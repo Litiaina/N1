@@ -135,11 +135,9 @@ impl NamespaceRuntime {
     ) -> Result<Option<NamespaceEntry>, AppError> {
         let fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
-        tokio::task::spawn_blocking(move || {
-            trash_entry(&fragment, &path)
-        })
-        .await
-        .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?
+        tokio::task::spawn_blocking(move || trash_entry(&fragment, &path))
+            .await
+            .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?
     }
 
     pub async fn head_for_path(
@@ -337,7 +335,9 @@ impl NamespaceRuntime {
                             let _ = fs::remove_dir_all(retired_root);
                         }
                     })
-                    .map_err(|e| AppError::InternalServerError(format!("spawn N2 trash purge: {e}")))?;
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!("spawn N2 trash purge: {e}"))
+                    })?;
             }
             Ok::<_, AppError>(())
         })
@@ -1231,7 +1231,9 @@ fn select_trash_record(
         return Err(AppError::NotFound);
     }
     for root in index_roots() {
-        let trash_path = fragment_root_on(&root, fragment).join(TRASH_DIR).join(target);
+        let trash_path = fragment_root_on(&root, fragment)
+            .join(TRASH_DIR)
+            .join(target);
         let meta = match fs::symlink_metadata(&trash_path) {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,

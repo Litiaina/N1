@@ -939,13 +939,21 @@ pub fn read_current_live_head(
     object_key: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
     let object_key = normalize_object_key(object_key)?;
+    let mut latest = None::<(PathBuf, NdxSummary)>;
     for dir in object_dir_candidates(fragment, &object_key)? {
         let Some(summary) = latest_summary_in_object_dir(&dir)? else {
             continue;
         };
-        return decode_metadata_file_as(&dir.join(summary.file_name), &object_key).map(Some);
+        if latest
+            .as_ref()
+            .is_none_or(|(_, current)| summary.version_id > current.version_id)
+        {
+            latest = Some((dir, summary));
+        }
     }
-    Ok(None)
+    latest
+        .map(|(dir, summary)| decode_metadata_file_as(&dir.join(summary.file_name), &object_key))
+        .transpose()
 }
 
 pub fn list_live_versions(
@@ -1944,6 +1952,49 @@ fn replica_index_records(score: &ReplicaScore) -> u64 {
         .saturating_add(score.upload_records)
 }
 
+fn collect_object_index_records(
+    fragment: &str,
+) -> Result<Vec<(String, String, Vec<u8>)>, AppError> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+
+    for root in index_roots() {
+        for (object_dir, object_id) in object_index_dirs_under_root(&root, fragment)? {
+            for name in read_dir_names(&object_dir)? {
+                if parse_ndx_file_name(&name).is_none() {
+                    continue;
+                }
+                if !seen.insert((object_id.clone(), name.clone())) {
+                    continue;
+                }
+                let bytes = fs::read(object_dir.join(&name))
+                    .map_err(|e| io_err(e, "read N1 object index record"))?;
+                records.push((object_id.clone(), name, bytes));
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+fn merge_object_index_records_into_root(
+    fragment: &str,
+    root: &Path,
+    records: &[(String, String, Vec<u8>)],
+) -> Result<u64, AppError> {
+    let mut copied = 0u64;
+    for (object_id, file_name, bytes) in records {
+        let target_dir = object_index_dir(root, fragment, object_id)?;
+        let target = target_dir.join(file_name);
+        if target.exists() {
+            continue;
+        }
+        write_atomic(&target, bytes)?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 fn mtime_nanos(path: &Path) -> u128 {
     fs::symlink_metadata(path)
         .and_then(|meta| meta.modified())
@@ -2170,9 +2221,13 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
     let _guard = N1_FS_LOCK
         .lock()
         .map_err(|_| AppError::InternalServerError("N1 index sync lock poisoned".to_string()))?;
-    let Some((source, source_score)) = choose_replica_source(fragment) else {
+    let Some((source, _source_score)) = choose_replica_source(fragment) else {
         return Ok(());
     };
+    let records = collect_object_index_records(fragment)?;
+    let source_root = source.parent().unwrap_or(&source).to_path_buf();
+    let _ = merge_object_index_records_into_root(fragment, &source_root, &records)?;
+    let source_score = replica_score(&source_root, fragment);
     for dst in fragment_roots(fragment) {
         if dst == source {
             continue;
@@ -2199,9 +2254,15 @@ pub fn repair_fragment_all_partition_replicas(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let Some((source, source_score)) = choose_replica_source(fragment) else {
+    let Some((source, mut source_score)) = choose_replica_source(fragment) else {
         return Ok((0, 0, 0));
     };
+    if !dry_run {
+        let records = collect_object_index_records(fragment)?;
+        let source_root = source.parent().unwrap_or(&source).to_path_buf();
+        let _ = merge_object_index_records_into_root(fragment, &source_root, &records)?;
+        source_score = replica_score(&source_root, fragment);
+    }
     let mut missing = 0;
     let mut divergent = 0;
     for dst in fragment_roots(fragment) {
@@ -3378,5 +3439,129 @@ mod tests {
             .expect("head exists");
         assert_eq!(full.version_id, new_id);
         assert_eq!(full.total_size_bytes, 222);
+    }
+
+    #[test]
+    fn current_head_uses_max_ulid_across_index_replicas() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(
+            roots.len() >= 2,
+            "replica head selection requires at least two index roots"
+        );
+        let fragment = format!("n1-replica-head-{}", Ulid::new());
+        let object_id = new_object_id();
+        let old_id = "01K00000000000000000000000";
+        let new_id = "01K00000000000000000000009";
+
+        for root in &roots {
+            publish_namespace_link(root, &fragment, "docs/stale-replica.pdf", &object_id)
+                .expect("publish namespace link");
+            fs::create_dir_all(live_object_dir(root, &fragment, &object_id).expect("object dir"))
+                .expect("create object dir");
+        }
+
+        let old_dir = live_object_dir(&roots[0], &fragment, &object_id).expect("old replica dir");
+        let mut old = test_metadata(&fragment, &object_id, 4_490_023);
+        old.version_id = old_id.to_string();
+        old.created_at = 1_779_883_031;
+        write_atomic(
+            &old_dir.join(ndx_file_name(&old)),
+            &encode(&old).expect("encode old replica metadata"),
+        )
+        .expect("write old replica");
+
+        let new_dir = live_object_dir(&roots[1], &fragment, &object_id).expect("new replica dir");
+        let mut new = test_metadata(&fragment, &object_id, 7_983_741);
+        new.version_id = new_id.to_string();
+        new.created_at = 1_779_892_004;
+        write_atomic(
+            &new_dir.join(ndx_file_name(&new)),
+            &encode(&new).expect("encode new replica metadata"),
+        )
+        .expect("write new replica");
+
+        let full = read_current_live_head(&fragment, &object_id)
+            .expect("read latest across replicas")
+            .expect("head exists");
+        assert_eq!(full.version_id, new_id);
+        assert_eq!(full.total_size_bytes, 7_983_741);
+    }
+
+    #[test]
+    fn repair_fragment_replicas_merges_split_object_versions() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(
+            roots.len() >= 2,
+            "split version repair requires at least two index roots"
+        );
+        let fragment = format!("n1-repair-split-{}", Ulid::new());
+        let object_id = new_object_id();
+        let logical_path = "docs/split-version.pdf";
+        let old_id = "01K00000000000000000000000";
+        let middle_id = "01K00000000000000000000001";
+        let new_id = "01K00000000000000000000009";
+
+        for root in &roots {
+            publish_namespace_link(root, &fragment, logical_path, &object_id)
+                .expect("publish namespace link");
+            fs::create_dir_all(live_object_dir(root, &fragment, &object_id).expect("object dir"))
+                .expect("create object dir");
+        }
+
+        for (version_id, size) in [(old_id, 4_490_023), (middle_id, 4_490_023)] {
+            let dir = live_object_dir(&roots[0], &fragment, &object_id).expect("old replica dir");
+            let mut meta = test_metadata(&fragment, &object_id, size);
+            meta.version_id = version_id.to_string();
+            meta.created_at = 1_779_883_031;
+            write_atomic(
+                &dir.join(ndx_file_name(&meta)),
+                &encode(&meta).expect("encode old metadata"),
+            )
+            .expect("write old metadata");
+        }
+
+        let new_dir = live_object_dir(&roots[1], &fragment, &object_id).expect("new replica dir");
+        let mut new = test_metadata(&fragment, &object_id, 7_983_741);
+        new.version_id = new_id.to_string();
+        new.created_at = 1_779_892_004;
+        write_atomic(
+            &new_dir.join(ndx_file_name(&new)),
+            &encode(&new).expect("encode new metadata"),
+        )
+        .expect("write new metadata");
+
+        let full = read_current_live_head(&fragment, &object_id)
+            .expect("read latest before repair")
+            .expect("head exists before repair");
+        assert_eq!(full.version_id, new_id);
+
+        repair_fragment_all_partition_replicas(&fragment, false).expect("repair split replicas");
+
+        for root in &roots {
+            let versions = read_dir_names(
+                &live_object_dir(root, &fragment, &object_id).expect("object dir after repair"),
+            )
+            .expect("read repaired object dir")
+            .into_iter()
+            .filter_map(|name| parse_ndx_file_name(&name).map(|summary| summary.version_id))
+            .collect::<BTreeSet<_>>();
+            assert_eq!(
+                versions,
+                BTreeSet::from([
+                    old_id.to_string(),
+                    middle_id.to_string(),
+                    new_id.to_string()
+                ]),
+                "repair must preserve the union of valid immutable versions"
+            );
+        }
+
+        let repaired = inspect_fragment_partition_replicas(&fragment, &roots);
+        assert!(
+            repaired.healthy,
+            "merged replicas should be 1:1 after repair"
+        );
     }
 }

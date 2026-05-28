@@ -3,6 +3,7 @@ use crate::core::index;
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::models::NamespaceMutationSummary;
 use crate::namespace::runtime::global_namespace_runtime;
 use axum::extract::Json as AxumJson;
 use axum::http::{HeaderMap, StatusCode};
@@ -10,9 +11,11 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::routes::storage_routes::AppState;
@@ -24,10 +27,42 @@ pub enum NamespaceMutationKind {
     Rename,
     Trash,
     Recover,
+    RecoverAll,
     Purge,
     EmptyTrash,
     UploadCommit,
     QuotaEdit,
+}
+
+#[derive(Clone, Debug)]
+pub enum NamespaceApplyOutcome {
+    None,
+    Created(bool),
+    Summary(NamespaceMutationSummary),
+    CommittedObject(String),
+}
+
+impl NamespaceApplyOutcome {
+    pub fn created(&self) -> Option<bool> {
+        match self {
+            Self::Created(created) => Some(*created),
+            _ => None,
+        }
+    }
+
+    pub fn summary(&self) -> Option<NamespaceMutationSummary> {
+        match self {
+            Self::Summary(summary) => Some(summary.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn committed_object(&self) -> Option<String> {
+        match self {
+            Self::CommittedObject(object_id) => Some(object_id.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -57,6 +92,19 @@ pub struct PeerNamespaceApplyRequest {
     pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ObjectMetadata>,
+}
+
+static NAMESPACE_COMMIT_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn namespace_commit_lock(fragment: &str) -> Result<Arc<Mutex<()>>, AppError> {
+    let mut locks = NAMESPACE_COMMIT_LOCKS.lock().map_err(|_| {
+        AppError::InternalServerError("N2 namespace commit lock table is poisoned".into())
+    })?;
+    Ok(locks
+        .entry(fragment.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
 }
 
 fn namespace_ledger_root() -> Result<std::path::PathBuf, AppError> {
@@ -120,6 +168,92 @@ fn namespace_peer_url(endpoint: &str) -> String {
     format!("{}/n2/peer/namespace/apply", endpoint.trim_end_matches('/'))
 }
 
+fn namespace_ledger_record(
+    request: &PeerNamespaceApplyRequest,
+) -> Result<NamespaceMutationRecord, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let mut record = build_namespace_record(
+        &request.fragment,
+        request.kind.clone(),
+        runtime.membership.epoch,
+    );
+    record.source_path = request.source_path.clone();
+    record.destination_path = request.destination_path.clone();
+    record.object_id = request.object_id.clone();
+    record.version_id = request.version_id.clone();
+    Ok(record)
+}
+
+fn append_request_ledger(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
+    let _ = append_namespace_mutation(namespace_ledger_record(request)?)?;
+    Ok(())
+}
+
+fn validate_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
+    if request.fragment.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "namespace mutation requires fragment".into(),
+        ));
+    }
+
+    let require_source = |name: &str| -> Result<(), AppError> {
+        if request
+            .source_path
+            .as_deref()
+            .unwrap_or_default()
+            .trim_matches('/')
+            .is_empty()
+        {
+            return Err(AppError::BadRequest(format!(
+                "{name} requires a non-empty source_path"
+            )));
+        }
+        Ok(())
+    };
+    let require_destination = |name: &str| -> Result<(), AppError> {
+        if request
+            .destination_path
+            .as_deref()
+            .unwrap_or_default()
+            .trim_matches('/')
+            .is_empty()
+        {
+            return Err(AppError::BadRequest(format!(
+                "{name} requires a non-empty destination_path"
+            )));
+        }
+        Ok(())
+    };
+
+    match request.kind {
+        NamespaceMutationKind::Mkdir
+        | NamespaceMutationKind::Trash
+        | NamespaceMutationKind::Recover
+        | NamespaceMutationKind::Purge => require_source("namespace mutation")?,
+        NamespaceMutationKind::Rename => {
+            require_source("rename")?;
+            require_destination("rename")?;
+        }
+        NamespaceMutationKind::RecoverAll
+        | NamespaceMutationKind::EmptyTrash
+        | NamespaceMutationKind::QuotaEdit => {}
+        NamespaceMutationKind::UploadCommit => {
+            require_source("upload commit")?;
+            if request.object_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(AppError::BadRequest(
+                    "upload commit requires object_id".into(),
+                ));
+            }
+            if request.metadata.is_none() {
+                return Err(AppError::BadRequest(
+                    "upload commit requires object metadata".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn post_namespace_to_peer(
     endpoint: &str,
     request: &PeerNamespaceApplyRequest,
@@ -143,55 +277,70 @@ async fn post_namespace_to_peer(
     Ok(())
 }
 
-async fn apply_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
+async fn apply_namespace_request_core(
+    request: &PeerNamespaceApplyRequest,
+) -> Result<NamespaceApplyOutcome, AppError> {
+    validate_namespace_request(request)?;
     match request.kind {
         NamespaceMutationKind::Mkdir => {
-            global_namespace_runtime()
+            let created = global_namespace_runtime()
                 .mkdir(
                     &request.fragment,
                     request.source_path.as_deref().unwrap_or_default(),
                 )
                 .await?;
+            Ok(NamespaceApplyOutcome::Created(created))
         }
         NamespaceMutationKind::Rename => {
-            global_namespace_runtime()
+            let summary = global_namespace_runtime()
                 .rename(
                     &request.fragment,
                     request.source_path.as_deref().unwrap_or_default(),
                     request.destination_path.as_deref().unwrap_or_default(),
                 )
                 .await?;
+            Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::Trash => {
-            global_namespace_runtime()
+            let summary = global_namespace_runtime()
                 .trash(
                     &request.fragment,
                     request.source_path.as_deref().unwrap_or_default(),
                 )
                 .await?;
+            Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::Recover => {
-            global_namespace_runtime()
+            let summary = global_namespace_runtime()
                 .recover(
                     &request.fragment,
                     request.source_path.as_deref().unwrap_or_default(),
                 )
                 .await?;
+            Ok(NamespaceApplyOutcome::Summary(summary))
+        }
+        NamespaceMutationKind::RecoverAll => {
+            let summary = global_namespace_runtime()
+                .recover_all(&request.fragment)
+                .await?;
+            Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::Purge => {
-            global_namespace_runtime()
+            let summary = global_namespace_runtime()
                 .purge_trash_path(
                     &request.fragment,
                     request.source_path.as_deref().unwrap_or_default(),
                 )
                 .await?;
+            Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::EmptyTrash => {
-            global_namespace_runtime()
+            let summary = global_namespace_runtime()
                 .empty_trash(&request.fragment)
                 .await?;
+            Ok(NamespaceApplyOutcome::Summary(summary))
         }
-        NamespaceMutationKind::QuotaEdit => {}
+        NamespaceMutationKind::QuotaEdit => Ok(NamespaceApplyOutcome::None),
         NamespaceMutationKind::UploadCommit => {
             let metadata = request.metadata.as_ref().ok_or_else(|| {
                 AppError::BadRequest("upload commit requires object metadata".into())
@@ -205,23 +354,19 @@ async fn apply_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<
                 .as_deref()
                 .ok_or_else(|| AppError::BadRequest("upload commit requires source_path".into()))?;
             index::publish_object(metadata).await?;
-            global_namespace_runtime()
+            let committed = global_namespace_runtime()
                 .finalize_logical_upload(&request.fragment, logical_path, object_id, metadata)
                 .await?;
+            Ok(NamespaceApplyOutcome::CommittedObject(committed))
         }
     }
+}
 
-    let runtime = active_cluster_runtime()?;
-    let mut record = build_namespace_record(
-        &request.fragment,
-        request.kind.clone(),
-        runtime.membership.epoch,
-    );
-    record.source_path = request.source_path.clone();
-    record.destination_path = request.destination_path.clone();
-    record.object_id = request.object_id.clone();
-    record.version_id = request.version_id.clone();
-    let _ = append_namespace_mutation(record)?;
+async fn apply_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
+    let lock = namespace_commit_lock(&request.fragment)?;
+    let _guard = lock.lock().await;
+    apply_namespace_request_core(request).await?;
+    append_request_ledger(request)?;
     Ok(())
 }
 
@@ -268,44 +413,52 @@ pub async fn commit_upload_quorum(
         version_id: Some(metadata.version_id.clone()),
         metadata: Some(metadata.clone()),
     };
-    let committed = global_namespace_runtime()
-        .finalize_logical_upload(fragment, logical_path, physical_object_id, metadata)
-        .await?;
-    apply_peers_quorum(&request).await?;
-    let runtime = active_cluster_runtime()?;
-    let mut record = build_namespace_record(
-        &request.fragment,
-        request.kind.clone(),
-        runtime.membership.epoch,
-    );
-    record.source_path = request.source_path.clone();
-    record.destination_path = request.destination_path.clone();
-    record.object_id = request.object_id.clone();
-    record.version_id = request.version_id.clone();
-    let _ = append_namespace_mutation(record)?;
-    Ok(committed)
+    let outcome = commit_namespace_quorum(request).await?;
+    Ok(outcome
+        .committed_object()
+        .unwrap_or_else(|| physical_object_id.to_string()))
 }
 
-pub async fn commit_namespace_quorum(request: PeerNamespaceApplyRequest) -> Result<(), AppError> {
-    apply_namespace_request(&request).await?;
-    apply_peers_quorum(&request).await
+pub async fn commit_namespace_quorum(
+    request: PeerNamespaceApplyRequest,
+) -> Result<NamespaceApplyOutcome, AppError> {
+    validate_namespace_request(&request)?;
+    apply_peers_quorum(&request).await?;
+    let lock = namespace_commit_lock(&request.fragment)?;
+    let _guard = lock.lock().await;
+    let outcome = apply_namespace_request_core(&request).await?;
+    append_request_ledger(&request)?;
+    Ok(outcome)
+}
+
+pub async fn commit_namespace_created_quorum(
+    request: PeerNamespaceApplyRequest,
+) -> Result<bool, AppError> {
+    Ok(commit_namespace_quorum(request)
+        .await?
+        .created()
+        .unwrap_or(false))
+}
+
+pub async fn commit_namespace_summary_quorum(
+    request: PeerNamespaceApplyRequest,
+) -> Result<NamespaceMutationSummary, AppError> {
+    commit_namespace_quorum(request)
+        .await?
+        .summary()
+        .ok_or_else(|| {
+            AppError::InternalServerError("namespace mutation did not return a summary".into())
+        })
 }
 
 pub async fn replicate_namespace_quorum(
     request: PeerNamespaceApplyRequest,
 ) -> Result<(), AppError> {
+    validate_namespace_request(&request)?;
     apply_peers_quorum(&request).await?;
-    let runtime = active_cluster_runtime()?;
-    let mut record = build_namespace_record(
-        &request.fragment,
-        request.kind.clone(),
-        runtime.membership.epoch,
-    );
-    record.source_path = request.source_path.clone();
-    record.destination_path = request.destination_path.clone();
-    record.object_id = request.object_id.clone();
-    record.version_id = request.version_id.clone();
-    let _ = append_namespace_mutation(record)?;
+    let lock = namespace_commit_lock(&request.fragment)?;
+    let _guard = lock.lock().await;
+    append_request_ledger(&request)?;
     Ok(())
 }
 
@@ -320,4 +473,51 @@ pub async fn peer_apply_namespace(
 
 pub fn build_namespace_peer_routes() -> Router<Arc<AppState>> {
     Router::new().route("/n2/peer/namespace/apply", post(peer_apply_namespace))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(kind: NamespaceMutationKind) -> PeerNamespaceApplyRequest {
+        PeerNamespaceApplyRequest {
+            kind,
+            fragment: "frag".into(),
+            source_path: Some("dir/file.bin".into()),
+            destination_path: None,
+            object_id: None,
+            version_id: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn two_node_cluster_requires_both_namespace_votes() {
+        assert_eq!(required_quorum(1), 1);
+        assert_eq!(required_quorum(2), 2);
+        assert_eq!(required_quorum(3), 2);
+        assert_eq!(required_quorum(4), 3);
+    }
+
+    #[test]
+    fn namespace_mutation_validation_rejects_empty_paths() {
+        let mut rename = request(NamespaceMutationKind::Rename);
+        rename.destination_path = Some(String::new());
+        assert!(validate_namespace_request(&rename).is_err());
+
+        let mut trash = request(NamespaceMutationKind::Trash);
+        trash.source_path = Some("/".into());
+        assert!(validate_namespace_request(&trash).is_err());
+    }
+
+    #[test]
+    fn namespace_recover_all_and_empty_trash_are_fragment_scoped() {
+        let mut recover_all = request(NamespaceMutationKind::RecoverAll);
+        recover_all.source_path = None;
+        assert!(validate_namespace_request(&recover_all).is_ok());
+
+        let mut empty_trash = request(NamespaceMutationKind::EmptyTrash);
+        empty_trash.source_path = None;
+        assert!(validate_namespace_request(&empty_trash).is_ok());
+    }
 }

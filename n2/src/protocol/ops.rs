@@ -47,6 +47,9 @@ use crate::core::upload::{
     upload_object_one_shot_direct, upload_object_one_shot_reader_direct,
     upload_object_one_shot_stream_direct,
 };
+use crate::distribution::namespace::{
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -386,9 +389,16 @@ async fn execute_native_op_inner(
         "trash.empty" => {
             let claims = claims_required(claims)?;
             require_delete(&claims)?;
-            let summary = global_namespace_runtime()
-                .empty_trash(&claims.fragment)
-                .await?;
+            let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+                kind: NamespaceMutationKind::EmptyTrash,
+                fragment: claims.fragment.clone(),
+                source_path: None,
+                destination_path: None,
+                object_id: None,
+                version_id: None,
+                metadata: None,
+            })
+            .await?;
             state.emit(
                 &claims.fragment,
                 StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
@@ -407,9 +417,16 @@ async fn execute_native_op_inner(
         "trash.recover_all" => {
             let claims = claims_required(claims)?;
             require_write(&claims)?;
-            let summary = global_namespace_runtime()
-                .recover_all(&claims.fragment)
-                .await?;
+            let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+                kind: NamespaceMutationKind::RecoverAll,
+                fragment: claims.fragment.clone(),
+                source_path: None,
+                destination_path: None,
+                object_id: None,
+                version_id: None,
+                metadata: None,
+            })
+            .await?;
             state.emit(
                 &claims.fragment,
                 StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
@@ -536,9 +553,16 @@ async fn execute_native_op_inner(
             if !version_exists {
                 return Err(AppError::NotFound);
             }
-            let summary = global_namespace_runtime()
-                .recover(&fragment, &logical)
-                .await?;
+            let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+                kind: NamespaceMutationKind::Recover,
+                fragment: fragment.clone(),
+                source_path: Some(logical.clone()),
+                destination_path: None,
+                object_id: None,
+                version_id: Some(version_id.clone()),
+                metadata: None,
+            })
+            .await?;
             state.emit(
                 &fragment,
                 StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
@@ -1050,21 +1074,21 @@ async fn native_bulk_namespace_operation(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
     for object_key in &unique_keys {
-        let result = match mode {
-            BulkNamespaceMode::Trash => {
-                global_namespace_runtime().trash(fragment, object_key).await
-            }
-            BulkNamespaceMode::Recover => {
-                global_namespace_runtime()
-                    .recover(fragment, object_key)
-                    .await
-            }
-            BulkNamespaceMode::Purge => {
-                global_namespace_runtime()
-                    .purge_trash_path(fragment, object_key)
-                    .await
-            }
+        let kind = match mode {
+            BulkNamespaceMode::Trash => NamespaceMutationKind::Trash,
+            BulkNamespaceMode::Recover => NamespaceMutationKind::Recover,
+            BulkNamespaceMode::Purge => NamespaceMutationKind::Purge,
         };
+        let result = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            kind,
+            fragment: fragment.to_string(),
+            source_path: Some(object_key.clone()),
+            destination_path: None,
+            object_id: None,
+            version_id: None,
+            metadata: None,
+        })
+        .await;
         match result {
             Ok(_) => succeeded = succeeded.saturating_add(1),
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),

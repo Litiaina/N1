@@ -1,6 +1,6 @@
-# N1 Storage Kernel Architecture
+# N1 Object Storage Architecture
 
-This document describes how N1 stores metadata and payloads on disk. Operators should start with [N1_DOCUMENTATION.md](N1_DOCUMENTATION.md). This document is for maintainers, reviewers, and administrators who need to reason about repair, GC, redistribution, and failure recovery.
+This document describes how N1 stores object metadata, namespace state, and payloads on disk. Operators should start with [N1_DOCUMENTATION.md](N1_DOCUMENTATION.md). This document is for maintainers, reviewers, and administrators who need to reason about repair, GC, redistribution, and failure recovery.
 
 ## Storage Planes
 
@@ -18,7 +18,7 @@ The workspace `n1_native_client` crate is the canonical Rust client implementati
 
 ## Native Protocol Plane
 
-N1 1.3.2 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+N1 1.3.3 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the N1 object storage system without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
 
 The native plane is intentionally thin:
 
@@ -50,7 +50,7 @@ The native plane must not:
 - bypass repair, GC, redistribution, or validation logic
 - implement a separate object metadata path
 
-Native is a lower-latency core face for the same storage kernel, not a fourth storage plane and not masked HTTP.
+Native is a lower-latency core face for the same N1 object storage system, not a fourth storage plane and not masked HTTP.
 
 ## Disk IO Scheduler
 
@@ -66,7 +66,7 @@ Scheduler lanes:
 
 Foreground work uses the adaptive upload target so live traffic can contract under CPU/RAM pressure. Background work has its own smaller lane and per-fragment gate, so GC, repair, and redistribution cannot consume the whole disk path while users are uploading or reading. Object status and repair also pass through the scheduler in addition to their object-scoped maintenance gates.
 
-The scheduler is intentionally coarse at 1.3: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the storage-kernel invariants stable while removing avoidable per-shard serialization from large uploads.
+The scheduler is intentionally coarse at 1.3: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the object-storage invariants stable while removing avoidable per-shard serialization from large uploads.
 
 N1 still serializes the same `(fragment, version_id, part_index)` upload part. Different parts can move in parallel, but two clients cannot race the same receipt or stable shard set for the same part. Large-upload clients should keep part concurrency bounded; too much concurrency can overload weak two-disk deployments instead of improving them.
 
@@ -214,9 +214,12 @@ Blob payloads with no reachable committed metadata become reclaim candidates.
 Repair restores:
 
 - missing namespace/index replicas from healthy roots
+- split immutable object-version records across index replicas
 - missing or corrupt shard/parity payloads where enough data remains
 - missing metadata replicas after disk loss or reformat
 - readable objects after recover-on-read or full repair
+
+Index repair treats `.ndx` version files as immutable records. Before mirroring an index replica, N1 merges valid object-version records found across active index roots into the selected source, then normalizes the replicas. That prevents a stale but record-rich replica from overwriting a newer version that only exists on another index root after an interrupted write, remount, or historical repair gap.
 
 Object-level repair scopes the operation to one object. Fragment repair scans the whole fragment.
 
@@ -228,4 +231,4 @@ Redistribution must preserve namespace symlinks, stable object ids, immutable `.
 
 ## Public Identity
 
-Public documentation should call this system N1, the N1 storage kernel, the N1 namespace, the N1 object index, and the N1 blob plane. Implementation files such as `.fragment.ndx`, `.objects`, `.uploads`, and `.blobs` are valid architecture terms, but they should not be presented as a separate database product.
+Public documentation should call this system N1, the N1 object storage system, the N1 namespace, the N1 object index, and the N1 blob plane. Implementation files such as `.fragment.ndx`, `.objects`, `.uploads`, and `.blobs` are valid architecture terms, but they should not be presented as a separate database product or as a filesystem product.

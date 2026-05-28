@@ -20,7 +20,7 @@ peer protocol, repair, rebalance, and health model.
 N2 owns distributed namespace, object identity, cluster layout, node placement,
 and cluster maintenance.
 
-N2 uses Litiaina storage-kernel principles directly: real namespace
+N2 uses Litiaina object-storage principles directly: real namespace
 directories, symlink object identity, immutable version records, and immutable
 .shard/.parity blobs.
 ```
@@ -188,12 +188,14 @@ That keeps N2 adaptable:
 - re-add node: recorded layouts can become healthy again
 - rebalance: explicit operator action, never silent mandatory churn
 
-## Current 0.11.0 State
+## Current 0.12.0 State
 
 N2 0.8.0 was the destructive reset point. N2 0.9.0 added the first distributed
-control plane. N2 0.10.0 moved into distributed execution. N2 0.11.0 hardens
+control plane. N2 0.10.0 moved into distributed execution. N2 0.11.0 hardened
 native peer transport, `.nmtd` placement records, repair/rebalance status, and
-two-node proof coverage.
+two-node proof coverage. N2 0.12.0 hardens namespace mutation flow so upload
+commits, POSIX/object mutations, recover-all, and empty-trash pass through a
+shared quorum commit path.
 
 Current base:
 
@@ -214,6 +216,8 @@ Current base:
 - distributed multipart upload
 - distributed range/chunk read with parity reconstruction
 - namespace quorum apply for upload commits and namespace mutation operations
+- per-fragment namespace commit gate for local mutation serialization
+- cluster health reports adaptive layout separately from optional rebalance debt
 - repair/rebalance executor start/status routes
 - persisted repair/rebalance status snapshots
 - native `n2://` peer transport for shard put/get

@@ -1,8 +1,8 @@
 # N1 Documentation
 
-N1 1.3.2 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.3.3 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
-N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
+N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
 For implementation details, see [N1_ARCHITECTURE.md](N1_ARCHITECTURE.md). For release validation notes, see [N1_VERIFICATION.md](N1_VERIFICATION.md).
 
@@ -224,7 +224,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.3.2 includes the native N1 protocol:
+N1 1.3.3 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -428,7 +428,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.3.2 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.3.3 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -471,7 +471,7 @@ The CLI intentionally keeps destructive namespace mutations out of the operator 
 
 ### Stability Boundary
 
-Native `n1://` does not bypass N1 validation, authorization, repair, GC, redistribution, upload accounting, or namespace rules. It reaches N1 core/service functions directly instead of masking HTTP. Its stability risks are protocol risks: framing, session handling, socket behavior, and client implementation. The storage kernel stays unchanged.
+Native `n1://` does not bypass N1 validation, authorization, repair, GC, redistribution, upload accounting, or namespace rules. It reaches N1 core/service functions directly instead of masking HTTP. Its stability risks are protocol risks: framing, session handling, socket behavior, and client implementation. The object storage system behavior stays unchanged.
 
 For LTS release proof, native should remain in the Rust release proof matrix for:
 
@@ -774,7 +774,7 @@ Returns public object metadata for the latest version.
 
 ### `GET /n1/objects/versions/{object_key}`
 
-Returns committed versions for a file path. Internal shard layout is stripped from the public response.
+Returns committed versions for a file path, newest first by version ULID. Internal shard layout is stripped from the public response.
 
 ### `GET /n1/objects/get/{object_key}`
 
@@ -1071,7 +1071,7 @@ Soft delete moves a file or folder into `.trash`. Live listing no longer shows i
 
 Hard delete removes trash namespace entries. Bytes are returned after GC determines no live or trash namespace path references the blob versions.
 
-N1 1.3.2 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
+N1 1.3.3 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
 
 Empty trash:
 
@@ -1096,7 +1096,7 @@ GET /n1/maintenance/trash/recover/status
 
 ### Disk IO Scheduler
 
-N1 1.3 adds a shared disk IO scheduler for kernel-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
+N1 1.3 adds a shared disk IO scheduler for disk-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
 
 The scheduler separates:
 
@@ -1331,4 +1331,4 @@ Trash recovery is path based. Send the path shown by trash listing.
 
 N1 is optimized for durable large-object storage, POSIX movement, repairability, and bounded memory. It can store many small objects, but tiny-object storms pay per-object namespace commit, receipt, and shard/parity overhead. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
 
-N1 is strongest when it can stream bytes, use the kernel for namespace movement, and keep durable resumability on disk rather than depending on RAM-only state.
+N1 is strongest when it can stream bytes, keep namespace movement lightweight, and keep durable resumability on disk rather than depending on RAM-only state.

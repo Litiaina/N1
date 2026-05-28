@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, replicate_namespace_quorum,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created_quorum,
+    commit_namespace_summary_quorum,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -156,18 +157,17 @@ pub async fn mkdir_path(
         ));
     }
 
-    let created = global_namespace_runtime().mkdir(&fragment, &path).await?;
+    let created = commit_namespace_created_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::Mkdir,
+        fragment: fragment.clone(),
+        source_path: Some(path.clone()),
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
     if created {
-        replicate_namespace_quorum(PeerNamespaceApplyRequest {
-            kind: NamespaceMutationKind::Mkdir,
-            fragment: fragment.clone(),
-            source_path: Some(path.clone()),
-            destination_path: None,
-            object_id: None,
-            version_id: None,
-            metadata: None,
-        })
-        .await?;
         state.emit(
             &fragment,
             StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::directory_created(
@@ -225,10 +225,7 @@ pub async fn rename_path(
         });
     }
 
-    let summary = global_namespace_runtime()
-        .rename(&fragment, &source_path, &destination_path)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Rename,
         fragment: fragment.clone(),
         source_path: Some(source_path.clone()),
@@ -270,8 +267,7 @@ pub async fn trash_path(
         ));
     }
     let fragment = claims.fragment.clone();
-    let summary = global_namespace_runtime().trash(&fragment, &path).await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Trash,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),
@@ -313,8 +309,7 @@ pub async fn recover_path(
         ));
     }
     let fragment = claims.fragment.clone();
-    let summary = global_namespace_runtime().recover(&fragment, &path).await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Recover,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),
@@ -356,10 +351,7 @@ pub async fn permanently_delete_path(
         ));
     }
     let fragment = claims.fragment.clone();
-    let summary = global_namespace_runtime()
-        .purge_trash_path(&fragment, &path)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Purge,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),

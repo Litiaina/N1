@@ -5,7 +5,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, replicate_namespace_quorum,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created_quorum,
+    commit_namespace_summary_quorum,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -123,20 +124,17 @@ async fn posix_mkdir(
         return Err(AppError::Forbidden("Write permission required".into()));
     }
     let path = req.path;
-    let created = global_namespace_runtime()
-        .mkdir(&claims.fragment, &path)
-        .await?;
+    let created = commit_namespace_created_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::Mkdir,
+        fragment: claims.fragment.clone(),
+        source_path: Some(path.clone()),
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
     if created {
-        replicate_namespace_quorum(PeerNamespaceApplyRequest {
-            kind: NamespaceMutationKind::Mkdir,
-            fragment: claims.fragment.clone(),
-            source_path: Some(path.clone()),
-            destination_path: None,
-            object_id: None,
-            version_id: None,
-            metadata: None,
-        })
-        .await?;
         state.emit(
             &claims.fragment,
             StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::directory_created(
@@ -166,10 +164,7 @@ async fn posix_rename(
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
-    let summary = global_namespace_runtime()
-        .rename(&claims.fragment, &req.source_path, &req.destination_path)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Rename,
         fragment: claims.fragment.clone(),
         source_path: Some(req.source_path.clone()),
@@ -207,10 +202,7 @@ async fn posix_trash(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let summary = global_namespace_runtime()
-        .trash(&claims.fragment, &req.path)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Trash,
         fragment: claims.fragment.clone(),
         source_path: Some(req.path.clone()),
@@ -248,19 +240,7 @@ async fn posix_recover(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let summary = match req.trash_entry_id.as_deref().map(str::trim) {
-        Some(trash_entry_id) if !trash_entry_id.is_empty() => {
-            global_namespace_runtime()
-                .recover_trash_entry_id(&claims.fragment, trash_entry_id)
-                .await?
-        }
-        _ => {
-            global_namespace_runtime()
-                .recover(&claims.fragment, &req.path)
-                .await?
-        }
-    };
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Recover,
         fragment: claims.fragment.clone(),
         source_path: Some(req.path.clone()),
@@ -301,19 +281,7 @@ async fn posix_purge(
     if !claims.delete {
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
-    let summary = match req.trash_entry_id.as_deref().map(str::trim) {
-        Some(trash_entry_id) if !trash_entry_id.is_empty() => {
-            global_namespace_runtime()
-                .purge_trash_entry_id(&claims.fragment, trash_entry_id)
-                .await?
-        }
-        _ => {
-            global_namespace_runtime()
-                .purge_trash_path(&claims.fragment, &req.path)
-                .await?
-        }
-    };
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Purge,
         fragment: claims.fragment.clone(),
         source_path: Some(req.path.clone()),

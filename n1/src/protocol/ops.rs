@@ -492,6 +492,7 @@ async fn execute_native_op_inner(
             let physical = resolve_logical_read_key(&fragment, &logical).await?;
             let mut versions =
                 index::list_live_object_versions_metadata(&fragment, &physical).await?;
+            versions.sort_by(|a, b| b.version_id.cmp(&a.version_id));
             for metadata in &mut versions {
                 metadata.object_key = logical.trim_start_matches('/').to_string();
                 metadata.strip_internal_layout();

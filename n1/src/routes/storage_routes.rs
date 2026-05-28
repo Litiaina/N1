@@ -412,6 +412,7 @@ async fn list_object_versions_scoped(
     let requested_path = object_key;
     let physical = resolve_logical_read_key(&fragment, &requested_path).await?;
     let mut versions = index::list_live_object_versions_metadata(&fragment, &physical).await?;
+    versions.sort_by(|a, b| b.version_id.cmp(&a.version_id));
     for metadata in &mut versions {
         metadata.object_key = requested_path.clone();
         metadata.strip_internal_layout();

@@ -48,7 +48,7 @@ use crate::core::upload::{
 use crate::core::{index, index_store};
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, build_namespace_peer_routes,
-    commit_upload_quorum, replicate_namespace_quorum,
+    commit_namespace_summary_quorum, commit_upload_quorum,
 };
 use crate::distribution::peer::build_peer_routes;
 use crate::distribution::routes::build_cluster_routes;
@@ -540,8 +540,7 @@ async fn empty_trash_scoped(
     if !claims.delete {
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
-    let summary = global_namespace_runtime().empty_trash(&fragment).await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::EmptyTrash,
         fragment: fragment.clone(),
         source_path: None,
@@ -576,10 +575,7 @@ async fn delete_object_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let summary = global_namespace_runtime()
-        .trash(&fragment, &object_key)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Trash,
         fragment: fragment.clone(),
         source_path: Some(object_key.clone()),
@@ -627,10 +623,7 @@ async fn delete_object_permanently_scoped(
     if !claims.delete {
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
-    let summary = global_namespace_runtime()
-        .purge_trash_path(&fragment, &object_key)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Purge,
         fragment: fragment.clone(),
         source_path: Some(object_key.clone()),
@@ -674,10 +667,7 @@ async fn recover_object_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let summary = global_namespace_runtime()
-        .recover(&fragment, &object_key)
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Recover,
         fragment: fragment.clone(),
         source_path: Some(object_key.clone()),
@@ -763,21 +753,18 @@ async fn bulk_delete_objects_scoped(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
     for object_key in &unique_keys {
-        match global_namespace_runtime()
-            .trash(&fragment, object_key)
-            .await
+        match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            kind: NamespaceMutationKind::Trash,
+            fragment: fragment.clone(),
+            source_path: Some(object_key.clone()),
+            destination_path: None,
+            object_id: None,
+            version_id: None,
+            metadata: None,
+        })
+        .await
         {
             Ok(_) => {
-                replicate_namespace_quorum(PeerNamespaceApplyRequest {
-                    kind: NamespaceMutationKind::Trash,
-                    fragment: fragment.clone(),
-                    source_path: Some(object_key.clone()),
-                    destination_path: None,
-                    object_id: None,
-                    version_id: None,
-                    metadata: None,
-                })
-                .await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
@@ -836,21 +823,18 @@ async fn bulk_recover_objects_scoped(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
     for object_key in &unique_keys {
-        match global_namespace_runtime()
-            .recover(&fragment, object_key)
-            .await
+        match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            kind: NamespaceMutationKind::Recover,
+            fragment: fragment.clone(),
+            source_path: Some(object_key.clone()),
+            destination_path: None,
+            object_id: None,
+            version_id: None,
+            metadata: None,
+        })
+        .await
         {
             Ok(_) => {
-                replicate_namespace_quorum(PeerNamespaceApplyRequest {
-                    kind: NamespaceMutationKind::Recover,
-                    fragment: fragment.clone(),
-                    source_path: Some(object_key.clone()),
-                    destination_path: None,
-                    object_id: None,
-                    version_id: None,
-                    metadata: None,
-                })
-                .await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
@@ -907,21 +891,18 @@ async fn bulk_permanent_delete_objects_scoped(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
     for object_key in &unique_keys {
-        match global_namespace_runtime()
-            .purge_trash_path(&fragment, object_key)
-            .await
+        match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            kind: NamespaceMutationKind::Purge,
+            fragment: fragment.clone(),
+            source_path: Some(object_key.clone()),
+            destination_path: None,
+            object_id: None,
+            version_id: None,
+            metadata: None,
+        })
+        .await
         {
             Ok(_) => {
-                replicate_namespace_quorum(PeerNamespaceApplyRequest {
-                    kind: NamespaceMutationKind::Purge,
-                    fragment: fragment.clone(),
-                    source_path: Some(object_key.clone()),
-                    destination_path: None,
-                    object_id: None,
-                    version_id: None,
-                    metadata: None,
-                })
-                .await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
@@ -963,7 +944,16 @@ async fn recover_all_trash_scoped(
             "Write permission required to recover all".into(),
         ));
     }
-    let summary = global_namespace_runtime().recover_all(&fragment).await?;
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::RecoverAll,
+        fragment: fragment.clone(),
+        source_path: None,
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
     state.emit(
         &fragment,
         StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
@@ -994,14 +984,7 @@ async fn rename_object_scoped(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let summary = global_namespace_runtime()
-        .rename(
-            &claims.fragment,
-            &payload.source_key,
-            &payload.destination_key,
-        )
-        .await?;
-    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         kind: NamespaceMutationKind::Rename,
         fragment: claims.fragment.clone(),
         source_path: Some(payload.source_key.clone()),

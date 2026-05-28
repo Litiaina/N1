@@ -11,7 +11,7 @@ For the deeper design, see [N2_ARCHITECTURE.md](N2_ARCHITECTURE.md).
 
 ## Current Status
 
-N2 `0.11.0` is the native-peer hardening line after the destructive reset.
+N2 `0.12.0` is the namespace-quorum hardening line after the destructive reset.
 
 What exists now:
 
@@ -29,7 +29,9 @@ What exists now:
 - peer-to-peer shard transport under `/n2/peer/...`
 - cluster EC upload streaming for one-shot and multipart writes
 - distributed range/chunk reads with parity reconstruction
-- namespace quorum apply for upload commits and POSIX/object mutations
+- guarded namespace quorum apply for upload commits and POSIX/object mutations
+- per-fragment namespace commit gate so hot fragments cannot interleave local mutations
+- cluster health fields that separate true health failure from optional rebalance debt
 - cluster repair executor status/start
 - cluster rebalance executor status/start
 - immutable `.nmtd` cluster placement records

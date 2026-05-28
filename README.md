@@ -19,10 +19,10 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`1.3.2`)
-  Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
-> - `N2` (`0.11.0`)
-  Standalone distributed object storage with node-level placement, peer shard transport, distributed upload/read, namespace quorum apply, cluster health, repair, and manual rebalance execution. N1 and N2 are independent Litiaina storage systems with shared design principles, not parent/child runtimes. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
+> - `N1` (`1.3.3`)
+  Single-node object storage system with a real N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
+> - `N2` (`0.12.0`)
+  Standalone distributed object storage system with node-level placement, peer shard transport, distributed upload/read, namespace quorum apply, cluster health, repair, and manual rebalance execution. N1 and N2 are independent Litiaina storage systems with shared design principles, not parent/child runtimes. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
 > - `NS` (`1.0.0`)
   Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
 > - `Registry` (`0.9.1`)
@@ -46,14 +46,14 @@ Current route namespaces are intentionally split:
 - `NS` exposes SMB on its configured TCP bind address and port.
 - `Registry` product-facing routes live under `/v1/...`
 
-The current N1 line retires the old Standard/indexdb engine from the active workspace. Active N1 metadata truth is the N1 namespace, immutable `.ndx` object records, and the `.blobs` payload plane:
+N1 stores object truth in its own namespace, immutable `.ndx` object records, and `.blobs` payload plane:
 
 - namespace state is real directories and symlink object pointers
 - object metadata is immutable `.ndx` records under `.objects/<hh>/<hh>/@o_<object-id>/`
 - upload sessions and receipts live under `.uploads/`
 - trash is namespace movement under `.trash/`
 - repair, redistribution, GC, and recover-on-read operate on explicit storage truth and reachability
-- SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
+- SMB/NAS serving is handled by standalone `NS`, keeping `N1` focused on object storage responsibilities.
 - `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
 - Per-fragment N1 index replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
 - Trash is namespace-native: soft delete moves the exact file or folder path into `.trash`, trash listing reads `.trash`, recover moves the path back to live namespace, and GC later reclaims headless object metadata and blobs.
@@ -67,7 +67,7 @@ The current N1 line retires the old Standard/indexdb engine from the active work
 
 ### N1
 
-`N1 1.3.2` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 1.3.3` is the primary single-node N1 object storage system and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 
@@ -82,7 +82,7 @@ index_root/<fragment_hash>/
 
 Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in two-level fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
 
-Use `N1` when the goal is the Linux-first, IO-bound N1 storage kernel.
+Use `N1` when the goal is durable single-node object storage with real namespace operations, resumable uploads, repair, redistribution, and bounded memory.
 
 Check a deployed N1 binary without starting the server:
 
@@ -97,7 +97,7 @@ N1 exposes two supported transport faces:
 
 ### N2
 
-`N2 0.11.0` is Litiaina's distributed object storage line.
+`N2 0.12.0` is Litiaina's distributed object storage line.
 
 It keeps the Litiaina storage principles and makes node placement a first-class cluster concern:
 
@@ -226,7 +226,7 @@ Typical deployments:
 ## Repository Layout
 
 - [`n1`](n1)
-  `N1` server and storage kernel
+  `N1` server and object storage system
 - [`n2`](n2)
   `N2` cluster layer
 - [`ns`](ns)
@@ -474,7 +474,7 @@ cargo run -p registry
 
 ### N2 Cluster
 
-Use `N2` when you need node-level distributed placement instead of one storage node. `N2 0.11.0` provides native peer shard transport, distributed one-shot and multipart upload, distributed read/reconstruct, namespace quorum apply, cluster health, repair execution, and manual rebalance execution.
+Use `N2` when you need node-level distributed placement instead of one storage node. `N2 0.12.0` provides native peer shard transport, distributed one-shot and multipart upload, distributed read/reconstruct, guarded namespace quorum apply, cluster health, repair execution, and manual rebalance execution.
 
 ## Configuration Overview
 
@@ -672,7 +672,7 @@ Many local deployments use self-signed or locally issued certificates. Use `curl
 
 ### NS Scope
 
-SMB/NAS workflows are handled by standalone `NS`, not embedded in `N1`. Keep `NS` share roots separate from `N1` index/blob roots so live NAS file serving cannot destabilize storage-kernel state.
+SMB/NAS workflows are handled by standalone `NS`, not embedded in `N1`. Keep `NS` share roots separate from `N1` index/blob roots so live NAS file serving cannot destabilize N1 object storage state.
 
 ## Development Notes
 
@@ -704,6 +704,6 @@ High-signal proof for the N2 line includes:
 - verification that object records use stable `@o_<object-id>` directories with max-ULID heads
 - verification that N2 does not return to the discarded `disk_shard_0.bin` design
 
-`N2 0.11.0` hardens distributed execution after the reset: native peer shard transport, cluster EC upload, multipart resume, distributed read/reconstruct, namespace quorum apply, persisted repair/rebalance status, `.nmtd` placement records, and focused two-node hardware proof. The long-running proof still needs a longer two-node soak and full node loss/re-add matrix.
+`N2 0.12.0` hardens distributed execution after the reset: native peer shard transport, cluster EC upload, multipart resume, distributed read/reconstruct, guarded namespace quorum apply, persisted repair/rebalance status, `.nmtd` placement records, and focused two-node hardware proof. The long-running proof still needs a longer two-node soak and full node loss/re-add matrix.
 
 If you are touching a subsystem boundary, prefer adding a focused regression test in that subsystem plus a workflow test when the behavior spans storage, namespace, and maintenance.

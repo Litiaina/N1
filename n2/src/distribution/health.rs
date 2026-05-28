@@ -1,3 +1,4 @@
+use crate::distribution::layout::ClusterLayoutMode;
 use crate::distribution::layout::resolve_layout;
 use crate::distribution::membership::{ClusterRuntime, NodeState};
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
@@ -31,6 +32,9 @@ pub struct ClusterHealthSnapshot {
     pub readable_nodes: usize,
     pub data_shards: usize,
     pub parity_shards: usize,
+    pub adaptive_layout: bool,
+    pub manual_rebalance_available: bool,
+    pub layout_drift_is_health_failure: bool,
     pub automatic_rebalance: bool,
     pub repair_running: bool,
     pub rebalance_running: bool,
@@ -57,6 +61,12 @@ pub fn cluster_health_snapshot(
     let repair_status = repair_status();
     let rebalance_status = rebalance_status();
     let mut notes = vec![rebalance.recommendation];
+    if active.len() >= required {
+        notes.push(
+            "layout drift is not health failure: new objects use the current node layout; old objects stay readable until manual rebalance"
+                .to_string(),
+        );
+    }
     if repair_status.running {
         notes.push(format!(
             "cluster repair is running for fragment '{}'{}",
@@ -94,6 +104,9 @@ pub fn cluster_health_snapshot(
         readable_nodes: readable.len(),
         data_shards: layout.data_shards,
         parity_shards: layout.parity_shards,
+        adaptive_layout: matches!(runtime.layout_policy.mode, ClusterLayoutMode::Auto),
+        manual_rebalance_available: active.len() > 1,
+        layout_drift_is_health_failure: false,
         automatic_rebalance: runtime.auto_rebalance,
         repair_running: repair_status.running,
         rebalance_running: rebalance_status.running,
@@ -167,6 +180,9 @@ mod tests {
         assert_eq!(snap.state, ClusterHealthState::Healthy);
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
+        assert!(snap.adaptive_layout);
+        assert!(snap.manual_rebalance_available);
+        assert!(!snap.layout_drift_is_health_failure);
         assert_eq!(
             snap.nodes[0].native_endpoint.as_deref(),
             Some("n2://a:50002")
