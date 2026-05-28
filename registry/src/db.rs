@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use indexdb::params;
+use indexdb::sql::{self, Connection, OptionalExtension, SqlExecutor, Value, params_from_iter};
 use serde_json::Value as JsonValue;
 use tokio::task;
 use uuid::Uuid;
@@ -4234,13 +4234,13 @@ where
     }
 }
 
-fn user_by_uid(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError> {
+fn user_by_uid(conn: &impl SqlExecutor, uid: &str) -> Result<UserRecord, RegistryError> {
     let mut user = user_by_uid_raw(conn, uid)?;
     apply_effective_quota_usage(conn, &mut user)?;
     Ok(user)
 }
 
-fn user_by_uid_raw(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError> {
+fn user_by_uid_raw(conn: &impl SqlExecutor, uid: &str) -> Result<UserRecord, RegistryError> {
     conn.query_row(
         r#"
         SELECT uid, email, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_enabled
@@ -4262,13 +4262,13 @@ fn user_by_uid_raw(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryE
         },
     )
     .map_err(|err| match err {
-        rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
+        sql::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
         other => sql_err(other),
     })
 }
 
 fn apply_effective_quota_usage(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     user: &mut UserRecord,
 ) -> Result<(), RegistryError> {
     user.quota_used_bytes = effective_quota_used_bytes_for_user(conn, &user.uid)?;
@@ -4276,13 +4276,13 @@ fn apply_effective_quota_usage(
 }
 
 fn apply_effective_quota_usage_to_auth(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     auth: &mut UserAuthRecord,
 ) -> Result<(), RegistryError> {
     apply_effective_quota_usage(conn, &mut auth.user)
 }
 
-fn user_auth_by_uid(conn: &Connection, uid: &str) -> Result<Option<UserAuthRecord>, RegistryError> {
+fn user_auth_by_uid(conn: &impl SqlExecutor, uid: &str) -> Result<Option<UserAuthRecord>, RegistryError> {
     let mut stmt = conn
         .prepare(
             r#"
@@ -4297,7 +4297,7 @@ fn user_auth_by_uid(conn: &Connection, uid: &str) -> Result<Option<UserAuthRecor
         .map_err(sql_err)
 }
 
-fn map_user_auth_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserAuthRecord> {
+fn map_user_auth_row(row: &sql::Row) -> sql::Result<UserAuthRecord> {
     Ok(UserAuthRecord {
         user: UserRecord {
             uid: row.get(0)?,
@@ -4316,7 +4316,7 @@ fn map_user_auth_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserAuthRecord
 }
 
 fn resolve_ready_object(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_key: &str,
@@ -4335,7 +4335,7 @@ fn resolve_ready_object(
 }
 
 fn resolve_live_object(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_key: &str,
@@ -4354,7 +4354,7 @@ fn resolve_live_object(
 }
 
 fn resolve_stored_object(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_key: &str,
@@ -4373,7 +4373,7 @@ fn resolve_stored_object(
 }
 
 fn resolve_any_object(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_key: &str,
@@ -4408,7 +4408,7 @@ fn resolve_any_object(
 }
 
 fn resolve_fragment_binding(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
 ) -> Result<Option<FragmentBindingRecord>, RegistryError> {
@@ -4441,7 +4441,7 @@ fn normalize_namespace_prefix(prefix: String) -> String {
 }
 
 fn select_objects_by_prefix(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     prefix: &str,
@@ -4470,7 +4470,7 @@ fn select_objects_by_prefix(
 }
 
 fn select_object_keys_by_prefix_with_status(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     prefix: &str,
@@ -4503,7 +4503,7 @@ fn select_object_keys_by_prefix_with_status(
 }
 
 fn list_objects_with_status_from_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     status: &str,
@@ -4529,7 +4529,7 @@ fn list_objects_with_status_from_conn(
 }
 
 fn select_upload_keys_by_prefix(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     prefix: &str,
@@ -4558,7 +4558,7 @@ fn select_upload_keys_by_prefix(
 }
 
 fn select_objects_by_keys(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_keys: &[String],
@@ -4596,7 +4596,7 @@ fn select_objects_by_keys(
 }
 
 fn select_upload_keys(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_keys: &[String],
@@ -4634,7 +4634,7 @@ fn select_upload_keys(
 }
 
 fn delete_object_namespace_rows(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_key: &str,
@@ -4668,7 +4668,7 @@ fn delete_object_namespace_rows(
 }
 
 fn rewrite_namespace_key(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     source_key: &str,
@@ -4733,7 +4733,7 @@ fn rewrite_namespace_key(
 }
 
 fn select_archive_objects_from_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: String,
     fragment: String,
     keys: Vec<String>,
@@ -4854,7 +4854,7 @@ fn canonical_archive_key(value: &str) -> String {
 }
 
 fn select_existing_object_keys(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_keys: &[String],
@@ -4892,7 +4892,7 @@ fn select_existing_object_keys(
 }
 
 fn select_existing_object_keys_with_status(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_keys: &[String],
@@ -4932,7 +4932,7 @@ fn select_existing_object_keys_with_status(
 }
 
 fn update_object_status_chunk(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_keys: &[String],
@@ -4967,7 +4967,7 @@ fn update_object_status_chunk(
 }
 
 fn delete_rows_for_object_keys_chunk(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     table: &str,
     owner_uid: &str,
     fragment: &str,
@@ -4996,20 +4996,20 @@ fn delete_rows_for_object_keys_chunk(
     Ok(())
 }
 
-fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
+fn quota_for_user(conn: &impl SqlExecutor, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
     conn.query_row(
         "SELECT quota_limit_bytes, quota_used_bytes FROM users WHERE uid = ?1",
         params![owner_uid],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0))),
     )
     .map_err(|err| match err {
-        rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
+        sql::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
         other => sql_err(other),
     })
 }
 
 fn projected_object_usage_bytes_for_user(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
 ) -> Result<i64, RegistryError> {
     conn.query_row(
@@ -5027,7 +5027,7 @@ fn projected_object_usage_bytes_for_user(
 }
 
 fn refresh_user_quota_used(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     updated_at: &str,
 ) -> Result<i64, RegistryError> {
@@ -5045,7 +5045,7 @@ fn refresh_user_quota_used(
 }
 
 fn pending_quota_reserved_bytes_for_user(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     exclude: Option<(&str, &str)>,
 ) -> Result<i64, RegistryError> {
@@ -5066,7 +5066,7 @@ fn pending_quota_reserved_bytes_for_user(
 }
 
 fn effective_quota_used_bytes_for_user(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
 ) -> Result<i64, RegistryError> {
     let (_, quota_used) = quota_for_user(conn, owner_uid)?;
@@ -5075,7 +5075,7 @@ fn effective_quota_used_bytes_for_user(
 }
 
 fn revoke_refresh_chain(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     start_hash: &str,
     now_text: &str,
 ) -> Result<(), RegistryError> {
@@ -5100,15 +5100,15 @@ fn revoke_refresh_chain(
     Ok(())
 }
 
-fn scalar_i64<P>(conn: &Connection, sql: &str, params: P) -> Result<i64, RegistryError>
+fn scalar_i64<P>(conn: &impl SqlExecutor, sql: &str, params: P) -> Result<i64, RegistryError>
 where
-    P: rusqlite::Params,
+    P: Into<Vec<Value>>,
 {
     conn.query_row(sql, params, |row| row.get(0))
         .map_err(sql_err)
 }
 
-fn map_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
+fn map_object_row(row: &sql::Row) -> sql::Result<ObjectRecord> {
     Ok(ObjectRecord {
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
@@ -5126,7 +5126,7 @@ fn map_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
     })
 }
 
-fn map_pending_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
+fn map_pending_row(row: &sql::Row) -> sql::Result<ObjectRecord> {
     Ok(ObjectRecord {
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
@@ -5144,50 +5144,34 @@ fn map_pending_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
     })
 }
 
-fn map_fragment_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FragmentBindingRecord> {
+fn map_fragment_binding_row(row: &sql::Row) -> sql::Result<FragmentBindingRecord> {
     Ok(FragmentBindingRecord {
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
-        deployment: StorageDeployment::parse_db(row.get::<_, String>(2)?).map_err(|message| {
-            rusqlite::Error::FromSqlConversionFailure(
-                2,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    message,
-                )),
-            )
-        })?,
+        deployment: StorageDeployment::parse_db(row.get::<_, String>(2)?)
+            .map_err(sql::Error::InvalidData)?,
         engine_url_override: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
 }
 
-fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRecord> {
+fn map_share_row(row: &sql::Row) -> sql::Result<ShareRecord> {
     Ok(ShareRecord {
         share_id: row.get(0)?,
         owner_uid: row.get(1)?,
         fragment: row.get(2)?,
         object_key: row.get(3)?,
         storage_object_id: row.get(4)?,
-        disposition: ShareDisposition::parse_db(row.get::<_, String>(5)?).map_err(|message| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    message,
-                )),
-            )
-        })?,
+        disposition: ShareDisposition::parse_db(row.get::<_, String>(5)?)
+            .map_err(sql::Error::InvalidData)?,
         expires_at: rfc3339_from_unix(row.get(6)?),
         created_at: row.get(7)?,
         revoked_at: row.get(8)?,
     })
 }
 
-fn map_audit_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRecord> {
+fn map_audit_event_row(row: &sql::Row) -> sql::Result<AuditEventRecord> {
     Ok(AuditEventRecord {
         event_id: row.get(0)?,
         owner_uid: row.get(1)?,
@@ -5200,7 +5184,7 @@ fn map_audit_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRe
     })
 }
 
-fn map_object_comment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectCommentRecord> {
+fn map_object_comment_row(row: &sql::Row) -> sql::Result<ObjectCommentRecord> {
     Ok(ObjectCommentRecord {
         comment_id: row.get(0)?,
         owner_uid: row.get(1)?,
@@ -5214,7 +5198,7 @@ fn map_object_comment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectCom
     })
 }
 
-fn map_object_purge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPurgeQueueEntry> {
+fn map_object_purge_queue_row(row: &sql::Row) -> sql::Result<ObjectPurgeQueueEntry> {
     Ok(ObjectPurgeQueueEntry {
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
@@ -5242,7 +5226,7 @@ fn parse_overlay_json(value: String) -> Vec<String> {
 }
 
 fn resolve_overlay(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     owner_uid: &str,
     fragment: &str,
     object_key: &str,
@@ -5301,7 +5285,7 @@ fn resolve_overlay(
 }
 
 fn enqueue_object_purge(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     object: &ObjectRecord,
     now: &str,
 ) -> Result<(), RegistryError> {
@@ -5331,34 +5315,21 @@ fn enqueue_object_purge(
     Ok(())
 }
 
-fn map_insert_user_err(err: rusqlite::Error) -> RegistryError {
-    match err {
-        rusqlite::Error::SqliteFailure(_, Some(message))
-            if message.contains("users.email") || message.contains("UNIQUE constraint failed") =>
-        {
-            RegistryError::conflict("email already exists")
-        }
-        other => sql_err(other),
+fn map_insert_user_err(err: sql::Error) -> RegistryError {
+    if err
+        .sqlite_message()
+        .is_some_and(|message| message.contains("users.email") || message.contains("UNIQUE constraint failed"))
+    {
+        return RegistryError::conflict("email already exists");
     }
+    sql_err(err)
 }
 
-fn sql_err(err: rusqlite::Error) -> RegistryError {
-    match &err {
-        rusqlite::Error::SqliteFailure(code, Some(message))
-            if code.code == rusqlite::ErrorCode::DatabaseBusy
-                || code.code == rusqlite::ErrorCode::DatabaseLocked
-                || message.to_ascii_lowercase().contains("database is locked") =>
-        {
-            RegistryError::service_unavailable("registry is busy, retry in a moment")
-        }
-        rusqlite::Error::SqliteFailure(code, None)
-            if code.code == rusqlite::ErrorCode::DatabaseBusy
-                || code.code == rusqlite::ErrorCode::DatabaseLocked =>
-        {
-            RegistryError::service_unavailable("registry is busy, retry in a moment")
-        }
-        _ => RegistryError::internal(format!("registry database error: {}", err)),
+fn sql_err(err: sql::Error) -> RegistryError {
+    if err.is_busy_or_locked() {
+        return RegistryError::service_unavailable("registry is busy, retry in a moment");
     }
+    RegistryError::internal(format!("registry database error: {}", err))
 }
 
 fn now_rfc3339() -> String {

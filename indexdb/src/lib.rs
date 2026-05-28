@@ -34,6 +34,7 @@ pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 mod error;
 mod ffi;
 pub mod n1;
+pub mod sql;
 mod simple;
 mod types;
 

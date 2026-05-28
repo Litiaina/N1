@@ -27,7 +27,7 @@ qrcode = "0.14.1"
 rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
-rusqlite.workspace = true
+indexdb = { path = "../indexdb" }
 serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.10.6"

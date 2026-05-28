@@ -153,6 +153,14 @@ fn normalized_optional_query(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalized_search_query(value: Option<&str>) -> Option<String> {
+    normalized_optional_query(value).map(|value| value.to_lowercase())
+}
+
+fn text_matches_search(value: &str, needle: &str) -> bool {
+    value.to_lowercase().contains(needle)
+}
+
 fn canonical_registry_object_key(value: &str) -> String {
     value.trim().trim_start_matches('/').to_string()
 }
@@ -329,7 +337,7 @@ async fn collect_engine_logical_objects(
     include_trashed: bool,
 ) -> Result<Vec<storage_broker::EngineLogicalObject>, RegistryError> {
     let normalized_prefix = normalized_engine_listing_prefix(prefix, Some("/"));
-    let search = normalized_optional_query(search);
+    let search = normalized_search_query(search);
     let mut continuation_token = None;
     let mut objects = Vec::new();
 
@@ -348,7 +356,7 @@ async fn collect_engine_logical_objects(
 
         for object in page.objects {
             if let Some(search) = search.as_deref() {
-                if !object.object_key.contains(search) {
+                if !text_matches_search(&object.object_key, search) {
                     continue;
                 }
             }
@@ -614,7 +622,7 @@ async fn list_objects_via_engine(
     include_trashed: bool,
 ) -> Result<db::RegistryListPage, RegistryError> {
     let fragment = binding.fragment.clone();
-    let search = normalized_optional_query(search);
+    let search = normalized_search_query(search);
     let use_namespace_listing = include_trashed || delimiter.map(str::trim) == Some("/");
 
     if use_namespace_listing {
@@ -643,7 +651,8 @@ async fn list_objects_via_engine(
 
             for entry in page.entries {
                 let matches_search = search.as_deref().is_none_or(|needle| {
-                    entry.path.contains(needle) || entry.name.contains(needle)
+                    text_matches_search(&entry.path, needle)
+                        || text_matches_search(&entry.name, needle)
                 });
                 if !matches_search {
                     continue;
@@ -741,7 +750,7 @@ async fn list_objects_via_engine(
 
         for common_prefix in page.common_prefixes {
             if let Some(search) = search.as_deref() {
-                if !common_prefix.contains(search) {
+                if !text_matches_search(&common_prefix, search) {
                     continue;
                 }
             }
@@ -759,7 +768,7 @@ async fn list_objects_via_engine(
 
         for object in page.objects {
             if let Some(search) = search.as_deref() {
-                if !object.object_key.contains(search) {
+                if !text_matches_search(&object.object_key, search) {
                     continue;
                 }
             }
@@ -817,7 +826,7 @@ async fn object_stats_via_engine(
     search: Option<&str>,
     include_trashed: bool,
 ) -> Result<db::RegistryObjectStats, RegistryError> {
-    let search = normalized_optional_query(search);
+    let search = normalized_search_query(search);
     let mut continuation_token = None;
     let mut total_objects = 0usize;
     let mut total_size_bytes = 0i64;
@@ -837,7 +846,7 @@ async fn object_stats_via_engine(
             .await?;
         for object in page.objects {
             if let Some(search) = search.as_deref() {
-                if !object.object_key.contains(search) {
+                if !text_matches_search(&object.object_key, search) {
                     continue;
                 }
             }
@@ -6598,6 +6607,77 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
         assert_eq!(suggestions, vec!["patients/a/one.dcm"]);
+    }
+
+    #[tokio::test]
+    async fn list_objects_searches_bound_fragment_globally_case_insensitive() {
+        let single_url = spawn_storage_recording_stub_with_state(
+            "single-stub-token",
+            Arc::new(TokioMutex::new(Vec::new())),
+            HashMap::from([
+                (
+                    "Patients/A/One.DCM".to_string(),
+                    StubObjectState {
+                        current_visible: true,
+                        versions: vec![StubVersion {
+                            version_id: "01ENGINESEARCH000000000000001".to_string(),
+                            object_size_bytes: 4096,
+                            content_type: "application/dicom".to_string(),
+                            created_at: 1710000100,
+                        }],
+                    },
+                ),
+                (
+                    "reports/two.pdf".to_string(),
+                    StubObjectState {
+                        current_visible: true,
+                        versions: vec![StubVersion {
+                            version_id: "01ENGINESEARCH000000000000002".to_string(),
+                            object_size_bytes: 1024,
+                            content_type: "application/pdf".to_string(),
+                            created_at: 1710000200,
+                        }],
+                    },
+                ),
+            ]),
+        )
+        .await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+
+        let base_url = spawn_registry_server(state).await;
+        let client = Client::new();
+        let response = client
+            .get(format!(
+                "{}/v1/objects?fragment=fragment-a&search=one&limit=10",
+                base_url
+            ))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("list search request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = response.json().await.expect("parse list search response");
+        let objects = payload["objects"].as_array().expect("objects array");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["object_key"].as_str(), Some("Patients/A/One.DCM"));
     }
 
     #[tokio::test]

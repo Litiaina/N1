@@ -20,6 +20,10 @@ type Destructor = Option<unsafe extern "C" fn(*mut c_void)>;
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
 const SQLITE_DONE: c_int = 101;
+const SQLITE_INTEGER: c_int = 1;
+const SQLITE_FLOAT: c_int = 2;
+const SQLITE_TEXT: c_int = 3;
+const SQLITE_BLOB: c_int = 4;
 const SQLITE_NULL: c_int = 5;
 
 const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
@@ -87,6 +91,8 @@ unsafe extern "C" {
     fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: c_int) -> i64;
     fn sqlite3_column_int(stmt: *mut sqlite3_stmt, idx: c_int) -> c_int;
     fn sqlite3_column_type(stmt: *mut sqlite3_stmt, idx: c_int) -> c_int;
+    fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> c_int;
+    fn sqlite3_column_double(stmt: *mut sqlite3_stmt, idx: c_int) -> f64;
     fn sqlite3_changes64(db: *mut sqlite3) -> i64;
     fn sqlite3_busy_timeout(db: *mut sqlite3, ms: c_int) -> c_int;
     fn sqlite3_wal_checkpoint_v2(
@@ -127,6 +133,15 @@ pub(crate) enum StepResult {
     Done,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum ColumnValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
 pub(crate) struct Connection {
     db: *mut sqlite3,
 }
@@ -155,6 +170,23 @@ impl Connection {
         path: &Path,
         mode: OpenMode,
         cache_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_options(path, mode, cache_size_bytes, true)
+    }
+
+    pub(crate) fn open_plain_sql(
+        path: &Path,
+        mode: OpenMode,
+        cache_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_options(path, mode, cache_size_bytes, false)
+    }
+
+    fn open_with_options(
+        path: &Path,
+        mode: OpenMode,
+        cache_size_bytes: usize,
+        initialize_schema: bool,
     ) -> Result<Self, StorageError> {
         let path = path.to_string_lossy();
         let c_path = CString::new(path.as_bytes()).map_err(|err| {
@@ -190,7 +222,9 @@ impl Connection {
         conn.busy_timeout(30_000)?;
         if matches!(mode, OpenMode::ReadWriteCreate) {
             conn.apply_pragmas(cache_size_bytes)?;
-            conn.initialize_schema()?;
+            if initialize_schema {
+                conn.initialize_schema()?;
+            }
         } else {
             conn.apply_cache_pragma(cache_size_bytes)?;
         }
@@ -286,7 +320,7 @@ impl Connection {
         self.check(rc)
     }
 
-    fn busy_timeout(&mut self, ms: c_int) -> Result<(), StorageError> {
+    pub(crate) fn busy_timeout(&mut self, ms: c_int) -> Result<(), StorageError> {
         // SAFETY: db is a live sqlite connection.
         let rc = unsafe { sqlite3_busy_timeout(self.db, ms) };
         self.check(rc)
@@ -785,6 +819,27 @@ impl Statement {
     pub(crate) fn column_i32(&self, idx: i32) -> i32 {
         // SAFETY: stmt is currently on a row.
         unsafe { sqlite3_column_int(self.stmt, idx) }
+    }
+
+    pub(crate) fn column_count(&self) -> i32 {
+        // SAFETY: stmt is live.
+        unsafe { sqlite3_column_count(self.stmt) }
+    }
+
+    pub(crate) fn column_value(&self, idx: i32) -> ColumnValue {
+        // SAFETY: stmt is currently on a row.
+        let kind = unsafe { sqlite3_column_type(self.stmt, idx) };
+        match kind {
+            SQLITE_NULL => ColumnValue::Null,
+            SQLITE_INTEGER => ColumnValue::Integer(self.column_i64(idx)),
+            SQLITE_FLOAT => {
+                // SAFETY: stmt is currently on a row.
+                ColumnValue::Real(unsafe { sqlite3_column_double(self.stmt, idx) })
+            }
+            SQLITE_TEXT => ColumnValue::Text(self.column_text(idx).unwrap_or_default()),
+            SQLITE_BLOB => ColumnValue::Blob(self.column_blob(idx).unwrap_or_default()),
+            _ => ColumnValue::Null,
+        }
     }
 }
 
