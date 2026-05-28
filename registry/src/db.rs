@@ -387,6 +387,36 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn set_user_quota_used(
+        &self,
+        uid: String,
+        quota_used_bytes: i64,
+    ) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let affected = tx
+                .execute(
+                    r#"
+                    UPDATE users
+                    SET quota_used_bytes = ?2, updated_at = ?3
+                    WHERE uid = ?1
+                    "#,
+                    params![uid, quota_used_bytes.max(0), now],
+                )
+                .map_err(sql_err)?;
+            if affected == 0 {
+                return Err(RegistryError::not_found("user not found"));
+            }
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
     pub async fn count_admin_users(&self) -> Result<i64, RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
@@ -4967,23 +4997,18 @@ fn delete_rows_for_object_keys_chunk(
 }
 
 fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
-    let quota_limit = conn
-        .query_row(
-            "SELECT quota_limit_bytes, quota_used_bytes FROM users WHERE uid = ?1",
-            params![owner_uid],
-            |row| row.get(0),
-        )
-        .map_err(|err| match err {
-            rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
-            other => sql_err(other),
-        })?;
-    Ok((
-        quota_limit,
-        committed_quota_used_bytes_for_user(conn, owner_uid)?,
-    ))
+    conn.query_row(
+        "SELECT quota_limit_bytes, quota_used_bytes FROM users WHERE uid = ?1",
+        params![owner_uid],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0))),
+    )
+    .map_err(|err| match err {
+        rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
+        other => sql_err(other),
+    })
 }
 
-fn committed_quota_used_bytes_for_user(
+fn projected_object_usage_bytes_for_user(
     conn: &Connection,
     owner_uid: &str,
 ) -> Result<i64, RegistryError> {
@@ -5006,7 +5031,7 @@ fn refresh_user_quota_used(
     owner_uid: &str,
     updated_at: &str,
 ) -> Result<i64, RegistryError> {
-    let next_used = committed_quota_used_bytes_for_user(conn, owner_uid)?;
+    let next_used = projected_object_usage_bytes_for_user(conn, owner_uid)?;
     conn.execute(
         r#"
         UPDATE users

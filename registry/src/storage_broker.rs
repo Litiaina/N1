@@ -1,7 +1,10 @@
 use hex::encode as hex_encode;
+use n1_native_client::{N1NativeClient, NativeClientError, NativeResponse};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +18,7 @@ use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
-use crate::config::{RegistryConfig, normalize_backend_url};
+use crate::config::{RegistryConfig, normalize_backend_url, normalize_native_backend_url};
 use crate::error::RegistryError;
 use crate::models::{
     FragmentBindingRecord, ObjectRecord, ShareDisposition, StorageDeployment,
@@ -205,10 +208,36 @@ struct EngineListUploadsResponse {
     total: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct NativeNamespaceListRequest<'a> {
+    path: &'a str,
+    limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<&'a str>,
+    trash: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeObjectListRequest<'a> {
+    limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delimiter: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeObjectKeyRequest<'a> {
+    object_key: &'a str,
+}
+
 #[derive(Debug)]
 struct ResolvedBackend {
     deployment: StorageDeployment,
     engine_url: String,
+    native_url: Option<String>,
     master_key: String,
     insecure_tls: bool,
 }
@@ -394,6 +423,24 @@ impl StorageBroker {
         binding: &FragmentBindingRecord,
     ) -> Result<Vec<EngineUploadSession>, RegistryError> {
         let backend = self.resolve_backend(binding)?;
+        if let Some(mut client) = self
+            .native_client_for_backend(&backend, &binding.fragment)
+            .await?
+        {
+            let payload: EngineListUploadsResponse = self
+                .native_operation_json(
+                    &mut client,
+                    "uploads.list",
+                    &json!({
+                        "limit": 1000usize,
+                        "offset": 0usize,
+                    }),
+                    "storage native upload session listing",
+                )
+                .await?;
+            return Ok(payload.sessions);
+        }
+
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
             .await?;
@@ -457,6 +504,36 @@ impl StorageBroker {
         include_trashed: bool,
     ) -> Result<EngineLogicalListPage, RegistryError> {
         let backend = self.resolve_backend(binding)?;
+        if let Some(mut client) = self
+            .native_client_for_backend(&backend, &binding.fragment)
+            .await?
+        {
+            let payload: EngineListObjectsResponse = self
+                .native_operation_json(
+                    &mut client,
+                    if include_trashed {
+                        "trash.list"
+                    } else {
+                        "object.list"
+                    },
+                    &NativeObjectListRequest {
+                        limit: limit.clamp(1, 1000),
+                        prefix: prefix.map(str::trim).filter(|value| !value.is_empty()),
+                        delimiter: delimiter.map(str::trim).filter(|value| !value.is_empty()),
+                        continuation_token: continuation_token
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty()),
+                    },
+                    "storage native logical list",
+                )
+                .await?;
+            return Ok(EngineLogicalListPage {
+                objects: payload.objects.into_iter().map(Into::into).collect(),
+                common_prefixes: payload.common_prefixes,
+                continuation_token: payload.continuation_token,
+            });
+        }
+
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
             .await?;
@@ -530,6 +607,34 @@ impl StorageBroker {
         scan_trash: bool,
     ) -> Result<EnginePosixListPage, RegistryError> {
         let backend = self.resolve_backend(binding)?;
+        if let Some(mut client) = self
+            .native_client_for_backend(&backend, &binding.fragment)
+            .await?
+        {
+            let payload: EnginePosixListResponse = self
+                .native_operation_json(
+                    &mut client,
+                    "posix.list",
+                    &NativeNamespaceListRequest {
+                        path: path
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_default(),
+                        limit: limit.clamp(1, 1000),
+                        continuation_token: continuation_token
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty()),
+                        trash: scan_trash,
+                    },
+                    "storage native namespace list",
+                )
+                .await?;
+            return Ok(EnginePosixListPage {
+                entries: payload.entries,
+                continuation_token: payload.continuation_token,
+            });
+        }
+
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
             .await?;
@@ -747,6 +852,15 @@ impl StorageBroker {
         include_versions: bool,
     ) -> Result<EngineObjectState, RegistryError> {
         let backend = self.resolve_backend(binding)?;
+        if let Some(mut client) = self
+            .native_client_for_backend(&backend, &binding.fragment)
+            .await?
+        {
+            return self
+                .read_object_state_native(&mut client, object_key, include_versions)
+                .await;
+        }
+
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
             .await?;
@@ -1128,18 +1242,75 @@ impl StorageBroker {
             .await
     }
 
+    pub async fn namespace_usage_bytes(
+        &self,
+        binding: &FragmentBindingRecord,
+        include_trash: bool,
+    ) -> Result<i64, RegistryError> {
+        const MAX_SCANNED_NAMESPACE_ENTRIES: usize = 1_000_000;
+
+        let mut total = 0i64;
+        let mut scanned = 0usize;
+        let mut directories = vec![String::new()];
+
+        while let Some(path) = directories.pop() {
+            let mut continuation_token = None;
+            loop {
+                let page = self
+                    .list_namespace_page(
+                        binding,
+                        (!path.is_empty()).then_some(path.as_str()),
+                        1000,
+                        continuation_token.as_deref(),
+                        include_trash,
+                    )
+                    .await?;
+
+                for entry in page.entries {
+                    scanned = scanned.saturating_add(1);
+                    if scanned > MAX_SCANNED_NAMESPACE_ENTRIES {
+                        return Err(RegistryError::service_unavailable(
+                            "storage namespace usage scan exceeded registry safety limit",
+                        ));
+                    }
+                    match entry.kind {
+                        EnginePosixNodeKind::File => {
+                            total = total.saturating_add(
+                                i64::try_from(entry.size_bytes.unwrap_or(0)).unwrap_or(i64::MAX),
+                            );
+                        }
+                        EnginePosixNodeKind::Directory => {
+                            if !entry.path.trim().is_empty() {
+                                directories.push(entry.path);
+                            }
+                        }
+                    }
+                }
+
+                continuation_token = page.continuation_token;
+                if continuation_token.is_none() {
+                    break;
+                }
+            }
+        }
+
+        Ok(total.max(0))
+    }
+
     fn resolve_backend(
         &self,
         binding: &FragmentBindingRecord,
     ) -> Result<ResolvedBackend, RegistryError> {
-        let (default_url, master_key, insecure_tls) = match binding.deployment {
+        let (default_url, default_native_url, master_key, insecure_tls) = match binding.deployment {
             StorageDeployment::SingleNode => (
                 self.config.single_node_url.clone(),
+                self.config.single_node_native_url.clone(),
                 self.config.single_node_master_key.clone(),
                 self.config.single_node_insecure_tls,
             ),
             StorageDeployment::MultiNode => (
                 self.config.multi_node_url.clone(),
+                None,
                 self.config.multi_node_master_key.clone(),
                 self.config.multi_node_insecure_tls,
             ),
@@ -1161,6 +1332,16 @@ impl StorageBroker {
         let engine_url = normalize_backend_url(&engine_url).map_err(|err| {
             RegistryError::bad_request(format!("invalid storage backend URL: {}", err))
         })?;
+        let native_url = default_native_url
+            .map(|value| {
+                normalize_native_backend_url(&value).map_err(|err| {
+                    RegistryError::bad_request(format!(
+                        "invalid native storage backend URL: {}",
+                        err
+                    ))
+                })
+            })
+            .transpose()?;
         let master_key = master_key.ok_or_else(|| {
             RegistryError::conflict(match binding.deployment {
                 StorageDeployment::SingleNode => {
@@ -1175,6 +1356,7 @@ impl StorageBroker {
         Ok(ResolvedBackend {
             deployment: binding.deployment,
             engine_url,
+            native_url,
             master_key,
             insecure_tls,
         })
@@ -1197,6 +1379,19 @@ impl StorageBroker {
             return Ok(ResolvedBackend {
                 deployment: StorageDeployment::SingleNode,
                 engine_url,
+                native_url: self
+                    .config
+                    .single_node_native_url
+                    .clone()
+                    .map(|value| {
+                        normalize_native_backend_url(&value).map_err(|err| {
+                            RegistryError::bad_request(format!(
+                                "invalid single-node native storage backend URL: {}",
+                                err
+                            ))
+                        })
+                    })
+                    .transpose()?,
                 master_key: self
                     .config
                     .single_node_master_key
@@ -1222,6 +1417,7 @@ impl StorageBroker {
             return Ok(ResolvedBackend {
                 deployment: StorageDeployment::MultiNode,
                 engine_url,
+                native_url: None,
                 master_key: self
                     .config
                     .multi_node_master_key
@@ -1242,6 +1438,43 @@ impl StorageBroker {
         } else {
             &self.strict_client
         }
+    }
+
+    async fn native_client_for_backend(
+        &self,
+        backend: &ResolvedBackend,
+        fragment: &str,
+    ) -> Result<Option<N1NativeClient>, RegistryError> {
+        let Some(native_url) = backend.native_url.as_deref() else {
+            return Ok(None);
+        };
+        let mut client = N1NativeClient::connect(native_url)
+            .await
+            .map_err(|err| native_client_error(err, "connect to N1 native storage"))?
+            .with_request_prefix("registry");
+        client
+            .auth_fragment(fragment, &backend.master_key)
+            .await
+            .map_err(|err| native_client_error(err, "authenticate N1 native fragment"))?;
+        Ok(Some(client))
+    }
+
+    async fn native_operation_json<T, R>(
+        &self,
+        client: &mut N1NativeClient,
+        op: &str,
+        payload: &T,
+        context: &str,
+    ) -> Result<R, RegistryError>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let response = client
+            .round_trip_json(op, payload, None)
+            .await
+            .map_err(|err| native_client_error(err, context))?;
+        decode_native_response_body(response, context)
     }
 
     async fn verify_fragment_ready(
@@ -1373,6 +1606,62 @@ impl StorageBroker {
             Vec::new()
         };
         Ok(EngineObjectState { current, versions })
+    }
+
+    async fn read_object_state_native(
+        &self,
+        client: &mut N1NativeClient,
+        object_key: &str,
+        include_versions: bool,
+    ) -> Result<EngineObjectState, RegistryError> {
+        let current = self
+            .fetch_native_object_metadata(client, object_key)
+            .await?;
+        let versions = if include_versions {
+            self.fetch_native_object_versions(client, object_key)
+                .await?
+        } else {
+            Vec::new()
+        };
+        Ok(EngineObjectState { current, versions })
+    }
+
+    async fn fetch_native_object_metadata(
+        &self,
+        client: &mut N1NativeClient,
+        object_key: &str,
+    ) -> Result<Option<EngineObjectMetadata>, RegistryError> {
+        let response = client
+            .round_trip_json("object.meta", &NativeObjectKeyRequest { object_key }, None)
+            .await
+            .map_err(|err| native_client_error(err, "storage native object metadata"))?;
+        if !response.ok && response.status == Some(404) {
+            return Ok(None);
+        }
+        let payload: EngineObjectSummary =
+            decode_native_response_body(response, "storage native object metadata")?;
+        Ok(Some(payload.into()))
+    }
+
+    async fn fetch_native_object_versions(
+        &self,
+        client: &mut N1NativeClient,
+        object_key: &str,
+    ) -> Result<Vec<EngineObjectMetadata>, RegistryError> {
+        let response = client
+            .round_trip_json(
+                "object.versions",
+                &NativeObjectKeyRequest { object_key },
+                None,
+            )
+            .await
+            .map_err(|err| native_client_error(err, "storage native object versions"))?;
+        if !response.ok && response.status == Some(404) {
+            return Ok(Vec::new());
+        }
+        let payload: Vec<EngineObjectSummary> =
+            decode_native_response_body(response, "storage native object versions")?;
+        Ok(payload.into_iter().map(Into::into).collect())
     }
 
     async fn fetch_object_metadata(
@@ -1586,6 +1875,37 @@ fn normalize_engine_auth_error_message(message: String) -> String {
         return "storage fragment auth failed inside N1; check that REGISTRY_SINGLE_NODE_MASTER_KEY or REGISTRY_MULTI_NODE_MASTER_KEY matches the engine MASTER_KEY, and that the fragment metadata exists and is readable".to_string();
     }
     trimmed.to_string()
+}
+
+fn native_client_error(err: NativeClientError, context: &str) -> RegistryError {
+    RegistryError::bad_gateway(format!("{context} failed: {err}"))
+}
+
+fn decode_native_response_body<T>(
+    response: NativeResponse,
+    context: &str,
+) -> Result<T, RegistryError>
+where
+    T: DeserializeOwned,
+{
+    if !response.ok {
+        let message = response.error.map(|err| err.message).unwrap_or_else(|| {
+            format!(
+                "{context} returned status {}",
+                response.status.unwrap_or(500)
+            )
+        });
+        return Err(RegistryError::bad_gateway(message));
+    }
+
+    let Some(body) = response.body else {
+        return Err(RegistryError::bad_gateway(format!(
+            "{context} returned an empty native body"
+        )));
+    };
+    rmp_serde::from_slice(body.as_slice()).map_err(|err| {
+        RegistryError::bad_gateway(format!("invalid {context} native response: {err}"))
+    })
 }
 
 async fn extract_engine_error_message(response: reqwest::Response, fallback: String) -> String {

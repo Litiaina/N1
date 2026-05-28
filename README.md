@@ -25,8 +25,8 @@ This repository contains the storage platform stack built around four runtime co
   Standalone distributed object storage system with node-level placement, peer shard transport, distributed upload/read, namespace quorum apply, cluster health, repair, and manual rebalance execution. N1 and N2 are independent Litiaina storage systems with shared design principles, not parent/child runtimes. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
 > - `NS` (`1.0.0`)
   Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
-> - `Registry` (`0.9.1`)
-  User-facing logical metadata and policy layer for accounts, quotas, logical namespace, shares, and storage-session brokering.
+> - `Registry` (`1.0.0`)
+  User-facing business policy layer for accounts, logical quotas, shares, storage-session brokering, audit, and UI metadata over N1 or N2.
 
 If you are new to the codebase, start here. This README explains what each component does, how the platform is intended to be used, and how to stand up a practical deployment.
 
@@ -59,7 +59,7 @@ N1 stores object truth in its own namespace, immutable `.ndx` object records, an
 - Trash is namespace-native: soft delete moves the exact file or folder path into `.trash`, trash listing reads `.trash`, recover moves the path back to live namespace, and GC later reclaims headless object metadata and blobs.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale Registry projection.
 - Registry folder trash/recover delegates to N1 POSIX namespace lifecycle, including empty folders, instead of emulating directory delete with object-key prefix loops.
-- Registry quota reservations are tracked as explicit durable pending reservations and reconciled against committed object usage on finalize and cancel paths.
+- Registry quota reservations are tracked as explicit durable pending reservations. For N1-bound fragments, committed logical usage is reconciled from the N1 namespace instead of Registry’s local projection.
 - Registry now keeps product metadata separate from object truth: shares, audit/activity, favorites, tags, labels, and comments live in Registry while file existence/listing comes from N1 for bound fragments.
 - Drive/RAD ARC folder scans consume the Registry/N1 namespace response directly and tolerate both direct DICOM files and nested `common_prefixes` under the selected folder.
 
@@ -139,7 +139,7 @@ It owns:
 - audit/activity
 - favorites, tags, labels, and comments
 
-Registry keeps user/business metadata around logical paths owned by `N1` or `N2`. It is the right layer for user ownership, quotas, shares, product policy, and UI overlays. It is not the layer that should own the authoritative file tree, repair shards, rebalance disks, or reclaim orphaned physical payloads.
+Registry keeps user/business metadata around logical paths owned by `N1` or `N2`. It is the right layer for user ownership, logical quotas, shares, product policy, and UI overlays. It is not the layer that should own the authoritative file tree, repair shards, rebalance disks, or reclaim orphaned physical payloads.
 
 ## Architecture Overview
 
@@ -462,6 +462,7 @@ cargo run -p n1_cli -- \
 - `REGISTRY_JWT_SECRET`
 - `REGISTRY_MASTER_KEY`
 - `REGISTRY_SINGLE_NODE_URL`
+- `REGISTRY_SINGLE_NODE_NATIVE_URL`
 - `REGISTRY_SINGLE_NODE_MASTER_KEY`
 
 3. Start Registry.
@@ -614,12 +615,12 @@ These are storage maintenance flows. They should not depend on namespace mutatio
 ### Registry Flow
 
 1. user logs in to Registry
-2. Registry resolves logical namespace and quotas
+2. Registry resolves logical namespace and logical quotas
 3. Registry issues a storage session for `N1` or `N2`
 4. storage engine handles upload/read/lifecycle
 5. Registry finalizes logical metadata after storage commit
 
-Quota and end-user policy live in `Registry`, not in standalone `N1`.
+Quota and end-user policy live in `Registry`, not in standalone `N1`. N1 physical quota remains a storage guardrail; Registry quota is the user-facing logical limit and does not include EC parity overhead.
 
 ## Troubleshooting And Notes
 

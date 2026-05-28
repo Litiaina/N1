@@ -1,6 +1,6 @@
 [package]
 name = "registry"
-version = "0.9.1"
+version = "1.0.0"
 edition = "2024"
 
 [[bin]]
@@ -43,6 +43,8 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 libc.workspace = true
 bytes.workspace = true
+n1_native_client = { path = "../n1_native_client" }
+rmp-serde.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite = "0.28.0"

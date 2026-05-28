@@ -567,6 +567,41 @@ async fn ensure_registry_business_object(
     Ok(())
 }
 
+async fn reconcile_bound_quota_usage(
+    state: &AppState,
+    owner_uid: &str,
+) -> Result<Option<i64>, RegistryError> {
+    let bindings = state
+        .db
+        .list_fragment_bindings(owner_uid.to_string())
+        .await?;
+    if bindings.is_empty() {
+        return Ok(None);
+    }
+
+    let mut total = 0i64;
+    for binding in bindings {
+        let live = state.broker.namespace_usage_bytes(&binding, false).await?;
+        let trash = state.broker.namespace_usage_bytes(&binding, true).await?;
+        total = total.saturating_add(live).saturating_add(trash);
+    }
+    state
+        .db
+        .set_user_quota_used(owner_uid.to_string(), total.max(0))
+        .await?;
+    Ok(Some(total.max(0)))
+}
+
+async fn reconcile_bound_quota_usage_or_warn(state: &AppState, owner_uid: &str) {
+    if let Err(err) = reconcile_bound_quota_usage(state, owner_uid).await {
+        warn!(
+            owner_uid,
+            error = %err.message,
+            "registry could not reconcile logical quota usage from storage namespace"
+        );
+    }
+}
+
 async fn list_objects_via_engine(
     state: &AppState,
     owner_uid: &str,
@@ -2152,6 +2187,7 @@ async fn me(
     if !removed_scopes.is_empty() {
         publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
     }
+    reconcile_bound_quota_usage_or_warn(&state, &claims.sub).await;
     let user = state.db.get_user(claims.sub).await?;
     Ok(Json(user))
 }
@@ -2856,6 +2892,7 @@ async fn register_object(
         publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
     }
     let _write_guard = state.write_gate.lock().await;
+    reconcile_bound_quota_usage(&state, &claims.sub).await?;
     let object = state
         .db
         .register_pending_object(
@@ -2973,7 +3010,7 @@ async fn finalize_object(
                             "storage finalize did not produce a readable committed object",
                         )
                     })?;
-                let (object, user) = state
+                let (object, _user) = state
                     .db
                     .sync_object_from_engine(
                         owner_uid,
@@ -2989,6 +3026,8 @@ async fn finalize_object(
                         "storage finalize did not produce a committed registry head",
                     )
                 })?;
+                reconcile_bound_quota_usage_or_warn(&state, &object.owner_uid).await;
+                let user = state.db.get_user(object.owner_uid.clone()).await?;
                 (object, user)
             }
             None if pending_or_existing.is_some() => {
@@ -6376,6 +6415,7 @@ mod tests {
             default_quota_bytes: 25 * 1024 * 1024 * 1024,
             storage_session_ttl_secs: 900,
             single_node_url: Some(single_url),
+            single_node_native_url: None,
             single_node_master_key: Some("single-master".to_string()),
             single_node_insecure_tls: false,
             multi_node_url: Some(multi_url),

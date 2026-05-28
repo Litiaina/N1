@@ -18,6 +18,7 @@ pub struct RegistryConfig {
     pub default_quota_bytes: i64,
     pub storage_session_ttl_secs: u64,
     pub single_node_url: Option<String>,
+    pub single_node_native_url: Option<String>,
     pub single_node_master_key: Option<String>,
     pub single_node_insecure_tls: bool,
     pub multi_node_url: Option<String>,
@@ -50,6 +51,12 @@ impl RegistryConfig {
                     .map_err(|err| format!("invalid REGISTRY_SINGLE_NODE_URL: {}", err))
             })
             .transpose()?;
+        let single_node_native_url = optional("REGISTRY_SINGLE_NODE_NATIVE_URL")
+            .map(|value| {
+                normalize_native_backend_url(&value)
+                    .map_err(|err| format!("invalid REGISTRY_SINGLE_NODE_NATIVE_URL: {}", err))
+            })
+            .transpose()?;
         let single_node_master_key = optional("REGISTRY_SINGLE_NODE_MASTER_KEY");
         let single_node_insecure_tls = parse_or("REGISTRY_SINGLE_NODE_INSECURE_TLS", false)?;
         let multi_node_url = optional("REGISTRY_MULTI_NODE_URL")
@@ -74,6 +81,7 @@ impl RegistryConfig {
             default_quota_bytes,
             storage_session_ttl_secs,
             single_node_url,
+            single_node_native_url,
             single_node_master_key,
             single_node_insecure_tls,
             multi_node_url,
@@ -191,9 +199,35 @@ pub fn normalize_backend_url(raw: &str) -> Result<String, String> {
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
+pub fn normalize_native_backend_url(raw: &str) -> Result<String, String> {
+    let candidate = repair_common_backend_url_typos(raw);
+    let parsed = reqwest::Url::parse(candidate.trim()).map_err(|err| {
+        format!(
+            "expected a valid native backend URL like n1://localhost:50101 (got '{}'): {}",
+            raw.trim(),
+            err
+        )
+    })?;
+
+    if parsed.scheme() != "n1" {
+        return Err(format!(
+            "unsupported native backend URL scheme '{}' (expected n1)",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("native backend URL is missing a host".to_string());
+    }
+    if parsed.port().is_none() {
+        return Err("native backend URL is missing a port".to_string());
+    }
+
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_backend_url;
+    use super::{normalize_backend_url, normalize_native_backend_url};
 
     #[test]
     fn normalizes_backend_url_and_trims_trailing_slash() {
@@ -213,5 +247,19 @@ mod tests {
     fn rejects_non_http_backend_url_scheme() {
         let err = normalize_backend_url("ftp://localhost:50001").expect_err("reject ftp");
         assert!(err.contains("unsupported backend URL scheme"));
+    }
+
+    #[test]
+    fn normalizes_native_backend_url() {
+        let normalized =
+            normalize_native_backend_url("n1://localhost:50101/").expect("normalize native url");
+        assert_eq!(normalized, "n1://localhost:50101");
+    }
+
+    #[test]
+    fn rejects_non_n1_native_backend_url_scheme() {
+        let err =
+            normalize_native_backend_url("https://localhost:50101").expect_err("reject https");
+        assert!(err.contains("unsupported native backend URL scheme"));
     }
 }

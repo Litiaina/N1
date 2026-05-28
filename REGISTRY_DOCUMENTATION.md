@@ -15,12 +15,13 @@ Use `Registry` when you need:
 
 `Registry` is also the correct home for user quotas and account policy. Standalone `N1` is not the user/account quota control plane.
 
-Current `0.9.1` behavior that matters operationally:
+Current `1.0.0` behavior that matters operationally:
 
-- for fragment-bound object listing and stats, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale Registry projection alone
+- for fragment-bound object listing, stats, object existence, and quota usage, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale Registry projection alone
+- when `REGISTRY_SINGLE_NODE_NATIVE_URL` is set, Registry uses the native `n1://` protocol for low-latency N1 namespace and object truth reads; HTTPS remains the storage-session and compatibility face
 - for current `N1`, that engine namespace truth is backed by real namespace directories, symlink object pointers, immutable `.ndx` records, and explicit `.blobs` payload roots
 - Registry object APIs for bound fragments use the engine namespace as the file-tree authority; Registry keeps a durable business/policy projection
-- pending quota reservations are stored durably in `object_uploads` and reconciled against committed object usage during finalize/cancel flows
+- pending quota reservations are stored durably in `object_uploads`; committed user-facing quota for N1-backed fragments is logical live/trash namespace bytes, not EC parity-expanded physical storage bytes
 - shares, audit events, favorites, tags, labels, and comments remain Registry-owned business metadata keyed by logical `object_key`
 - Drive/RAD ARC should treat `/v1/objects` results as the DICOM scan source for N1-bound fragments; direct `.dcm` objects and nested `common_prefixes` are both valid folder contents.
 
@@ -146,6 +147,7 @@ This is the bridge from `Registry` to `N1` or `N2`.
 Operational note:
 
 - for standalone `N1`, `Registry` currently brokers fragment access against the backend engine’s `/n1/auth/fragment` route
+- for internal Registry-to-N1 truth reads, configure `REGISTRY_SINGLE_NODE_NATIVE_URL=n1://host:port` so listing, metadata, version, upload-session, and quota reconciliation calls use N1’s native protocol
 - clients should treat the storage session response as the engine-facing contract and should not re-derive engine auth on their own for normal product flows
 
 ### Share Record

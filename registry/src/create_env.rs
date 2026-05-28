@@ -75,6 +75,13 @@ pub fn create_registry_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     writeln!(
         file,
+        "# Native N1 endpoint used by Registry for low-latency namespace and object truth"
+    )?;
+    writeln!(file, "REGISTRY_SINGLE_NODE_NATIVE_URL=")?;
+    writeln!(file)?;
+
+    writeln!(
+        file,
         "# Master key used by Registry to mint fragment sessions against single-node N1"
     )?;
     writeln!(file, "REGISTRY_SINGLE_NODE_MASTER_KEY=")?;
