@@ -3,13 +3,18 @@ set -euo pipefail
 
 REMOTE_IP="${REMOTE_IP:-192.168.0.13}"
 REMOTE_PASS="${REMOTE_PASS:-1122}"
+REMOTE2_IP="${REMOTE2_IP:-192.168.0.18}"
+REMOTE2_PASS="${REMOTE2_PASS:-Admin@@@123}"
 LOCAL_IP="${LOCAL_IP:-192.168.0.22}"
 LOCAL_HTTPS_PORT="${LOCAL_HTTPS_PORT:-53401}"
 LOCAL_NATIVE_PORT="${LOCAL_NATIVE_PORT:-53402}"
 REMOTE_HTTPS_PORT="${REMOTE_HTTPS_PORT:-53411}"
 REMOTE_NATIVE_PORT="${REMOTE_NATIVE_PORT:-53412}"
+REMOTE2_HTTPS_PORT="${REMOTE2_HTTPS_PORT:-53421}"
+REMOTE2_NATIVE_PORT="${REMOTE2_NATIVE_PORT:-53422}"
 LOCAL_HDD_ROOT="${LOCAL_HDD_ROOT:-/mnt/disk-00}"
 REMOTE_HDD_ROOT="${REMOTE_HDD_ROOT:-/mnt/DISK0}"
+REMOTE2_HDD_ROOT="${REMOTE2_HDD_ROOT:-/mnt/DISK2}"
 SOURCE_VIDEO="${SOURCE_VIDEO:-/home/administrator/Downloads/mhw.mp4}"
 PROOF_MIB="${PROOF_MIB:-256}"
 SMALL_OBJECTS="${SMALL_OBJECTS:-120}"
@@ -23,10 +28,13 @@ TS="$(date +%Y%m%d-%H%M%S)"
 OUT="$ROOT_DIR/.n2-bench/n2-hardening-native-proof-$TS"
 LROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a"
 RROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b"
+CROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c"
 LOCAL_BASE="https://$LOCAL_IP:$LOCAL_HTTPS_PORT"
 REMOTE_BASE="https://$REMOTE_IP:$REMOTE_HTTPS_PORT"
+REMOTE2_BASE="https://$REMOTE2_IP:$REMOTE2_HTTPS_PORT"
 LOCAL_NATIVE="n2://$LOCAL_IP:$LOCAL_NATIVE_PORT"
 REMOTE_NATIVE="n2://$REMOTE_IP:$REMOTE_NATIVE_PORT"
+REMOTE2_NATIVE="n2://$REMOTE2_IP:$REMOTE2_NATIVE_PORT"
 MASTER="n2-proof-master-key"
 FRAG_NAME="n2-hardening-$TS"
 FRAG_KEY="n2-frag-key-$TS"
@@ -40,11 +48,20 @@ scp_remote() {
   sshpass -p "$REMOTE_PASS" scp -o StrictHostKeyChecking=no "$@"
 }
 
+ssh_remote2() {
+  sshpass -p "$REMOTE2_PASS" ssh -o StrictHostKeyChecking=no administrator@"$REMOTE2_IP" "$@"
+}
+
+scp_remote2() {
+  sshpass -p "$REMOTE2_PASS" scp -o StrictHostKeyChecking=no "$@"
+}
+
 cleanup() {
   set +e
   if [[ -f "$LROOT/rss-monitor.pid" ]]; then kill "$(cat "$LROOT/rss-monitor.pid")" 2>/dev/null; fi
   if [[ -f "$LROOT/n2.pid" ]]; then kill "$(cat "$LROOT/n2.pid")" 2>/dev/null; fi
   ssh_remote "if [ -f '$RROOT/rss-monitor.pid' ]; then kill \$(cat '$RROOT/rss-monitor.pid') 2>/dev/null || true; fi; if [ -f '$RROOT/n2.pid' ]; then kill \$(cat '$RROOT/n2.pid') 2>/dev/null || true; fi" >/dev/null 2>&1
+  ssh_remote2 "if [ -f '$CROOT/rss-monitor.pid' ]; then kill \$(cat '$CROOT/rss-monitor.pid') 2>/dev/null || true; fi; if [ -f '$CROOT/n2.pid' ]; then kill \$(cat '$CROOT/n2.pid') 2>/dev/null || true; fi" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -86,6 +103,15 @@ write_membership() {
       "weight": 1,
       "index_roots": ["$RROOT/index"],
       "blob_roots": ["$RROOT/blob"]
+    },
+    {
+      "id": "node-c",
+      "endpoint": "$REMOTE2_BASE",
+      "native_endpoint": "$REMOTE2_NATIVE",
+      "state": "online",
+      "weight": 1,
+      "index_roots": ["$CROOT/index"],
+      "blob_roots": ["$CROOT/blob"]
     }
   ]
 }
@@ -191,21 +217,25 @@ wait_ping() {
 
 start_nodes() {
   ssh_remote "cd '$RROOT'; setsid ./litiaina-n2 </dev/null > server.log 2>&1 & echo \$! > n2.pid"
+  ssh_remote2 "cd '$CROOT'; setsid ./litiaina-n2 </dev/null > server.log 2>&1 & echo \$! > n2.pid"
   (cd "$LROOT"; setsid ./litiaina-n2 </dev/null > server.log 2>&1 & echo $! > n2.pid)
   wait_ping "$LOCAL_BASE"
   wait_ping "$REMOTE_BASE"
+  wait_ping "$REMOTE2_BASE"
   (while kill -0 "$(cat "$LROOT/n2.pid")" 2>/dev/null; do
     printf '%s,%s\n' "$(date +%s)" "$(ps -o rss= -p "$(cat "$LROOT/n2.pid")" | tr -d ' ')"
     sleep 1
   done) > "$OUT/rss-local.csv" &
   echo $! > "$LROOT/rss-monitor.pid"
   ssh_remote "pid=\$(cat '$RROOT/n2.pid'); nohup sh -c 'while kill -0 \"\$0\" 2>/dev/null; do printf \"%s,%s\\\\n\" \$(date +%s) \$(ps -o rss= -p \"\$0\" | tr -d \" \"); sleep 1; done' \"\$pid\" > '$RROOT/rss-remote.csv' 2>/dev/null & echo \$! > '$RROOT/rss-monitor.pid'"
+  ssh_remote2 "pid=\$(cat '$CROOT/n2.pid'); nohup sh -c 'while kill -0 \"\$0\" 2>/dev/null; do printf \"%s,%s\\\\n\" \$(date +%s) \$(ps -o rss= -p \"\$0\" | tr -d \" \"); sleep 1; done' \"\$pid\" > '$CROOT/rss-remote2.csv' 2>/dev/null & echo \$! > '$CROOT/rss-monitor.pid'"
 }
 
 stop_nodes() {
   if [[ -f "$LROOT/rss-monitor.pid" ]]; then kill "$(cat "$LROOT/rss-monitor.pid")" 2>/dev/null || true; rm -f "$LROOT/rss-monitor.pid"; fi
   if [[ -f "$LROOT/n2.pid" ]]; then kill "$(cat "$LROOT/n2.pid")" 2>/dev/null || true; rm -f "$LROOT/n2.pid"; fi
   ssh_remote "if [ -f '$RROOT/rss-monitor.pid' ]; then kill \$(cat '$RROOT/rss-monitor.pid') 2>/dev/null || true; rm -f '$RROOT/rss-monitor.pid'; fi; if [ -f '$RROOT/n2.pid' ]; then kill \$(cat '$RROOT/n2.pid') 2>/dev/null || true; rm -f '$RROOT/n2.pid'; fi" >/dev/null || true
+  ssh_remote2 "if [ -f '$CROOT/rss-monitor.pid' ]; then kill \$(cat '$CROOT/rss-monitor.pid') 2>/dev/null || true; rm -f '$CROOT/rss-monitor.pid'; fi; if [ -f '$CROOT/n2.pid' ]; then kill \$(cat '$CROOT/n2.pid') 2>/dev/null || true; rm -f '$CROOT/n2.pid'; fi" >/dev/null || true
   sleep 2
 }
 
@@ -227,22 +257,30 @@ rss_summary() {
 echo "[n2-proof] output=$OUT"
 pkill -x litiaina-n2 2>/dev/null || true
 ssh_remote "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
+ssh_remote2 "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
 mkdir -p "$OUT" "$LROOT/index" "$LROOT/blob" "$LROOT/fs"
 cp "$BIN" "$CERT" "$KEY" "$LROOT/"
 ssh_remote "rm -rf '$RROOT' && mkdir -p '$RROOT/index' '$RROOT/blob' '$RROOT/fs'"
+ssh_remote2 "rm -rf '$CROOT' && mkdir -p '$CROOT/index' '$CROOT/blob' '$CROOT/fs'"
 scp_remote "$BIN" "$CERT" "$KEY" administrator@"$REMOTE_IP":"$RROOT/" >/dev/null
+scp_remote2 "$BIN" "$CERT" "$KEY" administrator@"$REMOTE2_IP":"$CROOT/" >/dev/null
 write_env "$LROOT/n2.env"
 scp_remote "$LROOT/n2.env" administrator@"$REMOTE_IP":"$RROOT/n2.env" >/dev/null
+scp_remote2 "$LROOT/n2.env" administrator@"$REMOTE2_IP":"$CROOT/n2.env" >/dev/null
 write_membership "$LROOT/fs/n2_membership.json"
 scp_remote "$LROOT/fs/n2_membership.json" administrator@"$REMOTE_IP":"$RROOT/fs/n2_membership.json" >/dev/null
+scp_remote2 "$LROOT/fs/n2_membership.json" administrator@"$REMOTE2_IP":"$CROOT/fs/n2_membership.json" >/dev/null
 write_config "$LROOT/n2_config.ini" "$LOCAL_HTTPS_PORT" "$LOCAL_NATIVE_PORT" node-a "$LOCAL_BASE" "$LOCAL_NATIVE" "$LROOT"
 write_config "$OUT/node-b-config.ini" "$REMOTE_HTTPS_PORT" "$REMOTE_NATIVE_PORT" node-b "$REMOTE_BASE" "$REMOTE_NATIVE" "$RROOT"
+write_config "$OUT/node-c-config.ini" "$REMOTE2_HTTPS_PORT" "$REMOTE2_NATIVE_PORT" node-c "$REMOTE2_BASE" "$REMOTE2_NATIVE" "$CROOT"
 scp_remote "$OUT/node-b-config.ini" administrator@"$REMOTE_IP":"$RROOT/n2_config.ini" >/dev/null
+scp_remote2 "$OUT/node-c-config.ini" administrator@"$REMOTE2_IP":"$CROOT/n2_config.ini" >/dev/null
 
 start_nodes
 
 curl_json -X POST "$LOCAL_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"quota_bytes\":5368709120}" > "$OUT/create-local.json"
 curl_json -X POST "$REMOTE_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"quota_bytes\":5368709120}" > "$OUT/create-remote.json"
+curl_json -X POST "$REMOTE2_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"quota_bytes\":5368709120}" > "$OUT/create-remote2.json"
 FRAGMENT="$(jq -r '.fragment_hash' "$OUT/create-local.json")"
 curl_json -X POST "$LOCAL_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":21600}" > "$OUT/auth-local.json"
 TOKEN="$(jq -r '.access_token' "$OUT/auth-local.json")"
@@ -277,8 +315,14 @@ curl_json -X POST "$LOCAL_BASE/n2/upload/multipart/$VERSION/$SESSION/finalize?ob
 mp_ns=$(( "$(date +%s%N)" - mp_start ))
 printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s}\n' "$SIZE" "$(awk -v ns="$mp_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(metric_speed "$SIZE" "$mp_ns")" > "$OUT/multipart-resume-upload-metrics.json"
 
-for side in local remote; do
-  if [[ "$side" == "local" ]]; then base="$LOCAL_BASE"; else base="$REMOTE_BASE"; fi
+for side in local remote remote2; do
+  if [[ "$side" == "local" ]]; then
+    base="$LOCAL_BASE"
+  elif [[ "$side" == "remote" ]]; then
+    base="$REMOTE_BASE"
+  else
+    base="$REMOTE2_BASE"
+  fi
   start="$(date +%s%N)"
   curl_auth -G "$base/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/download-$side.bin"
   ns=$(( "$(date +%s%N)" - start ))
@@ -287,6 +331,7 @@ for side in local remote; do
 done
 cmp -s "$OUT/mhw-proof.bin" "$OUT/download-local.bin"
 cmp -s "$OUT/mhw-proof.bin" "$OUT/download-remote.bin"
+cmp -s "$OUT/mhw-proof.bin" "$OUT/download-remote2.bin"
 
 ns_start="$(date +%s%N)"
 for i in $(seq -w 1 "$NAMESPACE_OPS"); do
@@ -297,6 +342,7 @@ ns_total=$(( NAMESPACE_OPS * 2 ))
 ns_elapsed=$(( "$(date +%s%N)" - ns_start ))
 printf '{"operations":%s,"seconds":%.3f,"ops_per_sec":%.2f}\n' "$ns_total" "$(awk -v ns="$ns_elapsed" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(awk -v ops="$ns_total" -v ns="$ns_elapsed" 'BEGIN{sec=ns/1000000000; printf "%.2f", ops/sec}')" > "$OUT/namespace-stress-metrics.json"
 curl_auth -G "$REMOTE_BASE/n2/posix/list" --data-urlencode 'path=stress' --data-urlencode 'limit=1000' > "$OUT/namespace-stress-remote-list.json"
+curl_auth -G "$REMOTE2_BASE/n2/posix/list" --data-urlencode 'path=stress' --data-urlencode 'limit=1000' > "$OUT/namespace-stress-remote2-list.json"
 
 SMALL="$OUT/small.bin"
 dd if=/dev/urandom of="$SMALL" bs=4096 count=1 status=none
@@ -314,18 +360,21 @@ for pid in "${scale_pids[@]}"; do wait "$pid"; done
 scale_elapsed=$(( "$(date +%s%N)" - scale_start ))
 printf '{"objects":%s,"bytes_per_object":4096,"seconds":%.3f,"objects_per_sec":%.2f}\n' "$SMALL_OBJECTS" "$(awk -v ns="$scale_elapsed" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(awk -v objects="$SMALL_OBJECTS" -v ns="$scale_elapsed" 'BEGIN{sec=ns/1000000000; printf "%.2f", objects/sec}')" > "$OUT/scale-upload-metrics.json"
 curl_auth -G "$REMOTE_BASE/n2/posix/list" --data-urlencode 'path=scale' --data-urlencode 'limit=1000' > "$OUT/scale-remote-list.json"
+curl_auth -G "$REMOTE2_BASE/n2/posix/list" --data-urlencode 'path=scale' --data-urlencode 'limit=1000' > "$OUT/scale-remote2-list.json"
 
 curl_json -X POST "$LOCAL_BASE/n2/upload/multipart/init/tmp/cancel-$TS.bin" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":134217728,\"expected_parts\":2,\"part_size_bytes\":67108864}" > "$OUT/cancel-init.json"
 CVERSION="$(jq -r '.version_id' "$OUT/cancel-init.json")"
 curl_auth -X DELETE -G "$LOCAL_BASE/n2/upload/multipart/$CVERSION" --data-urlencode "object_key=tmp/cancel-$TS.bin" -o "$OUT/cancel-response.json"
 curl_auth "$LOCAL_BASE/n2/upload/multipart/$CVERSION" > "$OUT/cancel-status.json" || true
 
-find "$LROOT/index" \( -name '*.nmtd' -o -name '*.ndx' \) -print0 | xargs -0 strings -a | rg 'n2-peer|n2%3A' > "$OUT/native-peer-locator-strings.txt" || true
+find "$LROOT/index" \( -name '*.nmtd' -o -name '*.ndx' \) -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' > "$OUT/native-peer-locator-strings.txt" || true
+ssh_remote "find '$RROOT/index' \( -name '*.nmtd' -o -name '*.ndx' \) -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+ssh_remote2 "find '$CROOT/index' \( -name '*.nmtd' -o -name '*.ndx' \) -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
 NATIVE_LOCATORS="$(wc -l < "$OUT/native-peer-locator-strings.txt" | tr -d ' ')"
 
-ssh_remote "find '$RROOT/blob/$FRAGMENT/.blobs' -type f | sort | head -1" > "$OUT/deleted-shard.txt"
+ssh_remote2 "find '$CROOT/blob/$FRAGMENT/.blobs' -type f | sort | head -1" > "$OUT/deleted-shard.txt"
 DELETED="$(cat "$OUT/deleted-shard.txt")"
-ssh_remote "rm -f '$DELETED'"
+ssh_remote2 "rm -f '$DELETED'"
 start="$(date +%s%N)"
 curl_auth -G "$LOCAL_BASE/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/reconstruct-after-delete.bin"
 recon_elapsed=$(( "$(date +%s%N)" - start ))
@@ -339,8 +388,10 @@ wait_job "$LOCAL_BASE/n2/cluster/rebalance/status" "$OUT/cluster-rebalance-statu
 curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/cluster-health-final.json"
 
 scp_remote administrator@"$REMOTE_IP":"$RROOT/rss-remote.csv" "$OUT/rss-remote.csv" >/dev/null || true
+scp_remote2 administrator@"$REMOTE2_IP":"$CROOT/rss-remote2.csv" "$OUT/rss-remote2.csv" >/dev/null || true
 rss_summary "$OUT/rss-local.csv" > "$OUT/rss-local-summary.json"
 rss_summary "$OUT/rss-remote.csv" > "$OUT/rss-remote-summary.json"
+rss_summary "$OUT/rss-remote2.csv" > "$OUT/rss-remote2-summary.json"
 
 jq -n \
   --arg out "$OUT" \
@@ -349,6 +400,7 @@ jq -n \
   --slurpfile upload "$OUT/multipart-resume-upload-metrics.json" \
   --slurpfile dl "$OUT/download-local-metrics.json" \
   --slurpfile dr "$OUT/download-remote-metrics.json" \
+  --slurpfile dr2 "$OUT/download-remote2-metrics.json" \
   --slurpfile ns "$OUT/namespace-stress-metrics.json" \
   --slurpfile scale "$OUT/scale-upload-metrics.json" \
   --slurpfile recon "$OUT/reconstruct-after-delete-metrics.json" \
@@ -357,7 +409,8 @@ jq -n \
   --slurpfile health "$OUT/cluster-health-final.json" \
   --slurpfile rssl "$OUT/rss-local-summary.json" \
   --slurpfile rssr "$OUT/rss-remote-summary.json" \
-  '{out:$out, fragment:$fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], namespace_stress:$ns[0], scale_upload:$scale[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0]}' \
+  --slurpfile rssr2 "$OUT/rss-remote2-summary.json" \
+  '{out:$out, fragment:$fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_HARDENING_PROOF_OUT=$OUT"
