@@ -32,7 +32,7 @@ static FRAGMENT_INDEX_PARTITION_COUNT_CACHE: LazyLock<Mutex<HashMap<String, u16>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMetadata {
     pub fragment: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stable_fragment_id: Option<String>,
     pub key_phc: String,
     #[serde(default)]
@@ -373,7 +373,7 @@ async fn write_fragment_metadata_with_policy(
         edge.nt_hash_hex = meta.nt_hash_hex.clone();
         edge.index_partition_count = Some(meta.index_partition_count);
         edge.updated_at_unix = now;
-        let bytes = match rmp_serde::to_vec(&edge) {
+        let bytes = match rmp_serde::to_vec_named(&edge) {
             Ok(bytes) => bytes,
             Err(e) => {
                 failed_paths.push(format!(
@@ -505,7 +505,12 @@ mod tests {
             nt_hash_hex: Some("00112233445566778899aabbccddeeff".to_string()),
             index_partition_count: Some(64),
         };
-        let raw = rmp_serde::to_vec(&current).expect("encode current N1 fragment ndx");
+        let raw = rmp_serde::to_vec_named(&current).expect("encode current N1 fragment ndx");
+        assert!(
+            raw.first()
+                .is_some_and(|byte| (*byte & 0xf0) == 0x80 || *byte == 0xde || *byte == 0xdf),
+            "fragment metadata must be encoded as a named MessagePack map"
+        );
         let decoded = decode_fragment_metadata(&raw).expect("decode current");
         assert_eq!(decoded.fragment, current.fragment_id);
         assert_eq!(decoded.key_phc, current.key_phc.unwrap());

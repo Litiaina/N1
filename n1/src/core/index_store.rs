@@ -9,6 +9,7 @@ use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_BLOB_DIR;
 use crate::core::fragment_identity::{
     FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_root_on as resolved_fragment_root_on,
+    list_fragment_aliases,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
@@ -60,7 +61,7 @@ pub struct FragmentQuotaSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMeta {
     pub fragment_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stable_fragment_id: Option<String>,
     pub state: String,
     pub quota_bytes: u64,
@@ -166,6 +167,14 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
+    Ok(rmp_serde::from_slice(bytes)?)
+}
+
+fn encode_fragment_meta(meta: &FragmentMeta) -> Result<Vec<u8>, AppError> {
+    Ok(rmp_serde::to_vec_named(meta)?)
+}
+
+fn decode_fragment_meta(bytes: &[u8]) -> Result<FragmentMeta, AppError> {
     Ok(rmp_serde::from_slice(bytes)?)
 }
 
@@ -2140,11 +2149,11 @@ fn read_fragment_meta_from(root: &Path, fragment: &str) -> Result<Option<Fragmen
         return Ok(None);
     }
     let bytes = fs::read(path).map_err(|e| io_err(e, "read N1 fragment metadata"))?;
-    decode(&bytes).map(Some)
+    decode_fragment_meta(&bytes).map(Some)
 }
 
 fn write_fragment_meta(fragment: &str, meta: &FragmentMeta) -> Result<(), AppError> {
-    let bytes = encode(meta)?;
+    let bytes = encode_fragment_meta(meta)?;
     for root in index_roots() {
         write_atomic(
             &fragment_root_on(&root, fragment).join(FRAGMENT_META_FILE),
@@ -2207,7 +2216,7 @@ pub fn active_fragment_quota_specs() -> Result<Vec<FragmentQuotaSpec>, AppError>
         if !root.is_dir() {
             continue;
         }
-        for name in read_dir_names(&root).unwrap_or_default() {
+        for name in list_fragment_aliases(&root) {
             if !seen.insert(name.clone()) {
                 continue;
             }
@@ -2679,6 +2688,38 @@ mod tests {
                 .collect(),
         );
         roots
+    }
+
+    #[test]
+    fn fragment_meta_encoding_is_named_and_optional_fields_do_not_shift() {
+        let meta = FragmentMeta {
+            fragment_id: "frag".to_string(),
+            stable_fragment_id: None,
+            state: "active".to_string(),
+            quota_bytes: 0,
+            quota_project_id: Some(12_345),
+            committed_bytes: 0,
+            reserved_bytes: 0,
+            trash_bytes: 0,
+            created_at_unix: 1,
+            updated_at_unix: 2,
+            key_phc: None,
+            nt_hash_hex: None,
+            index_partition_count: None,
+        };
+
+        let encoded = encode_fragment_meta(&meta).expect("encode fragment metadata");
+        assert!(
+            encoded
+                .first()
+                .is_some_and(|byte| (*byte & 0xf0) == 0x80 || *byte == 0xde || *byte == 0xdf),
+            ".fragment.ndx must be a named MessagePack map, not a positional tuple"
+        );
+        let decoded = decode_fragment_meta(&encoded).expect("decode named fragment metadata");
+        assert_eq!(decoded.fragment_id, meta.fragment_id);
+        assert_eq!(decoded.stable_fragment_id, None);
+        assert_eq!(decoded.state, "active");
+        assert_eq!(decoded.quota_project_id, Some(12_345));
     }
 
     fn test_metadata(fragment: &str, object_key: &str, size: u64) -> ObjectMetadata {
