@@ -1546,7 +1546,7 @@ mod tests {
             Some(object_id.clone())
         );
         for root in &roots {
-            let link = root.join(&fragment).join("archive/docs/a/video.mp4");
+            let link = fragment_root_on(root, &fragment).join("archive/docs/a/video.mp4");
             let target = fs::read_link(&link).expect("read namespace link");
             assert_eq!(
                 target,
@@ -1572,11 +1572,10 @@ mod tests {
 
         for root in &roots {
             assert!(!path_exists_no_follow(
-                &root.join(&fragment).join("video/my-video.mp4")
+                &fragment_root_on(root, &fragment).join("video/my-video.mp4")
             ));
             assert!(path_exists_no_follow(
-                &root
-                    .join(&fragment)
+                &fragment_root_on(root, &fragment)
                     .join(TRASH_DIR)
                     .join("video/my-video.mp4")
             ));
@@ -1594,8 +1593,7 @@ mod tests {
             .expect("hard delete single trash item");
         for root in &roots {
             assert!(!path_exists_no_follow(
-                &root
-                    .join(&fragment)
+                &fragment_root_on(root, &fragment)
                     .join(TRASH_DIR)
                     .join("video/my-video.mp4")
             ));

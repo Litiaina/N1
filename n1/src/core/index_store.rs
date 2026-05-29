@@ -7,6 +7,9 @@ use super::index::{
 };
 use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_BLOB_DIR;
+use crate::core::fragment_identity::{
+    FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_root_on as resolved_fragment_root_on,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
 use chrono::Utc;
@@ -38,6 +41,7 @@ const PART_RECEIPT_PREFIX: &str = "part_p";
 const RECEIPT_SUFFIX: &str = ".receipt";
 const PART_META_PREFIX: &str = "part_";
 pub(crate) const OBJECT_DIR_PREFIX: &str = "@o_";
+pub(crate) const FRAGMENT_DIR_PREFIX: &str = PHYSICAL_FRAGMENT_PREFIX;
 const INTENTS_DIR: &str = ".intents";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
 pub(crate) const BLOB_DIR: &str = N1_BLOB_DIR;
@@ -56,6 +60,8 @@ pub struct FragmentQuotaSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMeta {
     pub fragment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_fragment_id: Option<String>,
     pub state: String,
     pub quota_bytes: u64,
     pub quota_project_id: Option<u32>,
@@ -168,7 +174,7 @@ fn index_roots() -> Vec<PathBuf> {
 }
 
 pub(crate) fn fragment_root_on(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment)
+    resolved_fragment_root_on(root, fragment)
 }
 
 fn fragment_roots(fragment: &str) -> Vec<PathBuf> {
@@ -198,7 +204,9 @@ fn first_fragment_root(fragment: &str) -> Result<PathBuf, AppError> {
 #[inline]
 fn reserved_user_segment(segment: &str) -> bool {
     segment.starts_with(OBJECT_DIR_PREFIX)
+        || segment.starts_with(FRAGMENT_DIR_PREFIX)
         || segment == BLOB_DIR
+        || segment.starts_with(FRAGMENT_ALIAS_DIR)
         || segment.starts_with(OBJECTS_DIR)
         || segment.starts_with(TRASH_DIR)
         || segment.starts_with(UPLOADS_DIR)
@@ -212,9 +220,11 @@ fn reserved_user_segment(segment: &str) -> bool {
 
 pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
     name.starts_with(OBJECT_DIR_PREFIX)
+        || name.starts_with(FRAGMENT_DIR_PREFIX)
         || matches!(
             name,
             BLOB_DIR
+                | FRAGMENT_ALIAS_DIR
                 | OBJECTS_DIR
                 | UPLOADS_DIR
                 | TRASH_DIR
@@ -303,8 +313,7 @@ pub(crate) fn object_index_dir(
     object_id: &str,
 ) -> Result<PathBuf, AppError> {
     let (fanout_a, fanout_b) = object_fanout_segments_for_id(object_id)?;
-    Ok(root
-        .join(fragment)
+    Ok(fragment_root_on(root, fragment)
         .join(OBJECTS_DIR)
         .join(fanout_a)
         .join(fanout_b)
@@ -320,7 +329,7 @@ pub(crate) fn live_object_dir(
 }
 
 pub(crate) fn namespace_path(root: &Path, fragment: &str, logical_path: &str) -> PathBuf {
-    root.join(fragment).join(logical_path)
+    fragment_root_on(root, fragment).join(logical_path)
 }
 
 fn object_symlink_target(object_id: &str) -> Result<PathBuf, AppError> {
@@ -417,7 +426,7 @@ fn object_index_dirs_under_root(
     root: &Path,
     fragment: &str,
 ) -> Result<Vec<(PathBuf, String)>, AppError> {
-    let objects_root = root.join(fragment).join(OBJECTS_DIR);
+    let objects_root = fragment_root_on(root, fragment).join(OBJECTS_DIR);
     if !objects_root.is_dir() {
         return Ok(Vec::new());
     }
@@ -1749,7 +1758,7 @@ pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<
         return Ok(());
     }
     for root in index_roots() {
-        let path = root.join(fragment).join(TRASH_DIR);
+        let path = fragment_root_on(&root, fragment).join(TRASH_DIR);
         if path.exists() {
             fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear N1 trash object dir"))?;
         }
@@ -1761,7 +1770,7 @@ pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<
 
 pub fn drop_fragment_trash_namespace(fragment: &str) -> Result<(), AppError> {
     for root in index_roots() {
-        let fragment_root = root.join(fragment);
+        let fragment_root = fragment_root_on(&root, fragment);
         let path = fragment_root.join(TRASH_DIR);
         if path.exists() {
             fs::remove_dir_all(&path).map_err(|e| io_err(e, "drop N1 trash namespace"))?;
@@ -1777,7 +1786,7 @@ pub(crate) fn retire_fragment_trash_namespace(fragment: &str) -> Result<Vec<Path
     let mut retired_roots = Vec::new();
 
     for root in index_roots() {
-        let fragment_root = root.join(fragment);
+        let fragment_root = fragment_root_on(&root, fragment);
         fs::create_dir_all(&fragment_root).map_err(|e| io_err(e, "create N1 fragment root"))?;
 
         let trash_root = fragment_root.join(TRASH_DIR);
@@ -1909,7 +1918,7 @@ fn count_object_index_records(root: &Path, fragment: &str) -> u64 {
 }
 
 fn count_upload_records(root: &Path, fragment: &str) -> u64 {
-    let uploads_root = root.join(fragment).join(UPLOADS_DIR);
+    let uploads_root = fragment_root_on(root, fragment).join(UPLOADS_DIR);
     let mut count = 0u64;
     let mut stack = vec![uploads_root];
     while let Some(dir) = stack.pop() {
@@ -1931,14 +1940,18 @@ fn count_upload_records(root: &Path, fragment: &str) -> u64 {
 }
 
 fn count_namespace_links(root: &Path, fragment: &str) -> u64 {
-    collect_symlink_object_ids_under(root, fragment, &root.join(fragment), true)
+    collect_symlink_object_ids_under(root, fragment, &fragment_root_on(root, fragment), true)
         .map(|ids| ids.len() as u64)
         .unwrap_or(0)
 }
 
 fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
     ReplicaScore {
-        meta_present: u64::from(root.join(fragment).join(FRAGMENT_META_FILE).is_file()),
+        meta_present: u64::from(
+            fragment_root_on(root, fragment)
+                .join(FRAGMENT_META_FILE)
+                .is_file(),
+        ),
         object_records: count_object_index_records(root, fragment),
         namespace_links: count_namespace_links(root, fragment),
         upload_records: count_upload_records(root, fragment),
@@ -2033,7 +2046,7 @@ fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
 fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaScore)> {
     let mut best: Option<(PathBuf, ReplicaScore, u128)> = None;
     for root in index_roots() {
-        let fragment_root = root.join(fragment);
+        let fragment_root = fragment_root_on(&root, fragment);
         if !fragment_root.exists() {
             continue;
         }
@@ -2060,7 +2073,7 @@ fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaScore)> {
             best = Some((root, score, modified));
         }
     }
-    best.map(|(root, score, _)| (root.join(fragment), score))
+    best.map(|(root, score, _)| (fragment_root_on(&root, fragment), score))
 }
 
 pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) -> ReplicaInspection {
@@ -2083,7 +2096,7 @@ pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) ->
 
     let mut valid_replicas = 0u64;
     for root in roots {
-        let fragment_root = root.join(fragment);
+        let fragment_root = fragment_root_on(&root, fragment);
         if !fragment_root.exists() {
             missing_replicas += 1;
             continue;
@@ -2122,7 +2135,7 @@ fn default_project_id(fragment: &str) -> u32 {
 }
 
 fn read_fragment_meta_from(root: &Path, fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
-    let path = root.join(fragment).join(FRAGMENT_META_FILE);
+    let path = fragment_root_on(root, fragment).join(FRAGMENT_META_FILE);
     if !path.exists() {
         return Ok(None);
     }
@@ -2133,7 +2146,10 @@ fn read_fragment_meta_from(root: &Path, fragment: &str) -> Result<Option<Fragmen
 fn write_fragment_meta(fragment: &str, meta: &FragmentMeta) -> Result<(), AppError> {
     let bytes = encode(meta)?;
     for root in index_roots() {
-        write_atomic(&root.join(fragment).join(FRAGMENT_META_FILE), &bytes)?;
+        write_atomic(
+            &fragment_root_on(&root, fragment).join(FRAGMENT_META_FILE),
+            &bytes,
+        )?;
     }
     Ok(())
 }
@@ -2152,6 +2168,7 @@ pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppErr
     let now = Utc::now().timestamp();
     let mut meta = fragment_quota_meta(fragment)?.unwrap_or(FragmentMeta {
         fragment_id: fragment.to_string(),
+        stable_fragment_id: None,
         state: "active".to_string(),
         quota_bytes,
         quota_project_id: Some(default_project_id(fragment)),
@@ -2321,7 +2338,7 @@ pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<us
         {
             continue;
         }
-        let fragment_root = blob_root.join(fragment);
+        let fragment_root = fragment_root_on(&blob_root, fragment);
         if !fragment_root.exists() {
             continue;
         }
@@ -2405,8 +2422,7 @@ pub fn open_session(
     let bytes = encode(&row)?;
     for root in index_roots() {
         write_atomic(
-            &root
-                .join(&manifest.fragment)
+            &fragment_root_on(&root, &manifest.fragment)
                 .join(UPLOADS_DIR)
                 .join(&manifest.version_id)
                 .join(MANIFEST_FILE),
@@ -2417,7 +2433,9 @@ pub fn open_session(
 }
 
 fn session_dir(root: &Path, fragment: &str, version_id: &str) -> PathBuf {
-    root.join(fragment).join(UPLOADS_DIR).join(version_id)
+    fragment_root_on(root, fragment)
+        .join(UPLOADS_DIR)
+        .join(version_id)
 }
 
 fn session_roots(fragment: &str, version_id: &str) -> Vec<PathBuf> {
@@ -2701,7 +2719,7 @@ mod tests {
         let fragment = format!("n1-repair-source-{}", Ulid::new());
         let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
-        let bad_root = roots[0].join(&fragment);
+        let bad_root = fragment_root_on(&roots[0], &fragment);
         let blob_marker = bad_root
             .join(BLOB_DIR)
             .join("version")
@@ -2767,13 +2785,13 @@ mod tests {
         .expect("publish one-disk namespace link");
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let stale_meta = roots[1].join(&fragment).join(FRAGMENT_META_FILE);
+        let stale_meta = fragment_root_on(&roots[1], &fragment).join(FRAGMENT_META_FILE);
         fs::write(&stale_meta, b"newer stale fragment metadata").expect("touch stale meta");
 
         let (source, _score) = choose_replica_source(&fragment).expect("source replica");
         assert_eq!(
             source,
-            roots[0].join(&fragment),
+            fragment_root_on(&roots[0], &fragment),
             "newer .fragment.ndx on a stale replica must not outrank the richer index plane"
         );
 
@@ -2781,10 +2799,12 @@ mod tests {
 
         for root in &roots {
             assert!(
-                fs::symlink_metadata(root.join(&fragment).join("n1-redistribution/one-disk.txt"))
-                    .expect("one-disk namespace link")
-                    .file_type()
-                    .is_symlink(),
+                fs::symlink_metadata(
+                    fragment_root_on(root, &fragment).join("n1-redistribution/one-disk.txt"),
+                )
+                .expect("one-disk namespace link")
+                .file_type()
+                .is_symlink(),
                 "repair must preserve the namespace link created while one replica was active"
             );
             assert!(
@@ -2823,21 +2843,20 @@ mod tests {
         .expect("publish one-disk namespace link");
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let stale_user_dir = roots[1]
-            .join(&fragment)
-            .join("maintenance-touched-stale-tree");
+        let stale_user_dir =
+            fragment_root_on(&roots[1], &fragment).join("maintenance-touched-stale-tree");
         fs::create_dir_all(&stale_user_dir).expect("touch stale index plane");
 
         assert!(
-            latest_index_plane_mtime_nanos(&roots[1].join(&fragment))
-                > latest_index_plane_mtime_nanos(&roots[0].join(&fragment)),
+            latest_index_plane_mtime_nanos(&fragment_root_on(&roots[1], &fragment))
+                > latest_index_plane_mtime_nanos(&fragment_root_on(&roots[0], &fragment)),
             "stale replica must be newer to reproduce the redistribution regression"
         );
 
         let (source, _score) = choose_replica_source(&fragment).expect("source replica");
         assert_eq!(
             source,
-            roots[0].join(&fragment),
+            fragment_root_on(&roots[0], &fragment),
             "a touched stale plane must not outrank the richer one-disk write"
         );
 
@@ -2845,10 +2864,12 @@ mod tests {
 
         for root in &roots {
             assert!(
-                fs::symlink_metadata(root.join(&fragment).join("n1-redistribution/one-disk.txt"))
-                    .expect("one-disk namespace link")
-                    .file_type()
-                    .is_symlink(),
+                fs::symlink_metadata(
+                    fragment_root_on(root, &fragment).join("n1-redistribution/one-disk.txt"),
+                )
+                .expect("one-disk namespace link")
+                .file_type()
+                .is_symlink(),
                 "repair must preserve the namespace link created while one replica was active"
             );
             assert!(
@@ -2879,7 +2900,7 @@ mod tests {
         let fragment = format!("n1-stale-cleanup-{}", Ulid::new());
         let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
-        let stale_fragment_root = blob_only_root.join(&fragment);
+        let stale_fragment_root = fragment_root_on(&blob_only_root, &fragment);
         let stale_object_dir =
             live_object_dir(&blob_only_root, &fragment, &object_id).expect("stale object dir");
         fs::create_dir_all(&stale_object_dir).expect("create stale object dir");
@@ -2955,7 +2976,7 @@ mod tests {
 
         assert_eq!(
             path,
-            root.join(fragment)
+            fragment_root_on(&root, fragment)
                 .join(OBJECTS_DIR)
                 .join(fanout_a)
                 .join(fanout_b)
@@ -2963,7 +2984,7 @@ mod tests {
         );
         assert_ne!(
             path,
-            root.join(fragment)
+            fragment_root_on(&root, fragment)
                 .join(OBJECTS_DIR)
                 .join(format!("@o_{object_id}")),
             "N1 object records must not use the old flat object directory"
@@ -3053,8 +3074,8 @@ mod tests {
         let new_key = "docs/new-name.txt";
         let object_id = publish_logical_object(&roots, &fragment, old_key, 42);
         for root in &roots {
-            let old_link = root.join(&fragment).join(old_key);
-            let new_link = root.join(&fragment).join(new_key);
+            let old_link = fragment_root_on(root, &fragment).join(old_key);
+            let new_link = fragment_root_on(root, &fragment).join(new_key);
             fs::rename(&old_link, &new_link).expect("simulate N1 namespace rename");
             assert_eq!(
                 read_namespace_symlink_object_id(root, &fragment, &new_link)
@@ -3147,7 +3168,9 @@ mod tests {
         };
         commit_session_part_receipt(&fragment, &version_id, &receipt).expect("write receipts");
 
-        let dir = roots[0].join(&fragment).join(UPLOADS_DIR).join(&version_id);
+        let dir = fragment_root_on(&roots[0], &fragment)
+            .join(UPLOADS_DIR)
+            .join(&version_id);
         let names = read_dir_names(&dir).expect("receipt names");
         assert!(names.contains(&"part_p00000000000000000007.01020304.receipt".to_string()));
         assert!(names.contains(&"shard_p00000000000000000007_s0000.11111111.receipt".to_string()));
@@ -3210,7 +3233,7 @@ mod tests {
             .iter()
             .map(|root| {
                 fs::read(
-                    root.join(&fragment)
+                    fragment_root_on(root, &fragment)
                         .join(UPLOADS_DIR)
                         .join(&version_id)
                         .join(MANIFEST_FILE),
@@ -3222,7 +3245,7 @@ mod tests {
             .iter()
             .map(|root| {
                 fs::read(
-                    root.join(&fragment)
+                    fragment_root_on(root, &fragment)
                         .join(UPLOADS_DIR)
                         .join(&version_id)
                         .join(BINDING_FILE),
@@ -3249,7 +3272,9 @@ mod tests {
         }
 
         for (idx, root) in roots.iter().enumerate() {
-            let dir = root.join(&fragment).join(UPLOADS_DIR).join(&version_id);
+            let dir = fragment_root_on(root, &fragment)
+                .join(UPLOADS_DIR)
+                .join(&version_id);
             assert_eq!(
                 fs::read(dir.join(MANIFEST_FILE)).expect("manifest after receipts"),
                 manifest_bytes_before[idx],
@@ -3331,8 +3356,7 @@ mod tests {
         assert!(remove_session(&fragment, &version_id).expect("remove session"));
         for root in roots {
             assert!(
-                !root
-                    .join(&fragment)
+                !fragment_root_on(&root, &fragment)
                     .join(UPLOADS_DIR)
                     .join(&version_id)
                     .exists(),
@@ -3355,7 +3379,7 @@ mod tests {
         publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
         for root in &roots {
-            let fragment_root = root.join(&fragment);
+            let fragment_root = fragment_root_on(root, &fragment);
             for internal in [
                 OBJECTS_DIR,
                 UPLOADS_DIR,

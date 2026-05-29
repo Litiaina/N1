@@ -1,6 +1,7 @@
 use crate::core::constants::N1_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::core::fragment_identity::{fragment_root_on, list_fragment_aliases};
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
@@ -396,22 +397,9 @@ async fn list_known_fragments(roots: &[PathBuf]) -> Vec<String> {
             if !root.exists() {
                 continue;
             }
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in entries.filter_map(|entry| entry.ok()) {
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
-                    continue;
-                };
+            for name in list_fragment_aliases(&root) {
                 if is_fragment_hash(&name)
-                    && entry
-                        .path()
+                    && fragment_root_on(&root, &name)
                         .join(crate::core::constants::FRAGMENT_METADATA_FILE)
                         .is_file()
                 {
@@ -443,7 +431,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join(N1_BLOB_DIR);
+            let blob_dir = fragment_root_on(&root, &fragment).join(N1_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -815,7 +803,7 @@ async fn collect_system_health(
                     let mut current_disk_count = 0u64;
                     let scan_root = target_fragment_for_scan
                         .as_ref()
-                        .map(|fragment| root.join(fragment))
+                        .map(|fragment| fragment_root_on(&root, fragment))
                         .unwrap_or_else(|| root.clone());
                     let walker = WalkDir::new(&scan_root).into_iter();
 
@@ -1139,7 +1127,10 @@ async fn collect_upload_runtime_stats(
     let fragments = tokio::task::spawn_blocking(move || -> Vec<String> {
         let mut seen = HashSet::new();
         if let Some(fragment) = target_fragment_owned {
-            if roots.iter().any(|root| root.join(&fragment).is_dir()) {
+            if roots
+                .iter()
+                .any(|root| fragment_root_on(root, &fragment).is_dir())
+            {
                 seen.insert(fragment);
             }
             return seen.into_iter().collect();
@@ -1148,19 +1139,7 @@ async fn collect_upload_runtime_stats(
             if !root.exists() {
                 continue;
             }
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in entries.filter_map(|entry| entry.ok()) {
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
-                    continue;
-                };
+            for name in list_fragment_aliases(&root) {
                 if is_fragment_hash(&name) {
                     seen.insert(name);
                 }

@@ -2,6 +2,7 @@ use crate::core::constants::{FRAGMENT_METADATA_FILE, PARITY_SUFFIX, SHARD_SUFFIX
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_io};
@@ -1104,7 +1105,7 @@ async fn repair_fragment_metadata_replicas(
 ) -> Result<(u64, u64, u64), AppError> {
     let paths: Vec<PathBuf> = index_roots
         .iter()
-        .map(|r| r.join(fragment).join(FRAGMENT_METADATA_FILE))
+        .map(|r| fragment_root_on(r, fragment).join(FRAGMENT_METADATA_FILE))
         .collect();
 
     let valid = |b: &[u8]| -> bool { rmp_serde::from_slice::<serde_json::Value>(b).is_ok() };

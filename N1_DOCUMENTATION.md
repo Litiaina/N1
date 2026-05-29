@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 1.3.3 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.0.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -8,7 +8,7 @@ For implementation details, see [N1_ARCHITECTURE.md](N1_ARCHITECTURE.md). For re
 
 ## Core Concepts
 
-- **Fragment:** A quota-bound virtual storage partition. Clients mount/authenticate a fragment before using the API.
+- **Fragment:** A quota-bound virtual storage partition. Clients mount/authenticate a fragment before using the API. The public fragment hash is a mutable namespace alias; N1 stores data under an immutable `@f_<stable_fragment_id>` physical fragment root.
 - **Namespace:** The user-facing tree of folders and files. This is what `/n1/posix/*` and the UI show.
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
@@ -103,6 +103,26 @@ sudo mount -o prjquota /dev/<device> /mnt/disk-00
 ```
 
 Fragment quota is a storage partition limit. Creating a fragment requires `quota_bytes`. N1 refuses fragment creation when the requested quota exceeds available allocatable capacity.
+
+### Fragment Identity Layout
+
+N1 1.0.0 separates the mutable fragment name/hash from the physical fragment root:
+
+```text
+<root>/
+  .fragment/
+    <fragment_hash> -> ../@f_<stable_fragment_id>
+
+  @f_<stable_fragment_id>/
+    .fragment.ndx
+    .objects/
+    .uploads/
+    .trash/
+    .blobs/
+    <namespace directories>
+```
+
+The `.fragment/<fragment_hash>` symlink is the mount/auth namespace. The `@f_<stable_fragment_id>` directory is immutable. Renaming a fragment changes the alias and `.fragment.ndx`; it does not move blob payloads or rewrite immutable object `.ndx` records. This keeps absolute shard/parity paths valid after fragment rename.
 
 ## Quick Start
 
@@ -224,7 +244,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.3.3 includes the native N1 protocol:
+N1 1.0.0 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -428,7 +448,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.3.3 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.0.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -594,7 +614,23 @@ Body:
 
 ### `DELETE /n1/fragments/{fragment}`
 
-Deletes a fragment. Requires a token with delete permission and an implementation state that allows deletion.
+Deletes a fragment. Requires all of the following:
+
+- a token scoped to the same fragment
+- `delete: true` permission
+- the N1 master key
+- an exact fragment-hash confirmation in the body
+
+Body:
+
+```json
+{
+  "secret": "<MASTER_KEY>",
+  "confirm_fragment": "<fragment_hash>"
+}
+```
+
+N1 rejects the request if `confirm_fragment` does not exactly match `{fragment}`.
 
 ### `GET /n1/capacity/usage`
 
@@ -1071,7 +1107,7 @@ Soft delete moves a file or folder into `.trash`. Live listing no longer shows i
 
 Hard delete removes trash namespace entries. Bytes are returned after GC determines no live or trash namespace path references the blob versions.
 
-N1 1.3.3 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
+N1 1.0.0 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
 
 Empty trash:
 
@@ -1096,7 +1132,7 @@ GET /n1/maintenance/trash/recover/status
 
 ### Disk IO Scheduler
 
-N1 1.3 adds a shared disk IO scheduler for disk-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
+N1 includes a shared disk IO scheduler for disk-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
 
 The scheduler separates:
 

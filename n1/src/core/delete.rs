@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::core::disk_manager::ObjectPathManager;
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
@@ -209,7 +210,7 @@ pub(crate) fn persistent_trash_job_paths(fragment: &str) -> Vec<std::path::PathB
         .get_all_index_roots()
         .into_iter()
         .map(|root| {
-            root.join(fragment)
+            fragment_root_on(&root, fragment)
                 .join(".trash-jobs")
                 .join(PERSISTENT_TRASH_JOB_FILE)
         })

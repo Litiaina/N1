@@ -505,6 +505,7 @@ fn map_refresh_error(error: RefreshStoreError) -> AuthError {
 mod tests {
     use super::*;
     use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+    use crate::core::fragment_identity::ensure_fragment_identity_on_roots;
     use crate::middleware::refresh_store::clear_refresh_store_for_tests;
     use crate::test_support::global_test_lock;
     use jsonwebtoken::Validation;
@@ -546,6 +547,16 @@ mod tests {
     }
 
     async fn ensure_auth_test_fragment(fragment: &str) {
+        let mut roots = Vec::new();
+        if let Some(index_roots) = INDEX_STORE_DISKS.get() {
+            roots.extend(index_roots.iter().map(std::path::PathBuf::from));
+        }
+        if let Some(blob_roots) = BLOB_STORE_DISKS.get() {
+            roots.extend(blob_roots.iter().map(std::path::PathBuf::from));
+        }
+        ensure_fragment_identity_on_roots(&roots, fragment, fragment)
+            .await
+            .expect("create fragment identity");
         crate::core::fragment_metadata::init_fragment_metadata(fragment, "fragment-key")
             .await
             .expect("init fragment metadata");

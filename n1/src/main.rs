@@ -814,7 +814,7 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
-    tracing::info!("Storage mode: N1 storage kernel with explicit .blobs payload roots");
+    tracing::info!("Storage mode: N1 object storage system with explicit .blobs payload roots");
 
     let quota_section = config.section(Some("quota_config"));
     let fragment_quota_backend =

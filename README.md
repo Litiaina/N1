@@ -19,8 +19,8 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`1.3.3`)
-  Single-node object storage system with a real N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
+> - `N1` (`1.0.0`)
+  Single-node object storage system with a real N1 namespace, immutable `@f_<stable_fragment_id>` fragment roots, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
 > - `N2` (`0.12.0`)
   Standalone distributed object storage system with node-level placement, peer shard transport, distributed upload/read, namespace quorum apply, cluster health, repair, and manual rebalance execution. N1 and N2 are independent Litiaina storage systems with shared design principles, not parent/child runtimes. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
 > - `NS` (`1.0.0`)
@@ -67,17 +67,22 @@ N1 stores object truth in its own namespace, immutable `.ndx` object records, an
 
 ### N1
 
-`N1 1.3.3` is the primary single-node N1 object storage system and the default N1 face for new deployments.
+`N1 1.0.0` is the primary single-node N1 object storage system and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 
 ```text
-index_root/<fragment_hash>/
-  .blobs/<version-id>/
+index_root/
+  .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/
+    .objects/<hh>/<hh>/@o_<object-id>/
+      <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+    docs/video.mp4 -> @o_<object-id>
+
+blob_root/
+  .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/.blobs/<version-id>/
     <shard-or-parity-file>
-  .objects/<hh>/<hh>/@o_<object-id>/
-    <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
-  docs/video.mp4 -> @o_<object-id>
 ```
 
 Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in two-level fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
@@ -154,22 +159,26 @@ Clients / UI / CLI
                                     optional cold sync to N1
 ```
 
-For standalone `N1 1.3`, the internal model is:
+For standalone `N1 1.0`, the internal model is:
 
 ```text
-index_root/<fragment_hash>/
-  .fragment.ndx
-  .objects/<hh>/<hh>/@o_<object-id>/
-    <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
-  .uploads/<version-id>/
-    manifest.ndx
-    part_p<part-number>.<crc32>.receipt
-  .trash/
-  docs/video.mp4 -> @o_<object-id>
+index_root/
+  .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/
+    .fragment.ndx
+    .objects/<hh>/<hh>/@o_<object-id>/
+      <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+    .uploads/<version-id>/
+      manifest.ndx
+      part_p<part-number>.<crc32>.receipt
+    .trash/
+    docs/video.mp4 -> @o_<object-id>
 
-blob_root/<fragment_hash>/.blobs/<version_id>/
-  - payload shards / parity
-  - placement
+blob_root/
+  .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/.blobs/<version_id>/
+    - payload shards / parity
+    - placement
 ```
 
 This split is why current `N1` is materially different from the older Standard/indexdb design:
@@ -312,7 +321,7 @@ curl -k https://127.0.0.1:50001/n1/auth/fragment \
 
 ### N1 Operator CLI
 
-`n1_cli` is the operator CLI for N1 health, maintenance, fragments, namespace reads, object status/repair, quota operations, and upload inspection. In N1 1.3, the CLI prefers the native `n1://` transport by default. HTTPS remains available only when `--url <https-url>` is provided for compatibility.
+`n1_cli` is the operator CLI for N1 health, maintenance, fragments, namespace reads, object status/repair, quota operations, and upload inspection. In N1 1.0, the CLI prefers the native `n1://` transport by default. HTTPS remains available only when `--url <https-url>` is provided for compatibility.
 
 The CLI uses the shared `n1_native_client` crate, which is also the intended Rust client foundation for N2, NS, and future N1 desktop/native tools.
 
@@ -502,7 +511,7 @@ Important settings:
 Notes:
 
 - `index_store_disks` and `blob_store_disks` can point to different directories on the same device, but separate devices are operationally stronger.
-- fragment names hash deterministically, so recreating the same fragment name yields the same fragment hash.
+- fragment names hash deterministically into the public fragment alias; the physical `@f_<stable_fragment_id>` root remains separate and immutable.
 
 ### Secrets
 
@@ -638,19 +647,21 @@ If you need immediate space reclamation, empty trash and then run GC.
 
 ### Fragment Already Exists After Reusing The Same Name
 
-Fragment names hash deterministically. Reusing the same name recreates the same fragment hash. If you want a brand-new fragment identity, use a different name. If a fragment was partially initialized, current N1 fragment create logic heals partial state on retry instead of false-conflicting.
+Fragment names hash deterministically into the public fragment alias used for auth and mounts. The physical fragment root is a separate immutable `@f_<stable_fragment_id>` minted during creation. Renaming a fragment changes the alias, not the physical root. If a fragment was partially initialized, current N1 fragment create logic heals partial state on retry instead of false-conflicting.
 
 ### Active Metadata Files
 
 For current `N1`, the active per-fragment metadata authority is the N1 storage index:
 
 ```text
-<index_root>/<fragment_hash>/
-  .fragment.ndx
-  .objects/<hh>/<hh>/@o_<object-id>/*.ndx
-  .uploads/
-  .trash/
-  <namespace directories and symlink object pointers>
+<index_root>/
+  .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/
+    .fragment.ndx
+    .objects/<hh>/<hh>/@o_<object-id>/*.ndx
+    .uploads/
+    .trash/
+    <namespace directories and symlink object pointers>
 ```
 
 Do not restore or point runtime code at retired Standard `indexdb`, `namespace_v2/catalog.ndxdb`, `catalog.ndxdb`, `namespace.ndxdb`, `namespace.sqlite`, redb index files, or serialized `ObjectMetadata` blobs as authority. Those belong only to older releases or explicit import tooling.

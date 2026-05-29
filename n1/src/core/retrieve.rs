@@ -1,5 +1,6 @@
 use crate::core::constants::BROWSER_CACHE_MAX_AGE;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
+use crate::core::fragment_identity::list_fragment_aliases;
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
@@ -17,7 +18,6 @@ use axum::{
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use walkdir::WalkDir;
 
 async fn list_objects_flat_page(
     fragment: &str,
@@ -175,18 +175,9 @@ pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppErro
                 continue;
             }
 
-            for entry in WalkDir::new(&root)
-                .min_depth(1)
-                .max_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if entry.file_type().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if is_fragment_hash(name) {
-                            fragment_hashes.insert(name.to_string());
-                        }
-                    }
+            for name in list_fragment_aliases(&root) {
+                if is_fragment_hash(&name) {
+                    fragment_hashes.insert(name);
                 }
             }
         }

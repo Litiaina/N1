@@ -1,5 +1,6 @@
 use crate::core::constants::N1_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index_store;
 use crate::enums::app_error_enum::AppError;
 use std::collections::{HashMap, HashSet};
@@ -369,17 +370,15 @@ fn apply_xfs_project_quota_sync(
     let hard_limit = quota_limit_kib(per_mount_quota_bytes);
 
     for root in roots {
-        std::fs::create_dir_all(root.join(fragment)).map_err(|err| {
+        let fragment_root_raw = fragment_root_on(&root, fragment);
+        std::fs::create_dir_all(&fragment_root_raw).map_err(|err| {
             AppError::Io(
                 err,
-                format!(
-                    "create fragment quota root {}",
-                    root.join(fragment).display()
-                ),
+                format!("create fragment quota root {}", fragment_root_raw.display()),
             )
         })?;
         let mount = validate_xfs_project_quota_root(&root, &mounts)?;
-        let fragment_root = canonical_existing_path(&root.join(fragment))?;
+        let fragment_root = canonical_existing_path(&fragment_root_raw)?;
         let fragment_root_arg = xfs_quota_path_arg(&fragment_root)?;
         let root_check = run_xfs_quota_command(
             &mount.mount_point,
@@ -515,7 +514,7 @@ fn validate_fragment_project_headroom_sync(
         if !seen_roots.insert(root.clone()) {
             continue;
         }
-        let fragment_root = root.join(fragment);
+        let fragment_root = fragment_root_on(&root, fragment);
         let used_bytes = sum_project_tree_bytes_no_follow(&fragment_root)?;
         let available_bytes = per_mount_quota_bytes.saturating_sub(used_bytes);
         if available_bytes < required_headroom {
@@ -647,10 +646,12 @@ async fn compute_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage
                 continue;
             }
             usage.live_bytes = usage.live_bytes.saturating_add(sum_file_tree_bytes(
-                &root.join(&fragment).join(N1_BLOB_DIR),
+                &fragment_root_on(&root, &fragment).join(N1_BLOB_DIR),
             )?);
             usage.trash_bytes = usage.trash_bytes.saturating_add(sum_file_tree_bytes(
-                &root.join(&fragment).join(".trash").join(N1_BLOB_DIR),
+                &fragment_root_on(&root, &fragment)
+                    .join(".trash")
+                    .join(N1_BLOB_DIR),
             )?);
         }
         Ok::<FragmentBlobUsage, AppError>(usage)

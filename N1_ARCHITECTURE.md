@@ -18,7 +18,7 @@ The workspace `n1_native_client` crate is the canonical Rust client implementati
 
 ## Native Protocol Plane
 
-N1 1.3.3 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the N1 object storage system without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+N1 1.0.0 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the N1 object storage system without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
 
 The native plane is intentionally thin:
 
@@ -54,7 +54,7 @@ Native is a lower-latency core face for the same N1 object storage system, not a
 
 ## Disk IO Scheduler
 
-N1 1.3 introduces a shared disk IO scheduler above the storage planes. The scheduler is not a metadata authority and does not change the object/index/blob layout. It only controls admission into disk-heavy work.
+N1 includes a shared disk IO scheduler above the storage planes. The scheduler is not a metadata authority and does not change the object/index/blob layout. It only controls admission into disk-heavy work.
 
 Scheduler lanes:
 
@@ -66,41 +66,47 @@ Scheduler lanes:
 
 Foreground work uses the adaptive upload target so live traffic can contract under CPU/RAM pressure. Background work has its own smaller lane and per-fragment gate, so GC, repair, and redistribution cannot consume the whole disk path while users are uploading or reading. Object status and repair also pass through the scheduler in addition to their object-scoped maintenance gates.
 
-The scheduler is intentionally coarse at 1.3: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the object-storage invariants stable while removing avoidable per-shard serialization from large uploads.
+The scheduler is intentionally coarse: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the object-storage invariants stable while removing avoidable per-shard serialization from large uploads.
 
 N1 still serializes the same `(fragment, version_id, part_index)` upload part. Different parts can move in parallel, but two clients cannot race the same receipt or stable shard set for the same part. Large-upload clients should keep part concurrency bounded; too much concurrency can overload weak two-disk deployments instead of improving them.
 
 Each configured root can house both index and blob data:
 
 ```text
-<root>/<fragment_hash>/
-  .fragment.ndx
-  .objects/
-    ab/
-      cd/
-        @o_<object-id>/
-          <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
-  .uploads/
-    <version_id>/
-      manifest.ndx
-      binding.ndx
-      part_p00000000000000000000.<crc32>.receipt
-      shard_p00000000000000000000_s0000.<crc32>.receipt
-  .trash/
+<root>/
+  .fragment/
+    <name_hash> -> ../@f_<stable_fragment_id>
+
+  @f_<stable_fragment_id>/
+    .fragment.ndx
+    .objects/
+      ab/
+        cd/
+          @o_<object-id>/
+            <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+    .uploads/
+      <version_id>/
+        manifest.ndx
+        binding.ndx
+        part_p00000000000000000000.<crc32>.receipt
+        shard_p00000000000000000000_s0000.<crc32>.receipt
+    .trash/
+      docs/
+        video.mp4 -> @o_<object-id>
+    .blobs/
+      <version_id>/
+        <shard-or-parity-file>
     docs/
       video.mp4 -> @o_<object-id>
-  .blobs/
-    <version_id>/
-      <shard-or-parity-file>
-  docs/
-    video.mp4 -> @o_<object-id>
 ```
+
+The `.fragment/<name_hash>` entry is the mutable fragment namespace alias. The `@f_<stable_fragment_id>` directory is the immutable physical fragment root. Fragment rename changes the alias and fragment control metadata; it does not move object records, blob files, upload receipts, or namespace directories. Because blob shard paths are absolute and object `.ndx` records are immutable, fragment rename must never require rewriting existing object metadata.
 
 ## Fragment Record
 
 `.fragment.ndx` is the per-fragment control record. It stores fragment-level operational state such as quota/project identity, state, timestamps, key material metadata, and index partition count.
 
-`.fragment.ndx` is not object truth and not namespace truth.
+`.fragment.ndx` also records the stable physical fragment identity. It is not object truth and not namespace truth.
 
 ## Namespace Plane
 
@@ -127,7 +133,9 @@ Reserved internal names are rejected in user paths:
 .intents
 .trash-jobs
 .blobs
+.fragment
 @o_*
+@f_*
 ```
 
 ## Object Index Plane
@@ -171,7 +179,8 @@ Normal listing opens the requested namespace directory and reads direct children
 
 ```text
 prefix=docs/
-open <root>/<fragment>/docs/
+resolve <root>/.fragment/<fragment_hash> -> @f_<stable_fragment_id>
+open <root>/@f_<stable_fragment_id>/docs/
 read direct children
 ```
 

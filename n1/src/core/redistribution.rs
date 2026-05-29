@@ -6,6 +6,7 @@ use crate::core::disk_manager::{
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::fragment_metadata::{
     fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
 };
@@ -730,8 +731,7 @@ fn get_shard_dir_custom(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root
-        .join(fragment_hash)
+    fragment_root_on(disk_root, fragment_hash)
         .join(N1_BLOB_DIR)
         .join(version_id)
 }
@@ -777,7 +777,7 @@ fn get_partition_intent_paths_custom(
     selected
         .into_iter()
         .map(|root| {
-            root.join(fragment_hash)
+            fragment_root_on(root, fragment_hash)
                 .join(".intents")
                 .join(format!("partition_{partition_id:04x}.n1"))
         })
@@ -819,7 +819,7 @@ fn object_index_dir_for_root(
         .strip_prefix("@o_")
         .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
     index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
-        root.join(fragment_hash)
+        fragment_root_on(root, fragment_hash)
             .join(".objects")
             .join(".invalid-object-id")
     })
@@ -940,7 +940,7 @@ pub async fn collect_redistribution_intent_debt(
                 continue;
             }
             let scan_root = if let Some(fragment) = target_fragment.as_ref() {
-                let scoped = root.join(fragment).join(".intents");
+                let scoped = fragment_root_on(&root, fragment).join(".intents");
                 if !scoped.exists() {
                     continue;
                 }
@@ -1023,7 +1023,7 @@ async fn replay_pending_intents_for_fragment(
 ) -> Result<(), AppError> {
     let mut intent_files = Vec::<PathBuf>::new();
     for root in live_index {
-        let intent_dir = root.join(fragment_hash).join(".intents");
+        let intent_dir = fragment_root_on(root, fragment_hash).join(".intents");
         if !intent_dir.exists() {
             continue;
         }
@@ -1429,7 +1429,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join(N1_BLOB_DIR);
+            let blob_dir = fragment_root_on(&root, &fragment).join(N1_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -2765,6 +2765,7 @@ mod tests {
         parse_scope_param, reachable_roots,
     };
     use crate::core::constants::FRAGMENT_METADATA_FILE;
+    use crate::core::fragment_identity::fragment_root_on;
     use std::collections::HashMap;
     use std::fs;
     use ulid::Ulid;
@@ -2954,7 +2955,7 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
         let write_intent = |fragment: &str, object_key: &str, phase: &str| {
-            let intent_dir = index_root.join(fragment).join(".intents");
+            let intent_dir = fragment_root_on(&index_root, fragment).join(".intents");
             fs::create_dir_all(&intent_dir).expect("create intent dir");
             let intent = RedistributionIntent {
                 tx_id: Ulid::new().to_string(),

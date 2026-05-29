@@ -1,5 +1,6 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX, N1_BLOB_DIR};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
@@ -355,7 +356,7 @@ pub async fn stop_garbage_collector(
 }
 
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
-    disk_root.join(fragment_hash).join(".trash")
+    fragment_root_on(disk_root, fragment_hash).join(".trash")
 }
 
 fn trash_deleted_age(deleted_at: i64, now_unix: i64) -> Duration {
@@ -921,7 +922,7 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let live_path = root.join(fragment).join(N1_BLOB_DIR).join(ver);
+            let live_path = fragment_root_on(root, fragment).join(N1_BLOB_DIR).join(ver);
             let trash_path = get_trash_root(root, fragment).join(N1_BLOB_DIR).join(ver);
             if live_path.exists() {
                 let _ = std::fs::remove_dir_all(&live_path);
@@ -934,7 +935,7 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let live_path = root.join(fragment).join(N1_BLOB_DIR).join(ver);
+            let live_path = fragment_root_on(root, fragment).join(N1_BLOB_DIR).join(ver);
             let trash_path = get_trash_root(root, fragment).join(N1_BLOB_DIR).join(ver);
             if live_path.exists() {
                 let _ = std::fs::remove_dir_all(&live_path);
@@ -976,7 +977,7 @@ async fn process_fragment_gc(
         if should_stop_gc() {
             return stats;
         }
-        let blob_root = root.join(fragment).join(N1_BLOB_DIR);
+        let blob_root = fragment_root_on(root, fragment).join(N1_BLOB_DIR);
         if !blob_root.exists() {
             continue;
         }
