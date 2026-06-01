@@ -17,8 +17,8 @@ use cli_core::models::{
 };
 
 use crate::args::{
-    Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, JobAction, NamespaceCommands,
-    ObjectCommands, RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg,
+    Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, GcArgs, NamespaceCommands,
+    ObjectCommands, RedistributeArgs, RedistributeScopeArg, RepairArgs, RepairModeArg,
     UploadCommands,
 };
 use crate::output::{
@@ -145,6 +145,126 @@ async fn resolve_target_fragment(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| io::Error::other("Pass --fragment <name-or-hash> for this command."))?;
     resolve_n1_auth_fragment(client, base_url, target).await
+}
+
+pub(crate) fn direct_action(
+    status: bool,
+    stop: bool,
+    watch: bool,
+) -> Result<DirectAction, DynError> {
+    let selected = status as u8 + stop as u8 + watch as u8;
+    if selected > 1 {
+        return Err(io::Error::other("Choose only one of --status, --stop, or --watch.").into());
+    }
+    if status {
+        Ok(DirectAction::Status)
+    } else if stop {
+        Ok(DirectAction::Stop)
+    } else if watch {
+        Ok(DirectAction::Watch)
+    } else {
+        Ok(DirectAction::Start)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DirectAction {
+    Start,
+    Status,
+    Stop,
+    Watch,
+}
+
+pub(crate) fn selected_repair_mode(args: &RepairArgs) -> Result<Option<RepairModeArg>, DynError> {
+    let selected =
+        args.availability as u8 + args.checksum as u8 + args.strict as u8 + args.scrub as u8;
+    if selected > 1 {
+        return Err(io::Error::other(
+            "Choose only one repair mode: --availability, --checksum, --strict, or --scrub.",
+        )
+        .into());
+    }
+    Ok(if args.availability {
+        Some(RepairModeArg::Availability)
+    } else if args.checksum {
+        Some(RepairModeArg::Checksum)
+    } else if args.strict {
+        Some(RepairModeArg::Strict)
+    } else if args.scrub {
+        Some(RepairModeArg::Scrub)
+    } else {
+        None
+    })
+}
+
+pub(crate) fn selected_execution_mode(
+    args: &RedistributeArgs,
+) -> Result<Option<ExecutionModeArg>, DynError> {
+    let selected = args.availability as u8 + args.strict as u8 + args.scrub as u8;
+    if selected > 1 {
+        return Err(io::Error::other(
+            "Choose only one redistribution mode: --availability, --strict, or --scrub.",
+        )
+        .into());
+    }
+    Ok(if args.availability {
+        Some(ExecutionModeArg::Availability)
+    } else if args.strict {
+        Some(ExecutionModeArg::Strict)
+    } else if args.scrub {
+        Some(ExecutionModeArg::Scrub)
+    } else {
+        None
+    })
+}
+
+pub(crate) fn selected_gc_mode(args: &GcArgs) -> Result<Option<&'static str>, DynError> {
+    let selected = args.availability as u8 + args.strict as u8 + args.scrub as u8;
+    if selected > 1 {
+        return Err(io::Error::other(
+            "Choose only one GC mode: --availability, --strict, or --scrub.",
+        )
+        .into());
+    }
+    Ok(if args.availability {
+        Some("availability")
+    } else if args.strict {
+        Some("strict")
+    } else if args.scrub {
+        Some("scrub")
+    } else {
+        None
+    })
+}
+
+async fn maintenance_target_fragment(
+    client: &Client,
+    base_url: &str,
+    cli: &Cli,
+    none: bool,
+) -> Result<Option<String>, DynError> {
+    if none {
+        return Ok(None);
+    }
+    resolve_target_fragment(client, base_url, cli)
+        .await
+        .map(Some)
+}
+
+pub(crate) fn build_gc_start_query(
+    fragment: Option<&str>,
+    mode: Option<&str>,
+    fast_mode: bool,
+) -> Vec<(String, String)> {
+    let mut query = Vec::new();
+    push_query_value(
+        &mut query,
+        "fragment",
+        fragment.filter(|value| !value.trim().is_empty()),
+    );
+    push_query_value(&mut query, "mode", mode);
+    push_query_flag(&mut query, "fast_mode", fast_mode);
+    query
 }
 
 async fn handle_fragment_command(
@@ -358,14 +478,22 @@ async fn handle_authenticated_command(
                 print_output(cli.json, &status, &format_upload_status(&status))
             }
         },
-        Commands::Gc { action } => match action {
-            JobAction::Start => {
-                send_without_body(
+        Commands::Gc(args) => match direct_action(args.status, args.stop, args.watch)? {
+            DirectAction::Start => {
+                let fragment =
+                    maintenance_target_fragment(client, base_url, cli, args.none).await?;
+                let query = build_gc_start_query(
+                    fragment.as_deref(),
+                    selected_gc_mode(args)?,
+                    args.fast_mode,
+                );
+                send_query_only(
                     client,
                     base_url,
                     session,
                     Method::POST,
                     &api_url(base_url, "/n1/maintenance/gc/start"),
+                    &query,
                 )
                 .await?;
                 watch_rendered::<GcJobStatus, _, _>(
@@ -380,7 +508,7 @@ async fn handle_authenticated_command(
                 )
                 .await
             }
-            JobAction::Status => {
+            DirectAction::Status => {
                 let status: GcJobStatus = fetch_json(
                     client,
                     base_url,
@@ -390,7 +518,7 @@ async fn handle_authenticated_command(
                 .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
             }
-            JobAction::Stop => {
+            DirectAction::Stop => {
                 send_without_body(
                     client,
                     base_url,
@@ -400,7 +528,7 @@ async fn handle_authenticated_command(
                 )
                 .await
             }
-            JobAction::Watch => {
+            DirectAction::Watch => {
                 watch_rendered::<GcJobStatus, _, _>(
                     client,
                     base_url,
@@ -414,12 +542,14 @@ async fn handle_authenticated_command(
                 .await
             }
         },
-        Commands::Repair { action } => match action {
-            RepairAction::Start(args) => {
+        Commands::Repair(args) => match direct_action(args.status, args.stop, args.watch)? {
+            DirectAction::Start => {
+                let fragment =
+                    maintenance_target_fragment(client, base_url, cli, args.none).await?;
                 let query = build_repair_start_query(
                     args.dry_run,
-                    cli.fragment.as_deref(),
-                    args.mode,
+                    fragment.as_deref(),
+                    selected_repair_mode(args)?,
                     args.fast_mode,
                     args.read_only_fast,
                     args.meta_concurrency,
@@ -447,7 +577,7 @@ async fn handle_authenticated_command(
                 )
                 .await
             }
-            RepairAction::Status => {
+            DirectAction::Status => {
                 let status: RepairJobStatus = fetch_json(
                     client,
                     base_url,
@@ -457,7 +587,7 @@ async fn handle_authenticated_command(
                 .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
             }
-            RepairAction::Stop => {
+            DirectAction::Stop => {
                 send_without_body(
                     client,
                     base_url,
@@ -467,7 +597,7 @@ async fn handle_authenticated_command(
                 )
                 .await
             }
-            RepairAction::Watch => {
+            DirectAction::Watch => {
                 watch_rendered::<RepairJobStatus, _, _>(
                     client,
                     base_url,
@@ -481,12 +611,14 @@ async fn handle_authenticated_command(
                 .await
             }
         },
-        Commands::Redistribute { action } => match action {
-            RedistributeAction::Start(args) => {
+        Commands::Redistribute(args) => match direct_action(args.status, args.stop, args.watch)? {
+            DirectAction::Start => {
+                let fragment =
+                    maintenance_target_fragment(client, base_url, cli, args.none).await?;
                 let query = build_redistribution_start_query(
                     args.dry_run,
-                    cli.fragment.as_deref(),
-                    args.mode,
+                    fragment.as_deref(),
+                    selected_execution_mode(args)?,
                     args.fast_mode,
                     args.read_only_fast,
                     args.durability,
@@ -515,7 +647,7 @@ async fn handle_authenticated_command(
                 )
                 .await
             }
-            RedistributeAction::Status => {
+            DirectAction::Status => {
                 let status: RedistributionJobStatus = fetch_json(
                     client,
                     base_url,
@@ -525,7 +657,7 @@ async fn handle_authenticated_command(
                 .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
             }
-            RedistributeAction::Stop => {
+            DirectAction::Stop => {
                 send_without_body(
                     client,
                     base_url,
@@ -535,7 +667,7 @@ async fn handle_authenticated_command(
                 )
                 .await
             }
-            RedistributeAction::Watch => {
+            DirectAction::Watch => {
                 watch_rendered::<RedistributionJobStatus, _, _>(
                     client,
                     base_url,

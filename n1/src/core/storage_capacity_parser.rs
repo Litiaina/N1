@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use crate::{
     core::{
         disk_manager::CapacityUsageResponse,
+        fragment_metadata::resolve_stable_fragment_id,
         index_store,
         quota_manager::{
             FragmentBlobUsage, apply_fragment_project_quota, fragment_quota_backend,
@@ -138,6 +139,8 @@ pub async fn resize_fragment_quota(
     AxumPath(fragment): AxumPath<String>,
     Json(payload): Json<ResizeFragmentQuotaRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let fragment = resolve_stable_fragment_id(&fragment).await?;
+
     if payload.secret != *MASTER_KEY {
         return Err(AppError::Forbidden(
             "Master Secret required to resize fragment quota".into(),

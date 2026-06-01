@@ -94,9 +94,13 @@ fn decode_index_fragment_meta(raw: &[u8]) -> Result<IndexFragmentMeta, AppError>
 }
 
 fn fragment_metadata_from_index(meta: IndexFragmentMeta) -> FragmentMetadata {
+    let stable_fragment_id = meta
+        .stable_fragment_id
+        .clone()
+        .or_else(|| Some(meta.fragment_id.clone()));
     FragmentMetadata {
         fragment: meta.fragment_id,
-        stable_fragment_id: meta.stable_fragment_id,
+        stable_fragment_id,
         key_phc: meta.key_phc.unwrap_or_default(),
         nt_hash_hex: meta.nt_hash_hex,
         index_partition_count: meta
@@ -105,6 +109,21 @@ fn fragment_metadata_from_index(meta: IndexFragmentMeta) -> FragmentMetadata {
         created: unix_to_rfc3339(meta.created_at_unix),
         updated: Some(unix_to_rfc3339(meta.updated_at_unix)),
     }
+}
+
+fn normalize_fragment_metadata_identity(
+    mut meta: FragmentMetadata,
+    root: &Path,
+    requested_fragment: &str,
+) -> FragmentMetadata {
+    let stable = meta
+        .stable_fragment_id
+        .clone()
+        .or_else(|| fragment_identity::stable_fragment_id_for_root(root, requested_fragment))
+        .unwrap_or_else(|| meta.fragment.clone());
+    meta.fragment = stable.clone();
+    meta.stable_fragment_id = Some(stable);
+    meta
 }
 
 fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
@@ -264,15 +283,14 @@ pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetad
             .await
             .map_err(|e| AppError::Io(e, format!("read {}", p.display())))?;
 
-        let mut meta = decode_fragment_metadata(&raw)?;
+        let meta = decode_fragment_metadata(&raw)?;
 
         if !meta.key_phc.trim().is_empty() {
-            meta.fragment = fragment_hash.to_string();
-            if meta.stable_fragment_id.is_none() {
-                meta.stable_fragment_id =
-                    fragment_identity::stable_fragment_id_for_root(&root, fragment_hash);
-            }
-            return Ok(meta);
+            return Ok(normalize_fragment_metadata_identity(
+                meta,
+                &root,
+                fragment_hash,
+            ));
         }
     }
 
@@ -291,18 +309,25 @@ pub fn read_fragment_metadata_sync(fragment_hash: &str) -> Result<FragmentMetada
 
         let raw =
             std::fs::read(&p).map_err(|e| AppError::Io(e, format!("read {}", p.display())))?;
-        let mut meta = decode_fragment_metadata(&raw)?;
+        let meta = decode_fragment_metadata(&raw)?;
         if !meta.key_phc.trim().is_empty() {
-            meta.fragment = fragment_hash.to_string();
-            if meta.stable_fragment_id.is_none() {
-                meta.stable_fragment_id =
-                    fragment_identity::stable_fragment_id_for_root(&root, fragment_hash);
-            }
-            return Ok(meta);
+            return Ok(normalize_fragment_metadata_identity(
+                meta,
+                &root,
+                fragment_hash,
+            ));
         }
     }
 
     Err(AppError::NotFound)
+}
+
+pub async fn resolve_stable_fragment_id(fragment: &str) -> Result<String, AppError> {
+    Ok(read_fragment_metadata(fragment).await?.fragment)
+}
+
+pub fn resolve_stable_fragment_id_sync(fragment: &str) -> Result<String, AppError> {
+    Ok(read_fragment_metadata_sync(fragment)?.fragment)
 }
 
 pub fn fragment_index_partition_count(fragment_hash: &str) -> Result<u16, AppError> {

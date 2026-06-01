@@ -48,6 +48,12 @@ fn symlink_target_dir_name(link_path: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+pub fn fragment_alias_target_stable_id(root: &Path, fragment_hash: &str) -> Option<String> {
+    symlink_target_dir_name(&fragment_alias_path(root, fragment_hash))
+        .as_deref()
+        .and_then(physical_fragment_id_from_dir_name)
+}
+
 pub fn resolve_physical_fragment_dir_name(root: &Path, fragment_hash: &str) -> String {
     if fragment_hash.starts_with(PHYSICAL_FRAGMENT_PREFIX) {
         return fragment_hash.to_string();
@@ -70,6 +76,20 @@ pub fn fragment_root_on(root: &Path, fragment_hash: &str) -> PathBuf {
 }
 
 pub fn stable_fragment_id_for_root(root: &Path, fragment_hash: &str) -> Option<String> {
+    if let Some(stable) = physical_fragment_id_from_dir_name(fragment_hash) {
+        return physical_fragment_root_on(root, &stable)
+            .exists()
+            .then_some(stable);
+    }
+
+    if physical_fragment_root_on(root, fragment_hash).exists() {
+        return Some(fragment_hash.to_string());
+    }
+
+    if let Some(stable) = fragment_alias_target_stable_id(root, fragment_hash) {
+        return Some(stable);
+    }
+
     let dir = resolve_physical_fragment_dir_name(root, fragment_hash);
     physical_fragment_id_from_dir_name(&dir)
 }
@@ -89,6 +109,21 @@ pub fn list_fragment_aliases(root: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+pub fn remove_fragment_aliases_for_stable_id(root: &Path, stable_fragment_id: &str) {
+    let alias_dir = fragment_alias_dir(root);
+    let Ok(entries) = fs::read_dir(alias_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if fragment_alias_target_stable_id(root, &name).as_deref() == Some(stable_fragment_id) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub async fn ensure_fragment_identity_on_root(

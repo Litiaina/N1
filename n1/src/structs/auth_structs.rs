@@ -28,6 +28,8 @@ pub struct LoginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub fragment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_alias: Option<String>,
     pub read: bool,
     pub write: bool,
     pub modify: bool,

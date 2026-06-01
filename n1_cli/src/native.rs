@@ -15,13 +15,14 @@ use cli_core::models::{
 };
 
 use crate::args::{
-    Cli, Commands, FragmentCommands, JobAction, NamespaceCommands, ObjectCommands,
-    RedistributeAction, RepairAction, UploadCommands,
+    Cli, Commands, FragmentCommands, NamespaceCommands, ObjectCommands, UploadCommands,
 };
 use crate::client::{
-    FragmentHashLookupRequest, FragmentHashLookupResponse, ResizeFragmentQuotaRequest,
-    build_redistribution_start_query, build_repair_start_query, looks_like_fragment_hash,
-    resolve_cli_auth_fragment_hint,
+    DirectAction, FragmentHashLookupRequest, FragmentHashLookupResponse,
+    ResizeFragmentQuotaRequest, build_gc_start_query, build_redistribution_start_query,
+    build_repair_start_query, direct_action, looks_like_fragment_hash,
+    resolve_cli_auth_fragment_hint, selected_execution_mode, selected_gc_mode,
+    selected_repair_mode,
 };
 use crate::output::{
     format_gc_status, format_health, format_health_watch_line, format_redistribution_status,
@@ -155,6 +156,25 @@ async fn resolve_n1_auth_fragment_native(
     Ok(response.fragment_hash)
 }
 
+async fn maintenance_target_fragment_native(
+    client: &mut N1NativeClient,
+    cli: &Cli,
+    none: bool,
+) -> Result<Option<String>, DynError> {
+    if none {
+        return Ok(None);
+    }
+    let target = cli
+        .fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("Pass --none or --fragment <name-or-hash>."))?;
+    resolve_n1_auth_fragment_native(client, target)
+        .await
+        .map(Some)
+}
+
 async fn handle_native_authenticated_command(
     client: &mut N1NativeClient,
     cli: &Cli,
@@ -276,11 +296,16 @@ async fn handle_native_authenticated_command(
                 print_output(cli.json, &status, &format_upload_status(&status))
             }
         },
-        Commands::Gc { action } => match action {
-            JobAction::Start => {
-                let response = client
-                    .mapped_request(Method::POST, "/n1/maintenance/gc/start", None)
-                    .await?;
+        Commands::Gc(args) => match direct_action(args.status, args.stop, args.watch)? {
+            DirectAction::Start => {
+                let fragment = maintenance_target_fragment_native(client, cli, args.none).await?;
+                let query = build_gc_start_query(
+                    fragment.as_deref(),
+                    selected_gc_mode(args)?,
+                    args.fast_mode,
+                );
+                let path = path_with_query("/n1/maintenance/gc/start", &query);
+                let response = client.mapped_request(Method::POST, &path, None).await?;
                 print_native_response(response)?;
                 native_watch_json::<GcJobStatus, _, _>(
                     client,
@@ -292,18 +317,18 @@ async fn handle_native_authenticated_command(
                 )
                 .await
             }
-            JobAction::Status => {
+            DirectAction::Status => {
                 let status: GcJobStatus = client
                     .mapped_json(Method::GET, "/n1/maintenance/gc/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
             }
-            JobAction::Stop => print_native_response(
+            DirectAction::Stop => print_native_response(
                 client
                     .mapped_request(Method::POST, "/n1/maintenance/gc/stop", None)
                     .await?,
             ),
-            JobAction::Watch => {
+            DirectAction::Watch => {
                 native_watch_json::<GcJobStatus, _, _>(
                     client,
                     "/n1/maintenance/gc/status",
@@ -315,12 +340,13 @@ async fn handle_native_authenticated_command(
                 .await
             }
         },
-        Commands::Repair { action } => match action {
-            RepairAction::Start(args) => {
+        Commands::Repair(args) => match direct_action(args.status, args.stop, args.watch)? {
+            DirectAction::Start => {
+                let fragment = maintenance_target_fragment_native(client, cli, args.none).await?;
                 let query = build_repair_start_query(
                     args.dry_run,
-                    cli.fragment.as_deref(),
-                    args.mode,
+                    fragment.as_deref(),
+                    selected_repair_mode(args)?,
                     args.fast_mode,
                     args.read_only_fast,
                     args.meta_concurrency,
@@ -339,18 +365,18 @@ async fn handle_native_authenticated_command(
                 )
                 .await
             }
-            RepairAction::Status => {
+            DirectAction::Status => {
                 let status: RepairJobStatus = client
                     .mapped_json(Method::GET, "/n1/maintenance/repair/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
             }
-            RepairAction::Stop => print_native_response(
+            DirectAction::Stop => print_native_response(
                 client
                     .mapped_request(Method::POST, "/n1/maintenance/repair/stop", None)
                     .await?,
             ),
-            RepairAction::Watch => {
+            DirectAction::Watch => {
                 native_watch_json::<RepairJobStatus, _, _>(
                     client,
                     "/n1/maintenance/repair/status",
@@ -362,12 +388,13 @@ async fn handle_native_authenticated_command(
                 .await
             }
         },
-        Commands::Redistribute { action } => match action {
-            RedistributeAction::Start(args) => {
+        Commands::Redistribute(args) => match direct_action(args.status, args.stop, args.watch)? {
+            DirectAction::Start => {
+                let fragment = maintenance_target_fragment_native(client, cli, args.none).await?;
                 let query = build_redistribution_start_query(
                     args.dry_run,
-                    cli.fragment.as_deref(),
-                    args.mode,
+                    fragment.as_deref(),
+                    selected_execution_mode(args)?,
                     args.fast_mode,
                     args.read_only_fast,
                     args.durability,
@@ -387,18 +414,18 @@ async fn handle_native_authenticated_command(
                 )
                 .await
             }
-            RedistributeAction::Status => {
+            DirectAction::Status => {
                 let status: RedistributionJobStatus = client
                     .mapped_json(Method::GET, "/n1/maintenance/redistribution/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
             }
-            RedistributeAction::Stop => print_native_response(
+            DirectAction::Stop => print_native_response(
                 client
                     .mapped_request(Method::POST, "/n1/maintenance/redistribution/stop", None)
                     .await?,
             ),
-            RedistributeAction::Watch => {
+            DirectAction::Watch => {
                 native_watch_json::<RedistributionJobStatus, _, _>(
                     client,
                     "/n1/maintenance/redistribution/status",
@@ -688,14 +715,24 @@ fn print_json_value(json_output: bool, value: &Value) -> Result<(), DynError> {
 }
 
 fn print_native_response(response: NativeOpResult) -> Result<(), DynError> {
-    if let Ok(value) = rmp_serde::from_slice::<Value>(&response.body) {
-        println!("{}", serde_json::to_string(&value)?);
+    if response.body.is_empty() {
+        println!("{{\"status\":{}}}", response.status);
+    } else if let Ok(text) = std::str::from_utf8(&response.body)
+        && text
+            .chars()
+            .all(|ch| ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control())
+    {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            println!("{}", serde_json::to_string(&value)?);
+        } else {
+            println!("{}", text.trim());
+        }
     } else if let Ok(value) = serde_json::from_slice::<Value>(&response.body) {
         println!("{}", serde_json::to_string(&value)?);
-    } else if !response.body.is_empty() {
-        println!("{}", String::from_utf8_lossy(&response.body));
+    } else if let Ok(value) = rmp_serde::from_slice::<Value>(&response.body) {
+        println!("{}", serde_json::to_string(&value)?);
     } else {
-        println!("{{\"status\":{}}}", response.status);
+        println!("{}", String::from_utf8_lossy(&response.body));
     }
     Ok(())
 }

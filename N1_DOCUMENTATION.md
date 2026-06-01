@@ -465,6 +465,23 @@ N1-owned tools should use `n1://` when they are running on trusted infrastructur
 
 `n1_cli` uses the shared `n1_native_client` crate. It does not keep a private native frame/auth implementation.
 
+For normal maintenance, use direct commands. The CLI accepts either a fragment name or a fragment hash. `--none` means whole-N1 scope:
+
+```bash
+cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> repair --none --strict --fast-mode
+cargo run -p n1_cli -- --secret <secret> --fragment <fragment-name-or-hash> repair --dry-run --availability
+cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> gc --none --scrub --fast-mode
+cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> redistribute --none --strict --durability strict
+```
+
+Status, stop, and watch are flags, not nested subcommands:
+
+```bash
+cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> repair --status
+cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> gc --watch
+cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> redistribute --stop
+```
+
 `n1_cli` is stateful when opened as a console:
 
 ```bash

@@ -16,6 +16,7 @@ use crate::core::download::{
 use crate::core::fragment_manager::{
     create_fragment, delete_fragment, get_fragment_hash, update_fragment, verify_fragment_existence,
 };
+use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::garbage_collector::{
     get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
 };
@@ -329,8 +330,14 @@ async fn run_fragment_gc(
     Path(fragment): Path<String>,
     Query(mut params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let fragment = match resolve_stable_fragment_id(&fragment).await {
+        Ok(stable) => stable,
+        Err(err) => return err.into_response(),
+    };
     params.insert("fragment".to_string(), fragment);
-    run_garbage_collector(State(state), Query(params)).await
+    run_garbage_collector(State(state), Query(params))
+        .await
+        .into_response()
 }
 
 async fn trigger_fragment_repair_job(
@@ -339,6 +346,7 @@ async fn trigger_fragment_repair_job(
     Path(fragment): Path<String>,
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let fragment = resolve_stable_fragment_id(&fragment).await?;
     params.insert("fragment".to_string(), fragment);
     trigger_repair_job_api(claims, State(state), Query(params)).await
 }
@@ -349,6 +357,7 @@ async fn trigger_fragment_redistribution_job(
     Path(fragment): Path<String>,
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let fragment = resolve_stable_fragment_id(&fragment).await?;
     params.insert("fragment".to_string(), fragment);
     trigger_redistribution_job_api(claims, State(state), Query(params)).await
 }
@@ -359,6 +368,7 @@ async fn get_fragment_health(
     Path(fragment): Path<String>,
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let fragment = resolve_stable_fragment_id(&fragment).await?;
     params.insert("fragment".to_string(), fragment);
     get_system_health(State(state), claims, Query(params)).await
 }
@@ -368,6 +378,7 @@ async fn resize_fragment_quota_scoped(
     Path(fragment): Path<String>,
     AxumJson(payload): AxumJson<ResizeFragmentQuotaRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let fragment = resolve_stable_fragment_id(&fragment).await?;
     resize_fragment_quota_impl(claims, axum::extract::Path(fragment), AxumJson(payload)).await
 }
 
@@ -888,11 +899,14 @@ async fn recover_all_trash_scoped(
 async fn rename_object_scoped(
     State(state): State<Arc<AppState>>,
     claims: Claims,
-    AxumJson(payload): AxumJson<crate::core::disk_manager::RenameObjectRequest>,
+    AxumJson(mut payload): AxumJson<crate::core::disk_manager::RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
+    payload.source_fragment = resolve_stable_fragment_id(&payload.source_fragment).await?;
+    payload.destination_fragment =
+        resolve_stable_fragment_id(&payload.destination_fragment).await?;
     if payload.source_fragment != claims.fragment || payload.destination_fragment != claims.fragment
     {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));

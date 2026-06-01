@@ -18,11 +18,11 @@ use crate::{
         disk_manager::ObjectPathManager,
         fragment_identity::{
             ensure_fragment_identity_on_roots, fragment_alias_path, fragment_root_on,
-            new_stable_fragment_id,
+            new_stable_fragment_id, remove_fragment_aliases_for_stable_id,
         },
         fragment_metadata::{
-            init_fragment_metadata_strict, read_fragment_metadata, rotate_fragment_key,
-            write_fragment_metadata,
+            init_fragment_metadata_strict, read_fragment_metadata, resolve_stable_fragment_id,
+            rotate_fragment_key, write_fragment_metadata,
         },
         index_store::{
             active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
@@ -68,7 +68,8 @@ pub struct UpdateFragmentResponse {
 
 fn validate_delete_fragment_request(
     claims: &Claims,
-    fragment: &str,
+    stable_fragment_id: &str,
+    requested_fragment: &str,
     payload: &DeleteFragmentRequest,
     master_key: &str,
 ) -> Result<(), AppError> {
@@ -77,15 +78,18 @@ fn validate_delete_fragment_request(
             "Delete permission required to delete fragment".into(),
         ));
     }
-    if claims.fragment != fragment {
+    if claims.fragment != stable_fragment_id {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
     if payload.secret != master_key {
         return Err(AppError::Unauthorized);
     }
-    if payload.confirm_fragment != fragment {
+    if payload.confirm_fragment != requested_fragment
+        && payload.confirm_fragment != stable_fragment_id
+    {
         return Err(AppError::BadRequest(
-            "confirm_fragment must exactly match the fragment hash in the URL".into(),
+            "confirm_fragment must exactly match the fragment in the URL or the stable fragment id"
+                .into(),
         ));
     }
     Ok(())
@@ -227,7 +231,7 @@ pub async fn create_fragment(
     apply_fragment_project_quota(&hash, requested_quota, quota_project_id).await?;
     set_fragment_quota(&hash, requested_quota)?;
     if !metadata_exists {
-        let _ = init_fragment_metadata_strict(&hash, &payload.key).await?;
+        let _ = init_fragment_metadata_strict(&stable_fragment_id, &payload.key).await?;
     }
 
     if metadata_exists || index_exists {
@@ -269,7 +273,9 @@ pub async fn update_fragment(
         .map(|s| s == &*MASTER_KEY)
         .unwrap_or(false);
 
-    if !is_admin && claims.fragment != fragment_hash {
+    let current_stable = resolve_stable_fragment_id(&fragment_hash).await?;
+
+    if !is_admin && claims.fragment != current_stable {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
@@ -304,6 +310,7 @@ pub async fn update_fragment(
             let stable_fragment_id = existing_meta
                 .as_ref()
                 .and_then(|meta| meta.stable_fragment_id.clone())
+                .or_else(|| existing_meta.as_ref().map(|meta| meta.fragment.clone()))
                 .ok_or_else(|| {
                     AppError::InternalServerError(format!(
                         "fragment {} has no stable fragment identity",
@@ -346,7 +353,7 @@ pub async fn update_fragment(
                     updated: None,
                 });
 
-            meta.fragment = new_hash.clone();
+            meta.fragment = stable_fragment_id.clone();
             meta.stable_fragment_id = Some(stable_fragment_id);
             write_fragment_metadata(&meta).await?;
 
@@ -387,29 +394,35 @@ pub async fn delete_fragment(
     Path(fragment): Path<String>,
     Json(payload): Json<DeleteFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    validate_delete_fragment_request(&claims, &fragment, &payload, &MASTER_KEY)?;
+    let stable_fragment_id = resolve_stable_fragment_id(&fragment).await?;
+    validate_delete_fragment_request(
+        &claims,
+        &stable_fragment_id,
+        &fragment,
+        &payload,
+        &MASTER_KEY,
+    )?;
 
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
     let blob_roots = path_manager.get_blob_roots();
-    let fragment_owned = fragment.clone();
+    let stable_owned = stable_fragment_id.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        global_namespace_runtime().evict_fragment(&fragment_owned);
+        global_namespace_runtime().evict_fragment(&stable_owned);
 
         for root in index_roots.iter() {
-            let fragment_path = fragment_root_on(root, &fragment_owned);
+            let fragment_path = fragment_root_on(root, &stable_owned);
             if fragment_path.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&fragment_path) {
                     warn!("Failed to delete fragment index {:?}: {}", fragment_path, e);
                 }
             }
-            let alias_path = fragment_alias_path(root, &fragment_owned);
-            let _ = std::fs::remove_file(alias_path);
+            remove_fragment_aliases_for_stable_id(root, &stable_owned);
         }
 
         for root in blob_roots.iter() {
-            let fragment_path = fragment_root_on(root, &fragment_owned);
+            let fragment_path = fragment_root_on(root, &stable_owned);
             if fragment_path.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&fragment_path) {
                     warn!(
@@ -418,8 +431,7 @@ pub async fn delete_fragment(
                     );
                 }
             }
-            let alias_path = fragment_alias_path(root, &fragment_owned);
-            let _ = std::fs::remove_file(alias_path);
+            remove_fragment_aliases_for_stable_id(root, &stable_owned);
         }
 
         Ok(())
@@ -492,6 +504,7 @@ mod tests {
     fn claims(fragment: &str, delete: bool, modify: bool) -> Claims {
         Claims {
             fragment: fragment.to_string(),
+            fragment_alias: None,
             read: true,
             write: true,
             modify,
@@ -515,6 +528,7 @@ mod tests {
         let result = validate_delete_fragment_request(
             &claims(fragment, false, true),
             fragment,
+            fragment,
             &payload,
             "master",
         );
@@ -522,6 +536,7 @@ mod tests {
 
         validate_delete_fragment_request(
             &claims(fragment, true, false),
+            fragment,
             fragment,
             &payload,
             "master",
@@ -536,6 +551,7 @@ mod tests {
         let result = validate_delete_fragment_request(
             &claims(fragment, true, false),
             fragment,
+            fragment,
             &payload,
             "master",
         );
@@ -545,6 +561,7 @@ mod tests {
         payload.confirm_fragment = "other-fragment".to_string();
         let result = validate_delete_fragment_request(
             &claims(fragment, true, false),
+            fragment,
             fragment,
             &payload,
             "master",

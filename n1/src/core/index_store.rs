@@ -9,7 +9,7 @@ use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_BLOB_DIR;
 use crate::core::fragment_identity::{
     FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_root_on as resolved_fragment_root_on,
-    list_fragment_aliases,
+    list_fragment_aliases, stable_fragment_id_for_root,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
@@ -2163,6 +2163,15 @@ fn write_fragment_meta(fragment: &str, meta: &FragmentMeta) -> Result<(), AppErr
     Ok(())
 }
 
+fn stable_fragment_id_for_fragment(fragment: &str) -> String {
+    for root in index_roots() {
+        if let Some(stable) = stable_fragment_id_for_root(&root, fragment) {
+            return stable;
+        }
+    }
+    fragment.to_string()
+}
+
 pub fn fragment_quota_meta(fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
     for root in index_roots() {
         if let Some(meta) = read_fragment_meta_from(&root, fragment)? {
@@ -2175,12 +2184,13 @@ pub fn fragment_quota_meta(fragment: &str) -> Result<Option<FragmentMeta>, AppEr
 pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppError> {
     ensure_fragment_dirs(fragment)?;
     let now = Utc::now().timestamp();
+    let stable_fragment_id = stable_fragment_id_for_fragment(fragment);
     let mut meta = fragment_quota_meta(fragment)?.unwrap_or(FragmentMeta {
-        fragment_id: fragment.to_string(),
-        stable_fragment_id: None,
+        fragment_id: stable_fragment_id.clone(),
+        stable_fragment_id: Some(stable_fragment_id.clone()),
         state: "active".to_string(),
         quota_bytes,
-        quota_project_id: Some(default_project_id(fragment)),
+        quota_project_id: Some(default_project_id(&stable_fragment_id)),
         committed_bytes: 0,
         reserved_bytes: 0,
         trash_bytes: 0,
@@ -2192,16 +2202,19 @@ pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppErr
     });
     meta.quota_bytes = quota_bytes;
     meta.updated_at_unix = now;
+    meta.fragment_id = stable_fragment_id.clone();
+    meta.stable_fragment_id = Some(stable_fragment_id.clone());
     if meta.quota_project_id.is_none() {
-        meta.quota_project_id = Some(default_project_id(fragment));
+        meta.quota_project_id = Some(default_project_id(&stable_fragment_id));
     }
     write_fragment_meta(fragment, &meta)
 }
 
 pub fn ensure_fragment_quota_project_id(fragment: &str) -> Result<u32, AppError> {
+    let stable_fragment_id = stable_fragment_id_for_fragment(fragment);
     let project_id = fragment_quota_meta(fragment)?
         .and_then(|meta| meta.quota_project_id)
-        .unwrap_or_else(|| default_project_id(fragment));
+        .unwrap_or_else(|| default_project_id(&stable_fragment_id));
     let quota = fragment_quota_meta(fragment)?
         .map(|meta| meta.quota_bytes)
         .unwrap_or(0);

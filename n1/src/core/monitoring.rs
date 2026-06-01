@@ -1,8 +1,11 @@
 use crate::core::constants::N1_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
-use crate::core::fragment_identity::{fragment_root_on, list_fragment_aliases};
+use crate::core::fragment_identity::{
+    fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
+};
 use crate::core::fragment_manager::is_fragment_hash;
+use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
 use crate::core::index_store;
@@ -725,10 +728,14 @@ async fn collect_system_health(
     state: &Arc<AppState>,
     params: &HashMap<String, String>,
 ) -> Result<SystemHealthResponse, AppError> {
-    let target_fragment = params
+    let target_fragment = match params
         .get("fragment")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+    {
+        Some(fragment) => Some(resolve_stable_fragment_id(&fragment).await?),
+        None => None,
+    };
     let system_metrics = get_system_metrics().await;
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
@@ -1141,7 +1148,7 @@ async fn collect_upload_runtime_stats(
             }
             for name in list_fragment_aliases(&root) {
                 if is_fragment_hash(&name) {
-                    seen.insert(name);
+                    seen.insert(stable_fragment_id_for_root(&root, &name).unwrap_or(name));
                 }
             }
         }

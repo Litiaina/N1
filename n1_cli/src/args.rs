@@ -17,8 +17,10 @@ Examples:
   litiaina-n1-cli --secret <secret> --fragment mainframe health
   litiaina-n1-cli --secret <secret> --fragment mainframe namespace list --path docs
   litiaina-n1-cli --secret <secret> --fragment mainframe uploads list
-  litiaina-n1-cli --secret <secret> --fragment mainframe repair start --mode availability
-  litiaina-n1-cli --secret <secret> --fragment mainframe redistribute start --mode strict --durability strict
+  litiaina-n1-cli --secret <secret> --fragment mainframe repair --none --strict --fast-mode
+  litiaina-n1-cli --secret <secret> --fragment mainframe repair --fragment mainframe --scrub
+  litiaina-n1-cli --secret <secret> --fragment mainframe gc --none --scrub --fast-mode
+  litiaina-n1-cli --secret <secret> --fragment mainframe redistribute --none --strict --durability strict
   litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health";
 
 #[derive(Parser, Debug)]
@@ -171,30 +173,21 @@ pub enum Commands {
 
     #[command(
         about = "Control garbage collection.",
-        long_about = "Start, stop, or watch the garbage collector. GC is responsible for trash expiry, orphan cleanup, and abandoned multipart cleanup."
+        long_about = "Direct GC control. Use --none for whole-N1 GC or --fragment <name-or-hash> for one fragment. Status, stop, and watch are single flags."
     )]
-    Gc {
-        #[command(subcommand)]
-        action: JobAction,
-    },
+    Gc(GcArgs),
 
     #[command(
         about = "Control repair jobs.",
-        long_about = "Repair scans metadata and blob state, then repairs or reports corruption depending on the selected mode."
+        long_about = "Direct repair control. Use --none for whole-N1 repair or --fragment <name-or-hash> for one fragment. Mode flags are direct: --availability, --checksum, --strict, or --scrub."
     )]
-    Repair {
-        #[command(subcommand)]
-        action: RepairAction,
-    },
+    Repair(RepairArgs),
 
     #[command(
         about = "Control redistribution jobs.",
-        long_about = "Redistribution realigns placement after disk or policy changes. Use dry-run first when you want to understand the work before moving data."
+        long_about = "Direct redistribution control. Use --none for whole-N1 redistribution or --fragment <name-or-hash> for one fragment. Redistribution is for placement realignment after disk or policy changes."
     )]
-    Redistribute {
-        #[command(subcommand)]
-        action: RedistributeAction,
-    },
+    Redistribute(RedistributeArgs),
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -333,20 +326,75 @@ pub enum JobAction {
     Watch,
 }
 
-#[derive(Subcommand, Debug, Clone)]
-pub enum RepairAction {
-    #[command(about = "Start a repair job with the chosen mode and tunings.")]
-    Start(RepairStartArgs),
-    #[command(about = "Fetch current repair status once.")]
-    Status,
-    #[command(about = "Request the running repair job to stop.")]
-    Stop,
-    #[command(about = "Continuously watch repair status using --poll-ms.")]
-    Watch,
+#[derive(Args, Debug, Clone)]
+pub struct GcArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run GC across all N1 fragments."
+    )]
+    pub none: bool,
+
+    #[arg(long, default_value_t = false, help = "Fetch current GC status once.")]
+    pub status: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Request the running GC job to stop."
+    )]
+    pub stop: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Continuously watch GC status using --poll-ms."
+    )]
+    pub watch: bool,
+
+    #[arg(long, default_value_t = false, help = "Use availability mode.")]
+    pub availability: bool,
+
+    #[arg(long, default_value_t = false, help = "Use strict maintenance mode.")]
+    pub strict: bool,
+
+    #[arg(long, default_value_t = false, help = "Use scrub maintenance mode.")]
+    pub scrub: bool,
+
+    #[arg(long, default_value_t = false, help = "Use fast-mode GC timing.")]
+    pub fast_mode: bool,
 }
 
 #[derive(Args, Debug, Clone)]
-pub struct RepairStartArgs {
+pub struct RepairArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Repair across all N1 fragments."
+    )]
+    pub none: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fetch current repair status once."
+    )]
+    pub status: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Request the running repair job to stop."
+    )]
+    pub stop: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Continuously watch repair status using --poll-ms."
+    )]
+    pub watch: bool,
+
     #[arg(
         long,
         default_value_t = false,
@@ -354,11 +402,17 @@ pub struct RepairStartArgs {
     )]
     pub dry_run: bool,
 
-    #[arg(
-        long,
-        help = "Repair mode. availability is safest for live traffic; scrub is the deepest pass."
-    )]
-    pub mode: Option<RepairModeArg>,
+    #[arg(long, default_value_t = false, help = "Use availability mode.")]
+    pub availability: bool,
+
+    #[arg(long, default_value_t = false, help = "Use checksum mode.")]
+    pub checksum: bool,
+
+    #[arg(long, default_value_t = false, help = "Use strict mode.")]
+    pub strict: bool,
+
+    #[arg(long, default_value_t = false, help = "Use scrub mode.")]
+    pub scrub: bool,
 
     #[arg(
         long,
@@ -387,20 +441,36 @@ pub struct RepairStartArgs {
     pub batch: Option<usize>,
 }
 
-#[derive(Subcommand, Debug, Clone)]
-pub enum RedistributeAction {
-    #[command(about = "Start a redistribution job with the chosen scope and durability.")]
-    Start(RedistributeStartArgs),
-    #[command(about = "Fetch current redistribution status once.")]
-    Status,
-    #[command(about = "Request the running redistribution job to stop.")]
-    Stop,
-    #[command(about = "Continuously watch redistribution status using --poll-ms.")]
-    Watch,
-}
-
 #[derive(Args, Debug, Clone)]
-pub struct RedistributeStartArgs {
+pub struct RedistributeArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Redistribute across all N1 fragments."
+    )]
+    pub none: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fetch current redistribution status once."
+    )]
+    pub status: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Request the running redistribution job to stop."
+    )]
+    pub stop: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Continuously watch redistribution status using --poll-ms."
+    )]
+    pub watch: bool,
+
     #[arg(
         long,
         default_value_t = false,
@@ -408,11 +478,14 @@ pub struct RedistributeStartArgs {
     )]
     pub dry_run: bool,
 
-    #[arg(
-        long,
-        help = "Execution mode. strict and scrub tighten maintenance access during the run."
-    )]
-    pub mode: Option<ExecutionModeArg>,
+    #[arg(long, default_value_t = false, help = "Use availability mode.")]
+    pub availability: bool,
+
+    #[arg(long, default_value_t = false, help = "Use strict mode.")]
+    pub strict: bool,
+
+    #[arg(long, default_value_t = false, help = "Use scrub mode.")]
+    pub scrub: bool,
 
     #[arg(
         long,
