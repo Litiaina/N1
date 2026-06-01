@@ -4,7 +4,7 @@ N1 1.0.0 is Litiaina's single-node object storage system. It exposes object-stor
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
-For implementation details, see [N1_ARCHITECTURE.md](N1_ARCHITECTURE.md). For release validation notes, see [N1_VERIFICATION.md](N1_VERIFICATION.md).
+For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). For release validation notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Core Concepts
 
@@ -36,22 +36,74 @@ Run directly for development:
 sudo ./target/release/litiaina-n1
 ```
 
-For production, install N1 as a systemd service:
+## Runtime Files
+
+N1 does not keep machine runtime files in the repository. When N1 starts inside
+a fresh deployment directory, it creates the local files it needs for that
+machine:
+
+- `n1.env` - local secret material.
+- `n1_config.ini` - local machine configuration: ports, disk roots, fragment
+  quota backend, erasure layout, and deployment settings.
+
+These files are intentionally ignored by git. Start N1 once in the deployment
+directory to generate them, stop the process, then fill the real machine values
+before installing the service.
+
+Production disks should already be mounted before N1 starts. If XFS quota is
+enabled, mount the disks with project quota support.
+
+## Production Systemd Install
+
+Build the release binary, place it in the deployment directory, and keep
+`n1.env` plus `n1_config.ini` in that same directory. N1 reads those files from
+its working directory by design.
+
+Example deployment directory:
+
+```text
+/home/administrator/SERVERS/N1-SERVER/
+  litiaina-n1
+  n1.env
+  n1_config.ini
+  cert.pem
+  key.pem
+```
+
+Install N1 as a systemd service:
 
 ```bash
 sudo scripts/install-n1-systemd.sh \
   --install-dir /home/administrator/SERVERS/N1-SERVER \
-  --binary ./target/release/litiaina-n1 \
-  --user administrator \
-  --group administrator
+  --enable \
+  --start
 ```
 
-Then:
+The production default runs as root because strict XFS project quota needs
+filesystem quota privileges. Advanced non-root deployments can use
+`--privilege cap-sys-admin --user <user> --group <group>`, but root mode is the
+simple operational path.
+
+Check the service:
 
 ```bash
-sudo systemctl enable --now litiaina-n1.service
+sudo systemctl status litiaina-n1.service --no-pager --full
 sudo journalctl -u litiaina-n1.service -f
 ```
+
+Installer proof commands:
+
+```bash
+bash -n scripts/install-n1-systemd.sh
+sudo scripts/install-n1-systemd.sh \
+  --install-dir /home/administrator/SERVERS/N1-SERVER \
+  --dry-run \
+  --skip-quota-preflight
+```
+
+`--dry-run` renders the exact unit without installing it. A real install also
+preflights XFS project quota unless `fragment_quota_backend=disabled` or
+`--skip-quota-preflight` is supplied.
 
 ## Configuration
 

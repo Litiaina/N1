@@ -1,6 +1,6 @@
 # N1 Object Storage Architecture
 
-This document describes how N1 stores object metadata, namespace state, and payloads on disk. Operators should start with [N1_DOCUMENTATION.md](N1_DOCUMENTATION.md). This document is for maintainers, reviewers, and administrators who need to reason about repair, GC, redistribution, and failure recovery.
+This document describes how N1 stores object metadata, namespace state, and payloads on disk. Operators should start with [DOCUMENTATION.md](DOCUMENTATION.md). This document is for maintainers, reviewers, and administrators who need to reason about repair, GC, redistribution, and failure recovery.
 
 ## Storage Planes
 

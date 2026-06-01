@@ -30,10 +30,10 @@ through its supported APIs or through the native client crate.
 - `simd-erasure-core/` - internal erasure-coding core used by N1.
 - `cli_core/` - small shared CLI support crate used by `n1_cli`.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling.
-- `N1_DOCUMENTATION.md` - user-facing N1 documentation.
-- `N1_ARCHITECTURE.md` - storage architecture and invariants.
-- `N1_TESTING.md` / `N1_VERIFICATION.md` - validation and release evidence.
-- `INSTRUCTIONS.md` - operator flow without committed runtime files.
+- `DOCUMENTATION.md` - user-facing N1 documentation.
+- `ARCHITECTURE.md` - storage architecture and invariants.
+- `TESTING.md` / `VERIFICATION.md` - validation and release evidence.
+- `deploy/systemd/` and `scripts/install-n1-systemd.sh` - production service installation.
 
 ## Storage Identity
 
@@ -86,7 +86,7 @@ directory. Those files are machine-local and intentionally ignored by this repo.
 ./target/release/litiaina-n1
 ```
 
-See `INSTRUCTIONS.md` for the deployment flow.
+See [DOCUMENTATION.md](DOCUMENTATION.md) for setup, runtime files, and production service installation.
 
 ## Validation
 
@@ -115,7 +115,7 @@ against temporary development directories.
 
 Start here:
 
-- [N1_DOCUMENTATION.md](N1_DOCUMENTATION.md)
-- [N1_ARCHITECTURE.md](N1_ARCHITECTURE.md)
-- [INSTRUCTIONS.md](INSTRUCTIONS.md)
-- [N1_VERIFICATION.md](N1_VERIFICATION.md)
+- [DOCUMENTATION.md](DOCUMENTATION.md)
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [TESTING.md](TESTING.md)
+- [VERIFICATION.md](VERIFICATION.md)

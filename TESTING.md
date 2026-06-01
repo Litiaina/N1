@@ -2,7 +2,7 @@
 
 N1 tests are split into three gates. A green in-process suite is useful, but it is not a production release signal by itself.
 
-The active N1 architecture uses real namespace directories, symlink object pointers, immutable `.ndx` object records, and explicit `.blobs` payload roots. Release evidence must inspect those N1 planes directly. Do not use retired Standard/indexdb table inspection as current N1 release evidence.
+N1 release evidence must inspect the namespace, object index, upload receipt, and blob planes directly. The public API, native protocol, on-disk layout, and maintenance paths all need to agree before a build is considered release-worthy.
 
 ## Gate 1: In-Process Regression Suite
 

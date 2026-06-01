@@ -232,6 +232,16 @@ validate_paths() {
   [[ -n "$RUN_USER" ]] || die "--user cannot be empty"
   [[ -n "$RUN_GROUP" ]] || die "--group cannot be empty"
   [[ -n "$RUST_LOG_VALUE" ]] || die "--rust-log cannot be empty"
+
+  local expected_env expected_config
+  expected_env="$(cd "$INSTALL_DIR" && pwd -P)/n1.env"
+  expected_config="$(cd "$INSTALL_DIR" && pwd -P)/n1_config.ini"
+  [[ "$(cd "$(dirname "$ENV_FILE")" && pwd -P)/$(basename "$ENV_FILE")" == "$expected_env" ]] || {
+    die "N1 reads n1.env from its working directory; place it at ${INSTALL_DIR}/n1.env"
+  }
+  [[ "$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)/$(basename "$CONFIG_FILE")" == "$expected_config" ]] || {
+    die "N1 reads n1_config.ini from its working directory; place it at ${INSTALL_DIR}/n1_config.ini"
+  }
 }
 
 validate_privilege_mode() {
