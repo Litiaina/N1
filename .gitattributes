@@ -1,0 +1,6 @@
+# Keep generated binary artifacts out of language statistics.
+*.bin binary
+*.receipt binary
+*.shard binary
+*.parity binary
+*.ndx binary
