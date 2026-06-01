@@ -7,10 +7,7 @@
   />
   <h1>Litiaina N1</h1>
   <p>
-    Single-node object storage system for Litiaina: stable object identity,
-    namespace operations, multipart uploads, erasure-coded payloads, repair,
-    lifecycle garbage collection, and a native <code>n1://</code> protocol for
-    trusted internal tools.
+    N1 is a high-performance single-node object storage system built for durable, redundant, namespace-managed, and efficient storage.
   </p>
 </div>
 
