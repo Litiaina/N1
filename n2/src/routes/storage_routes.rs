@@ -28,8 +28,8 @@ use crate::core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
 use crate::core::repair_manager::{
-    get_repair_status_api, inspect_object_status, parse_check_mode, repair_object,
-    stop_repair_job_api, trigger_repair_job_api,
+    get_repair_status_api, parse_check_mode, repair_object, stop_repair_job_api,
+    trigger_repair_job_api,
 };
 use crate::core::retrieve::{
     get_object as get_object_impl, get_object_metadata_direct, list_fragments,
@@ -52,6 +52,7 @@ use crate::distribution::namespace::{
 };
 use crate::distribution::peer::build_peer_routes;
 use crate::distribution::routes::build_cluster_routes;
+use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
     finalize_cluster_upload, initiate_cluster_upload, put_cluster_part, upload_cluster_one_shot,
 };
@@ -705,7 +706,7 @@ async fn get_object_repair_status_scoped(
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_read_key(&fragment, &object_key).await?;
     let metadata = get_object_metadata_direct(&fragment, &physical).await?;
-    let mut status = inspect_object_status(&metadata, parse_check_mode(&params)).await?;
+    let mut status = inspect_cluster_object_status(&metadata, parse_check_mode(&params)).await?;
     status.object_key = object_key.trim_start_matches('/').to_string();
     Ok(AxumJson(status))
 }

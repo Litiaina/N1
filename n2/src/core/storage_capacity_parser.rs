@@ -8,8 +8,8 @@ use crate::{
         fragment_metadata::resolve_stable_fragment_id,
         index_store,
         quota_manager::{
-            FragmentBlobUsage, apply_fragment_project_quota, fragment_quota_backend,
-            fragment_quota_enforcement_enabled, get_fragment_blob_usage, get_storage_usage,
+            FragmentBlobUsage, fragment_quota_backend, fragment_quota_enforcement_enabled,
+            get_fragment_blob_usage, get_storage_usage,
         },
     },
     enums::app_error_enum::AppError,
@@ -143,19 +143,13 @@ pub async fn resize_fragment_quota(
 
     if payload.secret != *MASTER_KEY {
         return Err(AppError::Forbidden(
-            "Master Secret required to resize fragment quota".into(),
-        ));
-    }
-
-    if payload.quota_bytes == 0 {
-        return Err(AppError::BadRequest(
-            "quota_bytes must be greater than 0".to_string(),
+            "Master Secret required to update fragment usage target".into(),
         ));
     }
 
     if claims.fragment != fragment && !claims.modify {
         return Err(AppError::Forbidden(
-            "Modify permission required to resize fragment quota".into(),
+            "Modify permission required to update fragment usage target".into(),
         ));
     }
 
@@ -174,7 +168,7 @@ pub async fn resize_fragment_quota(
 
     if meta.state != "active" {
         return Err(AppError::Conflict(format!(
-            "fragment quota can only be resized while active; current state is {}",
+            "fragment usage target can only be updated while active; current state is {}",
             meta.state
         )));
     }
@@ -182,13 +176,6 @@ pub async fn resize_fragment_quota(
     let previous_quota_bytes = meta.quota_bytes;
     let blob_usage = get_fragment_blob_usage(&fragment).await?;
     let used_bytes = blob_usage.used_bytes();
-
-    if payload.quota_bytes < used_bytes {
-        return Err(AppError::Conflict(format!(
-            "new quota_bytes {} is below current blob filesystem used_bytes {} (blob {} + trash {})",
-            payload.quota_bytes, used_bytes, blob_usage.live_bytes, blob_usage.trash_bytes
-        )));
-    }
 
     let usage = get_storage_usage().await?;
     let active_quota_bytes = tokio::task::spawn_blocking(index_store::active_fragment_quota_bytes)
@@ -199,37 +186,15 @@ pub async fn resize_fragment_quota(
         .saturating_sub(previous_quota_bytes)
         .saturating_add(payload.quota_bytes);
 
-    if payload.quota_bytes > previous_quota_bytes
-        && next_active_quota_bytes > usage.capacity_allocated
-    {
-        return Err(AppError::InsufficientStorage);
-    }
-
     let changed = payload.quota_bytes != previous_quota_bytes;
     if changed {
-        let project_fragment = fragment.clone();
-        let project_id = tokio::task::spawn_blocking(move || {
-            index_store::ensure_fragment_quota_project_id(&project_fragment)
-        })
-        .await
-        .map_err(|err| AppError::InternalServerError(format!("quota project worker: {err}")))??;
-
-        apply_fragment_project_quota(&fragment, payload.quota_bytes, project_id).await?;
-
         let fragment_for_update = fragment.clone();
         let quota_bytes = payload.quota_bytes;
-        if let Err(err) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             index_store::set_fragment_quota(&fragment_for_update, quota_bytes)
         })
         .await
-        .map_err(|err| AppError::InternalServerError(format!("quota update worker: {err}")))?
-        {
-            if fragment_quota_enforcement_enabled() {
-                let _ =
-                    apply_fragment_project_quota(&fragment, previous_quota_bytes, project_id).await;
-            }
-            return Err(err);
-        }
+        .map_err(|err| AppError::InternalServerError(format!("quota update worker: {err}")))??;
     }
 
     let available_bytes = payload.quota_bytes.saturating_sub(used_bytes);

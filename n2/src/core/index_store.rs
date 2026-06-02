@@ -34,6 +34,7 @@ pub(crate) const TMP_DIR: &str = ".tmp";
 pub(crate) const LOCKS_DIR: &str = ".locks";
 pub(crate) const GC_DIR: &str = ".gc";
 pub(crate) const REPAIR_DIR: &str = ".repair";
+pub(crate) const CLUSTER_DIR: &str = ".cluster";
 const FRAGMENT_META_FILE: &str = ".fragment.ndx";
 const MANIFEST_FILE: &str = "manifest.ndx";
 const BINDING_FILE: &str = "binding.ndx";
@@ -223,6 +224,7 @@ fn reserved_user_segment(segment: &str) -> bool {
         || segment.starts_with(LOCKS_DIR)
         || segment.starts_with(GC_DIR)
         || segment.starts_with(REPAIR_DIR)
+        || segment.starts_with(CLUSTER_DIR)
         || segment.starts_with(INTENTS_DIR)
         || segment.starts_with(TRASH_JOBS_DIR)
 }
@@ -241,6 +243,7 @@ pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
                 | LOCKS_DIR
                 | GC_DIR
                 | REPAIR_DIR
+                | CLUSTER_DIR
                 | INTENTS_DIR
                 | TRASH_JOBS_DIR
                 | FRAGMENT_META_FILE
@@ -3001,6 +3004,7 @@ mod tests {
         assert!(normalize_object_key("docs/@o_bad/file.txt").is_err());
         assert!(normalize_object_key(".trash/video.mp4").is_err());
         assert!(normalize_object_key(".blobs/video.mp4").is_err());
+        assert!(normalize_object_key(".cluster/objects/file.ndx").is_err());
         assert!(normalize_object_key("docs/.repair/file.txt").is_err());
         assert_eq!(
             normalize_object_key("docs/video.mp4").unwrap(),
@@ -3442,6 +3446,7 @@ mod tests {
                 LOCKS_DIR,
                 GC_DIR,
                 REPAIR_DIR,
+                CLUSTER_DIR,
                 INTENTS_DIR,
                 TRASH_JOBS_DIR,
                 BLOB_DIR,

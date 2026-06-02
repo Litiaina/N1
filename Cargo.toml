@@ -1,16 +1,12 @@
 [workspace]
 members = [
-    "block_manager",
-    "n1-arc",
-    "cli_core",
+    "indexdb",
     "registry",
-    "n1",
     "n1_native_client",
-    "n1_cli",
+    "n2_cli",
+    "n2_native_client",
     "n2",
-    "tools/n1-release-proof",
     "simd-erasure-core",
-    "indexdb", "ns",
 ]
 resolver = "2"
 

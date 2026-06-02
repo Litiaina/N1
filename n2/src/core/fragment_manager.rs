@@ -25,11 +25,8 @@ use crate::{
             rotate_fragment_key, write_fragment_metadata,
         },
         index_store::{
-            active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
-            ensure_fragment_quota_project_id, has_any_fragment_index, set_fragment_quota,
-        },
-        quota_manager::{
-            apply_fragment_project_quota, fragment_quota_enforcement_enabled, get_storage_usage,
+            ensure_fragment_owner_partition_available_strict, has_any_fragment_index,
+            set_fragment_quota,
         },
         sync::{
             CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
@@ -159,20 +156,6 @@ async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppEr
     Ok(())
 }
 
-async fn enforce_fragment_quota_request(requested_quota: u64) -> Result<(), AppError> {
-    if requested_quota == 0 {
-        return Ok(());
-    }
-    let usage = get_storage_usage().await?;
-    let active_quota = tokio::task::spawn_blocking(active_fragment_quota_bytes)
-        .await
-        .map_err(|err| AppError::InternalServerError(format!("quota scan task: {err}")))??;
-    if active_quota.saturating_add(requested_quota) > usage.capacity_allocated {
-        return Err(AppError::InsufficientStorage);
-    }
-    Ok(())
-}
-
 pub async fn create_fragment(
     Json(payload): Json<CreateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -200,18 +183,13 @@ pub async fn create_fragment(
         )));
     }
 
-    let requested_quota = payload.quota_bytes.ok_or_else(|| {
-        AppError::BadRequest(
-            "quota_bytes is required when creating a fragment; fragments are quota-bound virtual partitions"
-                .to_string(),
-        )
-    })?;
-    if requested_quota == 0 {
+    if payload.quota_bytes.unwrap_or(0) > 0 {
         return Err(AppError::BadRequest(
-            "quota_bytes must be greater than 0".to_string(),
+            "N2 does not accept fragment quota during creation; use cluster usage monitoring instead"
+                .into(),
         ));
     }
-    enforce_fragment_quota_request(requested_quota).await?;
+    let usage_target_bytes = 0;
 
     let path_manager = ObjectPathManager::new();
     let mut identity_roots = path_manager.get_all_index_roots();
@@ -228,12 +206,10 @@ pub async fn create_fragment(
     prepare_fragment_index_roots_strict(&hash).await?;
     ensure_fragment_blob_directories_strict(&hash).await?;
     ensure_fragment_owner_partition_available_strict(&hash)?;
-    let quota_project_id = ensure_fragment_quota_project_id(&hash)?;
-    apply_fragment_project_quota(&hash, requested_quota, quota_project_id).await?;
-    set_fragment_quota(&hash, requested_quota)?;
     if !metadata_exists {
         let _ = init_fragment_metadata_strict(&stable_fragment_id, &payload.key).await?;
     }
+    set_fragment_quota(&hash, usage_target_bytes)?;
 
     if metadata_exists || index_exists {
         info!(
@@ -246,12 +222,10 @@ pub async fn create_fragment(
             payload.name, hash
         );
     }
-    if fragment_quota_enforcement_enabled() {
-        info!(
-            "Applied filesystem project quota for fragment {} with project_id={} quota_bytes={}",
-            hash, quota_project_id, requested_quota
-        );
-    }
+    info!(
+        "N2 fragment {} usage target set to {} bytes (monitoring only)",
+        hash, usage_target_bytes
+    );
 
     Ok((
         StatusCode::CREATED,

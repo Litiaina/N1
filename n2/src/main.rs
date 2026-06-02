@@ -763,7 +763,9 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
-    tracing::info!("Storage mode: N2 distributed object storage with explicit .blobs payload roots");
+    tracing::info!(
+        "Storage mode: N2 distributed object storage with explicit .blobs payload roots"
+    );
 
     let https_endpoint = format!("https://{}:{}", host, https_port);
     let native_endpoint = format!("n2://{}:{}", host, native_port);
@@ -792,7 +794,7 @@ pub async fn run_server() {
     configure_fragment_quota_backend(fragment_quota_backend)
         .expect("Double initialization of fragment quota backend");
     tracing::info!(
-        "Fragment quota enforcement: backend={}",
+        "Fragment usage accounting: enforcement=disabled backend_config={}",
         fragment_quota_backend.as_str()
     );
     if let Err(err) = apply_all_fragment_project_quotas().await {

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 
 use crate::core::delete::delete_object_version;
 use crate::core::disk_manager::{
@@ -32,8 +33,7 @@ use crate::core::redistribution::{
     get_redist_status, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
 use crate::core::repair_manager::{
-    get_repair_status, inspect_object_status, parse_check_mode, repair_object, stop_repair_job_api,
-    trigger_repair_job_api,
+    get_repair_status, parse_check_mode, repair_object, stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{get_object_metadata_direct, list_fragments};
 use crate::core::storage_capacity_parser::{
@@ -44,12 +44,17 @@ use crate::core::upload::{
     FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
     get_upload_status, initiate_object_upload_direct, list_active_uploads,
     object_upload_part_direct, object_upload_part_reader_direct, object_upload_part_stream_direct,
-    upload_object_one_shot_direct, upload_object_one_shot_reader_direct,
-    upload_object_one_shot_stream_direct,
 };
+use crate::distribution::health::cluster_health_snapshot;
+use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
 };
+use crate::distribution::rebalance::{rebalance_status, repair_status};
+use crate::distribution::resolve_layout;
+use crate::distribution::routes::cluster_usage_snapshot;
+use crate::distribution::status::inspect_cluster_object_status;
+use crate::distribution::upload::upload_cluster_one_shot;
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -165,15 +170,18 @@ where
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
-            let mut metadata = upload_object_one_shot_reader_direct(
+            let body_stream = ReaderStream::new(reader).map(|chunk| {
+                chunk.map_err(|err| AppError::Io(err, "native cluster upload body read".into()))
+            });
+            let mut metadata = upload_cluster_one_shot(
                 claims,
                 fragment.clone(),
                 physical.clone(),
+                string_field(&payload, "content_type")
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
                 upload_part_query_from_payload(&payload)?,
-                string_field(&payload, "content_type"),
-                reader,
+                body_stream,
                 body_len,
-                true,
             )
             .await?;
             let committed_physical =
@@ -237,15 +245,15 @@ where
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
-            let mut metadata = upload_object_one_shot_stream_direct(
+            let mut metadata = upload_cluster_one_shot(
                 claims,
                 fragment.clone(),
                 physical.clone(),
+                string_field(&payload, "content_type")
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
                 upload_part_query_from_payload(&payload)?,
-                string_field(&payload, "content_type"),
                 body_stream,
                 body_len,
-                true,
             )
             .await?;
             let committed_physical =
@@ -446,7 +454,8 @@ async fn execute_native_op_inner(
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
             let metadata = get_object_metadata_direct(&claims.fragment, &physical).await?;
-            let mut status = inspect_object_status(&metadata, check_mode_payload(&payload)).await?;
+            let mut status =
+                inspect_cluster_object_status(&metadata, check_mode_payload(&payload)).await?;
             status.object_key = object_key.trim_start_matches('/').to_string();
             native_body(status)
         }
@@ -629,14 +638,18 @@ async fn execute_native_op_inner(
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
-            let mut metadata = upload_object_one_shot_direct(
+            let body_len = body.len() as u64;
+            let body_stream =
+                futures_util::stream::once(async move { Ok::<Bytes, AppError>(Bytes::from(body)) });
+            let mut metadata = upload_cluster_one_shot(
                 claims,
                 fragment.clone(),
                 physical.clone(),
+                string_field(&payload, "content_type")
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
                 upload_part_query_from_payload(&payload)?,
-                string_field(&payload, "content_type"),
-                body,
-                true,
+                body_stream,
+                body_len,
             )
             .await?;
             let committed_physical =
@@ -823,6 +836,52 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             native_body(system_health_snapshot(state, claims, params_from_payload(&payload)).await?)
         }
+        "cluster.membership" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            let runtime = active_cluster_runtime()?;
+            native_body(json!({
+                "local_node_id": runtime.local_node_id,
+                "membership_path": runtime.membership_path,
+                "membership": runtime.membership,
+            }))
+        }
+        "cluster.layout" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            let runtime = active_cluster_runtime()?;
+            let active = runtime.membership.active_write_nodes();
+            let layout = resolve_layout(active.len(), &runtime.layout_policy)
+                .map_err(AppError::BadRequest)?;
+            native_body(json!({
+                "membership_epoch": runtime.membership.epoch,
+                "policy": runtime.layout_policy,
+                "active_write_nodes": active.len(),
+                "layout": layout,
+                "adaptive_without_rebalance": true,
+                "automatic_rebalance": runtime.auto_rebalance,
+            }))
+        }
+        "cluster.health" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            let runtime = active_cluster_runtime()?;
+            native_body(cluster_health_snapshot(&runtime)?)
+        }
+        "cluster.usage" => {
+            let claims = claims_required(claims)?;
+            native_body(cluster_usage_snapshot(claims, string_field(&payload, "fragment")).await?)
+        }
+        "cluster.repair.status" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            native_body(repair_status())
+        }
+        "cluster.rebalance.status" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            native_body(rebalance_status())
+        }
         "maintenance.gc.status" => native_body(get_gc_status().await),
         "maintenance.repair.status" => native_body(get_repair_status().await),
         "maintenance.redistribution.status" => native_body(get_redist_status().await),
@@ -866,10 +925,7 @@ async fn execute_native_op_inner(
                 key: required_string(&payload, "key")?,
                 secret: required_string(&payload, "secret")?,
                 stable_fragment_id: string_field(&payload, "stable_fragment_id"),
-                quota_bytes: Some(
-                    u64_field(&payload, "quota_bytes")
-                        .ok_or_else(|| AppError::BadRequest("quota_bytes is required".into()))?,
-                ),
+                quota_bytes: None,
             };
             native_from_response(create_fragment(axum::Json(req)).await?).await
         }

@@ -1,0 +1,16 @@
+[package]
+name = "n2_cli"
+version = "1.0.0"
+edition = "2024"
+
+[[bin]]
+name = "litiaina-n2-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+n2_native_client = { path = "../n2_native_client" }
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

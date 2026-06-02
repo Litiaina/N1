@@ -1,5 +1,10 @@
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{ObjectPathManager, ShardInfo};
+use crate::core::quota_manager::{
+    FragmentBlobUsage, StorageRootUsage, StorageUsage, get_fragment_blob_usage,
+    get_storage_root_usage, get_storage_usage,
+};
+use crate::distribution::membership::active_cluster_runtime;
 use crate::enums::app_error_enum::AppError;
 use crate::protocol::frame::{read_response_body, read_response_control, write_request_control};
 use crate::protocol::types::{NativeRequest, NativeResponse};
@@ -73,6 +78,23 @@ pub struct PeerShardTarget {
     pub shard_index: usize,
     pub is_parity: bool,
     pub expected_len: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PeerUsageQuery {
+    #[serde(default)]
+    pub fragment: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerUsageResponse {
+    pub node_id: String,
+    pub capacity: StorageUsage,
+    pub roots: Vec<StorageRootUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment_usage: Option<FragmentBlobUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +292,25 @@ pub(crate) fn authorize_peer(headers: &HeaderMap) -> Result<(), AppError> {
     }
 }
 
+pub async fn local_peer_usage_snapshot(
+    fragment: Option<String>,
+) -> Result<PeerUsageResponse, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let capacity = get_storage_usage().await?;
+    let roots = get_storage_root_usage().await?;
+    let fragment_usage = match fragment.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(get_fragment_blob_usage(value).await?),
+        _ => None,
+    };
+    Ok(PeerUsageResponse {
+        node_id: runtime.local_node_id.clone(),
+        capacity,
+        roots,
+        fragment,
+        fragment_usage,
+    })
+}
+
 fn encode_segment(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
@@ -435,17 +476,20 @@ async fn native_get_peer_shard(
         body: None,
         body_len: None,
     };
-    timeout(PEER_WRITE_TIMEOUT, write_request_control(&mut stream, &request))
-        .await
-        .map_err(|_| {
-            AppError::ServiceUnavailable(format!(
-                "write N2 native peer get control to {} timed out",
-                locator.node_id
-            ))
-        })?
-        .map_err(|e| {
-            AppError::ServiceUnavailable(format!("write N2 native peer get control failed: {e}"))
-        })?;
+    timeout(
+        PEER_WRITE_TIMEOUT,
+        write_request_control(&mut stream, &request),
+    )
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(format!(
+            "write N2 native peer get control to {} timed out",
+            locator.node_id
+        ))
+    })?
+    .map_err(|e| {
+        AppError::ServiceUnavailable(format!("write N2 native peer get control failed: {e}"))
+    })?;
     let response = timeout(PEER_READ_TIMEOUT, read_native_peer_response(&mut stream))
         .await
         .map_err(|_| {
@@ -662,6 +706,14 @@ pub async fn peer_get_shard(
         .unwrap())
 }
 
+pub async fn peer_usage(
+    headers: HeaderMap,
+    Query(query): Query<PeerUsageQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(local_peer_usage_snapshot(query.fragment).await?))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NativePeerShardPayload {
     #[serde(default)]
@@ -835,10 +887,12 @@ pub fn native_peer_bytes_response(id: String, bytes: Vec<u8>) -> NativeResponse 
 }
 
 pub fn build_peer_routes() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/n2/peer/shards/{:fragment}/{:version_id}/{:part_index}/{:shard_index}",
-        put(peer_put_shard).get(peer_get_shard),
-    )
+    Router::new()
+        .route("/n2/peer/usage", axum::routing::get(peer_usage))
+        .route(
+            "/n2/peer/shards/{:fragment}/{:version_id}/{:part_index}/{:shard_index}",
+            put(peer_put_shard).get(peer_get_shard),
+        )
 }
 
 #[cfg(test)]

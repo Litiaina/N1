@@ -3,13 +3,14 @@ use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index_store;
 use crate::enums::app_error_enum::AppError;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StorageUsage {
     pub capacity_allocated: u64,
     pub capacity_used: u64,
@@ -17,10 +18,20 @@ pub struct StorageUsage {
     pub filesystem_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct FragmentBlobUsage {
     pub live_bytes: u64,
     pub trash_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageRootUsage {
+    pub path: String,
+    pub role: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub usage_percent: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,14 +57,7 @@ impl FragmentQuotaBackend {
     }
 
     fn default_backend() -> Self {
-        #[cfg(test)]
-        {
-            Self::Disabled
-        }
-        #[cfg(not(test))]
-        {
-            Self::XfsProject
-        }
+        Self::Disabled
     }
 
     pub fn as_str(self) -> &'static str {
@@ -85,7 +89,7 @@ pub fn fragment_quota_backend() -> FragmentQuotaBackend {
 }
 
 pub fn fragment_quota_enforcement_enabled() -> bool {
-    fragment_quota_backend() == FragmentQuotaBackend::XfsProject
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,6 +758,48 @@ pub async fn get_storage_usage() -> Result<StorageUsage, AppError> {
 
 pub async fn get_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage, AppError> {
     compute_fragment_blob_usage(fragment).await
+}
+
+pub async fn get_storage_root_usage() -> Result<Vec<StorageRootUsage>, AppError> {
+    let pm = ObjectPathManager::new();
+    let mut roots = Vec::<(PathBuf, String)>::new();
+    roots.extend(
+        pm.get_all_index_roots()
+            .into_iter()
+            .map(|path| (path, "index".to_string())),
+    );
+    roots.extend(
+        pm.get_blob_roots()
+            .into_iter()
+            .map(|path| (path, "blob".to_string())),
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for (path, role) in roots {
+            if !path.exists() {
+                continue;
+            }
+            let (_device_id, total_bytes, available_bytes) = statvfs_totals_sync(&path)?;
+            let used_bytes = total_bytes.saturating_sub(available_bytes);
+            let usage_percent = if total_bytes > 0 {
+                (used_bytes as f64 / total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            out.push(StorageRootUsage {
+                path: path.display().to_string(),
+                role,
+                total_bytes,
+                used_bytes,
+                available_bytes,
+                usage_percent,
+            });
+        }
+        Ok::<Vec<StorageRootUsage>, AppError>(out)
+    })
+    .await
+    .map_err(|err| AppError::InternalServerError(format!("storage root usage task: {err}")))?
 }
 
 pub async fn ensure_capacity_available(required_bytes: u64) -> Result<(), AppError> {

@@ -30,23 +30,15 @@ Desktop.ini
 # Environment variables
 .env
 .env.*
-n1.env
 n2.env
 registry.env
-arc/n1.env
-standard/n1.env
 
 # Config variables
 config.ini
-n1_config.ini
 n2_config.ini
 .ini.*
-arc/n1_config.ini
-arc/n1_config.ini.bak.*
-standard/n1_config.ini
-standard/n1_config.ini.bak.*
-.n1-bench/
 .n2-bench/
 
 # Local runtime/test artifacts
-.n1-local/
+.n2-local/
+.registry-local/

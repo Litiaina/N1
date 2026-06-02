@@ -8,7 +8,7 @@ use crate::core::index::{self, IndexReplicaWriteMode};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::object_layout::write_cluster_object_layout;
-use crate::distribution::peer::{PeerShardTarget, RemoteShardWriter};
+use crate::distribution::peer::{PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator};
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
 use crate::distribution::resolve_layout;
 use crate::enums::app_error_enum::AppError;
@@ -28,6 +28,17 @@ use ulid::Ulid;
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
+pub const CLUSTER_ONE_SHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+fn validate_cluster_one_shot_size(content_length: u64) -> Result<(), AppError> {
+    if content_length > CLUSTER_ONE_SHOT_MAX_BYTES {
+        return Err(AppError::PayloadTooLarge(format!(
+            "Object too large for one-shot upload; use multipart for objects over {} bytes",
+            CLUSTER_ONE_SHOT_MAX_BYTES
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 pub struct DistributedPartWrite {
@@ -48,6 +59,7 @@ struct LocalShardWriter {
     shard_index: usize,
     is_parity: bool,
     expected_len: u64,
+    locator: PeerShardTarget,
 }
 
 impl AsyncWrite for LocalShardWriter {
@@ -101,7 +113,7 @@ impl LocalShardWriter {
         Ok(ShardInfo {
             shard_index: self.shard_index,
             file_name: self.file_name,
-            absolute_path: self.stable_path.to_string_lossy().to_string(),
+            absolute_path: encode_peer_shard_locator(&self.locator),
             size_bytes: self.expected_len,
             checksum,
             is_parity: self.is_parity,
@@ -218,14 +230,7 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
     format!("part_{part_index}_shard_{shard_index}{ext}")
 }
 
-async fn open_local_writer(
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-    shard_index: usize,
-    is_parity: bool,
-    expected_len: u64,
-) -> Result<ClusterShardWriter, AppError> {
+async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter, AppError> {
     let pm = ObjectPathManager::new();
     let roots = pm.get_blob_roots();
     if roots.is_empty() {
@@ -233,12 +238,12 @@ async fn open_local_writer(
             "No blob storage disks configured".into(),
         ));
     }
-    let disk_idx = (part_index as usize + shard_index) % roots.len();
-    let dir = pm.get_shard_dir_on_disk(&roots[disk_idx], fragment, version_id);
+    let disk_idx = (target.part_index as usize + target.shard_index) % roots.len();
+    let dir = pm.get_shard_dir_on_disk(&roots[disk_idx], &target.fragment, &target.version_id);
     fs::create_dir_all(&dir)
         .await
         .map_err(|e| AppError::Io(e, format!("create cluster shard dir {}", dir.display())))?;
-    let file_name = stable_name(part_index, shard_index, is_parity);
+    let file_name = stable_name(target.part_index, target.shard_index, target.is_parity);
     let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
     let stable_path = dir.join(&file_name);
     let file = fs::OpenOptions::new()
@@ -253,9 +258,10 @@ async fn open_local_writer(
         tmp_path,
         stable_path,
         file_name,
-        shard_index,
-        is_parity,
-        expected_len,
+        shard_index: target.shard_index,
+        is_parity: target.is_parity,
+        expected_len: target.expected_len,
+        locator: target,
     }))
 }
 
@@ -271,33 +277,24 @@ async fn open_writers_for_plan(
             placement.role,
             crate::distribution::placement::ClusterShardRole::Parity
         );
+        let target = PeerShardTarget {
+            node_id: placement.node_id.clone(),
+            endpoint: placement
+                .native_endpoint
+                .clone()
+                .unwrap_or_else(|| placement.endpoint.clone()),
+            fragment: plan.fragment.clone(),
+            version_id: plan.version_id.clone(),
+            part_index,
+            shard_index: placement.shard_index,
+            is_parity,
+            expected_len: final_shard_len,
+        };
         if placement.node_id == runtime.local_node_id {
-            writers.push(Some(
-                open_local_writer(
-                    &plan.fragment,
-                    &plan.version_id,
-                    part_index,
-                    placement.shard_index,
-                    is_parity,
-                    final_shard_len,
-                )
-                .await?,
-            ));
+            writers.push(Some(open_local_writer(target).await?));
         } else {
             writers.push(Some(ClusterShardWriter::Remote(RemoteShardWriter::spawn(
-                PeerShardTarget {
-                    node_id: placement.node_id.clone(),
-                    endpoint: placement
-                        .native_endpoint
-                        .clone()
-                        .unwrap_or_else(|| placement.endpoint.clone()),
-                    fragment: plan.fragment.clone(),
-                    version_id: plan.version_id.clone(),
-                    part_index,
-                    shard_index: placement.shard_index,
-                    is_parity,
-                    expected_len: final_shard_len,
-                },
+                target,
             ))));
         }
     }
@@ -542,6 +539,7 @@ where
     if claims.fragment != fragment {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
+    validate_cluster_one_shot_size(content_length)?;
     let runtime = active_cluster_runtime()?;
     let active = runtime.membership.active_write_nodes();
     let layout =
@@ -718,5 +716,11 @@ mod tests {
         assert_eq!(expected_part_size(&m, 0), 64 * 1024 * 1024);
         assert_eq!(expected_part_size(&m, 1), 64 * 1024 * 1024);
         assert_eq!(expected_part_size(&m, 2), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cluster_one_shot_rejects_large_objects() {
+        assert!(validate_cluster_one_shot_size(CLUSTER_ONE_SHOT_MAX_BYTES).is_ok());
+        assert!(validate_cluster_one_shot_size(CLUSTER_ONE_SHOT_MAX_BYTES + 1).is_err());
     }
 }

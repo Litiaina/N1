@@ -9,6 +9,7 @@ pub mod placement;
 pub mod rebalance;
 pub mod repair;
 pub mod routes;
+pub mod status;
 pub mod upload;
 
 pub use layout::{
