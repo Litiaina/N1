@@ -1,5 +1,9 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX, N2_BLOB_DIR};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
+use crate::core::fragment_identity::{
+    fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
+};
+use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
@@ -261,7 +265,18 @@ pub async fn run_garbage_collector(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let target_fragment = parse_gc_target_fragment(&params);
+    let target_fragment = match parse_gc_target_fragment(&params) {
+        Some(fragment) => match resolve_stable_fragment_id(&fragment).await {
+            Ok(stable) => Some(stable),
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("Fragment {} was not found.", fragment),
+                );
+            }
+        },
+        None => None,
+    };
     let execution_mode = parse_gc_execution_mode(&params);
     let fast_mode = parse_bool_param(
         &params,
@@ -272,16 +287,6 @@ pub async fn run_garbage_collector(
         execution_mode,
         fast_mode,
     };
-    if let Some(fragment) = target_fragment.as_ref() {
-        let path_manager = ObjectPathManager::new();
-        if !collect_gc_fragments(&path_manager.get_all_index_roots()).contains(fragment) {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("Fragment {} was not found.", fragment),
-            );
-        }
-    }
-
     if GC_RUNNING.swap(true, Ordering::SeqCst) {
         return (
             StatusCode::CONFLICT,
@@ -355,7 +360,7 @@ pub async fn stop_garbage_collector(
 }
 
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
-    disk_root.join(fragment_hash).join(".trash")
+    fragment_root_on(disk_root, fragment_hash).join(".trash")
 }
 
 fn trash_deleted_age(deleted_at: i64, now_unix: i64) -> Duration {
@@ -619,18 +624,10 @@ async fn perform_gc_scan(
 fn collect_gc_fragments(index_roots: &[PathBuf]) -> HashSet<String> {
     let mut fragments = HashSet::new();
     for root in index_roots {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                let metadata_path = entry.path().join(FRAGMENT_METADATA_FILE);
-                if metadata_path.is_file() {
-                    fragments.insert(name);
-                }
+        for name in list_fragment_aliases(root) {
+            let metadata_path = fragment_root_on(root, &name).join(FRAGMENT_METADATA_FILE);
+            if metadata_path.is_file() {
+                fragments.insert(stable_fragment_id_for_root(root, &name).unwrap_or(name));
             }
         }
     }
@@ -921,7 +918,7 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let live_path = root.join(fragment).join(N2_BLOB_DIR).join(ver);
+            let live_path = fragment_root_on(root, fragment).join(N2_BLOB_DIR).join(ver);
             let trash_path = get_trash_root(root, fragment).join(N2_BLOB_DIR).join(ver);
             if live_path.exists() {
                 let _ = std::fs::remove_dir_all(&live_path);
@@ -934,7 +931,7 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let live_path = root.join(fragment).join(N2_BLOB_DIR).join(ver);
+            let live_path = fragment_root_on(root, fragment).join(N2_BLOB_DIR).join(ver);
             let trash_path = get_trash_root(root, fragment).join(N2_BLOB_DIR).join(ver);
             if live_path.exists() {
                 let _ = std::fs::remove_dir_all(&live_path);
@@ -976,7 +973,7 @@ async fn process_fragment_gc(
         if should_stop_gc() {
             return stats;
         }
-        let blob_root = root.join(fragment).join(N2_BLOB_DIR);
+        let blob_root = fragment_root_on(root, fragment).join(N2_BLOB_DIR);
         if !blob_root.exists() {
             continue;
         }
@@ -1021,7 +1018,11 @@ async fn process_fragment_gc(
 mod tests {
     use super::{GcExecutionMode, GcRunOptions, collect_gc_fragments, parse_gc_execution_mode};
     use crate::core::constants::FRAGMENT_METADATA_FILE;
+    use crate::core::fragment_identity::{
+        fragment_alias_dir, physical_fragment_dir_name, physical_fragment_root_on,
+    };
     use std::fs;
+    use std::os::unix::fs::symlink;
     use std::time::Duration;
     use ulid::Ulid;
 
@@ -1080,16 +1081,23 @@ mod tests {
         fs::create_dir_all(&index_root).expect("create index root");
 
         let real_fragment = "real-fragment";
-        let real_fragment_dir = index_root.join(real_fragment);
+        let stable_fragment = "stable-fragment";
+        let real_fragment_dir = physical_fragment_root_on(&index_root, stable_fragment);
         fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
         fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
             .expect("write fragment metadata marker");
+        fs::create_dir_all(fragment_alias_dir(&index_root)).expect("create alias dir");
+        symlink(
+            std::path::PathBuf::from("..").join(physical_fragment_dir_name(stable_fragment)),
+            fragment_alias_dir(&index_root).join(real_fragment),
+        )
+        .expect("create fragment alias");
 
         fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
         fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
 
         let fragments = collect_gc_fragments(&[index_root]);
-        assert!(fragments.contains(real_fragment));
+        assert!(fragments.contains(stable_fragment));
         assert!(!fragments.contains(".Trash-1000"));
         assert!(!fragments.contains("lost+found"));
 

@@ -21,7 +21,7 @@ This repository contains the storage platform stack built around four runtime co
 
 > - `N1` (`1.0.0`)
   Single-node object storage system with a real N1 namespace, immutable `@f_<stable_fragment_id>` fragment roots, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
-> - `N2` (`0.12.0`)
+> - `N2` (`1.0.0`)
   Standalone distributed object storage system with node-level placement, peer shard transport, distributed upload/read, namespace quorum apply, cluster health, repair, and manual rebalance execution. N1 and N2 are independent Litiaina storage systems with shared design principles, not parent/child runtimes. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
 > - `NS` (`1.0.0`)
   Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
@@ -102,7 +102,7 @@ N1 exposes two supported transport faces:
 
 ### N2
 
-`N2 0.12.0` is Litiaina's distributed object storage line.
+`N2 1.0.0` is Litiaina's distributed object storage line.
 
 It keeps the Litiaina storage principles and makes node placement a first-class cluster concern:
 
@@ -484,7 +484,7 @@ cargo run -p registry
 
 ### N2 Cluster
 
-Use `N2` when you need node-level distributed placement instead of one storage node. `N2 0.12.0` provides native peer shard transport, distributed one-shot and multipart upload, distributed read/reconstruct, guarded namespace quorum apply, cluster health, repair execution, and manual rebalance execution.
+Use `N2` when you need node-level distributed placement instead of one storage node. `N2 1.0.0` provides stable fragment identity, native peer shard transport, distributed one-shot and multipart upload, distributed read/reconstruct, guarded namespace quorum apply, cluster health, repair execution, and manual rebalance execution.
 
 ## Configuration Overview
 
@@ -716,6 +716,6 @@ High-signal proof for the N2 line includes:
 - verification that object records use stable `@o_<object-id>` directories with max-ULID heads
 - verification that N2 does not return to the discarded `disk_shard_0.bin` design
 
-`N2 0.12.0` hardens distributed execution after the reset: native peer shard transport, cluster EC upload, multipart resume, distributed read/reconstruct, guarded namespace quorum apply, persisted repair/rebalance status, `.nmtd` placement records, and focused two-node hardware proof. The long-running proof still needs a longer two-node soak and full node loss/re-add matrix.
+`N2 1.0.0` finalizes distributed execution after the reset: stable fragment identity, native peer shard transport, cluster EC upload, multipart resume, distributed read/reconstruct, guarded namespace quorum apply, persisted repair/rebalance status, `.nmtd` placement records, and focused two-node hardware proof. The long-running proof still needs a longer two-node soak and full node loss/re-add matrix.
 
 If you are touching a subsystem boundary, prefer adding a focused regression test in that subsystem plus a workflow test when the behavior spans storage, namespace, and maintenance.

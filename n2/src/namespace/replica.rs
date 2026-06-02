@@ -27,7 +27,7 @@ pub struct NamespaceReplicaRepairReport {
 }
 
 pub fn namespace_db_path_for_root(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment)
+    index_store::fragment_root_on(root, fragment)
 }
 
 pub fn namespace_db_paths_for_roots(fragment: &str, roots: &[PathBuf]) -> Vec<PathBuf> {

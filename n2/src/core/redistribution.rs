@@ -6,8 +6,12 @@ use crate::core::disk_manager::{
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
+use crate::core::fragment_identity::{
+    fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
+};
 use crate::core::fragment_metadata::{
-    fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
+    fragment_index_partition_count, read_fragment_metadata, resolve_stable_fragment_id,
+    write_fragment_metadata,
 };
 use crate::core::index;
 use crate::core::index_store;
@@ -630,10 +634,14 @@ pub async fn trigger_redistribution_job_api(
     let (max_object_concurrency, max_status_batch) = redistribution_limits_for_ram_gib(ram_gib);
     let durability_mode = parse_durability_mode_param(&params, fast_mode);
     let scope = parse_scope_param(&params);
-    let target_fragment = params
+    let target_fragment = match params
         .get("fragment")
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+    {
+        Some(fragment) => Some(resolve_stable_fragment_id(&fragment).await?),
+        None => None,
+    };
     let mut execution_mode = parse_execution_mode_param(&params);
     if read_only_fast && execution_mode == RedistributionExecutionMode::Availability {
         execution_mode = RedistributionExecutionMode::Strict;
@@ -730,8 +738,7 @@ fn get_shard_dir_custom(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root
-        .join(fragment_hash)
+    fragment_root_on(disk_root, fragment_hash)
         .join(N2_BLOB_DIR)
         .join(version_id)
 }
@@ -777,9 +784,9 @@ fn get_partition_intent_paths_custom(
     selected
         .into_iter()
         .map(|root| {
-            root.join(fragment_hash)
+            fragment_root_on(root, fragment_hash)
                 .join(".intents")
-                .join(format!("partition_{partition_id:04x}.n2"))
+                .join(format!("partition_{partition_id:04x}.n1"))
         })
         .collect()
 }
@@ -819,7 +826,7 @@ fn object_index_dir_for_root(
         .strip_prefix("@o_")
         .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
     index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
-        root.join(fragment_hash)
+        fragment_root_on(root, fragment_hash)
             .join(".objects")
             .join(".invalid-object-id")
     })
@@ -940,7 +947,7 @@ pub async fn collect_redistribution_intent_debt(
                 continue;
             }
             let scan_root = if let Some(fragment) = target_fragment.as_ref() {
-                let scoped = root.join(fragment).join(".intents");
+                let scoped = fragment_root_on(&root, fragment).join(".intents");
                 if !scoped.exists() {
                     continue;
                 }
@@ -1023,7 +1030,7 @@ async fn replay_pending_intents_for_fragment(
 ) -> Result<(), AppError> {
     let mut intent_files = Vec::<PathBuf>::new();
     for root in live_index {
-        let intent_dir = root.join(fragment_hash).join(".intents");
+        let intent_dir = fragment_root_on(root, fragment_hash).join(".intents");
         if !intent_dir.exists() {
             continue;
         }
@@ -1390,18 +1397,10 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
             if !root.exists() {
                 continue;
             }
-            let rd = match std::fs::read_dir(&root) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            for ent in rd.filter_map(|e| e.ok()) {
-                if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(name) = ent.file_name().to_str() {
-                        let metadata_path = ent.path().join(FRAGMENT_METADATA_FILE);
-                        if metadata_path.is_file() {
-                            out.insert(name.to_string());
-                        }
-                    }
+            for name in list_fragment_aliases(&root) {
+                let metadata_path = fragment_root_on(&root, &name).join(FRAGMENT_METADATA_FILE);
+                if metadata_path.is_file() {
+                    out.insert(stable_fragment_id_for_root(&root, &name).unwrap_or(name));
                 }
             }
         }
@@ -1429,7 +1428,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join(N2_BLOB_DIR);
+            let blob_dir = fragment_root_on(&root, &fragment).join(N2_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -2765,8 +2764,12 @@ mod tests {
         parse_scope_param, reachable_roots,
     };
     use crate::core::constants::FRAGMENT_METADATA_FILE;
+    use crate::core::fragment_identity::{
+        fragment_alias_dir, fragment_root_on, physical_fragment_dir_name, physical_fragment_root_on,
+    };
     use std::collections::HashMap;
     use std::fs;
+    use std::os::unix::fs::symlink;
     use ulid::Ulid;
 
     #[test]
@@ -2915,16 +2918,23 @@ mod tests {
         fs::create_dir_all(&index_root).expect("create index root");
 
         let real_fragment = "real-fragment";
-        let real_fragment_dir = index_root.join(real_fragment);
+        let stable_fragment = "stable-fragment";
+        let real_fragment_dir = physical_fragment_root_on(&index_root, stable_fragment);
         fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
         fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
             .expect("write fragment metadata marker");
+        fs::create_dir_all(fragment_alias_dir(&index_root)).expect("create alias dir");
+        symlink(
+            std::path::PathBuf::from("..").join(physical_fragment_dir_name(stable_fragment)),
+            fragment_alias_dir(&index_root).join(real_fragment),
+        )
+        .expect("create fragment alias");
 
         fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
         fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
 
         let fragments = list_all_fragments(&[index_root]).await;
-        assert_eq!(fragments, vec![real_fragment.to_string()]);
+        assert_eq!(fragments, vec![stable_fragment.to_string()]);
 
         let _ = fs::remove_dir_all(base);
     }
@@ -2954,7 +2964,7 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
         let write_intent = |fragment: &str, object_key: &str, phase: &str| {
-            let intent_dir = index_root.join(fragment).join(".intents");
+            let intent_dir = fragment_root_on(&index_root, fragment).join(".intents");
             fs::create_dir_all(&intent_dir).expect("create intent dir");
             let intent = RedistributionIntent {
                 tx_id: Ulid::new().to_string(),

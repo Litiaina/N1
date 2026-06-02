@@ -1,5 +1,6 @@
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
 use crate::settings::config::CONFIG;
@@ -38,7 +39,7 @@ async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError
         let mut orphans_count = 0;
 
         for root in blob_roots {
-            let blob_root = root.join(&fragment_owned).join(N2_BLOB_DIR);
+            let blob_root = fragment_root_on(&root, &fragment_owned).join(N2_BLOB_DIR);
 
             if !blob_root.exists() {
                 continue;

@@ -23,6 +23,7 @@ use std::task::{Context, Poll};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 use tokio_util::io::ReaderStream;
 use ulid::Ulid;
 
@@ -34,6 +35,10 @@ static PEER_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("build N2 peer HTTP client")
 });
+
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) fn peer_http_client() -> Result<reqwest::Client, AppError> {
     Ok(PEER_HTTP_CLIENT.clone())
@@ -363,7 +368,7 @@ pub async fn fetch_peer_shard_chunk(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = req.send().await.map_err(|e| {
+    let response = req.timeout(PEER_READ_TIMEOUT).send().await.map_err(|e| {
         AppError::ServiceUnavailable(format!(
             "peer shard read failed from {}: {e}",
             locator.node_id
@@ -377,9 +382,14 @@ pub async fn fetch_peer_shard_chunk(
             locator.node_id, status, text
         )));
     }
-    response
-        .bytes()
+    timeout(PEER_READ_TIMEOUT, response.bytes())
         .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "peer shard body read timed out from {}",
+                locator.node_id
+            ))
+        })?
         .map(|bytes| bytes.to_vec())
         .map_err(|e| AppError::ServiceUnavailable(format!("read peer shard body: {e}")))
 }
@@ -390,12 +400,20 @@ async fn native_get_peer_shard(
     length: usize,
 ) -> Result<Vec<u8>, AppError> {
     let addr = native_socket_addr(&locator.endpoint)?;
-    let mut stream = TcpStream::connect(&addr).await.map_err(|e| {
-        AppError::ServiceUnavailable(format!(
-            "connect N2 native peer {} at {} failed: {}",
-            locator.node_id, addr, e
-        ))
-    })?;
+    let mut stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "connect N2 native peer {} at {} timed out",
+                locator.node_id, addr
+            ))
+        })?
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "connect N2 native peer {} at {} failed: {}",
+                locator.node_id, addr, e
+            ))
+        })?;
     let _ = stream.set_nodelay(true);
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
@@ -417,20 +435,39 @@ async fn native_get_peer_shard(
         body: None,
         body_len: None,
     };
-    write_request_control(&mut stream, &request)
+    timeout(PEER_WRITE_TIMEOUT, write_request_control(&mut stream, &request))
         .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "write N2 native peer get control to {} timed out",
+                locator.node_id
+            ))
+        })?
         .map_err(|e| {
             AppError::ServiceUnavailable(format!("write N2 native peer get control failed: {e}"))
         })?;
-    let response = read_native_peer_response(&mut stream).await?;
+    let response = timeout(PEER_READ_TIMEOUT, read_native_peer_response(&mut stream))
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "read N2 native peer get response from {} timed out",
+                locator.node_id
+            ))
+        })??;
     if !response.ok {
         return Err(native_peer_locator_response_error(
             "get", locator, &response,
         ));
     }
     let body_len = response.body_len.unwrap_or(0);
-    read_response_body(&mut stream, body_len)
+    timeout(PEER_READ_TIMEOUT, read_response_body(&mut stream, body_len))
         .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "read N2 native peer shard body from {} timed out",
+                locator.node_id
+            ))
+        })?
         .map_err(|e| {
             AppError::ServiceUnavailable(format!("read N2 native peer shard body failed: {e}"))
         })

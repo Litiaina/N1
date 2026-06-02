@@ -375,9 +375,6 @@ impl FsdBackend for InProcessBackend {
             file.write_all(&bytes).await.map_err(|err| {
                 AppError::Io(err, format!("write {}", pending.target_path.display()))
             })?;
-            file.flush().await.map_err(|err| {
-                AppError::Io(err, format!("flush {}", pending.target_path.display()))
-            })?;
             Ok(())
         })
     }

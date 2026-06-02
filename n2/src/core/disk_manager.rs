@@ -1,4 +1,5 @@
 use crate::core::constants::N2_BLOB_DIR;
+use crate::core::fragment_identity;
 use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -87,10 +88,12 @@ impl ObjectPathManager {
     }
 
     fn intent_partition_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
-        root.join(fragment_hash).join(".intents").join(format!(
-            "{}{:04x}.n2",
-            INTENT_PARTITION_PREFIX, partition_id
-        ))
+        fragment_identity::fragment_root_on(root, fragment_hash)
+            .join(".intents")
+            .join(format!(
+                "{}{:04x}.n1",
+                INTENT_PARTITION_PREFIX, partition_id
+            ))
     }
 
     pub fn get_all_session_intent_partition_paths(
@@ -137,7 +140,10 @@ impl ObjectPathManager {
         version_id: &str,
     ) -> PathBuf {
         disk_root
-            .join(fragment_hash)
+            .join(fragment_identity::resolve_physical_fragment_dir_name(
+                disk_root,
+                fragment_hash,
+            ))
             .join(N2_BLOB_DIR)
             .join(version_id)
     }

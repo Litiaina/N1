@@ -245,6 +245,7 @@ async fn rewrite_object_to_current_layout(
     });
     let claims = Claims {
         fragment: fragment.clone(),
+        fragment_alias: None,
         read: true,
         write: true,
         modify: true,

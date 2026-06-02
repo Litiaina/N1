@@ -34,37 +34,45 @@ storage layout; cluster durability is the N2 node-level EC layout.
 Each N2 node has index roots and blob roots.
 
 ```text
-<index_root>/<fragment_hash>/
-  namespace/
-    videos/
-      demo.mp4 -> @o_<object_id>
+<index_root>/
+  .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
 
-  .objects/
-    ab/
-      cd/
-        @o_<object_id>/
-          <version_id>.<size>.<time>.<ext>.ndx
+  @f_<stable_fragment_id>/
+    namespace/
+      videos/
+        demo.mp4 -> @o_<object_id>
 
-  .cluster/
-    objects/
+    .objects/
       ab/
         cd/
-          ef/
-            12/
-              @o_<object_id>/
-                <version_id>.nmtd
+          @o_<object_id>/
+            <version_id>.<size>.<time>.<ext>.ndx
 
-<blob_root>/<fragment_hash>/
-  .blobs/
-    <version_id>/
-      part_0_shard_0.shard
-      part_0_shard_1.parity
+    .cluster/
+      objects/
+        ab/
+          cd/
+            ef/
+              12/
+                @o_<object_id>/
+                  <version_id>.nmtd
+
+<blob_root>/
+  .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
+
+  @f_<stable_fragment_id>/
+    .blobs/
+      <version_id>/
+        part_0_shard_0.shard
+        part_0_shard_1.parity
 ```
 
 The namespace is user-facing. The `.objects` directory is the local object
 index used for namespace/list/download semantics. The `.cluster/objects`
 directory stores N2 cluster placement records. The blob files are immutable
-cluster shard payloads.
+cluster shard payloads. The mutable fragment alias is not storage truth; it
+resolves to the stable fragment id used by object records, health, repair,
+rebalance, and GC.
 
 ## `.nmtd`
 
@@ -188,14 +196,16 @@ That keeps N2 adaptable:
 - re-add node: recorded layouts can become healthy again
 - rebalance: explicit operator action, never silent mandatory churn
 
-## Current 0.12.0 State
+## Current 1.0.0 State
 
 N2 0.8.0 was the destructive reset point. N2 0.9.0 added the first distributed
 control plane. N2 0.10.0 moved into distributed execution. N2 0.11.0 hardened
 native peer transport, `.nmtd` placement records, repair/rebalance status, and
 two-node proof coverage. N2 0.12.0 hardens namespace mutation flow so upload
 commits, POSIX/object mutations, recover-all, and empty-trash pass through a
-shared quorum commit path.
+shared quorum commit path. N2 1.0.0 finalizes the storage identity model around
+stable fragment roots, cluster placement records, distributed upload/read,
+repair, rebalance, and operator-visible health.
 
 Current base:
 
@@ -206,6 +216,7 @@ Current base:
 - HTTP route prefix: `/n2/...`
 - native protocol: `n2://`
 - storage shape: N2 namespace/object/blob planes
+- stable fragment identity: `.fragment/<alias_hash> -> @f_<stable_fragment_id>`
 - membership file: `n2_membership.json`
 - cluster layout policy: `auto` or `fixed`
 - deterministic node placement preview
@@ -224,6 +235,6 @@ Current base:
 - two-node proof script for multipart resume, reconstruction, repair, rebalance,
   health, and RSS checks
 
-The remaining hard work before 1.0 is not a new storage shape. It is proof and
+The remaining hard work before LTS is not a new storage shape. It is proof and
 hardening: longer node-loss/re-add testing, membership reload safety, long soak,
 and operator CLI/client polish.

@@ -336,17 +336,20 @@ impl NamespaceRuntime {
                         }
                     })
                     .map_err(|e| {
-                        AppError::InternalServerError(format!("spawn N2 trash purge: {e}"))
+                        AppError::InternalServerError(format!(
+                            "spawn N2 retired trash purge worker: {e}"
+                        ))
                     })?;
             }
             Ok::<_, AppError>(())
         })
         .await
         .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))??;
+
         Ok(NamespaceMutationSummary {
             operation: "empty_trash".to_string(),
             kind: NamespaceEntryKind::Directory,
-            affected_paths: 0,
+            affected_paths: 1,
             affected_objects: 0,
             source_path: None,
             destination_path: None,
@@ -598,27 +601,6 @@ impl NamespaceRuntime {
             for root in index_roots() {
                 let fragment_root = fragment_root_on(&root, &fragment);
                 let base = fragment_root.join(&prefix);
-                if !prefix.is_empty() {
-                    if let Some(object_id) =
-                        read_namespace_symlink_object_id(&root, &fragment, &base)?
-                    {
-                        if seen.insert(prefix.clone()) {
-                            let object_dir = live_object_dir(&root, &fragment, &object_id)?;
-                            if let Some(meta) = latest_summary_metadata_in_object_dir(
-                                &fragment,
-                                &object_id,
-                                &object_dir,
-                            )? {
-                                entries.push(NamespaceObjectRef {
-                                    path: prefix.clone(),
-                                    object_id,
-                                    version_id: meta.version_id,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-                }
                 let mut stack = vec![(base, prefix.clone())];
                 while let Some((dir, rel)) = stack.pop() {
                     if !dir.is_dir() {
@@ -1564,7 +1546,7 @@ mod tests {
             Some(object_id.clone())
         );
         for root in &roots {
-            let link = root.join(&fragment).join("archive/docs/a/video.mp4");
+            let link = fragment_root_on(root, &fragment).join("archive/docs/a/video.mp4");
             let target = fs::read_link(&link).expect("read namespace link");
             assert_eq!(
                 target,
@@ -1590,11 +1572,10 @@ mod tests {
 
         for root in &roots {
             assert!(!path_exists_no_follow(
-                &root.join(&fragment).join("video/my-video.mp4")
+                &fragment_root_on(root, &fragment).join("video/my-video.mp4")
             ));
             assert!(path_exists_no_follow(
-                &root
-                    .join(&fragment)
+                &fragment_root_on(root, &fragment)
                     .join(TRASH_DIR)
                     .join("video/my-video.mp4")
             ));
@@ -1612,8 +1593,7 @@ mod tests {
             .expect("hard delete single trash item");
         for root in &roots {
             assert!(!path_exists_no_follow(
-                &root
-                    .join(&fragment)
+                &fragment_root_on(root, &fragment)
                     .join(TRASH_DIR)
                     .join("video/my-video.mp4")
             ));
@@ -1680,23 +1660,6 @@ mod tests {
             .await
             .expect("page with empty object dir");
         assert!(!entries.iter().any(|entry| entry.name == "empty.svg"));
-    }
-
-    #[tokio::test]
-    async fn n2_object_ref_listing_accepts_exact_file_path_prefix() {
-        let _guard = crate::test_support::global_test_lock().lock().await;
-        let roots = ensure_test_index_roots();
-        let fragment = format!("n2-exact-prefix-{}", Ulid::new());
-        let object_id = publish_logical_object(&roots, &fragment, "videos/exact.mp4", 44);
-
-        let page = global_namespace_runtime()
-            .list_live_object_refs_page(&fragment, Some("videos/exact.mp4"), None, 10)
-            .await
-            .expect("list exact object path");
-
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].path, "videos/exact.mp4");
-        assert_eq!(page.entries[0].object_id, object_id);
     }
 
     #[tokio::test]

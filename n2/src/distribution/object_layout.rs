@@ -1,4 +1,5 @@
 use crate::core::disk_manager::ObjectPathManager;
+use crate::core::fragment_identity::fragment_root_on;
 use crate::distribution::placement::ClusterPlacementPlan;
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ fn object_hash(value: &str) -> String {
 
 fn layout_dir(root: PathBuf, fragment: &str, physical_object_id: &str) -> PathBuf {
     let hash = object_hash(physical_object_id);
-    root.join(fragment)
+    fragment_root_on(&root, fragment)
         .join(".cluster")
         .join("objects")
         .join(&hash[0..2])

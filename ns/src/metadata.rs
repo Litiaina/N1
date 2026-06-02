@@ -1,4 +1,5 @@
 use crate::enums::app_error_enum::AppError;
+use crate::local_auth::nt_hash_hex_for_secret;
 use crate::settings::config::NsConfig;
 use crate::structs::auth_structs::AuthBody;
 use indexdb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -12,6 +13,36 @@ const SHARES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("shares"
 const SYNC_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sync_state");
 const SYNC_WRITE_GUARDS_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("sync_write_guards");
+const USERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
+const DISKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("disks");
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NasPermission {
+    pub read: bool,
+    pub write: bool,
+    pub delete: bool,
+    pub admin: bool,
+}
+
+impl NasPermission {
+    pub fn read_only() -> Self {
+        Self {
+            read: true,
+            write: false,
+            delete: false,
+            admin: false,
+        }
+    }
+
+    pub fn full() -> Self {
+        Self {
+            read: true,
+            write: true,
+            delete: true,
+            admin: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NasShareRecord {
@@ -26,6 +57,27 @@ pub struct NasShareRecord {
     pub n1_access_expires_at_ms: Option<u64>,
     pub n1_refresh_token: Option<String>,
     pub n1_refresh_expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NasUserShareAccess {
+    pub share: String,
+    pub permission: NasPermission,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NasUserRecord {
+    pub username: String,
+    pub nt_hash_hex: String,
+    pub enabled: bool,
+    pub shares: Vec<NasUserShareAccess>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NasDiskRecord {
+    pub id: String,
+    pub root_path: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +124,97 @@ impl NasMetadataStore {
                 format!("mkdir {}", config.storage.share_root.display()),
             )
         })?;
+        for (disk_id, disk) in &config.disks {
+            std::fs::create_dir_all(&disk.root_path)
+                .map_err(|err| AppError::Io(err, format!("mkdir {}", disk.root_path.display())))?;
+            self.write_disk_record(&NasDiskRecord {
+                id: disk_id.clone(),
+                root_path: disk.root_path.display().to_string(),
+                enabled: disk.enabled,
+            })?;
+        }
+        for (share_name, share) in &config.shares {
+            let root_path = if let Some(root_path) = share.root_path.as_ref() {
+                root_path.clone()
+            } else if let Some(disk_id) = share.disk_id.as_ref() {
+                let disk = config.disks.get(disk_id).ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "share '{}' references missing disk '{}'",
+                        share_name, disk_id
+                    ))
+                })?;
+                disk.root_path.join(share_name)
+            } else {
+                config.storage.share_root.join(share_name)
+            };
+            std::fs::create_dir_all(&root_path)
+                .map_err(|err| AppError::Io(err, format!("mkdir {}", root_path.display())))?;
+            let fragment_hash = share.fragment_hash.clone().unwrap_or_else(|| {
+                fragment_identifier_to_hash(share_name).unwrap_or_else(|| share_name.clone())
+            });
+            self.write_share_record(&NasShareRecord {
+                name: share_name.clone(),
+                fragment_hash,
+                root_path: root_path.display().to_string(),
+                read_only: share.read_only,
+                n1_base_url: share
+                    .n1_base_url
+                    .clone()
+                    .or_else(|| config.n1.base_url.clone()),
+                cold_sync_enabled: config.sync.enabled && share.sync_enabled,
+                cold_n1_prefix: if share.cold_n1_prefix.is_empty() {
+                    config.sync.cold_n1_prefix.clone()
+                } else {
+                    share.cold_n1_prefix.clone()
+                },
+                n1_access_token: None,
+                n1_access_expires_at_ms: None,
+                n1_refresh_token: None,
+                n1_refresh_expires_at_ms: None,
+            })?;
+        }
+        for (username, user) in &config.users {
+            let nt_hash_hex = user
+                .nt_hash_hex
+                .clone()
+                .or_else(|| {
+                    user.password
+                        .as_ref()
+                        .map(|password| nt_hash_hex_for_secret(password))
+                })
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "user '{}' is missing password or nt_hash_hex",
+                        username
+                    ))
+                })?;
+            let default_permission = NasPermission {
+                read: user.read || user.admin,
+                write: user.write || user.admin,
+                delete: user.delete || user.admin,
+                admin: user.admin,
+            };
+            let shares = if user.shares.is_empty() {
+                vec![NasUserShareAccess {
+                    share: "*".to_string(),
+                    permission: default_permission,
+                }]
+            } else {
+                user.shares
+                    .iter()
+                    .map(|share| NasUserShareAccess {
+                        share: share.trim().to_ascii_lowercase(),
+                        permission: default_permission,
+                    })
+                    .collect()
+            };
+            self.write_user_record(&NasUserRecord {
+                username: username.clone(),
+                nt_hash_hex,
+                enabled: user.enabled,
+                shares,
+            })?;
+        }
         Ok(())
     }
 
@@ -105,6 +248,87 @@ impl NasMetadataStore {
         }
         shares.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(shares)
+    }
+
+    pub fn user(&self, username: &str) -> Result<Option<NasUserRecord>, AppError> {
+        let username = username.trim().to_ascii_lowercase();
+        if username.is_empty() {
+            return Ok(None);
+        }
+        let read_txn = self.db.begin_read().map_err(map_indexdb_error)?;
+        let table = match read_txn.open_table(USERS_TABLE) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        let Some(value) = table.get(username.as_str()).map_err(map_indexdb_error)? else {
+            return Ok(None);
+        };
+        deserialize::<NasUserRecord>(value.value())
+    }
+
+    pub fn list_users(&self) -> Result<Vec<NasUserRecord>, AppError> {
+        let read_txn = self.db.begin_read().map_err(map_indexdb_error)?;
+        let table = match read_txn.open_table(USERS_TABLE) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut users = Vec::new();
+        let iter = table.iter().map_err(map_indexdb_error)?;
+        for row in iter {
+            let (_, value) = row.map_err(map_indexdb_error)?;
+            users.push(
+                deserialize::<NasUserRecord>(value.value())?.ok_or_else(|| {
+                    AppError::InternalServerError("missing user record".to_string())
+                })?,
+            );
+        }
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(users)
+    }
+
+    pub fn list_disks(&self) -> Result<Vec<NasDiskRecord>, AppError> {
+        let read_txn = self.db.begin_read().map_err(map_indexdb_error)?;
+        let table = match read_txn.open_table(DISKS_TABLE) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut disks = Vec::new();
+        let iter = table.iter().map_err(map_indexdb_error)?;
+        for row in iter {
+            let (_, value) = row.map_err(map_indexdb_error)?;
+            disks.push(
+                deserialize::<NasDiskRecord>(value.value())?.ok_or_else(|| {
+                    AppError::InternalServerError("missing disk record".to_string())
+                })?,
+            );
+        }
+        disks.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(disks)
+    }
+
+    pub fn permission_for_user_share(
+        &self,
+        username: &str,
+        share_name: &str,
+    ) -> Result<Option<NasPermission>, AppError> {
+        let Some(user) = self.user(username)? else {
+            return Ok(None);
+        };
+        if !user.enabled {
+            return Ok(None);
+        }
+        let share_name = share_name.trim().to_ascii_lowercase();
+        let fragment_hash = fragment_identifier_to_hash(share_name.as_str()).unwrap_or_default();
+        for access in &user.shares {
+            let allowed = access.share.trim().to_ascii_lowercase();
+            if allowed == "*"
+                || allowed == share_name
+                || (!fragment_hash.is_empty() && allowed == fragment_hash)
+            {
+                return Ok(Some(access.permission));
+            }
+        }
+        Ok(None)
     }
 
     pub fn resolve_fragment_share(
@@ -470,7 +694,7 @@ impl NasMetadataStore {
         Ok(())
     }
 
-    fn write_share_record(&self, record: &NasShareRecord) -> Result<(), AppError> {
+    pub fn write_share_record(&self, record: &NasShareRecord) -> Result<(), AppError> {
         let write_txn = self.db.begin_write().map_err(map_indexdb_error)?;
         {
             let mut shares = write_txn
@@ -478,6 +702,50 @@ impl NasMetadataStore {
                 .map_err(map_indexdb_error)?;
             shares
                 .insert(record.name.as_str(), serialize(record)?.as_slice())
+                .map_err(map_indexdb_error)?;
+        }
+        write_txn.commit().map_err(map_indexdb_error)?;
+        Ok(())
+    }
+
+    pub fn write_user_record(&self, record: &NasUserRecord) -> Result<(), AppError> {
+        let username = record.username.trim().to_ascii_lowercase();
+        if username.is_empty() {
+            return Err(AppError::BadRequest(
+                "username must not be empty".to_string(),
+            ));
+        }
+        let mut record = record.clone();
+        record.username = username;
+        let write_txn = self.db.begin_write().map_err(map_indexdb_error)?;
+        {
+            let mut users = write_txn
+                .open_table(USERS_TABLE)
+                .map_err(map_indexdb_error)?;
+            users
+                .insert(record.username.as_str(), serialize(&record)?.as_slice())
+                .map_err(map_indexdb_error)?;
+        }
+        write_txn.commit().map_err(map_indexdb_error)?;
+        Ok(())
+    }
+
+    pub fn write_disk_record(&self, record: &NasDiskRecord) -> Result<(), AppError> {
+        let id = record.id.trim().to_ascii_lowercase();
+        if id.is_empty() {
+            return Err(AppError::BadRequest(
+                "disk id must not be empty".to_string(),
+            ));
+        }
+        let mut record = record.clone();
+        record.id = id;
+        let write_txn = self.db.begin_write().map_err(map_indexdb_error)?;
+        {
+            let mut disks = write_txn
+                .open_table(DISKS_TABLE)
+                .map_err(map_indexdb_error)?;
+            disks
+                .insert(record.id.as_str(), serialize(&record)?.as_slice())
                 .map_err(map_indexdb_error)?;
         }
         write_txn.commit().map_err(map_indexdb_error)?;
@@ -536,7 +804,8 @@ fn fragment_identifier_to_hash(identifier: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::settings::config::{
-        FragmentPolicyConfig, FragmentSyncConfig, N1Config, StorageConfig, SyncConfig,
+        FragmentPolicyConfig, FragmentSyncConfig, N1Config, NsAdminConfig, NsDiskConfig,
+        NsShareConfig, NsUserConfig, StorageConfig, SyncConfig,
     };
     use crate::smb::config::SmbConfig;
     use crate::structs::auth_structs::AuthBody;
@@ -559,6 +828,12 @@ mod tests {
 
     fn test_config(root: &Path) -> NsConfig {
         NsConfig {
+            admin: NsAdminConfig {
+                enabled: false,
+                bind_addr: "127.0.0.1".to_string(),
+                port: 0,
+                admin_key: None,
+            },
             smb: SmbConfig::default(),
             storage: StorageConfig {
                 metadata_db_path: root.join("metadata.ndxdb"),
@@ -568,6 +843,7 @@ mod tests {
             },
             n1: N1Config {
                 base_url: Some("https://127.0.0.1:50001".to_string()),
+                native_url: None,
                 accept_invalid_certs: true,
                 index_roots: vec![root.join("n1-index")],
             },
@@ -578,6 +854,9 @@ mod tests {
                 min_stable_age_seconds: 120,
                 cold_n1_prefix: String::new(),
             },
+            users: HashMap::new(),
+            disks: HashMap::new(),
+            shares: HashMap::new(),
             fragment_aliases: HashMap::new(),
             fragment_policies: HashMap::new(),
             fragment_syncs: HashMap::new(),
@@ -771,6 +1050,77 @@ mod tests {
             !store
                 .sync_guard_allows_file("share-a", "new.txt")
                 .expect("new path inherits guard")
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_nas_users_disks_and_shares_seed_permissions() {
+        let root = temp_root("configured-nas");
+        let mut config = test_config(root.as_path());
+        config.disks.insert(
+            "disk-a".to_string(),
+            NsDiskConfig {
+                root_path: root.join("disk-a"),
+                enabled: true,
+            },
+        );
+        config.shares.insert(
+            "clinical".to_string(),
+            NsShareConfig {
+                root_path: None,
+                disk_id: Some("disk-a".to_string()),
+                fragment_hash: None,
+                read_only: false,
+                n1_base_url: None,
+                sync_enabled: false,
+                cold_n1_prefix: String::new(),
+            },
+        );
+        config.users.insert(
+            "doctor".to_string(),
+            NsUserConfig {
+                password: Some("rounds-password".to_string()),
+                nt_hash_hex: None,
+                enabled: true,
+                shares: vec!["clinical".to_string()],
+                read: true,
+                write: true,
+                delete: false,
+                admin: false,
+            },
+        );
+
+        let store = NasMetadataStore::open(config.storage.metadata_db_path.as_path())
+            .expect("metadata opens");
+        store.seed_from_config(&config).expect("seed config");
+
+        let disks = store.list_disks().expect("list disks");
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].id, "disk-a");
+        assert!(PathBuf::from(disks[0].root_path.as_str()).exists());
+
+        let share = store
+            .share("clinical")
+            .expect("share lookup")
+            .expect("share exists");
+        assert_eq!(PathBuf::from(share.root_path), root.join("disk-a/clinical"));
+
+        let permission = store
+            .permission_for_user_share("doctor", "clinical")
+            .expect("permission lookup")
+            .expect("permission exists");
+        assert!(permission.read);
+        assert!(permission.write);
+        assert!(!permission.delete);
+        assert!(!permission.admin);
+        assert!(
+            store
+                .permission_for_user_share("doctor", "other")
+                .expect("other permission lookup")
+                .is_none()
         );
 
         drop(store);

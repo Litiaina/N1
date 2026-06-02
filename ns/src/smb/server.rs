@@ -11,6 +11,8 @@ use crate::fuse::backend::{DirEntry, InProcessBackend};
 use crate::fuse::config::FsdConfig;
 use crate::fuse::gateway::FsdGateway;
 use crate::fuse::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle};
+use crate::local_auth;
+use crate::metadata::NasPermission;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::{AppState, global_app_state};
 use crate::structs::auth_structs::Claims;
@@ -243,6 +245,7 @@ struct TreeContext {
     session_id: u64,
     fragment: String,
     kind: TreeKind,
+    permissions: NasPermission,
 }
 
 #[derive(Clone, Debug)]
@@ -357,6 +360,7 @@ struct SessionContext {
     signing_required: bool,
     signing_key: Option<[u8; 16]>,
     fragment_scope: Option<String>,
+    user_scope: Option<String>,
 }
 
 #[derive(Debug)]
@@ -419,6 +423,7 @@ impl ConnectionState {
                 signing_required: self.require_signing && self.auth_config.is_some(),
                 signing_key: None,
                 fragment_scope: None,
+                user_scope: None,
             },
         );
         id
@@ -435,7 +440,13 @@ impl ConnectionState {
             .retain(|_, handle| handle.session_id != session_id);
     }
 
-    fn create_tree(&mut self, session_id: u64, fragment: String, kind: TreeKind) -> u32 {
+    fn create_tree(
+        &mut self,
+        session_id: u64,
+        fragment: String,
+        kind: TreeKind,
+        permissions: NasPermission,
+    ) -> u32 {
         let id = self.next_tree_id;
         self.next_tree_id = self.next_tree_id.saturating_add(1);
         self.trees.insert(
@@ -444,6 +455,7 @@ impl ConnectionState {
                 session_id,
                 fragment,
                 kind,
+                permissions,
             },
         );
         id
@@ -1321,27 +1333,33 @@ async fn dispatch_smb2_command(
                     build_tree_connect_response_body(0x01),
                 )
             } else {
-                let session_scope = state
+                let (session_scope, user_scope) = state
                     .sessions
                     .get(&header.session_id)
-                    .and_then(|s| s.fragment_scope.clone());
+                    .map(|s| (s.fragment_scope.clone(), s.user_scope.clone()))
+                    .unwrap_or((None, None));
                 match parse_tree_connect_fragment(request) {
                     Some(fragment_candidate) if !fragment_candidate.is_empty() => {
                         let is_ipc_share = fragment_candidate.eq_ignore_ascii_case("IPC$");
                         match resolve_tree_connect_share(
                             fragment_candidate.as_str(),
                             session_scope.as_deref(),
+                            user_scope.as_deref(),
                         )
                         .await
                         {
-                            Some(fragment_hash) => {
+                            Some((fragment_hash, permissions)) => {
                                 let tree_kind = if is_ipc_share {
                                     TreeKind::Ipc
                                 } else {
                                     TreeKind::Namespace
                                 };
-                                let tree_id =
-                                    state.create_tree(header.session_id, fragment_hash, tree_kind);
+                                let tree_id = state.create_tree(
+                                    header.session_id,
+                                    fragment_hash,
+                                    tree_kind,
+                                    permissions,
+                                );
                                 (
                                     SMB2_STATUS_SUCCESS,
                                     tree_id,
@@ -1706,6 +1724,7 @@ async fn handle_session_setup_command(
                         session.auth_state = SessionAuthState::Negotiating;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         return (
                             SMB2_STATUS_LOGON_FAILURE,
                             0,
@@ -1718,6 +1737,7 @@ async fn handle_session_setup_command(
                         session.server_challenge = None;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         return (
                             SMB2_STATUS_LOGON_FAILURE,
                             0,
@@ -1725,13 +1745,13 @@ async fn handle_session_setup_command(
                             build_session_setup_response_body(0, &[]),
                         );
                     };
-                    let Some((signing_key, fragment_hash)) =
-                        verify_fragment_ntlmv2_auth(&auth, &challenge, &type3).await
+                    let Some(identity) = verify_smb_ntlmv2_auth(&auth, &challenge, &type3).await
                     else {
                         session.auth_state = SessionAuthState::Negotiating;
                         session.server_challenge = None;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         return (
                             SMB2_STATUS_LOGON_FAILURE,
                             0,
@@ -1742,8 +1762,9 @@ async fn handle_session_setup_command(
                     session.auth_state = SessionAuthState::Established;
                     session.server_challenge = None;
                     session.signing_required = state.require_signing;
-                    session.signing_key = Some(signing_key);
-                    session.fragment_scope = Some(fragment_hash);
+                    session.signing_key = Some(identity.signing_key);
+                    session.fragment_scope = identity.fragment_scope;
+                    session.user_scope = identity.user_scope;
                     (
                         SMB2_STATUS_SUCCESS,
                         0,
@@ -1756,6 +1777,7 @@ async fn handle_session_setup_command(
                     session.signing_required = false;
                     session.signing_key = None;
                     session.fragment_scope = None;
+                    session.user_scope = None;
                     (SMB2_STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, Vec::new())
                 } else {
                     session.auth_state = SessionAuthState::Negotiating;
@@ -1763,6 +1785,7 @@ async fn handle_session_setup_command(
                     session.raw_ntlm = false;
                     session.signing_key = None;
                     session.fragment_scope = None;
+                    session.user_scope = None;
                     return (
                         SMB2_STATUS_LOGON_FAILURE,
                         0,
@@ -1783,6 +1806,7 @@ async fn handle_session_setup_command(
                     session.signing_required = false;
                     session.signing_key = None;
                     session.fragment_scope = None;
+                    session.user_scope = None;
                     (SMB2_STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, Vec::new())
                 } else if ntlm_message_type == Some(1) {
                     let challenge = random_ntlm_challenge();
@@ -1804,6 +1828,7 @@ async fn handle_session_setup_command(
                         session.auth_state = SessionAuthState::Negotiating;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         return (
                             SMB2_STATUS_LOGON_FAILURE,
                             0,
@@ -1816,6 +1841,7 @@ async fn handle_session_setup_command(
                         session.server_challenge = None;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         return (
                             SMB2_STATUS_LOGON_FAILURE,
                             0,
@@ -1830,6 +1856,7 @@ async fn handle_session_setup_command(
                         session.signing_required = false;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         (
                             SMB2_STATUS_SUCCESS,
                             SMB2_SESSION_FLAG_IS_GUEST,
@@ -1841,6 +1868,7 @@ async fn handle_session_setup_command(
                         session.raw_ntlm = false;
                         session.signing_key = None;
                         session.fragment_scope = None;
+                        session.user_scope = None;
                         return (
                             SMB2_STATUS_LOGON_FAILURE,
                             0,
@@ -1853,6 +1881,7 @@ async fn handle_session_setup_command(
                     session.server_challenge = None;
                     session.signing_key = None;
                     session.fragment_scope = None;
+                    session.user_scope = None;
                     (
                         SMB2_STATUS_LOGON_FAILURE,
                         0,
@@ -1872,6 +1901,13 @@ struct NtlmType3AuthData {
     username: String,
     domain: String,
     nt_response: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedSmbIdentity {
+    signing_key: [u8; 16],
+    fragment_scope: Option<String>,
+    user_scope: Option<String>,
 }
 
 fn random_ntlm_challenge() -> [u8; 8] {
@@ -2053,11 +2089,11 @@ fn normalize_ntlm_identity_component(value: &str) -> String {
     value.trim_matches('\0').trim().to_string()
 }
 
-async fn verify_fragment_ntlmv2_auth(
+async fn verify_smb_ntlmv2_auth(
     auth: &ServerAuthConfig,
     challenge: &[u8; 8],
     type3: &NtlmType3AuthData,
-) -> Option<([u8; 16], String)> {
+) -> Option<VerifiedSmbIdentity> {
     if type3.nt_response.len() < 16 {
         return None;
     }
@@ -2068,6 +2104,27 @@ async fn verify_fragment_ntlmv2_auth(
     let client_domain = normalize_ntlm_identity_component(type3.domain.as_str());
     let app_state = Arc::clone(global_app_state());
     let domains = ntlm_domain_candidates(client_domain.as_str(), auth.domain.as_str());
+
+    if let Ok(Some(user)) = app_state.metadata.user(principal.as_str()) {
+        if user.enabled {
+            for domain in &domains {
+                if let Some(signing_key) = local_auth::verify_ntlmv2_with_nt_hash(
+                    principal.as_str(),
+                    user.nt_hash_hex.as_str(),
+                    challenge,
+                    domain.as_str(),
+                    type3.nt_response.as_slice(),
+                ) {
+                    return Some(VerifiedSmbIdentity {
+                        signing_key,
+                        fragment_scope: None,
+                        user_scope: Some(user.username),
+                    });
+                }
+            }
+        }
+    }
+
     for domain in &domains {
         let result =
             if let Some(fragment_hash) = app_state.config.fragment_identifier_hash(&principal) {
@@ -2103,7 +2160,11 @@ async fn verify_fragment_ntlmv2_auth(
                     app_state.config.as_ref(),
                 )
                 .ok()?;
-            return Some((result.0, share.fragment_hash));
+            return Some(VerifiedSmbIdentity {
+                signing_key: result.0,
+                fragment_scope: Some(share.fragment_hash),
+                user_scope: None,
+            });
         }
     }
 
@@ -3123,6 +3184,7 @@ async fn handle_create(
         return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
     }
     let fragment = tree.fragment.clone();
+    let permissions = tree.permissions;
 
     let base = SMB2_HEADER_LEN;
     if request.len() < base + 56 {
@@ -3231,6 +3293,18 @@ async fn handle_create(
     let requested_delete = (desired_access & (FILE_DELETE | FILE_GENERIC_ALL)) != 0;
     let requested_write_attributes =
         (desired_access & (FILE_WRITE_ATTRIBUTES | FILE_GENERIC_WRITE | FILE_GENERIC_ALL)) != 0;
+    if requested_read && !permissions.read {
+        return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
+    }
+    if requested_write && !permissions.write {
+        return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
+    }
+    if (requested_delete || delete_on_close) && !permissions.delete {
+        return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
+    }
+    if requested_write_attributes && !permissions.write && !permissions.delete {
+        return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
+    }
 
     debug!(
         "smb create path='{}' disposition={} desired_access=0x{:08X} create_options=0x{:08X}",
@@ -6046,14 +6120,15 @@ fn parse_tree_connect_fragment(request: &[u8]) -> Option<String> {
 async fn resolve_tree_connect_share(
     candidate: &str,
     session_fragment_hash: Option<&str>,
-) -> Option<String> {
+    session_user: Option<&str>,
+) -> Option<(String, NasPermission)> {
     let requested = candidate.trim();
     if requested.is_empty() {
         return None;
     }
 
     if requested.eq_ignore_ascii_case("IPC$") {
-        return Some("IPC$".to_string());
+        return Some(("IPC$".to_string(), NasPermission::full()));
     }
     if requested.eq_ignore_ascii_case("N1") || requested.eq_ignore_ascii_case("NS") {
         return None;
@@ -6065,12 +6140,26 @@ async fn resolve_tree_connect_share(
             return None;
         }
     }
-    app_state
+    let share = app_state
         .metadata
         .accessible_share(requested_hash.as_str(), session_fragment_hash)
         .ok()
-        .flatten()
-        .map(|share| share.name)
+        .flatten()?;
+    let permission = if let Some(username) = session_user {
+        app_state
+            .metadata
+            .permission_for_user_share(username, share.name.as_str())
+            .ok()
+            .flatten()?
+    } else if session_fragment_hash.is_some() {
+        NasPermission::full()
+    } else {
+        NasPermission::read_only()
+    };
+    if !permission.read {
+        return None;
+    }
+    Some((share.name, permission))
 }
 
 fn parse_negotiate_request_dialects(request: &[u8]) -> Option<Vec<u16>> {

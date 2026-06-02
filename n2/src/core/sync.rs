@@ -6,7 +6,10 @@ use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    core::{constants::N2_BLOB_DIR, disk_manager::ObjectPathManager},
+    core::{
+        constants::N2_BLOB_DIR, disk_manager::ObjectPathManager,
+        fragment_identity::fragment_root_on,
+    },
     enums::app_error_enum::AppError,
     structs::auth_structs::Claims,
 };
@@ -19,12 +22,15 @@ pub struct CreateFragmentRequest {
     pub secret: String,
     pub key: String,
     #[serde(default)]
+    pub stable_fragment_id: Option<String>,
+    #[serde(default)]
     pub quota_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
 pub struct CreateFragmentResponse {
     pub fragment_hash: String,
+    pub stable_fragment_id: String,
     pub name: String,
 }
 
@@ -33,7 +39,7 @@ pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
     let blob_roots = path_manager.get_blob_roots();
 
     for root in blob_roots {
-        let blob_dir = root.join(fragment_hash).join(N2_BLOB_DIR);
+        let blob_dir = fragment_root_on(&root, fragment_hash).join(N2_BLOB_DIR);
 
         let exists_check = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await;
 
@@ -75,7 +81,7 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
     }
 
     for root in blob_roots {
-        let blob_dir = root.join(fragment_hash).join(N2_BLOB_DIR);
+        let blob_dir = fragment_root_on(&root, fragment_hash).join(N2_BLOB_DIR);
 
         match timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await {
             Ok(Ok(false)) => {
@@ -144,7 +150,7 @@ async fn sweep_fragment_gc_files(fragment_hash: String) {
 
     tokio::task::spawn_blocking(move || {
         for root in blob_roots {
-            let fragment_root = root.join(&fragment_hash);
+            let fragment_root = fragment_root_on(&root, &fragment_hash);
             if !fragment_root.exists() {
                 continue;
             }

@@ -1,5 +1,6 @@
 use crate::core::constants::{GC_SUFFIX, N2_BLOB_DIR};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
+use crate::core::fragment_identity::fragment_root_on;
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
@@ -166,7 +167,9 @@ fn shard_dir_on_root(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root.join(fragment).join(N2_BLOB_DIR).join(version_id)
+    fragment_root_on(disk_root, fragment)
+        .join(N2_BLOB_DIR)
+        .join(version_id)
 }
 
 fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {

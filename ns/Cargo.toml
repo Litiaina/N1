@@ -17,6 +17,7 @@ hex.workspace = true
 hmac.workspace = true
 hostname.workspace = true
 indexdb = { path = "../indexdb" }
+n1_native_client = { path = "../n1_native_client" }
 libc.workspace = true
 md-5.workspace = true
 md4.workspace = true

@@ -12,12 +12,19 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     conf.with_section(Some("n1"))
         .set("base_url", "https://127.0.0.1:50001")
+        .set("native_url", "n1://127.0.0.1:50002")
         .set("accept_invalid_certs", "true")
         .set("index_roots", "/srv/litiaina/n1/index");
 
     conf.with_section(Some("auth"))
         .set("domain", "LITI")
         .set("allow_guest", "false");
+
+    conf.with_section(Some("admin"))
+        .set("enabled", "true")
+        .set("bind_addr", "127.0.0.1")
+        .set("port", "50730")
+        .set("admin_key", "");
 
     conf.with_section(Some("sync"))
         .set("enabled", "false")
@@ -41,6 +48,15 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("query_directory_page_limit", "1000")
         .set("query_directory_max_buffered_entries", "4096")
         .set("query_directory_max_seeded_entries", "512");
+
+    conf.with_section(Some("disk.local"))
+        .set("root_path", "ns-shares/fragments")
+        .set("enabled", "true");
+
+    conf.with_section(Some("share.public"))
+        .set("disk_id", "local")
+        .set("read_only", "false")
+        .set("sync_enabled", "false");
 
     conf.write_to_file(path).map_err(io::Error::other)
 }
@@ -73,8 +89,11 @@ mod tests {
         assert!(ini.section(Some("storage")).is_some());
         assert!(ini.section(Some("n1")).is_some());
         assert!(ini.section(Some("auth")).is_some());
+        assert!(ini.section(Some("admin")).is_some());
         assert!(ini.section(Some("sync")).is_some());
         assert!(ini.section(Some("smb")).is_some());
+        assert!(ini.section(Some("disk.local")).is_some());
+        assert!(ini.section(Some("share.public")).is_some());
 
         let _ = fs::remove_file(path);
     }

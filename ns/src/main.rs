@@ -1,7 +1,9 @@
+mod admin;
 mod core;
 mod enums;
 mod fragment_auth;
 mod fuse;
+mod local_auth;
 mod metadata;
 mod n1_sync;
 mod namespace;
@@ -84,12 +86,27 @@ async fn main() {
         config.storage.staging_root.clone(),
         Arc::clone(&config),
     ));
-    if let Err(err) = init_global_app_state(app_state) {
+    if let Err(err) = init_global_app_state(Arc::clone(&app_state)) {
         tracing::error!("failed to initialize global NS state: {}", err);
         return;
     }
 
     let _sync_join = n1_sync::spawn_sync_worker(Arc::clone(&config), metadata);
+
+    let admin_runtime = match admin::start(Arc::clone(&config), app_state.metadata.clone()).await {
+        Ok(Some(runtime)) => {
+            tracing::info!("NS admin listener online at {}", runtime.addr);
+            Some(runtime)
+        }
+        Ok(None) => {
+            tracing::info!("NS admin listener disabled");
+            None
+        }
+        Err(err) => {
+            tracing::error!("failed to start NS admin listener: {}", err);
+            return;
+        }
+    };
 
     let smb_runtime = match smb::start(config.smb.clone()).await {
         Ok(Some(runtime)) => {
@@ -108,13 +125,26 @@ async fn main() {
 
     if let Some(runtime) = smb_runtime {
         let mut join = runtime.join;
+        let mut admin_join = admin_runtime.map(|runtime| runtime.join);
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
                 join.abort();
+                if let Some(admin_join) = admin_join.as_mut() {
+                    admin_join.abort();
+                }
             }
             _ = &mut join => {
                 tracing::warn!("SMB listener exited");
+            }
+            _ = async {
+                if let Some(admin_join) = admin_join.as_mut() {
+                    let _ = admin_join.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                tracing::warn!("NS admin listener exited");
             }
         }
     } else if let Err(err) = tokio::signal::ctrl_c().await {

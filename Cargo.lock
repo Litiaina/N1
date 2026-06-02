@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "n2"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "async_zip",
@@ -2335,6 +2335,7 @@ dependencies = [
  "md-5",
  "md4",
  "mime_guess",
+ "n1_native_client",
  "once_cell",
  "percent-encoding",
  "rand 0.8.5",

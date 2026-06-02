@@ -763,7 +763,7 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
-    tracing::info!("Storage mode: N2 storage kernel with explicit .blobs payload roots");
+    tracing::info!("Storage mode: N2 distributed object storage with explicit .blobs payload roots");
 
     let https_endpoint = format!("https://{}:{}", host, https_port);
     let native_endpoint = format!("n2://{}:{}", host, native_port);

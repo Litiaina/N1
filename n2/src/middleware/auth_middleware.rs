@@ -1,4 +1,6 @@
-use crate::core::fragment_metadata::{backfill_fragment_nt_hash_if_missing, verify_fragment_key};
+use crate::core::fragment_metadata::{
+    backfill_fragment_nt_hash_if_missing, read_fragment_metadata, verify_fragment_key,
+};
 use crate::middleware::refresh_store::{
     RefreshStoreError, SessionPermissions, create_refresh_session, revoke_refresh_session,
     rotate_refresh_session,
@@ -128,8 +130,14 @@ pub async fn authorize_fragment_core(payload: AuthorizationRequest) -> Result<Au
         }
     }
 
+    let meta = read_fragment_metadata(&payload.fragment)
+        .await
+        .map_err(|_| AuthError::InternalError)?;
+    let stable_fragment = meta.fragment;
+
     mint_fragment_auth_body(
-        payload.fragment,
+        stable_fragment,
+        Some(payload.fragment),
         payload.read,
         payload.write,
         payload.modify,
@@ -199,6 +207,7 @@ pub async fn refresh_access_token(
         AuthSessionScope::Fragment { fragment } => AuthBody::new(
             mint_fragment_access_token(
                 fragment,
+                None,
                 rotated.permissions.read,
                 rotated.permissions.write,
                 rotated.permissions.modify,
@@ -369,6 +378,7 @@ pub enum AuthError {
 
 async fn mint_fragment_auth_body(
     fragment: String,
+    fragment_alias: Option<String>,
     read: bool,
     write: bool,
     modify: bool,
@@ -377,6 +387,7 @@ async fn mint_fragment_auth_body(
 ) -> Result<AuthBody, AuthError> {
     let token = mint_fragment_access_token(
         fragment.clone(),
+        fragment_alias,
         read,
         write,
         modify,
@@ -454,6 +465,7 @@ fn resolve_access_token_ttl(requested: Option<u64>) -> u64 {
 
 fn mint_fragment_access_token(
     fragment: String,
+    fragment_alias: Option<String>,
     read: bool,
     write: bool,
     modify: bool,
@@ -462,6 +474,7 @@ fn mint_fragment_access_token(
 ) -> Result<String, AuthError> {
     let claims = Claims {
         fragment,
+        fragment_alias,
         read,
         write,
         modify,
@@ -505,6 +518,7 @@ fn map_refresh_error(error: RefreshStoreError) -> AuthError {
 mod tests {
     use super::*;
     use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+    use crate::core::fragment_identity::ensure_fragment_identity_on_roots;
     use crate::middleware::refresh_store::clear_refresh_store_for_tests;
     use crate::test_support::global_test_lock;
     use jsonwebtoken::Validation;
@@ -546,6 +560,16 @@ mod tests {
     }
 
     async fn ensure_auth_test_fragment(fragment: &str) {
+        let mut roots = Vec::new();
+        if let Some(index_roots) = INDEX_STORE_DISKS.get() {
+            roots.extend(index_roots.iter().map(std::path::PathBuf::from));
+        }
+        if let Some(blob_roots) = BLOB_STORE_DISKS.get() {
+            roots.extend(blob_roots.iter().map(std::path::PathBuf::from));
+        }
+        ensure_fragment_identity_on_roots(&roots, fragment, fragment)
+            .await
+            .expect("create fragment identity");
         crate::core::fragment_metadata::init_fragment_metadata(fragment, "fragment-key")
             .await
             .expect("init fragment metadata");
@@ -582,7 +606,16 @@ mod tests {
             &Validation::default(),
         )
         .expect("decode token");
-        assert_eq!(decoded.claims.fragment, requested_fragment);
+        let stable_fragment =
+            crate::core::fragment_metadata::read_fragment_metadata(&requested_fragment)
+                .await
+                .expect("read stable fragment metadata")
+                .fragment;
+        assert_eq!(decoded.claims.fragment, stable_fragment);
+        assert_eq!(
+            decoded.claims.fragment_alias.as_deref(),
+            Some(requested_fragment.as_str())
+        );
         assert!(decoded.claims.read);
         assert!(decoded.claims.write);
         assert!(decoded.claims.modify);

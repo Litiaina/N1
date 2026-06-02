@@ -3,10 +3,12 @@ use crate::enums::app_error_enum::AppError;
 use crate::metadata::{NasMetadataStore, NasShareRecord, SyncCursor};
 use crate::settings::config::NsConfig;
 use crate::structs::auth_structs::AuthBody;
+use n1_native_client::N1NativeClient;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use serde::Serialize;
 use sha2::{Digest as ShaDigest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -88,6 +90,94 @@ pub fn spawn_sync_worker(
     }))
 }
 
+pub async fn restore_share_file_from_n1(
+    config: &NsConfig,
+    share: &NasShareRecord,
+    relative_key: &str,
+) -> Result<u64, AppError> {
+    let native_url = config.n1.native_url.as_deref().ok_or_else(|| {
+        AppError::BadRequest("N1 native URL is required for NS restore".to_string())
+    })?;
+    let sync_profile = config
+        .fragment_sync(share.fragment_hash.as_str())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "share '{}' has no N1 sync profile for restore",
+                share.name
+            ))
+        })?;
+    let secret = sync_profile.secret.as_deref().ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "share '{}' N1 restore profile is missing secret",
+            share.name
+        ))
+    })?;
+    let relative_path = safe_relative_path(relative_key)?;
+    let object_key = if share.cold_n1_prefix.is_empty() {
+        relative_key.trim_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            share.cold_n1_prefix.trim_matches('/'),
+            relative_key.trim_matches('/')
+        )
+    };
+    let destination = PathBuf::from(share.root_path.as_str()).join(relative_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
+    }
+    let tmp_path = destination.with_extension("ns-restore-partial");
+    let mut native = N1NativeClient::connect(native_url)
+        .await
+        .map_err(|err| AppError::InternalServerError(format!("N1 native connect failed: {}", err)))?
+        .with_request_prefix("ns-restore");
+    native
+        .auth_fragment(share.fragment_hash.as_str(), secret)
+        .await
+        .map_err(|err| AppError::InternalServerError(format!("N1 native auth failed: {}", err)))?;
+
+    let mut output = std::fs::File::create(tmp_path.as_path())
+        .map_err(|err| AppError::Io(err, format!("create {}", tmp_path.display())))?;
+    let (response, bytes_written) = match native
+        .stream_response(
+            "object.download_stream",
+            &serde_json::json!({ "object_key": object_key }),
+            |chunk| {
+                output.write_all(chunk)?;
+                Ok(())
+            },
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = std::fs::remove_file(tmp_path.as_path());
+            return Err(AppError::InternalServerError(format!(
+                "N1 native restore failed: {}",
+                err
+            )));
+        }
+    };
+    if !response.ok {
+        let _ = std::fs::remove_file(tmp_path.as_path());
+        let message = response
+            .error
+            .map(|err| err.message)
+            .unwrap_or_else(|| "N1 native restore failed".to_string());
+        return Err(AppError::InternalServerError(message));
+    }
+    output
+        .sync_all()
+        .map_err(|err| AppError::Io(err, format!("sync {}", tmp_path.display())))?;
+    drop(output);
+    fs::rename(tmp_path.as_path(), destination.as_path())
+        .await
+        .map_err(|err| AppError::Io(err, format!("rename {}", destination.display())))?;
+    Ok(bytes_written)
+}
+
 async fn sync_share(
     client: &reqwest::Client,
     metadata: &NasMetadataStore,
@@ -97,20 +187,27 @@ async fn sync_share(
     if !share.cold_sync_enabled {
         return Ok(());
     }
-    let Some(base_url) = share.n1_base_url.as_deref() else {
+    let native_url = config.n1.native_url.as_deref();
+    let base_url = share.n1_base_url.as_deref();
+    if native_url.is_none() && base_url.is_none() {
         debug!(
-            "cold sync skipped share='{}' because no N1 base URL is configured",
+            "cold sync skipped share='{}' because no N1 target URL is configured",
             share.name
         );
         return Ok(());
+    }
+    let token = if native_url.is_none() {
+        ensure_fragment_token(client, metadata, config, share).await?
+    } else {
+        None
     };
-    let Some(token) = ensure_fragment_token(client, metadata, config, share).await? else {
+    if native_url.is_none() && token.is_none() {
         debug!(
             "cold sync skipped share='{}' because no sync credential is configured",
             share.name
         );
         return Ok(());
-    };
+    }
 
     let root_path = PathBuf::from(&share.root_path);
     let files = collect_files(root_path.as_path())?;
@@ -171,17 +268,30 @@ async fn sync_share(
             continue;
         };
 
-        let upload_result = upload_file_to_n1(
-            client,
-            base_url,
-            token.as_str(),
-            share,
-            relative_key.as_str(),
-            path.as_path(),
-            snapshot_path.as_path(),
-            source_state.size_bytes,
-        )
-        .await;
+        let upload_result = if let Some(native_url) = native_url {
+            upload_file_to_n1_native(
+                native_url,
+                config,
+                share,
+                relative_key.as_str(),
+                path.as_path(),
+                snapshot_path.as_path(),
+                source_state.size_bytes,
+            )
+            .await
+        } else {
+            upload_file_to_n1(
+                client,
+                base_url.expect("base URL checked"),
+                token.as_deref().expect("token checked"),
+                share,
+                relative_key.as_str(),
+                path.as_path(),
+                snapshot_path.as_path(),
+                source_state.size_bytes,
+            )
+            .await
+        };
         cleanup_sync_snapshot(snapshot_path.as_path()).await;
         upload_result?;
 
@@ -364,6 +474,186 @@ async fn upload_file_to_n1(
         content_type.as_str(),
     )
     .await
+}
+
+async fn upload_file_to_n1_native(
+    native_url: &str,
+    config: &NsConfig,
+    share: &NasShareRecord,
+    relative_key: &str,
+    content_hint_path: &Path,
+    upload_path: &Path,
+    size_bytes: u64,
+) -> Result<(), AppError> {
+    let sync_profile = config
+        .fragment_sync(share.fragment_hash.as_str())
+        .ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "share '{}' has no native sync profile",
+                share.name
+            ))
+        })?;
+    let secret = sync_profile.secret.as_deref().ok_or_else(|| {
+        AppError::InternalServerError(format!(
+            "share '{}' native sync is missing secret",
+            share.name
+        ))
+    })?;
+    let object_key = if share.cold_n1_prefix.is_empty() {
+        relative_key.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            share.cold_n1_prefix.trim_matches('/'),
+            relative_key
+        )
+    };
+    let content_type = mime_guess::from_path(content_hint_path)
+        .first_or_octet_stream()
+        .to_string();
+    let mut native = N1NativeClient::connect(native_url)
+        .await
+        .map_err(|err| AppError::InternalServerError(format!("N1 native connect failed: {}", err)))?
+        .with_request_prefix("ns-cold-sync");
+    native
+        .auth_fragment(share.fragment_hash.as_str(), secret)
+        .await
+        .map_err(|err| AppError::InternalServerError(format!("N1 native auth failed: {}", err)))?;
+
+    if size_bytes <= SYNC_MULTIPART_THRESHOLD_BYTES {
+        let bytes = fs::read(upload_path)
+            .await
+            .map_err(|err| AppError::Io(err, format!("read {}", upload_path.display())))?;
+        native
+            .operation(
+                "upload.one_shot",
+                &serde_json::json!({
+                    "object_key": object_key,
+                    "content_type": content_type,
+                    "total_size_bytes": size_bytes,
+                }),
+                Some(bytes),
+            )
+            .await
+            .map_err(|err| {
+                AppError::InternalServerError(format!("N1 native upload failed: {}", err))
+            })?;
+        return Ok(());
+    }
+
+    let expected_parts = sync_expected_parts(size_bytes, SYNC_MULTIPART_PART_SIZE_BYTES);
+    let params = InitiateUploadParams {
+        content_type: Some(content_type.clone()),
+        total_size_bytes: size_bytes,
+        expected_parts,
+        part_size_bytes: Some(SYNC_MULTIPART_PART_SIZE_BYTES),
+    };
+    let init: InitiateUploadResponse = native
+        .operation_json(
+            "upload.multipart.init",
+            &serde_json::json!({
+                "object_key": object_key,
+                "content_type": content_type,
+                "total_size_bytes": size_bytes,
+                "expected_parts": expected_parts,
+                "part_size_bytes": SYNC_MULTIPART_PART_SIZE_BYTES,
+            }),
+            None,
+        )
+        .await
+        .map_err(|err| {
+            AppError::InternalServerError(format!("N1 native multipart init failed: {}", err))
+        })?;
+
+    let upload_result = upload_native_multipart_parts(
+        &mut native,
+        upload_path,
+        &init,
+        size_bytes,
+        content_type.as_str(),
+    )
+    .await;
+    if let Err(err) = upload_result {
+        let _ = native
+            .raw_json(
+                "upload.multipart.cancel",
+                &serde_json::json!({
+                    "object_key": object_key,
+                    "version_id": init.version_id,
+                }),
+                None,
+            )
+            .await;
+        return Err(err);
+    }
+
+    native
+        .operation(
+            "upload.multipart.finalize",
+            &serde_json::json!({
+                "object_key": object_key,
+                "version_id": init.version_id,
+                "session_id": init.session_id,
+                "content_type": params.content_type,
+                "total_size_bytes": params.total_size_bytes,
+                "expected_parts": params.expected_parts,
+                "part_size_bytes": params.part_size_bytes,
+            }),
+            None,
+        )
+        .await
+        .map_err(|err| {
+            AppError::InternalServerError(format!("N1 native multipart finalize failed: {}", err))
+        })?;
+    Ok(())
+}
+
+async fn upload_native_multipart_parts(
+    native: &mut N1NativeClient,
+    upload_path: &Path,
+    init: &InitiateUploadResponse,
+    size_bytes: u64,
+    content_type: &str,
+) -> Result<(), AppError> {
+    let mut file = fs::File::open(upload_path)
+        .await
+        .map_err(|err| AppError::Io(err, format!("open {}", upload_path.display())))?;
+
+    for part_index in 0..sync_expected_parts(size_bytes, SYNC_MULTIPART_PART_SIZE_BYTES) {
+        let part_size =
+            sync_expected_part_size(size_bytes, SYNC_MULTIPART_PART_SIZE_BYTES, part_index)
+                .ok_or_else(|| {
+                    AppError::InternalServerError(format!(
+                        "invalid native multipart part index {} for {}B file",
+                        part_index, size_bytes
+                    ))
+                })?;
+        let mut bytes = vec![0u8; part_size as usize];
+        if part_size > 0 {
+            file.read_exact(bytes.as_mut_slice())
+                .await
+                .map_err(|err| AppError::Io(err, format!("read {}", upload_path.display())))?;
+        }
+        native
+            .operation(
+                "upload.multipart.put_part",
+                &serde_json::json!({
+                    "version_id": init.version_id,
+                    "part_index": part_index,
+                    "content_type": content_type,
+                    "content_length": part_size,
+                }),
+                Some(bytes),
+            )
+            .await
+            .map_err(|err| {
+                AppError::InternalServerError(format!(
+                    "N1 native multipart part {} failed: {}",
+                    part_index, err
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 enum N1UploadAttemptError {
@@ -786,6 +1076,24 @@ fn relative_to_object_key(path: &Path) -> String {
         .join("/")
 }
 
+fn safe_relative_path(relative_key: &str) -> Result<PathBuf, AppError> {
+    let trimmed = relative_key.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("restore path is required".to_string()));
+    }
+    let mut path = PathBuf::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.contains('\\') {
+            return Err(AppError::BadRequest(format!(
+                "invalid restore path segment '{}'",
+                segment
+            )));
+        }
+        path.push(segment);
+    }
+    Ok(path)
+}
+
 fn encode_object_key(object_key: &str) -> String {
     object_key
         .split('/')
@@ -807,7 +1115,7 @@ mod tests {
     use super::*;
     use crate::metadata::NasMetadataStore;
     use crate::settings::config::{
-        FragmentSyncConfig, N1Config, NsConfig, StorageConfig, SyncConfig,
+        FragmentSyncConfig, N1Config, NsAdminConfig, NsConfig, StorageConfig, SyncConfig,
     };
     use crate::smb::config::SmbConfig;
     use axum::extract::{Path as AxumPath, Query, State};
@@ -872,6 +1180,12 @@ mod tests {
 
     fn test_config(root: &Path, base_url: &str) -> NsConfig {
         NsConfig {
+            admin: NsAdminConfig {
+                enabled: false,
+                bind_addr: "127.0.0.1".to_string(),
+                port: 0,
+                admin_key: None,
+            },
             smb: SmbConfig::default(),
             storage: StorageConfig {
                 metadata_db_path: root.join("metadata.ndxdb"),
@@ -881,6 +1195,7 @@ mod tests {
             },
             n1: N1Config {
                 base_url: Some(base_url.to_string()),
+                native_url: None,
                 accept_invalid_certs: true,
                 index_roots: vec![root.join("n1-index")],
             },
@@ -891,6 +1206,9 @@ mod tests {
                 min_stable_age_seconds: 120,
                 cold_n1_prefix: "nas".to_string(),
             },
+            users: HashMap::new(),
+            disks: HashMap::new(),
+            shares: HashMap::new(),
             fragment_aliases: HashMap::new(),
             fragment_policies: HashMap::new(),
             fragment_syncs: HashMap::new(),
@@ -1020,6 +1338,17 @@ mod tests {
         assert!(cursor_matches_state(Some(&same), &state));
         assert!(!cursor_matches_state(Some(&different_size), &state));
         assert!(!cursor_matches_state(None, &state));
+    }
+
+    #[test]
+    fn restore_relative_path_rejects_traversal() {
+        assert_eq!(
+            safe_relative_path("docs/report.pdf").expect("valid path"),
+            PathBuf::from("docs").join("report.pdf")
+        );
+        assert!(safe_relative_path("../secret.txt").is_err());
+        assert!(safe_relative_path("docs/../secret.txt").is_err());
+        assert!(safe_relative_path("").is_err());
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use crate::core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ObjectMetadata, UploadPartQuery,
 };
 use crate::core::fragment_manager::{
-    UpdateFragmentRequest, create_fragment, delete_fragment, update_fragment,
+    DeleteFragmentRequest, UpdateFragmentRequest, create_fragment, delete_fragment, update_fragment,
 };
 use crate::core::garbage_collector::{
     get_gc_status, run_garbage_collector, stop_garbage_collector,
@@ -865,6 +865,7 @@ async fn execute_native_op_inner(
                 name: required_string(&payload, "name")?,
                 key: required_string(&payload, "key")?,
                 secret: required_string(&payload, "secret")?,
+                stable_fragment_id: string_field(&payload, "stable_fragment_id"),
                 quota_bytes: Some(
                     u64_field(&payload, "quota_bytes")
                         .ok_or_else(|| AppError::BadRequest("quota_bytes is required".into()))?,
@@ -890,7 +891,11 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             let fragment =
                 string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
-            native_from_response(delete_fragment(State(state), claims, Path(fragment)).await?).await
+            let req: DeleteFragmentRequest = typed_payload(&payload)?;
+            native_from_response(
+                delete_fragment(State(state), claims, Path(fragment), axum::Json(req)).await?,
+            )
+            .await
         }
         "fragment.check" => {
             let fragment = required_string(&payload, "fragment")?;

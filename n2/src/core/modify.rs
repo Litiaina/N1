@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::disk_manager::{ObjectPathManager, RenameObjectRequest};
+use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -145,11 +146,15 @@ async fn acquire_rename_locks(
 pub async fn rename_object(
     State(state): State<Arc<AppState>>,
     claims: Claims,
-    AxumJson(payload): AxumJson<RenameObjectRequest>,
+    AxumJson(mut payload): AxumJson<RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
+
+    payload.source_fragment = resolve_stable_fragment_id(&payload.source_fragment).await?;
+    payload.destination_fragment =
+        resolve_stable_fragment_id(&payload.destination_fragment).await?;
 
     if claims.fragment != payload.source_fragment {
         return Err(AppError::Forbidden(

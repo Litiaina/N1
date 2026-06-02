@@ -2,6 +2,10 @@ use crate::core::constants::{FRAGMENT_METADATA_FILE, PARITY_SUFFIX, SHARD_SUFFIX
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
+use crate::core::fragment_identity::{
+    fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
+};
+use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_io};
@@ -838,12 +842,18 @@ pub async fn trigger_repair_job_api(
         access_mode = MaintenanceAccessMode::ReadOnly;
     }
 
+    let target_fragment = match params
+        .get("fragment")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(fragment) => Some(resolve_stable_fragment_id(&fragment).await?),
+        None => None,
+    };
+
     let cfg = RepairRunConfig {
         dry_run: parse_bool_param(&params, "dry_run", false),
-        target_fragment: params
-            .get("fragment")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty()),
+        target_fragment,
         check_mode,
         meta_concurrency: clamp_usize(
             params
@@ -940,17 +950,12 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
             if !root.exists() {
                 continue;
             }
-            if let Ok(rd) = std::fs::read_dir(&root) {
-                for ent in rd.filter_map(|e| e.ok()) {
-                    if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        let fragment_dir = ent.path();
-                        if !fragment_dir.join(FRAGMENT_METADATA_FILE).is_file() {
-                            continue;
-                        }
-                        if let Some(name) = ent.file_name().to_str() {
-                            out.insert(name.to_string());
-                        }
-                    }
+            for name in list_fragment_aliases(&root) {
+                if fragment_root_on(&root, &name)
+                    .join(FRAGMENT_METADATA_FILE)
+                    .is_file()
+                {
+                    out.insert(stable_fragment_id_for_root(&root, &name).unwrap_or(name));
                 }
             }
         }
@@ -1104,7 +1109,7 @@ async fn repair_fragment_metadata_replicas(
 ) -> Result<(u64, u64, u64), AppError> {
     let paths: Vec<PathBuf> = index_roots
         .iter()
-        .map(|r| r.join(fragment).join(FRAGMENT_METADATA_FILE))
+        .map(|r| fragment_root_on(r, fragment).join(FRAGMENT_METADATA_FILE))
         .collect();
 
     let valid = |b: &[u8]| -> bool { rmp_serde::from_slice::<serde_json::Value>(b).is_ok() };
@@ -1714,8 +1719,12 @@ async fn process_one_metadata(
 mod tests {
     use super::{RepairCheckMode, list_all_fragments, parse_check_mode, reachable_dir_roots};
     use crate::core::constants::FRAGMENT_METADATA_FILE;
+    use crate::core::fragment_identity::{
+        fragment_alias_dir, physical_fragment_dir_name, physical_fragment_root_on,
+    };
     use std::collections::HashMap;
     use std::fs;
+    use std::os::unix::fs::symlink;
     use ulid::Ulid;
 
     #[test]
@@ -1748,16 +1757,23 @@ mod tests {
         fs::create_dir_all(&index_root).expect("create index root");
 
         let real_fragment = "real-fragment";
-        let real_fragment_dir = index_root.join(real_fragment);
+        let stable_fragment = "stable-fragment";
+        let real_fragment_dir = physical_fragment_root_on(&index_root, stable_fragment);
         fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
         fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
             .expect("write fragment metadata marker");
+        fs::create_dir_all(fragment_alias_dir(&index_root)).expect("create alias dir");
+        symlink(
+            std::path::PathBuf::from("..").join(physical_fragment_dir_name(stable_fragment)),
+            fragment_alias_dir(&index_root).join(real_fragment),
+        )
+        .expect("create fragment alias");
 
         fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
         fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
 
         let fragments = list_all_fragments(&[index_root]).await;
-        assert_eq!(fragments, vec![real_fragment.to_string()]);
+        assert_eq!(fragments, vec![stable_fragment.to_string()]);
 
         let _ = fs::remove_dir_all(base);
     }

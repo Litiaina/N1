@@ -11,7 +11,9 @@ For the deeper design, see [N2_ARCHITECTURE.md](N2_ARCHITECTURE.md).
 
 ## Current Status
 
-N2 `0.12.0` is the namespace-quorum hardening line after the destructive reset.
+N2 `1.0.0` is the structure-final distributed object storage line. It is not
+an LTS claim yet; long soak and full node-loss/re-add proof remain separate
+release-validation work.
 
 What exists now:
 
@@ -20,6 +22,7 @@ What exists now:
 - `n2.env`
 - `/n2/...` HTTP route prefix
 - `n2://` native protocol identity
+- N2 stable fragment identity through `.fragment/<alias_hash> -> @f_<stable_fragment_id>`
 - N2 namespace, object record, blob, repair, GC, quota, and maintenance code
 - membership file creation/update
 - auto/fixed node-level layout policy
@@ -36,8 +39,10 @@ What exists now:
 - cluster rebalance executor status/start
 - immutable `.nmtd` cluster placement records
 - native `n2://` peer shard transport proof across two nodes
+- focused two-node hardware proof for multipart resume, reconstruct-after-delete,
+  repair, rebalance, final health, and RSS
 
-What is still before 1.0:
+What is still before LTS:
 
 - long two-node soak with real node loss/re-add
 - native `n2://` client/CLI once server semantics settle
@@ -134,18 +139,24 @@ N2 stores namespace, cluster object records, and blob payloads in explicit
 planes:
 
 ```text
-<index_root>/<fragment_hash>/
+<index_root>/
+  .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/
   namespace/
   .objects/
   .cluster/objects/<fanout>/@o_<object_id>/<version_id>.nmtd
 
-<blob_root>/<fragment_hash>/
+<blob_root>/
+  .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
+  @f_<stable_fragment_id>/
   .blobs/<version_id>/part_<part>_shard_<shard>.shard
   .blobs/<version_id>/part_<part>_shard_<shard>.parity
 ```
 
 `.cluster` is for N2 cluster control records such as immutable `.nmtd`
 placement metadata. Payload truth stays immutable in object records and blobs.
+The mutable fragment alias is only an identity entrypoint; core storage,
+health, repair, rebalance, and GC resolve to the stable fragment id.
 
 Peer-only routes are not public APIs. They are protected by `N2_CLUSTER_SECRET` when set:
 

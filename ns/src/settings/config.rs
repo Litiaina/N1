@@ -19,6 +19,7 @@ pub struct StorageConfig {
 #[derive(Clone, Debug)]
 pub struct N1Config {
     pub base_url: Option<String>,
+    pub native_url: Option<String>,
     pub accept_invalid_certs: bool,
     pub index_roots: Vec<PathBuf>,
 }
@@ -47,11 +48,52 @@ pub struct FragmentSyncConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct NsAdminConfig {
+    pub enabled: bool,
+    pub bind_addr: String,
+    pub port: u16,
+    pub admin_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NsUserConfig {
+    pub password: Option<String>,
+    pub nt_hash_hex: Option<String>,
+    pub enabled: bool,
+    pub shares: Vec<String>,
+    pub read: bool,
+    pub write: bool,
+    pub delete: bool,
+    pub admin: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NsDiskConfig {
+    pub root_path: PathBuf,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NsShareConfig {
+    pub root_path: Option<PathBuf>,
+    pub disk_id: Option<String>,
+    pub fragment_hash: Option<String>,
+    pub read_only: bool,
+    pub n1_base_url: Option<String>,
+    pub sync_enabled: bool,
+    pub cold_n1_prefix: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct NsConfig {
+    pub admin: NsAdminConfig,
     pub smb: SmbConfig,
     pub storage: StorageConfig,
     pub n1: N1Config,
     pub sync: SyncConfig,
+    pub users: HashMap<String, NsUserConfig>,
+    pub disks: HashMap<String, NsDiskConfig>,
+    pub shares: HashMap<String, NsShareConfig>,
     pub fragment_aliases: HashMap<String, String>,
     pub fragment_policies: HashMap<String, FragmentPolicyConfig>,
     pub fragment_syncs: HashMap<String, FragmentSyncConfig>,
@@ -135,6 +177,21 @@ fn parse_csv_paths(value: Option<&str>) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+fn parse_csv_strings(value: Option<&str>) -> Vec<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 pub fn load_config() -> Result<NsConfig, String> {
     let ini = Ini::load_from_file(CONFIG_FILE)
         .map_err(|err| format!("failed to load {}: {}", CONFIG_FILE, err))?;
@@ -144,6 +201,21 @@ pub fn load_config() -> Result<NsConfig, String> {
     let sync_section = ini.section(Some("sync"));
     let smb_section = ini.section(Some("smb"));
     let auth_section = ini.section(Some("auth"));
+    let admin_section = ini.section(Some("admin"));
+
+    let admin = NsAdminConfig {
+        enabled: admin_section
+            .map(|section| parse_bool(section.get("enabled"), true))
+            .unwrap_or(true),
+        bind_addr: admin_section
+            .and_then(|section| optional_string(section.get("bind_addr")))
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: admin_section
+            .and_then(|section| section.get("port"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(50730),
+        admin_key: admin_section.and_then(|section| optional_string(section.get("admin_key"))),
+    };
 
     let mut smb = SmbConfig::default();
     if let Some(section) = smb_section {
@@ -249,6 +321,11 @@ pub fn load_config() -> Result<NsConfig, String> {
             .or_else(|| {
                 sync_section.and_then(|section| optional_string(section.get("n1_base_url")))
             }),
+        native_url: n1_section
+            .and_then(|section| optional_string(section.get("native_url")))
+            .or_else(|| {
+                sync_section.and_then(|section| optional_string(section.get("n1_native_url")))
+            }),
         accept_invalid_certs: n1_section
             .map(|section| parse_bool(section.get("accept_invalid_certs"), true))
             .unwrap_or(true),
@@ -326,10 +403,106 @@ pub fn load_config() -> Result<NsConfig, String> {
 
     let mut fragment_policies = HashMap::new();
     let mut fragment_syncs = HashMap::new();
+    let mut users = HashMap::new();
+    let mut disks = HashMap::new();
+    let mut shares = HashMap::new();
     for (section_name, properties) in ini.iter() {
         let Some(section_name) = section_name else {
             continue;
         };
+
+        if let Some(username) = section_name.strip_prefix("user.") {
+            let username = username.trim().to_ascii_lowercase();
+            if username.is_empty() {
+                continue;
+            }
+            users.insert(
+                username,
+                NsUserConfig {
+                    password: properties
+                        .get("password")
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned),
+                    nt_hash_hex: properties
+                        .get("nt_hash_hex")
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_ascii_lowercase()),
+                    enabled: parse_bool(properties.get("enabled"), true),
+                    shares: parse_csv_strings(properties.get("shares")),
+                    read: parse_bool(properties.get("read"), true),
+                    write: parse_bool(properties.get("write"), false),
+                    delete: parse_bool(properties.get("delete"), false),
+                    admin: parse_bool(properties.get("admin"), false),
+                },
+            );
+            continue;
+        }
+
+        if let Some(disk_id) = section_name.strip_prefix("disk.") {
+            let disk_id = disk_id.trim().to_ascii_lowercase();
+            if disk_id.is_empty() {
+                continue;
+            }
+            let root_path = properties
+                .get("root")
+                .or_else(|| properties.get("root_path"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("{} is missing root_path", section_name))?;
+            disks.insert(
+                disk_id,
+                NsDiskConfig {
+                    root_path,
+                    enabled: parse_bool(properties.get("enabled"), true),
+                },
+            );
+            continue;
+        }
+
+        if let Some(share_name) = section_name.strip_prefix("share.") {
+            let share_name = share_name.trim().to_ascii_lowercase();
+            if share_name.is_empty() {
+                continue;
+            }
+            shares.insert(
+                share_name,
+                NsShareConfig {
+                    root_path: properties
+                        .get("root")
+                        .or_else(|| properties.get("root_path"))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from),
+                    disk_id: properties
+                        .get("disk")
+                        .or_else(|| properties.get("disk_id"))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_ascii_lowercase()),
+                    fragment_hash: properties
+                        .get("fragment")
+                        .or_else(|| properties.get("fragment_hash"))
+                        .and_then(fragment_identifier_to_hash),
+                    read_only: parse_bool(properties.get("read_only"), false),
+                    n1_base_url: properties
+                        .get("n1_base_url")
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned),
+                    sync_enabled: parse_bool(properties.get("sync_enabled"), false),
+                    cold_n1_prefix: properties
+                        .get("cold_n1_prefix")
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .trim_matches('/')
+                        .to_string(),
+                },
+            );
+            continue;
+        }
 
         if let Some(identifier) = section_name
             .strip_prefix("fragment_policy.")
@@ -403,7 +576,7 @@ pub fn load_config() -> Result<NsConfig, String> {
         }
     }
 
-    if !smb.allow_guest && n1.index_roots.is_empty() {
+    if !smb.allow_guest && n1.index_roots.is_empty() && users.is_empty() {
         return Err(
             "NS dynamic fragment authentication requires [n1].index_roots or index_store_disks"
                 .to_string(),
@@ -411,10 +584,14 @@ pub fn load_config() -> Result<NsConfig, String> {
     }
 
     Ok(NsConfig {
+        admin,
         smb,
         storage,
         n1,
         sync,
+        users,
+        disks,
+        shares,
         fragment_aliases,
         fragment_policies,
         fragment_syncs,
