@@ -287,7 +287,7 @@ Fragment tokens carry independent permissions:
 
 - `object_key`, `path`, `source_path`, and `destination_path` are namespace paths such as `videos/clip.mp4`. URL-encode spaces and special characters when they appear in a path or query string.
 - Request bodies are JSON unless the route says the body is raw bytes.
-- HTTPS is the universal API face for consumers and broad compatibility. `n1://` is the native N1 protocol face for N1 Console, N1 CLI, NS, N2, and heavy internal clients.
+- HTTPS is the universal API face for consumers and broad compatibility. `n1://` is the native N1 protocol face for N1 Console, N1 Shell, NS, N2, and heavy internal clients.
 - Large files should use multipart upload. One-shot upload is intended for smaller objects.
 - `version_id` is the persistent upload/object-version id. Multipart part upload and status use `version_id`; finalize also requires the `session_id` returned by init.
 - Empty trash and hard delete remove namespace references first. Blob bytes are reclaimed after GC proves no live or trash metadata references them.
@@ -303,7 +303,7 @@ n1://127.0.0.1:50002
 protocol: n1/0.4
 ```
 
-HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for namespace, control-plane, and data-plane calls.
+HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 Shell, NS, N2, and trusted services that need lower latency than HTTPS for namespace, control-plane, and data-plane calls.
 
 The native protocol does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests use typed `n1://` operations that call N1 core/service functions directly. They do not emulate HTTP requests and they do not dispatch through the Axum route graph.
 
@@ -513,34 +513,34 @@ Listing is less transport-bound because namespace scanning and response body siz
 
 ### Tooling Policy
 
-N1-owned tools should use `n1://` when they are running on trusted infrastructure. HTTPS stays available for browsers, external consumers, curl workflows, and compatibility. `n1_cli` uses native transport by default and only uses HTTPS when the operator explicitly passes `--url <https-url>`.
+N1-owned tools should use `n1://` when they are running on trusted infrastructure. HTTPS stays available for browsers, external consumers, curl workflows, and compatibility. `n1_shell` uses native transport by default and only uses HTTPS when the operator explicitly passes `--url <https-url>`.
 
-`n1_cli` uses the shared `n1_native_client` crate. It does not keep a private native frame/auth implementation.
+`n1_shell` uses the shared `n1_native_client` crate. It does not keep a private native frame/auth implementation.
 
-For normal maintenance, use direct commands. The CLI accepts either a fragment name or a fragment hash. `--none` means whole-N1 scope:
+For normal maintenance, use direct commands. The shell accepts either a fragment name or a fragment hash. `--none` means whole-N1 scope:
 
 ```bash
-cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> repair --none --strict --fast-mode
-cargo run -p n1_cli -- --secret <secret> --fragment <fragment-name-or-hash> repair --dry-run --availability
-cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> gc --none --scrub --fast-mode
-cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> redistribute --none --strict --durability strict
+cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> repair --none --strict --fast-mode
+cargo run -p n1_shell -- --secret <secret> --fragment <fragment-name-or-hash> repair --dry-run --availability
+cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> gc --none --scrub --fast-mode
+cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> redistribute --none --strict --durability strict
 ```
 
 Status, stop, and watch are flags, not nested subcommands:
 
 ```bash
-cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> repair --status
-cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> gc --watch
-cargo run -p n1_cli -- --secret <secret> --fragment <auth-fragment> redistribute --stop
+cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> repair --status
+cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> gc --watch
+cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> redistribute --stop
 ```
 
-`n1_cli` is stateful when opened as a console:
+`n1_shell` is stateful when opened as a shell:
 
 ```bash
-cargo run -p n1_cli -- --secret <secret> --fragment <fragment> console
+cargo run -p n1_shell -- --secret <secret> --fragment <fragment> shell
 ```
 
-The console keeps one native session open and supports read/maintenance operations:
+The shell keeps one native session open and supports read/maintenance operations:
 
 - `health`
 - `quota`
@@ -556,7 +556,7 @@ The console keeps one native session open and supports read/maintenance operatio
 - `object repair <object_key>`
 - `session`
 
-The CLI intentionally keeps destructive namespace mutations out of the operator console. Rename, delete, update, upload, and application CRUD still belong to the HTTP or native API surfaces used by clients that explicitly own those workflows.
+The shell intentionally keeps destructive namespace mutations out of the operator prompt. Rename, delete, update, upload, and application CRUD still belong to the HTTP or native API surfaces used by clients that explicitly own those workflows.
 
 ### Stability Boundary
 

@@ -25,10 +25,10 @@ through its supported APIs or through the native client crate.
 ## What Is Included
 
 - `n1/` - N1 server and storage engine.
-- `n1_cli/` - operator CLI for N1 inspection and maintenance.
+- `n1_shell/` - operator shell for N1 inspection and maintenance.
 - `n1_native_client/` - canonical Rust client for the `n1://` protocol.
 - `simd-erasure-core/` - internal erasure-coding core used by N1.
-- `cli_core/` - small shared CLI support crate used by `n1_cli`.
+- `cli_core/` - small shared shell support crate used by `n1_shell`.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling.
 - `DOCUMENTATION.md` - user-facing N1 documentation.
 - `ARCHITECTURE.md` - storage architecture and invariants.
@@ -68,7 +68,7 @@ native protocol is not a separate storage engine.
 
 ```bash
 cargo build -p n1 --release
-cargo build -p n1_cli --release
+cargo build -p n1_shell --release
 ```
 
 Check the N1 server binary:
@@ -96,10 +96,10 @@ Run the core test suite:
 cargo test -p n1
 ```
 
-Run CLI tests:
+Run shell tests:
 
 ```bash
-cargo test -p n1_cli
+cargo test -p n1_shell
 ```
 
 Run the release proof harness when validating a real deployment:

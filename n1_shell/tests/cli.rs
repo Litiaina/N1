@@ -394,7 +394,7 @@ async fn fragment_create_uses_direct_route() {
     let router = Router::new().route("/n1/fragments", post(create_fragment_handler));
     let (base_url, handle) = spawn_server(router).await;
 
-    let output = Command::cargo_bin("litiaina-n1-cli")
+    let output = Command::cargo_bin("litiaina-n1-shell")
         .unwrap()
         .args([
             "--url",
@@ -432,7 +432,7 @@ async fn fragment_resize_quota_uses_authenticated_admin_route() {
         );
     let (base_url, handle) = spawn_server(router).await;
 
-    let output = Command::cargo_bin("litiaina-n1-cli")
+    let output = Command::cargo_bin("litiaina-n1-shell")
         .unwrap()
         .args([
             "--url",
@@ -467,7 +467,7 @@ async fn health_renders_disk_usage_and_health() {
         .route("/n1/maintenance/health", get(health_handler));
     let (base_url, handle) = spawn_server(router).await;
 
-    let output = Command::cargo_bin("litiaina-n1-cli")
+    let output = Command::cargo_bin("litiaina-n1-shell")
         .unwrap()
         .args([
             "--url",
@@ -509,7 +509,7 @@ async fn uploads_status_can_emit_json() {
         );
     let (base_url, handle) = spawn_server(router).await;
 
-    let output = Command::cargo_bin("litiaina-n1-cli")
+    let output = Command::cargo_bin("litiaina-n1-shell")
         .unwrap()
         .args([
             "--url",
@@ -551,7 +551,7 @@ async fn health_auto_refreshes_expiring_access_token() {
         .with_state(refresh_calls.clone());
     let (base_url, handle) = spawn_server(router).await;
 
-    let output = Command::cargo_bin("litiaina-n1-cli")
+    let output = Command::cargo_bin("litiaina-n1-shell")
         .unwrap()
         .args([
             "--url",
@@ -601,7 +601,7 @@ async fn maintenance_status_commands_use_n1_routes() {
             AUTH_FRAGMENT_NAME,
             "--json",
             "gc",
-            "status",
+            "--status",
         ],
         vec![
             "--url",
@@ -612,7 +612,7 @@ async fn maintenance_status_commands_use_n1_routes() {
             AUTH_FRAGMENT_NAME,
             "--json",
             "repair",
-            "status",
+            "--status",
         ],
         vec![
             "--url",
@@ -623,10 +623,10 @@ async fn maintenance_status_commands_use_n1_routes() {
             AUTH_FRAGMENT_NAME,
             "--json",
             "redistribute",
-            "status",
+            "--status",
         ],
     ] {
-        let output = Command::cargo_bin("litiaina-n1-cli")
+        let output = Command::cargo_bin("litiaina-n1-shell")
             .unwrap()
             .args(args)
             .output()
@@ -647,7 +647,7 @@ async fn maintenance_status_commands_use_n1_routes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn protected_commands_require_fragment_or_auth_fragment() {
-    let output = Command::cargo_bin("litiaina-n1-cli")
+    let output = Command::cargo_bin("litiaina-n1-shell")
         .unwrap()
         .args([
             "--url",

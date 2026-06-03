@@ -1,11 +1,11 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const CLI_LONG_ABOUT: &str = "\
-Operator-first CLI for N1.
+Operator-first shell for N1.
 
-Use this CLI to inspect health, track upload pressure, list namespace state,
+Use this shell to inspect health, track upload pressure, list namespace state,
 and run maintenance jobs without guessing the protocol routes behind them.
-When no HTTPS --url is provided, the CLI prefers the native n1:// transport
+When no HTTPS --url is provided, the shell prefers the native n1:// transport
 from n1_config.ini or n1://127.0.0.1:50002.
 
 N1 authentication is fragment-scoped. For protected commands, pass either
@@ -13,21 +13,21 @@ N1 authentication is fragment-scoped. For protected commands, pass either
 
 const CLI_AFTER_HELP: &str = "\
 Examples:
-  litiaina-n1-cli --secret <secret> --fragment mainframe console
-  litiaina-n1-cli --secret <secret> --fragment mainframe health
-  litiaina-n1-cli --secret <secret> --fragment mainframe namespace list --path docs
-  litiaina-n1-cli --secret <secret> --fragment mainframe uploads list
-  litiaina-n1-cli --secret <secret> --fragment mainframe repair --none --strict --fast-mode
-  litiaina-n1-cli --secret <secret> --fragment mainframe repair --fragment mainframe --scrub
-  litiaina-n1-cli --secret <secret> --fragment mainframe gc --none --scrub --fast-mode
-  litiaina-n1-cli --secret <secret> --fragment mainframe redistribute --none --strict --durability strict
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health";
+  litiaina-n1-shell --secret <secret> --fragment mainframe shell
+  litiaina-n1-shell --secret <secret> --fragment mainframe health
+  litiaina-n1-shell --secret <secret> --fragment mainframe namespace list --path docs
+  litiaina-n1-shell --secret <secret> --fragment mainframe uploads list
+  litiaina-n1-shell --secret <secret> --fragment mainframe repair --none --strict --fast-mode
+  litiaina-n1-shell --secret <secret> --fragment mainframe repair --scrub
+  litiaina-n1-shell --secret <secret> --fragment mainframe gc --none --scrub --fast-mode
+  litiaina-n1-shell --secret <secret> --fragment mainframe redistribute --none --strict --durability strict
+  litiaina-n1-shell --url https://n1.local:50001 --secret <secret> --fragment mainframe health";
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "litiaina-n1-cli",
+    name = "litiaina-n1-shell",
     version,
-    about = "Operator CLI for N1",
+    about = "Operator shell for N1",
     long_about = CLI_LONG_ABOUT,
     subcommand_required = true,
     arg_required_else_help = true,
@@ -68,7 +68,7 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Connection",
-        help = "Compatibility HTTPS API URL, for example https://127.0.0.1:50001. If omitted, the CLI prefers native n1://."
+        help = "Compatibility HTTPS API URL, for example https://127.0.0.1:50001. If omitted, the shell prefers native n1://."
     )]
     pub url: Option<String>,
 
@@ -111,10 +111,10 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
     #[command(
-        about = "Open a stateful native N1 operator console.",
+        about = "Open a stateful native N1 operator shell.",
         long_about = "Open a persistent n1:// session for monitoring, listing, object status/repair, GC, repair, redistribution, and quota checks."
     )]
-    Console,
+    Shell,
 
     #[command(
         about = "Manage engine fragments.",
@@ -146,7 +146,7 @@ pub enum Commands {
 
     #[command(
         about = "Read namespace state.",
-        long_about = "Read-only namespace commands for listing and stat. The CLI intentionally does not expose namespace rename/delete/update operations."
+        long_about = "Read-only namespace commands for listing and stat. The shell intentionally does not expose namespace rename/delete/update operations."
     )]
     Namespace {
         #[command(subcommand)]

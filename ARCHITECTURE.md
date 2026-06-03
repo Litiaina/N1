@@ -10,11 +10,11 @@ N1 has three storage planes and two transport faces:
 - **Object index plane:** fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories with immutable `.ndx` version records.
 - **Blob plane:** shard/parity payload files under `.blobs/<version_id>/`.
 - **HTTPS/LOA face:** the universal `/n1/...` API.
-- **Native `n1://` face:** a MessagePack-framed protocol for N1 Console, CLI, NS, N2, and trusted internal native clients.
+- **Native `n1://` face:** a MessagePack-framed protocol for N1 Console, N1 Shell, NS, N2, and trusted internal native clients.
 
 The transport faces call the same N1 core/service graph. `n1://` is not a separate metadata path and does not own storage truth.
 
-The workspace `n1_native_client` crate is the canonical Rust client implementation for this transport. N1 CLI uses it directly, and N2, NS, desktop tools, and future operators should use the same crate instead of copying frame/auth/streaming code.
+The workspace `n1_native_client` crate is the canonical Rust client implementation for this transport. N1 Shell uses it directly, and N2, NS, desktop tools, and future operators should use the same crate instead of copying frame/auth/streaming code.
 
 ## Native Protocol Plane
 

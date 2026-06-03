@@ -618,7 +618,7 @@ fn print_usage(binary: &str) {
     println!("Usage: {binary} [--version|-V|--help|-h]");
     println!();
     println!("N1 server binary. Run with no arguments to start the server.");
-    println!("Use litiaina-n1-cli for admin and maintenance commands.");
+    println!("Use litiaina-n1-shell for admin and maintenance commands.");
     println!();
     println!("Options:");
     println!("  -V, --version    Print N1 build version and native protocol version");

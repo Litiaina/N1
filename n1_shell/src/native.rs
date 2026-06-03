@@ -39,9 +39,9 @@ pub async fn run_native(cli: Cli) -> Result<(), DynError> {
         .with_request_prefix("n1-cli");
 
     match &cli.command {
-        Commands::Console => {
+        Commands::Shell => {
             authenticate_native_cli(&mut client, &cli, &secret).await?;
-            native_console(&mut client, &cli).await
+            native_shell(&mut client, &cli).await
         }
         Commands::Fragment {
             command: FragmentCommands::Create(args),
@@ -180,7 +180,7 @@ async fn handle_native_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
-        Commands::Console => native_console(client, cli).await,
+        Commands::Shell => native_shell(client, cli).await,
         Commands::Fragment { command } => {
             handle_native_fragment_command(client, cli, command).await
         }
@@ -502,8 +502,8 @@ async fn handle_native_fragment_command(
     }
 }
 
-async fn native_console(client: &mut N1NativeClient, cli: &Cli) -> Result<(), DynError> {
-    println!("N1 native console connected. Type 'help' for commands, 'exit' to quit.");
+async fn native_shell(client: &mut N1NativeClient, cli: &Cli) -> Result<(), DynError> {
+    println!("N1 shell connected over n1://. Type 'help' for commands, 'exit' to quit.");
     let mut line = String::new();
     loop {
         print!("n1> ");
@@ -523,14 +523,14 @@ async fn native_console(client: &mut N1NativeClient, cli: &Cli) -> Result<(), Dy
             print_console_help();
             continue;
         }
-        if let Err(err) = handle_console_line(client, cli, input).await {
+        if let Err(err) = handle_shell_line(client, cli, input).await {
             eprintln!("error: {err}");
         }
     }
     Ok(())
 }
 
-async fn handle_console_line(
+async fn handle_shell_line(
     client: &mut N1NativeClient,
     cli: &Cli,
     input: &str,
@@ -678,7 +678,7 @@ async fn handle_console_line(
 
 fn print_console_help() {
     println!(
-        "commands:\n  health\n  quota\n  fragments\n  list [path]\n  stat <path>\n  uploads\n  upload <version_id>\n  gc status|start\n  repair status|start\n  redistribute status|start\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  session\n  exit"
+        "commands:\n  health\n  quota\n  fragments\n  list [path]\n  stat <path>\n  uploads\n  upload <version_id>\n  gc status|start|stop\n  repair status|start|stop\n  redistribute status|start|stop\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  session\n  exit"
     );
 }
 
@@ -879,7 +879,7 @@ fn native_op_from_mapped_call(
         }
         _ => {
             return Err(io::Error::other(format!(
-                "native CLI has no direct n1:// mapping for {} {}",
+                "native shell has no direct n1:// mapping for {} {}",
                 method_for_error, path
             ))
             .into());

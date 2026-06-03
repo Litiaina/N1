@@ -304,8 +304,8 @@ async fn handle_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
-        Commands::Console => Err(io::Error::other(
-            "console requires native n1:// transport; omit --url or pass --native-url.",
+        Commands::Shell => Err(io::Error::other(
+            "shell requires native n1:// transport; omit --url or pass --native-url.",
         )
         .into()),
         Commands::Health { watch, deep_scan } => {

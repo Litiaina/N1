@@ -2019,7 +2019,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "n1_cli"
+name = "n1_native_client"
+version = "1.3.3"
+dependencies = [
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "n1_shell"
 version = "1.3.3"
 dependencies = [
  "assert_cmd",
@@ -2032,17 +2043,6 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "n1_native_client"
-version = "1.3.3"
-dependencies = [
- "rmp-serde",
- "serde",
- "serde_bytes",
  "serde_json",
  "tokio",
 ]
