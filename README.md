@@ -26,7 +26,7 @@ N2-native operators, peers, tools, and future internal systems.
 ## What Ships Here
 
 - `litiaina-n2`: the N2 distributed object storage server.
-- `litiaina-n2-cli`: native N2 operator CLI.
+- `litiaina-n2-shell`: native N2 operator shell.
 - `n2_native_client`: reusable Rust client for `n2://`.
 - `registry`: business/user/account/policy layer for Litiaina storage.
 - `indexdb`: Registry metadata engine.
@@ -86,8 +86,8 @@ node.
 ```text
 n2/
   src/                  N2 server, object storage, namespace, distribution, protocol
-n2_cli/
-  src/                  N2 native operator CLI
+n2_shell/
+  src/                  N2 native operator shell
 n2_native_client/
   src/                  reusable Rust client for n2://
 registry/
@@ -110,10 +110,10 @@ Build the server:
 cargo build -p n2 --release
 ```
 
-Build the native CLI:
+Build the native shell:
 
 ```bash
-cargo build -p n2_cli --release
+cargo build -p n2_shell --release
 ```
 
 Run the server locally:
@@ -192,23 +192,23 @@ curl -k https://127.0.0.1:50001/n2/posix/list?path=videos \
 See [DOCUMENTATION.md](DOCUMENTATION.md) for full route bodies, query fields,
 and examples.
 
-## Native CLI
+## Native Shell
 
 ```bash
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 ping
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 ping
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   health --fragment n2-test --secret fragment-key
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   list --fragment n2-test --secret fragment-key --path videos --limit 200
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
-  upload-one-shot --fragment n2-test --secret fragment-key \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  upload --fragment n2-test --secret fragment-key \
   --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4
 ```
 
-The CLI also has a `raw` command for calling supported native operation names
+The shell also has a `raw` command for calling supported native operation names
 directly.
 
 ## Proof And Testing
@@ -217,7 +217,7 @@ Run unit-level checks:
 
 ```bash
 cargo test -p n2 --lib
-cargo test -p n2_cli
+cargo test -p n2_shell
 cargo test -p n2_native_client
 ```
 

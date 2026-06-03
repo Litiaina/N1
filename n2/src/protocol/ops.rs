@@ -50,7 +50,11 @@ use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
 };
-use crate::distribution::rebalance::{rebalance_status, repair_status};
+use crate::distribution::rebalance::{
+    ClusterRebalanceRequest, plan_rebalance, rebalance_status, repair_status, start_rebalance,
+    start_repair,
+};
+use crate::distribution::repair::repair_policy;
 use crate::distribution::resolve_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
@@ -877,10 +881,34 @@ async fn execute_native_op_inner(
             require_read(&claims)?;
             native_body(repair_status())
         }
+        "cluster.repair.plan" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            let runtime = active_cluster_runtime()?;
+            native_body(repair_policy(&runtime))
+        }
+        "cluster.repair.start" => {
+            let claims = claims_required(claims)?;
+            require_write_modify(&claims)?;
+            let request: ClusterRebalanceRequest = typed_payload(&payload)?;
+            native_body(start_repair(request)?)
+        }
         "cluster.rebalance.status" => {
             let claims = claims_required(claims)?;
             require_read(&claims)?;
             native_body(rebalance_status())
+        }
+        "cluster.rebalance.plan" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            let runtime = active_cluster_runtime()?;
+            native_body(plan_rebalance(&runtime)?)
+        }
+        "cluster.rebalance.start" => {
+            let claims = claims_required(claims)?;
+            require_write_modify(&claims)?;
+            let request: ClusterRebalanceRequest = typed_payload(&payload)?;
+            native_body(start_rebalance(request)?)
         }
         "maintenance.gc.status" => native_body(get_gc_status().await),
         "maintenance.repair.status" => native_body(get_repair_status().await),

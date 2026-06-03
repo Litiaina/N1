@@ -11,7 +11,7 @@ storage layout and consistency model, see [ARCHITECTURE.md](ARCHITECTURE.md).
 N2 `1.0.0` is the architecture-final line for the distributed object storage
 system. That means the core shape is set: `/n2/...` HTTP API, `n2://` native
 protocol, distributed object placement, namespace coordination, cluster
-monitoring, repair, rebalance, and N2 console/CLI flows.
+monitoring, repair, rebalance, and N2 console/shell flows.
 
 This is not an LTS claim yet. Long soak, larger cluster proof, node-loss
 re-add proof, and wider UI viewport proof remain validation work.
@@ -101,10 +101,10 @@ Build the N2 server:
 cargo build -p n2 --release
 ```
 
-Build the N2 native CLI:
+Build the N2 native shell:
 
 ```bash
-cargo build -p n2_cli --release
+cargo build -p n2_shell --release
 ```
 
 Server binary:
@@ -113,10 +113,10 @@ Server binary:
 target/release/litiaina-n2
 ```
 
-CLI binary:
+Shell binary:
 
 ```text
-target/release/litiaina-n2-cli
+target/release/litiaina-n2-shell
 ```
 
 Run locally:
@@ -1380,39 +1380,39 @@ The native protocol is for low-latency N2-native clients and operators. It is
 not a wrapper around a browser UI. It carries authenticated operation frames
 and supports streamed upload/download operations.
 
-Native CLI examples:
+Native shell examples:
 
 ```bash
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 ping
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 ping
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   auth --fragment n2-test --secret fragment-key
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   health --fragment n2-test --secret fragment-key
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   membership --fragment n2-test --secret fragment-key
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   layout --fragment n2-test --secret fragment-key
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   usage --fragment n2-test --secret fragment-key --target-fragment n2-test
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   list --fragment n2-test --secret fragment-key --path videos --limit 200
 
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
-  upload-one-shot --fragment n2-test --secret fragment-key \
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  upload --fragment n2-test --secret fragment-key \
   --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4
 ```
 
-The CLI supports raw native operation calls:
+The shell supports raw native operation calls:
 
 ```bash
-target/release/litiaina-n2-cli --native-url n2://127.0.0.1:50002 \
-  raw cluster.health --fragment n2-test --secret fragment-key --json '{}'
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  raw cluster.health --fragment n2-test --secret fragment-key --payload '{}'
 ```
 
 Common native operation names:
@@ -1618,9 +1618,9 @@ internal control path, treat that as a UI/API filtering bug.
 ## Validation Commands
 
 ```bash
-cargo check -p n2 -p n2_cli -p n2_native_client
+cargo check -p n2 -p n2_shell -p n2_native_client
 cargo test -p n2 --lib
-cargo test -p n2_cli
+cargo test -p n2_shell
 cargo test -p n2_native_client
 ```
 
@@ -1642,4 +1642,5 @@ For 1.0.0 readiness, prove at minimum:
 - cluster health, layout, usage;
 - cluster repair plan/status;
 - cluster rebalance plan/status;
-- CLI ping, auth, health, membership, layout, list, usage, upload-one-shot.
+- Shell ping, auth, health, membership, layout, list, usage, upload, download,
+  object status/repair, cluster repair, and cluster rebalance.

@@ -3,7 +3,7 @@ members = [
     "indexdb",
     "registry",
     "n1_native_client",
-    "n2_cli",
+    "n2_shell",
     "n2_native_client",
     "n2",
     "simd-erasure-core",

@@ -1,10 +1,10 @@
 [package]
-name = "n2_cli"
+name = "n2_shell"
 version = "1.0.0"
 edition = "2024"
 
 [[bin]]
-name = "litiaina-n2-cli"
+name = "litiaina-n2-shell"
 path = "src/main.rs"
 
 [dependencies]

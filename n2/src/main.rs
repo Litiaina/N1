@@ -644,7 +644,7 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
     raise_open_file_limit_for_storage();
 
     if std::env::args_os().nth(1).is_some() {
-        eprintln!("litiaina-n2 runs the server only. Use `litiaina-n2-cli` for admin commands.");
+        eprintln!("litiaina-n2 runs the server only. Use `litiaina-n2-shell` for admin commands.");
         std::process::exit(2);
     }
 
