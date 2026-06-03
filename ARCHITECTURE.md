@@ -251,3 +251,9 @@ N2 has two protocol surfaces:
 
 - `/n2/...` HTTP API for browsers, external clients, and compatibility
 - `n2://` native protocol identity for N2-native tools and node-to-node work
+
+N2 Gateway is the optional user-facing front door. It routes HTTPS `/n2/...`
+traffic to healthy N2 nodes, keeps multipart session affinity, and uses
+`n2://` for native hot paths where the gateway can preserve streaming
+semantics. Gateway state is routing state only; it is not namespace, object,
+placement, repair, rebalance, or quota authority.

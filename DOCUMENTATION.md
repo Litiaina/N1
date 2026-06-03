@@ -31,8 +31,8 @@ N2 is built around these rules:
 - New objects use the current cluster layout.
 - Existing objects keep their recorded layout until explicit rebalance.
 - Multipart upload session state is coordinator-owned until finalize.
-- Quota is monitoring-only inside N2. Enforcement belongs in Registry or
-  another business layer.
+- Quota is monitoring-only inside N2. Enforcement belongs in an external
+  business layer.
 
 ## Core Concepts
 
@@ -107,6 +107,12 @@ Build the N2 native shell:
 cargo build -p n2_shell --release
 ```
 
+Build the N2 Gateway:
+
+```bash
+cargo build -p n2_gateway --release
+```
+
 Server binary:
 
 ```text
@@ -117,6 +123,12 @@ Shell binary:
 
 ```text
 target/release/litiaina-n2-shell
+```
+
+Gateway binary:
+
+```text
+target/release/litiaina-n2-gateway
 ```
 
 Run locally:
@@ -288,6 +300,232 @@ Node states:
 
 Membership reload is intentionally disabled at runtime. Restart N2 after editing
 membership so the epoch transition is explicit and clean.
+
+## Full Installation With Gateway
+
+This is the normal production shape when N2 is exposed through one stable user
+endpoint:
+
+```text
+users / UI / clients
+        |
+        v
+litiaina-n2-gateway
+        |
+        v
+N2 node A / N2 node B / N2 node C
+```
+
+The gateway is routing authority only. N2 nodes remain the storage authority.
+
+### 1. Prepare Every N2 Node
+
+On each N2 node:
+
+```bash
+mkdir -p /mnt/n2/index /mnt/n2/blob /mnt/n2/fs
+```
+
+Install the same N2 build on every node:
+
+```bash
+cargo build -p n2 --release
+cargo build -p n2_shell --release
+```
+
+Each node must have:
+
+- a unique `node_id`;
+- reachable HTTPS API port;
+- reachable native `n2://` port;
+- local index/blob/runtime roots;
+- the same membership file content and epoch.
+
+Example per-node identity:
+
+```text
+node-a -> https://192.168.0.22:50001 / n2://192.168.0.22:50002
+node-b -> https://192.168.0.13:50001 / n2://192.168.0.13:50002
+node-c -> https://192.168.0.18:50001 / n2://192.168.0.18:50002
+```
+
+### 2. Write `n2_config.ini` Per Node
+
+Each node uses the same config shape, but different `node_id`,
+`node_endpoint`, `native_endpoint`, and disk roots when needed.
+
+Node A:
+
+```ini
+[server]
+host=0.0.0.0
+https_port=50001
+native_port=50002
+cert_path=./certificates/cert.pem
+key_path=./certificates/key.pem
+
+[disk_config]
+index_store_disks=/mnt/n2/index
+blob_store_disks=/mnt/n2/blob
+fs_storage_path=/mnt/n2/fs
+
+[cluster_config]
+node_id=node-a
+node_endpoint=https://192.168.0.22:50001
+native_endpoint=n2://192.168.0.22:50002
+membership_file=n2_membership.json
+cluster_layout_mode=auto
+fixed_data_shards=
+fixed_parity_shards=
+auto_rebalance=false
+
+[quota_config]
+fragment_quota_backend=disabled
+```
+
+Node B and Node C use the same file with their own IDs and addresses.
+
+### 3. Write The Membership File
+
+Place the same membership file on every node under `fs_storage_path`, or use an
+absolute `membership_file` path.
+
+```json
+{
+  "cluster_id": "litiaina-n2-prod",
+  "epoch": 1,
+  "nodes": [
+    {
+      "id": "node-a",
+      "endpoint": "https://192.168.0.22:50001",
+      "native_endpoint": "n2://192.168.0.22:50002",
+      "state": "online",
+      "weight": 1,
+      "index_roots": ["/mnt/n2/index"],
+      "blob_roots": ["/mnt/n2/blob"]
+    },
+    {
+      "id": "node-b",
+      "endpoint": "https://192.168.0.13:50001",
+      "native_endpoint": "n2://192.168.0.13:50002",
+      "state": "online",
+      "weight": 1,
+      "index_roots": ["/mnt/n2/index"],
+      "blob_roots": ["/mnt/n2/blob"]
+    },
+    {
+      "id": "node-c",
+      "endpoint": "https://192.168.0.18:50001",
+      "native_endpoint": "n2://192.168.0.18:50002",
+      "state": "online",
+      "weight": 1,
+      "index_roots": ["/mnt/n2/index"],
+      "blob_roots": ["/mnt/n2/blob"]
+    }
+  ]
+}
+```
+
+### 4. Start And Validate N2 Nodes
+
+Start `litiaina-n2` on every node.
+
+Validate process liveness:
+
+```bash
+curl -k https://192.168.0.22:50001/n2/ping
+curl -k https://192.168.0.13:50001/n2/ping
+curl -k https://192.168.0.18:50001/n2/ping
+```
+
+Validate native ports from the gateway host:
+
+```bash
+nc -vz 192.168.0.22 50002
+nc -vz 192.168.0.13 50002
+nc -vz 192.168.0.18 50002
+```
+
+After authenticating, validate cluster health from any node:
+
+```bash
+curl -k https://192.168.0.22:50001/n2/cluster/health \
+  -H "Authorization: Bearer $N2_TOKEN"
+```
+
+### 5. Configure The Gateway
+
+Build the gateway on the gateway machine:
+
+```bash
+cargo build -p n2_gateway --release
+```
+
+Create or edit `n2_gateway_config.ini`:
+
+```ini
+[server]
+host=0.0.0.0
+https_port=51002
+cert_path=./certificates/cert.pem
+key_path=./certificates/key.pem
+
+[state]
+upload_routes_path=./n2_gateway_upload_routes.json
+
+[routing]
+health_interval_seconds=5
+request_timeout_seconds=300
+
+[node.node-a]
+http_url=https://192.168.0.22:50001
+native_url=n2://192.168.0.22:50002
+weight=1
+
+[node.node-b]
+http_url=https://192.168.0.13:50001
+native_url=n2://192.168.0.13:50002
+weight=1
+
+[node.node-c]
+http_url=https://192.168.0.18:50001
+native_url=n2://192.168.0.18:50002
+weight=1
+```
+
+Start:
+
+```bash
+target/release/litiaina-n2-gateway
+```
+
+Validate:
+
+```bash
+curl -k https://127.0.0.1:51002/gateway/health
+curl -k https://127.0.0.1:51002/gateway/nodes
+```
+
+### 6. Use The Gateway Endpoint
+
+Create fragments, authenticate, upload, list, download, repair, and rebalance
+through the gateway endpoint:
+
+```bash
+curl -k https://gateway.example.com:51002/n2/ping
+curl -k https://gateway.example.com:51002/gateway/health
+```
+
+Multipart uploads through the gateway are coordinator-sticky by design:
+
+```text
+init -> selected N2 node
+part/status/finalize/cancel -> same selected N2 node
+finalized object -> readable from any N2 node
+```
+
+This is the preferred user-facing deployment because clients only need one
+stable URL while N2 keeps its distributed node semantics internally.
 
 ## Authentication
 
@@ -1590,7 +1828,7 @@ is coordinator-owned. Route the session back to the node that returned the
 
 ### Fragment Quota Does Not Stop Uploads
 
-Correct. N2 quota is monitoring-only. Use Registry or a business layer for user
+Correct. N2 quota is monitoring-only. Use an external business layer for user
 quota enforcement.
 
 ### Old Objects Do Not Move After Adding A Node
@@ -1618,10 +1856,11 @@ internal control path, treat that as a UI/API filtering bug.
 ## Validation Commands
 
 ```bash
-cargo check -p n2 -p n2_shell -p n2_native_client
+cargo check -p n2 -p n2_shell -p n2_native_client -p n2_gateway
 cargo test -p n2 --lib
 cargo test -p n2_shell
 cargo test -p n2_native_client
+cargo test -p n2_gateway
 ```
 
 Native hardening proof:

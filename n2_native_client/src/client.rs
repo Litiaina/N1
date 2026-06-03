@@ -5,7 +5,7 @@ use crate::url::parse_native_address;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub struct N2NativeClient {
@@ -235,6 +235,40 @@ impl N2NativeClient {
         let body_len = response.body_len.unwrap_or(0);
         let bytes =
             stream_response_body(&mut self.stream, body_len, |chunk| on_chunk(chunk)).await?;
+        Ok((response, bytes))
+    }
+
+    pub async fn stream_response_to_writer<T, W>(
+        &mut self,
+        op: &str,
+        payload: &T,
+        writer: &mut W,
+    ) -> NativeClientResult<(NativeResponse, u64)>
+    where
+        T: Serialize,
+        W: AsyncWrite + Unpin,
+    {
+        self.next_id = self.next_id.saturating_add(1);
+        let id = format!("{}-{}", self.request_prefix, self.next_id);
+        let request = NativeRequest {
+            id: id.clone(),
+            op: op.to_string(),
+            payload: Some(serde_json::to_string(payload)?),
+            body: None,
+            body_len: None,
+        };
+        write_control_frame(&mut self.stream, &request).await?;
+        self.stream.flush().await?;
+
+        let response = read_response(&mut self.stream).await?;
+        ensure_response_id(&response, &id)?;
+        let body_len = response.body_len.unwrap_or(0);
+        let bytes = tokio::io::copy(&mut (&mut self.stream).take(body_len), writer).await?;
+        if bytes != body_len {
+            return Err(NativeClientError::protocol(format!(
+                "native response streamed {bytes} bytes, expected {body_len}"
+            )));
+        }
         Ok((response, bytes))
     }
 }

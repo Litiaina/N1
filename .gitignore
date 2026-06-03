@@ -31,7 +31,7 @@ Desktop.ini
 .env
 .env.*
 n2.env
-registry.env
+n2_gateway_config.ini
 
 # Config variables
 config.ini
@@ -41,4 +41,4 @@ n2_config.ini
 
 # Local runtime/test artifacts
 .n2-local/
-.registry-local/
+n2_gateway_upload_routes.json

@@ -1,4 +1,1 @@
-# Keep vendored indexdb engine sources out of GitHub language totals.
-indexdb/sqlite/sqlite3.c linguist-vendored
-indexdb/sqlite/sqlite3.h linguist-vendored
-indexdb/sqlite/sqlite3ext.h linguist-vendored
+# N2 currently has no vendored metadata engine sources.

@@ -36,7 +36,12 @@ struct Cli {
     #[arg(short, long, global = true, help = "Fragment secret.")]
     secret: Option<String>,
 
-    #[arg(long, global = true, default_value_t = false, help = "Print compact JSON.")]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Print compact JSON."
+    )]
     json: bool,
 
     #[command(subcommand)]
@@ -251,9 +256,15 @@ async fn run() -> NativeClientResult<()> {
         }
         Command::Auth(auth) => {
             client.auth_fragment(&auth.fragment, &auth.secret).await?;
-            print_value(client.raw_json("session.info", &json!({}), None).await?, cli.json)
+            print_value(
+                client.raw_json("session.info", &json!({}), None).await?,
+                cli.json,
+            )
         }
-        Command::Session => print_value(client.raw_json("session.info", &json!({}), None).await?, cli.json),
+        Command::Session => print_value(
+            client.raw_json("session.info", &json!({}), None).await?,
+            cli.json,
+        ),
         Command::Raw { op, payload } => {
             authenticate_if_configured(&mut client, &cli).await?;
             let payload = parse_json(&payload)?;
@@ -276,7 +287,13 @@ async fn run_authenticated_command(
         Command::Membership => print_op(client, "cluster.membership", json!({}), cli.json).await,
         Command::Layout => print_op(client, "cluster.layout", json!({}), cli.json).await,
         Command::Usage { target_fragment } => {
-            print_op(client, "cluster.usage", json!({ "fragment": target_fragment }), cli.json).await
+            print_op(
+                client,
+                "cluster.usage",
+                json!({ "fragment": target_fragment }),
+                cli.json,
+            )
+            .await
         }
         Command::List(args) => {
             print_op(
@@ -297,36 +314,64 @@ async fn run_authenticated_command(
             .await
         }
         Command::Mkdir(args) => {
-            print_op(client, "namespace.mkdir", json!({ "path": args.path }), cli.json).await
-        }
-        Command::Rename(args) => {
             print_op(
                 client,
-                "namespace.rename",
-                json!({ "source_path": args.source_path, "destination_path": args.destination_path }),
+                "namespace.mkdir",
+                json!({ "path": args.path }),
                 cli.json,
             )
             .await
         }
+        Command::Rename(args) => print_op(
+            client,
+            "namespace.rename",
+            json!({ "source_path": args.source_path, "destination_path": args.destination_path }),
+            cli.json,
+        )
+        .await,
         Command::Trash(args) => {
-            print_op(client, "namespace.trash", json!({ "path": args.path }), cli.json).await
+            print_op(
+                client,
+                "namespace.trash",
+                json!({ "path": args.path }),
+                cli.json,
+            )
+            .await
         }
         Command::Recover(args) => {
-            print_op(client, "namespace.recover", json!({ "path": args.path }), cli.json).await
+            print_op(
+                client,
+                "namespace.recover",
+                json!({ "path": args.path }),
+                cli.json,
+            )
+            .await
         }
         Command::Purge(args) => {
-            print_op(client, "namespace.purge", json!({ "path": args.path }), cli.json).await
+            print_op(
+                client,
+                "namespace.purge",
+                json!({ "path": args.path }),
+                cli.json,
+            )
+            .await
         }
         Command::EmptyTrash => print_op(client, "trash.empty", json!({}), cli.json).await,
         Command::Object { command } => run_object_command(client, command, cli.json).await,
         Command::Upload(args) => upload_file(client, args, cli.json).await,
         Command::Download(args) => download_file(client, args).await,
         Command::Uploads { command } => run_uploads_command(client, command, cli.json).await,
-        Command::Repair(args) => run_job_command(client, "cluster.repair", args, &cli.fragment, cli.json).await,
+        Command::Repair(args) => {
+            run_job_command(client, "cluster.repair", args, &cli.fragment, cli.json).await
+        }
         Command::Rebalance(args) => {
             run_job_command(client, "cluster.rebalance", args, &cli.fragment, cli.json).await
         }
-        Command::Ping | Command::Shell | Command::Auth(_) | Command::Session | Command::Raw { .. } => Ok(()),
+        Command::Ping
+        | Command::Shell
+        | Command::Auth(_)
+        | Command::Session
+        | Command::Raw { .. } => Ok(()),
     }
 }
 
@@ -349,8 +394,13 @@ async fn run_object_command(
             .await
         }
         ObjectCommand::Versions { object_key } => {
-            print_op(client, "object.versions", json!({ "object_key": object_key }), json_output)
-                .await
+            print_op(
+                client,
+                "object.versions",
+                json!({ "object_key": object_key }),
+                json_output,
+            )
+            .await
         }
         ObjectCommand::Status { object_key, mode } => {
             print_op(
@@ -380,10 +430,22 @@ async fn run_uploads_command(
 ) -> NativeClientResult<()> {
     match command {
         UploadsCommand::List { limit } => {
-            print_op(client, "uploads.list", json!({ "limit": limit }), json_output).await
+            print_op(
+                client,
+                "uploads.list",
+                json!({ "limit": limit }),
+                json_output,
+            )
+            .await
         }
         UploadsCommand::Status { version_id } => {
-            print_op(client, "uploads.status", json!({ "version_id": version_id }), json_output).await
+            print_op(
+                client,
+                "uploads.status",
+                json!({ "version_id": version_id }),
+                json_output,
+            )
+            .await
         }
         UploadsCommand::Cancel {
             version_id,
@@ -408,8 +470,12 @@ async fn run_job_command(
     json_output: bool,
 ) -> NativeClientResult<()> {
     match args.action {
-        JobAction::Plan => print_op(client, &format!("{prefix}.plan"), json!({}), json_output).await,
-        JobAction::Status => print_op(client, &format!("{prefix}.status"), json!({}), json_output).await,
+        JobAction::Plan => {
+            print_op(client, &format!("{prefix}.plan"), json!({}), json_output).await
+        }
+        JobAction::Status => {
+            print_op(client, &format!("{prefix}.status"), json!({}), json_output).await
+        }
         JobAction::Start {
             target_fragment,
             prefix: object_prefix,
@@ -418,7 +484,11 @@ async fn run_job_command(
         } => {
             let fragment = target_fragment
                 .or_else(|| auth_fragment.clone())
-                .ok_or_else(|| NativeClientError::protocol("job start requires --fragment or --target-fragment"))?;
+                .ok_or_else(|| {
+                    NativeClientError::protocol(
+                        "job start requires --fragment or --target-fragment",
+                    )
+                })?;
             print_op(
                 client,
                 &format!("{prefix}.start"),
@@ -537,10 +607,19 @@ async fn download_file(client: &mut N2NativeClient, args: DownloadArgs) -> Nativ
         let (code, message) = response
             .error
             .map(|err| (err.code, err.message))
-            .unwrap_or_else(|| ("native_error".to_string(), "unknown native error".to_string()));
+            .unwrap_or_else(|| {
+                (
+                    "native_error".to_string(),
+                    "unknown native error".to_string(),
+                )
+            });
         return Err(NativeClientError::Native { code, message });
     }
-    eprintln!("downloaded {} to {}", human_bytes(bytes), args.file.display());
+    eprintln!(
+        "downloaded {} to {}",
+        human_bytes(bytes),
+        args.file.display()
+    );
     Ok(())
 }
 
@@ -580,7 +659,10 @@ async fn run_shell_line(
     let parts = input.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         ["ping"] => print_value(client.raw_json("ping", &json!({}), None).await?, cli.json),
-        ["session"] => print_value(client.raw_json("session.info", &json!({}), None).await?, cli.json),
+        ["session"] => print_value(
+            client.raw_json("session.info", &json!({}), None).await?,
+            cli.json,
+        ),
         ["health"] => print_op(client, "maintenance.health", json!({}), cli.json).await,
         ["cluster"] | ["cluster", "health"] => {
             print_op(client, "cluster.health", json!({}), cli.json).await
@@ -588,15 +670,37 @@ async fn run_shell_line(
         ["membership"] => print_op(client, "cluster.membership", json!({}), cli.json).await,
         ["layout"] => print_op(client, "cluster.layout", json!({}), cli.json).await,
         ["usage"] => print_op(client, "cluster.usage", json!({}), cli.json).await,
-        ["list"] => print_op(client, "namespace.list", json!({"path": "", "limit": 200}), cli.json).await,
+        ["list"] => {
+            print_op(
+                client,
+                "namespace.list",
+                json!({"path": "", "limit": 200}),
+                cli.json,
+            )
+            .await
+        }
         ["list", path] => {
-            print_op(client, "namespace.list", json!({"path": path, "limit": 200}), cli.json).await
+            print_op(
+                client,
+                "namespace.list",
+                json!({"path": path, "limit": 200}),
+                cli.json,
+            )
+            .await
         }
         ["trash-list"] => {
-            print_op(client, "namespace.list", json!({"path": "", "limit": 200, "trash": true}), cli.json).await
+            print_op(
+                client,
+                "namespace.list",
+                json!({"path": "", "limit": 200, "trash": true}),
+                cli.json,
+            )
+            .await
         }
         ["stat", path] => print_op(client, "namespace.stat", json!({"path": path}), cli.json).await,
-        ["mkdir", path] => print_op(client, "namespace.mkdir", json!({"path": path}), cli.json).await,
+        ["mkdir", path] => {
+            print_op(client, "namespace.mkdir", json!({"path": path}), cli.json).await
+        }
         ["rename", source, destination] | ["move", source, destination] => {
             print_op(
                 client,
@@ -606,27 +710,61 @@ async fn run_shell_line(
             )
             .await
         }
-        ["trash", path] => print_op(client, "namespace.trash", json!({"path": path}), cli.json).await,
+        ["trash", path] => {
+            print_op(client, "namespace.trash", json!({"path": path}), cli.json).await
+        }
         ["recover", path] => {
             print_op(client, "namespace.recover", json!({"path": path}), cli.json).await
         }
-        ["purge", path] => print_op(client, "namespace.purge", json!({"path": path}), cli.json).await,
+        ["purge", path] => {
+            print_op(client, "namespace.purge", json!({"path": path}), cli.json).await
+        }
         ["empty-trash"] => print_op(client, "trash.empty", json!({}), cli.json).await,
         ["uploads"] => print_op(client, "uploads.list", json!({"limit": 50}), cli.json).await,
         ["upload-status", version_id] => {
-            print_op(client, "uploads.status", json!({"version_id": version_id}), cli.json).await
+            print_op(
+                client,
+                "uploads.status",
+                json!({"version_id": version_id}),
+                cli.json,
+            )
+            .await
         }
         ["object", "meta", object_key] => {
-            print_op(client, "object.meta", json!({"object_key": object_key}), cli.json).await
+            print_op(
+                client,
+                "object.meta",
+                json!({"object_key": object_key}),
+                cli.json,
+            )
+            .await
         }
         ["object", "versions", object_key] => {
-            print_op(client, "object.versions", json!({"object_key": object_key}), cli.json).await
+            print_op(
+                client,
+                "object.versions",
+                json!({"object_key": object_key}),
+                cli.json,
+            )
+            .await
         }
         ["object", "status", object_key] => {
-            print_op(client, "object.status", json!({"object_key": object_key}), cli.json).await
+            print_op(
+                client,
+                "object.status",
+                json!({"object_key": object_key}),
+                cli.json,
+            )
+            .await
         }
         ["object", "repair", object_key] => {
-            print_op(client, "object.repair", json!({"object_key": object_key, "mode": "strict"}), cli.json).await
+            print_op(
+                client,
+                "object.repair",
+                json!({"object_key": object_key, "mode": "strict"}),
+                cli.json,
+            )
+            .await
         }
         ["repair"] | ["repair", "status"] => {
             print_op(client, "cluster.repair.status", json!({}), cli.json).await
@@ -636,7 +774,13 @@ async fn run_shell_line(
             let fragment = cli.fragment.clone().ok_or_else(|| {
                 NativeClientError::protocol("repair start requires global --fragment")
             })?;
-            print_op(client, "cluster.repair.start", json!({"fragment": fragment}), cli.json).await
+            print_op(
+                client,
+                "cluster.repair.start",
+                json!({"fragment": fragment}),
+                cli.json,
+            )
+            .await
         }
         ["rebalance"] | ["rebalance", "status"] => {
             print_op(client, "cluster.rebalance.status", json!({}), cli.json).await
@@ -648,7 +792,13 @@ async fn run_shell_line(
             let fragment = cli.fragment.clone().ok_or_else(|| {
                 NativeClientError::protocol("rebalance start requires global --fragment")
             })?;
-            print_op(client, "cluster.rebalance.start", json!({"fragment": fragment}), cli.json).await
+            print_op(
+                client,
+                "cluster.rebalance.start",
+                json!({"fragment": fragment}),
+                cli.json,
+            )
+            .await
         }
         _ => {
             println!("unknown command. Type 'help'.");

@@ -27,9 +27,8 @@ N2-native operators, peers, tools, and future internal systems.
 
 - `litiaina-n2`: the N2 distributed object storage server.
 - `litiaina-n2-shell`: native N2 operator shell.
+- `litiaina-n2-gateway`: smart N2 front door for user-facing traffic.
 - `n2_native_client`: reusable Rust client for `n2://`.
-- `registry`: business/user/account/policy layer for Litiaina storage.
-- `indexdb`: Registry metadata engine.
 - `simd-erasure-core`: SIMD erasure implementation used by N2.
 
 ## Documentation
@@ -38,8 +37,8 @@ N2-native operators, peers, tools, and future internal systems.
   bodies, query fields, examples, and troubleshooting.
 - [ARCHITECTURE.md](ARCHITECTURE.md): storage layout, object identity,
   cluster placement, namespace coordination, repair, and rebalance design.
-- [REGISTRY_DOCUMENTATION.md](REGISTRY_DOCUMENTATION.md): Registry business
-  layer documentation.
+- [GATEWAY.md](GATEWAY.md): gateway deployment, routing, and multipart
+  resumability behavior.
 
 ## Core Model
 
@@ -90,10 +89,8 @@ n2_shell/
   src/                  N2 native operator shell
 n2_native_client/
   src/                  reusable Rust client for n2://
-registry/
-  src/                  account, session, sharing, policy, and business layer
-indexdb/
-  src/                  Registry metadata engine
+n2_gateway/
+  src/                  user-facing N2 gateway and resumability router
 simd-erasure-core/
   src/                  erasure coding implementation
 scripts/bench/
@@ -114,6 +111,12 @@ Build the native shell:
 
 ```bash
 cargo build -p n2_shell --release
+```
+
+Build the gateway:
+
+```bash
+cargo build -p n2_gateway --release
 ```
 
 Run the server locally:
@@ -238,6 +241,6 @@ ignored local output under `.n2-bench/`.
 - Long soak, larger cluster proof, node loss/re-add proof, and wider UI
   viewport proof remain release-validation work.
 - Per-fragment quota is monitoring-only in N2. Enforcement belongs in a
-  business layer such as Registry.
+  business layer outside this repository.
 - S3 compatibility is not part of the N2 core. If needed, it should live as an
   adapter layer.
