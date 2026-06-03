@@ -248,7 +248,7 @@ fn should_count_index_record(path: &std::path::Path) -> bool {
         None => return false,
     };
 
-    if !name.ends_with(".ndx") {
+    if !name.ends_with(".ncdx") {
         return false;
     }
 
@@ -278,14 +278,14 @@ mod tests {
     #[test]
     fn deep_scan_counts_only_live_index_records() {
         assert!(should_count_index_record(Path::new(
-            "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
+            "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ncdx"
         )));
         assert!(!should_count_index_record(Path::new(
             "frag/.intents/0001.pending.redist.intent.msgpack"
         )));
-        assert!(!should_count_index_record(Path::new("frag/.fragment.ndx")));
+        assert!(!should_count_index_record(Path::new("frag/.fragment.ncdx")));
         assert!(!should_count_index_record(Path::new(
-            "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
+            "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ncdx"
         )));
     }
 }

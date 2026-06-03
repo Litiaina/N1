@@ -832,13 +832,13 @@ fn object_index_dir_for_root(
     })
 }
 
-async fn object_index_dir_has_ndx(path: &Path) -> bool {
+async fn object_index_dir_has_ncdx(path: &Path) -> bool {
     let Ok(mut entries) = tokio_fs::read_dir(path).await else {
         return false;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
-        if name.to_string_lossy().ends_with(".ndx") {
+        if name.to_string_lossy().ends_with(".ncdx") {
             return true;
         }
     }
@@ -2263,7 +2263,7 @@ pub(crate) async fn check_needs_redistribution(
     if check_index {
         for root in target_index_roots {
             let path = object_index_dir_for_root(root, &meta.fragment, &meta.object_key, is_trash);
-            if !object_index_dir_has_ndx(&path).await {
+            if !object_index_dir_has_ncdx(&path).await {
                 needs.index = true;
                 break;
             }

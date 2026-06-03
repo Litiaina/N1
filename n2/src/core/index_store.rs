@@ -34,10 +34,9 @@ pub(crate) const TMP_DIR: &str = ".tmp";
 pub(crate) const LOCKS_DIR: &str = ".locks";
 pub(crate) const GC_DIR: &str = ".gc";
 pub(crate) const REPAIR_DIR: &str = ".repair";
-pub(crate) const CLUSTER_DIR: &str = ".cluster";
-const FRAGMENT_META_FILE: &str = ".fragment.ndx";
-const MANIFEST_FILE: &str = "manifest.ndx";
-const BINDING_FILE: &str = "binding.ndx";
+const FRAGMENT_META_FILE: &str = ".fragment.ncdx";
+const MANIFEST_FILE: &str = "manifest.ncdx";
+const BINDING_FILE: &str = "binding.ncdx";
 const SHARD_RECEIPT_PREFIX: &str = "shard_p";
 const PART_RECEIPT_PREFIX: &str = "part_p";
 const RECEIPT_SUFFIX: &str = ".receipt";
@@ -108,7 +107,7 @@ pub(crate) struct TrashRecord {
 }
 
 #[derive(Debug, Clone)]
-struct NdxSummary {
+struct NcdxSummary {
     version_id: String,
     size_bytes: u64,
     unix_nanos: i128,
@@ -224,7 +223,6 @@ fn reserved_user_segment(segment: &str) -> bool {
         || segment.starts_with(LOCKS_DIR)
         || segment.starts_with(GC_DIR)
         || segment.starts_with(REPAIR_DIR)
-        || segment.starts_with(CLUSTER_DIR)
         || segment.starts_with(INTENTS_DIR)
         || segment.starts_with(TRASH_JOBS_DIR)
 }
@@ -243,7 +241,6 @@ pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
                 | LOCKS_DIR
                 | GC_DIR
                 | REPAIR_DIR
-                | CLUSTER_DIR
                 | INTENTS_DIR
                 | TRASH_JOBS_DIR
                 | FRAGMENT_META_FILE
@@ -307,12 +304,17 @@ fn object_dir_name_for_id(object_id: &str) -> Result<String, AppError> {
     ))
 }
 
-fn object_fanout_segments_for_id(object_id: &str) -> Result<(String, String), AppError> {
+fn object_fanout_segments_for_id(object_id: &str) -> Result<[String; 4], AppError> {
     let object_id = normalize_object_id(object_id)?;
     let mut hasher = Sha256::new();
     hasher.update(object_id.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    Ok((hash[0..2].to_string(), hash[2..4].to_string()))
+    Ok([
+        hash[0..2].to_string(),
+        hash[2..4].to_string(),
+        hash[4..6].to_string(),
+        hash[6..8].to_string(),
+    ])
 }
 
 pub(crate) fn object_id_from_dir_name(name: &str) -> Option<String> {
@@ -324,11 +326,13 @@ pub(crate) fn object_index_dir(
     fragment: &str,
     object_id: &str,
 ) -> Result<PathBuf, AppError> {
-    let (fanout_a, fanout_b) = object_fanout_segments_for_id(object_id)?;
+    let fanout = object_fanout_segments_for_id(object_id)?;
     Ok(fragment_root_on(root, fragment)
         .join(OBJECTS_DIR)
-        .join(fanout_a)
-        .join(fanout_b)
+        .join(&fanout[0])
+        .join(&fanout[1])
+        .join(&fanout[2])
+        .join(&fanout[3])
         .join(object_dir_name_for_id(object_id)?))
 }
 
@@ -444,25 +448,21 @@ fn object_index_dirs_under_root(
     }
 
     let mut out = Vec::new();
-    for fanout_a in read_dir_names(&objects_root)? {
-        let fanout_a_dir = objects_root.join(&fanout_a);
-        if !fanout_a_dir.is_dir() {
-            continue;
-        }
-        for fanout_b in read_dir_names(&fanout_a_dir)? {
-            let fanout_b_dir = fanout_a_dir.join(&fanout_b);
-            if !fanout_b_dir.is_dir() {
+    let mut stack = vec![(objects_root, 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        for name in read_dir_names(&dir)? {
+            let child = dir.join(&name);
+            if !child.is_dir() {
                 continue;
             }
-            for name in read_dir_names(&fanout_b_dir)? {
-                let Some(object_id) = object_id_from_dir_name(&name) else {
-                    continue;
-                };
-                let object_dir = fanout_b_dir.join(&name);
-                if object_dir.is_dir() {
-                    out.push((object_dir, object_id));
-                }
+            if depth < 4 {
+                stack.push((child, depth + 1));
+                continue;
             }
+            let Some(object_id) = object_id_from_dir_name(&name) else {
+                continue;
+            };
+            out.push((child, object_id));
         }
     }
     Ok(out)
@@ -518,10 +518,10 @@ fn unpack_extension_key(mut packed: u64) -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-fn ndx_file_name(metadata: &ObjectMetadata) -> String {
+fn ncdx_file_name(metadata: &ObjectMetadata) -> String {
     let unix_nanos = i128::from(metadata.created_at.max(0)) * 1_000_000_000i128;
     format!(
-        "{}.{}.{}.{}.ndx",
+        "{}.{}.{}.{}.ncdx",
         metadata.version_id,
         metadata.total_size_bytes,
         unix_nanos,
@@ -529,8 +529,8 @@ fn ndx_file_name(metadata: &ObjectMetadata) -> String {
     )
 }
 
-fn parse_ndx_file_name(name: &str) -> Option<NdxSummary> {
-    let stem = name.strip_suffix(".ndx")?;
+fn parse_ncdx_file_name(name: &str) -> Option<NcdxSummary> {
+    let stem = name.strip_suffix(".ncdx")?;
     let mut parts = stem.split('.');
     let version_id = parts.next()?.to_string();
     let size_bytes = parts.next()?.parse::<u64>().ok()?;
@@ -539,7 +539,7 @@ fn parse_ndx_file_name(name: &str) -> Option<NdxSummary> {
     if parts.next().is_some() {
         return None;
     }
-    Some(NdxSummary {
+    Some(NcdxSummary {
         version_id,
         size_bytes,
         unix_nanos,
@@ -574,13 +574,13 @@ pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
     Ok(names)
 }
 
-fn latest_summary_in_object_dir(dir: &Path) -> Result<Option<NdxSummary>, AppError> {
+fn latest_summary_in_object_dir(dir: &Path) -> Result<Option<NcdxSummary>, AppError> {
     if !dir.is_dir() {
         return Ok(None);
     }
-    let mut latest = None::<NdxSummary>;
+    let mut latest = None::<NcdxSummary>;
     for name in read_dir_names(dir)? {
-        let Some(summary) = parse_ndx_file_name(&name) else {
+        let Some(summary) = parse_ncdx_file_name(&name) else {
             continue;
         };
         if latest
@@ -602,7 +602,7 @@ pub(crate) fn latest_summary_metadata_in_object_dir(
         .map(|summary| summary_metadata(fragment, record_key.to_string(), summary)))
 }
 
-fn ndx_path_for_version(dir: &Path, version_id: &str) -> Result<Option<PathBuf>, AppError> {
+fn ncdx_path_for_version(dir: &Path, version_id: &str) -> Result<Option<PathBuf>, AppError> {
     if !dir.is_dir() {
         return Ok(None);
     }
@@ -610,7 +610,7 @@ fn ndx_path_for_version(dir: &Path, version_id: &str) -> Result<Option<PathBuf>,
         if !name.starts_with(version_id) {
             continue;
         }
-        if parse_ndx_file_name(&name).is_some() {
+        if parse_ncdx_file_name(&name).is_some() {
             return Ok(Some(dir.join(name)));
         }
     }
@@ -772,7 +772,7 @@ fn record_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn summary_metadata(fragment: &str, object_key: String, summary: NdxSummary) -> ObjectMetadata {
+fn summary_metadata(fragment: &str, object_key: String, summary: NcdxSummary) -> ObjectMetadata {
     let ext = unpack_extension_key(summary.packed_ext);
     ObjectMetadata {
         object_key,
@@ -790,13 +790,16 @@ fn summary_metadata(fragment: &str, object_key: String, summary: NdxSummary) -> 
         },
         total_size_bytes: summary.size_bytes,
         created_at: (summary.unix_nanos / 1_000_000_000i128) as i64,
+        membership_epoch: 0,
+        data_shards: 0,
+        parity_shards: 0,
         parts: Vec::new(),
         is_delete_marker: false,
         stripe_size_bytes: super::disk_manager::default_stripe_size(),
     }
 }
 
-fn summary_entry(record: String, summary: &NdxSummary) -> IndexListEntry {
+fn summary_entry(record: String, summary: &NcdxSummary) -> IndexListEntry {
     IndexListEntry {
         record,
         kind: "file".to_string(),
@@ -865,7 +868,7 @@ fn create_empty_marker(path: &Path) -> Result<(), AppError> {
 fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
     ensure_fragment_dirs(&metadata.fragment)?;
     let bytes = encode(metadata)?;
-    let file_name = ndx_file_name(metadata);
+    let file_name = ncdx_file_name(metadata);
     for root in index_roots() {
         let object_dir = object_index_dir(&root, &metadata.fragment, &metadata.object_key)?;
         write_atomic(&object_dir.join(&file_name), &bytes)?;
@@ -920,7 +923,7 @@ fn all_live_version_paths(fragment: &str, object_key: &str) -> Result<Vec<PathBu
             continue;
         }
         for name in read_dir_names(&dir)? {
-            if parse_ndx_file_name(&name).is_some() {
+            if parse_ncdx_file_name(&name).is_some() {
                 paths.push(dir.join(name));
             }
         }
@@ -948,7 +951,7 @@ pub fn read_live_version(
 ) -> Result<Option<ObjectMetadata>, AppError> {
     let object_key = normalize_object_key(object_key)?;
     for dir in object_dir_candidates(fragment, &object_key)? {
-        if let Some(path) = ndx_path_for_version(&dir, version_id)? {
+        if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
             return decode_metadata_file_as(&path, &object_key).map(Some);
         }
     }
@@ -960,7 +963,7 @@ pub fn read_current_live_head(
     object_key: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
     let object_key = normalize_object_key(object_key)?;
-    let mut latest = None::<(PathBuf, NdxSummary)>;
+    let mut latest = None::<(PathBuf, NcdxSummary)>;
     for dir in object_dir_candidates(fragment, &object_key)? {
         let Some(summary) = latest_summary_in_object_dir(&dir)? else {
             continue;
@@ -1184,7 +1187,7 @@ pub fn read_trash_version(
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
     for dir in object_dir_candidates(fragment, object_id)? {
-        if let Some(path) = ndx_path_for_version(&dir, version_id)? {
+        if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
             return decode_metadata_file(&path).map(Some);
         }
     }
@@ -1212,7 +1215,7 @@ pub fn list_trash_versions(
             continue;
         }
         for name in read_dir_names(&dir)? {
-            if parse_ndx_file_name(&name).is_some() {
+            if parse_ncdx_file_name(&name).is_some() {
                 let meta = decode_metadata_file(&dir.join(name))?;
                 if seen.insert(meta.version_id.clone()) {
                     out.push(meta);
@@ -1255,11 +1258,11 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                     let mut version_ids = BTreeSet::new();
                     let mut deleted_at = Utc::now().timestamp();
                     let object_dir = object_index_dir(&index_root, fragment, &object_id)?;
-                    for ndx_name in read_dir_names(&object_dir)? {
-                        if parse_ndx_file_name(&ndx_name).is_none() {
+                    for ncdx_name in read_dir_names(&object_dir)? {
+                        if parse_ncdx_file_name(&ncdx_name).is_none() {
                             continue;
                         }
-                        let meta = decode_metadata_file(&object_dir.join(&ndx_name))?;
+                        let meta = decode_metadata_file(&object_dir.join(&ncdx_name))?;
                         deleted_at = meta.created_at;
                         object_keys.insert(object_id.clone());
                         version_ids.insert(meta.version_id);
@@ -1389,6 +1392,9 @@ fn scan_trash_page(
                 content_type: "application/octet-stream".to_string(),
                 total_size_bytes: 0,
                 created_at: record.deleted_at_unix,
+                membership_epoch: 0,
+                data_shards: 0,
+                parity_shards: 0,
                 parts: Vec::new(),
                 is_delete_marker: false,
                 stripe_size_bytes: super::disk_manager::default_stripe_size(),
@@ -1743,7 +1749,7 @@ pub fn delete_live_version(
 ) -> Result<bool, AppError> {
     let mut removed = false;
     for dir in object_dir_candidates(fragment, object_key)? {
-        if let Some(path) = ndx_path_for_version(&dir, version_id)? {
+        if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
             removed |= remove_file_if_exists(&path)?;
         }
     }
@@ -1757,7 +1763,7 @@ pub fn delete_trash_version(
 ) -> Result<bool, AppError> {
     let mut removed = false;
     for dir in object_dir_candidates(fragment, object_key)? {
-        if let Some(path) = ndx_path_for_version(&dir, version_id)? {
+        if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
             removed |= remove_file_if_exists(&path)?;
         }
     }
@@ -1898,7 +1904,7 @@ pub fn fragment_has_object_index_records(fragment: &str, roots: &[PathBuf]) -> b
                 let Some(name) = record.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                if parse_ndx_file_name(&name).is_some() {
+                if parse_ncdx_file_name(&name).is_some() {
                     return true;
                 }
             }
@@ -1920,7 +1926,7 @@ fn count_object_index_records(root: &Path, fragment: &str) -> u64 {
             if record
                 .file_name()
                 .to_str()
-                .is_some_and(|name| parse_ndx_file_name(name).is_some())
+                .is_some_and(|name| parse_ncdx_file_name(name).is_some())
             {
                 count += 1;
             }
@@ -1986,7 +1992,7 @@ fn collect_object_index_records(
     for root in index_roots() {
         for (object_dir, object_id) in object_index_dirs_under_root(&root, fragment)? {
             for name in read_dir_names(&object_dir)? {
-                if parse_ndx_file_name(&name).is_none() {
+                if parse_ncdx_file_name(&name).is_none() {
                     continue;
                 }
                 if !seen.insert((object_id.clone(), name.clone())) {
@@ -2489,7 +2495,7 @@ pub fn commit_session_part(
     let bytes = encode(part)?;
     for dir in session_roots(fragment, version_id) {
         write_atomic(
-            &dir.join(format!("{}{:020}.ndx", PART_META_PREFIX, part.part_index)),
+            &dir.join(format!("{}{:020}.ncdx", PART_META_PREFIX, part.part_index)),
             &bytes,
         )?;
     }
@@ -2535,7 +2541,7 @@ pub fn load_session(
         let mut part_checksums = BTreeMap::<u64, u32>::new();
         for name in read_dir_names(&dir)? {
             let path = dir.join(&name);
-            if name.starts_with(PART_META_PREFIX) && name.ends_with(".ndx") {
+            if name.starts_with(PART_META_PREFIX) && name.ends_with(".ncdx") {
                 let part: PartMetadata =
                     decode(&fs::read(path).map_err(|e| io_err(e, "read upload part metadata"))?)?;
                 state.parts.insert(part.part_index, part);
@@ -2729,7 +2735,7 @@ mod tests {
             encoded
                 .first()
                 .is_some_and(|byte| (*byte & 0xf0) == 0x80 || *byte == 0xde || *byte == 0xdf),
-            ".fragment.ndx must be a named MessagePack map, not a positional tuple"
+            ".fragment.ncdx must be a named MessagePack map, not a positional tuple"
         );
         let decoded = decode_fragment_meta(&encoded).expect("decode named fragment metadata");
         assert_eq!(decoded.fragment_id, meta.fragment_id);
@@ -2748,6 +2754,9 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             total_size_bytes: size,
             created_at: 1_777_905_000,
+            membership_epoch: 0,
+            data_shards: 1,
+            parity_shards: 0,
             parts: Vec::new(),
             is_delete_marker: false,
             stripe_size_bytes: crate::core::disk_manager::default_stripe_size(),
@@ -2829,7 +2838,7 @@ mod tests {
             object_index_dir(&roots[0], &fragment, &one_disk_object_id).expect("object dir");
         fs::create_dir_all(&one_disk_object_dir).expect("create one-disk object dir");
         write_atomic(
-            &one_disk_object_dir.join(ndx_file_name(&one_disk_meta)),
+            &one_disk_object_dir.join(ncdx_file_name(&one_disk_meta)),
             &encode(&one_disk_meta).expect("encode one-disk metadata"),
         )
         .expect("write one-disk metadata");
@@ -2849,7 +2858,7 @@ mod tests {
         assert_eq!(
             source,
             fragment_root_on(&roots[0], &fragment),
-            "newer .fragment.ndx on a stale replica must not outrank the richer index plane"
+            "newer .fragment.ncdx on a stale replica must not outrank the richer index plane"
         );
 
         repair_fragment_all_partition_replicas(&fragment, false).expect("repair N2 replicas");
@@ -2887,7 +2896,7 @@ mod tests {
             object_index_dir(&roots[0], &fragment, &one_disk_object_id).expect("object dir");
         fs::create_dir_all(&one_disk_object_dir).expect("create one-disk object dir");
         write_atomic(
-            &one_disk_object_dir.join(ndx_file_name(&one_disk_meta)),
+            &one_disk_object_dir.join(ncdx_file_name(&one_disk_meta)),
             &encode(&one_disk_meta).expect("encode one-disk metadata"),
         )
         .expect("write one-disk metadata");
@@ -3004,7 +3013,6 @@ mod tests {
         assert!(normalize_object_key("docs/@o_bad/file.txt").is_err());
         assert!(normalize_object_key(".trash/video.mp4").is_err());
         assert!(normalize_object_key(".blobs/video.mp4").is_err());
-        assert!(normalize_object_key(".cluster/objects/file.ndx").is_err());
         assert!(normalize_object_key("docs/.repair/file.txt").is_err());
         assert_eq!(
             normalize_object_key("docs/video.mp4").unwrap(),
@@ -3024,20 +3032,21 @@ mod tests {
     }
 
     #[test]
-    fn object_index_dir_uses_two_level_hash_fanout() {
+    fn object_index_dir_uses_four_level_hash_fanout() {
         let root = PathBuf::from("/n2-index");
         let fragment = "fragment-a";
         let object_id = "01KQXRVALIDEDGEID0000000";
-        let (fanout_a, fanout_b) =
-            object_fanout_segments_for_id(object_id).expect("fanout segments");
+        let fanout = object_fanout_segments_for_id(object_id).expect("fanout segments");
         let path = object_index_dir(&root, fragment, object_id).expect("object dir");
 
         assert_eq!(
             path,
             fragment_root_on(&root, fragment)
                 .join(OBJECTS_DIR)
-                .join(fanout_a)
-                .join(fanout_b)
+                .join(&fanout[0])
+                .join(&fanout[1])
+                .join(&fanout[2])
+                .join(&fanout[3])
                 .join(format!("@o_{object_id}"))
         );
         assert_ne!(
@@ -3050,14 +3059,14 @@ mod tests {
     }
 
     #[test]
-    fn live_head_listing_reads_filenames_without_decoding_ndx_body() {
+    fn live_head_listing_reads_filenames_without_decoding_ncdx_body() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         let fragment = format!("n2-list-{}", Ulid::new());
         let object_id = new_object_id();
         let logical_path = "docs/bad-body.mp4";
         let file_name = format!(
-            "{}.{}.{}.{}.ndx",
+            "{}.{}.{}.{}.ncdx",
             Ulid::new(),
             12345,
             1_777_905_000_000_000_000i128,
@@ -3212,6 +3221,7 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             created_at: 1_777_905_000,
             stripe_size_bytes: 512,
+            membership_epoch: 0,
             data_shards: 2,
             parity_shards: 1,
         };
@@ -3272,6 +3282,7 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             created_at: 1_777_905_100,
             stripe_size_bytes: 512,
+            membership_epoch: 0,
             data_shards: 2,
             parity_shards: 1,
         };
@@ -3336,18 +3347,18 @@ mod tests {
             assert_eq!(
                 fs::read(dir.join(MANIFEST_FILE)).expect("manifest after receipts"),
                 manifest_bytes_before[idx],
-                "part receipt commits must not rewrite manifest.ndx"
+                "part receipt commits must not rewrite manifest.ncdx"
             );
             assert_eq!(
                 fs::read(dir.join(BINDING_FILE)).expect("binding after receipts"),
                 binding_bytes_before[idx],
-                "part receipt commits must not rewrite binding.ndx"
+                "part receipt commits must not rewrite binding.ncdx"
             );
             assert!(
                 !read_dir_names(&dir)
                     .expect("session dir entries")
                     .iter()
-                    .any(|name| name.starts_with(PART_META_PREFIX) && name.ends_with(".ndx")),
+                    .any(|name| name.starts_with(PART_META_PREFIX) && name.ends_with(".ncdx")),
                 "receipt-only hot path must not create heavy part metadata records"
             );
         }
@@ -3384,6 +3395,7 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             created_at: 1_777_905_300,
             stripe_size_bytes: 512,
+            membership_epoch: 0,
             data_shards: 1,
             parity_shards: 1,
         };
@@ -3446,7 +3458,6 @@ mod tests {
                 LOCKS_DIR,
                 GC_DIR,
                 REPAIR_DIR,
-                CLUSTER_DIR,
                 INTENTS_DIR,
                 TRASH_JOBS_DIR,
                 BLOB_DIR,
@@ -3475,7 +3486,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_head_uses_max_ulid_and_ignores_invalid_ndx_names() {
+    fn latest_head_uses_max_ulid_and_ignores_invalid_ncdx_names() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         let fragment = format!("n2-head-{}", Ulid::new());
@@ -3493,19 +3504,19 @@ mod tests {
             old.version_id = old_id.to_string();
             old.created_at = 1_777_905_400;
             write_atomic(
-                &dir.join(ndx_file_name(&old)),
+                &dir.join(ncdx_file_name(&old)),
                 &encode(&old).expect("encode old metadata"),
             )
             .expect("write old version");
 
-            fs::write(dir.join("not-a-valid-version.ndx"), b"garbage")
+            fs::write(dir.join("not-a-valid-version.ncdx"), b"garbage")
                 .expect("write invalid ndx name");
 
             let mut new = test_metadata(&fragment, &object_id, 222);
             new.version_id = new_id.to_string();
             new.created_at = 1_777_905_500;
             write_atomic(
-                &dir.join(ndx_file_name(&new)),
+                &dir.join(ncdx_file_name(&new)),
                 &encode(&new).expect("encode new metadata"),
             )
             .expect("write new version");
@@ -3549,7 +3560,7 @@ mod tests {
         old.version_id = old_id.to_string();
         old.created_at = 1_779_883_031;
         write_atomic(
-            &old_dir.join(ndx_file_name(&old)),
+            &old_dir.join(ncdx_file_name(&old)),
             &encode(&old).expect("encode old replica metadata"),
         )
         .expect("write old replica");
@@ -3559,7 +3570,7 @@ mod tests {
         new.version_id = new_id.to_string();
         new.created_at = 1_779_892_004;
         write_atomic(
-            &new_dir.join(ndx_file_name(&new)),
+            &new_dir.join(ncdx_file_name(&new)),
             &encode(&new).expect("encode new replica metadata"),
         )
         .expect("write new replica");
@@ -3599,7 +3610,7 @@ mod tests {
             meta.version_id = version_id.to_string();
             meta.created_at = 1_779_883_031;
             write_atomic(
-                &dir.join(ndx_file_name(&meta)),
+                &dir.join(ncdx_file_name(&meta)),
                 &encode(&meta).expect("encode old metadata"),
             )
             .expect("write old metadata");
@@ -3610,7 +3621,7 @@ mod tests {
         new.version_id = new_id.to_string();
         new.created_at = 1_779_892_004;
         write_atomic(
-            &new_dir.join(ndx_file_name(&new)),
+            &new_dir.join(ncdx_file_name(&new)),
             &encode(&new).expect("encode new metadata"),
         )
         .expect("write new metadata");
@@ -3628,7 +3639,7 @@ mod tests {
             )
             .expect("read repaired object dir")
             .into_iter()
-            .filter_map(|name| parse_ndx_file_name(&name).map(|summary| summary.version_id))
+            .filter_map(|name| parse_ncdx_file_name(&name).map(|summary| summary.version_id))
             .collect::<BTreeSet<_>>();
             assert_eq!(
                 versions,

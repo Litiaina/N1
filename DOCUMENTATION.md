@@ -1608,10 +1608,12 @@ operator monitoring action, not a high-frequency UI polling route.
 Correct. Rename and move are namespace mutations. N2 does not rewrite object
 payloads just because a path changed.
 
-### `.cluster` Appears In Listings
+### Unexpected Internal Entries Appear In Listings
 
-`.cluster` is internal control metadata and should be hidden from user-facing
-namespace listing. If a console shows it, treat that as a UI/API filtering bug.
+N2 user-facing listings should expose namespace entries only. Object metadata
+under `.objects`, uploads, trash internals, locks, repair state, GC state, and
+other control directories must not appear as user files. If a console shows an
+internal control path, treat that as a UI/API filtering bug.
 
 ## Validation Commands
 

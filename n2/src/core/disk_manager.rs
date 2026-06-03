@@ -212,6 +212,9 @@ pub struct ObjectMetadata {
     pub content_type: String,
     pub total_size_bytes: u64,
     pub created_at: i64,
+    pub membership_epoch: u64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
     pub parts: Vec<PartMetadata>,
     #[serde(default)]
     pub is_delete_marker: bool,
@@ -240,6 +243,9 @@ pub struct ObjectSummary {
     pub content_type: String,
     pub total_size_bytes: u64,
     pub created_at: i64,
+    pub membership_epoch: u64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
     #[serde(rename = "parts")]
     pub _parts_ignored: IgnoredAny,
     #[serde(default)]
@@ -259,6 +265,9 @@ impl From<ObjectSummary> for ObjectMetadata {
             content_type: summary.content_type,
             total_size_bytes: summary.total_size_bytes,
             created_at: summary.created_at,
+            membership_epoch: summary.membership_epoch,
+            data_shards: summary.data_shards,
+            parity_shards: summary.parity_shards,
             parts: Vec::new(),
             is_delete_marker: summary.is_delete_marker,
             stripe_size_bytes: summary.stripe_size_bytes,
@@ -266,7 +275,7 @@ impl From<ObjectSummary> for ObjectMetadata {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct InitiateUploadParams {
     pub content_type: Option<String>,
     pub total_size_bytes: u64,
@@ -337,7 +346,7 @@ pub struct ChunkQuery {
     pub chunk_size: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct UploadPartQuery {
     pub checksum: Option<String>,
     #[serde(default)]

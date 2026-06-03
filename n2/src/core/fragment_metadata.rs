@@ -514,7 +514,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_fragment_metadata_accepts_n2_fragment_ndx_shape() {
+    fn decode_fragment_metadata_accepts_n2_fragment_ncdx_shape() {
         let current = IndexFragmentMeta {
             fragment_id: "abc".to_string(),
             stable_fragment_id: Some("01KSTABLEFRAGMENT000000000".to_string()),

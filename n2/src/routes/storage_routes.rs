@@ -46,11 +46,13 @@ use crate::core::upload::{
     get_upload_status as get_upload_status_impl, list_active_uploads as list_active_uploads_impl,
 };
 use crate::core::{index, index_store};
+use crate::distribution::download::part_has_remote_shards;
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, build_namespace_peer_routes,
     commit_namespace_summary_quorum, commit_upload_quorum,
 };
 use crate::distribution::peer::build_peer_routes;
+use crate::distribution::rebalance::rewrite_object_to_current_layout;
 use crate::distribution::routes::build_cluster_routes;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -724,7 +726,27 @@ async fn repair_object_scoped(
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_read_key(&fragment, &object_key).await?;
     let metadata = get_object_metadata_direct(&fragment, &physical).await?;
-    let mut status = repair_object(&metadata, parse_check_mode(&params)).await?;
+    let check_mode = parse_check_mode(&params);
+    let mut status = if metadata.parts.iter().any(part_has_remote_shards) {
+        let status = inspect_cluster_object_status(&metadata, check_mode).await?;
+        if status.status == "healthy" {
+            status
+        } else if status.repairable {
+            rewrite_object_to_current_layout(
+                object_key.trim_start_matches('/').to_string(),
+                physical.clone(),
+                metadata.clone(),
+                false,
+            )
+            .await?;
+            let repaired_metadata = get_object_metadata_direct(&fragment, &physical).await?;
+            inspect_cluster_object_status(&repaired_metadata, check_mode).await?
+        } else {
+            status
+        }
+    } else {
+        repair_object(&metadata, check_mode).await?
+    };
     status.object_key = object_key.trim_start_matches('/').to_string();
     Ok(AxumJson(status))
 }

@@ -1,12 +1,16 @@
 use crate::core::disk_manager::FS_STORAGE_ROOT;
-use crate::core::disk_manager::{ChunkQuery, ObjectMetadata, UploadPartQuery};
+use crate::core::disk_manager::{
+    ChunkQuery, InitiateUploadParams, ObjectMetadata, UploadPartQuery,
+};
 use crate::core::download::download_object_chunk_from_metadata;
 use crate::core::index;
 use crate::distribution::download::{part_has_remote_shards, shard_probe_readable};
 use crate::distribution::layout::resolve_layout;
 use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
 use crate::distribution::namespace::commit_upload_quorum;
-use crate::distribution::upload::upload_cluster_one_shot;
+use crate::distribution::upload::{
+    finalize_cluster_upload, initiate_cluster_upload, put_cluster_part,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::structs::auth_structs::Claims;
@@ -18,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
 const REWRITE_CHUNK_BYTES: usize = 1024 * 1024;
+const REWRITE_PART_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClusterRebalanceRequest {
@@ -210,7 +215,7 @@ async fn object_has_unreadable_shard(meta: &ObjectMetadata) -> bool {
     false
 }
 
-async fn rewrite_object_to_current_layout(
+pub async fn rewrite_object_to_current_layout(
     logical_path: String,
     object_id: String,
     source: ObjectMetadata,
@@ -222,27 +227,6 @@ async fn rewrite_object_to_current_layout(
     let fragment = source.fragment.clone();
     let content_type = source.content_type.clone();
     let total = source.total_size_bytes;
-    let source_for_stream = source.clone();
-    let stream = stream::unfold(0u64, move |offset| {
-        let meta = source_for_stream.clone();
-        async move {
-            if offset >= meta.total_size_bytes {
-                return None;
-            }
-            let chunk_size =
-                (meta.total_size_bytes - offset).min(REWRITE_CHUNK_BYTES as u64) as usize;
-            let query = ChunkQuery {
-                object_key: meta.object_key.clone(),
-                offset,
-                chunk_size,
-            };
-            let next = offset.saturating_add(chunk_size as u64);
-            let result = download_object_chunk_from_metadata(meta, &query)
-                .await
-                .map(|(bytes, _)| Bytes::from(bytes));
-            Some((result, next))
-        }
-    });
     let claims = Claims {
         fragment: fragment.clone(),
         fragment_alias: None,
@@ -258,16 +242,81 @@ async fn rewrite_object_to_current_layout(
         strict_durability: None,
         io_gate: None,
     };
-    let rewritten = upload_cluster_one_shot(
-        claims,
+    let part_size_bytes = REWRITE_PART_BYTES.min(total.max(1));
+    let expected_parts = if total == 0 {
+        1
+    } else {
+        total.div_ceil(part_size_bytes)
+    };
+    let params = InitiateUploadParams {
+        content_type: Some(content_type.clone()),
+        total_size_bytes: total,
+        expected_parts,
+        part_size_bytes: Some(part_size_bytes),
+    };
+    let init = initiate_cluster_upload(
+        claims.clone(),
         fragment.clone(),
         object_id.clone(),
-        content_type,
-        query,
-        stream,
-        total,
+        params.clone(),
     )
     .await?;
+    for part_index in 0..expected_parts {
+        let offset = part_index.saturating_mul(part_size_bytes);
+        let part_len = if total == 0 {
+            0
+        } else {
+            (total - offset).min(part_size_bytes)
+        };
+        let source_for_stream = source.clone();
+        let stream = stream::unfold(0u64, move |part_offset| {
+            let meta = source_for_stream.clone();
+            async move {
+                if part_offset >= part_len {
+                    return None;
+                }
+                let chunk_size = (part_len - part_offset).min(REWRITE_CHUNK_BYTES as u64) as usize;
+                let query = ChunkQuery {
+                    object_key: meta.object_key.clone(),
+                    offset: offset.saturating_add(part_offset),
+                    chunk_size,
+                };
+                let next = part_offset.saturating_add(chunk_size as u64);
+                let result = download_object_chunk_from_metadata(meta, &query)
+                    .await
+                    .map(|(bytes, _)| Bytes::from(bytes));
+                Some((result, next))
+            }
+        });
+        put_cluster_part(
+            claims.clone(),
+            fragment.clone(),
+            init.version_id.clone(),
+            part_index,
+            query.clone(),
+            stream,
+            part_len,
+        )
+        .await?;
+    }
+    let rewritten = match finalize_cluster_upload(
+        claims,
+        fragment.clone(),
+        init.version_id.clone(),
+        init.session_id,
+        object_id.clone(),
+        params,
+    )
+    .await?
+    {
+        crate::core::upload::FinalizeUploadResult::Complete(meta) => meta,
+        crate::core::upload::FinalizeUploadResult::Incomplete(incomplete) => {
+            return Err(AppError::Conflict(format!(
+                "cluster rewrite incomplete: missing parts {:?}",
+                incomplete.missing_parts
+            )));
+        }
+    };
     commit_upload_quorum(&fragment, &logical_path, &object_id, &rewritten).await?;
     Ok(true)
 }
@@ -440,6 +489,9 @@ mod tests {
             content_type: "application/octet-stream".into(),
             total_size_bytes: 1,
             created_at: 0,
+            membership_epoch: 0,
+            data_shards: 1,
+            parity_shards: 1,
             stripe_size_bytes: 4096,
             is_delete_marker: false,
             parts: vec![PartMetadata {

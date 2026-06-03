@@ -7,7 +7,6 @@ use crate::core::ec::ErasureStreamWriter;
 use crate::core::index::{self, IndexReplicaWriteMode};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
 use crate::distribution::membership::active_cluster_runtime;
-use crate::distribution::object_layout::write_cluster_object_layout;
 use crate::distribution::peer::{PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator};
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
 use crate::distribution::resolve_layout;
@@ -43,7 +42,9 @@ fn validate_cluster_one_shot_size(content_length: u64) -> Result<(), AppError> {
 #[derive(Debug, Serialize)]
 pub struct DistributedPartWrite {
     pub part: PartMetadata,
-    pub placement: ClusterPlacementPlan,
+    pub membership_epoch: u64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
 }
 
 enum ClusterShardWriter {
@@ -390,6 +391,9 @@ where
     }
     shards.sort_by_key(|shard| shard.shard_index);
     Ok(DistributedPartWrite {
+        membership_epoch: runtime.membership.epoch,
+        data_shards: layout.data_shards as u16,
+        parity_shards: layout.parity_shards as u16,
         part: PartMetadata {
             part_index,
             size_bytes: total_bytes_read,
@@ -397,7 +401,6 @@ where
             shards,
             checksum: total_checksum,
         },
-        placement,
     })
 }
 
@@ -454,6 +457,7 @@ pub async fn initiate_cluster_upload(
             .unwrap_or_else(|| "application/octet-stream".into()),
         created_at: Utc::now().timestamp(),
         stripe_size_bytes: stripe_size,
+        membership_epoch: runtime.membership.epoch,
         data_shards: layout.data_shards as u16,
         parity_shards: layout.parity_shards as u16,
     };
@@ -569,19 +573,15 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at: Utc::now().timestamp(),
+        membership_epoch: part.membership_epoch,
+        data_shards: part.data_shards,
+        parity_shards: part.parity_shards,
         parts: vec![part.part],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
     };
     let _lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     index::publish_object(&object_meta).await?;
-    write_cluster_object_layout(
-        &fragment,
-        &object_key,
-        &object_key,
-        &version_id,
-        part.placement,
-    )?;
     Ok(object_meta)
 }
 
@@ -638,25 +638,15 @@ pub async fn finalize_cluster_upload(
         ),
         total_size_bytes,
         created_at: state.manifest.created_at,
+        membership_epoch: state.manifest.membership_epoch,
+        data_shards: state.manifest.data_shards,
+        parity_shards: state.manifest.parity_shards,
         parts,
         is_delete_marker: false,
         stripe_size_bytes: state.manifest.stripe_size_bytes,
     };
     let _lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     index::publish_object(&object_meta).await?;
-    let runtime = active_cluster_runtime()?;
-    let active = runtime.membership.active_write_nodes();
-    let layout =
-        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
-    let placement = build_placement_plan(
-        &fragment,
-        &object_key,
-        &version_id,
-        runtime.membership.epoch,
-        layout,
-        &active,
-    )?;
-    write_cluster_object_layout(&fragment, &object_key, &object_key, &version_id, placement)?;
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
     Ok(FinalizeUploadResult::Complete(object_meta))
 }
@@ -695,6 +685,7 @@ mod tests {
             content_type: "application/octet-stream".into(),
             created_at: 0,
             stripe_size_bytes: 256 * 1024,
+            membership_epoch: 0,
             data_shards: 1,
             parity_shards: 1,
         }

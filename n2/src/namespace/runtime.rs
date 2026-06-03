@@ -1409,6 +1409,9 @@ mod tests {
             content_type: "application/octet-stream".to_string(),
             total_size_bytes: size,
             created_at: Utc::now().timestamp(),
+            membership_epoch: 0,
+            data_shards: 1,
+            parity_shards: 0,
             parts: Vec::new(),
             is_delete_marker: false,
             stripe_size_bytes: crate::core::disk_manager::default_stripe_size(),
@@ -1554,47 +1557,6 @@ mod tests {
                 "namespace links store stable object ids, not depth-relative paths"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn n2_cluster_layout_plane_is_hidden_from_namespace_walks() {
-        let _guard = crate::test_support::global_test_lock().lock().await;
-        let roots = ensure_test_index_roots();
-        let fragment = format!("n2-cluster-hidden-{}", Ulid::new());
-        let object_id = publish_logical_object(&roots, &fragment, "videos/mhw.mp4", 16);
-
-        for root in &roots {
-            let cluster_dir = fragment_root_on(root, &fragment)
-                .join(index_store::CLUSTER_DIR)
-                .join("objects");
-            fs::create_dir_all(&cluster_dir).expect("create internal cluster plane");
-            std::os::unix::fs::symlink(
-                format!("@o_{object_id}"),
-                cluster_dir.join("leaked-layout-link"),
-            )
-            .expect("create internal cluster symlink");
-        }
-
-        let (entries, token) = global_namespace_runtime()
-            .list_dir_page(&fragment, "", false, 100, None)
-            .await
-            .expect("list root namespace");
-        assert!(token.is_none());
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["videos"]
-        );
-
-        let refs = global_namespace_runtime()
-            .list_live_object_refs_page(&fragment, None, None, 100)
-            .await
-            .expect("scan live refs");
-        assert_eq!(refs.entries.len(), 1);
-        assert_eq!(refs.entries[0].path, "videos/mhw.mp4");
-        assert!(refs.continuation_token.is_none());
     }
 
     #[tokio::test]

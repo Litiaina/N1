@@ -351,6 +351,7 @@ pub struct UploadSessionManifest {
     pub content_type: String,
     pub created_at: i64,
     pub stripe_size_bytes: usize,
+    pub membership_epoch: u64,
     #[serde(default)]
     pub data_shards: u16,
     #[serde(default)]
@@ -2018,6 +2019,7 @@ pub async fn initiate_object_upload_direct(
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         created_at: Utc::now().timestamp(),
         stripe_size_bytes: stripe_size,
+        membership_epoch: 0,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
     };
@@ -2657,6 +2659,9 @@ async fn upload_object_one_shot_inner(
         content_type,
         total_size_bytes: content_length,
         created_at,
+        membership_epoch: 0,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2828,6 +2833,9 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
+        membership_epoch: 0,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2930,6 +2938,9 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
+        membership_epoch: 0,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -3116,6 +3127,15 @@ pub async fn finalize_object_upload_direct(
         .as_ref()
         .map(|m| m.stripe_size_bytes)
         .unwrap_or_else(configured_block_size);
+    let membership_epoch = manifest.as_ref().map(|m| m.membership_epoch).unwrap_or(0);
+    let data_shards = manifest
+        .as_ref()
+        .map(|m| m.data_shards)
+        .unwrap_or_else(|| configured_data_shards() as u16);
+    let parity_shards = manifest
+        .as_ref()
+        .map(|m| m.parity_shards)
+        .unwrap_or_else(|| configured_parity_shards() as u16);
 
     let content_type = manifest
         .as_ref()
@@ -3135,6 +3155,9 @@ pub async fn finalize_object_upload_direct(
             .as_ref()
             .map(|m| m.created_at)
             .unwrap_or_else(|| Utc::now().timestamp()),
+        membership_epoch,
+        data_shards,
+        parity_shards,
         parts,
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,

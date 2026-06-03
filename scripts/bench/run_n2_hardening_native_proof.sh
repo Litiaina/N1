@@ -335,13 +335,13 @@ fi
 
 start_nodes
 
-curl_json -X POST "$LOCAL_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"quota_bytes\":5368709120}" > "$OUT/create-local.json"
+curl_json -X POST "$LOCAL_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\"}" > "$OUT/create-local.json"
 FRAGMENT="$(jq -r '.fragment_hash' "$OUT/create-local.json")"
 STABLE_FRAGMENT="$(jq -r '.stable_fragment_id' "$OUT/create-local.json")"
-curl_json -X POST "$REMOTE_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE_FRAGMENT\",\"quota_bytes\":5368709120}" > "$OUT/create-remote.json"
+curl_json -X POST "$REMOTE_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE_FRAGMENT\"}" > "$OUT/create-remote.json"
 jq -e --arg stable "$STABLE_FRAGMENT" '.stable_fragment_id == $stable' "$OUT/create-remote.json" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_json -X POST "$REMOTE2_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE_FRAGMENT\",\"quota_bytes\":5368709120}" > "$OUT/create-remote2.json"
+  curl_json -X POST "$REMOTE2_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE_FRAGMENT\"}" > "$OUT/create-remote2.json"
   jq -e --arg stable "$STABLE_FRAGMENT" '.stable_fragment_id == $stable' "$OUT/create-remote2.json" >/dev/null
 else
   printf '{}\n' > "$OUT/create-remote2.json"
@@ -405,6 +405,24 @@ else
   printf '{}\n' > "$OUT/download-remote2-metrics.json"
 fi
 
+curl_auth -G "$LOCAL_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-before-repair.json"
+jq -e '.status == "healthy" and .repairable == true' "$OUT/object-status-before-repair.json" >/dev/null
+curl_auth -X POST -G "$LOCAL_BASE/n2/objects/repair/$KEY_MP" --data-urlencode 'mode=scrub' > "$OUT/object-repair.json"
+curl_auth -G "$REMOTE_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-after-repair-remote.json"
+jq -e '.status == "healthy"' "$OUT/object-status-after-repair-remote.json" >/dev/null
+
+curl_auth -X DELETE "$REMOTE_BASE/n2/objects/$KEY_MP" > "$OUT/trash-object-remote.json"
+curl_auth -G "$LOCAL_BASE/n2/trash" --data-urlencode 'prefix=videos/' --data-urlencode 'limit=100' > "$OUT/trash-list-local.json"
+jq -e --arg key "$KEY_MP" '.objects[]? | select(.object_key == $key)' "$OUT/trash-list-local.json" >/dev/null
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  RECOVER_BASE="$REMOTE2_BASE"
+else
+  RECOVER_BASE="$LOCAL_BASE"
+fi
+curl_auth -X POST "$RECOVER_BASE/n2/objects/recover/$KEY_MP" > "$OUT/recover-object.json"
+curl_auth -G "$REMOTE_BASE/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/read-after-recover.bin"
+cmp -s "$OUT/mhw-proof.bin" "$OUT/read-after-recover.bin"
+
 ns_start="$(date +%s%N)"
 for i in $(seq -w 1 "$NAMESPACE_OPS"); do
   curl_json -X POST "$LOCAL_BASE/n2/posix/mkdir" -H "Authorization: Bearer $TOKEN" -d "{\"path\":\"stress/dir-$i\"}" >/dev/null
@@ -447,10 +465,23 @@ CVERSION="$(jq -r '.version_id' "$OUT/cancel-init.json")"
 curl_auth -X DELETE -G "$LOCAL_BASE/n2/upload/multipart/$CVERSION" --data-urlencode "object_key=tmp/cancel-$TS.bin" -o "$OUT/cancel-response.json"
 curl_auth "$LOCAL_BASE/n2/upload/multipart/$CVERSION" > "$OUT/cancel-status.json" || true
 
-find "$LROOT/index" \( -name '*.nmtd' -o -name '*.ndx' \) -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' > "$OUT/native-peer-locator-strings.txt" || true
-ssh_remote "find '$RROOT/index' \( -name '*.nmtd' -o -name '*.ndx' \) -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+find "$LROOT/index" \( -path '*/.cluster/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print > "$OUT/forbidden-layout-local.txt"
+ssh_remote "find '$RROOT/index' \( -path '*/.cluster/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print" > "$OUT/forbidden-layout-remote.txt"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  ssh_remote2 "find '$CROOT/index' \( -name '*.nmtd' -o -name '*.ndx' \) -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+  ssh_remote2 "find '$CROOT/index' \( -path '*/.cluster/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print" > "$OUT/forbidden-layout-remote2.txt"
+else
+  : > "$OUT/forbidden-layout-remote2.txt"
+fi
+if [[ -s "$OUT/forbidden-layout-local.txt" || -s "$OUT/forbidden-layout-remote.txt" || -s "$OUT/forbidden-layout-remote2.txt" ]]; then
+  echo "forbidden old N2 layout paths found" >&2
+  cat "$OUT"/forbidden-layout-*.txt >&2
+  exit 1
+fi
+
+find "$LROOT/index" -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' > "$OUT/native-peer-locator-strings.txt" || true
+ssh_remote "find '$RROOT/index' -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  ssh_remote2 "find '$CROOT/index' -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
 fi
 NATIVE_LOCATORS="$(wc -l < "$OUT/native-peer-locator-strings.txt" | tr -d ' ')"
 
@@ -497,14 +528,18 @@ jq -n \
   --slurpfile dr2 "$OUT/download-remote2-metrics.json" \
   --slurpfile ns "$OUT/namespace-stress-metrics.json" \
   --slurpfile scale "$OUT/scale-upload-metrics.json" \
+  --slurpfile object_status "$OUT/object-status-before-repair.json" \
+  --slurpfile object_repair "$OUT/object-repair.json" \
   --slurpfile recon "$OUT/reconstruct-after-delete-metrics.json" \
+  --slurpfile trash "$OUT/trash-object-remote.json" \
+  --slurpfile recover "$OUT/recover-object.json" \
   --slurpfile repair "$OUT/cluster-repair-status.json" \
   --slurpfile rebalance "$OUT/cluster-rebalance-status.json" \
   --slurpfile health "$OUT/cluster-health-final.json" \
   --slurpfile rssl "$OUT/rss-local-summary.json" \
   --slurpfile rssr "$OUT/rss-remote-summary.json" \
   --slurpfile rssr2 "$OUT/rss-remote2-summary.json" \
-  '{out:$out, fragment:$fragment, stable_fragment_id:$stable_fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
+  '{out:$out, fragment:$fragment, stable_fragment_id:$stable_fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], object_status:$object_status[0], object_repair:$object_repair[0], trash:$trash[0], recover:$recover[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_HARDENING_PROOF_OUT=$OUT"

@@ -3,7 +3,6 @@ pub mod health;
 pub mod layout;
 pub mod membership;
 pub mod namespace;
-pub mod object_layout;
 pub mod peer;
 pub mod placement;
 pub mod rebalance;

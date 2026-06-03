@@ -78,24 +78,16 @@ Each node has index roots and blob roots.
   .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
 
   @f_<stable_fragment_id>/
-    namespace/
-      videos/
-        demo.mp4 -> @o_<object_id>
+    videos/
+      demo.mp4 -> @o_<object_id>
 
     .objects/
       ab/
         cd/
-          @o_<object_id>/
-            <version_id>.<size>.<time>.<ext>.ndx
-
-    .cluster/
-      objects/
-        ab/
-          cd/
-            ef/
-              12/
-                @o_<object_id>/
-                  <version_id>.nmtd
+          ef/
+            12/
+              @o_<object_id>/
+                <version_id>.<size>.<time>.<ext>.ncdx
 
 <blob_root>/
   .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
@@ -114,15 +106,10 @@ stable fragment id.
 
 Object records are immutable. New content creates a new version record.
 
-The latest object version is selected from immutable version records, not from a
-mutable latest pointer.
+`.ncdx` means N2 cluster data index. It is the single immutable object metadata
+record for a committed N2 object version.
 
-## Cluster Placement Records
-
-`.nmtd` means N2 metadata. It is the immutable cluster placement record for a
-committed object version.
-
-Each placement record stores:
+Each object record stores:
 
 - stable fragment id
 - object key at commit time
@@ -133,6 +120,10 @@ Each placement record stores:
 - shard refs by node
 - size and content metadata
 - timestamps
+
+The latest object version is selected from immutable `.ncdx` filenames, not
+from a mutable latest pointer. N2 does not use a separate cluster object
+metadata plane; the object record already owns distributed placement.
 
 ## Namespace Boundary
 
@@ -183,7 +174,7 @@ client upload
   -> coordinator resolves cluster layout
   -> coordinator streams bytes through cluster EC
   -> target nodes persist .shard/.parity files
-  -> coordinator commits immutable object and .nmtd records
+  -> coordinator commits immutable object and .ncdx records
   -> namespace mutation is applied through the cluster mutation path
 ```
 
@@ -202,7 +193,7 @@ client read
   -> any N2 node
   -> namespace symlink resolves object id
   -> immutable object record resolves version
-  -> .nmtd resolves recorded shard placement
+  -> .ncdx resolves recorded shard placement
   -> coordinator fetches needed shard ranges from holder nodes
   -> healthy path streams data shards
   -> degraded path reconstructs from parity
