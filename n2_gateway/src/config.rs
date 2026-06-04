@@ -10,7 +10,6 @@ pub struct GatewayConfig {
     pub https_port: u16,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-    pub state_path: PathBuf,
     pub health_interval: Duration,
     pub request_timeout: Duration,
     pub nodes: Vec<NodeConfig>,
@@ -36,18 +35,12 @@ impl GatewayConfig {
         let ini = Ini::load_from_file(&path)
             .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         let server = ini.section(Some("server"));
-        let state = ini.section(Some("state"));
         let routing = ini.section(Some("routing"));
 
         let host = read_string(server, "host", "0.0.0.0");
         let https_port = read_parse(server, "https_port", 51002u16)?;
         let cert_path = PathBuf::from(read_string(server, "cert_path", "./certificates/cert.pem"));
         let key_path = PathBuf::from(read_string(server, "key_path", "./certificates/key.pem"));
-        let state_path = PathBuf::from(read_string(
-            state,
-            "upload_routes_path",
-            "./n2_gateway_upload_routes.json",
-        ));
         let health_interval =
             Duration::from_secs(read_parse(routing, "health_interval_seconds", 5u64)?);
         let request_timeout =
@@ -59,14 +52,12 @@ impl GatewayConfig {
 
         validate_file_target(&cert_path, "cert_path")?;
         validate_file_target(&key_path, "key_path")?;
-        validate_state_target(&state_path)?;
 
         Ok(Self {
             host,
             https_port,
             cert_path,
             key_path,
-            state_path,
             health_interval,
             request_timeout,
             nodes,
@@ -186,13 +177,6 @@ fn validate_file_target(path: &Path, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_state_target(path: &Path) -> Result<(), String> {
-    if path.as_os_str().is_empty() {
-        return Err("upload_routes_path must not be empty".into());
-    }
-    Ok(())
-}
-
 fn required_node_value(id: &str, props: &ini::Properties, key: &str) -> Result<String, String> {
     props
         .get(key)
@@ -216,9 +200,6 @@ host=0.0.0.0
 https_port=51002
 cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
-
-[state]
-upload_routes_path=./n2_gateway_upload_routes.json
 
 [routing]
 health_interval_seconds=5
@@ -254,9 +235,6 @@ host=127.0.0.1
 https_port=51002
 cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
-
-[state]
-upload_routes_path=./target/n2-gateway-test-routes.json
 
 [routing]
 health_interval_seconds=5

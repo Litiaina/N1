@@ -3,9 +3,9 @@
 N2 Gateway is the user-facing front door for N2 clusters.
 
 It is not storage authority. It does not own namespace truth, object metadata,
-cluster placement, repair, rebalance, or quota enforcement. Its job is to route
-user traffic to healthy N2 nodes and keep multipart upload resumability pointed
-at the correct coordinator node.
+cluster placement, repair, rebalance, quota enforcement, or multipart
+resumability state. Its job is to route user traffic to healthy N2 nodes and
+return the selected coordinator to the client.
 
 ## Deployment Shape
 
@@ -57,25 +57,25 @@ request.
 
 ## Multipart Routing
 
-Multipart state is coordinator-owned by design.
+Multipart state is coordinator-owned by design, and coordinator memory is
+client-owned. The gateway does not persist upload routes.
 
 ```text
-POST init      -> gateway selects node A
-PUT part       -> gateway routes to node A
-GET status     -> gateway routes to node A
-POST finalize  -> gateway routes to node A
-DELETE cancel  -> gateway routes to node A
+POST init      -> gateway selects node A and returns coordinator_node_id=node-a
+PUT part       -> client sends coordinator_node_id=node-a
+GET status     -> client sends coordinator_node_id=node-a
+POST finalize  -> client sends coordinator_node_id=node-a
+DELETE cancel  -> client sends coordinator_node_id=node-a
 ```
 
-The gateway stores only routing state:
+The client stores the resumability pointer:
 
 ```text
 session_id -> coordinator_node_id
 version_id -> coordinator_node_id
-expires_at -> cleanup boundary
 ```
 
-It does not store object metadata.
+The gateway stores neither upload routes nor object metadata.
 
 ## Configuration
 
@@ -87,9 +87,6 @@ host=0.0.0.0
 https_port=51002
 cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
-
-[state]
-upload_routes_path=./n2_gateway_upload_routes.json
 
 [routing]
 health_interval_seconds=5
@@ -221,8 +218,6 @@ target/release/litiaina-n2-gateway
 ```text
 GET /gateway/health
 GET /gateway/nodes
-GET /gateway/routes/uploads
-GET /gateway/routes/uploads/{session_id}
 ```
 
 ## Gateway Routed N2 API
@@ -233,9 +228,9 @@ These routes have gateway-specific routing rules:
 POST /n2/fragments                         fan out fragment creation to all available nodes
 POST /n2/auth/fragment                     try available nodes until auth succeeds
 POST /n2/upload/one-shot/{object_key}      stream through native N2 to a selected coordinator
-POST /n2/upload/multipart/init/{object_key} select and remember multipart coordinator
-PUT  /n2/upload/multipart/{version}/{part} route part to original coordinator
-GET  /n2/upload/multipart/{version}        route status to original coordinator
+POST /n2/upload/multipart/init/{object_key} select coordinator and return coordinator_node_id
+PUT  /n2/upload/multipart/{version}/{part} route to client-supplied coordinator_node_id
+GET  /n2/upload/multipart/{version}        route to client-supplied coordinator_node_id
 POST /n2/upload/multipart/{version}/{session}/finalize
 DELETE /n2/upload/multipart/{version}
 GET  /n2/objects/download                  stream through native N2 from a selected node
@@ -264,11 +259,11 @@ Other `/n2/...` routes are transparently proxied over HTTP to a healthy N2 node.
 ## Failure Behavior
 
 - New stateless requests route to another healthy node.
-- Existing multipart sessions remain sticky to their coordinator.
-- If the coordinator is unavailable, the gateway returns a clear conflict or
-  unavailable response instead of inventing cross-node resume.
-- If the gateway restarts, it reloads active upload routes from
-  `n2_gateway_upload_routes.json`.
+- Existing multipart sessions remain sticky only when the client supplies the
+  coordinator node returned by multipart init.
+- If the coordinator is unavailable, the gateway returns a clear unavailable
+  response instead of inventing cross-node resume.
+- If the gateway restarts, there is no gateway upload route state to reload.
 
 This keeps resumability strong without pushing temporary upload state into N2
 cluster consensus.

@@ -2,6 +2,7 @@ use crate::distribution::health::cluster_health_snapshot;
 use crate::distribution::membership::{
     ClusterNode, active_cluster_runtime, live_active_write_nodes,
 };
+use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::peer::{
     PeerUsageResponse, cluster_secret, local_peer_usage_snapshot, peer_http_client,
 };
@@ -14,7 +15,7 @@ use crate::distribution::repair::repair_policy;
 use crate::distribution::resolve_layout;
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -105,6 +106,14 @@ pub async fn cluster_health(claims: Claims) -> Result<impl axum::response::IntoR
     }
     let runtime = active_cluster_runtime()?;
     Ok(Json(cluster_health_snapshot(&runtime).await?))
+}
+
+pub async fn cluster_monitor(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ClusterMonitorQuery>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    Ok(Json(cluster_monitor_snapshot(state, claims, query).await?))
 }
 
 async fn usage_for_node(
@@ -326,6 +335,7 @@ pub fn build_cluster_routes() -> Router<Arc<AppState>> {
         .route("/n2/cluster/membership/reload", post(reload_membership))
         .route("/n2/cluster/layout", get(cluster_layout))
         .route("/n2/cluster/health", get(cluster_health))
+        .route("/n2/cluster/monitor", get(cluster_monitor))
         .route("/n2/cluster/usage", get(cluster_usage))
         .route("/n2/cluster/placement/preview", get(placement_preview))
         .route("/n2/cluster/rebalance/plan", get(rebalance_plan))

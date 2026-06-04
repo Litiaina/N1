@@ -3,7 +3,6 @@ mod native;
 mod node;
 mod proxy;
 mod routes;
-mod session_db;
 mod state;
 
 use axum_server::tls_rustls::RustlsConfig;

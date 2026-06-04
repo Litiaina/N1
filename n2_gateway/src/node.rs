@@ -1,11 +1,10 @@
 use crate::config::NodeConfig;
-use crate::session_db::now_unix;
 use n2_native_client::N2NativeClient;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -221,6 +220,13 @@ fn node_score(node: &NodeRuntime) -> u64 {
     };
     let routed = node.routed_requests / node.config.weight.max(1) as u64;
     health_penalty + node.rtt_ms.unwrap_or(default_rtt) + routed
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[cfg(test)]

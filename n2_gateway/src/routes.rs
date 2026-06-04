@@ -14,26 +14,18 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::NodeConfig;
 use crate::native::{
-    MultipartInitResponse, bearer_from_headers, content_length, content_type,
-    native_download_to_writer, native_json, native_upload_body,
+    bearer_from_headers, content_length, content_type, native_download_to_writer, native_json,
+    native_upload_body,
 };
 use crate::node::NodeStatus;
 use crate::proxy::{proxy_http, text_response};
-use crate::session_db::{UploadRoute, now_unix};
 use crate::state::GatewayState;
-
-const DEFAULT_UPLOAD_ROUTE_TTL_SECS: i64 = 24 * 60 * 60;
 
 pub fn router(state: GatewayState) -> Router {
     let state = Arc::new(state);
     Router::new()
         .route("/gateway/health", get(gateway_health))
         .route("/gateway/nodes", get(gateway_nodes))
-        .route("/gateway/routes/uploads", get(gateway_upload_routes))
-        .route(
-            "/gateway/routes/uploads/{session_id}",
-            get(gateway_upload_route),
-        )
         .route("/n2/auth/fragment", post(auth_fragment))
         .route("/n2/fragments", post(create_fragment))
         .route(
@@ -65,6 +57,7 @@ fn build_cors_layer() -> CorsLayer {
         .allow_origin(Any)
         .allow_headers([
             HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-n2-coordinator-node"),
             HeaderName::from_static("uid"),
             HeaderName::from_static("content-type"),
             HeaderName::from_static("digest"),
@@ -104,33 +97,19 @@ async fn gateway_health(State(state): State<Arc<GatewayState>>) -> impl IntoResp
     } else {
         "unavailable"
     };
-    let active_upload_routes = state.sessions.list_active().await.len();
     Json(json!({
         "status": status,
         "server": "Litiaina N2 Gateway",
         "nodes": nodes,
         "online_nodes": online_nodes,
         "available_nodes": available_nodes,
-        "active_upload_routes": active_upload_routes,
+        "role": "route_only",
+        "resumability_owner": "client",
     }))
 }
 
 async fn gateway_nodes(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     Json(json!({ "nodes": state.nodes.snapshots().await }))
-}
-
-async fn gateway_upload_routes(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
-    Json(json!({ "routes": state.sessions.list_active().await }))
-}
-
-async fn gateway_upload_route(
-    State(state): State<Arc<GatewayState>>,
-    Path(session_id): Path<String>,
-) -> impl IntoResponse {
-    match state.sessions.get(&session_id).await {
-        Some(route) => Json(route).into_response(),
-        None => text_response(StatusCode::NOT_FOUND, "upload route not found").into_response(),
-    }
 }
 
 async fn auth_fragment(
@@ -277,31 +256,24 @@ async fn multipart_init(
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
     };
+    let object_key = decode_path(&object_key);
     let node = match best_node(&state).await {
         Ok(node) => node,
         Err(response) => return response,
     };
-    payload["object_key"] = Value::String(decode_path(&object_key));
-    let (status, body) = match native_json(&node, &bearer, "upload.multipart.init", payload).await {
-        Ok(value) => value,
-        Err(err) => return upstream_failed(&state, &node, err).await,
-    };
-    let parsed = serde_json::from_value::<MultipartInitResponse>(body.clone());
-    if let Ok(parsed) = parsed {
-        let route = UploadRoute {
-            session_id: parsed.session_id,
-            version_id: parsed.version_id,
-            coordinator_node_id: node.id.clone(),
-            fragment: None,
-            object_key: Some(decode_path(&object_key)),
-            created_at: now_unix(),
-            expires_at: now_unix() + DEFAULT_UPLOAD_ROUTE_TTL_SECS,
-            finalized_at: None,
-            cancelled_at: None,
+    payload["object_key"] = Value::String(object_key.clone());
+    let (status, mut body) =
+        match native_json(&node, &bearer, "upload.multipart.init", payload).await {
+            Ok(value) => value,
+            Err(err) => return upstream_failed(&state, &node, err).await,
         };
-        if let Err(err) = state.sessions.upsert(route).await {
-            return text_response(StatusCode::INTERNAL_SERVER_ERROR, err);
-        }
+    if status < 300 {
+        body["coordinator_node_id"] = Value::String(node.id.clone());
+        body["gateway"] = json!({
+            "coordinator_node_id": node.id,
+            "route_only": true,
+            "resumability_owner": "client",
+        });
     }
     json_response(status, body)
 }
@@ -317,7 +289,7 @@ async fn multipart_put_part(
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
     };
-    let node = match coordinator_node(&state, &version_id).await {
+    let node = match coordinator_node(&state, &headers, &query).await {
         Ok(node) => node,
         Err(response) => return response,
     };
@@ -347,12 +319,13 @@ async fn multipart_status(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     Path(version_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
     };
-    let node = match coordinator_node(&state, &version_id).await {
+    let node = match coordinator_node(&state, &headers, &query).await {
         Ok(node) => node,
         Err(response) => return response,
     };
@@ -380,7 +353,7 @@ async fn multipart_finalize(
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
     };
-    let node = match coordinator_node(&state, &session_id).await {
+    let node = match coordinator_node(&state, &headers, &query).await {
         Ok(node) => node,
         Err(response) => return response,
     };
@@ -390,15 +363,7 @@ async fn multipart_finalize(
         payload["object_key"] = Value::String(object_key.clone());
     }
     match native_json(&node, &bearer, "upload.multipart.finalize", payload).await {
-        Ok((status, value)) => {
-            if status < 300 {
-                let _ = state
-                    .sessions
-                    .mark_finalized(&session_id, &version_id)
-                    .await;
-            }
-            json_response(status, value)
-        }
+        Ok((status, value)) => json_response(status, value),
         Err(err) => upstream_failed(&state, &node, err).await,
     }
 }
@@ -413,19 +378,14 @@ async fn multipart_cancel(
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
     };
-    let node = match coordinator_node(&state, &version_id).await {
+    let node = match coordinator_node(&state, &headers, &query).await {
         Ok(node) => node,
         Err(response) => return response,
     };
     let mut payload = query_to_json(query);
     payload["version_id"] = Value::String(version_id.clone());
     match native_json(&node, &bearer, "upload.multipart.cancel", payload).await {
-        Ok((status, value)) => {
-            if status < 300 {
-                let _ = state.sessions.mark_cancelled(None, &version_id).await;
-            }
-            json_response(status, value)
-        }
+        Ok((status, value)) => json_response(status, value),
         Err(err) => upstream_failed(&state, &node, err).await,
     }
 }
@@ -526,29 +486,50 @@ async fn best_node(state: &GatewayState) -> Result<NodeConfig, Response<Body>> {
     })
 }
 
-async fn coordinator_node(state: &GatewayState, key: &str) -> Result<NodeConfig, Response<Body>> {
-    let route = state.sessions.get(key).await.ok_or_else(|| {
+async fn coordinator_node(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+) -> Result<NodeConfig, Response<Body>> {
+    let coordinator_node_id = coordinator_node_id(headers, query).ok_or_else(|| {
         text_response(
-            StatusCode::CONFLICT,
-            "multipart session route not found; retry through the original node or restart upload",
+            StatusCode::BAD_REQUEST,
+            "coordinator_node_id is required for multipart gateway routing",
         )
     })?;
-    state.nodes.mark_route(&route.coordinator_node_id).await;
-    if !state.nodes.is_available(&route.coordinator_node_id).await {
+    state.nodes.mark_route(&coordinator_node_id).await;
+    if !state.nodes.is_available(&coordinator_node_id).await {
         return Err(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "multipart coordinator node is unavailable",
         ));
     }
-    state
-        .nodes
-        .get(&route.coordinator_node_id)
-        .await
-        .ok_or_else(|| {
-            text_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "multipart coordinator node is not configured",
-            )
+    state.nodes.get(&coordinator_node_id).await.ok_or_else(|| {
+        text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "multipart coordinator node is not configured",
+        )
+    })
+}
+
+fn coordinator_node_id(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
+    headers
+        .get("x-n2-coordinator-node")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            ["coordinator_node_id", "coordinator", "node_id"]
+                .into_iter()
+                .find_map(|key| {
+                    query
+                        .get(key)
+                        .map(String::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
         })
 }
 
@@ -563,6 +544,12 @@ async fn upstream_failed(state: &GatewayState, node: &NodeConfig, err: String) -
 fn query_to_json(query: HashMap<String, String>) -> Value {
     let mut map = serde_json::Map::new();
     for (key, value) in query {
+        if matches!(
+            key.as_str(),
+            "coordinator_node_id" | "coordinator" | "node_id"
+        ) {
+            continue;
+        }
         if let Ok(parsed) = value.parse::<u64>() {
             map.insert(key, Value::Number(parsed.into()));
         } else if value == "true" || value == "false" {
@@ -730,24 +717,16 @@ mod tests {
         stream.flush().await
     }
 
-    fn gateway_config(state_path: PathBuf, nodes: Vec<NodeConfig>) -> crate::config::GatewayConfig {
+    fn gateway_config(nodes: Vec<NodeConfig>) -> crate::config::GatewayConfig {
         crate::config::GatewayConfig {
             host: "127.0.0.1".to_string(),
             https_port: 0,
             cert_path: PathBuf::from("./certificates/cert.pem"),
             key_path: PathBuf::from("./certificates/key.pem"),
-            state_path,
             health_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(10),
             nodes,
         }
-    }
-
-    fn temp_state_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "n2-gateway-routes-{name}-{}.json",
-            std::process::id()
-        ))
     }
 
     async fn response_json(response: Response<Body>) -> Value {
@@ -755,37 +734,38 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    #[tokio::test]
-    async fn multipart_flow_routes_every_step_to_original_coordinator() {
-        let node_a = spawn_mock_native_node("node-a").await;
-        let node_b = spawn_mock_native_node("node-b").await;
-        let state_path = temp_state_path("multipart");
-        let _ = tokio::fs::remove_file(&state_path).await;
-        let state = GatewayState::new(gateway_config(
-            state_path.clone(),
-            vec![
-                NodeConfig {
-                    id: "node-a".to_string(),
-                    http_url: "https://127.0.0.1:51001".to_string(),
-                    native_url: node_a.native_url.clone(),
-                    weight: 1,
-                },
-                NodeConfig {
-                    id: "node-b".to_string(),
-                    http_url: "https://127.0.0.1:51003".to_string(),
-                    native_url: node_b.native_url.clone(),
-                    weight: 1,
-                },
-            ],
-        ))
+    async fn two_node_gateway_state(
+        node_a: &MockNativeNode,
+        node_b: &MockNativeNode,
+    ) -> GatewayState {
+        let state = GatewayState::new(gateway_config(vec![
+            NodeConfig {
+                id: "node-a".to_string(),
+                http_url: "https://127.0.0.1:51001".to_string(),
+                native_url: node_a.native_url.clone(),
+                weight: 1,
+            },
+            NodeConfig {
+                id: "node-b".to_string(),
+                http_url: "https://127.0.0.1:51003".to_string(),
+                native_url: node_b.native_url.clone(),
+                weight: 1,
+            },
+        ]))
         .await
         .unwrap();
         state.nodes.mark_online_for_test("node-a", 1).await;
         state.nodes.mark_online_for_test("node-b", 1).await;
-        let app = router(state.clone());
+        state
+    }
 
-        let response = app
-            .clone()
+    #[tokio::test]
+    async fn multipart_init_returns_client_owned_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -800,22 +780,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = response_json(response).await;
         assert_eq!(body["session_id"], "sess-a");
-        assert_eq!(
-            state
-                .sessions
-                .get("ver-a")
-                .await
-                .unwrap()
-                .coordinator_node_id,
-            "node-a"
-        );
+        assert_eq!(body["version_id"], "ver-a");
+        assert_eq!(body["coordinator_node_id"], "node-a");
+        assert_eq!(body["gateway"]["route_only"], true);
+        assert_eq!(body["gateway"]["resumability_owner"], "client");
+    }
+
+    #[tokio::test]
+    async fn multipart_followups_use_client_supplied_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let app = router(state);
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/n2/upload/multipart/ver-a/0?crc32=123")
+                    .uri("/n2/upload/multipart/ver-a/0?crc32=123&coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_LENGTH, "5")
                     .body(Body::from("hello"))
@@ -830,7 +813,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/upload/multipart/ver-a")
+                    .uri("/n2/upload/multipart/ver-a?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -844,7 +827,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/n2/upload/multipart/ver-a/sess-a/finalize")
+                    .uri("/n2/upload/multipart/ver-a/sess-a/finalize?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
@@ -853,62 +836,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.sessions.get("ver-a").await.is_none());
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .method("GET")
-                    .uri("/n2/upload/multipart/ver-a")
+                    .method("DELETE")
+                    .uri("/n2/upload/multipart/ver-a?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let ops_a = node_a.operations.lock().await.clone();
         let ops_b = node_b.operations.lock().await.clone();
-        assert!(ops_a.contains(&"upload.multipart.init".to_string()));
         assert!(ops_a.contains(&"upload.multipart.put_part".to_string()));
         assert!(ops_a.contains(&"uploads.status".to_string()));
         assert!(ops_a.contains(&"upload.multipart.finalize".to_string()));
+        assert!(ops_a.contains(&"upload.multipart.cancel".to_string()));
         assert!(!ops_b.contains(&"upload.multipart.put_part".to_string()));
-        let _ = tokio::fs::remove_file(state_path).await;
     }
 
     #[tokio::test]
-    async fn offline_multipart_coordinator_returns_service_unavailable() {
-        let state_path = temp_state_path("offline");
-        let _ = tokio::fs::remove_file(&state_path).await;
-        let state = GatewayState::new(gateway_config(
-            state_path.clone(),
-            vec![NodeConfig {
-                id: "node-a".to_string(),
-                http_url: "https://127.0.0.1:51001".to_string(),
-                native_url: "n2://127.0.0.1:51002".to_string(),
-                weight: 1,
-            }],
-        ))
-        .await
-        .unwrap();
-        state
-            .sessions
-            .upsert(UploadRoute {
-                session_id: "sess-a".to_string(),
-                version_id: "ver-a".to_string(),
-                coordinator_node_id: "node-a".to_string(),
-                fragment: None,
-                object_key: Some("object.bin".to_string()),
-                created_at: now_unix(),
-                expires_at: now_unix() + 60,
-                finalized_at: None,
-                cancelled_at: None,
-            })
-            .await
-            .unwrap();
-        state.nodes.mark_offline_for_test("node-a").await;
+    async fn multipart_followup_without_client_coordinator_is_rejected() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
 
         let response = router(state)
             .oneshot(
@@ -921,7 +876,32 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn offline_client_supplied_coordinator_returns_service_unavailable() {
+        let state = GatewayState::new(gateway_config(vec![NodeConfig {
+            id: "node-a".to_string(),
+            http_url: "https://127.0.0.1:51001".to_string(),
+            native_url: "n2://127.0.0.1:51002".to_string(),
+            weight: 1,
+        }]))
+        .await
+        .unwrap();
+        state.nodes.mark_offline_for_test("node-a").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/n2/upload/multipart/ver-a?coordinator_node_id=node-a")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let _ = tokio::fs::remove_file(state_path).await;
     }
 }

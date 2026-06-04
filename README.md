@@ -37,8 +37,8 @@ N2-native operators, peers, tools, and future internal systems.
   bodies, query fields, examples, and troubleshooting.
 - [ARCHITECTURE.md](ARCHITECTURE.md): storage layout, object identity,
   cluster placement, namespace coordination, repair, and rebalance design.
-- [GATEWAY.md](GATEWAY.md): gateway deployment, routing, and multipart
-  resumability behavior.
+- [GATEWAY.md](GATEWAY.md): gateway deployment, route-only behavior, and
+  client-owned multipart coordinator tracking.
 
 ## Core Model
 
@@ -60,6 +60,9 @@ The result is simple operational behavior:
 - old objects remain valid after membership changes until explicit rebalance;
 - object status reports layout drift, object redistribution can rewrite one
   version, and targeted rebalance skips already-current objects.
+- cluster monitoring exposes overview, nodes, topology, object-layout health,
+  redistribution, jobs, namespace consensus, and upload activity in one
+  efficient `/n2/cluster/monitor` snapshot.
 
 ## Coordination Model
 
@@ -74,10 +77,11 @@ N2 is bidirectional at the node level. Any healthy node can coordinate:
 - cluster health, usage, repair, and rebalance flows.
 
 Multipart sessions are intentionally coordinator-owned until finalize. The node
-that accepts `multipart init` owns the temporary upload session and should keep
-receiving that session's part, status, finalize, and cancel requests. The object
-data is still distributed across the cluster; only the temporary resumability
-state is local to the coordinator.
+that accepts `multipart init` owns the temporary upload session and returns its
+`coordinator_node_id`. Clients keep that coordinator and send it on part,
+status, finalize, and cancel requests. The object data is still distributed
+across the cluster; only the temporary resumability state is local to the
+coordinator.
 
 After finalize, the object becomes cluster-visible and can be read from any
 node.
@@ -92,7 +96,7 @@ n2_shell/
 n2_native_client/
   src/                  reusable Rust client for n2://
 n2_gateway/
-  src/                  user-facing N2 gateway and resumability router
+  src/                  user-facing route-only N2 gateway
 simd-erasure-core/
   src/                  erasure coding implementation
 scripts/bench/

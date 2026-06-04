@@ -1,5 +1,6 @@
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{ObjectPathManager, ShardInfo};
+use crate::core::monitoring::system_health_snapshot;
 use crate::core::quota_manager::{
     FragmentBlobUsage, StorageRootUsage, StorageUsage, get_fragment_blob_usage,
     get_storage_root_usage, get_storage_usage,
@@ -9,7 +10,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::protocol::frame::{read_response_body, read_response_control, write_request_control};
 use crate::protocol::types::{NativeRequest, NativeResponse};
 use axum::body::Body;
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::put;
@@ -20,7 +21,7 @@ use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::io::SeekFrom;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -33,6 +34,7 @@ use tokio_util::io::ReaderStream;
 use ulid::Ulid;
 
 use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 
 static PEER_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -95,6 +97,27 @@ pub struct PeerUsageResponse {
     pub fragment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragment_usage: Option<FragmentBlobUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PeerMonitorQuery {
+    #[serde(default)]
+    pub fragment: Option<String>,
+    #[serde(default)]
+    pub include_usage: bool,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub deep_scan: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerMonitorResponse {
+    pub node_id: String,
+    pub sampled_at_unix: i64,
+    pub health: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<PeerUsageResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,6 +375,51 @@ pub async fn local_peer_usage_snapshot(
         roots,
         fragment,
         fragment_usage,
+    })
+}
+
+pub async fn local_peer_monitor_snapshot(
+    state: Arc<AppState>,
+    fragment: Option<String>,
+    include_usage: bool,
+    refresh: bool,
+    deep_scan: bool,
+) -> Result<PeerMonitorResponse, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let claims = Claims {
+        fragment: fragment.clone().unwrap_or_default(),
+        fragment_alias: None,
+        read: true,
+        write: false,
+        modify: false,
+        delete: false,
+        exp: usize::MAX,
+    };
+    let mut params = std::collections::HashMap::new();
+    if let Some(fragment) = fragment.as_deref().filter(|value| !value.trim().is_empty()) {
+        params.insert("fragment".to_string(), fragment.to_string());
+    }
+    if refresh {
+        params.insert("refresh".to_string(), "true".to_string());
+    }
+    if deep_scan {
+        params.insert("deep_scan".to_string(), "true".to_string());
+    }
+    let health = system_health_snapshot(state, claims, params).await?;
+    let sampled_at_unix = health.sampled_at;
+    let health = serde_json::to_value(health).map_err(|err| {
+        AppError::InternalServerError(format!("encode N2 peer monitor snapshot: {err}"))
+    })?;
+    let usage = if include_usage {
+        Some(local_peer_usage_snapshot(fragment).await?)
+    } else {
+        None
+    };
+    Ok(PeerMonitorResponse {
+        node_id: runtime.local_node_id.clone(),
+        sampled_at_unix,
+        health,
+        usage,
     })
 }
 
@@ -758,6 +826,24 @@ pub async fn peer_usage(
     Ok(Json(local_peer_usage_snapshot(query.fragment).await?))
 }
 
+pub async fn peer_monitor(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PeerMonitorQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(
+        local_peer_monitor_snapshot(
+            state,
+            query.fragment,
+            query.include_usage,
+            query.refresh,
+            query.deep_scan,
+        )
+        .await?,
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NativePeerShardPayload {
     #[serde(default)]
@@ -933,6 +1019,7 @@ pub fn native_peer_bytes_response(id: String, bytes: Vec<u8>) -> NativeResponse 
 pub fn build_peer_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/n2/peer/usage", axum::routing::get(peer_usage))
+        .route("/n2/peer/monitor", axum::routing::get(peer_monitor))
         .route(
             "/n2/peer/shards/{:fragment}/{:version_id}/{:part_index}/{:shard_index}",
             put(peer_put_shard).get(peer_get_shard),

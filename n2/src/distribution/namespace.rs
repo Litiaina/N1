@@ -99,6 +99,25 @@ pub struct PeerNamespaceApplyRequest {
     pub metadata: Option<ObjectMetadata>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NamespaceLedgerSummary {
+    pub fragment: String,
+    pub local_requests: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_kind: Option<NamespaceMutationKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_destination_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_version_id: Option<String>,
+    pub request_ledger_path: String,
+}
+
 static NAMESPACE_COMMIT_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
@@ -243,6 +262,23 @@ fn read_request_ledger(fragment: &str) -> Result<Vec<PeerNamespaceApplyRequest>,
     }
     out.sort_by(|left, right| left.mutation_id.cmp(&right.mutation_id));
     Ok(out)
+}
+
+pub fn namespace_local_ledger_summary(fragment: &str) -> Result<NamespaceLedgerSummary, AppError> {
+    let path = namespace_request_ledger_path(fragment)?;
+    let requests = read_request_ledger(fragment)?;
+    let last = requests.last();
+    Ok(NamespaceLedgerSummary {
+        fragment: fragment.to_string(),
+        local_requests: requests.len() as u64,
+        last_mutation_id: last.and_then(|request| request.mutation_id.clone()),
+        last_kind: last.map(|request| request.kind.clone()),
+        last_source_path: last.and_then(|request| request.source_path.clone()),
+        last_destination_path: last.and_then(|request| request.destination_path.clone()),
+        last_object_id: last.and_then(|request| request.object_id.clone()),
+        last_version_id: last.and_then(|request| request.version_id.clone()),
+        request_ledger_path: path.to_string_lossy().to_string(),
+    })
 }
 
 fn request_seen(fragment: &str, mutation_id: Option<&str>) -> Result<bool, AppError> {
@@ -606,6 +642,14 @@ pub async fn peer_namespace_requests(
     })))
 }
 
+pub async fn peer_namespace_summary(
+    headers: HeaderMap,
+    Path(fragment): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(namespace_local_ledger_summary(&fragment)?))
+}
+
 async fn fetch_peer_namespace_requests(
     endpoint: &str,
     fragment: &str,
@@ -675,6 +719,10 @@ pub fn build_namespace_peer_routes() -> Router<Arc<AppState>> {
         .route(
             "/n2/peer/namespace/requests/{fragment}",
             get(peer_namespace_requests),
+        )
+        .route(
+            "/n2/peer/namespace/summary/{fragment}",
+            get(peer_namespace_summary),
         )
 }
 

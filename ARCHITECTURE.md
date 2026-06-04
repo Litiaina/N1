@@ -62,8 +62,8 @@ cluster-visible and any node can list, read, download, or inspect the object.
 Load balancers do not need storage intelligence. They only need to:
 
 - route new operations to any healthy N2 node
-- keep multipart part/status/finalize requests sticky to the node that returned
-  the multipart session
+- route multipart part/status/finalize/cancel requests to the coordinator node
+  supplied by the client
 
 If a coordinator dies before finalize, the in-flight multipart upload can be
 restarted. Finalized objects remain cluster-visible and are not tied to the
@@ -250,6 +250,25 @@ N2 does not enforce per-fragment quota. Fragment quota is monitoring metadata.
 Cluster storage is distributed, so usage is reported through explicit monitoring
 calls instead of being treated like single-node physical quota.
 
+## Cluster Monitoring
+
+N2 exposes detailed cluster monitoring through `/n2/cluster/monitor` and
+`cluster.monitor` on the native protocol.
+
+The monitor reports eight planes without becoming cluster authority:
+
+- cluster overview
+- node health
+- current topology/layout
+- sampled object layout and health state
+- redistribution/rebalance readiness
+- repair, rebalance, and GC jobs
+- namespace consensus ledger status
+- upload activity
+
+Disk usage remains explicit through `/n2/cluster/usage` because it can require
+node and disk scans. Normal UI polling should use the monitor snapshot.
+
 ## Protocol Surfaces
 
 N2 has two protocol surfaces:
@@ -258,7 +277,9 @@ N2 has two protocol surfaces:
 - `n2://` native protocol identity for N2-native tools and node-to-node work
 
 N2 Gateway is the optional user-facing front door. It routes HTTPS `/n2/...`
-traffic to healthy N2 nodes, keeps multipart session affinity, and uses
-`n2://` for native hot paths where the gateway can preserve streaming
-semantics. Gateway state is routing state only; it is not namespace, object,
-placement, repair, rebalance, or quota authority.
+traffic to healthy N2 nodes and uses `n2://` for native hot paths where the
+gateway can preserve streaming semantics. Multipart init returns the selected
+`coordinator_node_id`; clients keep that value and send it on part/status/
+finalize/cancel requests. Gateway state is routing health only; it is not
+namespace, object, placement, repair, rebalance, quota, or resumability
+authority.

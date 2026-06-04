@@ -46,6 +46,7 @@ use crate::core::upload::{
 use crate::distribution::download::part_has_remote_shards;
 use crate::distribution::health::cluster_health_snapshot;
 use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
+use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
 };
@@ -980,6 +981,13 @@ async fn execute_native_op_inner(
             require_read(&claims)?;
             let runtime = active_cluster_runtime()?;
             native_body(cluster_health_snapshot(&runtime).await?)
+        }
+        "cluster.monitor" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            let query =
+                serde_json::from_value::<ClusterMonitorQuery>(payload.clone()).unwrap_or_default();
+            native_body(cluster_monitor_snapshot(state, claims, query).await?)
         }
         "cluster.usage" => {
             let claims = claims_required(claims)?;

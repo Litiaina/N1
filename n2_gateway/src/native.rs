@@ -1,18 +1,11 @@
 use axum::body::Body;
 use futures_util::TryStreamExt;
 use n2_native_client::{N2NativeClient, NativeClientError, NativeOperationResponse};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWrite;
 use tokio_util::io::StreamReader;
 
 use crate::config::NodeConfig;
-
-#[derive(Debug, Deserialize)]
-pub struct MultipartInitResponse {
-    pub session_id: String,
-    pub version_id: String,
-}
 
 pub async fn connect_with_bearer(
     node: &NodeConfig,

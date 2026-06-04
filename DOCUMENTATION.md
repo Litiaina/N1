@@ -470,9 +470,6 @@ https_port=51002
 cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
-[state]
-upload_routes_path=./n2_gateway_upload_routes.json
-
 [routing]
 health_interval_seconds=5
 request_timeout_seconds=300
@@ -516,16 +513,18 @@ curl -k https://gateway.example.com:51002/n2/ping
 curl -k https://gateway.example.com:51002/gateway/health
 ```
 
-Multipart uploads through the gateway are coordinator-sticky by design:
+Multipart uploads through the gateway are coordinator-sticky by client-owned
+coordinator tracking:
 
 ```text
-init -> selected N2 node
-part/status/finalize/cancel -> same selected N2 node
+init -> selected N2 node, response includes coordinator_node_id
+part/status/finalize/cancel -> client sends coordinator_node_id
 finalized object -> readable from any N2 node
 ```
 
 This is the preferred user-facing deployment because clients only need one
-stable URL while N2 keeps its distributed node semantics internally.
+stable URL while N2 keeps its distributed node semantics internally. The
+gateway does not store resumability routes.
 
 ## Authentication
 
@@ -817,11 +816,14 @@ Response:
 ```json
 {
   "session_id": "01KS...",
-  "version_id": "01KS..."
+  "version_id": "01KS...",
+  "coordinator_node_id": "node-a"
 }
 ```
 
 Keep the same coordinator node for every request in this multipart session.
+When using N2 Gateway, include `coordinator_node_id` as a query field or
+`x-n2-coordinator-node` header on part/status/finalize/cancel requests.
 
 ### Multipart Put Part
 
@@ -836,6 +838,7 @@ Body is raw part bytes.
 Query fields:
 
 - `checksum`: optional checksum string.
+- `coordinator_node_id`: required when this request goes through N2 Gateway.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
 - `io_gate`: optional boolean.
@@ -854,7 +857,7 @@ Returns `200 OK` when accepted.
 ### Multipart Status
 
 ```http
-GET /n2/upload/multipart/{version_id}
+GET /n2/upload/multipart/{version_id}?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -883,7 +886,7 @@ Authorization: Bearer <token>
 ### Multipart Finalize
 
 ```http
-POST /n2/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/mhw.mp4
+POST /n2/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/mhw.mp4&coordinator_node_id=node-a
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -914,7 +917,7 @@ binding.
 ### Multipart Cancel
 
 ```http
-DELETE /n2/upload/multipart/{version_id}?object_key=videos/mhw.mp4
+DELETE /n2/upload/multipart/{version_id}?object_key=videos/mhw.mp4&coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -1456,6 +1459,53 @@ Authorization: Bearer <token>
 
 Cluster health summarizes membership, layout, node state, and cluster readiness.
 
+### Detailed Cluster Monitor
+
+```http
+GET /n2/cluster/monitor?fragment=n2-test&object_limit=96
+Authorization: Bearer <token>
+```
+
+This is the preferred console/operator polling endpoint. It combines the
+high-signal cluster state into one read-only snapshot without starting repair,
+rebalance, GC, or disk usage scans.
+
+Query fields:
+
+- `fragment`: optional fragment to include object, namespace, and upload
+  context. If omitted, the authenticated fragment is used.
+- `prefix`: optional namespace prefix for the object-layout sample.
+- `object_limit`: number of live namespace objects to sample. Default is `64`,
+  maximum is `512`.
+- `probe_objects`: optional full availability probe for sampled objects.
+  Default is `false` because shard probing is heavier than layout inspection.
+- `refresh`: bypass local cached health where supported.
+- `deep_scan`: request deeper local node health sampling. Use manually, not as
+  an aggressive UI poll.
+
+Response sections:
+
+- `overview`: cluster state, epoch, local node, writable/readable nodes, and
+  current `data + parity` layout.
+- `nodes`: configured node list with reachability, HTTP/native endpoints,
+  index/blob roots, local health status, upload counters, storage plane, disk
+  status, and maintenance state.
+- `topology`: current layout policy, current shard counts, object-level erasure
+  layout flag, old-layout validity, and manual redistribution policy.
+- `object_health`: sampled live object versions with current-layout count,
+  older-recorded-layout count, placement mismatch count, redistributable count,
+  optional availability probe counts, and representative samples.
+- `redistribution`: targeted rebalance capability and current rebalance job.
+  Already-current objects are skipped by design.
+- `jobs`: cluster repair, cluster rebalance, and local GC status.
+- `namespace_consensus`: quorum size, voter count, local ledger summary, and
+  namespace-consensus notes.
+- `uploads`: aggregate active/stale multipart activity reported by nodes.
+
+Normal console polling should use `/n2/cluster/monitor`. Use
+`/n2/cluster/usage` only when an operator explicitly requests disk/fragment
+usage totals.
+
 ### Usage
 
 ```http
@@ -1760,6 +1810,7 @@ uploads.list
 cluster.membership
 cluster.layout
 cluster.health
+cluster.monitor
 cluster.usage
 cluster.repair.status
 cluster.rebalance.plan
@@ -1903,9 +1954,10 @@ depending on the route.
 
 ### Multipart Upload Resumes Fail On A Different Node
 
-This is expected if the load balancer is not sticky. Multipart temporary state
-is coordinator-owned. Route the session back to the node that returned the
-`session_id` and `version_id`.
+This is expected if the client does not preserve the coordinator. Multipart
+temporary state is coordinator-owned. Direct-node clients should keep using the
+node that returned the `session_id` and `version_id`; gateway clients should
+store and send the returned `coordinator_node_id`.
 
 ### Fragment Quota Does Not Stop Uploads
 
