@@ -1,11 +1,24 @@
 use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
 use crate::enums::app_error_enum::AppError;
 use chrono::Utc;
+use futures_util::future::join_all;
 use ini::Ini;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
+
+const CLUSTER_NODE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+static CLUSTER_PROBE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(CLUSTER_NODE_PROBE_TIMEOUT)
+        .build()
+        .expect("build N2 cluster probe HTTP client")
+});
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +99,77 @@ impl ClusterMembership {
             .cloned()
             .collect()
     }
+}
+
+fn native_socket_addr(endpoint: &str) -> Option<String> {
+    endpoint
+        .trim()
+        .strip_prefix("n2://")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn native_endpoint_is_reachable(endpoint: &str) -> bool {
+    let Some(addr) = native_socket_addr(endpoint) else {
+        return false;
+    };
+    matches!(
+        timeout(CLUSTER_NODE_PROBE_TIMEOUT, TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
+}
+
+async fn http_endpoint_is_reachable(endpoint: &str) -> bool {
+    let url = format!("{}/n2/ping", endpoint.trim_end_matches('/'));
+    matches!(
+        CLUSTER_PROBE_HTTP_CLIENT.get(url).send().await,
+        Ok(response) if response.status().is_success()
+    )
+}
+
+pub async fn cluster_node_is_reachable(local_node_id: &str, node: &ClusterNode) -> bool {
+    if node.is_local(local_node_id) {
+        return true;
+    }
+    if let Some(native_endpoint) = node
+        .native_endpoint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return native_endpoint_is_reachable(native_endpoint).await;
+    }
+    http_endpoint_is_reachable(&node.endpoint).await
+}
+
+async fn live_filter_nodes(local_node_id: &str, candidates: Vec<ClusterNode>) -> Vec<ClusterNode> {
+    let probes = candidates.into_iter().map(|node| {
+        let local_node_id = local_node_id.to_string();
+        async move {
+            if cluster_node_is_reachable(&local_node_id, &node).await {
+                Some(node)
+            } else {
+                None
+            }
+        }
+    });
+    join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+}
+
+pub async fn live_active_write_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
+    live_filter_nodes(
+        &runtime.local_node_id,
+        runtime.membership.active_write_nodes(),
+    )
+    .await
+}
+
+pub async fn live_readable_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
+    live_filter_nodes(&runtime.local_node_id, runtime.membership.readable_nodes()).await
 }
 
 #[derive(Clone, Debug)]

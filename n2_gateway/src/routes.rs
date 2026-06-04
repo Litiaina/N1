@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, Response, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, Method, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::io::ReaderStream;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::NodeConfig;
 use crate::native::{
@@ -33,6 +34,8 @@ pub fn router(state: GatewayState) -> Router {
             "/gateway/routes/uploads/{session_id}",
             get(gateway_upload_route),
         )
+        .route("/n2/auth/fragment", post(auth_fragment))
+        .route("/n2/fragments", post(create_fragment))
         .route(
             "/n2/upload/multipart/init/{*object_key}",
             post(multipart_init),
@@ -53,7 +56,35 @@ pub fn router(state: GatewayState) -> Router {
         .route("/n2/upload/one-shot/{*object_key}", post(one_shot_upload))
         .route("/n2/objects/download", get(download_object))
         .fallback(proxy_fallback)
+        .layer(build_cors_layer())
         .with_state(state)
+}
+
+fn build_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("uid"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("digest"),
+            HeaderName::from_static("buffer"),
+            HeaderName::from_static("range"),
+            HeaderName::from_static("upgrade"),
+            HeaderName::from_static("connection"),
+            HeaderName::from_static("sec-websocket-key"),
+            HeaderName::from_static("sec-websocket-version"),
+            HeaderName::from_static("sec-websocket-protocol"),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .max_age(std::time::Duration::from_secs(86400))
 }
 
 async fn gateway_health(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
@@ -100,6 +131,140 @@ async fn gateway_upload_route(
         Some(route) => Json(route).into_response(),
         None => text_response(StatusCode::NOT_FOUND, "upload route not found").into_response(),
     }
+}
+
+async fn auth_fragment(
+    State(state): State<Arc<GatewayState>>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    let nodes = state.nodes.available_configs().await;
+    if nodes.is_empty() {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway has no available N2 nodes",
+        );
+    }
+
+    let mut first_client_error: Option<Response<Body>> = None;
+    let mut last_error: Option<Response<Body>> = None;
+
+    for node in nodes {
+        match post_json_to_node(&state, &node, "/n2/auth/fragment", &payload).await {
+            Ok((status, body)) if status.is_success() => {
+                state.nodes.mark_route(&node.id).await;
+                return json_response_value(status, body);
+            }
+            Ok((status, body)) if status.is_client_error() => {
+                first_client_error.get_or_insert_with(|| json_response_value(status, body));
+            }
+            Ok((status, body)) => {
+                last_error = Some(json_response_value(status, body));
+                state.nodes.mark_failure(&node.id).await;
+            }
+            Err(err) => {
+                state.nodes.mark_failure(&node.id).await;
+                last_error = Some(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("gateway upstream {} failed: {err}", node.id),
+                ));
+            }
+        }
+    }
+
+    first_client_error.or(last_error).unwrap_or_else(|| {
+        text_response(StatusCode::UNAUTHORIZED, "fragment authentication failed")
+    })
+}
+
+async fn create_fragment(
+    State(state): State<Arc<GatewayState>>,
+    Json(mut payload): Json<Value>,
+) -> Response<Body> {
+    let nodes = state.nodes.available_configs().await;
+    if nodes.is_empty() {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway has no available N2 nodes",
+        );
+    }
+
+    let mut stable_fragment_id = payload
+        .get("stable_fragment_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let mut fragment_hash = String::new();
+    let mut created = Vec::new();
+    let mut errors = Vec::new();
+    let mut first_body: Option<Value> = None;
+    let mut first_status = StatusCode::CREATED;
+
+    for node in nodes {
+        if let Some(stable) = &stable_fragment_id {
+            payload["stable_fragment_id"] = Value::String(stable.clone());
+        }
+
+        match post_json_to_node(&state, &node, "/n2/fragments", &payload).await {
+            Ok((status, body)) if status.is_success() => {
+                state.nodes.mark_route(&node.id).await;
+                if first_body.is_none() {
+                    first_status = status;
+                    first_body = Some(body.clone());
+                }
+                if stable_fragment_id.is_none() {
+                    stable_fragment_id = body
+                        .get("stable_fragment_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                if fragment_hash.is_empty() {
+                    fragment_hash = body
+                        .get("fragment_hash")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                created.push(json!({ "node": node.id, "status": status.as_u16() }));
+            }
+            Ok((status, body)) => {
+                if status.is_server_error() {
+                    state.nodes.mark_failure(&node.id).await;
+                }
+                errors.push(json!({
+                    "node": node.id,
+                    "status": status.as_u16(),
+                    "error": body.get("error")
+                        .or_else(|| body.get("message"))
+                        .cloned()
+                        .unwrap_or(body)
+                }));
+            }
+            Err(err) => {
+                state.nodes.mark_failure(&node.id).await;
+                errors.push(json!({ "node": node.id, "status": 502, "error": err }));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return json_response_value(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "error": "fragment creation did not complete on every N2 node",
+                "created": created,
+                "errors": errors,
+                "fragment_hash": fragment_hash,
+                "stable_fragment_id": stable_fragment_id,
+            }),
+        );
+    }
+
+    let mut body = first_body.unwrap_or_else(|| json!({}));
+    body["gateway"] = json!({
+        "cluster_created": true,
+        "nodes": created,
+    });
+    json_response_value(first_status, body)
 }
 
 async fn multipart_init(
@@ -415,6 +580,10 @@ fn decode_path(path: &str) -> String {
 
 fn json_response(status: u16, value: Value) -> Response<Body> {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    json_response_value(status, value)
+}
+
+fn json_response_value(status: StatusCode, value: Value) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
@@ -422,6 +591,31 @@ fn json_response(status: u16, value: Value) -> Response<Body> {
             serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
         ))
         .expect("valid json response")
+}
+
+async fn post_json_to_node(
+    state: &GatewayState,
+    node: &NodeConfig,
+    path: &str,
+    payload: &Value,
+) -> Result<(StatusCode, Value), String> {
+    let upstream = state
+        .http
+        .post(format!("{}{}", node.http_url, path))
+        .json(payload)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = upstream.status();
+    let bytes = upstream.bytes().await.map_err(|err| err.to_string())?;
+    let body = if bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+            |_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_string() }),
+        )
+    };
+    Ok((status, body))
 }
 
 #[cfg(test)]

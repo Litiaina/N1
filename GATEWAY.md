@@ -46,8 +46,14 @@ Gateway hot paths use N2 native upstreams where possible:
 n2-gateway -> n2://node
 ```
 
-Auth/token routes remain HTTP passthrough because bearer tokens are minted by
-the N2 HTTP API. Native N2 auth is connection-local.
+Fragment auth is gateway-aware: the gateway tries available N2 nodes until a
+valid fragment session is minted. Hot-path bearer traffic then uses native
+upstreams where the gateway has a native operation for that route.
+
+Fragment creation is also gateway-aware. `POST /n2/fragments` provisions the
+same stable fragment identity on every available N2 node, so later gateway
+auth, uploads, reads, and maintenance do not depend on which node receives a
+request.
 
 ## Multipart Routing
 
@@ -100,7 +106,8 @@ Add one `[node.<id>]` section per N2 node.
 ## Node Setup
 
 Every N2 node behind the gateway must already be a working N2 server. The
-gateway does not create fragments, format disks, or manage cluster membership.
+gateway can provision fragments across those nodes, but it does not format
+disks or manage cluster membership.
 
 Each node needs:
 
@@ -217,6 +224,24 @@ GET /gateway/nodes
 GET /gateway/routes/uploads
 GET /gateway/routes/uploads/{session_id}
 ```
+
+## Gateway Routed N2 API
+
+These routes have gateway-specific routing rules:
+
+```text
+POST /n2/fragments                         fan out fragment creation to all available nodes
+POST /n2/auth/fragment                     try available nodes until auth succeeds
+POST /n2/upload/one-shot/{object_key}      stream through native N2 to a selected coordinator
+POST /n2/upload/multipart/init/{object_key} select and remember multipart coordinator
+PUT  /n2/upload/multipart/{version}/{part} route part to original coordinator
+GET  /n2/upload/multipart/{version}        route status to original coordinator
+POST /n2/upload/multipart/{version}/{session}/finalize
+DELETE /n2/upload/multipart/{version}
+GET  /n2/objects/download                  stream through native N2 from a selected node
+```
+
+All other `/n2/...` routes are proxied to an available N2 node.
 
 These endpoints expose gateway routing health only.
 

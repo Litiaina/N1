@@ -103,6 +103,19 @@ impl NodeTable {
             .map(|node| node.config.clone())
     }
 
+    pub async fn available_configs(&self) -> Vec<NodeConfig> {
+        let mut configs = self
+            .nodes
+            .read()
+            .await
+            .values()
+            .filter(|node| !matches!(node.status, NodeStatus::Offline))
+            .map(|node| node.config.clone())
+            .collect::<Vec<_>>();
+        configs.sort_by(|a, b| a.id.cmp(&b.id));
+        configs
+    }
+
     pub async fn is_available(&self, id: &str) -> bool {
         self.nodes
             .read()

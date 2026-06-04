@@ -1,9 +1,12 @@
 use crate::distribution::layout::ClusterLayoutMode;
 use crate::distribution::layout::resolve_layout;
-use crate::distribution::membership::{ClusterRuntime, NodeState};
+use crate::distribution::membership::{
+    ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
+};
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,18 +45,33 @@ pub struct ClusterHealthSnapshot {
     pub notes: Vec<String>,
 }
 
-pub fn cluster_health_snapshot(
+pub async fn cluster_health_snapshot(
     runtime: &ClusterRuntime,
 ) -> Result<ClusterHealthSnapshot, AppError> {
-    let active = runtime.membership.active_write_nodes();
-    let readable = runtime.membership.readable_nodes();
+    let active = live_active_write_nodes(runtime).await;
+    let readable = live_readable_nodes(runtime).await;
+    cluster_health_snapshot_with_live_nodes(runtime, active, readable)
+}
+
+pub fn cluster_health_snapshot_with_live_nodes(
+    runtime: &ClusterRuntime,
+    active: Vec<ClusterNode>,
+    readable: Vec<ClusterNode>,
+) -> Result<ClusterHealthSnapshot, AppError> {
+    let configured_active = runtime.membership.active_write_nodes();
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
-    let required = layout.total_shards();
-    let state = if active.len() >= required {
-        ClusterHealthState::Healthy
-    } else if readable.len() >= layout.data_shards {
+    let missing_writable = configured_active.len().saturating_sub(active.len());
+    let live_node_ids = readable
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    let state = if readable.len() < layout.data_shards {
+        ClusterHealthState::Critical
+    } else if missing_writable > 0 {
         ClusterHealthState::Degraded
+    } else if readable.len() >= layout.data_shards {
+        ClusterHealthState::Healthy
     } else {
         ClusterHealthState::Critical
     };
@@ -61,7 +79,7 @@ pub fn cluster_health_snapshot(
     let repair_status = repair_status();
     let rebalance_status = rebalance_status();
     let mut notes = vec![rebalance.recommendation];
-    if active.len() >= required {
+    if missing_writable == 0 {
         notes.push(
             "layout drift is not health failure: new objects use the current node layout; old objects stay readable until manual rebalance"
                 .to_string(),
@@ -89,11 +107,17 @@ pub fn cluster_health_snapshot(
                 .unwrap_or_default()
         ));
     }
-    if active.len() < required {
+    if missing_writable > 0 {
         notes.push(format!(
-            "cluster cannot accept this layout: requires {} writable node(s), has {}",
-            required,
-            active.len()
+            "{} configured writable node(s) are currently unreachable; new writes use the live topology, while older objects keep their recorded layout",
+            missing_writable
+        ));
+    }
+    if readable.len() < layout.data_shards {
+        notes.push(format!(
+            "cluster cannot read the current live layout: requires {} readable node(s), has {}",
+            layout.data_shards,
+            readable.len()
         ));
     }
 
@@ -115,7 +139,15 @@ pub fn cluster_health_snapshot(
             .nodes
             .iter()
             .map(|node| {
-                let state = node.effective_state();
+                let configured_state = node.effective_state();
+                let state = if configured_state.is_readable()
+                    && !node.is_local(&runtime.local_node_id)
+                    && !live_node_ids.contains(&node.id)
+                {
+                    NodeState::Offline
+                } else {
+                    configured_state
+                };
                 ClusterNodeHealth {
                     node_id: node.id.clone(),
                     accepts_writes: state.accepts_new_writes(),
@@ -172,10 +204,15 @@ mod tests {
 
     #[test]
     fn health_reflects_writable_layout_capacity() {
-        let snap = cluster_health_snapshot(&runtime(vec![
+        let runtime = runtime(vec![
             node("a", NodeState::Online),
             node("b", NodeState::Online),
-        ]))
+        ]);
+        let snap = cluster_health_snapshot_with_live_nodes(
+            &runtime,
+            runtime.membership.active_write_nodes(),
+            runtime.membership.readable_nodes(),
+        )
         .unwrap();
         assert_eq!(snap.state, ClusterHealthState::Healthy);
         assert_eq!(snap.data_shards, 1);
@@ -189,5 +226,24 @@ mod tests {
         );
         assert!(!snap.repair_running);
         assert!(!snap.rebalance_running);
+    }
+
+    #[test]
+    fn health_marks_unreachable_configured_node_as_degraded() {
+        let runtime = runtime(vec![
+            node("a", NodeState::Online),
+            node("b", NodeState::Online),
+            node("c", NodeState::Online),
+        ]);
+        let live = vec![
+            runtime.membership.nodes[0].clone(),
+            runtime.membership.nodes[1].clone(),
+        ];
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
+        assert_eq!(snap.state, ClusterHealthState::Degraded);
+        assert_eq!(snap.active_write_nodes, 2);
+        assert_eq!(snap.data_shards, 1);
+        assert_eq!(snap.parity_shards, 1);
+        assert_eq!(snap.nodes[2].state, NodeState::Offline);
     }
 }

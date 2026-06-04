@@ -1,34 +1,50 @@
 use crate::core::disk_manager::ObjectMetadata;
 use crate::core::repair_manager::{ObjectRepairStatus, RepairCheckMode, inspect_object_status};
 use crate::distribution::download::{part_has_remote_shards, shard_probe_readable};
+use crate::distribution::membership::active_cluster_runtime;
+use crate::distribution::rebalance::object_layout_status;
 use crate::enums::app_error_enum::AppError;
+
+fn attach_layout_status(
+    mut report: ObjectRepairStatus,
+    meta: &ObjectMetadata,
+) -> Result<ObjectRepairStatus, AppError> {
+    let runtime = active_cluster_runtime()?;
+    report.layout = Some(object_layout_status(meta, &runtime)?);
+    Ok(report)
+}
 
 pub async fn inspect_cluster_object_status(
     meta: &ObjectMetadata,
     check_mode: RepairCheckMode,
 ) -> Result<ObjectRepairStatus, AppError> {
     if meta.parts.is_empty() {
-        return Ok(ObjectRepairStatus {
-            object_key: meta.object_key.clone(),
-            version_id: meta.version_id.clone(),
-            status: if meta.total_size_bytes == 0 {
-                "healthy".to_string()
-            } else {
-                "lost".to_string()
+        return attach_layout_status(
+            ObjectRepairStatus {
+                object_key: meta.object_key.clone(),
+                version_id: meta.version_id.clone(),
+                status: if meta.total_size_bytes == 0 {
+                    "healthy".to_string()
+                } else {
+                    "lost".to_string()
+                },
+                total_parts: meta.parts.len() as u64,
+                total_shards: 0,
+                healthy_shards: 0,
+                missing_shards: 0,
+                corrupt_shards: 0,
+                repairable: meta.total_size_bytes == 0,
+                repaired_shards: 0,
+                failed_repairs: 0,
+                layout: None,
             },
-            total_parts: meta.parts.len() as u64,
-            total_shards: 0,
-            healthy_shards: 0,
-            missing_shards: 0,
-            corrupt_shards: 0,
-            repairable: meta.total_size_bytes == 0,
-            repaired_shards: 0,
-            failed_repairs: 0,
-        });
+            meta,
+        );
     }
 
     if !meta.parts.iter().any(part_has_remote_shards) {
-        return inspect_object_status(meta, check_mode).await;
+        let report = inspect_object_status(meta, check_mode).await?;
+        return attach_layout_status(report, meta);
     }
 
     let mut report = ObjectRepairStatus {
@@ -43,6 +59,7 @@ pub async fn inspect_cluster_object_status(
         repairable: true,
         repaired_shards: 0,
         failed_repairs: 0,
+        layout: None,
     };
 
     let mut any_degraded = false;
@@ -91,5 +108,5 @@ pub async fn inspect_cluster_object_status(
         "healthy".to_string()
     };
 
-    Ok(report)
+    attach_layout_status(report, meta)
 }

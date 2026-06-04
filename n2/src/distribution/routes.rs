@@ -1,5 +1,7 @@
 use crate::distribution::health::cluster_health_snapshot;
-use crate::distribution::membership::{ClusterNode, active_cluster_runtime};
+use crate::distribution::membership::{
+    ClusterNode, active_cluster_runtime, live_active_write_nodes,
+};
 use crate::distribution::peer::{
     PeerUsageResponse, cluster_secret, local_peer_usage_snapshot, peer_http_client,
 };
@@ -84,7 +86,7 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = runtime.membership.active_write_nodes();
+    let active = live_active_write_nodes(&runtime).await;
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
     Ok(Json(serde_json::json!({
@@ -102,7 +104,7 @@ pub async fn cluster_health(claims: Claims) -> Result<impl axum::response::IntoR
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    Ok(Json(cluster_health_snapshot(&runtime)?))
+    Ok(Json(cluster_health_snapshot(&runtime).await?))
 }
 
 async fn usage_for_node(
@@ -151,7 +153,7 @@ async fn fetch_remote_usage(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(Duration::from_secs(8), req.send())
+    let response = timeout(Duration::from_secs(2), req.send())
         .await
         .map_err(|_| AppError::ServiceUnavailable("N2 peer usage request timed out".into()))?
         .map_err(|err| {
@@ -237,7 +239,7 @@ pub async fn placement_preview(
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = runtime.membership.active_write_nodes();
+    let active = live_active_write_nodes(&runtime).await;
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
     let version = query.version_id.unwrap_or_else(|| "preview".to_string());

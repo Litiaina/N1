@@ -169,6 +169,18 @@ enum ObjectCommand {
         #[arg(long, default_value = "strict")]
         mode: String,
     },
+    Redistribute {
+        #[arg(long)]
+        object_key: String,
+        #[arg(long)]
+        version_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value = "availability")]
+        mode: String,
+    },
 }
 
 #[derive(Args)]
@@ -229,6 +241,8 @@ enum JobAction {
         limit: Option<usize>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        #[arg(long, default_value_t = true)]
+        mismatched_only: bool,
     },
     Status,
 }
@@ -420,6 +434,27 @@ async fn run_object_command(
             )
             .await
         }
+        ObjectCommand::Redistribute {
+            object_key,
+            version_id,
+            dry_run,
+            force,
+            mode,
+        } => {
+            print_op(
+                client,
+                "object.redistribute",
+                json!({
+                    "object_key": object_key,
+                    "version_id": version_id,
+                    "dry_run": dry_run,
+                    "force": force,
+                    "mode": mode,
+                }),
+                json_output,
+            )
+            .await
+        }
     }
 }
 
@@ -481,6 +516,7 @@ async fn run_job_command(
             prefix: object_prefix,
             limit,
             dry_run,
+            mismatched_only,
         } => {
             let fragment = target_fragment
                 .or_else(|| auth_fragment.clone())
@@ -497,6 +533,7 @@ async fn run_job_command(
                     "prefix": object_prefix,
                     "limit": limit,
                     "dry_run": dry_run,
+                    "mismatched_only": mismatched_only,
                 }),
                 json_output,
             )
@@ -766,6 +803,25 @@ async fn run_shell_line(
             )
             .await
         }
+        ["object", "redistribute", object_key] => {
+            print_op(
+                client,
+                "object.redistribute",
+                json!({"object_key": object_key}),
+                cli.json,
+            )
+            .await
+        }
+        ["object", "redistribute", object_key, "dry-run"]
+        | ["object", "redistribute", object_key, "--dry-run"] => {
+            print_op(
+                client,
+                "object.redistribute",
+                json!({"object_key": object_key, "dry_run": true}),
+                cli.json,
+            )
+            .await
+        }
         ["repair"] | ["repair", "status"] => {
             print_op(client, "cluster.repair.status", json!({}), cli.json).await
         }
@@ -795,7 +851,7 @@ async fn run_shell_line(
             print_op(
                 client,
                 "cluster.rebalance.start",
-                json!({"fragment": fragment}),
+                json!({"fragment": fragment, "mismatched_only": true}),
                 cli.json,
             )
             .await
@@ -809,7 +865,7 @@ async fn run_shell_line(
 
 fn print_shell_help() {
     println!(
-        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  usage\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  repair status|plan|start\n  rebalance status|plan|start\n  exit"
+        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  usage\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start\n  rebalance status|plan|start\n  exit"
     );
 }
 

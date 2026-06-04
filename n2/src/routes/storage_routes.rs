@@ -28,8 +28,8 @@ use crate::core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
 use crate::core::repair_manager::{
-    get_repair_status_api, parse_check_mode, repair_object, stop_repair_job_api,
-    trigger_repair_job_api,
+    ObjectRepairStatus, get_repair_status_api, parse_check_mode, repair_object,
+    stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{
     get_object as get_object_impl, get_object_metadata_direct, list_fragments,
@@ -47,12 +47,15 @@ use crate::core::upload::{
 };
 use crate::core::{index, index_store};
 use crate::distribution::download::part_has_remote_shards;
+use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, build_namespace_peer_routes,
-    commit_namespace_summary_quorum, commit_upload_quorum,
+    commit_namespace_summary_quorum, commit_upload_quorum, sync_namespace_from_peers,
 };
 use crate::distribution::peer::build_peer_routes;
-use crate::distribution::rebalance::rewrite_object_to_current_layout;
+use crate::distribution::rebalance::{
+    metadata_matches_current_layout, rewrite_object_to_current_layout,
+};
 use crate::distribution::routes::build_cluster_routes;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -83,7 +86,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
 };
 use futures_util::StreamExt;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,18 +135,25 @@ pub(crate) async fn resolve_logical_read_key(
     requested_path: &str,
 ) -> Result<String, AppError> {
     let requested = requested_path.trim_start_matches('/').trim();
-    if let Some(entry) = global_namespace_runtime()
-        .entry(fragment, requested)
-        .await?
-    {
-        if entry.kind != crate::namespace::models::NamespaceEntryKind::File
-            || !entry.lifecycle.is_live()
+    for attempt in 0..=1 {
+        if let Some(entry) = global_namespace_runtime()
+            .entry(fragment, requested)
+            .await?
         {
-            return Err(logical_not_found());
+            if entry.kind != crate::namespace::models::NamespaceEntryKind::File
+                || !entry.lifecycle.is_live()
+            {
+                return Err(logical_not_found());
+            }
+            return entry.object_id.ok_or_else(|| {
+                AppError::InternalServerError(
+                    "logical file is missing physical object id".to_string(),
+                )
+            });
         }
-        return entry.object_id.ok_or_else(|| {
-            AppError::InternalServerError("logical file is missing physical object id".to_string())
-        });
+        if attempt == 0 {
+            let _ = sync_namespace_from_peers(fragment).await;
+        }
     }
     index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }
@@ -168,6 +178,13 @@ fn looks_like_flat_storage_object_id(requested_path: &str) -> bool {
         && !normalized.contains('/')
         && normalized.len() == 64
         && normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn query_bool(params: &HashMap<String, String>, key: &str) -> bool {
+    params
+        .get(key)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 pub(crate) async fn resolve_logical_write_key(
@@ -403,6 +420,7 @@ async fn list_objects_scoped(
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
+    let _ = sync_namespace_from_peers(&fragment).await;
     Ok(AxumJson(
         global_namespace_runtime()
             .list_objects_page(&fragment, &params, false)
@@ -544,6 +562,7 @@ async fn empty_trash_scoped(
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::EmptyTrash,
         fragment: fragment.clone(),
         source_path: None,
@@ -579,6 +598,7 @@ async fn delete_object_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Trash,
         fragment: fragment.clone(),
         source_path: Some(object_key.clone()),
@@ -627,6 +647,7 @@ async fn delete_object_permanently_scoped(
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Purge,
         fragment: fragment.clone(),
         source_path: Some(object_key.clone()),
@@ -671,6 +692,7 @@ async fn recover_object_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: fragment.clone(),
         source_path: Some(object_key.clone()),
@@ -707,10 +729,112 @@ async fn get_object_repair_status_scoped(
     }
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let metadata = if let Some(version_id) = params
+        .get("version_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        index::read_object_version(&fragment, &physical, version_id).await?
+    } else {
+        get_object_metadata_direct(&fragment, &physical).await?
+    };
     let mut status = inspect_cluster_object_status(&metadata, parse_check_mode(&params)).await?;
     status.object_key = object_key.trim_start_matches('/').to_string();
     Ok(AxumJson(status))
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectRedistributeResponse {
+    object_key: String,
+    physical_object_id: String,
+    requested_version_id: Option<String>,
+    dry_run: bool,
+    force: bool,
+    rewritten: bool,
+    skipped: bool,
+    reason: Option<String>,
+    before: ObjectRepairStatus,
+    after: Option<ObjectRepairStatus>,
+}
+
+async fn redistribute_object_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify {
+        return Err(AppError::Forbidden(
+            "Write and Modify permission required".into(),
+        ));
+    }
+    let fragment = claims.fragment.clone();
+    let logical = object_key.trim_start_matches('/').to_string();
+    let physical = resolve_logical_read_key(&fragment, &logical).await?;
+    let requested_version_id = params
+        .get("version_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let metadata = if let Some(version_id) = requested_version_id.as_deref() {
+        index::read_object_version(&fragment, &physical, version_id).await?
+    } else {
+        get_object_metadata_direct(&fragment, &physical).await?
+    };
+    let check_mode = parse_check_mode(&params);
+    let mut before = inspect_cluster_object_status(&metadata, check_mode).await?;
+    before.object_key = logical.clone();
+
+    let runtime = active_cluster_runtime()?;
+    let dry_run = query_bool(&params, "dry_run");
+    let force = query_bool(&params, "force");
+    let already_current = metadata_matches_current_layout(&metadata, &runtime);
+    if already_current && !force {
+        return Ok(AxumJson(ObjectRedistributeResponse {
+            object_key: logical,
+            physical_object_id: physical,
+            requested_version_id,
+            dry_run,
+            force,
+            rewritten: false,
+            skipped: true,
+            reason: Some("object version already uses the current topology".to_string()),
+            before: before.clone(),
+            after: Some(before),
+        }));
+    }
+
+    if dry_run {
+        return Ok(AxumJson(ObjectRedistributeResponse {
+            object_key: logical,
+            physical_object_id: physical,
+            requested_version_id,
+            dry_run,
+            force,
+            rewritten: false,
+            skipped: false,
+            reason: Some("dry_run: object version would be redistributed".to_string()),
+            before,
+            after: None,
+        }));
+    }
+
+    rewrite_object_to_current_layout(logical.clone(), physical.clone(), metadata.clone(), false)
+        .await?;
+    let rewritten_metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let mut after = inspect_cluster_object_status(&rewritten_metadata, check_mode).await?;
+    after.object_key = logical.clone();
+    Ok(AxumJson(ObjectRedistributeResponse {
+        object_key: logical,
+        physical_object_id: physical,
+        requested_version_id,
+        dry_run,
+        force,
+        rewritten: true,
+        skipped: false,
+        reason: None,
+        before,
+        after: Some(after),
+    }))
 }
 
 async fn repair_object_scoped(
@@ -777,6 +901,7 @@ async fn bulk_delete_objects_scoped(
     let mut failed = Vec::new();
     for object_key in &unique_keys {
         match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            mutation_id: None,
             kind: NamespaceMutationKind::Trash,
             fragment: fragment.clone(),
             source_path: Some(object_key.clone()),
@@ -847,6 +972,7 @@ async fn bulk_recover_objects_scoped(
     let mut failed = Vec::new();
     for object_key in &unique_keys {
         match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            mutation_id: None,
             kind: NamespaceMutationKind::Recover,
             fragment: fragment.clone(),
             source_path: Some(object_key.clone()),
@@ -915,6 +1041,7 @@ async fn bulk_permanent_delete_objects_scoped(
     let mut failed = Vec::new();
     for object_key in &unique_keys {
         match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            mutation_id: None,
             kind: NamespaceMutationKind::Purge,
             fragment: fragment.clone(),
             source_path: Some(object_key.clone()),
@@ -968,6 +1095,7 @@ async fn recover_all_trash_scoped(
         ));
     }
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::RecoverAll,
         fragment: fragment.clone(),
         source_path: None,
@@ -1008,6 +1136,7 @@ async fn rename_object_scoped(
     }
 
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Rename,
         fragment: claims.fragment.clone(),
         source_path: Some(payload.source_key.clone()),
@@ -1382,6 +1511,10 @@ pub fn build_storage_routes_unbound_with_options(
             .route(
                 "/n2/objects/permanent/bulk-delete",
                 post(bulk_permanent_delete_objects_scoped),
+            )
+            .route(
+                "/n2/objects/redistribute/{*object_key}",
+                post(redistribute_object_scoped),
             )
             .route("/n2/objects/{*object_key}", delete(delete_object_scoped))
             .route(

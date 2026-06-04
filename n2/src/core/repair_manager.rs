@@ -60,6 +60,24 @@ pub struct RepairJobStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ObjectLayoutStatus {
+    pub recorded_membership_epoch: u64,
+    pub current_membership_epoch: u64,
+    pub recorded_data_shards: u16,
+    pub recorded_parity_shards: u16,
+    pub current_data_shards: usize,
+    pub current_parity_shards: usize,
+    pub recorded_total_shards: usize,
+    pub current_total_shards: usize,
+    pub active_write_nodes: usize,
+    pub layout_matches_current: bool,
+    pub placement_matches_current: bool,
+    pub state: String,
+    pub redistributable: bool,
+    pub mismatch_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ObjectRepairStatus {
     pub object_key: String,
     pub version_id: String,
@@ -72,6 +90,8 @@ pub struct ObjectRepairStatus {
     pub repairable: bool,
     pub repaired_shards: u64,
     pub failed_repairs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<ObjectLayoutStatus>,
 }
 
 static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
@@ -654,6 +674,7 @@ async fn inspect_object_parts(
         repairable: true,
         repaired_shards: 0,
         failed_repairs: 0,
+        layout: None,
     };
 
     let mut normalized_parts = Vec::with_capacity(meta.parts.len());

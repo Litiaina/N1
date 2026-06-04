@@ -1244,7 +1244,7 @@ Authorization: Bearer <token>
 ### Object Status
 
 ```http
-GET /n2/objects/status/{object_key}?mode=availability
+GET /n2/objects/status/{object_key}?mode=availability&version_id=01KS...
 Authorization: Bearer <token>
 ```
 
@@ -1254,6 +1254,8 @@ Modes:
 - `checksum`: checksum-aware check.
 - `strict`: deeper verification with read-only maintenance behavior.
 - `scrub`: strictest repair/scrub behavior.
+
+`version_id` is optional. When omitted, N2 reports the current namespace head.
 
 Response:
 
@@ -1269,9 +1271,32 @@ Response:
   "corrupt_shards": 0,
   "repairable": true,
   "repaired_shards": 0,
-  "failed_repairs": 0
+  "failed_repairs": 0,
+  "layout": {
+    "recorded_membership_epoch": 7,
+    "current_membership_epoch": 8,
+    "recorded_data_shards": 2,
+    "recorded_parity_shards": 1,
+    "current_data_shards": 3,
+    "current_parity_shards": 1,
+    "recorded_total_shards": 3,
+    "current_total_shards": 4,
+    "active_write_nodes": 4,
+    "layout_matches_current": false,
+    "placement_matches_current": false,
+    "state": "older_recorded_layout",
+    "redistributable": true,
+    "mismatch_reasons": [
+      "membership_epoch recorded=7 current=8",
+      "ec_layout recorded=2+1 current=3+1"
+    ]
+  }
 }
 ```
+
+An object can be `healthy` while its layout state is `older_recorded_layout`.
+That means the object is valid under the topology that wrote it. It is not a
+failure; it is eligible for operator-controlled redistribution.
 
 ### Object Repair
 
@@ -1281,6 +1306,48 @@ Authorization: Bearer <token>
 ```
 
 Requires `write` and `modify`.
+
+### Object Redistribution
+
+```http
+POST /n2/objects/redistribute/{object_key}?version_id=01KS...&dry_run=false&force=false
+Authorization: Bearer <token>
+```
+
+Requires `write` and `modify`.
+
+Object redistribution rewrites one object/version into the current cluster
+topology. When `version_id` is omitted, N2 targets the current namespace head.
+Already-current objects are skipped unless `force=true`.
+
+Response:
+
+```json
+{
+  "object_key": "videos/mhw.mp4",
+  "physical_object_id": "9f2d...",
+  "requested_version_id": "01KS...",
+  "dry_run": false,
+  "force": false,
+  "rewritten": true,
+  "skipped": false,
+  "reason": null,
+  "before": {
+    "status": "healthy",
+    "layout": {
+      "state": "older_recorded_layout",
+      "redistributable": true
+    }
+  },
+  "after": {
+    "status": "healthy",
+    "layout": {
+      "state": "current_layout",
+      "redistributable": false
+    }
+  }
+}
+```
 
 ## Archives
 
@@ -1574,9 +1641,15 @@ Body:
   "fragment": "n2-test",
   "prefix": "videos/",
   "limit": 1000,
-  "dry_run": false
+  "dry_run": false,
+  "mismatched_only": true
 }
 ```
+
+`mismatched_only` defaults to `true`. In that mode N2 scans object metadata and
+only rewrites versions whose recorded epoch, EC shape, or deterministic node
+placement differs from the current topology. Already-current objects are
+skipped completely.
 
 ### Cluster Rebalance Status
 
@@ -1593,6 +1666,7 @@ Job status shape:
   "job": "cluster_rebalance",
   "fragment": "n2-test",
   "dry_run": false,
+  "mismatched_only": true,
   "resumable": true,
   "scanned": 100,
   "rewritten": 20,
@@ -1644,6 +1718,10 @@ target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   upload --fragment n2-test --secret fragment-key \
   --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4
+
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  object redistribute --fragment n2-test --secret fragment-key \
+  --object-key videos/sample.mp4 --dry-run
 ```
 
 The shell supports raw native operation calls:
@@ -1668,6 +1746,7 @@ object.meta
 object.versions
 object.status
 object.repair
+object.redistribute
 object.delete
 object.recover
 object.purge
@@ -1683,7 +1762,9 @@ cluster.layout
 cluster.health
 cluster.usage
 cluster.repair.status
+cluster.rebalance.plan
 cluster.rebalance.status
+cluster.rebalance.start
 maintenance.gc.start
 maintenance.gc.status
 maintenance.repair.start

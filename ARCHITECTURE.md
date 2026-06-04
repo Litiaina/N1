@@ -208,7 +208,12 @@ N2 maintenance is cluster-level:
 
 - health checks node reachability and shard availability
 - repair restores missing shards for recorded layouts
-- rebalance rewrites selected objects onto a newer layout when requested
+- object status reports whether a version uses the current topology or an
+  older recorded layout
+- object redistribution rewrites one selected object/version into the current
+  topology when requested
+- targeted rebalance scans metadata and rewrites only layout-mismatched objects
+- already-current objects are skipped by targeted rebalance
 - GC removes unreachable immutable records and blobs
 
 N2 distinguishes:

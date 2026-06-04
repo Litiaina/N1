@@ -41,24 +41,25 @@ use crate::core::storage_capacity_parser::{
 };
 use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
-    FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
-    get_upload_status, initiate_object_upload_direct, list_active_uploads,
-    object_upload_part_direct, object_upload_part_reader_direct, object_upload_part_stream_direct,
+    FinalizeUploadResult, cancel_upload_session_direct, get_upload_status, list_active_uploads,
 };
+use crate::distribution::download::part_has_remote_shards;
 use crate::distribution::health::cluster_health_snapshot;
-use crate::distribution::membership::active_cluster_runtime;
+use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
 };
 use crate::distribution::rebalance::{
-    ClusterRebalanceRequest, plan_rebalance, rebalance_status, repair_status, start_rebalance,
-    start_repair,
+    ClusterRebalanceRequest, metadata_matches_current_layout, plan_rebalance, rebalance_status,
+    repair_status, rewrite_object_to_current_layout, start_rebalance, start_repair,
 };
 use crate::distribution::repair::repair_policy;
 use crate::distribution::resolve_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
-use crate::distribution::upload::upload_cluster_one_shot;
+use crate::distribution::upload::{
+    finalize_cluster_upload, initiate_cluster_upload, put_cluster_part, upload_cluster_one_shot,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -203,16 +204,20 @@ where
         }
         "multipart.put_part" | "upload.multipart.put_part" => {
             require_write(&claims)?;
+            let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
             let part_index = u64_field(&payload, "part_index")
                 .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
-            object_upload_part_reader_direct(
-                claims.clone(),
-                claims.fragment.clone(),
+            let body_stream = ReaderStream::new(reader).map(|chunk| {
+                chunk.map_err(|err| AppError::Io(err, "native cluster multipart body read".into()))
+            });
+            put_cluster_part(
+                claims,
+                fragment,
                 version_id.clone(),
                 part_index,
                 upload_part_query_from_payload(&payload)?,
-                reader,
+                body_stream,
                 body_len,
             )
             .await?;
@@ -275,12 +280,13 @@ where
         }
         "multipart.put_part" | "upload.multipart.put_part" => {
             require_write(&claims)?;
+            let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
             let part_index = u64_field(&payload, "part_index")
                 .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
-            object_upload_part_stream_direct(
-                claims.clone(),
-                claims.fragment.clone(),
+            put_cluster_part(
+                claims,
+                fragment,
                 version_id.clone(),
                 part_index,
                 upload_part_query_from_payload(&payload)?,
@@ -402,6 +408,7 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_delete(&claims)?;
             let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+                mutation_id: None,
                 kind: NamespaceMutationKind::EmptyTrash,
                 fragment: claims.fragment.clone(),
                 source_path: None,
@@ -430,6 +437,7 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_write(&claims)?;
             let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+                mutation_id: None,
                 kind: NamespaceMutationKind::RecoverAll,
                 fragment: claims.fragment.clone(),
                 source_path: None,
@@ -457,7 +465,12 @@ async fn execute_native_op_inner(
             require_read(&claims)?;
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
-            let metadata = get_object_metadata_direct(&claims.fragment, &physical).await?;
+            let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
+                get_version_metadata(&claims.fragment, &physical, &version_id, &claims.fragment)
+                    .await?
+            } else {
+                get_object_metadata_direct(&claims.fragment, &physical).await?
+            };
             let mut status =
                 inspect_cluster_object_status(&metadata, check_mode_payload(&payload)).await?;
             status.object_key = object_key.trim_start_matches('/').to_string();
@@ -469,9 +482,103 @@ async fn execute_native_op_inner(
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
             let metadata = get_object_metadata_direct(&claims.fragment, &physical).await?;
-            let mut status = repair_object(&metadata, check_mode_payload(&payload)).await?;
+            let check_mode = check_mode_payload(&payload);
+            let mut status = if metadata.parts.iter().any(part_has_remote_shards) {
+                let status = inspect_cluster_object_status(&metadata, check_mode).await?;
+                if status.status == "healthy" {
+                    status
+                } else if status.repairable {
+                    rewrite_object_to_current_layout(
+                        object_key.trim_start_matches('/').to_string(),
+                        physical.clone(),
+                        metadata.clone(),
+                        false,
+                    )
+                    .await?;
+                    let repaired_metadata =
+                        get_object_metadata_direct(&claims.fragment, &physical).await?;
+                    inspect_cluster_object_status(&repaired_metadata, check_mode).await?
+                } else {
+                    status
+                }
+            } else {
+                repair_object(&metadata, check_mode).await?
+            };
             status.object_key = object_key.trim_start_matches('/').to_string();
             native_body(status)
+        }
+        "object.redistribute" => {
+            let claims = claims_required(claims)?;
+            require_write_modify(&claims)?;
+            let object_key = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
+            let requested_version_id = string_field(&payload, "version_id");
+            let metadata = if let Some(version_id) = requested_version_id.as_deref() {
+                get_version_metadata(&claims.fragment, &physical, version_id, &claims.fragment)
+                    .await?
+            } else {
+                get_object_metadata_direct(&claims.fragment, &physical).await?
+            };
+            let check_mode = check_mode_payload(&payload);
+            let mut before = inspect_cluster_object_status(&metadata, check_mode).await?;
+            before.object_key = object_key.trim_start_matches('/').to_string();
+            let runtime = active_cluster_runtime()?;
+            let dry_run = bool_field(&payload, "dry_run").unwrap_or(false);
+            let force = bool_field(&payload, "force").unwrap_or(false);
+            let already_current = metadata_matches_current_layout(&metadata, &runtime);
+            if already_current && !force {
+                let after = before.clone();
+                native_body(json!({
+                    "object_key": object_key.trim_start_matches('/'),
+                    "physical_object_id": physical,
+                    "requested_version_id": requested_version_id,
+                    "dry_run": dry_run,
+                    "force": force,
+                    "rewritten": false,
+                    "skipped": true,
+                    "reason": "object version already uses the current topology",
+                    "before": before,
+                    "after": after,
+                }))
+            } else if dry_run {
+                native_body(json!({
+                    "object_key": object_key.trim_start_matches('/'),
+                    "physical_object_id": physical,
+                    "requested_version_id": requested_version_id,
+                    "dry_run": dry_run,
+                    "force": force,
+                    "rewritten": false,
+                    "skipped": false,
+                    "reason": "dry_run: object version would be redistributed",
+                    "before": before,
+                    "after": null,
+                }))
+            } else {
+                rewrite_object_to_current_layout(
+                    object_key.trim_start_matches('/').to_string(),
+                    physical.clone(),
+                    metadata,
+                    false,
+                )
+                .await?;
+                let rewritten_metadata =
+                    get_object_metadata_direct(&claims.fragment, &physical).await?;
+                let mut after =
+                    inspect_cluster_object_status(&rewritten_metadata, check_mode).await?;
+                after.object_key = object_key.trim_start_matches('/').to_string();
+                native_body(json!({
+                    "object_key": object_key.trim_start_matches('/'),
+                    "physical_object_id": physical,
+                    "requested_version_id": requested_version_id,
+                    "dry_run": dry_run,
+                    "force": force,
+                    "rewritten": true,
+                    "skipped": false,
+                    "reason": null,
+                    "before": before,
+                    "after": after,
+                }))
+            }
         }
         "object.delete" => {
             let claims = claims_required(claims)?;
@@ -567,6 +674,7 @@ async fn execute_native_op_inner(
                 return Err(AppError::NotFound);
             }
             let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+                mutation_id: None,
                 kind: NamespaceMutationKind::Recover,
                 fragment: fragment.clone(),
                 source_path: Some(logical.clone()),
@@ -681,13 +789,9 @@ async fn execute_native_op_inner(
                 (op_response(201), native_body_bytes(&existing))
             } else {
                 let physical = resolve_logical_write_key(&fragment, &logical).await?;
-                let response = initiate_object_upload_direct(
-                    claims,
-                    fragment.clone(),
-                    physical.clone(),
-                    params,
-                )
-                .await?;
+                let response =
+                    initiate_cluster_upload(claims, fragment.clone(), physical.clone(), params)
+                        .await?;
                 global_namespace_runtime()
                     .bind_pending_upload(
                         &fragment,
@@ -704,16 +808,21 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_write(&claims)?;
             let body = _body.ok_or_else(|| AppError::BadRequest("part body is required".into()))?;
+            let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
             let part_index = u64_field(&payload, "part_index")
                 .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
-            object_upload_part_direct(
-                claims.clone(),
-                claims.fragment.clone(),
+            let body_len = body.len() as u64;
+            let body_stream =
+                futures_util::stream::once(async move { Ok::<Bytes, AppError>(Bytes::from(body)) });
+            put_cluster_part(
+                claims,
+                fragment,
                 version_id.clone(),
                 part_index,
                 upload_part_query_from_payload(&payload)?,
-                body,
+                body_stream,
+                body_len,
             )
             .await?;
             native_body(json!({
@@ -737,7 +846,7 @@ async fn execute_native_op_inner(
                 .as_ref()
                 .map(|value| value.physical_object_id.clone())
                 .unwrap_or_else(|| logical.clone());
-            match finalize_object_upload_direct(
+            match finalize_cluster_upload(
                 claims,
                 fragment.clone(),
                 version_id,
@@ -854,7 +963,7 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_read(&claims)?;
             let runtime = active_cluster_runtime()?;
-            let active = runtime.membership.active_write_nodes();
+            let active = live_active_write_nodes(&runtime).await;
             let layout = resolve_layout(active.len(), &runtime.layout_policy)
                 .map_err(AppError::BadRequest)?;
             native_body(json!({
@@ -870,7 +979,7 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_read(&claims)?;
             let runtime = active_cluster_runtime()?;
-            native_body(cluster_health_snapshot(&runtime)?)
+            native_body(cluster_health_snapshot(&runtime).await?)
         }
         "cluster.usage" => {
             let claims = claims_required(claims)?;
@@ -1169,6 +1278,7 @@ async fn native_bulk_namespace_operation(
             BulkNamespaceMode::Purge => NamespaceMutationKind::Purge,
         };
         let result = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            mutation_id: None,
             kind,
             fragment: fragment.to_string(),
             source_path: Some(object_key.clone()),

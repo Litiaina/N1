@@ -6,7 +6,7 @@ use crate::core::disk_manager::{
 use crate::core::ec::ErasureStreamWriter;
 use crate::core::index::{self, IndexReplicaWriteMode};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
-use crate::distribution::membership::active_cluster_runtime;
+use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
 use crate::distribution::peer::{PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator};
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
 use crate::distribution::resolve_layout;
@@ -318,7 +318,7 @@ where
     S: Stream<Item = Result<Bytes, AppError>>,
 {
     let runtime = active_cluster_runtime()?;
-    let active = runtime.membership.active_write_nodes();
+    let active = live_active_write_nodes(&runtime).await;
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
     if layout.data_shards != data_shards || layout.parity_shards != parity_shards {
@@ -438,7 +438,7 @@ pub async fn initiate_cluster_upload(
         ));
     }
     let runtime = active_cluster_runtime()?;
-    let active = runtime.membership.active_write_nodes();
+    let active = live_active_write_nodes(&runtime).await;
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
     let version_id = Ulid::new().to_string();
@@ -545,7 +545,7 @@ where
     }
     validate_cluster_one_shot_size(content_length)?;
     let runtime = active_cluster_runtime()?;
-    let active = runtime.membership.active_write_nodes();
+    let active = live_active_write_nodes(&runtime).await;
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
     let version_id = Ulid::new().to_string();

@@ -57,7 +57,9 @@ The result is simple operational behavior:
 - each upload coordinator distributes object payloads across the cluster;
 - finalized objects can be listed, read, inspected, and repaired from any node;
 - folder rename and move are namespace mutations, not object rewrites;
-- old objects remain valid after membership changes until explicit rebalance.
+- old objects remain valid after membership changes until explicit rebalance;
+- object status reports layout drift, object redistribution can rewrite one
+  version, and targeted rebalance skips already-current objects.
 
 ## Coordination Model
 

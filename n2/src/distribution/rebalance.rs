@@ -1,13 +1,18 @@
 use crate::core::disk_manager::FS_STORAGE_ROOT;
 use crate::core::disk_manager::{
-    ChunkQuery, InitiateUploadParams, ObjectMetadata, UploadPartQuery,
+    ChunkQuery, InitiateUploadParams, ObjectMetadata, ShardInfo, UploadPartQuery,
 };
 use crate::core::download::download_object_chunk_from_metadata;
 use crate::core::index;
-use crate::distribution::download::{part_has_remote_shards, shard_probe_readable};
+use crate::core::repair_manager::ObjectLayoutStatus;
+use crate::distribution::download::shard_probe_readable;
 use crate::distribution::layout::resolve_layout;
 use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
 use crate::distribution::namespace::commit_upload_quorum;
+use crate::distribution::peer::parse_peer_shard_locator;
+use crate::distribution::placement::{
+    ClusterShardPlacement, ClusterShardRole, build_placement_plan,
+};
 use crate::distribution::upload::{
     finalize_cluster_upload, initiate_cluster_upload, put_cluster_part,
 };
@@ -24,6 +29,10 @@ use std::sync::{LazyLock, Mutex};
 const REWRITE_CHUNK_BYTES: usize = 1024 * 1024;
 const REWRITE_PART_BYTES: u64 = 64 * 1024 * 1024;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClusterRebalanceRequest {
     pub fragment: String,
@@ -33,6 +42,8 @@ pub struct ClusterRebalanceRequest {
     pub limit: Option<usize>,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default = "default_true")]
+    pub mismatched_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -51,6 +62,7 @@ pub struct ClusterRewriteJobStatus {
     pub job: String,
     pub fragment: String,
     pub dry_run: bool,
+    pub mismatched_only: bool,
     pub resumable: bool,
     pub scanned: u64,
     pub rewritten: u64,
@@ -157,6 +169,7 @@ fn begin_job(
         job: job.to_string(),
         fragment: req.fragment.clone(),
         dry_run: req.dry_run,
+        mismatched_only: req.mismatched_only,
         resumable: true,
         started_at_unix: Some(chrono::Utc::now().timestamp()),
         ..ClusterRewriteJobStatus::default()
@@ -187,21 +200,147 @@ fn finish_job(status: &LazyLock<Mutex<ClusterRewriteJobStatus>>) {
     });
 }
 
-fn metadata_matches_current_layout(meta: &ObjectMetadata, runtime: &ClusterRuntime) -> bool {
-    let Ok(layout) = resolve_layout(
-        runtime.membership.active_write_nodes().len(),
-        &runtime.layout_policy,
-    ) else {
-        return false;
-    };
-    let cluster_has_remote = runtime.membership.active_write_nodes().len() > 1;
-    meta.parts.iter().all(|part| {
-        let data = part.shards.iter().filter(|shard| !shard.is_parity).count();
-        let parity = part.shards.iter().filter(|shard| shard.is_parity).count();
-        data == layout.data_shards
-            && parity == layout.parity_shards
-            && (!cluster_has_remote || part_has_remote_shards(part))
+fn shard_holder_node(runtime: &ClusterRuntime, shard: &ShardInfo) -> String {
+    parse_peer_shard_locator(&shard.absolute_path)
+        .map(|locator| locator.node_id)
+        .unwrap_or_else(|| runtime.local_node_id.clone())
+}
+
+fn placement_role_matches(shard: &ShardInfo, placement: &ClusterShardPlacement) -> bool {
+    let expected_parity = matches!(placement.role, ClusterShardRole::Parity);
+    shard.is_parity == expected_parity
+}
+
+pub fn object_layout_status(
+    meta: &ObjectMetadata,
+    runtime: &ClusterRuntime,
+) -> Result<ObjectLayoutStatus, AppError> {
+    let active = runtime.membership.active_write_nodes();
+    let layout =
+        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let recorded_total_shards = meta
+        .parts
+        .first()
+        .map(|part| part.shards.len())
+        .unwrap_or_else(|| (meta.data_shards as usize).saturating_add(meta.parity_shards as usize));
+    let mut mismatch_reasons = Vec::new();
+
+    if meta.membership_epoch != runtime.membership.epoch {
+        mismatch_reasons.push(format!(
+            "membership_epoch recorded={} current={}",
+            meta.membership_epoch, runtime.membership.epoch
+        ));
+    }
+    if meta.data_shards as usize != layout.data_shards
+        || meta.parity_shards as usize != layout.parity_shards
+    {
+        mismatch_reasons.push(format!(
+            "ec_layout recorded={}+{} current={}+{}",
+            meta.data_shards, meta.parity_shards, layout.data_shards, layout.parity_shards
+        ));
+    }
+
+    let mut placement_matches_current = true;
+    if meta.parts.is_empty() {
+        if meta.total_size_bytes != 0 {
+            placement_matches_current = false;
+            mismatch_reasons.push("non-empty object has no recorded shard placement".to_string());
+        }
+    } else {
+        let plan = build_placement_plan(
+            &meta.fragment,
+            &meta.object_key,
+            &meta.version_id,
+            runtime.membership.epoch,
+            layout,
+            &active,
+        )?;
+
+        for part in &meta.parts {
+            if part.shards.len() != plan.placements.len() {
+                placement_matches_current = false;
+                mismatch_reasons.push(format!(
+                    "part {} shard_count recorded={} current={}",
+                    part.part_index,
+                    part.shards.len(),
+                    plan.placements.len()
+                ));
+            }
+            for expected in &plan.placements {
+                let Some(shard) = part
+                    .shards
+                    .iter()
+                    .find(|shard| shard.shard_index == expected.shard_index)
+                else {
+                    placement_matches_current = false;
+                    mismatch_reasons.push(format!(
+                        "part {} missing shard {} for node {}",
+                        part.part_index, expected.shard_index, expected.node_id
+                    ));
+                    continue;
+                };
+                let holder = shard_holder_node(runtime, shard);
+                if holder != expected.node_id {
+                    placement_matches_current = false;
+                    mismatch_reasons.push(format!(
+                        "part {} shard {} node recorded={} current={}",
+                        part.part_index, expected.shard_index, holder, expected.node_id
+                    ));
+                }
+                if !placement_role_matches(shard, expected) {
+                    placement_matches_current = false;
+                    let recorded_role = if shard.is_parity { "parity" } else { "data" };
+                    let current_role = match expected.role {
+                        ClusterShardRole::Data => "data",
+                        ClusterShardRole::Parity => "parity",
+                    };
+                    mismatch_reasons.push(format!(
+                        "part {} shard {} role recorded={} current={}",
+                        part.part_index, expected.shard_index, recorded_role, current_role
+                    ));
+                }
+            }
+        }
+    }
+
+    let layout_matches_current = meta.membership_epoch == runtime.membership.epoch
+        && meta.data_shards as usize == layout.data_shards
+        && meta.parity_shards as usize == layout.parity_shards;
+    let matches_current = layout_matches_current && placement_matches_current;
+    let state = if matches_current {
+        "current_layout"
+    } else if meta.membership_epoch < runtime.membership.epoch
+        || meta.data_shards as usize != layout.data_shards
+        || meta.parity_shards as usize != layout.parity_shards
+    {
+        "older_recorded_layout"
+    } else {
+        "placement_mismatch"
+    }
+    .to_string();
+
+    Ok(ObjectLayoutStatus {
+        recorded_membership_epoch: meta.membership_epoch,
+        current_membership_epoch: runtime.membership.epoch,
+        recorded_data_shards: meta.data_shards,
+        recorded_parity_shards: meta.parity_shards,
+        current_data_shards: layout.data_shards,
+        current_parity_shards: layout.parity_shards,
+        recorded_total_shards,
+        current_total_shards: layout.total_shards(),
+        active_write_nodes: active.len(),
+        layout_matches_current,
+        placement_matches_current,
+        state,
+        redistributable: !matches_current,
+        mismatch_reasons,
     })
+}
+
+pub fn metadata_matches_current_layout(meta: &ObjectMetadata, runtime: &ClusterRuntime) -> bool {
+    object_layout_status(meta, runtime)
+        .map(|status| status.layout_matches_current && status.placement_matches_current)
+        .unwrap_or(false)
 }
 
 async fn object_has_unreadable_shard(meta: &ObjectMetadata) -> bool {
@@ -388,8 +527,10 @@ async fn run_rewrite_job(
             };
             let should_rewrite = if repair_only {
                 object_has_unreadable_shard(&meta).await
-            } else {
+            } else if req.mismatched_only {
                 !metadata_matches_current_layout(&meta, &runtime)
+            } else {
+                true
             };
             if !should_rewrite {
                 update_job(status, |guard| {
@@ -441,46 +582,40 @@ pub fn start_repair(req: ClusterRebalanceRequest) -> Result<ClusterRewriteJobSta
 mod tests {
     use super::*;
     use crate::core::disk_manager::{PartMetadata, ShardInfo};
+    use crate::distribution::membership::{ClusterMembership, ClusterNode, NodeState};
+    use crate::distribution::peer::{PeerShardTarget, encode_peer_shard_locator};
 
-    #[test]
-    fn layout_match_requires_current_shape_and_remote_cluster_holders() {
-        let runtime = ClusterRuntime {
+    fn node(id: &str) -> ClusterNode {
+        ClusterNode {
+            id: id.into(),
+            endpoint: format!("http://{id}"),
+            native_endpoint: Some(format!("n2://{id}:50002")),
+            state: Some(NodeState::Online),
+            weight: 1,
+            index_roots: vec![],
+            blob_roots: vec![],
+            capacity_bytes: None,
+            used_bytes: None,
+            last_seen_unix: None,
+        }
+    }
+
+    fn runtime(epoch: u64) -> ClusterRuntime {
+        ClusterRuntime {
             local_node_id: "a".into(),
             membership_path: "membership.json".into(),
             layout_policy: crate::distribution::layout::ClusterLayoutPolicy::default(),
-            membership: crate::distribution::membership::ClusterMembership {
+            membership: ClusterMembership {
                 cluster_id: "test".into(),
-                epoch: 1,
-                nodes: vec![
-                    crate::distribution::membership::ClusterNode {
-                        id: "a".into(),
-                        endpoint: "http://a".into(),
-                        native_endpoint: None,
-                        state: Some(crate::distribution::membership::NodeState::Online),
-                        weight: 1,
-                        index_roots: vec![],
-                        blob_roots: vec![],
-                        capacity_bytes: None,
-                        used_bytes: None,
-                        last_seen_unix: None,
-                    },
-                    crate::distribution::membership::ClusterNode {
-                        id: "b".into(),
-                        endpoint: "http://b".into(),
-                        native_endpoint: None,
-                        state: Some(crate::distribution::membership::NodeState::Online),
-                        weight: 1,
-                        index_roots: vec![],
-                        blob_roots: vec![],
-                        capacity_bytes: None,
-                        used_bytes: None,
-                        last_seen_unix: None,
-                    },
-                ],
+                epoch,
+                nodes: vec![node("a"), node("b"), node("c")],
             },
             auto_rebalance: false,
-        };
-        let meta = ObjectMetadata {
+        }
+    }
+
+    fn base_meta(epoch: u64, data_shards: u16, parity_shards: u16) -> ObjectMetadata {
+        ObjectMetadata {
             object_key: "obj".into(),
             fragment: "frag".into(),
             version_id: "v".into(),
@@ -489,26 +624,115 @@ mod tests {
             content_type: "application/octet-stream".into(),
             total_size_bytes: 1,
             created_at: 0,
-            membership_epoch: 0,
-            data_shards: 1,
-            parity_shards: 1,
+            membership_epoch: epoch,
+            data_shards,
+            parity_shards,
             stripe_size_bytes: 4096,
             is_delete_marker: false,
-            parts: vec![PartMetadata {
-                part_index: 0,
-                size_bytes: 1,
-                created_at: 0,
-                checksum: None,
-                shards: vec![ShardInfo {
-                    shard_index: 0,
-                    file_name: "s".into(),
-                    absolute_path: "/local".into(),
+            parts: vec![],
+        }
+    }
+
+    fn meta_matching_runtime(runtime: &ClusterRuntime) -> ObjectMetadata {
+        let active = runtime.membership.active_write_nodes();
+        let layout = resolve_layout(active.len(), &runtime.layout_policy).unwrap();
+        let plan = build_placement_plan(
+            "frag",
+            "obj",
+            "v",
+            runtime.membership.epoch,
+            layout,
+            &active,
+        )
+        .unwrap();
+        let shards = plan
+            .placements
+            .iter()
+            .map(|placement| {
+                let is_parity = matches!(placement.role, ClusterShardRole::Parity);
+                let absolute_path = if placement.node_id == runtime.local_node_id {
+                    format!("/tmp/part_0_shard_{}", placement.shard_index)
+                } else {
+                    encode_peer_shard_locator(&PeerShardTarget {
+                        node_id: placement.node_id.clone(),
+                        endpoint: placement
+                            .native_endpoint
+                            .clone()
+                            .unwrap_or_else(|| placement.endpoint.clone()),
+                        fragment: "frag".into(),
+                        version_id: "v".into(),
+                        part_index: 0,
+                        shard_index: placement.shard_index,
+                        is_parity,
+                        expected_len: 1,
+                    })
+                };
+                ShardInfo {
+                    shard_index: placement.shard_index,
+                    file_name: format!("part_0_shard_{}", placement.shard_index),
+                    absolute_path,
                     size_bytes: 1,
                     checksum: String::new(),
-                    is_parity: false,
-                }],
+                    is_parity,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut meta = base_meta(
+            runtime.membership.epoch,
+            layout.data_shards as u16,
+            layout.parity_shards as u16,
+        );
+        meta.parts = vec![PartMetadata {
+            part_index: 0,
+            size_bytes: 1,
+            created_at: 0,
+            checksum: None,
+            shards,
+        }];
+        meta
+    }
+
+    #[test]
+    fn layout_match_accepts_exact_current_epoch_shape_and_placement() {
+        let runtime = runtime(4);
+        let meta = meta_matching_runtime(&runtime);
+        let status = object_layout_status(&meta, &runtime).unwrap();
+        assert_eq!(status.state, "current_layout");
+        assert!(status.layout_matches_current);
+        assert!(status.placement_matches_current);
+        assert!(metadata_matches_current_layout(&meta, &runtime));
+    }
+
+    #[test]
+    fn layout_match_rejects_older_recorded_epoch_even_when_shards_are_readable() {
+        let runtime = runtime(4);
+        let mut meta = meta_matching_runtime(&runtime);
+        meta.membership_epoch = 2;
+        let status = object_layout_status(&meta, &runtime).unwrap();
+        assert_eq!(status.state, "older_recorded_layout");
+        assert!(status.placement_matches_current);
+        assert!(!status.layout_matches_current);
+        assert!(!metadata_matches_current_layout(&meta, &runtime));
+    }
+
+    #[test]
+    fn layout_match_rejects_missing_remote_cluster_holders() {
+        let runtime = runtime(1);
+        let mut meta = base_meta(0, 1, 1);
+        meta.parts = vec![PartMetadata {
+            part_index: 0,
+            size_bytes: 1,
+            created_at: 0,
+            checksum: None,
+            shards: vec![ShardInfo {
+                shard_index: 0,
+                file_name: "s".into(),
+                absolute_path: "/local".into(),
+                size_bytes: 1,
+                checksum: String::new(),
+                is_parity: false,
             }],
-        };
+        }];
         assert!(!metadata_matches_current_layout(&meta, &runtime));
     }
 }

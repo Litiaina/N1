@@ -6,7 +6,7 @@ use axum::{Json, Router};
 
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created_quorum,
-    commit_namespace_summary_quorum,
+    commit_namespace_summary_quorum, sync_namespace_from_peers,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -29,6 +29,7 @@ async fn posix_list(
     let scan_trash = query.trash.unwrap_or(false);
     let path = query.path.unwrap_or_default();
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let _ = sync_namespace_from_peers(&claims.fragment).await;
     let (entries, continuation_token) = global_namespace_runtime()
         .list_dir_page(
             &claims.fragment,
@@ -73,6 +74,7 @@ async fn posix_stat(
     }
     let path = query.path.unwrap_or_default();
     let scan_trash = query.trash.unwrap_or(false);
+    let _ = sync_namespace_from_peers(&claims.fragment).await;
     let entry = if scan_trash {
         global_namespace_runtime()
             .trashed_entry(&claims.fragment, &path)
@@ -125,6 +127,7 @@ async fn posix_mkdir(
     }
     let path = req.path;
     let created = commit_namespace_created_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Mkdir,
         fragment: claims.fragment.clone(),
         source_path: Some(path.clone()),
@@ -165,6 +168,7 @@ async fn posix_rename(
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Rename,
         fragment: claims.fragment.clone(),
         source_path: Some(req.source_path.clone()),
@@ -203,6 +207,7 @@ async fn posix_trash(
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Trash,
         fragment: claims.fragment.clone(),
         source_path: Some(req.path.clone()),
@@ -241,6 +246,7 @@ async fn posix_recover(
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: claims.fragment.clone(),
         source_path: Some(req.path.clone()),
@@ -282,6 +288,7 @@ async fn posix_purge(
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Purge,
         fragment: claims.fragment.clone(),
         source_path: Some(req.path.clone()),

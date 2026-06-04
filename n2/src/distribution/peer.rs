@@ -160,6 +160,7 @@ async fn http_put_peer_shard(
         req = req.header("x-n2-cluster-secret", secret);
     }
     let response = req
+        .timeout(PEER_WRITE_TIMEOUT)
         .send()
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("peer shard upload failed: {e}")))?;
@@ -182,12 +183,20 @@ async fn native_put_peer_shard(
     mut reader: DuplexStream,
 ) -> Result<ShardInfo, AppError> {
     let addr = native_socket_addr(&target.endpoint)?;
-    let mut stream = TcpStream::connect(&addr).await.map_err(|e| {
-        AppError::ServiceUnavailable(format!(
-            "connect N2 native peer {} at {} failed: {}",
-            target.node_id, addr, e
-        ))
-    })?;
+    let mut stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "connect N2 native peer {} at {} timed out",
+                target.node_id, addr
+            ))
+        })?
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "connect N2 native peer {} at {} failed: {}",
+                target.node_id, addr, e
+            ))
+        })?;
     let _ = stream.set_nodelay(true);
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
@@ -209,20 +218,55 @@ async fn native_put_peer_shard(
         body: None,
         body_len: Some(target.expected_len),
     };
-    write_request_control(&mut stream, &request)
-        .await
-        .map_err(|e| {
-            AppError::ServiceUnavailable(format!("write N2 native peer put control failed: {e}"))
-        })?;
-    tokio::io::copy(&mut reader, &mut stream)
-        .await
-        .map_err(|e| {
-            AppError::ServiceUnavailable(format!("stream N2 native peer shard failed: {e}"))
-        })?;
-    stream.shutdown().await.map_err(|e| {
-        AppError::ServiceUnavailable(format!("shutdown N2 native peer shard stream failed: {e}"))
+    timeout(
+        PEER_WRITE_TIMEOUT,
+        write_request_control(&mut stream, &request),
+    )
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(format!(
+            "write N2 native peer put control to {} timed out",
+            target.node_id
+        ))
+    })?
+    .map_err(|e| {
+        AppError::ServiceUnavailable(format!("write N2 native peer put control failed: {e}"))
     })?;
-    let response = read_native_peer_response(&mut stream).await?;
+    timeout(
+        PEER_WRITE_TIMEOUT,
+        tokio::io::copy(&mut reader, &mut stream),
+    )
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(format!(
+            "stream N2 native peer shard to {} timed out",
+            target.node_id
+        ))
+    })?
+    .map_err(|e| {
+        AppError::ServiceUnavailable(format!("stream N2 native peer shard failed: {e}"))
+    })?;
+    timeout(PEER_WRITE_TIMEOUT, stream.shutdown())
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "shutdown N2 native peer shard stream to {} timed out",
+                target.node_id
+            ))
+        })?
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "shutdown N2 native peer shard stream failed: {e}"
+            ))
+        })?;
+    let response = timeout(PEER_READ_TIMEOUT, read_native_peer_response(&mut stream))
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "read N2 native peer put response from {} timed out",
+                target.node_id
+            ))
+        })??;
     if !response.ok {
         return Err(native_peer_response_error("put", target, &response));
     }

@@ -158,6 +158,7 @@ pub async fn mkdir_path(
     }
 
     let created = commit_namespace_created_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Mkdir,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),
@@ -226,6 +227,7 @@ pub async fn rename_path(
     }
 
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Rename,
         fragment: fragment.clone(),
         source_path: Some(source_path.clone()),
@@ -268,6 +270,7 @@ pub async fn trash_path(
     }
     let fragment = claims.fragment.clone();
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Trash,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),
@@ -310,6 +313,7 @@ pub async fn recover_path(
     }
     let fragment = claims.fragment.clone();
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),
@@ -352,6 +356,7 @@ pub async fn permanently_delete_path(
     }
     let fragment = claims.fragment.clone();
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::Purge,
         fragment: fragment.clone(),
         source_path: Some(path.clone()),

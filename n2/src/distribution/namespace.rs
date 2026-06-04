@@ -5,20 +5,23 @@ use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceMutationSummary;
 use crate::namespace::runtime::global_namespace_runtime;
-use axum::extract::Json as AxumJson;
+use axum::extract::{Json as AxumJson, Path};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 use ulid::Ulid;
 
 use crate::routes::storage_routes::AppState;
+
+const NAMESPACE_PEER_APPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +83,8 @@ pub struct NamespaceMutationRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerNamespaceApplyRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_id: Option<String>,
     pub kind: NamespaceMutationKind,
     pub fragment: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +173,27 @@ fn namespace_peer_url(endpoint: &str) -> String {
     format!("{}/n2/peer/namespace/apply", endpoint.trim_end_matches('/'))
 }
 
+fn namespace_requests_peer_url(endpoint: &str, fragment: &str) -> String {
+    format!(
+        "{}/n2/peer/namespace/requests/{}",
+        endpoint.trim_end_matches('/'),
+        percent_encoding::utf8_percent_encode(fragment, percent_encoding::NON_ALPHANUMERIC)
+    )
+}
+
+fn ensure_request_mutation_id(mut request: PeerNamespaceApplyRequest) -> PeerNamespaceApplyRequest {
+    if request
+        .mutation_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        request.mutation_id = Some(Ulid::new().to_string());
+    }
+    request
+}
+
 fn namespace_ledger_record(
     request: &PeerNamespaceApplyRequest,
 ) -> Result<NamespaceMutationRecord, AppError> {
@@ -181,11 +207,88 @@ fn namespace_ledger_record(
     record.destination_path = request.destination_path.clone();
     record.object_id = request.object_id.clone();
     record.version_id = request.version_id.clone();
+    record.mutation_id = request.mutation_id.clone().unwrap_or_default();
     Ok(record)
+}
+
+fn namespace_request_ledger_path(fragment: &str) -> Result<std::path::PathBuf, AppError> {
+    Ok(namespace_ledger_root()?.join(format!("{fragment}.requests.jsonl")))
+}
+
+fn read_request_ledger(fragment: &str) -> Result<Vec<PeerNamespaceApplyRequest>, AppError> {
+    let path = namespace_request_ledger_path(fragment)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(&path).map_err(|e| {
+        AppError::Io(
+            e,
+            format!("open N2 namespace request ledger {}", path.display()),
+        )
+    })?;
+    let mut out = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| {
+            AppError::Io(
+                e,
+                format!("read N2 namespace request ledger {}", path.display()),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(request) = serde_json::from_str::<PeerNamespaceApplyRequest>(&line) {
+            out.push(request);
+        }
+    }
+    out.sort_by(|left, right| left.mutation_id.cmp(&right.mutation_id));
+    Ok(out)
+}
+
+fn request_seen(fragment: &str, mutation_id: Option<&str>) -> Result<bool, AppError> {
+    let Some(mutation_id) = mutation_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(false);
+    };
+    Ok(read_request_ledger(fragment)?.iter().any(|request| {
+        request
+            .mutation_id
+            .as_deref()
+            .is_some_and(|value| value == mutation_id)
+    }))
 }
 
 fn append_request_ledger(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
     let _ = append_namespace_mutation(namespace_ledger_record(request)?)?;
+    let path = namespace_request_ledger_path(&request.fragment)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            AppError::Io(
+                e,
+                format!("create N2 namespace ledger {}", parent.display()),
+            )
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| {
+            AppError::Io(
+                e,
+                format!("open N2 namespace request ledger {}", path.display()),
+            )
+        })?;
+    let line = serde_json::to_vec(request).map_err(|e| {
+        AppError::InternalServerError(format!("encode N2 namespace request ledger: {e}"))
+    })?;
+    file.write_all(&line)
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|e| {
+            AppError::Io(
+                e,
+                format!("append N2 namespace request ledger {}", path.display()),
+            )
+        })?;
     Ok(())
 }
 
@@ -263,9 +366,14 @@ async fn post_namespace_to_peer(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = req.send().await.map_err(|e| {
-        AppError::ServiceUnavailable(format!("namespace peer apply failed at {endpoint}: {e}"))
-    })?;
+    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, req.send())
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!("namespace peer apply timed out at {endpoint}"))
+        })?
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!("namespace peer apply failed at {endpoint}: {e}"))
+        })?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -363,8 +471,14 @@ async fn apply_namespace_request_core(
 }
 
 async fn apply_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
+    if request_seen(&request.fragment, request.mutation_id.as_deref())? {
+        return Ok(());
+    }
     let lock = namespace_commit_lock(&request.fragment)?;
     let _guard = lock.lock().await;
+    if request_seen(&request.fragment, request.mutation_id.as_deref())? {
+        return Ok(());
+    }
     apply_namespace_request_core(request).await?;
     append_request_ledger(request)?;
     Ok(())
@@ -405,6 +519,7 @@ pub async fn commit_upload_quorum(
     metadata: &ObjectMetadata,
 ) -> Result<String, AppError> {
     let request = PeerNamespaceApplyRequest {
+        mutation_id: None,
         kind: NamespaceMutationKind::UploadCommit,
         fragment: fragment.to_string(),
         source_path: Some(logical_path.to_string()),
@@ -422,10 +537,14 @@ pub async fn commit_upload_quorum(
 pub async fn commit_namespace_quorum(
     request: PeerNamespaceApplyRequest,
 ) -> Result<NamespaceApplyOutcome, AppError> {
+    let request = ensure_request_mutation_id(request);
     validate_namespace_request(&request)?;
     apply_peers_quorum(&request).await?;
     let lock = namespace_commit_lock(&request.fragment)?;
     let _guard = lock.lock().await;
+    if request_seen(&request.fragment, request.mutation_id.as_deref())? {
+        return Ok(NamespaceApplyOutcome::None);
+    }
     let outcome = apply_namespace_request_core(&request).await?;
     append_request_ledger(&request)?;
     Ok(outcome)
@@ -454,10 +573,14 @@ pub async fn commit_namespace_summary_quorum(
 pub async fn replicate_namespace_quorum(
     request: PeerNamespaceApplyRequest,
 ) -> Result<(), AppError> {
+    let request = ensure_request_mutation_id(request);
     validate_namespace_request(&request)?;
     apply_peers_quorum(&request).await?;
     let lock = namespace_commit_lock(&request.fragment)?;
     let _guard = lock.lock().await;
+    if request_seen(&request.fragment, request.mutation_id.as_deref())? {
+        return Ok(());
+    }
     append_request_ledger(&request)?;
     Ok(())
 }
@@ -467,12 +590,92 @@ pub async fn peer_apply_namespace(
     AxumJson(request): AxumJson<PeerNamespaceApplyRequest>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     authorize_peer(&headers)?;
+    let request = ensure_request_mutation_id(request);
     apply_namespace_request(&request).await?;
     Ok((StatusCode::OK, Json(serde_json::json!({"applied": true}))))
 }
 
+pub async fn peer_namespace_requests(
+    headers: HeaderMap,
+    Path(fragment): Path<String>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(serde_json::json!({
+        "fragment": fragment,
+        "requests": read_request_ledger(&fragment)?,
+    })))
+}
+
+async fn fetch_peer_namespace_requests(
+    endpoint: &str,
+    fragment: &str,
+) -> Result<Vec<PeerNamespaceApplyRequest>, AppError> {
+    let client = peer_http_client()?;
+    let mut req = client.get(namespace_requests_peer_url(endpoint, fragment));
+    if let Some(secret) = cluster_secret() {
+        req = req.header("x-n2-cluster-secret", secret);
+    }
+    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, req.send())
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "namespace request ledger fetch timed out at {endpoint}"
+            ))
+        })?
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "namespace request ledger fetch failed at {endpoint}: {e}"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "namespace request ledger fetch returned {} from {}",
+            response.status(),
+            endpoint
+        )));
+    }
+    let payload = response.json::<serde_json::Value>().await.map_err(|e| {
+        AppError::InternalServerError(format!("decode namespace request ledger: {e}"))
+    })?;
+    serde_json::from_value(payload.get("requests").cloned().unwrap_or_default()).map_err(|e| {
+        AppError::InternalServerError(format!("decode namespace request records: {e}"))
+    })
+}
+
+pub async fn sync_namespace_from_peers(fragment: &str) -> Result<u64, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let mut applied = 0u64;
+    for node in runtime
+        .membership
+        .readable_nodes()
+        .into_iter()
+        .filter(|node| node.id != runtime.local_node_id)
+    {
+        let Ok(mut requests) = fetch_peer_namespace_requests(&node.endpoint, fragment).await else {
+            continue;
+        };
+        requests.sort_by(|left, right| left.mutation_id.cmp(&right.mutation_id));
+        for request in requests {
+            if request.fragment != fragment {
+                continue;
+            }
+            if request_seen(fragment, request.mutation_id.as_deref())? {
+                continue;
+            }
+            apply_namespace_request(&request).await?;
+            applied = applied.saturating_add(1);
+        }
+    }
+    Ok(applied)
+}
+
 pub fn build_namespace_peer_routes() -> Router<Arc<AppState>> {
-    Router::new().route("/n2/peer/namespace/apply", post(peer_apply_namespace))
+    Router::new()
+        .route("/n2/peer/namespace/apply", post(peer_apply_namespace))
+        .route(
+            "/n2/peer/namespace/requests/{fragment}",
+            get(peer_namespace_requests),
+        )
 }
 
 #[cfg(test)]
@@ -481,6 +684,7 @@ mod tests {
 
     fn request(kind: NamespaceMutationKind) -> PeerNamespaceApplyRequest {
         PeerNamespaceApplyRequest {
+            mutation_id: None,
             kind,
             fragment: "frag".into(),
             source_path: Some("dir/file.bin".into()),

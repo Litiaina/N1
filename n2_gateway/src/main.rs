@@ -14,6 +14,10 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install 'ring' as the default TLS provider.");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "n2_gateway=info,tower_http=info".into()),

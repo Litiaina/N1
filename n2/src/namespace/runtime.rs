@@ -601,6 +601,30 @@ impl NamespaceRuntime {
             for root in index_roots() {
                 let fragment_root = fragment_root_on(&root, &fragment);
                 let base = fragment_root.join(&prefix);
+                if let Some(object_id) = read_namespace_symlink_object_id(&root, &fragment, &base)?
+                {
+                    if after
+                        .as_ref()
+                        .is_some_and(|cursor| prefix.as_str() <= cursor.as_str())
+                    {
+                        continue;
+                    }
+                    if seen.insert(prefix.clone()) {
+                        let object_dir = live_object_dir(&root, &fragment, &object_id)?;
+                        if let Some(meta) = latest_summary_metadata_in_object_dir(
+                            &fragment,
+                            &object_id,
+                            &object_dir,
+                        )? {
+                            entries.push(NamespaceObjectRef {
+                                path: prefix.clone(),
+                                object_id,
+                                version_id: meta.version_id,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 let mut stack = vec![(base, prefix.clone())];
                 while let Some((dir, rel)) = stack.pop() {
                     if !dir.is_dir() {
