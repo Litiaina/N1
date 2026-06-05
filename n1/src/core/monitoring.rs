@@ -81,6 +81,13 @@ fn deep_scan_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn is_fragment_scoped_health_request(params: &HashMap<String, String>) -> bool {
+    params
+        .get("fragment")
+        .map(|fragment| !fragment.trim().is_empty())
+        .unwrap_or(false)
+}
+
 pub(crate) fn human_bytes_for_display(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -272,7 +279,8 @@ fn should_count_index_record(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_count_index_record;
+    use super::{is_fragment_scoped_health_request, should_count_index_record};
+    use std::collections::HashMap;
     use std::path::Path;
 
     #[test]
@@ -287,6 +295,21 @@ mod tests {
         assert!(!should_count_index_record(Path::new(
             "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
+    }
+
+    #[test]
+    fn fragment_scoped_health_requests_are_detected_for_cache_isolation() {
+        let mut params = HashMap::new();
+        assert!(!is_fragment_scoped_health_request(&params));
+
+        params.insert("fragment".to_string(), "   ".to_string());
+        assert!(!is_fragment_scoped_health_request(&params));
+
+        params.insert(
+            "fragment".to_string(),
+            "01KT14SFXZSVT8Y8WZFFN864GJ".to_string(),
+        );
+        assert!(is_fragment_scoped_health_request(&params));
     }
 }
 
@@ -1399,21 +1422,26 @@ pub async fn system_health_snapshot(
         .map(|v| v == "true")
         .unwrap_or(false);
     let refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
+    let fragment_scoped = is_fragment_scoped_health_request(&params);
 
     if deep_scan || refresh {
         let snapshot = collect_system_health(&state, &params).await?;
-        *HEALTH_CACHE.write().await = Some(snapshot.clone());
-        if deep_scan {
+        if !fragment_scoped {
+            *HEALTH_CACHE.write().await = Some(snapshot.clone());
+        }
+        if deep_scan && !fragment_scoped {
             *LAST_DEEP_SCAN_AT.write().await = Some(Instant::now());
         }
         return Ok(snapshot);
     }
 
-    if let Some(cached) = HEALTH_CACHE.read().await.clone() {
+    if !fragment_scoped && let Some(cached) = HEALTH_CACHE.read().await.clone() {
         return Ok(cached);
     }
 
     let snapshot = collect_system_health(&state, &params).await?;
-    *HEALTH_CACHE.write().await = Some(snapshot.clone());
+    if !fragment_scoped {
+        *HEALTH_CACHE.write().await = Some(snapshot.clone());
+    }
     Ok(snapshot)
 }
