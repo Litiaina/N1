@@ -5,6 +5,8 @@ redundant, namespace-managed, and efficient storage.
 
 This document is the user, operator, and API guide for N2. For the deeper
 storage layout and consistency model, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For production service setup, systemd templates, and validation order, see
+[INSTALLATION.md](INSTALLATION.md).
 
 ## Status
 
@@ -139,6 +141,10 @@ cargo run -p n2 --release
 
 N2 creates missing local runtime files on first run. Production should use
 explicit config and environment values.
+
+Systemd service templates live under `deploy/systemd/`. They are templates, not
+runtime config. Keep node-local `n2.env`, `n2_config.ini`, gateway config,
+certificates, membership files, and disk roots on the machine that owns them.
 
 ## Environment
 
@@ -526,6 +532,16 @@ This is the preferred user-facing deployment because clients only need one
 stable URL while N2 keeps its distributed node semantics internally. The
 gateway does not store resumability routes.
 
+Repair and rebalance through the gateway follow the same coordinator rule:
+
+```text
+start -> selected N2 node, response includes coordinator_node_id
+status/stop -> client sends coordinator_node_id
+```
+
+The gateway is route-only. It does not store repair, rebalance, upload,
+namespace, object, or cluster truth.
+
 ## Authentication
 
 Most routes require:
@@ -758,7 +774,9 @@ Body is raw object bytes.
 
 Query fields:
 
-- `checksum`: optional checksum string for client tracking.
+- `checksum`: optional CRC32 validation value. Accepts `deadbeef` or
+  `crc32:deadbeef`. Headers `x-litiaina-checksum`, `x-n2-checksum-crc32`, and
+  base64 `x-amz-checksum-crc32` are also accepted.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
 - `io_gate`: optional boolean.
@@ -837,7 +855,9 @@ Body is raw part bytes.
 
 Query fields:
 
-- `checksum`: optional checksum string.
+- `checksum`: optional CRC32 validation value. Accepts `deadbeef` or
+  `crc32:deadbeef`. Headers `x-litiaina-checksum`, `x-n2-checksum-crc32`, and
+  base64 `x-amz-checksum-crc32` are also accepted.
 - `coordinator_node_id`: required when this request goes through N2 Gateway.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
@@ -1497,6 +1517,12 @@ Response sections:
   optional availability probe counts, and representative samples.
 - `redistribution`: targeted rebalance capability and current rebalance job.
   Already-current objects are skipped by design.
+- `io_control`: peer read/write pressure, stalled peer count, active
+  maintenance jobs, usage-cache state, p50/p95/p99 IO latency samples, recent
+  slow-path events, process RSS/fd/thread snapshot, and read-on-recover
+  counters.
+- `io_control.scrub`: explicit scrub route, native operation, and recommended
+  scheduling interval. N2 does not surprise weak nodes with automatic scrub IO.
 - `jobs`: cluster repair, cluster rebalance, and local GC status.
 - `namespace_consensus`: quorum size, voter count, local ledger summary, and
   namespace-consensus notes.
@@ -1513,7 +1539,14 @@ GET /n2/cluster/usage?fragment=n2-test
 Authorization: Bearer <token>
 ```
 
-This asks every readable node for usage and aggregates the result.
+This asks every readable node for usage and aggregates the result. N2 keeps a
+short bounded local usage cache so explicit monitoring does not repeatedly walk
+the same disks. Use `refresh=true` when the operator needs a fresh scan.
+
+```http
+GET /n2/cluster/usage?fragment=n2-test&refresh=true
+Authorization: Bearer <token>
+```
 
 Response includes:
 
@@ -1523,7 +1556,8 @@ Response includes:
 - cluster total/used/available bytes
 - fragment live/trash/physical bytes
 
-Do not poll this aggressively. It can require node and disk scans.
+Do not poll this aggressively. It can require node and disk scans when the
+cache is cold or refresh is forced.
 
 ### Placement Preview
 
@@ -1651,7 +1685,13 @@ Body:
   "fragment": "n2-test",
   "prefix": "videos/",
   "limit": 1000,
-  "dry_run": false
+  "dry_run": false,
+  "max_duration_seconds": 1800,
+  "max_objects": 1000,
+  "max_directories": 10000,
+  "max_bytes": 107374182400,
+  "continuation_token": null,
+  "priority": "low"
 }
 ```
 
@@ -1661,13 +1701,31 @@ Fields:
 - `prefix`: optional object key prefix.
 - `limit`: optional maximum objects for this run.
 - `dry_run`: plan without rewrite.
+- `max_duration_seconds`: optional wall-clock budget.
+- `max_objects`: optional object budget.
+- `max_bytes`: optional rewrite byte budget.
+- `priority`: optional operator label, normally `low` for maintenance.
+
+When this request is sent through N2 Gateway, the response includes
+`coordinator_node_id`. Keep that value for repair status and stop.
+
+### Stop Cluster Repair
+
+```http
+POST /n2/cluster/repair/stop?coordinator_node_id=node-a
+Authorization: Bearer <token>
+```
+
+`coordinator_node_id` is required when this request goes through N2 Gateway.
 
 ### Cluster Repair Status
 
 ```http
-GET /n2/cluster/repair/status
+GET /n2/cluster/repair/status?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
+
+`coordinator_node_id` is required when this request goes through N2 Gateway.
 
 ### Cluster Rebalance Plan
 
@@ -1692,7 +1750,11 @@ Body:
   "prefix": "videos/",
   "limit": 1000,
   "dry_run": false,
-  "mismatched_only": true
+  "mismatched_only": true,
+  "max_duration_seconds": 1800,
+  "max_objects": 1000,
+  "max_bytes": 107374182400,
+  "priority": "low"
 }
 ```
 
@@ -1701,12 +1763,33 @@ only rewrites versions whose recorded epoch, EC shape, or deterministic node
 placement differs from the current topology. Already-current objects are
 skipped completely.
 
+`max_duration_seconds`, `max_objects`, `max_directories`, and `max_bytes` are
+optional budgets. They make long repair/rebalance runs controllable on weak
+hardware and unstable networks without making rebalance automatic.
+
+`continuation_token` resumes from a previous status token when an operator
+wants to continue a stopped or budget-exhausted rewrite job.
+
+When this request is sent through N2 Gateway, the response includes
+`coordinator_node_id`. Keep that value for rebalance status and stop.
+
+### Stop Cluster Rebalance
+
+```http
+POST /n2/cluster/rebalance/stop?coordinator_node_id=node-a
+Authorization: Bearer <token>
+```
+
+`coordinator_node_id` is required when this request goes through N2 Gateway.
+
 ### Cluster Rebalance Status
 
 ```http
-GET /n2/cluster/rebalance/status
+GET /n2/cluster/rebalance/status?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
+
+`coordinator_node_id` is required when this request goes through N2 Gateway.
 
 Job status shape:
 
@@ -1718,10 +1801,25 @@ Job status shape:
   "dry_run": false,
   "mismatched_only": true,
   "resumable": true,
+  "priority": "low",
+  "cancel_requested": false,
+  "budget_exhausted": false,
+  "budget_reason": null,
+  "budget": {
+    "elapsed_ms": 5000,
+    "objects": 100,
+    "bytes": 1073741824,
+    "directories": 0,
+    "exhausted": false,
+    "exhaustion_reason": null
+  },
   "scanned": 100,
   "rewritten": 20,
   "skipped": 80,
+  "skipped_current_layout": 80,
+  "skipped_healthy": 0,
   "failed": 0,
+  "bytes_processed": 1073741824,
   "started_at_unix": 1780000000,
   "finished_at_unix": 1780000100,
   "last_object": "videos/mhw.mp4",
@@ -1763,15 +1861,33 @@ target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   usage --fragment n2-test --secret fragment-key --target-fragment n2-test
 
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  monitor --fragment n2-test --secret fragment-key \
+  --object-limit 96 --probe-objects
+
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  usage --fragment n2-test --secret fragment-key --refresh
+
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   list --fragment n2-test --secret fragment-key --path videos --limit 200
 
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   upload --fragment n2-test --secret fragment-key \
-  --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4
+  --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4 \
+  --crc32
 
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   object redistribute --fragment n2-test --secret fragment-key \
   --object-key videos/sample.mp4 --dry-run
+
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  rebalance start --fragment n2-test --secret fragment-key \
+  --dry-run --mismatched-only --max-objects 100 --priority low
+
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  rebalance stop --fragment n2-test --secret fragment-key
+
+target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
+  gc status --fragment n2-test --secret fragment-key
 ```
 
 The shell supports raw native operation calls:
@@ -1812,11 +1928,16 @@ cluster.layout
 cluster.health
 cluster.monitor
 cluster.usage
+cluster.repair.plan
 cluster.repair.status
+cluster.repair.start
+cluster.repair.stop
 cluster.rebalance.plan
 cluster.rebalance.status
 cluster.rebalance.start
+cluster.rebalance.stop
 maintenance.gc.start
+maintenance.gc.stop
 maintenance.gc.status
 maintenance.repair.start
 maintenance.repair.status

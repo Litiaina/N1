@@ -261,6 +261,7 @@ The monitor reports eight planes without becoming cluster authority:
 - node health
 - current topology/layout
 - sampled object layout and health state
+- peer IO pressure and read-on-recover counters
 - redistribution/rebalance readiness
 - repair, rebalance, and GC jobs
 - namespace consensus ledger status
@@ -268,6 +269,23 @@ The monitor reports eight planes without becoming cluster authority:
 
 Disk usage remains explicit through `/n2/cluster/usage` because it can require
 node and disk scans. Normal UI polling should use the monitor snapshot.
+
+Maintenance jobs are explicit, budgeted, and cancellable. Repair and rebalance
+can be limited by duration, object count, directory count, and byte count;
+already-current objects are skipped during targeted rebalance. These controls
+protect weak nodes and unstable links without turning rebalance into a hidden
+background authority.
+
+N2 also has an IO control plane for operational stability:
+
+- bounded capacity/usage cache for explicit usage views
+- peer read/write backpressure
+- IO latency p50/p95/p99 samples
+- recent slow-path diagnostics
+- process RSS/thread/fd sampler
+- maintenance resume journal through persisted rewrite status
+- CRC32 upload checksum normalization
+- explicit scrub policy/status, with scheduling kept under operator control
 
 ## Protocol Surfaces
 

@@ -1,0 +1,29 @@
+[Unit]
+Description=Litiaina N2 Distributed Object Storage
+Documentation=@N2_HOME@/README.md @N2_HOME@/DOCUMENTATION.md @N2_HOME@/INSTALLATION.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@N2_USER@
+Group=@N2_GROUP@
+WorkingDirectory=@N2_RUNTIME_DIR@
+EnvironmentFile=@N2_ENV_FILE@
+Environment=RUST_LOG=@N2_LOG_FILTER@
+ExecStart=@N2_BIN@
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+TasksMax=infinity
+TimeoutStopSec=90
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@N2_RUNTIME_DIR@ @N2_DATA_PATHS@
+
+[Install]
+WantedBy=multi-user.target

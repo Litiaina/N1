@@ -4,6 +4,7 @@ use crate::distribution::download::{part_has_remote_shards, shard_probe_readable
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::rebalance::object_layout_status;
 use crate::enums::app_error_enum::AppError;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 fn attach_layout_status(
     mut report: ObjectRepairStatus,
@@ -75,9 +76,14 @@ pub async fn inspect_cluster_object_status(
             .max(1);
         let mut healthy_in_part = 0usize;
 
-        for shard in &part.shards {
+        let mut probes = FuturesUnordered::new();
+        for shard in part.shards.iter().cloned() {
+            probes.push(async move { shard_probe_readable(&shard).await });
+        }
+
+        while let Some(readable) = probes.next().await {
             report.total_shards += 1;
-            if shard_probe_readable(shard).await {
+            if readable {
                 report.healthy_shards += 1;
                 healthy_in_part += 1;
             } else {

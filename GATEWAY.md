@@ -77,6 +77,22 @@ version_id -> coordinator_node_id
 
 The gateway stores neither upload routes nor object metadata.
 
+## Maintenance Job Routing
+
+Cluster repair and rebalance jobs are also coordinator-owned. The gateway
+starts the job on one healthy N2 node and returns that node as
+`coordinator_node_id`. The client keeps that value and sends it on status and
+stop requests.
+
+```text
+POST repair/rebalance start  -> gateway selects node A and returns coordinator_node_id=node-a
+GET status                   -> client sends coordinator_node_id=node-a
+POST stop                    -> client sends coordinator_node_id=node-a
+```
+
+The gateway does not store job state. The selected coordinator owns the local
+job state, and N2 owns the distributed repair/rebalance work.
+
 ## Configuration
 
 The gateway creates `n2_gateway_config.ini` on first run if missing.
@@ -233,6 +249,12 @@ PUT  /n2/upload/multipart/{version}/{part} route to client-supplied coordinator_
 GET  /n2/upload/multipart/{version}        route to client-supplied coordinator_node_id
 POST /n2/upload/multipart/{version}/{session}/finalize
 DELETE /n2/upload/multipart/{version}
+POST /n2/cluster/repair/start              select coordinator and return coordinator_node_id
+GET  /n2/cluster/repair/status             route to client-supplied coordinator_node_id
+POST /n2/cluster/repair/stop               route to client-supplied coordinator_node_id
+POST /n2/cluster/rebalance/start           select coordinator and return coordinator_node_id
+GET  /n2/cluster/rebalance/status          route to client-supplied coordinator_node_id
+POST /n2/cluster/rebalance/stop            route to client-supplied coordinator_node_id
 GET  /n2/objects/download                  stream through native N2 from a selected node
 ```
 
@@ -252,6 +274,12 @@ GET    /n2/upload/multipart/{version_id}
 POST   /n2/upload/multipart/{version_id}/{session_id}/finalize
 DELETE /n2/upload/multipart/{version_id}
 GET    /n2/objects/download?object_key=...
+POST   /n2/cluster/repair/start
+GET    /n2/cluster/repair/status?coordinator_node_id=...
+POST   /n2/cluster/repair/stop?coordinator_node_id=...
+POST   /n2/cluster/rebalance/start
+GET    /n2/cluster/rebalance/status?coordinator_node_id=...
+POST   /n2/cluster/rebalance/stop?coordinator_node_id=...
 ```
 
 Other `/n2/...` routes are transparently proxied over HTTP to a healthy N2 node.
@@ -261,9 +289,12 @@ Other `/n2/...` routes are transparently proxied over HTTP to a healthy N2 node.
 - New stateless requests route to another healthy node.
 - Existing multipart sessions remain sticky only when the client supplies the
   coordinator node returned by multipart init.
+- Existing repair/rebalance jobs remain sticky only when the client supplies
+  the coordinator node returned by job start.
 - If the coordinator is unavailable, the gateway returns a clear unavailable
-  response instead of inventing cross-node resume.
-- If the gateway restarts, there is no gateway upload route state to reload.
+  response instead of inventing cross-node resume or cross-node job state.
+- If the gateway restarts, there is no gateway upload or job route state to
+  reload.
 
 This keeps resumability strong without pushing temporary upload state into N2
 cluster consensus.

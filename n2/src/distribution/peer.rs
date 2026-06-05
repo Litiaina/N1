@@ -7,6 +7,12 @@ use crate::core::quota_manager::{
 };
 use crate::distribution::membership::active_cluster_runtime;
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::{
+    PeerOperation, acquire_peer_operation, record_capacity_cache_failure,
+    record_capacity_cache_hit, record_capacity_cache_invalidation, record_capacity_cache_miss,
+    record_capacity_cache_refresh, record_io_latency, record_peer_progress,
+    set_capacity_cache_size, usage_cache_ttl_seconds,
+};
 use crate::protocol::frame::{read_response_body, read_response_control, write_request_control};
 use crate::protocol::types::{NativeRequest, NativeResponse};
 use axum::body::Body;
@@ -22,10 +28,12 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration as StdDuration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
@@ -42,10 +50,14 @@ static PEER_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("build N2 peer HTTP client")
 });
+static USAGE_CACHE: LazyLock<Mutex<HashMap<String, CachedPeerUsage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_PEER_MIN_TRANSFER_MIB_PER_SEC: u64 = 4;
+const MAX_PEER_TRANSFER_TIMEOUT_SECS: u64 = 3600;
 
 pub(crate) fn peer_http_client() -> Result<reqwest::Client, AppError> {
     Ok(PEER_HTTP_CLIENT.clone())
@@ -70,6 +82,21 @@ fn native_socket_addr(endpoint: &str) -> Result<String, AppError> {
     Ok(addr.to_string())
 }
 
+fn peer_transfer_timeout(bytes: u64) -> Duration {
+    let min_mib_per_sec = std::env::var("N2_PEER_MIN_TRANSFER_MIB_PER_SEC")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PEER_MIN_TRANSFER_MIB_PER_SEC)
+        .clamp(1, 1024);
+    let min_bytes_per_sec = min_mib_per_sec.saturating_mul(1024 * 1024).max(1);
+    let transfer_secs = bytes.div_ceil(min_bytes_per_sec);
+    Duration::from_secs(
+        20u64
+            .saturating_add(transfer_secs)
+            .clamp(20, MAX_PEER_TRANSFER_TIMEOUT_SECS),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerShardTarget {
     pub node_id: String,
@@ -86,6 +113,8 @@ pub struct PeerShardTarget {
 pub struct PeerUsageQuery {
     #[serde(default)]
     pub fragment: Option<String>,
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +149,12 @@ pub struct PeerMonitorResponse {
     pub usage: Option<PeerUsageResponse>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedPeerUsage {
+    inserted: Instant,
+    response: PeerUsageResponse,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PeerShardQuery {
     #[serde(default)]
@@ -139,21 +174,41 @@ pub struct RemoteShardWriter {
 }
 
 impl RemoteShardWriter {
-    pub fn spawn(target: PeerShardTarget) -> Self {
+    pub fn spawn(target: PeerShardTarget) -> Result<Self, AppError> {
+        let permit = acquire_peer_operation(&target.node_id, PeerOperation::Write)?;
         let (writer, reader) = tokio::io::duplex(1024 * 1024);
         let upload_target = target.clone();
         let handle = tokio::spawn(async move {
-            if endpoint_is_native(&upload_target.endpoint) {
+            let started = Instant::now();
+            let label = if endpoint_is_native(&upload_target.endpoint) {
+                "peer.write.native"
+            } else {
+                "peer.write.http"
+            };
+            let result = if endpoint_is_native(&upload_target.endpoint) {
                 native_put_peer_shard(&upload_target, reader).await
             } else {
                 http_put_peer_shard(&upload_target, reader).await
+            };
+            record_io_latency(
+                label,
+                started.elapsed(),
+                upload_target.expected_len,
+                result.is_ok(),
+            );
+            match result {
+                Ok(info) => {
+                    permit.complete();
+                    Ok(info)
+                }
+                Err(err) => Err(err),
             }
         });
-        Self {
+        Ok(Self {
             target,
             writer: Some(writer),
             handle,
-        }
+        })
     }
 
     pub async fn finish(mut self) -> Result<ShardInfo, AppError> {
@@ -183,7 +238,7 @@ async fn http_put_peer_shard(
         req = req.header("x-n2-cluster-secret", secret);
     }
     let response = req
-        .timeout(PEER_WRITE_TIMEOUT)
+        .timeout(peer_transfer_timeout(target.expected_len))
         .send()
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("peer shard upload failed: {e}")))?;
@@ -256,7 +311,7 @@ async fn native_put_peer_shard(
         AppError::ServiceUnavailable(format!("write N2 native peer put control failed: {e}"))
     })?;
     timeout(
-        PEER_WRITE_TIMEOUT,
+        peer_transfer_timeout(target.expected_len),
         tokio::io::copy(&mut reader, &mut stream),
     )
     .await
@@ -311,7 +366,13 @@ impl AsyncWrite for RemoteShardWriter {
             .writer
             .as_mut()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer closed"))?;
-        Pin::new(writer).poll_write(cx, buf)
+        match Pin::new(writer).poll_write(cx, buf) {
+            Poll::Ready(Ok(bytes)) => {
+                record_peer_progress(&self.target.node_id, PeerOperation::Write, bytes as u64);
+                Poll::Ready(Ok(bytes))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(
@@ -362,6 +423,51 @@ pub(crate) fn authorize_peer(headers: &HeaderMap) -> Result<(), AppError> {
 pub async fn local_peer_usage_snapshot(
     fragment: Option<String>,
 ) -> Result<PeerUsageResponse, AppError> {
+    local_peer_usage_snapshot_refresh(fragment, false).await
+}
+
+pub async fn local_peer_usage_snapshot_refresh(
+    fragment: Option<String>,
+    refresh: bool,
+) -> Result<PeerUsageResponse, AppError> {
+    let key = usage_cache_key(&fragment);
+    let ttl = StdDuration::from_secs(usage_cache_ttl_seconds());
+    if !refresh && let Ok(cache) = USAGE_CACHE.lock() {
+        publish_usage_cache_size(&cache);
+        if let Some(cached) = cache.get(&key)
+            && cached.inserted.elapsed() < ttl
+        {
+            record_capacity_cache_hit();
+            return Ok(cached.response.clone());
+        }
+    }
+    record_capacity_cache_miss();
+    let started = Instant::now();
+    let result = collect_local_peer_usage(fragment.clone()).await;
+    record_io_latency("capacity.local_usage", started.elapsed(), 0, result.is_ok());
+    match result {
+        Ok(response) => {
+            if let Ok(mut cache) = USAGE_CACHE.lock() {
+                cache.insert(
+                    key,
+                    CachedPeerUsage {
+                        inserted: Instant::now(),
+                        response: response.clone(),
+                    },
+                );
+                publish_usage_cache_size(&cache);
+            }
+            record_capacity_cache_refresh();
+            Ok(response)
+        }
+        Err(err) => {
+            record_capacity_cache_failure();
+            Err(err)
+        }
+    }
+}
+
+async fn collect_local_peer_usage(fragment: Option<String>) -> Result<PeerUsageResponse, AppError> {
     let runtime = active_cluster_runtime()?;
     let capacity = get_storage_usage().await?;
     let roots = get_storage_root_usage().await?;
@@ -376,6 +482,27 @@ pub async fn local_peer_usage_snapshot(
         fragment,
         fragment_usage,
     })
+}
+
+fn usage_cache_key(fragment: &Option<String>) -> String {
+    fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("__cluster__")
+        .to_string()
+}
+
+fn publish_usage_cache_size(cache: &HashMap<String, CachedPeerUsage>) {
+    set_capacity_cache_size(cache.len(), 0);
+}
+
+pub fn invalidate_local_usage_cache(_fragment: Option<&str>) {
+    if let Ok(mut cache) = USAGE_CACHE.lock() {
+        cache.clear();
+        publish_usage_cache_size(&cache);
+    }
+    record_capacity_cache_invalidation();
 }
 
 pub async fn local_peer_monitor_snapshot(
@@ -411,7 +538,7 @@ pub async fn local_peer_monitor_snapshot(
         AppError::InternalServerError(format!("encode N2 peer monitor snapshot: {err}"))
     })?;
     let usage = if include_usage {
-        Some(local_peer_usage_snapshot(fragment).await?)
+        Some(local_peer_usage_snapshot_refresh(fragment, refresh).await?)
     } else {
         None
     };
@@ -513,9 +640,35 @@ pub async fn fetch_peer_shard_chunk(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, AppError> {
-    if endpoint_is_native(&locator.endpoint) {
-        return native_get_peer_shard(locator, offset, length).await;
+    let permit = acquire_peer_operation(&locator.node_id, PeerOperation::Read)?;
+    let started = Instant::now();
+    let label = if endpoint_is_native(&locator.endpoint) {
+        "peer.read.native"
+    } else {
+        "peer.read.http"
+    };
+    let result = if endpoint_is_native(&locator.endpoint) {
+        native_get_peer_shard(locator, offset, length).await
+    } else {
+        http_get_peer_shard(locator, offset, length).await
+    };
+    let bytes_len = result.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0);
+    record_io_latency(label, started.elapsed(), bytes_len, result.is_ok());
+    match result {
+        Ok(bytes) => {
+            permit.record_progress(bytes.len() as u64);
+            permit.complete();
+            Ok(bytes)
+        }
+        Err(err) => Err(err),
     }
+}
+
+async fn http_get_peer_shard(
+    locator: &PeerShardLocator,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, AppError> {
     let client = peer_http_client()?;
     let mut req = client.get(peer_shard_read_url(locator, offset, length));
     if let Some(secret) = cluster_secret() {
@@ -703,6 +856,7 @@ pub async fn peer_put_shard(
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
     authorize_peer(&headers)?;
+    let started = Instant::now();
     let is_parity = query.parity.unwrap_or(false);
     let expected_len = query.expected_len.unwrap_or(0);
     let dir = shard_dir(&fragment, &version_id, part_index, shard_index)?;
@@ -770,6 +924,8 @@ pub async fn peer_put_shard(
         checksum: format!("{:08x}", hasher.finalize()),
         is_parity,
     };
+    invalidate_local_usage_cache(Some(&fragment));
+    record_io_latency("peer.local_shard_put", started.elapsed(), written, true);
     Ok((StatusCode::CREATED, Json(info)))
 }
 
@@ -823,7 +979,9 @@ pub async fn peer_usage(
     Query(query): Query<PeerUsageQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     authorize_peer(&headers)?;
-    Ok(Json(local_peer_usage_snapshot(query.fragment).await?))
+    Ok(Json(
+        local_peer_usage_snapshot_refresh(query.fragment, query.refresh).await?,
+    ))
 }
 
 pub async fn peer_monitor(
@@ -951,6 +1109,7 @@ where
             ),
         )
     })?;
+    invalidate_local_usage_cache(Some(&payload.fragment));
     Ok(ShardInfo {
         shard_index: payload.shard_index,
         file_name,
@@ -1061,5 +1220,13 @@ mod tests {
             native_socket_addr("n2://node-a.local:50002").unwrap(),
             "node-a.local:50002"
         );
+    }
+
+    #[test]
+    fn peer_transfer_timeout_scales_for_large_shards() {
+        let small = peer_transfer_timeout(1024);
+        let large = peer_transfer_timeout(1024 * 1024 * 1024);
+        assert!(large > small);
+        assert!(small >= PEER_WRITE_TIMEOUT);
     }
 }

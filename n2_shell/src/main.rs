@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use crc32fast::Hasher;
 use n2_native_client::{N2NativeClient, NativeClientError, NativeClientResult};
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -66,6 +67,8 @@ enum Command {
     },
     #[command(about = "Show local and storage-system health.")]
     Health,
+    #[command(about = "Show detailed cluster monitor snapshot.")]
+    Monitor(MonitorArgs),
     #[command(about = "Show cluster membership.")]
     Membership,
     #[command(about = "Show resolved cluster layout.")]
@@ -74,6 +77,13 @@ enum Command {
     Usage {
         #[arg(long)]
         target_fragment: Option<String>,
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+    },
+    #[command(about = "Fragment administration.")]
+    Fragment {
+        #[command(subcommand)]
+        command: FragmentCommand,
     },
     #[command(about = "List a namespace directory.")]
     List(ListArgs),
@@ -105,6 +115,8 @@ enum Command {
         #[command(subcommand)]
         command: UploadsCommand,
     },
+    #[command(about = "Local maintenance GC/scrub controls.")]
+    Gc(JobArgs),
     #[command(about = "Cluster repair controls.")]
     Repair(JobArgs),
     #[command(about = "Cluster rebalance controls.")]
@@ -117,6 +129,22 @@ struct AuthArgs {
     fragment: String,
     #[arg(long)]
     secret: String,
+}
+
+#[derive(Args)]
+struct MonitorArgs {
+    #[arg(long)]
+    target_fragment: Option<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long, default_value_t = 64)]
+    object_limit: usize,
+    #[arg(long, default_value_t = false)]
+    probe_objects: bool,
+    #[arg(long, default_value_t = false)]
+    refresh: bool,
+    #[arg(long, default_value_t = false)]
+    deep_scan: bool,
 }
 
 #[derive(Args)]
@@ -183,6 +211,29 @@ enum ObjectCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum FragmentCommand {
+    List,
+    Check {
+        #[arg(long)]
+        fragment: String,
+    },
+    Hash {
+        #[arg(long)]
+        fragment: String,
+    },
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        master_key: String,
+        #[arg(long)]
+        stable_fragment_id: Option<String>,
+    },
+}
+
 #[derive(Args)]
 struct UploadArgs {
     #[arg(long)]
@@ -193,6 +244,12 @@ struct UploadArgs {
     content_type: Option<String>,
     #[arg(long, default_value_t = DEFAULT_PART_SIZE)]
     part_size: u64,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Calculate and send CRC32 for each uploaded body/part."
+    )]
+    crc32: bool,
 }
 
 #[derive(Args)]
@@ -243,8 +300,21 @@ enum JobAction {
         dry_run: bool,
         #[arg(long, default_value_t = true)]
         mismatched_only: bool,
+        #[arg(long)]
+        max_duration_seconds: Option<u64>,
+        #[arg(long)]
+        max_objects: Option<u64>,
+        #[arg(long)]
+        max_directories: Option<u64>,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        continuation_token: Option<String>,
+        #[arg(long, default_value = "low")]
+        priority: String,
     },
     Status,
+    Stop,
 }
 
 #[tokio::main]
@@ -298,17 +368,30 @@ async fn run_authenticated_command(
 ) -> NativeClientResult<()> {
     match command {
         Command::Health => print_op(client, "maintenance.health", json!({}), cli.json).await,
-        Command::Membership => print_op(client, "cluster.membership", json!({}), cli.json).await,
-        Command::Layout => print_op(client, "cluster.layout", json!({}), cli.json).await,
-        Command::Usage { target_fragment } => {
+        Command::Monitor(args) => {
             print_op(
                 client,
-                "cluster.usage",
-                json!({ "fragment": target_fragment }),
+                "cluster.monitor",
+                monitor_payload(args, &cli.fragment),
                 cli.json,
             )
             .await
         }
+        Command::Membership => print_op(client, "cluster.membership", json!({}), cli.json).await,
+        Command::Layout => print_op(client, "cluster.layout", json!({}), cli.json).await,
+        Command::Usage {
+            target_fragment,
+            refresh,
+        } => {
+            print_op(
+                client,
+                "cluster.usage",
+                json!({ "fragment": target_fragment, "refresh": refresh }),
+                cli.json,
+            )
+            .await
+        }
+        Command::Fragment { command } => run_fragment_command(client, command, cli.json).await,
         Command::List(args) => {
             print_op(
                 client,
@@ -375,6 +458,7 @@ async fn run_authenticated_command(
         Command::Upload(args) => upload_file(client, args, cli.json).await,
         Command::Download(args) => download_file(client, args).await,
         Command::Uploads { command } => run_uploads_command(client, command, cli.json).await,
+        Command::Gc(args) => run_gc_command(client, args, cli.json).await,
         Command::Repair(args) => {
             run_job_command(client, "cluster.repair", args, &cli.fragment, cli.json).await
         }
@@ -386,6 +470,64 @@ async fn run_authenticated_command(
         | Command::Auth(_)
         | Command::Session
         | Command::Raw { .. } => Ok(()),
+    }
+}
+
+fn monitor_payload(args: MonitorArgs, auth_fragment: &Option<String>) -> Value {
+    json!({
+        "fragment": args.target_fragment.or_else(|| auth_fragment.clone()),
+        "prefix": args.prefix,
+        "object_limit": args.object_limit,
+        "probe_objects": args.probe_objects,
+        "refresh": args.refresh,
+        "deep_scan": args.deep_scan,
+    })
+}
+
+async fn run_fragment_command(
+    client: &mut N2NativeClient,
+    command: FragmentCommand,
+    json_output: bool,
+) -> NativeClientResult<()> {
+    match command {
+        FragmentCommand::List => print_op(client, "fragment.list", json!({}), json_output).await,
+        FragmentCommand::Check { fragment } => {
+            print_op(
+                client,
+                "fragment.check",
+                json!({ "fragment": fragment }),
+                json_output,
+            )
+            .await
+        }
+        FragmentCommand::Hash { fragment } => {
+            print_op(
+                client,
+                "fragment.hash",
+                json!({ "fragment": fragment }),
+                json_output,
+            )
+            .await
+        }
+        FragmentCommand::Create {
+            name,
+            key,
+            master_key,
+            stable_fragment_id,
+        } => {
+            print_op(
+                client,
+                "fragment.create",
+                json!({
+                    "name": name,
+                    "key": key,
+                    "secret": master_key,
+                    "stable_fragment_id": stable_fragment_id,
+                }),
+                json_output,
+            )
+            .await
+        }
     }
 }
 
@@ -497,6 +639,40 @@ async fn run_uploads_command(
     }
 }
 
+async fn run_gc_command(
+    client: &mut N2NativeClient,
+    args: JobArgs,
+    json_output: bool,
+) -> NativeClientResult<()> {
+    match args.action {
+        JobAction::Plan | JobAction::Status => {
+            print_op(client, "maintenance.gc.status", json!({}), json_output).await
+        }
+        JobAction::Stop => print_op(client, "maintenance.gc.stop", json!({}), json_output).await,
+        JobAction::Start {
+            target_fragment: _,
+            prefix: _,
+            limit: _,
+            dry_run: _,
+            mismatched_only: _,
+            max_duration_seconds: _,
+            max_objects: _,
+            max_directories: _,
+            max_bytes: _,
+            continuation_token: _,
+            priority: _,
+        } => {
+            print_op(
+                client,
+                "maintenance.gc.start",
+                json!({ "mode": "scrub", "fast_mode": false }),
+                json_output,
+            )
+            .await
+        }
+    }
+}
+
 async fn run_job_command(
     client: &mut N2NativeClient,
     prefix: &str,
@@ -511,12 +687,21 @@ async fn run_job_command(
         JobAction::Status => {
             print_op(client, &format!("{prefix}.status"), json!({}), json_output).await
         }
+        JobAction::Stop => {
+            print_op(client, &format!("{prefix}.stop"), json!({}), json_output).await
+        }
         JobAction::Start {
             target_fragment,
             prefix: object_prefix,
             limit,
             dry_run,
             mismatched_only,
+            max_duration_seconds,
+            max_objects,
+            max_directories,
+            max_bytes,
+            continuation_token,
+            priority,
         } => {
             let fragment = target_fragment
                 .or_else(|| auth_fragment.clone())
@@ -534,6 +719,12 @@ async fn run_job_command(
                     "limit": limit,
                     "dry_run": dry_run,
                     "mismatched_only": mismatched_only,
+                    "max_duration_seconds": max_duration_seconds,
+                    "max_objects": max_objects,
+                    "max_directories": max_directories,
+                    "max_bytes": max_bytes,
+                    "continuation_token": continuation_token,
+                    "priority": priority,
                 }),
                 json_output,
             )
@@ -554,12 +745,19 @@ async fn upload_file(
         .unwrap_or_else(|| content_type_from_path(&args.file));
 
     if size <= ONE_SHOT_LIMIT {
+        let checksum = if args.crc32 {
+            Some(crc32_range(&mut file, 0, size).await?)
+        } else {
+            None
+        };
+        file.seek(std::io::SeekFrom::Start(0)).await?;
         let response = client
             .operation_reader(
                 "upload.one_shot",
                 &json!({
                     "object_key": args.object_key,
                     "content_type": content_type,
+                    "checksum": checksum,
                 }),
                 &mut file,
                 size,
@@ -589,6 +787,11 @@ async fn upload_file(
     for part_index in 0..expected_parts {
         let start = part_index.saturating_mul(part_size);
         let part_len = part_size.min(size.saturating_sub(start));
+        let checksum = if args.crc32 {
+            Some(crc32_range(&mut file, start, part_len).await?)
+        } else {
+            None
+        };
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let mut part_reader = (&mut file).take(part_len);
         client
@@ -597,6 +800,7 @@ async fn upload_file(
                 &json!({
                     "version_id": version_id,
                     "part_index": part_index,
+                    "checksum": checksum,
                 }),
                 &mut part_reader,
                 part_len,
@@ -626,6 +830,25 @@ async fn upload_file(
         )
         .await?;
     print_response(finalized, json_output)
+}
+
+async fn crc32_range(file: &mut File, offset: u64, len: u64) -> NativeClientResult<String> {
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut remaining = len;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut hasher = Hasher::new();
+    while remaining > 0 {
+        let take = buffer.len().min(remaining as usize);
+        let read = file.read(&mut buffer[..take]).await?;
+        if read == 0 {
+            return Err(NativeClientError::protocol(format!(
+                "file ended while calculating CRC32: expected {len} bytes from offset {offset}"
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(format!("{:08x}", hasher.finalize()))
 }
 
 async fn download_file(client: &mut N2NativeClient, args: DownloadArgs) -> NativeClientResult<()> {
@@ -707,6 +930,53 @@ async fn run_shell_line(
         ["membership"] => print_op(client, "cluster.membership", json!({}), cli.json).await,
         ["layout"] => print_op(client, "cluster.layout", json!({}), cli.json).await,
         ["usage"] => print_op(client, "cluster.usage", json!({}), cli.json).await,
+        ["usage", "refresh"] | ["usage", "--refresh"] => {
+            print_op(client, "cluster.usage", json!({"refresh": true}), cli.json).await
+        }
+        ["monitor"] => {
+            print_op(
+                client,
+                "cluster.monitor",
+                json!({"fragment": cli.fragment.clone(), "object_limit": 64}),
+                cli.json,
+            )
+            .await
+        }
+        ["monitor", "deep"] => {
+            print_op(
+                client,
+                "cluster.monitor",
+                json!({"fragment": cli.fragment.clone(), "object_limit": 64, "deep_scan": true}),
+                cli.json,
+            )
+            .await
+        }
+        ["monitor", "probe"] => print_op(
+            client,
+            "cluster.monitor",
+            json!({"fragment": cli.fragment.clone(), "object_limit": 64, "probe_objects": true}),
+            cli.json,
+        )
+        .await,
+        ["fragments"] => print_op(client, "fragment.list", json!({}), cli.json).await,
+        ["fragment", "check", fragment] => {
+            print_op(
+                client,
+                "fragment.check",
+                json!({"fragment": fragment}),
+                cli.json,
+            )
+            .await
+        }
+        ["fragment", "hash", fragment] => {
+            print_op(
+                client,
+                "fragment.hash",
+                json!({"fragment": fragment}),
+                cli.json,
+            )
+            .await
+        }
         ["list"] => {
             print_op(
                 client,
@@ -826,6 +1096,7 @@ async fn run_shell_line(
             print_op(client, "cluster.repair.status", json!({}), cli.json).await
         }
         ["repair", "plan"] => print_op(client, "cluster.repair.plan", json!({}), cli.json).await,
+        ["repair", "stop"] => print_op(client, "cluster.repair.stop", json!({}), cli.json).await,
         ["repair", "start"] => {
             let fragment = cli.fragment.clone().ok_or_else(|| {
                 NativeClientError::protocol("repair start requires global --fragment")
@@ -844,6 +1115,9 @@ async fn run_shell_line(
         ["rebalance", "plan"] => {
             print_op(client, "cluster.rebalance.plan", json!({}), cli.json).await
         }
+        ["rebalance", "stop"] => {
+            print_op(client, "cluster.rebalance.stop", json!({}), cli.json).await
+        }
         ["rebalance", "start"] => {
             let fragment = cli.fragment.clone().ok_or_else(|| {
                 NativeClientError::protocol("rebalance start requires global --fragment")
@@ -856,6 +1130,19 @@ async fn run_shell_line(
             )
             .await
         }
+        ["gc"] | ["gc", "status"] => {
+            print_op(client, "maintenance.gc.status", json!({}), cli.json).await
+        }
+        ["gc", "scrub"] | ["gc", "start"] => {
+            print_op(
+                client,
+                "maintenance.gc.start",
+                json!({"mode": "scrub", "fast_mode": false}),
+                cli.json,
+            )
+            .await
+        }
+        ["gc", "stop"] => print_op(client, "maintenance.gc.stop", json!({}), cli.json).await,
         _ => {
             println!("unknown command. Type 'help'.");
             Ok(())
@@ -865,7 +1152,7 @@ async fn run_shell_line(
 
 fn print_shell_help() {
     println!(
-        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  usage\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start\n  rebalance status|plan|start\n  exit"
+        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  monitor [deep|probe]\n  usage [refresh]\n  fragments\n  fragment check <fragment>\n  fragment hash <fragment>\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start|stop\n  rebalance status|plan|start|stop\n  gc status|scrub|stop\n  exit"
     );
 }
 

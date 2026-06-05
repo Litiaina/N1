@@ -1,6 +1,9 @@
 use crate::core::disk_manager::{PartMetadata, ShardInfo};
 use crate::distribution::peer::{fetch_peer_shard_chunk, parse_peer_shard_locator};
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::record_read_recover;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use simd_erasure_core::ReedSolomonDecoder;
 use std::io::SeekFrom;
 use tokio::fs::File;
@@ -83,7 +86,9 @@ pub async fn read_cluster_data_chunk(
         AppError::InternalServerError("cluster data shard index out of bounds".into())
     })?;
 
-    if let Ok(bytes) = read_shard_chunk(target, offset, len).await {
+    if !shard_is_remote(target)
+        && let Ok(bytes) = read_shard_chunk(target, offset, len).await
+    {
         return Ok(bytes);
     }
 
@@ -99,14 +104,28 @@ pub async fn read_cluster_data_chunk(
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, recovery_len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     let mut added = 0usize;
+    let mut reads = FuturesUnordered::new();
 
     for shard in &part.shards {
-        if shard.shard_index == target.shard_index {
-            continue;
-        }
-        let Ok(chunk) = read_shard_chunk(shard, offset, recovery_len).await else {
+        let shard = shard.clone();
+        let read_len = if shard.shard_index == target.shard_index {
+            len
+        } else {
+            recovery_len
+        };
+        reads.push(async move {
+            let result = read_shard_chunk(&shard, offset, read_len).await;
+            (shard, result)
+        });
+    }
+
+    while let Some((shard, result)) = reads.next().await {
+        let Ok(chunk) = result else {
             continue;
         };
+        if shard.shard_index == target.shard_index {
+            return Ok(chunk);
+        }
         let added_result = if shard.is_parity {
             decoder.add_recovery_shard(shard.shard_index.saturating_sub(data_count), chunk)
         } else {
@@ -127,6 +146,7 @@ pub async fn read_cluster_data_chunk(
         )));
     }
 
+    let missing_observed = part.shards.len().saturating_sub(added).max(1);
     let restored = decoder
         .decode()
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
@@ -137,6 +157,7 @@ pub async fn read_cluster_data_chunk(
         .to_vec();
     let mut restored = restored;
     restored.truncate(len);
+    record_read_recover(restored.len() as u64, missing_observed as u64);
     Ok(restored)
 }
 

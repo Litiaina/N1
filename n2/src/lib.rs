@@ -3,6 +3,7 @@ pub mod distribution;
 pub mod enums;
 pub mod fs;
 pub mod handlers;
+pub mod io_control;
 pub mod middleware;
 pub mod namespace;
 pub mod posix;

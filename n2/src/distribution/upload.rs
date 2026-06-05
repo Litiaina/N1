@@ -7,10 +7,13 @@ use crate::core::ec::ErasureStreamWriter;
 use crate::core::index::{self, IndexReplicaWriteMode};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
 use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
-use crate::distribution::peer::{PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator};
+use crate::distribution::peer::{
+    PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
+};
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
 use crate::distribution::resolve_layout;
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::record_io_latency;
 use crate::structs::auth_structs::Claims;
 use bytes::Bytes;
 use chrono::Utc;
@@ -20,6 +23,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use ulid::Ulid;
@@ -111,6 +115,7 @@ impl LocalShardWriter {
                     ),
                 )
             })?;
+        invalidate_local_usage_cache(Some(&self.locator.fragment));
         Ok(ShardInfo {
             shard_index: self.shard_index,
             file_name: self.file_name,
@@ -294,9 +299,8 @@ async fn open_writers_for_plan(
         if placement.node_id == runtime.local_node_id {
             writers.push(Some(open_local_writer(target).await?));
         } else {
-            writers.push(Some(ClusterShardWriter::Remote(RemoteShardWriter::spawn(
-                target,
-            ))));
+            let remote = RemoteShardWriter::spawn(target)?;
+            writers.push(Some(ClusterShardWriter::Remote(remote)));
         }
     }
     Ok(writers)
@@ -501,6 +505,7 @@ where
             "Part size does not match upload session manifest".into(),
         ));
     }
+    let started = Instant::now();
     let part = write_cluster_part_from_stream(
         &fragment,
         &state.manifest.object_key,
@@ -513,7 +518,14 @@ where
         body_stream,
         query.checksum.as_deref(),
     )
-    .await?;
+    .await;
+    record_io_latency(
+        "cluster.upload.part",
+        started.elapsed(),
+        content_length,
+        part.is_ok(),
+    );
+    let part = part?;
     index::commit_session_part(
         &fragment,
         &version_id,
@@ -551,6 +563,7 @@ where
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(content_length);
+    let started = Instant::now();
     let part = write_cluster_part_from_stream(
         &fragment,
         &object_key,
@@ -563,7 +576,14 @@ where
         body_stream,
         query.checksum.as_deref(),
     )
-    .await?;
+    .await;
+    record_io_latency(
+        "cluster.upload.one_shot",
+        started.elapsed(),
+        content_length,
+        part.is_ok(),
+    );
+    let part = part?;
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
         fragment: fragment.clone(),

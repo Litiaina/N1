@@ -1,0 +1,28 @@
+[Unit]
+Description=Litiaina N2 Gateway
+Documentation=@N2_HOME@/GATEWAY.md @N2_HOME@/INSTALLATION.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@N2_USER@
+Group=@N2_GROUP@
+WorkingDirectory=@N2_GATEWAY_RUNTIME_DIR@
+Environment=RUST_LOG=@N2_GATEWAY_LOG_FILTER@
+ExecStart=@N2_GATEWAY_BIN@
+Restart=always
+RestartSec=3
+LimitNOFILE=262144
+TasksMax=infinity
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@N2_GATEWAY_RUNTIME_DIR@
+
+[Install]
+WantedBy=multi-user.target

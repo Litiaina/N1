@@ -4,12 +4,12 @@ use crate::distribution::membership::{
 };
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::peer::{
-    PeerUsageResponse, cluster_secret, local_peer_usage_snapshot, peer_http_client,
+    PeerUsageResponse, cluster_secret, local_peer_usage_snapshot_refresh, peer_http_client,
 };
 use crate::distribution::placement::build_placement_plan;
 use crate::distribution::rebalance::{
     ClusterRebalanceRequest, plan_rebalance, rebalance_status, repair_status, start_rebalance,
-    start_repair,
+    start_repair, stop_rebalance, stop_repair,
 };
 use crate::distribution::repair::repair_policy;
 use crate::distribution::resolve_layout;
@@ -38,6 +38,8 @@ pub struct PlacementPreviewQuery {
 pub struct ClusterUsageQuery {
     #[serde(default)]
     pub fragment: Option<String>,
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -120,13 +122,14 @@ async fn usage_for_node(
     local_node_id: String,
     node: ClusterNode,
     fragment: Option<String>,
+    refresh: bool,
 ) -> ClusterNodeUsage {
     let state = format!("{:?}", node.effective_state()).to_ascii_lowercase();
     let endpoint = node.endpoint.clone();
     let result = if node.id == local_node_id {
-        local_peer_usage_snapshot(fragment).await
+        local_peer_usage_snapshot_refresh(fragment, refresh).await
     } else {
-        fetch_remote_usage(&node.endpoint, fragment).await
+        fetch_remote_usage(&node.endpoint, fragment, refresh).await
     };
     match result {
         Ok(usage) => ClusterNodeUsage {
@@ -151,11 +154,19 @@ async fn usage_for_node(
 async fn fetch_remote_usage(
     endpoint: &str,
     fragment: Option<String>,
+    refresh: bool,
 ) -> Result<PeerUsageResponse, AppError> {
     let mut url = format!("{}/n2/peer/usage", endpoint.trim_end_matches('/'));
+    let mut separator = "?";
     if let Some(fragment) = fragment.as_deref().filter(|value| !value.trim().is_empty()) {
-        url.push_str("?fragment=");
+        url.push_str(separator);
+        url.push_str("fragment=");
         url.push_str(&utf8_percent_encode(fragment, NON_ALPHANUMERIC).to_string());
+        separator = "&";
+    }
+    if refresh {
+        url.push_str(separator);
+        url.push_str("refresh=true");
     }
     let client = peer_http_client()?;
     let mut req = client.get(url);
@@ -184,12 +195,15 @@ pub async fn cluster_usage(
     claims: Claims,
     Query(query): Query<ClusterUsageQuery>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    Ok(Json(cluster_usage_snapshot(claims, query.fragment).await?))
+    Ok(Json(
+        cluster_usage_snapshot(claims, query.fragment, query.refresh).await?,
+    ))
 }
 
 pub async fn cluster_usage_snapshot(
     claims: Claims,
     fragment: Option<String>,
+    refresh: bool,
 ) -> Result<ClusterUsageResponse, AppError> {
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
@@ -202,6 +216,7 @@ pub async fn cluster_usage_snapshot(
             runtime.local_node_id.clone(),
             node,
             fragment.clone(),
+            refresh,
         ));
     }
     let nodes = futures_util::future::join_all(nodes).await;
@@ -290,6 +305,13 @@ pub async fn rebalance_status_route(
     Ok(Json(rebalance_status()))
 }
 
+pub async fn rebalance_stop(claims: Claims) -> Result<impl axum::response::IntoResponse, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden("Modify permission required".into()));
+    }
+    Ok(Json(stop_rebalance()))
+}
+
 pub async fn repair_plan(claims: Claims) -> Result<impl axum::response::IntoResponse, AppError> {
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
@@ -317,6 +339,13 @@ pub async fn repair_status_route(
     Ok(Json(repair_status()))
 }
 
+pub async fn repair_stop(claims: Claims) -> Result<impl axum::response::IntoResponse, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden("Modify permission required".into()));
+    }
+    Ok(Json(stop_repair()))
+}
+
 pub async fn reload_membership(
     claims: Claims,
     Query(_params): Query<HashMap<String, String>>,
@@ -340,8 +369,10 @@ pub fn build_cluster_routes() -> Router<Arc<AppState>> {
         .route("/n2/cluster/placement/preview", get(placement_preview))
         .route("/n2/cluster/rebalance/plan", get(rebalance_plan))
         .route("/n2/cluster/rebalance/start", post(rebalance_start))
+        .route("/n2/cluster/rebalance/stop", post(rebalance_stop))
         .route("/n2/cluster/rebalance/status", get(rebalance_status_route))
         .route("/n2/cluster/repair/plan", get(repair_plan))
         .route("/n2/cluster/repair/start", post(repair_start))
+        .route("/n2/cluster/repair/stop", post(repair_stop))
         .route("/n2/cluster/repair/status", get(repair_status_route))
 }

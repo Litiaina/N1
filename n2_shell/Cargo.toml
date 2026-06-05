@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+crc32fast.workspace = true
 n2_native_client = { path = "../n2_native_client" }
 rmp-serde.workspace = true
 serde.workspace = true

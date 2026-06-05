@@ -17,6 +17,10 @@ use crate::distribution::upload::{
     finalize_cluster_upload, initiate_cluster_upload, put_cluster_part,
 };
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::{
+    IoJobKind, IoPriority, MaintenanceBudget, MaintenanceBudgetConfig, MaintenanceBudgetSnapshot,
+    register_io_job, request_io_job_cancel,
+};
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::structs::auth_structs::Claims;
 use bytes::Bytes;
@@ -25,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const REWRITE_CHUNK_BYTES: usize = 1024 * 1024;
 const REWRITE_PART_BYTES: u64 = 64 * 1024 * 1024;
@@ -44,6 +50,18 @@ pub struct ClusterRebalanceRequest {
     pub dry_run: bool,
     #[serde(default = "default_true")]
     pub mismatched_only: bool,
+    #[serde(default)]
+    pub max_duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_objects: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_directories: Option<u64>,
+    #[serde(default)]
+    pub continuation_token: Option<String>,
+    #[serde(default)]
+    pub priority: Option<IoPriority>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -57,6 +75,7 @@ pub struct ClusterRebalancePlan {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClusterRewriteJobStatus {
     pub running: bool,
     pub job: String,
@@ -64,10 +83,18 @@ pub struct ClusterRewriteJobStatus {
     pub dry_run: bool,
     pub mismatched_only: bool,
     pub resumable: bool,
+    pub priority: String,
+    pub cancel_requested: bool,
+    pub budget_exhausted: bool,
+    pub budget_reason: Option<String>,
+    pub budget: Option<MaintenanceBudgetSnapshot>,
     pub scanned: u64,
     pub rewritten: u64,
     pub skipped: u64,
+    pub skipped_current_layout: u64,
+    pub skipped_healthy: u64,
     pub failed: u64,
+    pub bytes_processed: u64,
     pub started_at_unix: Option<i64>,
     pub finished_at_unix: Option<i64>,
     pub last_object: Option<String>,
@@ -145,6 +172,23 @@ fn status_snapshot(
     }
 }
 
+fn priority_label(priority: IoPriority) -> String {
+    format!("{priority:?}").to_ascii_lowercase()
+}
+
+fn request_priority(req: &ClusterRebalanceRequest) -> IoPriority {
+    req.priority.unwrap_or(IoPriority::Low)
+}
+
+fn budget_for_request(req: &ClusterRebalanceRequest) -> MaintenanceBudget {
+    MaintenanceBudget::new(MaintenanceBudgetConfig {
+        max_duration: req.max_duration_seconds.map(Duration::from_secs),
+        max_objects: req.max_objects.or(req.limit.map(|limit| limit as u64)),
+        max_bytes: req.max_bytes,
+        max_directories: req.max_directories,
+    })
+}
+
 pub fn rebalance_status() -> ClusterRewriteJobStatus {
     status_snapshot(&REBALANCE_STATUS, "cluster_rebalance")
 }
@@ -171,6 +215,9 @@ fn begin_job(
         dry_run: req.dry_run,
         mismatched_only: req.mismatched_only,
         resumable: true,
+        priority: priority_label(request_priority(req)),
+        budget: Some(budget_for_request(req).snapshot()),
+        continuation_token: req.continuation_token.clone(),
         started_at_unix: Some(chrono::Utc::now().timestamp()),
         ..ClusterRewriteJobStatus::default()
     };
@@ -198,6 +245,41 @@ fn finish_job(status: &LazyLock<Mutex<ClusterRewriteJobStatus>>) {
         guard.running = false;
         guard.finished_at_unix = Some(chrono::Utc::now().timestamp());
     });
+}
+
+fn mark_cancel_requested(status: &'static LazyLock<Mutex<ClusterRewriteJobStatus>>) {
+    update_job(status, |guard| {
+        guard.cancel_requested = true;
+        guard.last_error = Some("job cancellation requested".to_string());
+    });
+}
+
+fn mark_budget(
+    status: &'static LazyLock<Mutex<ClusterRewriteJobStatus>>,
+    budget: &MaintenanceBudget,
+) {
+    let snapshot = budget.snapshot();
+    update_job(status, |guard| {
+        guard.budget = Some(snapshot.clone());
+        guard.budget_exhausted = snapshot.exhausted;
+        guard.budget_reason = snapshot.exhaustion_reason.clone();
+    });
+}
+
+fn should_stop_job(
+    status: &'static LazyLock<Mutex<ClusterRewriteJobStatus>>,
+    cancel: &CancellationToken,
+    budget: &MaintenanceBudget,
+) -> bool {
+    if cancel.is_cancelled() {
+        mark_cancel_requested(status);
+        return true;
+    }
+    if budget.exhausted() {
+        mark_budget(status, budget);
+        return true;
+    }
+    false
 }
 
 fn shard_holder_node(runtime: &ClusterRuntime, shard: &ShardInfo) -> String {
@@ -465,6 +547,32 @@ async fn run_rewrite_job(
     req: ClusterRebalanceRequest,
     repair_only: bool,
 ) {
+    let job_name = if repair_only {
+        "cluster_repair"
+    } else {
+        "cluster_rebalance"
+    };
+    let job_kind = if repair_only {
+        IoJobKind::ClusterRepair
+    } else {
+        IoJobKind::ClusterRebalance
+    };
+    let priority = request_priority(&req);
+    let job_guard = match register_io_job(job_name, job_kind, priority) {
+        Ok(guard) => guard,
+        Err(err) => {
+            update_job(status, |guard| {
+                guard.failed = guard.failed.saturating_add(1);
+                guard.last_error = Some(err.to_string());
+            });
+            finish_job(status);
+            return;
+        }
+    };
+    let cancel = job_guard.token();
+    let mut budget = budget_for_request(&req);
+    mark_budget(status, &budget);
+
     let runtime = match active_cluster_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -476,9 +584,12 @@ async fn run_rewrite_job(
             return;
         }
     };
-    let mut continuation = None;
+    let mut continuation = req.continuation_token.clone();
     let mut remaining = req.limit.unwrap_or(usize::MAX).max(1);
     while remaining > 0 {
+        if should_stop_job(status, &cancel, &budget) {
+            break;
+        }
         let page = match global_namespace_runtime()
             .list_live_object_refs_page(
                 &req.fragment,
@@ -504,10 +615,15 @@ async fn run_rewrite_job(
             if remaining == 0 {
                 break;
             }
+            if should_stop_job(status, &cancel, &budget) {
+                break;
+            }
             remaining = remaining.saturating_sub(1);
+            budget.record_object();
             update_job(status, |guard| {
                 guard.scanned = guard.scanned.saturating_add(1);
                 guard.last_object = Some(entry.path.clone());
+                guard.budget = Some(budget.snapshot());
             });
             let meta = match index::read_object_version(
                 &req.fragment,
@@ -534,16 +650,29 @@ async fn run_rewrite_job(
             };
             if !should_rewrite {
                 update_job(status, |guard| {
-                    guard.skipped = guard.skipped.saturating_add(1)
+                    guard.skipped = guard.skipped.saturating_add(1);
+                    if repair_only {
+                        guard.skipped_healthy = guard.skipped_healthy.saturating_add(1);
+                    } else if req.mismatched_only {
+                        guard.skipped_current_layout =
+                            guard.skipped_current_layout.saturating_add(1);
+                    }
                 });
                 continue;
             }
+            let rewrite_bytes = meta.total_size_bytes;
+            budget.record_bytes(rewrite_bytes);
+            mark_budget(status, &budget);
             match rewrite_object_to_current_layout(entry.path, entry.object_id, meta, req.dry_run)
                 .await
             {
                 Ok(true) => {
                     update_job(status, |guard| {
-                        guard.rewritten = guard.rewritten.saturating_add(1)
+                        guard.rewritten = guard.rewritten.saturating_add(1);
+                        if !req.dry_run {
+                            guard.bytes_processed =
+                                guard.bytes_processed.saturating_add(rewrite_bytes);
+                        }
                     });
                 }
                 Ok(false) => update_job(status, |guard| {
@@ -558,6 +687,7 @@ async fn run_rewrite_job(
         continuation = page.continuation_token;
         update_job(status, |guard| {
             guard.continuation_token = continuation.clone();
+            guard.budget = Some(budget.snapshot());
         });
         if continuation.is_none() {
             break;
@@ -576,6 +706,20 @@ pub fn start_repair(req: ClusterRebalanceRequest) -> Result<ClusterRewriteJobSta
     begin_job(&REPAIR_STATUS, "cluster_repair", &req)?;
     tokio::spawn(run_rewrite_job(&REPAIR_STATUS, req, true));
     Ok(repair_status())
+}
+
+pub fn stop_rebalance() -> ClusterRewriteJobStatus {
+    if request_io_job_cancel("cluster_rebalance") {
+        mark_cancel_requested(&REBALANCE_STATUS);
+    }
+    rebalance_status()
+}
+
+pub fn stop_repair() -> ClusterRewriteJobStatus {
+    if request_io_job_cancel("cluster_repair") {
+        mark_cancel_requested(&REPAIR_STATUS);
+    }
+    repair_status()
 }
 
 #[cfg(test)]

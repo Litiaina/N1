@@ -63,6 +63,7 @@ use crate::distribution::upload::{
 };
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::MAX_FILE_SIZE;
+use crate::io_control::upload_crc32_checksum;
 use crate::middleware::auth_middleware::{
     authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
@@ -1186,13 +1187,14 @@ async fn upload_object_one_shot_scoped(
     claims: Claims,
     headers: axum::http::HeaderMap,
     Path(object_key): Path<String>,
-    Query(query): Query<crate::core::disk_manager::UploadPartQuery>,
+    Query(mut query): Query<crate::core::disk_manager::UploadPartQuery>,
     body: axum::body::Body,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let content_length = request_content_length(&headers)?;
     let content_type = request_content_type(&headers);
+    query.checksum = upload_crc32_checksum(&headers, query.checksum.as_deref())?;
     let body_stream = body.into_data_stream().map(|chunk_result| {
         chunk_result.map_err(|e| {
             AppError::Io(
@@ -1257,11 +1259,12 @@ async fn object_upload_part_scoped(
     claims: Claims,
     headers: axum::http::HeaderMap,
     Path((version_id, part_index)): Path<(String, u64)>,
-    Query(query): Query<crate::core::disk_manager::UploadPartQuery>,
+    Query(mut query): Query<crate::core::disk_manager::UploadPartQuery>,
     body: axum::body::Body,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     let content_length = request_content_length(&headers)?;
+    query.checksum = upload_crc32_checksum(&headers, query.checksum.as_deref())?;
     let body_stream = body.into_data_stream().map(|chunk_result| {
         chunk_result.map_err(|e| {
             AppError::Io(

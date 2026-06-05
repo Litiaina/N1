@@ -27,7 +27,7 @@ N2-native operators, peers, tools, and future internal systems.
 
 - `litiaina-n2`: the N2 distributed object storage server.
 - `litiaina-n2-shell`: native N2 operator shell.
-- `litiaina-n2-gateway`: smart N2 front door for user-facing traffic.
+- `litiaina-n2-gateway`: route-only N2 front door for user-facing traffic.
 - `n2_native_client`: reusable Rust client for `n2://`.
 - `simd-erasure-core`: SIMD erasure implementation used by N2.
 
@@ -35,6 +35,8 @@ N2-native operators, peers, tools, and future internal systems.
 
 - [DOCUMENTATION.md](DOCUMENTATION.md): setup, operations, API usage, request
   bodies, query fields, examples, and troubleshooting.
+- [INSTALLATION.md](INSTALLATION.md): production setup, systemd templates,
+  gateway deployment, and validation checklist.
 - [ARCHITECTURE.md](ARCHITECTURE.md): storage layout, object identity,
   cluster placement, namespace coordination, repair, and rebalance design.
 - [GATEWAY.md](GATEWAY.md): gateway deployment, route-only behavior, and
@@ -97,6 +99,9 @@ n2_native_client/
   src/                  reusable Rust client for n2://
 n2_gateway/
   src/                  user-facing route-only N2 gateway
+deploy/systemd/
+  litiaina-n2*.service.in
+deploy/install.sh       production installer for node/gateway systemd setup
 simd-erasure-core/
   src/                  erasure coding implementation
 scripts/bench/
@@ -123,6 +128,14 @@ Build the gateway:
 
 ```bash
 cargo build -p n2_gateway --release
+```
+
+Install a production node or gateway:
+
+```bash
+sudo ./deploy/install.sh --node --build --copy-certs --enable --start
+sudo ./deploy/install.sh --gateway --build --copy-certs --enable --start \
+  --gateway-node node-a,https://192.168.0.22:50001,n2://192.168.0.22:50002
 ```
 
 Run the server locally:

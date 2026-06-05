@@ -16,6 +16,7 @@ use crate::distribution::rebalance::{
 };
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::{IoControlSnapshot, io_control_snapshot};
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -53,6 +54,7 @@ pub struct ClusterMonitorSnapshot {
     pub nodes: Vec<ClusterMonitorNode>,
     pub topology: ClusterMonitorTopology,
     pub object_health: ClusterObjectHealthSummary,
+    pub io_control: IoControlSnapshot,
     pub redistribution: ClusterRedistributionSummary,
     pub jobs: ClusterJobsSummary,
     pub namespace_consensus: ClusterNamespaceConsensusSummary,
@@ -99,6 +101,8 @@ pub struct ClusterMonitorNode {
     pub system: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploads: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_control: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,6 +309,7 @@ pub async fn cluster_monitor_snapshot(
             manual_redistribution_only: !runtime.auto_rebalance,
         },
         object_health: object_health.clone(),
+        io_control: io_control_snapshot(),
         redistribution: ClusterRedistributionSummary {
             plan,
             targeted_rebalance_available: true,
@@ -406,6 +411,9 @@ fn monitor_node_from_peer(
             .map(str::to_string),
         system: health_value.and_then(|value| value.get("system")).cloned(),
         uploads: health_value.and_then(|value| value.get("uploads")).cloned(),
+        io_control: health_value
+            .and_then(|value| value.get("io_control"))
+            .cloned(),
         storage: health_value.and_then(|value| value.get("storage")).cloned(),
         maintenance: health_value
             .and_then(|value| value.get("maintenance"))

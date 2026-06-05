@@ -52,7 +52,8 @@ use crate::distribution::namespace::{
 };
 use crate::distribution::rebalance::{
     ClusterRebalanceRequest, metadata_matches_current_layout, plan_rebalance, rebalance_status,
-    repair_status, rewrite_object_to_current_layout, start_rebalance, start_repair,
+    repair_status, rewrite_object_to_current_layout, start_rebalance, start_repair, stop_rebalance,
+    stop_repair,
 };
 use crate::distribution::repair::repair_policy;
 use crate::distribution::resolve_layout;
@@ -991,7 +992,14 @@ async fn execute_native_op_inner(
         }
         "cluster.usage" => {
             let claims = claims_required(claims)?;
-            native_body(cluster_usage_snapshot(claims, string_field(&payload, "fragment")).await?)
+            native_body(
+                cluster_usage_snapshot(
+                    claims,
+                    string_field(&payload, "fragment"),
+                    bool_field(&payload, "refresh").unwrap_or(false),
+                )
+                .await?,
+            )
         }
         "cluster.repair.status" => {
             let claims = claims_required(claims)?;
@@ -1010,6 +1018,11 @@ async fn execute_native_op_inner(
             let request: ClusterRebalanceRequest = typed_payload(&payload)?;
             native_body(start_repair(request)?)
         }
+        "cluster.repair.stop" => {
+            let claims = claims_required(claims)?;
+            require_write_modify(&claims)?;
+            native_body(stop_repair())
+        }
         "cluster.rebalance.status" => {
             let claims = claims_required(claims)?;
             require_read(&claims)?;
@@ -1026,6 +1039,11 @@ async fn execute_native_op_inner(
             require_write_modify(&claims)?;
             let request: ClusterRebalanceRequest = typed_payload(&payload)?;
             native_body(start_rebalance(request)?)
+        }
+        "cluster.rebalance.stop" => {
+            let claims = claims_required(claims)?;
+            require_write_modify(&claims)?;
+            native_body(stop_rebalance())
         }
         "maintenance.gc.status" => native_body(get_gc_status().await),
         "maintenance.repair.status" => native_body(get_repair_status().await),

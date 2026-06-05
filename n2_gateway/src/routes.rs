@@ -28,6 +28,15 @@ pub fn router(state: GatewayState) -> Router {
         .route("/gateway/nodes", get(gateway_nodes))
         .route("/n2/auth/fragment", post(auth_fragment))
         .route("/n2/fragments", post(create_fragment))
+        .route("/n2/cluster/rebalance/start", post(cluster_rebalance_start))
+        .route(
+            "/n2/cluster/rebalance/status",
+            get(cluster_rebalance_status),
+        )
+        .route("/n2/cluster/rebalance/stop", post(cluster_rebalance_stop))
+        .route("/n2/cluster/repair/start", post(cluster_repair_start))
+        .route("/n2/cluster/repair/status", get(cluster_repair_status))
+        .route("/n2/cluster/repair/stop", post(cluster_repair_stop))
         .route(
             "/n2/upload/multipart/init/{*object_key}",
             post(multipart_init),
@@ -278,6 +287,112 @@ async fn multipart_init(
     json_response(status, body)
 }
 
+async fn cluster_rebalance_start(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    cluster_job_start(state, headers, "cluster.rebalance.start", payload).await
+}
+
+async fn cluster_repair_start(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    cluster_job_start(state, headers, "cluster.repair.start", payload).await
+}
+
+async fn cluster_rebalance_status(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    cluster_job_followup(state, headers, query, "cluster.rebalance.status").await
+}
+
+async fn cluster_repair_status(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    cluster_job_followup(state, headers, query, "cluster.repair.status").await
+}
+
+async fn cluster_rebalance_stop(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    cluster_job_followup(state, headers, query, "cluster.rebalance.stop").await
+}
+
+async fn cluster_repair_stop(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    cluster_job_followup(state, headers, query, "cluster.repair.stop").await
+}
+
+async fn cluster_job_start(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    op: &str,
+    payload: Value,
+) -> Response<Body> {
+    let bearer = match bearer_from_headers(&headers) {
+        Ok(value) => value,
+        Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
+    };
+    let node = match best_node(&state).await {
+        Ok(node) => node,
+        Err(response) => return response,
+    };
+    let (status, mut body) = match native_json(&node, &bearer, op, payload).await {
+        Ok(value) => value,
+        Err(err) => return upstream_failed(&state, &node, err).await,
+    };
+    if status < 300 {
+        body["coordinator_node_id"] = Value::String(node.id.clone());
+        body["gateway"] = json!({
+            "coordinator_node_id": node.id,
+            "route_only": true,
+            "job_state_owner": "coordinator_node",
+        });
+    }
+    json_response(status, body)
+}
+
+async fn cluster_job_followup(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    query: HashMap<String, String>,
+    op: &str,
+) -> Response<Body> {
+    let bearer = match bearer_from_headers(&headers) {
+        Ok(value) => value,
+        Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
+    };
+    let node = match coordinator_node(&state, &headers, &query).await {
+        Ok(node) => node,
+        Err(response) => return response,
+    };
+    let (status, mut body) = match native_json(&node, &bearer, op, json!({})).await {
+        Ok(value) => value,
+        Err(err) => return upstream_failed(&state, &node, err).await,
+    };
+    if status < 300 {
+        body["coordinator_node_id"] = Value::String(node.id.clone());
+        body["gateway"] = json!({
+            "coordinator_node_id": node.id,
+            "route_only": true,
+            "job_state_owner": "coordinator_node",
+        });
+    }
+    json_response(status, body)
+}
+
 async fn multipart_put_part(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -494,20 +609,20 @@ async fn coordinator_node(
     let coordinator_node_id = coordinator_node_id(headers, query).ok_or_else(|| {
         text_response(
             StatusCode::BAD_REQUEST,
-            "coordinator_node_id is required for multipart gateway routing",
+            "coordinator_node_id is required for coordinator-owned gateway routing",
         )
     })?;
     state.nodes.mark_route(&coordinator_node_id).await;
     if !state.nodes.is_available(&coordinator_node_id).await {
         return Err(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "multipart coordinator node is unavailable",
+            "coordinator node is unavailable",
         ));
     }
     state.nodes.get(&coordinator_node_id).await.ok_or_else(|| {
         text_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "multipart coordinator node is not configured",
+            "coordinator node is not configured",
         )
     })
 }
@@ -903,5 +1018,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn cluster_jobs_are_client_sticky_through_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/n2/cluster/rebalance/start")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"fragment":"frag","mismatched_only":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["coordinator_node_id"], "node-a");
+        assert_eq!(body["gateway"]["route_only"], true);
+        assert_eq!(body["gateway"]["job_state_owner"], "coordinator_node");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/n2/cluster/rebalance/status?coordinator_node_id=node-a")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/n2/cluster/rebalance/status")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let ops_a = node_a.operations.lock().await.clone();
+        let ops_b = node_b.operations.lock().await.clone();
+        assert!(ops_a.contains(&"cluster.rebalance.start".to_string()));
+        assert!(ops_a.contains(&"cluster.rebalance.status".to_string()));
+        assert!(!ops_b.contains(&"cluster.rebalance.status".to_string()));
     }
 }
