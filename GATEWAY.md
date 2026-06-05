@@ -77,6 +77,10 @@ version_id -> coordinator_node_id
 
 The gateway stores neither upload routes nor object metadata.
 
+Do not add a gateway upload/session database. Multipart resume state belongs
+to the client and selected N2 coordinator. The gateway may route by the
+client-supplied `coordinator_node_id`; it must not become cluster truth.
+
 ## Maintenance Job Routing
 
 Cluster repair and rebalance jobs are also coordinator-owned. The gateway

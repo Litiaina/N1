@@ -1,12 +1,18 @@
 use clap::{Args, Parser, Subcommand};
 use crc32fast::Hasher;
 use n2_native_client::{N2NativeClient, NativeClientError, NativeClientResult};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::time::{Duration, sleep};
 
+const DEFAULT_NATIVE_URL: &str = "n2://127.0.0.1:50002";
 const ONE_SHOT_LIMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_PART_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -21,10 +27,17 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        default_value = "n2://127.0.0.1:50002",
+        default_value = DEFAULT_NATIVE_URL,
         help = "Native N2 endpoint, for example n2://127.0.0.1:50002."
     )]
     native_url: String,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Load native URL, fragment, and optional secret from a saved shell profile."
+    )]
+    profile: Option<String>,
 
     #[arg(
         short,
@@ -55,6 +68,11 @@ enum Command {
     Ping,
     #[command(about = "Open a persistent operator shell.")]
     Shell,
+    #[command(about = "Manage saved shell profiles.")]
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     #[command(about = "Authenticate and print the native session.")]
     Auth(AuthArgs),
     #[command(about = "Print the current native session.")]
@@ -69,6 +87,8 @@ enum Command {
     Health,
     #[command(about = "Show detailed cluster monitor snapshot.")]
     Monitor(MonitorArgs),
+    #[command(about = "Show a compact operator dashboard.")]
+    Dashboard(DashboardArgs),
     #[command(about = "Show cluster membership.")]
     Membership,
     #[command(about = "Show resolved cluster layout.")]
@@ -123,12 +143,48 @@ enum Command {
     Rebalance(JobArgs),
 }
 
+#[derive(Subcommand)]
+enum ProfileCommand {
+    #[command(about = "List saved shell profiles.")]
+    List,
+    #[command(about = "Show the profile store path.")]
+    Path,
+    #[command(about = "Save the current --native-url/--fragment profile.")]
+    Save {
+        #[arg(long)]
+        name: String,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Store --secret in the local profile file. Off by default."
+        )]
+        store_secret: bool,
+    },
+    #[command(about = "Remove a saved shell profile.")]
+    Remove {
+        #[arg(long)]
+        name: String,
+    },
+}
+
 #[derive(Args)]
 struct AuthArgs {
     #[arg(long)]
     fragment: String,
     #[arg(long)]
     secret: String,
+}
+
+#[derive(Args)]
+struct DashboardArgs {
+    #[arg(long)]
+    target_fragment: Option<String>,
+    #[arg(long, default_value_t = 64)]
+    object_limit: usize,
+    #[arg(long, default_value_t = false)]
+    probe_objects: bool,
+    #[arg(long, default_value_t = false)]
+    refresh: bool,
 }
 
 #[derive(Args)]
@@ -314,7 +370,20 @@ enum JobAction {
         priority: String,
     },
     Status,
+    Watch {
+        #[arg(long, default_value_t = 5)]
+        interval_seconds: u64,
+    },
     Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShellProfile {
+    native_url: String,
+    #[serde(default)]
+    fragment: Option<String>,
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 #[tokio::main]
@@ -327,6 +396,10 @@ async fn main() {
 
 async fn run() -> NativeClientResult<()> {
     let mut cli = Cli::parse();
+    if let Some(command) = take_profile_command(&mut cli) {
+        return run_profile_command(command, &cli);
+    }
+    apply_profile(&mut cli)?;
     let command = cli.command.take().unwrap_or(Command::Shell);
     let mut client = N2NativeClient::connect(&cli.native_url)
         .await?
@@ -338,6 +411,7 @@ async fn run() -> NativeClientResult<()> {
             authenticate_from_cli(&mut client, &cli).await?;
             interactive_shell(&mut client, &cli).await
         }
+        Command::Profile { .. } => Ok(()),
         Command::Auth(auth) => {
             client.auth_fragment(&auth.fragment, &auth.secret).await?;
             print_value(
@@ -361,6 +435,16 @@ async fn run() -> NativeClientResult<()> {
     }
 }
 
+fn take_profile_command(cli: &mut Cli) -> Option<ProfileCommand> {
+    if matches!(cli.command, Some(Command::Profile { .. })) {
+        let Some(Command::Profile { command }) = cli.command.take() else {
+            unreachable!("profile command was already matched");
+        };
+        return Some(command);
+    }
+    None
+}
+
 async fn run_authenticated_command(
     client: &mut N2NativeClient,
     cli: &Cli,
@@ -377,6 +461,7 @@ async fn run_authenticated_command(
             )
             .await
         }
+        Command::Dashboard(args) => print_dashboard(client, args, &cli).await,
         Command::Membership => print_op(client, "cluster.membership", json!({}), cli.json).await,
         Command::Layout => print_op(client, "cluster.layout", json!({}), cli.json).await,
         Command::Usage {
@@ -467,10 +552,166 @@ async fn run_authenticated_command(
         }
         Command::Ping
         | Command::Shell
+        | Command::Profile { .. }
         | Command::Auth(_)
         | Command::Session
         | Command::Raw { .. } => Ok(()),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_precheck_does_not_discard_normal_commands() {
+        let mut cli = Cli::try_parse_from([
+            "litiaina-n2-shell",
+            "--native-url",
+            "n2://127.0.0.1:50002",
+            "--fragment",
+            "frag",
+            "--secret",
+            "secret",
+            "upload",
+            "--object-key",
+            "bench/test.bin",
+            "--file",
+            "/tmp/test.bin",
+        ])
+        .expect("upload command parses");
+
+        assert!(take_profile_command(&mut cli).is_none());
+        assert!(matches!(cli.command, Some(Command::Upload(_))));
+    }
+
+    #[test]
+    fn profile_precheck_takes_profile_commands_only() {
+        let mut cli = Cli::try_parse_from(["litiaina-n2-shell", "profile", "path"])
+            .expect("profile command parses");
+
+        assert!(matches!(
+            take_profile_command(&mut cli),
+            Some(ProfileCommand::Path)
+        ));
+        assert!(cli.command.is_none());
+    }
+}
+
+fn dashboard_payload(args: DashboardArgs, auth_fragment: &Option<String>) -> Value {
+    json!({
+        "fragment": args.target_fragment.or_else(|| auth_fragment.clone()),
+        "object_limit": args.object_limit,
+        "probe_objects": args.probe_objects,
+        "refresh": args.refresh,
+    })
+}
+
+fn run_profile_command(command: ProfileCommand, cli: &Cli) -> NativeClientResult<()> {
+    match command {
+        ProfileCommand::Path => {
+            println!("{}", profile_store_path()?.display());
+            Ok(())
+        }
+        ProfileCommand::List => {
+            let profiles = load_profiles()?;
+            if profiles.is_empty() {
+                println!("No N2 shell profiles saved.");
+                return Ok(());
+            }
+            for (name, profile) in profiles {
+                let fragment = profile.fragment.unwrap_or_else(|| "-".to_string());
+                let secret = if profile.secret.is_some() {
+                    "stored"
+                } else {
+                    "not stored"
+                };
+                println!(
+                    "{name}\n  native_url: {}\n  fragment:   {fragment}\n  secret:     {secret}",
+                    profile.native_url
+                );
+            }
+            Ok(())
+        }
+        ProfileCommand::Save { name, store_secret } => {
+            let mut profiles = load_profiles()?;
+            let profile = ShellProfile {
+                native_url: cli.native_url.clone(),
+                fragment: cli.fragment.clone(),
+                secret: if store_secret {
+                    cli.secret.clone()
+                } else {
+                    None
+                },
+            };
+            profiles.insert(name.clone(), profile);
+            save_profiles(&profiles)?;
+            println!("saved N2 shell profile '{name}'");
+            Ok(())
+        }
+        ProfileCommand::Remove { name } => {
+            let mut profiles = load_profiles()?;
+            if profiles.remove(&name).is_some() {
+                save_profiles(&profiles)?;
+                println!("removed N2 shell profile '{name}'");
+            } else {
+                println!("profile '{name}' was not found");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn apply_profile(cli: &mut Cli) -> NativeClientResult<()> {
+    let Some(name) = cli.profile.clone() else {
+        return Ok(());
+    };
+    let profiles = load_profiles()?;
+    let profile = profiles.get(&name).ok_or_else(|| {
+        NativeClientError::protocol(format!("N2 shell profile '{name}' not found"))
+    })?;
+    if cli.native_url == DEFAULT_NATIVE_URL {
+        cli.native_url = profile.native_url.clone();
+    }
+    if cli.fragment.is_none() {
+        cli.fragment = profile.fragment.clone();
+    }
+    if cli.secret.is_none() {
+        cli.secret = profile.secret.clone();
+    }
+    Ok(())
+}
+
+fn load_profiles() -> NativeClientResult<BTreeMap<String, ShellProfile>> {
+    let path = profile_store_path()?;
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let bytes = fs::read(&path)?;
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn save_profiles(profiles: &BTreeMap<String, ShellProfile>) -> NativeClientResult<()> {
+    let path = profile_store_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(profiles)?;
+    fs::write(path, body)?;
+    Ok(())
+}
+
+fn profile_store_path() -> NativeClientResult<PathBuf> {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(config_home).join("litiaina/n2/shell-profiles.json"));
+    }
+    let home = env::var("HOME").map_err(|_| {
+        NativeClientError::protocol("HOME is not set; cannot resolve N2 shell profile path")
+    })?;
+    Ok(PathBuf::from(home).join(".config/litiaina/n2/shell-profiles.json"))
 }
 
 fn monitor_payload(args: MonitorArgs, auth_fragment: &Option<String>) -> Value {
@@ -648,6 +889,15 @@ async fn run_gc_command(
         JobAction::Plan | JobAction::Status => {
             print_op(client, "maintenance.gc.status", json!({}), json_output).await
         }
+        JobAction::Watch { interval_seconds } => {
+            watch_job(
+                client,
+                "maintenance.gc",
+                interval_seconds.max(1),
+                json_output,
+            )
+            .await
+        }
         JobAction::Stop => print_op(client, "maintenance.gc.stop", json!({}), json_output).await,
         JobAction::Start {
             target_fragment: _,
@@ -686,6 +936,9 @@ async fn run_job_command(
         }
         JobAction::Status => {
             print_op(client, &format!("{prefix}.status"), json!({}), json_output).await
+        }
+        JobAction::Watch { interval_seconds } => {
+            watch_job(client, prefix, interval_seconds.max(1), json_output).await
         }
         JobAction::Stop => {
             print_op(client, &format!("{prefix}.stop"), json!({}), json_output).await
@@ -731,6 +984,33 @@ async fn run_job_command(
             .await
         }
     }
+}
+
+async fn watch_job(
+    client: &mut N2NativeClient,
+    prefix: &str,
+    interval_seconds: u64,
+    json_output: bool,
+) -> NativeClientResult<()> {
+    loop {
+        let value = client
+            .operation_json(&format!("{prefix}.status"), &json!({}), None)
+            .await?;
+        if json_output {
+            println!("{}", serde_json::to_string(&value)?);
+        } else {
+            print_job_status_line(prefix, &value);
+        }
+        if !value
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        sleep(Duration::from_secs(interval_seconds)).await;
+    }
+    Ok(())
 }
 
 async fn upload_file(
@@ -958,6 +1238,32 @@ async fn run_shell_line(
             cli.json,
         )
         .await,
+        ["dashboard"] => {
+            print_dashboard(
+                client,
+                DashboardArgs {
+                    target_fragment: cli.fragment.clone(),
+                    object_limit: 64,
+                    probe_objects: false,
+                    refresh: false,
+                },
+                cli,
+            )
+            .await
+        }
+        ["dashboard", "probe"] => {
+            print_dashboard(
+                client,
+                DashboardArgs {
+                    target_fragment: cli.fragment.clone(),
+                    object_limit: 64,
+                    probe_objects: true,
+                    refresh: false,
+                },
+                cli,
+            )
+            .await
+        }
         ["fragments"] => print_op(client, "fragment.list", json!({}), cli.json).await,
         ["fragment", "check", fragment] => {
             print_op(
@@ -1097,6 +1403,7 @@ async fn run_shell_line(
         }
         ["repair", "plan"] => print_op(client, "cluster.repair.plan", json!({}), cli.json).await,
         ["repair", "stop"] => print_op(client, "cluster.repair.stop", json!({}), cli.json).await,
+        ["repair", "watch"] => watch_job(client, "cluster.repair", 5, cli.json).await,
         ["repair", "start"] => {
             let fragment = cli.fragment.clone().ok_or_else(|| {
                 NativeClientError::protocol("repair start requires global --fragment")
@@ -1118,6 +1425,7 @@ async fn run_shell_line(
         ["rebalance", "stop"] => {
             print_op(client, "cluster.rebalance.stop", json!({}), cli.json).await
         }
+        ["rebalance", "watch"] => watch_job(client, "cluster.rebalance", 5, cli.json).await,
         ["rebalance", "start"] => {
             let fragment = cli.fragment.clone().ok_or_else(|| {
                 NativeClientError::protocol("rebalance start requires global --fragment")
@@ -1143,6 +1451,7 @@ async fn run_shell_line(
             .await
         }
         ["gc", "stop"] => print_op(client, "maintenance.gc.stop", json!({}), cli.json).await,
+        ["gc", "watch"] => watch_job(client, "maintenance.gc", 5, cli.json).await,
         _ => {
             println!("unknown command. Type 'help'.");
             Ok(())
@@ -1152,7 +1461,7 @@ async fn run_shell_line(
 
 fn print_shell_help() {
     println!(
-        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  monitor [deep|probe]\n  usage [refresh]\n  fragments\n  fragment check <fragment>\n  fragment hash <fragment>\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start|stop\n  rebalance status|plan|start|stop\n  gc status|scrub|stop\n  exit"
+        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  dashboard [probe]\n  monitor [deep|probe]\n  usage [refresh]\n  fragments\n  fragment check <fragment>\n  fragment hash <fragment>\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start|watch|stop\n  rebalance status|plan|start|watch|stop\n  gc status|scrub|watch|stop\n  exit"
     );
 }
 
@@ -1187,6 +1496,145 @@ async fn print_op(
 ) -> NativeClientResult<()> {
     let response = client.operation(op, &payload, None).await?;
     print_response(response, json_output)
+}
+
+async fn print_dashboard(
+    client: &mut N2NativeClient,
+    args: DashboardArgs,
+    cli: &Cli,
+) -> NativeClientResult<()> {
+    let value = client
+        .operation_json(
+            "cluster.monitor",
+            &dashboard_payload(args, &cli.fragment),
+            None,
+        )
+        .await?;
+    if cli.json {
+        return print_value(value, true);
+    }
+
+    println!("N2 Operator Dashboard");
+    println!("---------------------");
+    println!(
+        "cluster: {} | access: {} | epoch: {}",
+        value_str(&value, &["cluster", "status"])
+            .or_else(|| value_str(&value, &["status"]))
+            .unwrap_or("unknown"),
+        value_str(&value, &["cluster", "access_mode"])
+            .or_else(|| value_str(&value, &["access_mode"]))
+            .unwrap_or("unknown"),
+        value_u64(&value, &["cluster", "membership_epoch"])
+            .or_else(|| value_u64(&value, &["membership", "epoch"]))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+
+    if let Some(layout) = value.get("topology").or_else(|| value.get("layout")) {
+        println!(
+            "layout: data={} parity={} active_nodes={} old_layout={} current_layout={}",
+            value_u64(layout, &["data_shards"]).unwrap_or(0),
+            value_u64(layout, &["parity_shards"]).unwrap_or(0),
+            value_u64(layout, &["active_write_nodes"]).unwrap_or_else(|| {
+                layout
+                    .get("active_nodes")
+                    .and_then(Value::as_array)
+                    .map(|nodes| nodes.len() as u64)
+                    .unwrap_or(0)
+            }),
+            value_u64(layout, &["old_layout_objects"]).unwrap_or(0),
+            value_u64(layout, &["current_layout_objects"]).unwrap_or(0),
+        );
+    }
+
+    if let Some(nodes) = value.get("nodes").and_then(Value::as_array) {
+        let online = nodes
+            .iter()
+            .filter(|node| {
+                value_str(node, &["status"]) == Some("online")
+                    || value_str(node, &["state"]) == Some("online")
+            })
+            .count();
+        println!("nodes: {online}/{} online", nodes.len());
+        for node in nodes {
+            println!(
+                "  {} {:<10} rss={} rtt={}ms disk_free={}",
+                value_str(node, &["id"])
+                    .or_else(|| value_str(node, &["node_id"]))
+                    .unwrap_or("node"),
+                value_str(node, &["status"])
+                    .or_else(|| value_str(node, &["state"]))
+                    .unwrap_or("unknown"),
+                value_u64(node, &["rss_bytes"])
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "-".to_string()),
+                value_u64(node, &["rtt_ms"]).unwrap_or(0),
+                value_u64(node, &["disk_free_bytes"])
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
+    }
+
+    if let Some(health) = value.get("objects").or_else(|| value.get("object_health")) {
+        println!(
+            "objects: healthy={} degraded={} unavailable={} repairable={}",
+            value_u64(health, &["healthy"]).unwrap_or(0),
+            value_u64(health, &["degraded"]).unwrap_or(0),
+            value_u64(health, &["unavailable"]).unwrap_or(0),
+            value_u64(health, &["repairable"]).unwrap_or(0),
+        );
+    }
+
+    if let Some(jobs) = value.get("jobs") {
+        print_job_status_line("repair", jobs.get("repair").unwrap_or(&Value::Null));
+        print_job_status_line("rebalance", jobs.get("rebalance").unwrap_or(&Value::Null));
+    }
+
+    if let Some(io_control) = value.get("io_control") {
+        println!(
+            "io: peer_read_pressure={} peer_write_pressure={} stalled_peers={}",
+            value_u64(io_control, &["peer_read_pressure"]).unwrap_or(0),
+            value_u64(io_control, &["peer_write_pressure"]).unwrap_or(0),
+            value_u64(io_control, &["stalled_peers"]).unwrap_or(0),
+        );
+    }
+
+    Ok(())
+}
+
+fn print_job_status_line(label: &str, value: &Value) {
+    let running = value
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let job = value_str(value, &["job"]).unwrap_or(label);
+    let scanned = value_u64(value, &["scanned"]).unwrap_or(0);
+    let rewritten = value_u64(value, &["rewritten"]).unwrap_or(0);
+    let skipped = value_u64(value, &["skipped"])
+        .or_else(|| value_u64(value, &["skipped_current_layout"]))
+        .unwrap_or(0);
+    let failed = value_u64(value, &["failed"]).unwrap_or(0);
+    let last_error = value_str(value, &["last_error"]).unwrap_or("-");
+    println!(
+        "{job}: running={running} scanned={scanned} rewritten={rewritten} skipped={skipped} failed={failed} last_error={last_error}"
+    );
+}
+
+fn value_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_str()
+}
+
+fn value_u64(value: &Value, path: &[&str]) -> Option<u64> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_u64()
 }
 
 fn print_response(

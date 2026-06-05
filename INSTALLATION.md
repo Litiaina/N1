@@ -63,6 +63,8 @@ services, and can enable/start the services.
 
 The installer does not overwrite existing `n2.env`, `n2_config.ini`,
 `n2_membership.json`, or gateway config unless `--force-config` is passed.
+When it creates a missing environment file, it generates local random secrets
+instead of shipping static credentials.
 
 Preview a node install without changing the machine:
 
@@ -399,3 +401,30 @@ Operator proof checklist:
 - targeted rebalance dry-run and real run on layout-mismatched objects;
 - stop one node, verify read-on-recover for repairable objects;
 - restore the node and verify cluster monitor returns healthy.
+
+Automated installer proof:
+
+```bash
+scripts/proof/run_n2_installer_proof.sh
+```
+
+Automated hardening proof:
+
+```bash
+scripts/bench/run_n2_hardening_native_proof.sh
+```
+
+The hardening proof uses temporary data roots and test ports. It does not kill
+existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
+
+Capacity expansion proof:
+
+```bash
+scripts/bench/run_n2_capacity_expansion_proof.sh
+```
+
+Benchmark matrix:
+
+```bash
+FRAGMENT=n2-test SECRET=fragment-key scripts/bench/run_n2_benchmark_matrix.sh
+```

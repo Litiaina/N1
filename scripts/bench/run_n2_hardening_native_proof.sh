@@ -6,6 +6,7 @@ REMOTE_PASS="${REMOTE_PASS:-1122}"
 REMOTE2_IP="${REMOTE2_IP:-192.168.0.18}"
 REMOTE2_PASS="${REMOTE2_PASS:-Admin@@@123}"
 N2_PROOF_NODE_COUNT="${N2_PROOF_NODE_COUNT:-3}"
+N2_PROOF_ALLOW_PKILL="${N2_PROOF_ALLOW_PKILL:-0}"
 LOCAL_IP="${LOCAL_IP:-192.168.0.22}"
 LOCAL_HTTPS_PORT="${LOCAL_HTTPS_PORT:-53401}"
 LOCAL_NATIVE_PORT="${LOCAL_NATIVE_PORT:-53402}"
@@ -284,6 +285,17 @@ stop_nodes() {
   sleep 2
 }
 
+stop_remote_node_b() {
+  ssh_remote "if [ -f '$RROOT/rss-monitor.pid' ]; then kill \$(cat '$RROOT/rss-monitor.pid') 2>/dev/null || true; rm -f '$RROOT/rss-monitor.pid'; fi; if [ -f '$RROOT/n2.pid' ]; then kill \$(cat '$RROOT/n2.pid') 2>/dev/null || true; rm -f '$RROOT/n2.pid'; fi" >/dev/null || true
+  sleep 2
+}
+
+start_remote_node_b() {
+  ssh_remote "cd '$RROOT'; setsid ./litiaina-n2 </dev/null > server.log 2>&1 & echo \$! > n2.pid"
+  wait_ping "$REMOTE_BASE"
+  ssh_remote "pid=\$(cat '$RROOT/n2.pid'); nohup sh -c 'while kill -0 \"\$0\" 2>/dev/null; do printf \"%s,%s\\\\n\" \$(date +%s) \$(ps -o rss= -p \"\$0\" | tr -d \" \"); sleep 1; done' \"\$pid\" >> '$RROOT/rss-remote.csv' 2>/dev/null & echo \$! > '$RROOT/rss-monitor.pid'"
+}
+
 wait_job() {
   local url="$1" out="$2"
   for _ in $(seq 1 180); do
@@ -300,10 +312,12 @@ rss_summary() {
 }
 
 echo "[n2-proof] output=$OUT"
-pkill -x litiaina-n2 2>/dev/null || true
-ssh_remote "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
-if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  ssh_remote2 "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
+if [[ "$N2_PROOF_ALLOW_PKILL" == "1" ]]; then
+  pkill -x litiaina-n2 2>/dev/null || true
+  ssh_remote "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
+  if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+    ssh_remote2 "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
+  fi
 fi
 mkdir -p "$OUT" "$LROOT/index" "$LROOT/blob" "$LROOT/fs"
 cp "$BIN" "$CERT" "$KEY" "$LROOT/"
@@ -403,6 +417,35 @@ if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   cmp -s "$OUT/mhw-proof.bin" "$OUT/download-remote2.bin"
 else
   printf '{}\n' > "$OUT/download-remote2-metrics.json"
+fi
+
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  stop_remote_node_b
+  curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/node-loss-health-down.json"
+  start="$(date +%s%N)"
+  curl_auth -G "$LOCAL_BASE/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/node-loss-download.bin"
+  loss_download_ns=$(( "$(date +%s%N)" - start ))
+  cmp -s "$OUT/mhw-proof.bin" "$OUT/node-loss-download.bin"
+  printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s,"lost_node":"node-b"}\n' "$SIZE" "$(awk -v ns="$loss_download_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(metric_speed "$SIZE" "$loss_download_ns")" > "$OUT/node-loss-download-metrics.json"
+  curl_auth -G "$LOCAL_BASE/n2/posix/list" --data-urlencode 'path=videos' --data-urlencode 'limit=100' > "$OUT/node-loss-list.json"
+  NODE_LOSS_RENAMED="videos/node-loss-rename-$TS.mp4"
+  curl_json -X POST "$LOCAL_BASE/n2/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$KEY_MP\",\"destination_path\":\"$NODE_LOSS_RENAMED\"}" > "$OUT/node-loss-rename-forward.json"
+  curl_json -X POST "$LOCAL_BASE/n2/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$NODE_LOSS_RENAMED\",\"destination_path\":\"$KEY_MP\"}" > "$OUT/node-loss-rename-back.json"
+  dd if=/dev/urandom of="$OUT/node-loss-small.bin" bs=4096 count=1 status=none
+  start="$(date +%s%N)"
+  node_loss_upload_status="$(curl -k --http1.1 -m 20 -sS -o "$OUT/node-loss-upload-response.json" -w '%{http_code}' -X POST "$LOCAL_BASE/n2/upload/one-shot/node-loss/upload-$TS.bin" -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss-small.bin" || true)"
+  node_loss_upload_ns=$(( "$(date +%s%N)" - start ))
+  printf '{"status":"%s","seconds":%.3f,"bounded":true}\n' "$node_loss_upload_status" "$(awk -v ns="$node_loss_upload_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" > "$OUT/node-loss-upload-bounded.json"
+  start_remote_node_b
+  curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/node-loss-health-restored.json"
+else
+  printf '{}\n' > "$OUT/node-loss-health-down.json"
+  printf '{}\n' > "$OUT/node-loss-download-metrics.json"
+  printf '{}\n' > "$OUT/node-loss-list.json"
+  printf '{}\n' > "$OUT/node-loss-rename-forward.json"
+  printf '{}\n' > "$OUT/node-loss-rename-back.json"
+  printf '{}\n' > "$OUT/node-loss-upload-bounded.json"
+  printf '{}\n' > "$OUT/node-loss-health-restored.json"
 fi
 
 curl_auth -G "$LOCAL_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-before-repair.json"
@@ -531,6 +574,10 @@ jq -n \
   --slurpfile object_status "$OUT/object-status-before-repair.json" \
   --slurpfile object_repair "$OUT/object-repair.json" \
   --slurpfile recon "$OUT/reconstruct-after-delete-metrics.json" \
+  --slurpfile node_loss_health "$OUT/node-loss-health-down.json" \
+  --slurpfile node_loss_download "$OUT/node-loss-download-metrics.json" \
+  --slurpfile node_loss_upload "$OUT/node-loss-upload-bounded.json" \
+  --slurpfile node_loss_restored "$OUT/node-loss-health-restored.json" \
   --slurpfile trash "$OUT/trash-object-remote.json" \
   --slurpfile recover "$OUT/recover-object.json" \
   --slurpfile repair "$OUT/cluster-repair-status.json" \
@@ -539,7 +586,7 @@ jq -n \
   --slurpfile rssl "$OUT/rss-local-summary.json" \
   --slurpfile rssr "$OUT/rss-remote-summary.json" \
   --slurpfile rssr2 "$OUT/rss-remote2-summary.json" \
-  '{out:$out, fragment:$fragment, stable_fragment_id:$stable_fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], object_status:$object_status[0], object_repair:$object_repair[0], trash:$trash[0], recover:$recover[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
+  '{out:$out, fragment:$fragment, stable_fragment_id:$stable_fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], object_status:$object_status[0], object_repair:$object_repair[0], node_loss:{health_down:$node_loss_health[0], download:$node_loss_download[0], bounded_upload_attempt:$node_loss_upload[0], health_restored:$node_loss_restored[0]}, trash:$trash[0], recover:$recover[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_HARDENING_PROOF_OUT=$OUT"

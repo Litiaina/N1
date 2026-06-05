@@ -133,6 +133,28 @@ Gateway binary:
 target/release/litiaina-n2-gateway
 ```
 
+Save an operator shell profile:
+
+```bash
+target/release/litiaina-n2-shell \
+  --native-url n2://192.168.0.22:50002 \
+  --fragment n2-test \
+  --secret fragment-key \
+  profile save --name lab --store-secret
+```
+
+Use the profile:
+
+```bash
+target/release/litiaina-n2-shell --profile lab dashboard
+target/release/litiaina-n2-shell --profile lab dashboard --probe-objects
+target/release/litiaina-n2-shell --profile lab repair watch
+target/release/litiaina-n2-shell --profile lab rebalance watch
+```
+
+Profile storage is local to the operator account. Secrets are not saved unless
+`--store-secret` is explicitly passed.
+
 Run locally:
 
 ```bash
@@ -2123,6 +2145,35 @@ Native hardening proof:
 scripts/bench/run_n2_hardening_native_proof.sh
 ```
 
+Installer proof:
+
+```bash
+scripts/proof/run_n2_installer_proof.sh
+```
+
+Benchmark matrix:
+
+```bash
+FRAGMENT=n2-test SECRET=fragment-key \
+  DIRECT_BASE=https://127.0.0.1:50001 \
+  GATEWAY_BASE=https://127.0.0.1:51002 \
+  NATIVE_URL=n2://127.0.0.1:50002 \
+  scripts/bench/run_n2_benchmark_matrix.sh
+```
+
+Capacity expansion proof:
+
+```bash
+scripts/bench/run_n2_capacity_expansion_proof.sh
+```
+
+The hardening proof covers multipart resume on the coordinator, download from
+each node, object status/repair, trash/recover, namespace stress, small-object
+scale, cancel, layout invariant checks, native placement locator checks,
+read-on-recover after deleting a shard, node-loss read/list/rename behavior,
+cluster repair/rebalance, and RSS summaries. It only kills unrelated N2
+processes when `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
+
 For 1.0.0 readiness, prove at minimum:
 
 - all nodes start with the same membership epoch;
@@ -2136,4 +2187,5 @@ For 1.0.0 readiness, prove at minimum:
 - cluster repair plan/status;
 - cluster rebalance plan/status;
 - Shell ping, auth, health, membership, layout, list, usage, upload, download,
-  object status/repair, cluster repair, and cluster rebalance.
+  object status/repair, cluster repair, cluster rebalance, dashboard, profile,
+  and job watch flows.

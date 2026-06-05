@@ -105,7 +105,11 @@ deploy/install.sh       production installer for node/gateway systemd setup
 simd-erasure-core/
   src/                  erasure coding implementation
 scripts/bench/
+  run_n2_benchmark_matrix.sh
+  run_n2_capacity_expansion_proof.sh
   run_n2_hardening_native_proof.sh
+scripts/proof/
+  run_n2_installer_proof.sh
 certificates/
   local development TLS certificates
 ```
@@ -233,6 +237,19 @@ target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
 The shell also has a `raw` command for calling supported native operation names
 directly.
 
+Useful operator shell flows:
+
+```bash
+target/release/litiaina-n2-shell \
+  --native-url n2://127.0.0.1:50002 \
+  --fragment n2-test --secret fragment-key \
+  profile save --name lab
+
+target/release/litiaina-n2-shell --profile lab dashboard
+target/release/litiaina-n2-shell --profile lab repair watch
+target/release/litiaina-n2-shell --profile lab rebalance watch
+```
+
 ## Proof And Testing
 
 Run unit-level checks:
@@ -249,8 +266,22 @@ Run the N2 native hardening harness:
 scripts/bench/run_n2_hardening_native_proof.sh
 ```
 
-The proof harness is intended for multi-node correctness checks and writes
-ignored local output under `.n2-bench/`.
+Run installer dry-run proof:
+
+```bash
+scripts/proof/run_n2_installer_proof.sh
+```
+
+Run benchmark and capacity-expansion proofs:
+
+```bash
+FRAGMENT=n2-test SECRET=fragment-key scripts/bench/run_n2_benchmark_matrix.sh
+scripts/bench/run_n2_capacity_expansion_proof.sh
+```
+
+The proof harnesses are intended for multi-node correctness checks and write
+ignored local output under `.n2-bench/`. The hardening harness does not kill
+existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
 
 ## Operational Boundaries
 
