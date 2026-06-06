@@ -3,26 +3,36 @@
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 owns distributed namespace, object identity, cluster layout, node placement,
-peer transport, repair, rebalance, and health.
+N2 owns distributed namespace, immutable object identity, per-version erasure
+layout, node placement, peer transport, repair, redistribution, rebalance, and
+cluster health. Every healthy node can receive client operations; there is no
+permanent object-IO leader.
 
-## Core Model
+## Architectural Invariants
 
-```text
-client
-  -> any N2 node
-  -> namespace/object operation
-  -> cluster layout decision
-  -> shard/parity placement across nodes
-  -> immutable object and placement records
-```
+The N2 1.0 storage model is defined by these rules:
 
-Every N2 node can coordinate object IO. There is no permanent object-IO leader.
+- a user path is mutable namespace, not object storage;
+- a namespace file is a direct symlink to `@o_<object-id>`;
+- `@o_<object-id>` and every committed `.ncdx` version are immutable;
+- each `.ncdx` is colocated with that version's shard/parity data;
+- `.ncdx` contains immutable object and placement truth, never a logical path;
+- every shard-bearing participant stores the same named-MessagePack `.ncdx`;
+- the head version is the greatest valid ULID filename in the object directory;
+- object bytes and metadata are not cluster-consensus state;
+- namespace mutation is partitioned quorum state by fragment and path;
+- every version records the exact membership epoch, EC shape, and shard
+  placement that wrote it;
+- adding nodes does not invalidate or automatically rewrite old objects;
+- no `.cluster`, `.namespace`, `.blobs`, `.nmtd`, `.ndx`, or mutable latest
+  pointer exists in the accepted disk format.
 
-## Bidirectional Coordination
+These boundaries are not optional implementation details. They are the N2
+storage contract.
 
-N2 is bidirectional at the node level. Any healthy node can receive a client
-operation and become the coordinator for that operation.
+## Bidirectional Nodes
+
+Any healthy N2 node can coordinate an operation:
 
 ```text
 client A -> node-a -> upload object-a
@@ -30,127 +40,280 @@ client B -> node-b -> upload object-b
 client C -> node-c -> list, download, rename, delete, recover
 ```
 
-There is no fixed leader for normal object IO. Coordination is per operation,
-not per cluster.
+The receiving node is coordinator only for that operation. It resolves the
+current layout, distributes bytes to participant nodes, publishes immutable
+metadata, and submits namespace mutation to the fragment's voters.
 
-Multipart upload sessions are intentionally coordinator-owned until finalize.
-The node that accepts `init` owns that temporary `.uploads` session state:
+All nodes can serve reads and mutations. A node that is not a namespace voter
+routes the namespace request to the current voter group for that namespace
+partition.
+
+## Disk Roles
+
+N2 supports two deliberate node layouts.
+
+### Separated Roots
+
+Fast storage holds mutable namespace and control state. Capacity storage holds
+immutable object metadata and shard data.
 
 ```text
-init multipart on node-a
-put part/status/finalize for that session -> node-a
+NVMe / index root
+  -> namespace, trash, fragment control, coordinator upload state
+
+HDD / blob root
+  -> immutable .ncdx and shard/parity data
 ```
 
-The session coordinator records resumability state locally:
+This is the preferred production layout when NVMe and HDD are available.
 
-- upload manifest
-- session id and version id binding
-- uploaded part metadata
-- part and shard receipts
-- finalize readiness
+### Shared Root
 
-This is deliberate. Temporary multipart session state is hot, high-churn, and
-not final object truth. Replicating every in-flight part receipt through the
-cluster would add metadata chatter and race surfaces without improving the
-committed object model.
+The exact same path may be configured as both an index root and a blob root:
 
-The data plane is still distributed during the upload. Each part is encoded and
-written as shard/parity data across the selected cluster nodes. After finalize,
-the immutable object metadata, namespace entry, and placement record become
-cluster-visible and any node can list, read, download, or inspect the object.
+```ini
+index_store_disks=/mnt/n2/storage
+blob_store_disks=/mnt/n2/storage
+```
 
-Load balancers do not need storage intelligence. They only need to:
+N2 merges both roles into one physical tree. It does not create duplicate
+metadata planes. This is the minimum deployment shape and is valid for a node
+with one usable storage device.
 
-- route new operations to any healthy N2 node
-- route multipart part/status/finalize/cancel requests to the coordinator node
-  supplied by the client
+Roots are defined by configuration, not by marker files. An index root is a
+mutable namespace/control root. A blob root is an immutable object/shard root.
+If the same path is configured for both roles, the two planes intentionally
+coexist under the same stable fragment directory.
 
-If a coordinator dies before finalize, the in-flight multipart upload can be
-restarted. Finalized objects remain cluster-visible and are not tied to the
-coordinator that created them.
+This architecture has no in-place compatibility or migration path from earlier
+development layouts.
 
-## Storage Planes
+## Physical Layout
 
-Each node has index roots and blob roots.
+### Namespace And Control Root
 
 ```text
 <index_root>/
-  .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
+  .fragment/
+    <fragment-alias-hash> -> ../@f_<stable-fragment-id>
 
-  @f_<stable_fragment_id>/
+  @f_<stable-fragment-id>/
+    .uploads/
+    .trash/
+
     videos/
-      demo.mp4 -> @o_<object_id>
+      movie.mp4 -> @o_<object-id>
+    reports/
+      annual.pdf -> @o_<object-id>
+```
 
+The mutable fragment alias is only an entrypoint. The stable fragment ID is
+storage truth. Renaming a fragment changes its alias, not its physical identity
+or existing object metadata. The index root does not own `.fragment.ncdx`;
+immutable fragment metadata lives in the blob plane.
+
+There is no `.namespace` wrapper. Namespace paths live directly below the
+stable fragment root, and N2 applies distributed mutation semantics around that
+namespace.
+
+### Object And Shard Root
+
+```text
+<blob_root>/
+  @f_<stable-fragment-id>/
+    .fragment.ncdx
     .objects/
       ab/
         cd/
           ef/
             12/
-              @o_<object_id>/
-                <version_id>.<size>.<time>.<ext>.ncdx
-
-<blob_root>/
-  .fragment/<fragment_alias_hash> -> ../@f_<stable_fragment_id>
-
-  @f_<stable_fragment_id>/
-    .blobs/
-      <version_id>/
-        part_0_shard_0.shard
-        part_0_shard_1.parity
+              @o_<object-id>/
+                <version-ulid>.<size>.<unix-nanos>.<packed-ext>.ncdx
+                <version-ulid>/
+                  part_0_shard_0.shard
+                  part_0_shard_1.shard
+                  part_0_shard_2.parity
 ```
 
-The mutable fragment alias is an entrypoint. Storage truth resolves to the
-stable fragment id.
+Object fanout is four levels. The fanout distributes object directories across
+large filesystems without changing object identity.
 
-## Object Records
+Blob roots do not own fragment aliases. They only use stable `@f_` roots. On a
+shared root, the namespace/control entries and immutable `.objects` tree simply
+coexist under the same stable fragment root.
 
-Object records are immutable. New content creates a new version record.
+## Immutable Object Record
 
-`.ncdx` means N2 cluster data index. It is the single immutable object metadata
-record for a committed N2 object version.
+`.ncdx` means N2 cluster data index. It is the only committed metadata record
+for one immutable object version.
 
-Each object record stores:
+Its body stores:
 
-- stable fragment id
-- object key at commit time
-- object id
-- version id
-- layout epoch
-- resolved EC layout
-- shard refs by node
-- size and content metadata
-- timestamps
+- immutable object ID;
+- stable fragment ID;
+- version ID and upload session ID;
+- owner and content metadata;
+- total logical size and creation time;
+- membership/layout epoch;
+- resolved data and parity shard counts;
+- stripe size;
+- part metadata;
+- shard locators, checksums, lengths, node IDs, and parity role.
 
-The latest object version is selected from immutable `.ncdx` filenames, not
-from a mutable latest pointer. N2 does not use a separate cluster object
-metadata plane; the object record already owns distributed placement.
+It does not store the user-facing object path. Rename and move therefore never
+rewrite `.ncdx`.
 
-## Namespace Boundary
+The filename provides a zero-decode summary:
 
-Namespace state is mutable. Object and blob payload state is immutable.
+```text
+<version-ulid>.<size>.<unix-nanos>.<packed-ext>.ncdx
+```
 
-Namespace mutations include:
+Listings and head selection can obtain version, size, time, and extension
+without decoding the MessagePack body.
 
-- create namespace entry
-- rename namespace entry
-- trash/recover namespace entry
-- folder mutation
-- membership and layout epoch changes
+## Metadata Placement
 
-Payload bytes are not consensus state. Payloads are streamed to their holder
-nodes, committed as immutable shard/parity files, and referenced by immutable
-placement records.
+Object metadata follows the object's erasure participants:
 
-## Layout Modes
+```text
+object version uses node-a, node-b, node-c
+  -> node-a stores local shard(s) + identical .ncdx
+  -> node-b stores local shard(s) + identical .ncdx
+  -> node-c stores local shard(s) + identical .ncdx
+```
 
-N2 supports two layout modes:
+N2 does not replicate object metadata across every index disk or every cluster
+node. The erasure participants already define the durable object set. Metadata
+resolution queries those participants and rejects divergent immutable copies.
+
+If a node has several blob roots, shard placement rotates over those roots.
+`.ncdx` is written only where that node has a shard-bearing version directory.
+
+## Version And Head Rules
+
+The namespace points only to the immutable object ID:
+
+```text
+videos/movie.mp4 -> @o_<object-id>
+```
+
+It does not store a version pointer. To resolve the head, N2 enumerates valid
+`.ncdx` filenames for that object and chooses the greatest ULID:
+
+```text
+01...A.ncdx
+01...B.ncdx
+01...C.ncdx  <- head
+```
+
+There is no `.nlatest`, head file, mutable object record, or cached head truth
+on disk. A new upload appends a new immutable version.
+
+## Partitioned Namespace Quorum
+
+Namespace is the mutable database of N2. It is partitioned by fragment and
+logical path, then each partition gets a stable voter group from the current
+membership epoch. This spreads namespace write pressure without dragging
+immutable object bytes or object `.ncdx` records into consensus.
+
+```text
+fragment + logical path
+  -> namespace partition
+  -> stable voter assignment for that partition
+  -> prepare
+  -> quorum acceptance
+  -> commit
+  -> durable request ledger
+  -> periodic namespace snapshot
+```
+
+Files are materialized in their owning namespace partition. Directories are
+namespace structure and may be present across roots so folder rename/move stays
+fast and does not rewrite every child object.
+
+Namespace quorum covers:
+
+- upload publication;
+- mkdir;
+- rename and move;
+- trash and recover;
+- purge and empty trash.
+
+Prepared mutations are durable. Recovery checks whether the requested
+filesystem state was already materialized before replaying, closing the crash
+window between filesystem mutation and ledger append.
+
+Namespace snapshots contain only mutable namespace and trash state. They do not
+copy `.objects`, `.ncdx`, shards, parity, or upload payload data.
+
+The assignment, ledger, prepared records, and snapshots live under
+`fs_storage_path/.n2`. They are control state, not a second user namespace.
+
+## Multipart Ownership
+
+Multipart sessions are coordinator-owned until finalize:
+
+```text
+init on node-a
+  -> manifest, binding, receipts on node-a
+  -> parts streamed and erasure-written across participant nodes
+  -> status/finalize/cancel return to node-a
+```
+
+Temporary receipts are high-churn state and are not replicated through
+namespace quorum. The client records `coordinator_node_id` and returns to that
+node when resuming.
+
+This preserves stateless cluster routing for new operations while avoiding
+cluster-wide consensus for every part. Once finalized, the immutable object is
+cluster-visible and no longer depends on its upload coordinator.
+
+## Write Path
+
+```text
+client upload
+  -> any healthy N2 node
+  -> authenticate and resolve stable fragment
+  -> choose/reuse immutable object ID
+  -> resolve current membership epoch and EC layout
+  -> stream stripes through SIMD erasure coding
+  -> write shard/parity bytes to participant nodes
+  -> publish byte-identical .ncdx to shard-bearing participants
+  -> commit namespace object pointer through fragment quorum
+  -> return committed version
+```
+
+Object publication is ordered so namespace cannot intentionally point to an
+unpublished object version. Failed pre-commit uploads remain unreachable and
+are reclaimed by maintenance.
+
+## Read Path
+
+```text
+client read on any node
+  -> resolve logical path through fragment namespace voter
+  -> obtain immutable object ID
+  -> resolve max-ULID .ncdx from shard participants
+  -> use that version's recorded placement
+  -> fetch sufficient shard ranges over n2://
+  -> stream directly when healthy
+  -> reconstruct through parity when degraded
+```
+
+Reads never infer an old object's placement from the current cluster topology.
+The version record is authoritative.
+
+## Layout Evolution
+
+N2 supports:
 
 ```text
 auto
 fixed
 ```
 
-Auto mode derives the cluster EC shape from writable node count:
+Auto mode derives an EC shape from writable node count:
 
 ```text
 1 node  -> 1 + 0
@@ -159,145 +322,101 @@ Auto mode derives the cluster EC shape from writable node count:
 4 nodes -> 3 + 1
 ```
 
-Fixed mode lets the operator explicitly set data and parity shard counts.
+Fixed mode lets the operator preserve a deliberate production EC shape.
 
-Every object version records its resolved layout. Adding nodes does not make old
-objects unhealthy. Old objects remain valid under their recorded layout; new
-objects use the current layout.
+Every object version records its resolved layout. Therefore:
 
-## Write Path
+- adding a node lets new objects use the new topology immediately;
+- old objects remain healthy under their recorded topology;
+- no automatic full-cluster rebalance is required;
+- operators can modernize selected objects explicitly.
 
-```text
-client upload
-  -> any N2 node
-  -> coordinator validates auth, fragment, membership, and capacity gates
-  -> coordinator resolves cluster layout
-  -> coordinator streams bytes through cluster EC
-  -> target nodes persist .shard/.parity files
-  -> coordinator commits immutable object and .ncdx records
-  -> namespace mutation is applied through the cluster mutation path
-```
+## Repair And Rebalance
 
-Multipart upload is the preferred large-object path. Each part is independently
-streamed, recorded, and finalized into the committed object version.
+N2 maintenance uses immutable version metadata and recorded placement:
 
-Multipart resumability is coordinator-owned. A resumed multipart upload should
-return to the node that created the session. This keeps temporary upload state
-simple and avoids cluster-wide consensus on every part receipt while preserving
-distributed shard placement and cluster-wide final object visibility.
-
-## Read Path
-
-```text
-client read
-  -> any N2 node
-  -> namespace symlink resolves object id
-  -> immutable object record resolves version
-  -> .ncdx resolves recorded shard placement
-  -> coordinator fetches needed shard ranges from holder nodes
-  -> healthy path streams data shards
-  -> degraded path reconstructs from parity
-```
-
-Reads use the object version's recorded layout. They do not assume the current
-cluster layout matches old objects.
-
-## Maintenance
-
-N2 maintenance is cluster-level:
-
-- health checks node reachability and shard availability
-- repair restores missing shards for recorded layouts
-- object status reports whether a version uses the current topology or an
-  older recorded layout
+- object status verifies shard availability and reports layout age;
+- read-on-recover reconstructs a readable result without mutating namespace;
+- object repair restores missing or corrupt shards for the recorded layout;
 - object redistribution rewrites one selected object/version into the current
-  topology when requested
-- targeted rebalance scans metadata and rewrites only layout-mismatched objects
-- already-current objects are skipped by targeted rebalance
-- GC removes unreachable immutable records and blobs
+  layout;
+- targeted rebalance scans metadata and rewrites only layout-mismatched
+  objects;
+- already-current objects are skipped without shard IO;
+- GC removes immutable object versions no longer reachable from live or trash
+  namespace.
 
-N2 distinguishes:
-
-```text
-healthy old layout
-degraded object
-critical object
-lost object
-rebalance available
-```
-
-An old layout is not a health failure.
-
-## Adaptability Rule
-
-N2 does not force redistribution just because a node was added.
+An older recorded layout is not degradation:
 
 ```text
-new layout available != existing objects are unhealthy
+healthy + older_recorded_layout
 ```
 
-That keeps the system adaptable:
+Health and topology age are separate facts.
 
-- add node: new objects can use it immediately
-- remove node: affected recorded layouts degrade based on actual reachability
-- re-add node: recorded layouts can become healthy again
-- rebalance: explicit operator action
+## Failure Semantics
 
-## Quota Rule
+- A lost non-coordinator node can degrade affected objects while repairable
+  reads reconstruct from remaining shards.
+- Namespace operations continue while the fragment voter quorum remains
+  available.
+- A restored node makes its recorded shards available again without mandatory
+  rebalance.
+- A lost multipart coordinator loses access to that unfinished local session;
+  committed objects remain unaffected.
+- A disk should normally be replaced at the same operational role before
+  repair. N2 can repair onto currently configured writable roots, but that may
+  create temporary local imbalance.
 
-N2 does not enforce per-fragment quota. Fragment quota is monitoring metadata.
+## Gateway Boundary
 
-Cluster storage is distributed, so usage is reported through explicit monitoring
-calls instead of being treated like single-node physical quota.
+N2 Gateway is optional and deliberately route-only:
 
-## Cluster Monitoring
+```text
+client -> gateway -> healthy N2 node
+```
 
-N2 exposes detailed cluster monitoring through `/n2/cluster/monitor` and
-`cluster.monitor` on the native protocol.
+It performs node health selection and forwards streaming requests. It is not
+namespace, object, placement, maintenance, quota, or resumability authority.
+Multipart coordinator ownership remains a client-visible N2 rule.
 
-The monitor reports eight planes without becoming cluster authority:
+## Monitoring And IO Control
 
-- cluster overview
-- node health
-- current topology/layout
-- sampled object layout and health state
-- peer IO pressure and read-on-recover counters
-- redistribution/rebalance readiness
-- repair, rebalance, and GC jobs
-- namespace consensus ledger status
-- upload activity
+`/n2/cluster/monitor` and native `cluster.monitor` report:
 
-Disk usage remains explicit through `/n2/cluster/usage` because it can require
-node and disk scans. Normal UI polling should use the monitor snapshot.
+- cluster overview;
+- node health and resource state;
+- current topology/layout;
+- sampled object health and layout age;
+- peer IO pressure and read-on-recover counters;
+- redistribution/rebalance readiness;
+- repair, rebalance, and GC jobs;
+- namespace voter and ledger state;
+- active upload activity.
 
-Maintenance jobs are explicit, budgeted, and cancellable. Repair and rebalance
-can be limited by duration, object count, directory count, and byte count;
-already-current objects are skipped during targeted rebalance. These controls
-protect weak nodes and unstable links without turning rebalance into a hidden
-background authority.
+Explicit `/n2/cluster/usage` performs the more expensive disk aggregation and
+should be operator-driven rather than polled continuously.
 
-N2 also has an IO control plane for operational stability:
+N2 protects mixed hardware through:
 
-- bounded capacity/usage cache for explicit usage views
-- peer read/write backpressure
-- IO latency p50/p95/p99 samples
-- recent slow-path diagnostics
-- process RSS/thread/fd sampler
-- maintenance resume journal through persisted rewrite status
-- CRC32 upload checksum normalization
-- explicit scrub policy/status, with scheduling kept under operator control
+- bounded peer read/write concurrency;
+- backpressure and quorum-aware admission;
+- latency and stall observation;
+- bounded capacity/usage caching;
+- maintenance budgets and cancellation;
+- persisted maintenance progress;
+- streaming CRC32 validation;
+- RSS, thread, and file-descriptor monitoring.
+
+These controls govern pressure. They do not change object identity, placement
+truth, or namespace authority.
 
 ## Protocol Surfaces
 
-N2 has two protocol surfaces:
+N2 exposes:
 
-- `/n2/...` HTTP API for browsers, external clients, and compatibility
-- `n2://` native protocol identity for N2-native tools and node-to-node work
+- `/n2/...` HTTPS for browsers and general clients;
+- `n2://` for N2-native tools, shard transport, and node-to-node operations.
 
-N2 Gateway is the optional user-facing front door. It routes HTTPS `/n2/...`
-traffic to healthy N2 nodes and uses `n2://` for native hot paths where the
-gateway can preserve streaming semantics. Multipart init returns the selected
-`coordinator_node_id`; clients keep that value and send it on part/status/
-finalize/cancel requests. Gateway state is routing health only; it is not
-namespace, object, placement, repair, rebalance, quota, or resumability
-authority.
+The two transports call the same storage and namespace rules. The native
+protocol does not introduce a second storage path or alternate object model.

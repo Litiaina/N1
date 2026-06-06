@@ -1,14 +1,13 @@
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
-use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectPathManager};
 use crate::core::fragment_identity::{
-    fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
+    fragment_root_on, list_fragment_aliases, physical_fragment_root_on, stable_fragment_id_for_root,
 };
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
-use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoSchedulerSnapshot, disk_io_scheduler_snapshot};
 use crate::core::operation_gate::{MaintenanceAccessMode, current_maintenance_access_mode};
 use crate::core::redistribution::{
@@ -43,7 +42,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
@@ -62,7 +61,6 @@ static REDIST_INTENT_DEBT_CACHE: LazyLock<
     Arc<tokio::sync::RwLock<Option<CachedRedistributionIntentDebt>>>,
 > = LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 const REDIST_INTENT_DEBT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(5);
 
 fn monitor_interval() -> Duration {
     let secs = MONITOR_INTERVAL_SECS_ATOMIC
@@ -118,15 +116,15 @@ pub struct DiskStatus {
 
 #[derive(Serialize, Clone)]
 pub struct ConsistencyStats {
-    pub total_index_records_scanned: u64,
-    pub index_health: String,
-    pub index_replicas: IndexReplicaHealthStats,
+    pub total_object_records_scanned: u64,
+    pub object_record_health: String,
+    pub namespace_replicas: NamespaceReplicaHealthStats,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_record_counts: Option<HashMap<String, u64>>,
+    pub object_record_counts: Option<HashMap<String, u64>>,
 }
 
 #[derive(Serialize, Clone, Default)]
-pub struct IndexReplicaHealthStats {
+pub struct NamespaceReplicaHealthStats {
     pub fragments_checked: u64,
     pub fragments_degraded: u64,
     pub fragments_critical: u64,
@@ -153,10 +151,9 @@ pub struct UploadRuntimeStats {
 }
 
 #[derive(Serialize, Clone, Default)]
-pub struct IndexRuntimeStats {
-    pub loaded_index_records: u64,
-    pub index_roots_online: u64,
-    pub prefix_projection_fragments_pending: u64,
+pub struct ObjectRecordRuntimeStats {
+    pub scanned_object_records: u64,
+    pub shard_roots_online: u64,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -217,7 +214,7 @@ pub struct SystemHealthResponse {
     pub uploads: UploadRuntimeStats,
     pub io_scheduler: DiskIoSchedulerSnapshot,
     pub io_control: IoControlSnapshot,
-    pub index_runtime: IndexRuntimeStats,
+    pub object_record_runtime: ObjectRecordRuntimeStats,
     pub namespace_runtime: NamespaceRuntimeStats,
     pub storage: StoragePlaneStats,
     pub maintenance: MaintenanceRuntimeStats,
@@ -254,12 +251,10 @@ fn should_count_index_record(path: &std::path::Path) -> bool {
         return false;
     }
 
-    if path.components().any(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some(".trash" | ".uploads" | ".intents")
-        )
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component.as_os_str().to_str(), Some(".trash" | ".uploads")))
+    {
         return false;
     }
 
@@ -278,12 +273,12 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn deep_scan_counts_only_live_index_records() {
+    fn deep_scan_counts_only_live_object_records() {
         assert!(should_count_index_record(Path::new(
             "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ncdx"
         )));
         assert!(!should_count_index_record(Path::new(
-            "frag/.intents/0001.pending.redist.intent.msgpack"
+            "frag/.uploads/0001.pending.ncdx"
         )));
         assert!(!should_count_index_record(Path::new("frag/.fragment.ncdx")));
         assert!(!should_count_index_record(Path::new(
@@ -394,20 +389,25 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
     }
 }
 
-async fn list_known_fragments(roots: &[PathBuf]) -> Vec<String> {
-    let roots = roots.to_vec();
+async fn list_known_fragments(index_roots: &[PathBuf], blob_roots: &[PathBuf]) -> Vec<String> {
+    let index_roots = index_roots.to_vec();
+    let blob_roots = blob_roots.to_vec();
     tokio::task::spawn_blocking(move || {
         let mut seen = HashSet::new();
-        for root in roots {
+        for root in index_roots {
             if !root.exists() {
                 continue;
             }
             for name in list_fragment_aliases(&root) {
-                if is_fragment_hash(&name)
-                    && fragment_root_on(&root, &name)
+                let Some(stable) = stable_fragment_id_for_root(&root, &name) else {
+                    continue;
+                };
+                let has_metadata = blob_roots.iter().any(|blob_root| {
+                    physical_fragment_root_on(blob_root, &stable)
                         .join(crate::core::constants::FRAGMENT_METADATA_FILE)
                         .is_file()
-                {
+                });
+                if is_fragment_hash(&name) && has_metadata {
                     seen.insert(name);
                 }
             }
@@ -423,42 +423,21 @@ async fn list_known_fragments(roots: &[PathBuf]) -> Vec<String> {
 async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bool {
     let fragment = fragment.to_string();
     let roots = blob_roots.to_vec();
-    let active_session_ids = index::list_active_sessions(&fragment)
-        .await
-        .map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
-                .map(|session| session.manifest.version_id)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
+        let stable = ObjectPathManager::new().resolve_stable_fragment_id(&fragment);
         for root in roots {
-            let blob_dir = fragment_root_on(&root, &fragment).join(N2_BLOB_DIR);
-            let Ok(entries) = std::fs::read_dir(&blob_dir) else {
-                continue;
-            };
-            for entry in entries.filter_map(|entry| entry.ok()) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let version_id = entry.file_name().to_string_lossy().to_string();
-                if active_session_ids.contains(&version_id) {
-                    continue;
-                }
-                let modified = std::fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(now);
-                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= ORPHAN_BLOB_GRACE {
-                    continue;
-                }
-                if std::fs::read_dir(&path)
-                    .ok()
-                    .and_then(|mut parts| parts.next())
-                    .is_some()
+            let blob_dir = physical_fragment_root_on(&root, &stable).join(N2_BLOB_DIR);
+            for entry in WalkDir::new(&blob_dir)
+                .min_depth(5)
+                .max_depth(5)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if entry.file_type().is_dir()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("@o_"))
                 {
                     return true;
                 }
@@ -472,26 +451,12 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
 
 async fn fragment_has_indexed_payload(
     fragment: &str,
-    active_index_roots: &[PathBuf],
+    _active_index_roots: &[PathBuf],
 ) -> Result<bool, AppError> {
-    let fragment_owned = fragment.to_string();
-    let roots = active_index_roots.to_vec();
-    let has_object_index = tokio::task::spawn_blocking(move || {
-        index_store::fragment_has_object_index_records(&fragment_owned, &roots)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("N2 object index scan join: {e}")))?;
-    if has_object_index {
-        return Ok(true);
-    }
-
-    let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
-    if !live.objects.is_empty() {
-        return Ok(true);
-    }
-    let trash =
-        index::scan_fragment_trash_metadata_page(fragment, None, None, 1, None, true).await?;
-    Ok(!trash.objects.is_empty())
+    Ok(global_namespace_runtime()
+        .reachability_snapshot_if_present(fragment)
+        .await?
+        .is_some_and(|snapshot| !snapshot.referenced_object_ids.is_empty()))
 }
 
 async fn fragment_has_sampled_redundancy_debt(
@@ -572,9 +537,7 @@ async fn detect_fragment_redundancy_debt(
         return Ok(FragmentRedundancyDebt::default());
     }
 
-    let mut roots = active_index_roots.to_vec();
-    roots.extend_from_slice(active_blob_roots);
-    let mut fragments = list_known_fragments(&roots).await;
+    let mut fragments = list_known_fragments(active_index_roots, active_blob_roots).await;
     if let Some(target) = target_fragment {
         fragments.retain(|fragment| fragment == target);
     }
@@ -624,20 +587,21 @@ async fn detect_fragment_redundancy_debt(
     Ok(debt)
 }
 
-async fn detect_index_replica_debt(
+async fn detect_namespace_replica_debt(
     active_index_roots: &[PathBuf],
+    active_blob_roots: &[PathBuf],
     deep_scan: bool,
     target_fragment: Option<&str>,
-) -> Result<IndexReplicaHealthStats, AppError> {
+) -> Result<NamespaceReplicaHealthStats, AppError> {
     if active_index_roots.is_empty() {
-        return Ok(IndexReplicaHealthStats::default());
+        return Ok(NamespaceReplicaHealthStats::default());
     }
 
-    let mut fragments = list_known_fragments(active_index_roots).await;
+    let mut fragments = list_known_fragments(active_index_roots, active_blob_roots).await;
     if let Some(target) = target_fragment {
         fragments.retain(|fragment| fragment == target);
     }
-    let mut stats = IndexReplicaHealthStats::default();
+    let mut stats = NamespaceReplicaHealthStats::default();
 
     for fragment in fragments {
         let inspection = inspect_namespace_replicas(&fragment, active_index_roots).await?;
@@ -788,15 +752,15 @@ async fn collect_system_health(
         .map(|v| v == "true")
         .unwrap_or(false);
     let force_refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
-    let mut index_record_counts = Vec::new();
-    let mut partition_map = HashMap::new();
+    let mut object_record_counts = Vec::new();
+    let mut object_record_map = HashMap::new();
     let mut scan_performed = false;
     let mut scan_busy = false;
 
-    if deep_scan && !active_index_roots.is_empty() {
+    if deep_scan && !active_blob_roots.is_empty() {
         if let Ok(_permit) = DEEP_SCAN_SEMAPHORE.try_acquire() {
             scan_performed = true;
-            let roots_clone = active_index_roots.clone();
+            let roots_clone = active_blob_roots.clone();
             let target_fragment_for_scan = target_fragment.clone();
             let (tx, rx) = oneshot::channel();
 
@@ -833,13 +797,13 @@ async fn collect_system_health(
                 let _ = tx.send(counts);
             });
 
-            index_record_counts = rx.await.map_err(|e| {
+            object_record_counts = rx.await.map_err(|e| {
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
 
-            for (i, root) in active_index_roots.iter().enumerate() {
-                if let Some(count) = index_record_counts.get(i) {
-                    partition_map.insert(root.to_string_lossy().to_string(), *count);
+            for (i, root) in active_blob_roots.iter().enumerate() {
+                if let Some(count) = object_record_counts.get(i) {
+                    object_record_map.insert(root.to_string_lossy().to_string(), *count);
                 }
             }
         } else {
@@ -847,13 +811,13 @@ async fn collect_system_health(
         }
     }
 
-    let total_index_records = index_record_counts.iter().copied().sum::<u64>();
+    let total_object_records = object_record_counts.iter().copied().sum::<u64>();
 
-    let index_health = if scan_busy {
+    let object_record_health = if scan_busy {
         "skipped (scan in progress)".to_string()
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
-    } else if index_record_counts.is_empty() {
+    } else if object_record_counts.is_empty() {
         "empty".to_string()
     } else {
         "records-scanned".to_string()
@@ -877,8 +841,13 @@ async fn collect_system_health(
         target_fragment.as_deref(),
     )
     .await?;
-    let index_replica_debt =
-        detect_index_replica_debt(&active_index_roots, deep_scan, target_fragment.as_deref())
+    let namespace_replica_debt =
+        detect_namespace_replica_debt(
+            &active_index_roots,
+            &active_blob_roots,
+            deep_scan,
+            target_fragment.as_deref(),
+        )
             .await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
@@ -942,22 +911,22 @@ async fn collect_system_health(
                     .join(", ")
             ),
         )
-    } else if index_replica_debt.fragments_critical > 0 {
+    } else if namespace_replica_debt.fragments_critical > 0 {
         (
             "critical",
             format!(
                 "N2 index has no valid replica for {} fragment(s): {}.",
-                index_replica_debt.fragments_critical,
-                index_replica_debt.degraded_fragments.join(", ")
+                namespace_replica_debt.fragments_critical,
+                namespace_replica_debt.degraded_fragments.join(", ")
             ),
         )
-    } else if index_replica_debt.fragments_degraded > 0 {
+    } else if namespace_replica_debt.fragments_degraded > 0 {
         (
             "degraded",
             format!(
-                "N2 index replicas need repair for {} fragment(s): {}.",
-                index_replica_debt.fragments_degraded,
-                index_replica_debt.degraded_fragments.join(", ")
+                "N2 namespace voters need synchronization for {} fragment(s): {}.",
+                namespace_replica_debt.fragments_degraded,
+                namespace_replica_debt.degraded_fragments.join(", ")
             ),
         )
     } else if placement_limiter_low {
@@ -1032,8 +1001,8 @@ async fn collect_system_health(
         .ok(),
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
-        index_status: index_health.clone(),
-        index_healthy: online_index_count == total_index,
+        object_record_status: object_record_health.clone(),
+        namespace_healthy: online_index_count == total_index,
         sampled_at: Some(Utc::now().timestamp()),
         summary: Some(summary.clone()),
     };
@@ -1044,11 +1013,11 @@ async fn collect_system_health(
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
-            total_index_records_scanned: total_index_records,
-            index_health,
-            index_replicas: index_replica_debt,
-            index_record_counts: if !partition_map.is_empty() {
-                Some(partition_map)
+            total_object_records_scanned: total_object_records,
+            object_record_health,
+            namespace_replicas: namespace_replica_debt,
+            object_record_counts: if !object_record_map.is_empty() {
+                Some(object_record_map)
             } else {
                 None
             },
@@ -1057,10 +1026,9 @@ async fn collect_system_health(
         uploads,
         io_scheduler: disk_io_scheduler_snapshot(),
         io_control: io_control_snapshot(),
-        index_runtime: IndexRuntimeStats {
-            loaded_index_records: total_index_records,
-            index_roots_online: online_index_count as u64,
-            prefix_projection_fragments_pending: 0,
+        object_record_runtime: ObjectRecordRuntimeStats {
+            scanned_object_records: total_object_records,
+            shard_roots_online: online_blob_count as u64,
         },
         namespace_runtime,
         storage,

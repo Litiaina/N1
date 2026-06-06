@@ -1,6 +1,6 @@
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
-use crate::core::fragment_identity::fragment_root_on;
+use crate::core::fragment_identity::physical_fragment_root_on;
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
 use crate::settings::config::CONFIG;
@@ -14,7 +14,7 @@ use tracing::{error, info};
 async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError> {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let fragment_owned = fragment.to_string();
+    let stable_fragment = path_manager.resolve_stable_fragment_id(fragment);
     let now = SystemTime::now();
     let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
     let live_objects = index::list_fragment_live_objects(fragment).await?;
@@ -39,7 +39,7 @@ async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError
         let mut orphans_count = 0;
 
         for root in blob_roots {
-            let blob_root = fragment_root_on(&root, &fragment_owned).join(N2_BLOB_DIR);
+            let blob_root = physical_fragment_root_on(&root, &stable_fragment).join(N2_BLOB_DIR);
 
             if !blob_root.exists() {
                 continue;

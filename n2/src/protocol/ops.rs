@@ -184,6 +184,7 @@ where
                 claims,
                 fragment.clone(),
                 physical.clone(),
+                crate::core::index_store::packed_extension_key(&logical),
                 string_field(&payload, "content_type")
                     .unwrap_or_else(|| "application/octet-stream".to_string()),
                 upload_part_query_from_payload(&payload)?,
@@ -260,6 +261,7 @@ where
                 claims,
                 fragment.clone(),
                 physical.clone(),
+                crate::core::index_store::packed_extension_key(&logical),
                 string_field(&payload, "content_type")
                     .unwrap_or_else(|| "application/octet-stream".to_string()),
                 upload_part_query_from_payload(&payload)?,
@@ -759,6 +761,7 @@ async fn execute_native_op_inner(
                 claims,
                 fragment.clone(),
                 physical.clone(),
+                crate::core::index_store::packed_extension_key(&logical),
                 string_field(&payload, "content_type")
                     .unwrap_or_else(|| "application/octet-stream".to_string()),
                 upload_part_query_from_payload(&payload)?,
@@ -784,12 +787,13 @@ async fn execute_native_op_inner(
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
-            let params: InitiateUploadParams = typed_payload(&payload)?;
+            let mut params: InitiateUploadParams = typed_payload(&payload)?;
             if let Some(existing) =
                 find_reusable_pending_upload(&fragment, &logical, &params).await?
             {
                 (op_response(201), native_body_bytes(&existing))
             } else {
+                params.packed_ext_u64 = crate::core::index_store::packed_extension_key(&logical);
                 let physical = resolve_logical_write_key(&fragment, &logical).await?;
                 let response =
                     initiate_cluster_upload(claims, fragment.clone(), physical.clone(), params)
@@ -1087,7 +1091,6 @@ async fn execute_native_op_inner(
                 name: required_string(&payload, "name")?,
                 key: required_string(&payload, "key")?,
                 secret: required_string(&payload, "secret")?,
-                stable_fragment_id: string_field(&payload, "stable_fragment_id"),
                 quota_bytes: None,
             };
             native_from_response(create_fragment(axum::Json(req)).await?).await

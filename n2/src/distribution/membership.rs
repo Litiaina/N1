@@ -189,6 +189,10 @@ pub fn active_cluster_runtime() -> Result<Arc<ClusterRuntime>, AppError> {
     })
 }
 
+pub fn try_active_cluster_runtime() -> Option<Arc<ClusterRuntime>> {
+    CLUSTER_RUNTIME.get().cloned()
+}
+
 fn parse_layout_mode(raw: Option<&str>) -> Result<ClusterLayoutMode, AppError> {
     match raw.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
         "auto" | "" => Ok(ClusterLayoutMode::Auto),

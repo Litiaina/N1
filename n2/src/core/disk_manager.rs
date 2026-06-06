@@ -1,13 +1,10 @@
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::fragment_identity;
-use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
-
-const INTENT_PARTITION_PREFIX: &str = "partition_";
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -54,59 +51,53 @@ impl ObjectPathManager {
         hasher.finalize().into()
     }
 
-    fn fragment_owner_index(fragment_hash: &str, root_count: usize) -> usize {
+    fn namespace_partition_index(fragment_hash: &str, path: &str, root_count: usize) -> usize {
         if root_count <= 1 {
             return 0;
         }
-        let hash = Self::route_hash(&["fragment", fragment_hash]);
+        let hash = Self::route_hash(&["namespace", fragment_hash, path]);
         usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
     }
 
-    fn partition_id(fragment_hash: &str, namespace: &str, key: &str) -> Result<u16, AppError> {
-        let partition_count =
-            crate::core::fragment_metadata::fragment_index_partition_count(fragment_hash)?;
-        let hash = Self::route_hash(&[namespace, fragment_hash, key]);
-        Ok((u16::from(hash[0]) << 8 | u16::from(hash[1])) % partition_count)
+    pub fn resolve_stable_fragment_id(&self, fragment_hash: &str) -> String {
+        let roots = INDEX_STORE_DISKS
+            .get()
+            .map(|roots| roots.iter().map(PathBuf::from).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for root in roots {
+            if let Some(stable) =
+                fragment_identity::stable_fragment_id_for_root(&root, fragment_hash)
+            {
+                return stable;
+            }
+        }
+        fragment_hash.to_string()
     }
 
-    fn select_partition_roots(&self, fragment_hash: &str, partition_id: u16) -> Vec<PathBuf> {
+    pub fn get_namespace_roots(&self, fragment_hash: &str) -> Vec<PathBuf> {
+        self.get_namespace_roots_for_path(fragment_hash, "")
+    }
+
+    pub fn get_namespace_roots_for_path(&self, fragment_hash: &str, logical_path: &str) -> Vec<PathBuf> {
         let roots = self.get_all_index_roots();
         if roots.is_empty() {
             return Vec::new();
         }
+        vec![roots[Self::namespace_partition_index(fragment_hash, logical_path, roots.len())].clone()]
+    }
 
-        let owner_idx = (Self::fragment_owner_index(fragment_hash, roots.len())
-            + usize::from(partition_id))
-            % roots.len();
-        let mut selected = vec![roots[owner_idx].clone()];
-        for (idx, root) in roots.into_iter().enumerate() {
-            if idx != owner_idx {
-                selected.push(root);
-            }
+    pub fn get_all_namespace_roots(&self, _fragment_hash: &str) -> Vec<PathBuf> {
+        self.get_all_index_roots()
+    }
+
+    pub fn get_session_root(&self, fragment_hash: &str, version_id: &str) -> Option<PathBuf> {
+        let roots = self.get_all_index_roots();
+        if roots.is_empty() {
+            return None;
         }
-        selected
-    }
-
-    fn intent_partition_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
-        fragment_identity::fragment_root_on(root, fragment_hash)
-            .join(".intents")
-            .join(format!(
-                "{}{:04x}.n1",
-                INTENT_PARTITION_PREFIX, partition_id
-            ))
-    }
-
-    pub fn get_all_session_intent_partition_paths(
-        &self,
-        fragment_hash: &str,
-        version_id: &str,
-    ) -> Result<Vec<PathBuf>, AppError> {
-        let partition_id = Self::partition_id(fragment_hash, "session", version_id)?;
-        Ok(self
-            .select_partition_roots(fragment_hash, partition_id)
-            .iter()
-            .map(|root| Self::intent_partition_path(root, fragment_hash, partition_id))
-            .collect())
+        let hash = Self::route_hash(&["session", fragment_hash, version_id]);
+        let idx = usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % roots.len();
+        roots.get(idx).cloned()
     }
 
     pub fn object_key_hash(object_key: &str) -> String {
@@ -119,33 +110,50 @@ impl ObjectPathManager {
         object_key.trim_start_matches('/').to_string()
     }
 
-    pub fn get_all_object_intent_partition_paths(
-        &self,
-        fragment_hash: &str,
-        object_key: &str,
-    ) -> Result<Vec<PathBuf>, AppError> {
-        let object_key = Self::canonical_object_key(object_key);
-        let partition_id = Self::partition_id(fragment_hash, "object", &object_key)?;
-        Ok(self
-            .select_partition_roots(fragment_hash, partition_id)
-            .iter()
-            .map(|root| Self::intent_partition_path(root, fragment_hash, partition_id))
-            .collect())
+    pub fn object_fanout_segments(object_id: &str) -> [String; 4] {
+        let hash = Sha256::digest(object_id.as_bytes());
+        [
+            format!("{:02x}", hash[0]),
+            format!("{:02x}", hash[1]),
+            format!("{:02x}", hash[2]),
+            format!("{:02x}", hash[3]),
+        ]
     }
 
     pub fn get_shard_dir_on_disk(
         &self,
         disk_root: &PathBuf,
         fragment_hash: &str,
+        object_id: &str,
         version_id: &str,
     ) -> PathBuf {
-        disk_root
-            .join(fragment_identity::resolve_physical_fragment_dir_name(
-                disk_root,
-                fragment_hash,
-            ))
+        let stable_fragment_id = self.resolve_stable_fragment_id(fragment_hash);
+        let fanout = Self::object_fanout_segments(object_id);
+        fragment_identity::physical_fragment_root_on(disk_root, &stable_fragment_id)
             .join(N2_BLOB_DIR)
+            .join(&fanout[0])
+            .join(&fanout[1])
+            .join(&fanout[2])
+            .join(&fanout[3])
+            .join(format!("@o_{object_id}"))
             .join(version_id)
+    }
+
+    pub fn get_object_dir_on_disk(
+        &self,
+        disk_root: &PathBuf,
+        fragment_hash: &str,
+        object_id: &str,
+    ) -> PathBuf {
+        let stable_fragment_id = self.resolve_stable_fragment_id(fragment_hash);
+        let fanout = Self::object_fanout_segments(object_id);
+        fragment_identity::physical_fragment_root_on(disk_root, &stable_fragment_id)
+            .join(N2_BLOB_DIR)
+            .join(&fanout[0])
+            .join(&fanout[1])
+            .join(&fanout[2])
+            .join(&fanout[3])
+            .join(format!("@o_{object_id}"))
     }
 }
 
@@ -205,6 +213,8 @@ pub struct PartMetadata {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ObjectMetadata {
     pub object_key: String,
+    #[serde(default)]
+    pub packed_ext_u64: u64,
     pub fragment: String,
     pub version_id: String,
     pub upload_session_id: String,
@@ -236,6 +246,8 @@ impl ObjectMetadata {
 #[derive(Deserialize)]
 pub struct ObjectSummary {
     pub object_key: String,
+    #[serde(default)]
+    pub packed_ext_u64: u64,
     pub fragment: String,
     pub version_id: String,
     pub upload_session_id: String,
@@ -258,6 +270,7 @@ impl From<ObjectSummary> for ObjectMetadata {
     fn from(summary: ObjectSummary) -> Self {
         ObjectMetadata {
             object_key: summary.object_key,
+            packed_ext_u64: summary.packed_ext_u64,
             fragment: summary.fragment,
             version_id: summary.version_id,
             upload_session_id: summary.upload_session_id,
@@ -282,6 +295,8 @@ pub struct InitiateUploadParams {
     pub expected_parts: u64,
     #[serde(default)]
     pub part_size_bytes: Option<u64>,
+    #[serde(skip)]
+    pub packed_ext_u64: u64,
 }
 
 #[derive(Serialize, Deserialize)]

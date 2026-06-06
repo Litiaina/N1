@@ -51,8 +51,8 @@ pub enum StorageEventPayload {
         maintenance: Option<serde_json::Value>,
         repair_job: Option<serde_json::Value>,
         redist_job: Option<serde_json::Value>,
-        index_status: String,
-        index_healthy: bool,
+        object_record_status: String,
+        namespace_healthy: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         sampled_at: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]

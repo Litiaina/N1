@@ -17,20 +17,49 @@ REMOTE2_NATIVE_PORT="${REMOTE2_NATIVE_PORT:-53422}"
 LOCAL_HDD_ROOT="${LOCAL_HDD_ROOT:-/mnt/disk-00}"
 REMOTE_HDD_ROOT="${REMOTE_HDD_ROOT:-/mnt/DISK0}"
 REMOTE2_HDD_ROOT="${REMOTE2_HDD_ROOT:-/mnt/DISK2}"
+LOCAL_NVME_ROOT="${LOCAL_NVME_ROOT:-/home/administrator/.local/share/litiaina-n2-proof}"
+REMOTE_NVME_ROOT="${REMOTE_NVME_ROOT:-/home/administrator/.local/share/litiaina-n2-proof}"
+REMOTE2_NVME_ROOT="${REMOTE2_NVME_ROOT:-/home/administrator/.local/share/litiaina-n2-proof}"
+N2_PROOF_STORAGE_LAYOUT="${N2_PROOF_STORAGE_LAYOUT:-separated}"
 SOURCE_VIDEO="${SOURCE_VIDEO:-/home/administrator/Downloads/mhw.mp4}"
 PROOF_MIB="${PROOF_MIB:-256}"
 SMALL_OBJECTS="${SMALL_OBJECTS:-120}"
 NAMESPACE_OPS="${NAMESPACE_OPS:-40}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT_DIR/target/release/litiaina-n2"
+BIN="${N2_PROOF_BIN:-$ROOT_DIR/target/release/litiaina-n2}"
 CERT="$ROOT_DIR/certificates/cert.pem"
 KEY="$ROOT_DIR/certificates/key.pem"
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT="$ROOT_DIR/.n2-bench/n2-hardening-native-proof-$TS"
-LROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a"
-RROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b"
-CROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c"
+LROOT="/tmp/n2-hardening-native-proof-$TS/node-a"
+RROOT="/tmp/n2-hardening-native-proof-$TS/node-b"
+CROOT="/tmp/n2-hardening-native-proof-$TS/node-c"
+case "$N2_PROOF_STORAGE_LAYOUT" in
+  separated)
+    L_INDEX_ROOT="$LOCAL_NVME_ROOT/$TS/node-a/index"
+    R_INDEX_ROOT="$REMOTE_NVME_ROOT/$TS/node-b/index"
+    C_INDEX_ROOT="$REMOTE2_NVME_ROOT/$TS/node-c/index"
+    L_BLOB_ROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a/blob"
+    R_BLOB_ROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b/blob"
+    C_BLOB_ROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c/blob"
+    ;;
+  shared)
+    L_INDEX_ROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a/storage"
+    R_INDEX_ROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b/storage"
+    C_INDEX_ROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c/storage"
+    L_BLOB_ROOT="$L_INDEX_ROOT"
+    R_BLOB_ROOT="$R_INDEX_ROOT"
+    C_BLOB_ROOT="$C_INDEX_ROOT"
+    ;;
+  *)
+    echo "N2_PROOF_STORAGE_LAYOUT must be separated or shared" >&2
+    exit 1
+    ;;
+esac
+L_FS_ROOT="$LOCAL_NVME_ROOT/$TS/node-a/fs"
+R_FS_ROOT="$REMOTE_NVME_ROOT/$TS/node-b/fs"
+C_FS_ROOT="$REMOTE2_NVME_ROOT/$TS/node-c/fs"
 LOCAL_BASE="https://$LOCAL_IP:$LOCAL_HTTPS_PORT"
 REMOTE_BASE="https://$REMOTE_IP:$REMOTE_HTTPS_PORT"
 REMOTE2_BASE="https://$REMOTE2_IP:$REMOTE2_HTTPS_PORT"
@@ -102,8 +131,8 @@ write_membership() {
       "native_endpoint": "$LOCAL_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$LROOT/index"],
-      "blob_roots": ["$LROOT/blob"]
+      "index_roots": ["$L_INDEX_ROOT"],
+      "blob_roots": ["$L_BLOB_ROOT"]
     },
     {
       "id": "node-b",
@@ -111,8 +140,8 @@ write_membership() {
       "native_endpoint": "$REMOTE_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$RROOT/index"],
-      "blob_roots": ["$RROOT/blob"]
+      "index_roots": ["$R_INDEX_ROOT"],
+      "blob_roots": ["$R_BLOB_ROOT"]
     }
   ]
 }
@@ -130,8 +159,8 @@ JSON
       "native_endpoint": "$LOCAL_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$LROOT/index"],
-      "blob_roots": ["$LROOT/blob"]
+      "index_roots": ["$L_INDEX_ROOT"],
+      "blob_roots": ["$L_BLOB_ROOT"]
     },
     {
       "id": "node-b",
@@ -139,8 +168,8 @@ JSON
       "native_endpoint": "$REMOTE_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$RROOT/index"],
-      "blob_roots": ["$RROOT/blob"]
+      "index_roots": ["$R_INDEX_ROOT"],
+      "blob_roots": ["$R_BLOB_ROOT"]
     },
     {
       "id": "node-c",
@@ -148,8 +177,8 @@ JSON
       "native_endpoint": "$REMOTE2_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$CROOT/index"],
-      "blob_roots": ["$CROOT/blob"]
+      "index_roots": ["$C_INDEX_ROOT"],
+      "blob_roots": ["$C_BLOB_ROOT"]
     }
   ]
 }
@@ -157,25 +186,25 @@ JSON
 }
 
 write_config() {
-  local path="$1" https_port="$2" native_port="$3" node_id="$4" node_endpoint="$5" native_endpoint="$6" root="$7"
+  local path="$1" https_port="$2" native_port="$3" node_id="$4" node_endpoint="$5" native_endpoint="$6" run_root="$7" index_root="$8" blob_root="$9" fs_root="${10}"
   cat > "$path" <<CFG
 [server]
 host=0.0.0.0
 https_port=$https_port
 native_port=$native_port
-cert_path=$root/cert.pem
-key_path=$root/key.pem
+cert_path=$run_root/cert.pem
+key_path=$run_root/key.pem
 
 [disk_config]
-index_store_disks=$root/index
-blob_store_disks=$root/blob
-fs_storage_path=$root/fs
+index_store_disks=$index_root
+blob_store_disks=$blob_root
+fs_storage_path=$fs_root
 
 [cluster_config]
 node_id=$node_id
 node_endpoint=$node_endpoint
 native_endpoint=$native_endpoint
-membership_file=$root/fs/n2_membership.json
+membership_file=$fs_root/n2_membership.json
 cluster_layout_mode=auto
 fixed_data_shards=
 fixed_parity_shards=
@@ -183,9 +212,6 @@ auto_rebalance=false
 
 [quota_config]
 fragment_quota_backend=disabled
-
-[index_config]
-partition_count=64
 
 [garbage_collector]
 cleanup_interval_seconds=3600
@@ -312,6 +338,7 @@ rss_summary() {
 }
 
 echo "[n2-proof] output=$OUT"
+echo "[n2-proof] storage_layout=$N2_PROOF_STORAGE_LAYOUT"
 if [[ "$N2_PROOF_ALLOW_PKILL" == "1" ]]; then
   pkill -x litiaina-n2 2>/dev/null || true
   ssh_remote "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
@@ -319,11 +346,11 @@ if [[ "$N2_PROOF_ALLOW_PKILL" == "1" ]]; then
     ssh_remote2 "pkill -x litiaina-n2 2>/dev/null || true" >/dev/null || true
   fi
 fi
-mkdir -p "$OUT" "$LROOT/index" "$LROOT/blob" "$LROOT/fs"
+mkdir -p "$OUT" "$LROOT" "$L_INDEX_ROOT" "$L_BLOB_ROOT" "$L_FS_ROOT"
 cp "$BIN" "$CERT" "$KEY" "$LROOT/"
-ssh_remote "rm -rf '$RROOT' && mkdir -p '$RROOT/index' '$RROOT/blob' '$RROOT/fs'"
+ssh_remote "rm -rf '$RROOT' '$R_INDEX_ROOT' '$R_BLOB_ROOT' '$R_FS_ROOT' && mkdir -p '$RROOT' '$R_INDEX_ROOT' '$R_BLOB_ROOT' '$R_FS_ROOT'"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  ssh_remote2 "rm -rf '$CROOT' && mkdir -p '$CROOT/index' '$CROOT/blob' '$CROOT/fs'"
+  ssh_remote2 "rm -rf '$CROOT' '$C_INDEX_ROOT' '$C_BLOB_ROOT' '$C_FS_ROOT' && mkdir -p '$CROOT' '$C_INDEX_ROOT' '$C_BLOB_ROOT' '$C_FS_ROOT'"
 fi
 scp_remote "$BIN" "$CERT" "$KEY" administrator@"$REMOTE_IP":"$RROOT/" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
@@ -334,16 +361,16 @@ scp_remote "$LROOT/n2.env" administrator@"$REMOTE_IP":"$RROOT/n2.env" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   scp_remote2 "$LROOT/n2.env" administrator@"$REMOTE2_IP":"$CROOT/n2.env" >/dev/null
 fi
-write_membership "$LROOT/fs/n2_membership.json"
-scp_remote "$LROOT/fs/n2_membership.json" administrator@"$REMOTE_IP":"$RROOT/fs/n2_membership.json" >/dev/null
+write_membership "$L_FS_ROOT/n2_membership.json"
+scp_remote "$L_FS_ROOT/n2_membership.json" administrator@"$REMOTE_IP":"$R_FS_ROOT/n2_membership.json" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  scp_remote2 "$LROOT/fs/n2_membership.json" administrator@"$REMOTE2_IP":"$CROOT/fs/n2_membership.json" >/dev/null
+  scp_remote2 "$L_FS_ROOT/n2_membership.json" administrator@"$REMOTE2_IP":"$C_FS_ROOT/n2_membership.json" >/dev/null
 fi
-write_config "$LROOT/n2_config.ini" "$LOCAL_HTTPS_PORT" "$LOCAL_NATIVE_PORT" node-a "$LOCAL_BASE" "$LOCAL_NATIVE" "$LROOT"
-write_config "$OUT/node-b-config.ini" "$REMOTE_HTTPS_PORT" "$REMOTE_NATIVE_PORT" node-b "$REMOTE_BASE" "$REMOTE_NATIVE" "$RROOT"
+write_config "$LROOT/n2_config.ini" "$LOCAL_HTTPS_PORT" "$LOCAL_NATIVE_PORT" node-a "$LOCAL_BASE" "$LOCAL_NATIVE" "$LROOT" "$L_INDEX_ROOT" "$L_BLOB_ROOT" "$L_FS_ROOT"
+write_config "$OUT/node-b-config.ini" "$REMOTE_HTTPS_PORT" "$REMOTE_NATIVE_PORT" node-b "$REMOTE_BASE" "$REMOTE_NATIVE" "$RROOT" "$R_INDEX_ROOT" "$R_BLOB_ROOT" "$R_FS_ROOT"
 scp_remote "$OUT/node-b-config.ini" administrator@"$REMOTE_IP":"$RROOT/n2_config.ini" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  write_config "$OUT/node-c-config.ini" "$REMOTE2_HTTPS_PORT" "$REMOTE2_NATIVE_PORT" node-c "$REMOTE2_BASE" "$REMOTE2_NATIVE" "$CROOT"
+  write_config "$OUT/node-c-config.ini" "$REMOTE2_HTTPS_PORT" "$REMOTE2_NATIVE_PORT" node-c "$REMOTE2_BASE" "$REMOTE2_NATIVE" "$CROOT" "$C_INDEX_ROOT" "$C_BLOB_ROOT" "$C_FS_ROOT"
   scp_remote2 "$OUT/node-c-config.ini" administrator@"$REMOTE2_IP":"$CROOT/n2_config.ini" >/dev/null
 fi
 
@@ -352,11 +379,11 @@ start_nodes
 curl_json -X POST "$LOCAL_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\"}" > "$OUT/create-local.json"
 FRAGMENT="$(jq -r '.fragment_hash' "$OUT/create-local.json")"
 STABLE_FRAGMENT="$(jq -r '.stable_fragment_id' "$OUT/create-local.json")"
-curl_json -X POST "$REMOTE_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE_FRAGMENT\"}" > "$OUT/create-remote.json"
-jq -e --arg stable "$STABLE_FRAGMENT" '.stable_fragment_id == $stable' "$OUT/create-remote.json" >/dev/null
+curl_json -X POST "$REMOTE_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" > "$OUT/create-remote.json"
+jq -e '.access_token | type == "string"' "$OUT/create-remote.json" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_json -X POST "$REMOTE2_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE_FRAGMENT\"}" > "$OUT/create-remote2.json"
-  jq -e --arg stable "$STABLE_FRAGMENT" '.stable_fragment_id == $stable' "$OUT/create-remote2.json" >/dev/null
+  curl_json -X POST "$REMOTE2_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" > "$OUT/create-remote2.json"
+  jq -e '.access_token | type == "string"' "$OUT/create-remote2.json" >/dev/null
 else
   printf '{}\n' > "$OUT/create-remote2.json"
 fi
@@ -364,11 +391,16 @@ curl_json -X POST "$LOCAL_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\"
 TOKEN="$(jq -r '.access_token' "$OUT/auth-local.json")"
 curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/cluster-health-initial.json"
 
-dd if="$SOURCE_VIDEO" of="$OUT/mhw-proof.bin" bs=1M count="$PROOF_MIB" status=none
+if [[ -f "$SOURCE_VIDEO" ]]; then
+  dd if="$SOURCE_VIDEO" of="$OUT/mhw-proof.bin" bs=1M count="$PROOF_MIB" status=none
+else
+  dd if=/dev/urandom of="$OUT/mhw-proof.bin" bs=1M count="$PROOF_MIB" status=none
+fi
 sha256sum "$OUT/mhw-proof.bin" > "$OUT/source.sha256"
 split -b 64M -d -a 2 "$OUT/mhw-proof.bin" "$OUT/part-"
 
 KEY_MP="videos/mhw-native-resume-$TS.mp4"
+NODE_LOSS_OBJECT="node-loss/upload-$TS.bin"
 SIZE="$(stat -c%s "$OUT/mhw-proof.bin")"
 PART=67108864
 EXPECTED_PARTS=$(( (SIZE + PART - 1) / PART ))
@@ -433,7 +465,7 @@ if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   curl_json -X POST "$LOCAL_BASE/n2/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$NODE_LOSS_RENAMED\",\"destination_path\":\"$KEY_MP\"}" > "$OUT/node-loss-rename-back.json"
   dd if=/dev/urandom of="$OUT/node-loss-small.bin" bs=4096 count=1 status=none
   start="$(date +%s%N)"
-  node_loss_upload_status="$(curl -k --http1.1 -m 20 -sS -o "$OUT/node-loss-upload-response.json" -w '%{http_code}' -X POST "$LOCAL_BASE/n2/upload/one-shot/node-loss/upload-$TS.bin" -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss-small.bin" || true)"
+  node_loss_upload_status="$(curl -k --http1.1 -m 20 -sS -o "$OUT/node-loss-upload-response.json" -w '%{http_code}' -X POST "$LOCAL_BASE/n2/upload/one-shot/$NODE_LOSS_OBJECT" -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss-small.bin" || true)"
   node_loss_upload_ns=$(( "$(date +%s%N)" - start ))
   printf '{"status":"%s","seconds":%.3f,"bounded":true}\n' "$node_loss_upload_status" "$(awk -v ns="$node_loss_upload_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" > "$OUT/node-loss-upload-bounded.json"
   start_remote_node_b
@@ -450,6 +482,42 @@ fi
 
 curl_auth -G "$LOCAL_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-before-repair.json"
 jq -e '.status == "healthy" and .repairable == true' "$OUT/object-status-before-repair.json" >/dev/null
+
+find "$L_BLOB_ROOT" -path '*/@o_*/*' -name "$VERSION*.ncdx" -print > "$OUT/main-version-ncdx-local.txt"
+ssh_remote "find '$R_BLOB_ROOT' -path '*/@o_*/*' -name '$VERSION*.ncdx' -print" > "$OUT/main-version-ncdx-remote.txt"
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  ssh_remote2 "find '$C_BLOB_ROOT' -path '*/@o_*/*' -name '$VERSION*.ncdx' -print" > "$OUT/main-version-ncdx-remote2.txt"
+else
+  : > "$OUT/main-version-ncdx-remote2.txt"
+fi
+for file in "$OUT/main-version-ncdx-local.txt" "$OUT/main-version-ncdx-remote.txt"; do
+  [[ "$(wc -l < "$file")" -eq 1 ]] || {
+    echo "expected one colocated metadata record for $VERSION in $file" >&2
+    exit 1
+  }
+done
+if [[ "$N2_PROOF_NODE_COUNT" == "3" && "$(wc -l < "$OUT/main-version-ncdx-remote2.txt")" -ne 1 ]]; then
+  echo "expected one colocated metadata record for $VERSION on node-c" >&2
+  exit 1
+fi
+LOCAL_NCDX="$(cat "$OUT/main-version-ncdx-local.txt")"
+REMOTE_NCDX="$(cat "$OUT/main-version-ncdx-remote.txt")"
+LOCAL_NCDX_SHA="$(sha256sum "$LOCAL_NCDX" | awk '{print $1}')"
+REMOTE_NCDX_SHA="$(ssh_remote "sha256sum '$REMOTE_NCDX' | cut -d ' ' -f 1")"
+[[ "$LOCAL_NCDX_SHA" == "$REMOTE_NCDX_SHA" ]] || {
+  echo "immutable .ncdx copies diverged between node-a and node-b" >&2
+  exit 1
+}
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  REMOTE2_NCDX="$(cat "$OUT/main-version-ncdx-remote2.txt")"
+  REMOTE2_NCDX_SHA="$(ssh_remote2 "sha256sum '$REMOTE2_NCDX' | cut -d ' ' -f 1")"
+  [[ "$LOCAL_NCDX_SHA" == "$REMOTE2_NCDX_SHA" ]] || {
+    echo "immutable .ncdx copies diverged between node-a and node-c" >&2
+    exit 1
+  }
+fi
+printf '%s\n' "$LOCAL_NCDX_SHA" > "$OUT/main-version-ncdx.sha256"
+
 curl_auth -X POST -G "$LOCAL_BASE/n2/objects/repair/$KEY_MP" --data-urlencode 'mode=scrub' > "$OUT/object-repair.json"
 curl_auth -G "$REMOTE_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-after-repair-remote.json"
 jq -e '.status == "healthy"' "$OUT/object-status-after-repair-remote.json" >/dev/null
@@ -508,10 +576,10 @@ CVERSION="$(jq -r '.version_id' "$OUT/cancel-init.json")"
 curl_auth -X DELETE -G "$LOCAL_BASE/n2/upload/multipart/$CVERSION" --data-urlencode "object_key=tmp/cancel-$TS.bin" -o "$OUT/cancel-response.json"
 curl_auth "$LOCAL_BASE/n2/upload/multipart/$CVERSION" > "$OUT/cancel-status.json" || true
 
-find "$LROOT/index" \( -path '*/.cluster/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print > "$OUT/forbidden-layout-local.txt"
-ssh_remote "find '$RROOT/index' \( -path '*/.cluster/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print" > "$OUT/forbidden-layout-remote.txt"
+find "$L_INDEX_ROOT" "$L_BLOB_ROOT" \( -path '*/.cluster/*' -o -path '*/.namespace/*' -o -path '*/.intents/*' -o -path '*/.blobs/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print | sort -u > "$OUT/forbidden-layout-local.txt"
+ssh_remote "find '$R_INDEX_ROOT' '$R_BLOB_ROOT' \( -path '*/.cluster/*' -o -path '*/.namespace/*' -o -path '*/.intents/*' -o -path '*/.blobs/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print | sort -u" > "$OUT/forbidden-layout-remote.txt"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  ssh_remote2 "find '$CROOT/index' \( -path '*/.cluster/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print" > "$OUT/forbidden-layout-remote2.txt"
+  ssh_remote2 "find '$C_INDEX_ROOT' '$C_BLOB_ROOT' \( -path '*/.cluster/*' -o -path '*/.namespace/*' -o -path '*/.intents/*' -o -path '*/.blobs/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print | sort -u" > "$OUT/forbidden-layout-remote2.txt"
 else
   : > "$OUT/forbidden-layout-remote2.txt"
 fi
@@ -521,17 +589,42 @@ if [[ -s "$OUT/forbidden-layout-local.txt" || -s "$OUT/forbidden-layout-remote.t
   exit 1
 fi
 
-find "$LROOT/index" -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' > "$OUT/native-peer-locator-strings.txt" || true
-ssh_remote "find '$RROOT/index' -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+if [[ "$N2_PROOF_STORAGE_LAYOUT" == "separated" ]]; then
+  find "$L_INDEX_ROOT" \( \( -path '*/.objects/*' -name '*.ncdx' \) -o -name '*.shard' -o -name '*.parity' \) -print > "$OUT/object-data-on-index-local.txt"
+  ssh_remote "find '$R_INDEX_ROOT' \( \( -path '*/.objects/*' -name '*.ncdx' \) -o -name '*.shard' -o -name '*.parity' \) -print" > "$OUT/object-data-on-index-remote.txt"
+  if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+    ssh_remote2 "find '$C_INDEX_ROOT' \( \( -path '*/.objects/*' -name '*.ncdx' \) -o -name '*.shard' -o -name '*.parity' \) -print" > "$OUT/object-data-on-index-remote2.txt"
+  else
+    : > "$OUT/object-data-on-index-remote2.txt"
+  fi
+  if [[ -s "$OUT/object-data-on-index-local.txt" || -s "$OUT/object-data-on-index-remote.txt" || -s "$OUT/object-data-on-index-remote2.txt" ]]; then
+    echo "immutable object data leaked onto a separated namespace/index root" >&2
+    cat "$OUT"/object-data-on-index-*.txt >&2
+    exit 1
+  fi
+fi
+
+find "$L_BLOB_ROOT" -name '*.ncdx' -print > "$OUT/ncdx-local.txt"
+ssh_remote "find '$R_BLOB_ROOT' -name '*.ncdx' -print" > "$OUT/ncdx-remote.txt"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  ssh_remote2 "find '$CROOT/index' -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+  ssh_remote2 "find '$C_BLOB_ROOT' -name '*.ncdx' -print" > "$OUT/ncdx-remote2.txt"
+else
+  : > "$OUT/ncdx-remote2.txt"
+fi
+NCDX_TOTAL=$(( $(wc -l < "$OUT/ncdx-local.txt") + $(wc -l < "$OUT/ncdx-remote.txt") + $(wc -l < "$OUT/ncdx-remote2.txt") ))
+if (( NCDX_TOTAL == 0 )); then
+  echo "no canonical .ncdx metadata found on shard-bearing disks" >&2
+  exit 1
+fi
+
+find "$L_BLOB_ROOT" -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' > "$OUT/native-peer-locator-strings.txt" || true
+ssh_remote "find '$R_BLOB_ROOT' -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  ssh_remote2 "find '$C_BLOB_ROOT' -name '*.ncdx' -exec strings -a {} + 2>/dev/null | grep -E 'n2-peer|n2%3A' || true" >> "$OUT/native-peer-locator-strings.txt"
 fi
 NATIVE_LOCATORS="$(wc -l < "$OUT/native-peer-locator-strings.txt" | tr -d ' ')"
 
-find "$LROOT/blob" -path '*/.blobs/*' -type f -name '*.shard' | sort | head -1 > "$OUT/deleted-shard.txt"
-if [[ ! -s "$OUT/deleted-shard.txt" ]]; then
-  find "$LROOT/blob" -path '*/.blobs/*' -type f | sort | head -1 > "$OUT/deleted-shard.txt"
-fi
+find "$L_BLOB_ROOT" -path '*/.objects/*/@o_*/*/*' -type f \( -name '*.shard' -o -name '*.parity' \) | sort | head -1 > "$OUT/deleted-shard.txt"
 DELETED="$(cat "$OUT/deleted-shard.txt")"
 if [[ -z "$DELETED" ]]; then
   echo "no local cluster shard found for deletion proof" >&2
@@ -546,8 +639,20 @@ printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s,"deleted_shard":"%s"}\n' "$S
 
 curl_json -X POST "$LOCAL_BASE/n2/cluster/repair/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"videos/\",\"dry_run\":false}" > "$OUT/cluster-repair-start.json"
 wait_job "$LOCAL_BASE/n2/cluster/repair/status" "$OUT/cluster-repair-status.json"
-curl_json -X POST "$LOCAL_BASE/n2/cluster/rebalance/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"videos/\",\"dry_run\":false}" > "$OUT/cluster-rebalance-start.json"
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  curl_auth -G "$LOCAL_BASE/n2/objects/status/$NODE_LOSS_OBJECT" --data-urlencode 'mode=availability' > "$OUT/targeted-rebalance-before.json"
+  jq -e '.layout.state == "older_recorded_layout"' "$OUT/targeted-rebalance-before.json" >/dev/null
+fi
+curl_json -X POST "$LOCAL_BASE/n2/cluster/rebalance/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"node-loss/\",\"dry_run\":false}" > "$OUT/cluster-rebalance-start.json"
 wait_job "$LOCAL_BASE/n2/cluster/rebalance/status" "$OUT/cluster-rebalance-status.json"
+if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
+  curl_auth -G "$LOCAL_BASE/n2/objects/status/$NODE_LOSS_OBJECT" --data-urlencode 'mode=availability' > "$OUT/targeted-rebalance-after.json"
+  jq -e '.status == "healthy" and .layout.state == "current_layout"' "$OUT/targeted-rebalance-after.json" >/dev/null
+  jq -e '.rewritten == 1 and .failed == 0' "$OUT/cluster-rebalance-status.json" >/dev/null
+else
+  printf '{}\n' > "$OUT/targeted-rebalance-before.json"
+  printf '{}\n' > "$OUT/targeted-rebalance-after.json"
+fi
 curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/cluster-health-final.json"
 
 scp_remote administrator@"$REMOTE_IP":"$RROOT/rss-remote.csv" "$OUT/rss-remote.csv" >/dev/null || true
@@ -562,8 +667,16 @@ rss_summary "$OUT/rss-remote2.csv" > "$OUT/rss-remote2-summary.json"
 
 jq -n \
   --arg out "$OUT" \
+  --arg storage_layout "$N2_PROOF_STORAGE_LAYOUT" \
   --arg fragment "$FRAGMENT" \
   --arg stable_fragment "$STABLE_FRAGMENT" \
+  --arg local_index_root "$L_INDEX_ROOT" \
+  --arg local_blob_root "$L_BLOB_ROOT" \
+  --arg remote_index_root "$R_INDEX_ROOT" \
+  --arg remote_blob_root "$R_BLOB_ROOT" \
+  --arg remote2_index_root "$C_INDEX_ROOT" \
+  --arg remote2_blob_root "$C_BLOB_ROOT" \
+  --argjson ncdx_records "$NCDX_TOTAL" \
   --argjson native_locators "$NATIVE_LOCATORS" \
   --slurpfile upload "$OUT/multipart-resume-upload-metrics.json" \
   --slurpfile dl "$OUT/download-local-metrics.json" \
@@ -582,11 +695,13 @@ jq -n \
   --slurpfile recover "$OUT/recover-object.json" \
   --slurpfile repair "$OUT/cluster-repair-status.json" \
   --slurpfile rebalance "$OUT/cluster-rebalance-status.json" \
+  --slurpfile rebalance_before "$OUT/targeted-rebalance-before.json" \
+  --slurpfile rebalance_after "$OUT/targeted-rebalance-after.json" \
   --slurpfile health "$OUT/cluster-health-final.json" \
   --slurpfile rssl "$OUT/rss-local-summary.json" \
   --slurpfile rssr "$OUT/rss-remote-summary.json" \
   --slurpfile rssr2 "$OUT/rss-remote2-summary.json" \
-  '{out:$out, fragment:$fragment, stable_fragment_id:$stable_fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], object_status:$object_status[0], object_repair:$object_repair[0], node_loss:{health_down:$node_loss_health[0], download:$node_loss_download[0], bounded_upload_attempt:$node_loss_upload[0], health_restored:$node_loss_restored[0]}, trash:$trash[0], recover:$recover[0], reconstruct_after_delete:$recon[0], repair:$repair[0], rebalance:$rebalance[0], final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
+  '{out:$out, storage_layout:$storage_layout, roots:{local:{index:$local_index_root,blob:$local_blob_root},remote:{index:$remote_index_root,blob:$remote_blob_root},remote2:{index:$remote2_index_root,blob:$remote2_blob_root}}, canonical_ncdx_records:$ncdx_records, fragment:$fragment, stable_fragment_id:$stable_fragment, native_peer_locator_strings:$native_locators, multipart_resume_upload:$upload[0], download_local:$dl[0], download_remote:$dr[0], download_remote2:$dr2[0], namespace_stress:$ns[0], scale_upload:$scale[0], object_status:$object_status[0], object_repair:$object_repair[0], node_loss:{health_down:$node_loss_health[0], download:$node_loss_download[0], bounded_upload_attempt:$node_loss_upload[0], health_restored:$node_loss_restored[0]}, trash:$trash[0], recover:$recover[0], reconstruct_after_delete:$recon[0], repair:$repair[0], targeted_rebalance:{before:$rebalance_before[0],job:$rebalance[0],after:$rebalance_after[0]}, final_health:$health[0], rss_local:$rssl[0], rss_remote:$rssr[0], rss_remote2:$rssr2[0]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_HARDENING_PROOF_OUT=$OUT"

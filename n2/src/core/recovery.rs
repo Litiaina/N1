@@ -1,6 +1,5 @@
 use crate::core::constants::{GC_SUFFIX, N2_BLOB_DIR};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
-use crate::core::fragment_identity::fragment_root_on;
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
@@ -117,59 +116,62 @@ fn stable_abs_candidates(abs: &str) -> Vec<String> {
     out
 }
 
-fn extract_fragment_version_from_abs(abs: &str) -> Option<(String, String, bool)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShardPathHint {
+    fragment: String,
+    object_id: String,
+    version_id: String,
+}
+
+fn extract_shard_path_hint(abs: &str) -> Option<ShardPathHint> {
     if abs.is_empty() {
         return None;
     }
     let norm = abs.replace('\\', "/");
     let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     let blob_pos = parts.iter().position(|p| *p == N2_BLOB_DIR)?;
-    if blob_pos == 0 || blob_pos + 1 >= parts.len() {
+    if blob_pos == 0 || blob_pos + 6 >= parts.len() {
         return None;
     }
-
-    let is_trash = blob_pos >= 2 && parts[blob_pos - 1] == ".trash";
-    let fragment = if is_trash {
-        if blob_pos < 2 {
-            return None;
-        }
-        parts[blob_pos - 2]
-    } else {
-        parts[blob_pos - 1]
-    };
-
-    let version_id = parts[blob_pos + 1];
-    Some((fragment.to_string(), version_id.to_string(), is_trash))
+    let object_dir = parts[blob_pos + 5];
+    let object_id = object_dir.strip_prefix("@o_")?;
+    let version_id = parts[blob_pos + 6];
+    Some(ShardPathHint {
+        fragment: parts[blob_pos - 1].to_string(),
+        object_id: object_id.to_string(),
+        version_id: version_id.to_string(),
+    })
 }
 
-fn parse_version_dir_hint(version_dir: &Path) -> Option<(String, String, bool)> {
+fn parse_version_dir_hint(version_dir: &Path) -> Option<ShardPathHint> {
     let version_id = version_dir.file_name()?.to_string_lossy().to_string();
-    let blob_dir = version_dir.parent()?;
-    if blob_dir.file_name()?.to_string_lossy() != N2_BLOB_DIR {
+    let object_dir = version_dir.parent()?;
+    let object_id = object_dir
+        .file_name()?
+        .to_string_lossy()
+        .strip_prefix("@o_")?
+        .to_string();
+    let mut cursor = object_dir.parent()?;
+    for _ in 0..4 {
+        cursor = cursor.parent()?;
+    }
+    if cursor.file_name()?.to_string_lossy() != N2_BLOB_DIR {
         return None;
     }
-
-    let up = blob_dir.parent()?;
-    let name = up.file_name()?.to_string_lossy();
-
-    if name == ".trash" {
-        let frag = up.parent()?.file_name()?.to_string_lossy().to_string();
-        return Some((frag, version_id, true));
-    }
-
-    Some((name.to_string(), version_id, false))
+    Some(ShardPathHint {
+        fragment: cursor.parent()?.file_name()?.to_string_lossy().to_string(),
+        object_id,
+        version_id,
+    })
 }
 
-fn shard_dir_on_root(
-    disk_root: &Path,
-    fragment: &str,
-    version_id: &str,
-    is_trash: bool,
-) -> PathBuf {
-    let _ = is_trash;
-    fragment_root_on(disk_root, fragment)
-        .join(N2_BLOB_DIR)
-        .join(version_id)
+fn shard_dir_on_root(disk_root: &Path, hint: &ShardPathHint) -> PathBuf {
+    crate::core::disk_manager::ObjectPathManager::new().get_shard_dir_on_disk(
+        &disk_root.to_path_buf(),
+        &hint.fragment,
+        &hint.object_id,
+        &hint.version_id,
+    )
 }
 
 fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
@@ -333,9 +335,9 @@ async fn get_or_open_shard_ha(
                 .to_string(),
         );
 
-        if let Some((fragment, version_id, is_trash)) = parse_version_dir_hint(vdir) {
+        if let Some(hint) = parse_version_dir_hint(vdir) {
             for root in BLOB_ROOTS.iter() {
-                let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+                let dir = shard_dir_on_root(root.as_path(), &hint);
                 candidates.push(
                     dir.join(&shard_info.file_name)
                         .to_string_lossy()
@@ -345,11 +347,9 @@ async fn get_or_open_shard_ha(
         }
     }
 
-    if let Some((fragment, version_id, is_trash)) =
-        extract_fragment_version_from_abs(&shard_info.absolute_path)
-    {
+    if let Some(hint) = extract_shard_path_hint(&shard_info.absolute_path) {
         for root in BLOB_ROOTS.iter() {
-            let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+            let dir = shard_dir_on_root(root.as_path(), &hint);
             candidates.push(
                 dir.join(&shard_info.file_name)
                     .to_string_lossy()
@@ -405,9 +405,9 @@ async fn get_or_open_shard_fast(
                 .to_string(),
         );
 
-        if let Some((fragment, version_id, is_trash)) = parse_version_dir_hint(vdir) {
+        if let Some(hint) = parse_version_dir_hint(vdir) {
             for root in BLOB_ROOTS.iter() {
-                let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+                let dir = shard_dir_on_root(root.as_path(), &hint);
                 candidates.push(
                     dir.join(&shard_info.file_name)
                         .to_string_lossy()
@@ -417,11 +417,9 @@ async fn get_or_open_shard_fast(
         }
     }
 
-    if let Some((fragment, version_id, is_trash)) =
-        extract_fragment_version_from_abs(&shard_info.absolute_path)
-    {
+    if let Some(hint) = extract_shard_path_hint(&shard_info.absolute_path) {
         for root in BLOB_ROOTS.iter() {
-            let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+            let dir = shard_dir_on_root(root.as_path(), &hint);
             candidates.push(
                 dir.join(&shard_info.file_name)
                     .to_string_lossy()
@@ -932,11 +930,6 @@ mod tests {
     #[tokio::test]
     async fn read_or_recover_chunk_restores_single_data_shard_for_nine_byte_object() {
         let root = std::env::temp_dir().join(format!("n2-recovery-nine-byte-{}", Ulid::new()));
-        let parity_dir = root.join("frag").join(N2_BLOB_DIR).join("ver");
-        fs::create_dir_all(&parity_dir)
-            .await
-            .expect("create parity dir");
-
         let matrix_base = std::env::temp_dir().join(format!("n2-matrix-{}", std::process::id()));
         let index_roots = vec![
             matrix_base.join("index_1").to_string_lossy().to_string(),
@@ -965,6 +958,15 @@ mod tests {
                 .set(matrix_base.to_string_lossy().to_string())
                 .expect("set suite fs root");
         }
+        let object_id = "01KRECOVERYOBJECT0000000000";
+        let version_id = "01KRECOVERYVERSION000000000";
+        let parity_dir = crate::core::disk_manager::ObjectPathManager::new()
+            .get_shard_dir_on_disk(&root, "frag", object_id, version_id);
+        let missing_dir = crate::core::disk_manager::ObjectPathManager::new()
+            .get_shard_dir_on_disk(&root.join("missing"), "frag", object_id, version_id);
+        fs::create_dir_all(&parity_dir)
+            .await
+            .expect("create parity dir");
 
         let mut shard_bytes = vec![0u8; 262_144];
         shard_bytes[..9].copy_from_slice(b"trash-me\n");
@@ -984,11 +986,7 @@ mod tests {
                 ShardInfo {
                     shard_index: 0,
                     file_name: "part_0_shard_0.shard".to_string(),
-                    absolute_path: root
-                        .join("missing")
-                        .join("frag")
-                        .join(N2_BLOB_DIR)
-                        .join("ver")
+                    absolute_path: missing_dir
                         .join("part_0_shard_0.shard")
                         .to_string_lossy()
                         .to_string(),
@@ -1007,32 +1005,17 @@ mod tests {
             ],
         });
 
-        let bytes = read_or_recover_chunk(
-            &mut HashMap::new(),
-            &root
-                .join("missing")
-                .join("frag")
-                .join(N2_BLOB_DIR)
-                .join("ver"),
-            part,
-            0,
-            0,
-            9,
-            262_144,
-        )
-        .await
-        .expect("recover missing shard");
+        let bytes =
+            read_or_recover_chunk(&mut HashMap::new(), &missing_dir, part, 0, 0, 9, 262_144)
+                .await
+                .expect("recover missing shard");
 
         assert_eq!(bytes, b"trash-me\n");
 
         let bytes = read_or_recover_chunk_streaming(
             &mut HashMap::new(),
             &mut HashMap::new(),
-            &root
-                .join("missing")
-                .join("frag")
-                .join(N2_BLOB_DIR)
-                .join("ver"),
+            &missing_dir,
             Arc::new(PartMetadata {
                 part_index: 0,
                 size_bytes: 9,
@@ -1042,11 +1025,7 @@ mod tests {
                     ShardInfo {
                         shard_index: 0,
                         file_name: "part_0_shard_0.shard".to_string(),
-                        absolute_path: root
-                            .join("missing")
-                            .join("frag")
-                            .join(N2_BLOB_DIR)
-                            .join("ver")
+                        absolute_path: missing_dir
                             .join("part_0_shard_0.shard")
                             .to_string_lossy()
                             .to_string(),

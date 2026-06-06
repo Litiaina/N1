@@ -119,9 +119,6 @@ auto_rebalance=false
 [quota_config]
 fragment_quota_backend=disabled
 
-[index_config]
-partition_count=64
-
 [garbage_collector]
 cleanup_interval_seconds=3600
 file_ttl_seconds=3600
@@ -209,9 +206,9 @@ curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/n2/fragments" \
   -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\"}" >"$OUT/create-a.json"
 FRAGMENT="$(jq -r '.fragment_hash' "$OUT/create-a.json")"
 STABLE="$(jq -r '.stable_fragment_id' "$OUT/create-a.json")"
-curl -sk --http1.1 -fsS -X POST "$REMOTE_BASE/n2/fragments" \
+curl -sk --http1.1 -fsS -X POST "$REMOTE_BASE/n2/auth/fragment" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE\"}" >"$OUT/create-b.json"
+  -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" >"$OUT/create-b.json"
 auth
 
 dd if=/dev/urandom of="$OUT/old-layout.bin" bs=1M count="$PROOF_MIB" status=none
@@ -226,9 +223,16 @@ scp_c "$LROOT/fs/n2_membership.json" administrator@"$REMOTE2_IP":"$CROOT/fs/n2_m
 start_c
 start_b
 start_a
-curl -sk --http1.1 -fsS -X POST "$REMOTE2_BASE/n2/fragments" \
-  -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\",\"stable_fragment_id\":\"$STABLE\"}" >"$OUT/create-c.json"
+for _ in $(seq 1 30); do
+  if curl -sk --http1.1 -fsS -X POST "$REMOTE2_BASE/n2/auth/fragment" \
+      -H 'Content-Type: application/json' \
+      -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" \
+      >"$OUT/create-c.json"; then
+    break
+  fi
+  sleep 2
+done
+jq -e '.access_token | type == "string"' "$OUT/create-c.json" >/dev/null
 auth
 
 dd if=/dev/urandom of="$OUT/new-layout.bin" bs=1M count="$PROOF_MIB" status=none

@@ -1,20 +1,26 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 use chrono::Utc;
 use rustix::fs::{CWD, renameat};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
+use crate::core::index;
 use crate::core::index_store::{
     self, PendingUploadBinding, TRASH_DIR, TrashKind, TrashRecord, fragment_root_on,
     internal_namespace_entry_name, latest_summary_metadata_in_object_dir, live_object_dir,
     namespace_path, new_object_id, publish_namespace_link, read_dir_names,
     read_namespace_symlink_object_id, reject_reserved_user_path, scan_trash_records,
     write_pending_binding,
+};
+use crate::distribution::namespace::{
+    PeerNamespaceReadKind, PeerNamespaceReadRequest, PeerNamespaceReadResponse,
+    namespace_read_if_remote,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -31,14 +37,14 @@ pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceObjectRef {
     pub path: String,
     pub object_id: String,
     pub version_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceObjectRefPage {
     pub entries: Vec<NamespaceObjectRef>,
     pub continuation_token: Option<String>,
@@ -103,17 +109,49 @@ impl NamespaceRuntime {
         limit: usize,
         continuation_token: Option<&str>,
     ) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
+        if let Some(PeerNamespaceReadResponse::ListDir {
+            entries,
+            continuation_token,
+        }) = namespace_read_if_remote(PeerNamespaceReadRequest {
+            fragment: fragment.to_string(),
+            kind: PeerNamespaceReadKind::ListDir,
+            path: Some(path.to_string()),
+            include_trashed,
+            limit: Some(limit),
+            continuation_token: continuation_token.map(ToOwned::to_owned),
+            prefix: None,
+        })
+        .await?
+        {
+            return Ok((entries, continuation_token));
+        }
         let fragment = fragment.to_string();
+        let scan_fragment = fragment.clone();
         let path = normalize_user_path(path)?;
         let after = continuation_token.map(ToOwned::to_owned);
-        tokio::task::spawn_blocking(move || {
+        let (mut entries, next) = tokio::task::spawn_blocking(move || {
             if include_trashed {
-                return list_trash_dir_page(&fragment, &path, limit, after.as_deref());
+                return list_trash_dir_page(&scan_fragment, &path, limit, after.as_deref());
             }
-            list_live_dir_page(&fragment, &path, limit, after.as_deref())
+            list_live_dir_page(&scan_fragment, &path, limit, after.as_deref())
         })
         .await
-        .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?
+        .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))??;
+        for entry in entries
+            .iter_mut()
+            .filter(|entry| entry.kind == NamespaceEntryKind::File)
+        {
+            let Some(object_id) = entry.object_id.as_deref() else {
+                continue;
+            };
+            if let Ok(metadata) = index::read_latest_object(fragment.as_str(), object_id).await {
+                entry.size_bytes = Some(metadata.total_size_bytes);
+                entry.version_id = Some(metadata.version_id);
+                entry.created_at_unix = metadata.created_at;
+                entry.updated_at_unix = metadata.created_at;
+            }
+        }
+        Ok((entries, next))
     }
 
     pub async fn entry(
@@ -121,11 +159,39 @@ impl NamespaceRuntime {
         fragment: &str,
         path: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
+        if let Some(PeerNamespaceReadResponse::Entry(entry)) =
+            namespace_read_if_remote(PeerNamespaceReadRequest {
+                fragment: fragment.to_string(),
+                kind: PeerNamespaceReadKind::Entry,
+                path: Some(path.to_string()),
+                include_trashed: false,
+                limit: None,
+                continuation_token: None,
+                prefix: None,
+            })
+            .await?
+        {
+            return Ok(entry);
+        }
         let fragment = fragment.to_string();
+        let scan_fragment = fragment.clone();
         let path = normalize_user_path(path)?;
-        tokio::task::spawn_blocking(move || live_entry(&fragment, &path))
+        let mut entry = tokio::task::spawn_blocking(move || live_entry(&scan_fragment, &path))
             .await
-            .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?
+            .map_err(|err| {
+                AppError::InternalServerError(format!("N2 namespace worker: {err}"))
+            })??;
+        if let Some(entry) = entry.as_mut()
+            && entry.kind == NamespaceEntryKind::File
+            && let Some(object_id) = entry.object_id.as_deref()
+            && let Ok(metadata) = index::read_latest_object(fragment.as_str(), object_id).await
+        {
+            entry.size_bytes = Some(metadata.total_size_bytes);
+            entry.version_id = Some(metadata.version_id);
+            entry.created_at_unix = metadata.created_at;
+            entry.updated_at_unix = metadata.created_at;
+        }
+        Ok(entry)
     }
 
     pub async fn trashed_entry(
@@ -133,11 +199,39 @@ impl NamespaceRuntime {
         fragment: &str,
         path: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
+        if let Some(PeerNamespaceReadResponse::Entry(entry)) =
+            namespace_read_if_remote(PeerNamespaceReadRequest {
+                fragment: fragment.to_string(),
+                kind: PeerNamespaceReadKind::TrashedEntry,
+                path: Some(path.to_string()),
+                include_trashed: true,
+                limit: None,
+                continuation_token: None,
+                prefix: None,
+            })
+            .await?
+        {
+            return Ok(entry);
+        }
         let fragment = fragment.to_string();
+        let scan_fragment = fragment.clone();
         let path = normalize_user_path(path)?;
-        tokio::task::spawn_blocking(move || trash_entry(&fragment, &path))
+        let mut entry = tokio::task::spawn_blocking(move || trash_entry(&scan_fragment, &path))
             .await
-            .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?
+            .map_err(|err| {
+                AppError::InternalServerError(format!("N2 namespace worker: {err}"))
+            })??;
+        if let Some(entry) = entry.as_mut()
+            && entry.kind == NamespaceEntryKind::File
+            && let Some(object_id) = entry.object_id.as_deref()
+            && let Ok(metadata) = index::read_latest_object(fragment.as_str(), object_id).await
+        {
+            entry.size_bytes = Some(metadata.total_size_bytes);
+            entry.version_id = Some(metadata.version_id);
+            entry.created_at_unix = metadata.created_at;
+            entry.updated_at_unix = metadata.created_at;
+        }
+        Ok(entry)
     }
 
     pub async fn head_for_path(
@@ -148,8 +242,10 @@ impl NamespaceRuntime {
         let Some(object_id) = self.resolve_live_object_id(fragment, path).await? else {
             return Ok(None);
         };
-        let Some(meta) = index_store::read_current_live_head(fragment, &object_id)? else {
-            return Ok(None);
+        let meta = match index::read_latest_object(fragment, &object_id).await {
+            Ok(meta) => meta,
+            Err(AppError::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
         };
         Ok(Some(object_head_from_meta(
             fragment,
@@ -165,7 +261,7 @@ impl NamespaceRuntime {
     ) -> Result<HashMap<String, ObjectHead>, AppError> {
         let mut out = HashMap::new();
         for object_id in object_ids {
-            if let Some(meta) = index_store::read_current_live_head(fragment, object_id)? {
+            if let Ok(meta) = index::read_latest_object(fragment, object_id).await {
                 out.insert(
                     object_id.clone(),
                     object_head_from_meta(fragment, LifecycleState::Live, meta),
@@ -186,7 +282,7 @@ impl NamespaceRuntime {
                 return Ok(false);
             }
             let mut created = false;
-            for root in index_roots() {
+            for root in namespace_roots(&fragment) {
                 let dir = fragment_root_on(&root, &fragment).join(&path);
                 if !dir.exists() {
                     created = true;
@@ -363,19 +459,30 @@ impl NamespaceRuntime {
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
         let mut snapshot = NamespaceReachabilitySnapshot::default();
-        for object_id in index_store::referenced_object_ids(fragment)? {
-            for meta in index_store::list_live_versions(fragment, &object_id)? {
+        let object_ids = match namespace_read_if_remote(PeerNamespaceReadRequest {
+            fragment: fragment.to_string(),
+            kind: PeerNamespaceReadKind::Reachability,
+            path: None,
+            include_trashed: true,
+            limit: None,
+            continuation_token: None,
+            prefix: None,
+        })
+        .await?
+        {
+            Some(PeerNamespaceReadResponse::Reachability(object_ids)) => object_ids,
+            Some(_) => {
+                return Err(AppError::InternalServerError(
+                    "N2 namespace reachability returned the wrong response kind".into(),
+                ));
+            }
+            None => index_store::referenced_object_ids(fragment)?,
+        };
+        for object_id in object_ids {
+            for meta in index::list_live_object_versions_metadata(fragment, &object_id).await? {
                 snapshot.referenced_object_ids.insert(object_id.clone());
                 snapshot.referenced_version_ids.insert(meta.version_id);
             }
-        }
-        for record in scan_trash_records(fragment)? {
-            snapshot
-                .referenced_object_ids
-                .extend(record.object_keys.iter().cloned());
-            snapshot
-                .referenced_version_ids
-                .extend(record.version_ids.iter().cloned());
         }
         Ok(Some(snapshot))
     }
@@ -400,6 +507,20 @@ impl NamespaceRuntime {
         fragment: &str,
         path: &str,
     ) -> Result<Option<String>, AppError> {
+        if let Some(PeerNamespaceReadResponse::ObjectId(object_id)) =
+            namespace_read_if_remote(PeerNamespaceReadRequest {
+                fragment: fragment.to_string(),
+                kind: PeerNamespaceReadKind::ResolveLiveObject,
+                path: Some(path.to_string()),
+                include_trashed: false,
+                limit: None,
+                continuation_token: None,
+                prefix: None,
+            })
+            .await?
+        {
+            return Ok(object_id);
+        }
         let fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
         tokio::task::spawn_blocking(move || resolve_live_object_id_sync(&fragment, &path))
@@ -454,12 +575,11 @@ impl NamespaceRuntime {
         fragment: &str,
         logical_path: &str,
         physical_object_id: &str,
-        metadata: &ObjectMetadata,
+        _metadata: &ObjectMetadata,
     ) -> Result<String, AppError> {
         let fragment = fragment.to_string();
         let logical_path = normalize_user_path(logical_path)?;
         let physical_object_id = physical_object_id.to_string();
-        let mut metadata = metadata.clone();
         let lock_key = format!("{fragment}\0{logical_path}");
         let lock = {
             let mut locks = FINALIZE_LOCKS.lock().await;
@@ -485,12 +605,13 @@ impl NamespaceRuntime {
             };
 
             if final_object_id != physical_object_id {
-                metadata.object_key = final_object_id.clone();
-                index_store::upsert_live_version(&metadata)?;
-                index_store::delete_unreferenced_object_index(&fragment, &physical_object_id)?;
+                return Err(AppError::Conflict(format!(
+                    "logical path '{}' was concurrently committed to another immutable object",
+                    logical_path
+                )));
             }
 
-            for root in index_roots() {
+            for root in namespace_roots_for_path(&fragment, &logical_path) {
                 publish_namespace_link(&root, &fragment, &logical_path, &final_object_id)?;
             }
             Ok(final_object_id)
@@ -582,6 +703,132 @@ impl NamespaceRuntime {
         }
     }
 
+    async fn list_object_refs_page(
+        &self,
+        fragment: &str,
+        prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        limit: usize,
+        include_trashed: bool,
+    ) -> Result<NamespaceObjectRefPage, AppError> {
+        if let Some(PeerNamespaceReadResponse::ObjectRefs(page)) =
+            namespace_read_if_remote(PeerNamespaceReadRequest {
+                fragment: fragment.to_string(),
+                kind: PeerNamespaceReadKind::ObjectRefs,
+                path: None,
+                include_trashed,
+                limit: Some(limit),
+                continuation_token: continuation_token.map(ToOwned::to_owned),
+                prefix: prefix.map(ToOwned::to_owned),
+            })
+            .await?
+        {
+            return Ok(page);
+        }
+        let fragment = fragment.to_string();
+        let prefix = prefix
+            .map(normalize_user_path)
+            .transpose()?
+            .unwrap_or_default();
+        let after = continuation_token.map(ToOwned::to_owned);
+        let scan_fragment = fragment.clone();
+        let page =
+            tokio::task::spawn_blocking(move || -> Result<NamespaceObjectRefPage, AppError> {
+                let mut entries = Vec::new();
+                let mut seen = HashSet::new();
+                for root in namespace_roots(&scan_fragment) {
+                    let fragment_root = fragment_root_on(&root, &scan_fragment);
+                    let base = if include_trashed {
+                        fragment_root.join(TRASH_DIR).join(&prefix)
+                    } else {
+                        fragment_root.join(&prefix)
+                    };
+                    if let Some(object_id) =
+                        read_namespace_symlink_object_id(&root, &scan_fragment, &base)?
+                    {
+                        if after
+                            .as_ref()
+                            .is_some_and(|cursor| prefix.as_str() <= cursor.as_str())
+                        {
+                            continue;
+                        }
+                        if seen.insert(prefix.clone()) {
+                            entries.push(NamespaceObjectRef {
+                                path: prefix.clone(),
+                                object_id,
+                                version_id: String::new(),
+                            });
+                        }
+                        continue;
+                    }
+                    let mut stack = vec![(base, prefix.clone())];
+                    while let Some((dir, rel)) = stack.pop() {
+                        if !dir.is_dir() {
+                            continue;
+                        }
+                        for name in read_dir_names(&dir)? {
+                            if internal_namespace_entry_name(&name) {
+                                continue;
+                            }
+                            let child = dir.join(&name);
+                            let child_rel = if rel.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{rel}/{name}")
+                            };
+                            if after
+                                .as_ref()
+                                .is_some_and(|cursor| child_rel.as_str() <= cursor.as_str())
+                            {
+                                continue;
+                            }
+                            if let Some(object_id) =
+                                read_namespace_symlink_object_id(&root, &scan_fragment, &child)?
+                            {
+                                if !seen.insert(child_rel.clone()) {
+                                    continue;
+                                }
+                                entries.push(NamespaceObjectRef {
+                                    path: child_rel,
+                                    object_id,
+                                    version_id: String::new(),
+                                });
+                            } else if child.is_dir() {
+                                stack.push((child, child_rel));
+                            }
+                        }
+                    }
+                }
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                let continuation_token = if entries.len() > limit {
+                    entries.truncate(limit);
+                    entries.last().map(|entry| entry.path.clone())
+                } else {
+                    None
+                };
+                Ok(NamespaceObjectRefPage {
+                    entries,
+                    continuation_token,
+                })
+            })
+            .await
+            .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?;
+        let mut page = page?;
+        let object_ids = page
+            .entries
+            .iter()
+            .map(|entry| entry.object_id.clone())
+            .collect::<Vec<_>>();
+        let heads =
+            crate::distribution::peer::resolve_cluster_object_heads(&fragment, &object_ids).await?;
+        for entry in &mut page.entries {
+            if let Some(metadata) = heads.get(&entry.object_id) {
+                entry.version_id = metadata.version_id.clone();
+            }
+        }
+        Ok(page)
+    }
+
     pub async fn list_live_object_refs_page(
         &self,
         fragment: &str,
@@ -589,108 +836,28 @@ impl NamespaceRuntime {
         continuation_token: Option<&str>,
         limit: usize,
     ) -> Result<NamespaceObjectRefPage, AppError> {
-        let fragment = fragment.to_string();
-        let prefix = prefix
-            .map(normalize_user_path)
-            .transpose()?
-            .unwrap_or_default();
-        let after = continuation_token.map(ToOwned::to_owned);
-        tokio::task::spawn_blocking(move || {
-            let mut entries = Vec::new();
-            let mut seen = HashSet::new();
-            for root in index_roots() {
-                let fragment_root = fragment_root_on(&root, &fragment);
-                let base = fragment_root.join(&prefix);
-                if let Some(object_id) = read_namespace_symlink_object_id(&root, &fragment, &base)?
-                {
-                    if after
-                        .as_ref()
-                        .is_some_and(|cursor| prefix.as_str() <= cursor.as_str())
-                    {
-                        continue;
-                    }
-                    if seen.insert(prefix.clone()) {
-                        let object_dir = live_object_dir(&root, &fragment, &object_id)?;
-                        if let Some(meta) = latest_summary_metadata_in_object_dir(
-                            &fragment,
-                            &object_id,
-                            &object_dir,
-                        )? {
-                            entries.push(NamespaceObjectRef {
-                                path: prefix.clone(),
-                                object_id,
-                                version_id: meta.version_id,
-                            });
-                        }
-                    }
-                    continue;
-                }
-                let mut stack = vec![(base, prefix.clone())];
-                while let Some((dir, rel)) = stack.pop() {
-                    if !dir.is_dir() {
-                        continue;
-                    }
-                    for name in read_dir_names(&dir)? {
-                        if internal_namespace_entry_name(&name) {
-                            continue;
-                        }
-                        let child = dir.join(&name);
-                        let child_rel = if rel.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{rel}/{name}")
-                        };
-                        if after
-                            .as_ref()
-                            .is_some_and(|cursor| child_rel.as_str() <= cursor.as_str())
-                        {
-                            continue;
-                        }
-                        if let Some(object_id) =
-                            read_namespace_symlink_object_id(&root, &fragment, &child)?
-                        {
-                            if !seen.insert(child_rel.clone()) {
-                                continue;
-                            }
-                            let object_dir = live_object_dir(&root, &fragment, &object_id)?;
-                            let Some(meta) = latest_summary_metadata_in_object_dir(
-                                &fragment,
-                                &object_id,
-                                &object_dir,
-                            )?
-                            else {
-                                continue;
-                            };
-                            entries.push(NamespaceObjectRef {
-                                path: child_rel,
-                                object_id,
-                                version_id: meta.version_id,
-                            });
-                        } else if child.is_dir() {
-                            stack.push((child, child_rel));
-                        }
-                    }
-                }
-            }
-            entries.sort_by(|a, b| a.path.cmp(&b.path));
-            let continuation_token = if entries.len() > limit {
-                entries.truncate(limit);
-                entries.last().map(|entry| entry.path.clone())
-            } else {
-                None
-            };
-            Ok(NamespaceObjectRefPage {
-                entries,
-                continuation_token,
-            })
-        })
-        .await
-        .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))?
+        self.list_object_refs_page(fragment, prefix, continuation_token, limit, false)
+            .await
+    }
+
+    pub async fn list_trash_object_refs_page(
+        &self,
+        fragment: &str,
+        prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        limit: usize,
+    ) -> Result<NamespaceObjectRefPage, AppError> {
+        self.list_object_refs_page(fragment, prefix, continuation_token, limit, true)
+            .await
     }
 }
 
-fn index_roots() -> Vec<PathBuf> {
-    crate::core::disk_manager::ObjectPathManager::new().get_all_index_roots()
+fn namespace_roots(fragment: &str) -> Vec<PathBuf> {
+    crate::core::disk_manager::ObjectPathManager::new().get_all_namespace_roots(fragment)
+}
+
+fn namespace_roots_for_path(fragment: &str, path: &str) -> Vec<PathBuf> {
+    crate::core::disk_manager::ObjectPathManager::new().get_namespace_roots_for_path(fragment, path)
 }
 
 fn io_err(err: std::io::Error, context: &str) -> AppError {
@@ -794,17 +961,10 @@ fn live_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppE
     if internal_namespace_entry_name(base_name(path).as_str()) {
         return Ok(None);
     }
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let direct = namespace_path(&root, fragment, path);
         if let Some(object_id) = read_namespace_symlink_object_id(&root, fragment, &direct)? {
-            let object_dir = live_object_dir(&root, fragment, &object_id)?;
-            let Some(meta) =
-                latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
-            else {
-                continue;
-            };
-            let size_time = Some((meta.created_at, meta.created_at));
-            let mut entry = namespace_entry(
+            return Ok(Some(namespace_entry(
                 fragment,
                 path.to_string(),
                 NamespaceEntryKind::File,
@@ -812,11 +972,8 @@ fn live_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppE
                 LifecycleState::Live,
                 None,
                 None,
-                size_time,
-            );
-            entry.size_bytes = Some(meta.total_size_bytes);
-            entry.version_id = Some(meta.version_id);
-            return Ok(Some(entry));
+                None,
+            )));
         }
         if direct.is_dir() && !internal_namespace_entry_name(base_name(path).as_str()) {
             return Ok(Some(namespace_entry(
@@ -845,7 +1002,7 @@ fn list_live_dir_page(
     }
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let dir = fragment_root_on(&root, fragment).join(path);
         if !dir.is_dir() {
             continue;
@@ -868,14 +1025,7 @@ fn list_live_dir_page(
                 if !seen.insert(display_name.clone()) {
                     continue;
                 }
-                let object_dir = live_object_dir(&root, fragment, &object_id)?;
-                let Some(meta) =
-                    latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
-                else {
-                    continue;
-                };
-                let size_time = Some((meta.created_at, meta.created_at));
-                let mut entry = namespace_entry(
+                entries.push(namespace_entry(
                     fragment,
                     child_path,
                     NamespaceEntryKind::File,
@@ -883,11 +1033,8 @@ fn list_live_dir_page(
                     LifecycleState::Live,
                     None,
                     None,
-                    size_time,
-                );
-                entry.size_bytes = Some(meta.total_size_bytes);
-                entry.version_id = Some(meta.version_id);
-                entries.push(entry);
+                    None,
+                ));
             } else if child.is_dir() {
                 if !seen.insert(display_name.clone()) {
                     continue;
@@ -958,7 +1105,7 @@ fn trash_child_paths(fragment: &str, path: &str) -> Result<Vec<String>, AppError
 
 fn direct_trash_child_paths(fragment: &str, path: &str) -> Result<Vec<String>, AppError> {
     let mut seen = BTreeSet::new();
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let dir = fragment_root_on(&root, fragment).join(TRASH_DIR).join(path);
         if !dir.is_dir() {
             continue;
@@ -979,7 +1126,7 @@ fn direct_trash_child_paths(fragment: &str, path: &str) -> Result<Vec<String>, A
 }
 
 fn trash_path_is_dir(fragment: &str, path: &str) -> Result<bool, AppError> {
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let trash_path = fragment_root_on(&root, fragment).join(TRASH_DIR).join(path);
         match fs::symlink_metadata(&trash_path) {
             Ok(meta) => return Ok(meta.is_dir()),
@@ -1022,7 +1169,7 @@ fn trash_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, App
     if internal_namespace_entry_name(base_name(path).as_str()) {
         return Ok(None);
     }
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let trash_path = fragment_root_on(&root, fragment).join(TRASH_DIR).join(path);
         let meta = match fs::symlink_metadata(&trash_path) {
             Ok(meta) => meta,
@@ -1105,10 +1252,15 @@ fn rename_live_path(
     let Some(entry) = live_entry(fragment, source)? else {
         return Err(AppError::NotFound);
     };
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
+    let destination_roots = if entry.kind == NamespaceEntryKind::File {
+        namespace_roots_for_path(fragment, destination)
+    } else {
+        namespace_roots(fragment)
+    };
+    for root in &destination_roots {
+        let fragment_root = fragment_root_on(root, fragment);
         let destination_path = if entry.kind == NamespaceEntryKind::File {
-            namespace_path(&root, fragment, destination)
+            namespace_path(root, fragment, destination)
         } else {
             fragment_root.join(destination)
         };
@@ -1119,27 +1271,49 @@ fn rename_live_path(
             )));
         }
     }
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
-        let source_path = if entry.kind == NamespaceEntryKind::File {
-            namespace_path(&root, fragment, source)
-        } else {
-            fragment_root.join(source)
-        };
-        if !path_exists_no_follow(&source_path) {
-            continue;
-        }
-        let destination_path = if entry.kind == NamespaceEntryKind::File {
-            namespace_path(&root, fragment, destination)
-        } else {
-            fragment_root.join(destination)
-        };
+
+    if entry.kind == NamespaceEntryKind::File {
+        let source_roots = namespace_roots_for_path(fragment, source);
+        let destination_root = destination_roots.first().ok_or_else(|| {
+            AppError::InternalServerError("N2 namespace has no destination partition root".into())
+        })?;
+        let destination_path = namespace_path(destination_root, fragment, destination);
         if let Some(parent) = destination_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| io_err(e, "create rename destination parent"))?;
         }
-        renameat(CWD, &source_path, CWD, &destination_path)
-            .map_err(|e| AppError::InternalServerError(format!("N2 namespace rename: {e}")))?;
+        let mut moved = false;
+        for root in source_roots {
+            let source_path = namespace_path(&root, fragment, source);
+            if !path_exists_no_follow(&source_path) {
+                continue;
+            }
+            let object_id = read_namespace_symlink_object_id(&root, fragment, &source_path)?
+                .ok_or_else(|| AppError::InternalServerError("N2 file namespace entry is not an object link".into()))?;
+            unix_fs::symlink(format!("@o_{object_id}"), &destination_path)
+                .map_err(|e| io_err(e, "create cross-partition rename namespace link"))?;
+            fs::remove_file(&source_path)
+                .map_err(|e| io_err(e, "remove old cross-partition namespace link"))?;
+            moved = true;
+        }
+        if !moved {
+            return Err(AppError::NotFound);
+        }
+    } else {
+        for root in namespace_roots(fragment) {
+            let fragment_root = fragment_root_on(&root, fragment);
+            let source_path = fragment_root.join(source);
+            if !path_exists_no_follow(&source_path) {
+                continue;
+            }
+            let destination_path = fragment_root.join(destination);
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| io_err(e, "create rename destination parent"))?;
+            }
+            renameat(CWD, &source_path, CWD, &destination_path)
+                .map_err(|e| AppError::InternalServerError(format!("N2 namespace rename: {e}")))?;
+        }
     }
     Ok(NamespaceMutationSummary {
         operation: "rename".to_string(),
@@ -1160,7 +1334,7 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
     let deleted_at = Utc::now().timestamp();
     let source_relative = path.to_string();
     let affected_objects = usize::from(entry.kind == NamespaceEntryKind::File);
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let fragment_root = fragment_root_on(&root, fragment);
         let src = fragment_root.join(&source_relative);
         if !path_exists_no_follow(&src) {
@@ -1236,7 +1410,7 @@ fn select_trash_record(
     if target.is_empty() {
         return Err(AppError::NotFound);
     }
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let trash_path = fragment_root_on(&root, fragment)
             .join(TRASH_DIR)
             .join(target);
@@ -1295,7 +1469,7 @@ fn recover_trash_path(
     trash_entry_id: Option<&str>,
 ) -> Result<NamespaceMutationSummary, AppError> {
     let record = select_trash_record(fragment, path, trash_entry_id)?;
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let fragment_root = fragment_root_on(&root, fragment);
         let src = fragment_root
             .join(TRASH_DIR)
@@ -1339,7 +1513,7 @@ fn purge_trash(
     trash_entry_id: Option<&str>,
 ) -> Result<NamespaceMutationSummary, AppError> {
     let record = select_trash_record(fragment, path, trash_entry_id)?;
-    for root in index_roots() {
+    for root in namespace_roots(fragment) {
         let trash_root = fragment_root_on(&root, fragment)
             .join(TRASH_DIR)
             .join(&record.source_relative_path);
@@ -1399,13 +1573,16 @@ pub fn unexpected_response(status: axum::http::StatusCode, context: &str) -> App
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::disk_manager::{INDEX_STORE_DISKS, ObjectMetadata};
+    use crate::core::disk_manager::{
+        BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager,
+    };
     use crate::core::index_store;
     use ulid::Ulid;
 
     fn ensure_test_index_roots() -> Vec<PathBuf> {
         let base = std::env::temp_dir().join("n2-index-tests");
         let roots = vec![base.join("index-00"), base.join("index-01")];
+        let blob_roots = vec![base.join("blob-00"), base.join("blob-01")];
         if INDEX_STORE_DISKS.get().is_none() {
             INDEX_STORE_DISKS
                 .set(
@@ -1415,6 +1592,16 @@ mod tests {
                         .collect::<Vec<_>>(),
                 )
                 .expect("set N2 test index roots");
+        }
+        if BLOB_STORE_DISKS.get().is_none() {
+            BLOB_STORE_DISKS
+                .set(
+                    blob_roots
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("set N2 test blob roots");
         }
         let configured = INDEX_STORE_DISKS.get().expect("N2 test roots");
         for root in configured {
@@ -1426,6 +1613,7 @@ mod tests {
     fn test_metadata(fragment: &str, object_key: &str, size: u64) -> ObjectMetadata {
         ObjectMetadata {
             object_key: object_key.to_string(),
+            packed_ext_u64: crate::core::index_store::packed_extension_key(object_key),
             fragment: fragment.to_string(),
             version_id: Ulid::new().to_string(),
             upload_session_id: "session".to_string(),
@@ -1443,16 +1631,26 @@ mod tests {
     }
 
     fn publish_logical_object(
-        roots: &[PathBuf],
+        _roots: &[PathBuf],
         fragment: &str,
         logical_path: &str,
         size: u64,
     ) -> String {
         let object_id = new_object_id();
-        index_store::upsert_live_version(&test_metadata(fragment, &object_id, size))
-            .expect("publish N2 ndx");
-        for root in roots {
-            publish_namespace_link(root, fragment, logical_path, &object_id)
+        let metadata = test_metadata(fragment, &object_id, size);
+        let path_manager = ObjectPathManager::new();
+        for root in path_manager.get_blob_roots() {
+            fs::create_dir_all(path_manager.get_shard_dir_on_disk(
+                &root,
+                fragment,
+                &object_id,
+                &metadata.version_id,
+            ))
+            .expect("create shard-bearing object version");
+        }
+        index_store::upsert_live_version(&metadata).expect("publish N2 ndx");
+        for root in path_manager.get_namespace_roots_for_path(fragment, logical_path) {
+            publish_namespace_link(&root, fragment, logical_path, &object_id)
                 .expect("publish namespace link");
         }
         object_id
@@ -1492,8 +1690,17 @@ mod tests {
             .expect("select object id for overwrite");
         assert_eq!(selected, object_id);
 
-        index_store::upsert_live_version(&test_metadata(&fragment, &selected, 456))
-            .expect("publish second version");
+        let second = test_metadata(&fragment, &selected, 456);
+        for root in ObjectPathManager::new().get_blob_roots() {
+            fs::create_dir_all(ObjectPathManager::new().get_shard_dir_on_disk(
+                &root,
+                &fragment,
+                &selected,
+                &second.version_id,
+            ))
+            .expect("create second shard-bearing object version");
+        }
+        index_store::upsert_live_version(&second).expect("publish second version");
         assert_eq!(
             index_store::list_live_versions(&fragment, &selected)
                 .expect("live versions")
@@ -1512,6 +1719,18 @@ mod tests {
         let second_object_id = new_object_id();
         let first = test_metadata(&fragment, &first_object_id, 111);
         let second = test_metadata(&fragment, &second_object_id, 222);
+        let path_manager = ObjectPathManager::new();
+        for metadata in [&first, &second] {
+            for root in path_manager.get_blob_roots() {
+                fs::create_dir_all(path_manager.get_shard_dir_on_disk(
+                    &root,
+                    &fragment,
+                    &metadata.object_key,
+                    &metadata.version_id,
+                ))
+                .expect("create provisional shard-bearing object version");
+            }
+        }
         index_store::upsert_live_version(&first).expect("publish first provisional version");
         index_store::upsert_live_version(&second).expect("publish second provisional version");
 
@@ -1521,11 +1740,13 @@ mod tests {
             .expect("finalize first writer");
         assert_eq!(committed_first, first_object_id);
 
-        let committed_second = global_namespace_runtime()
+        let second_result = global_namespace_runtime()
             .finalize_logical_upload(&fragment, logical_path, &second_object_id, &second)
-            .await
-            .expect("finalize second writer under existing path");
-        assert_eq!(committed_second, first_object_id);
+            .await;
+        assert!(
+            matches!(second_result, Err(AppError::Conflict(_))),
+            "a concurrent immutable object identity must not be silently merged"
+        );
 
         assert_eq!(
             global_namespace_runtime()
@@ -1536,16 +1757,12 @@ mod tests {
         );
         let versions =
             index_store::list_live_versions(&fragment, &first_object_id).expect("live versions");
-        assert_eq!(versions.len(), 2);
-        assert!(
-            versions
-                .iter()
-                .all(|meta| meta.object_key == first_object_id)
-        );
+        assert_eq!(versions.len(), 1);
         assert!(
             index_store::read_current_live_head(&fragment, &second_object_id)
-                .expect("read stale provisional object")
-                .is_none()
+                .expect("read orphaned provisional object")
+                .is_some(),
+            "the losing immutable object remains an unreachable orphan until GC"
         );
     }
 
@@ -1572,15 +1789,21 @@ mod tests {
                 .expect("resolve moved symlink"),
             Some(object_id.clone())
         );
-        for root in &roots {
-            let link = fragment_root_on(root, &fragment).join("archive/docs/a/video.mp4");
+        let mut checked_link = false;
+        for root in ObjectPathManager::new().get_all_namespace_roots(&fragment) {
+            let link = fragment_root_on(&root, &fragment).join("archive/docs/a/video.mp4");
+            if !path_exists_no_follow(&link) {
+                continue;
+            }
             let target = fs::read_link(&link).expect("read namespace link");
             assert_eq!(
                 target,
                 PathBuf::from(format!("@o_{object_id}")),
                 "namespace links store stable object ids, not depth-relative paths"
             );
+            checked_link = true;
         }
+        assert!(checked_link, "moved folder namespace link should exist");
     }
 
     #[tokio::test]
@@ -1597,20 +1820,26 @@ mod tests {
         assert_eq!(summary.operation, "trash");
         assert_eq!(summary.affected_objects, 1);
 
-        for root in &roots {
+        let mut trash_anchor_seen = false;
+        for root in ObjectPathManager::new().get_all_namespace_roots(&fragment) {
             assert!(!path_exists_no_follow(
-                &fragment_root_on(root, &fragment).join("video/my-video.mp4")
+                &fragment_root_on(&root, &fragment).join("video/my-video.mp4")
             ));
-            assert!(path_exists_no_follow(
-                &fragment_root_on(root, &fragment)
+            if path_exists_no_follow(
+                &fragment_root_on(&root, &fragment)
                     .join(TRASH_DIR)
-                    .join("video/my-video.mp4")
-            ));
+                    .join("video/my-video.mp4"),
+            ) {
+                trash_anchor_seen = true;
+            }
+        }
+        assert!(trash_anchor_seen, "soft delete should materialize a trash anchor");
+        for root in ObjectPathManager::new().get_blob_roots() {
             assert!(
-                live_object_dir(root, &fragment, &object_id)
+                live_object_dir(&root, &fragment, &object_id)
                     .expect("object dir")
                     .is_dir(),
-                "soft delete must not move immutable object index"
+                "soft delete must not move immutable object record"
             );
         }
 
@@ -1618,24 +1847,26 @@ mod tests {
             .purge_trash_path(&fragment, "video/my-video.mp4")
             .await
             .expect("hard delete single trash item");
-        for root in &roots {
+        for root in ObjectPathManager::new().get_namespace_roots(&fragment) {
             assert!(!path_exists_no_follow(
-                &fragment_root_on(root, &fragment)
+                &fragment_root_on(&root, &fragment)
                     .join(TRASH_DIR)
                     .join("video/my-video.mp4")
             ));
+        }
+        for root in ObjectPathManager::new().get_blob_roots() {
             assert!(
-                live_object_dir(root, &fragment, &object_id)
+                live_object_dir(&root, &fragment, &object_id)
                     .expect("object dir")
                     .exists(),
-                "hard delete must only retire namespace; GC reclaims headless object index later"
+                "hard delete must only retire namespace; GC reclaims headless object record later"
             );
         }
         assert!(
             !index_store::referenced_object_ids(&fragment)
                 .expect("referenced object ids")
                 .contains(&object_id),
-            "purged trash item must leave object index headless for GC"
+            "purged trash item must leave object record headless for GC"
         );
     }
 

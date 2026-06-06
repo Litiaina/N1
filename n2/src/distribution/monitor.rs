@@ -7,6 +7,7 @@ use crate::distribution::membership::{
     ClusterNode, active_cluster_runtime, live_active_write_nodes, live_readable_nodes,
 };
 use crate::distribution::namespace::{NamespaceLedgerSummary, namespace_local_ledger_summary};
+use crate::distribution::namespace_group::namespace_partition_count;
 use crate::distribution::peer::{
     PeerMonitorResponse, cluster_secret, local_peer_monitor_snapshot, peer_http_client,
 };
@@ -619,16 +620,15 @@ fn namespace_consensus_summary(
     let mut notes = vec![
         "namespace mutation is quorum-gated; immutable object/layout metadata is not consensus-mutated after commit".to_string(),
     ];
-    let local_ledger =
-        fragment
-            .as_deref()
-            .and_then(|fragment| match namespace_local_ledger_summary(fragment) {
-                Ok(summary) => Some(summary),
-                Err(err) => {
-                    notes.push(format!("local namespace ledger summary failed: {err}"));
-                    None
-                }
-            });
+    let local_ledger = fragment.as_deref().and_then(|fragment| {
+        match aggregate_local_namespace_ledger(fragment) {
+            Ok(summary) => Some(summary),
+            Err(err) => {
+                notes.push(format!("local namespace ledger summary failed: {err}"));
+                None
+            }
+        }
+    });
     let status = if local_ledger.is_some() {
         "ledger_available"
     } else if fragment.is_some() {
@@ -646,6 +646,41 @@ fn namespace_consensus_summary(
         status,
         notes,
     }
+}
+
+fn aggregate_local_namespace_ledger(fragment: &str) -> Result<NamespaceLedgerSummary, AppError> {
+    let mut aggregate = NamespaceLedgerSummary {
+        fragment: fragment.to_string(),
+        partition_id: 0,
+        local_requests: 0,
+        committed_log_index: 0,
+        last_mutation_id: None,
+        last_kind: None,
+        last_source_path: None,
+        last_destination_path: None,
+        last_object_id: None,
+        last_version_id: None,
+        request_ledger_path: format!(".n2/namespace-ledger/{fragment}/<partition>.requests.jsonl"),
+    };
+    for partition_id in 0..namespace_partition_count() {
+        let summary = namespace_local_ledger_summary(fragment, partition_id)?;
+        aggregate.local_requests = aggregate
+            .local_requests
+            .saturating_add(summary.local_requests);
+        aggregate.committed_log_index = aggregate
+            .committed_log_index
+            .saturating_add(summary.committed_log_index);
+        if summary.last_mutation_id.is_some() {
+            aggregate.partition_id = partition_id;
+            aggregate.last_mutation_id = summary.last_mutation_id;
+            aggregate.last_kind = summary.last_kind;
+            aggregate.last_source_path = summary.last_source_path;
+            aggregate.last_destination_path = summary.last_destination_path;
+            aggregate.last_object_id = summary.last_object_id;
+            aggregate.last_version_id = summary.last_version_id;
+        }
+    }
+    Ok(aggregate)
 }
 
 fn summarize_uploads(nodes: &[ClusterMonitorNode]) -> ClusterUploadActivitySummary {

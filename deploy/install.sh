@@ -302,9 +302,6 @@ auto_rebalance=false
 [quota_config]
 fragment_quota_backend=disabled
 
-[index_config]
-partition_count=64
-
 [garbage_collector]
 cleanup_interval_seconds=3600
 file_ttl_seconds=3600

@@ -210,6 +210,7 @@ pub(crate) async fn download_object_chunk_from_metadata(
                 let shard_dir = path_manager.get_shard_dir_on_disk(
                     target_disk,
                     &metadata.fragment,
+                    &metadata.object_key,
                     &metadata.version_id,
                 );
 
@@ -341,6 +342,7 @@ where
                 let shard_dir = path_manager.get_shard_dir_on_disk(
                     target_disk,
                     &metadata.fragment,
+                    &metadata.object_key,
                     &metadata.version_id,
                 );
 

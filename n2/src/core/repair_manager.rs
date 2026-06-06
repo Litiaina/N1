@@ -3,11 +3,10 @@ use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use crate::core::fragment_identity::{
-    fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
+    list_fragment_aliases, physical_fragment_root_on, stable_fragment_id_for_root,
 };
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
-use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
@@ -579,6 +578,7 @@ fn expected_shard_path(
     path_manager: &ObjectPathManager,
     blob_roots: &[PathBuf],
     fragment: &str,
+    object_id: &str,
     version_id: &str,
     part_index: u64,
     shard_index: usize,
@@ -593,7 +593,7 @@ fn expected_shard_path(
         return None;
     }
     let disk_root = &blob_roots[disk_idx];
-    let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment, version_id);
+    let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment, object_id, version_id);
     let name = stable_shard_file_name(part_index, shard_index, is_parity);
     Some(shard_dir.join(name))
 }
@@ -602,6 +602,7 @@ async fn normalize_part_paths_for_repair(
     path_manager: &ObjectPathManager,
     blob_roots: &[PathBuf],
     fragment: &str,
+    object_id: &str,
     version_id: &str,
     mut part: PartMetadata,
 ) -> PartMetadata {
@@ -617,6 +618,7 @@ async fn normalize_part_paths_for_repair(
             path_manager,
             blob_roots,
             fragment,
+            object_id,
             version_id,
             part.part_index,
             shard.shard_index,
@@ -688,6 +690,7 @@ async fn inspect_object_parts(
             &path_manager,
             &blob_roots,
             &meta.fragment,
+            &meta.object_key,
             &meta.version_id,
             part.clone(),
         )
@@ -963,8 +966,9 @@ pub async fn stop_repair_job_api(
     Ok((StatusCode::OK, "Stop signal sent to repair manager."))
 }
 
-async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
+async fn list_all_fragments(index_roots: &[PathBuf], blob_roots: &[PathBuf]) -> Vec<String> {
     let roots = index_roots.to_vec();
+    let blob_roots = blob_roots.to_vec();
     tokio::task::spawn_blocking(move || {
         let mut out = HashSet::new();
         for root in roots {
@@ -972,11 +976,16 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
                 continue;
             }
             for name in list_fragment_aliases(&root) {
-                if fragment_root_on(&root, &name)
-                    .join(FRAGMENT_METADATA_FILE)
-                    .is_file()
-                {
-                    out.insert(stable_fragment_id_for_root(&root, &name).unwrap_or(name));
+                let Some(stable) = stable_fragment_id_for_root(&root, &name) else {
+                    continue;
+                };
+                let has_metadata = blob_roots.iter().any(|blob_root| {
+                    physical_fragment_root_on(blob_root, &stable)
+                        .join(FRAGMENT_METADATA_FILE)
+                        .is_file()
+                });
+                if has_metadata {
+                    out.insert(stable);
                 }
             }
         }
@@ -1124,13 +1133,14 @@ async fn replicate_bytes_strict(
 }
 
 async fn repair_fragment_metadata_replicas(
-    index_roots: &[PathBuf],
+    blob_roots: &[PathBuf],
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let paths: Vec<PathBuf> = index_roots
+    let stable_fragment = ObjectPathManager::new().resolve_stable_fragment_id(fragment);
+    let paths: Vec<PathBuf> = blob_roots
         .iter()
-        .map(|r| fragment_root_on(r, fragment).join(FRAGMENT_METADATA_FILE))
+        .map(|r| physical_fragment_root_on(r, &stable_fragment).join(FRAGMENT_METADATA_FILE))
         .collect();
 
     let valid = |b: &[u8]| -> bool { rmp_serde::from_slice::<serde_json::Value>(b).is_ok() };
@@ -1149,14 +1159,6 @@ async fn repair_fragment_metadata_replicas(
     let canon = reps[best].bytes.clone().unwrap();
     let (m, d) = replicate_bytes_strict(&paths, &canon, dry_run).await?;
     Ok((m, d, 0))
-}
-
-async fn repair_fragment_index_db(
-    _index_roots: &[PathBuf],
-    fragment: &str,
-    dry_run: bool,
-) -> Result<(u64, u64, u64), AppError> {
-    index_store::repair_fragment_all_partition_replicas(fragment, dry_run)
 }
 
 async fn process_object_repair(
@@ -1186,6 +1188,7 @@ async fn process_object_repair(
             &path_manager,
             blob_roots,
             &meta_arc.fragment,
+            &meta_arc.object_key,
             &meta_arc.version_id,
             part.clone(),
         )
@@ -1362,7 +1365,7 @@ pub async fn run_repair_job_with_options(
     let shard_repair_sem = Arc::new(Semaphore::new(cfg.shard_repair_concurrency));
     let fragments = match cfg.target_fragment.as_ref() {
         Some(fragment) => vec![fragment.clone()],
-        None => list_all_fragments(&index_roots).await,
+        None => list_all_fragments(&index_roots, &blob_roots).await,
     };
 
     info!(
@@ -1397,7 +1400,7 @@ pub async fn run_repair_job_with_options(
         }
 
         let (fmiss, fdiv, fcorrupt) =
-            repair_fragment_metadata_replicas(&index_roots, &fragment_hash, cfg.dry_run).await?;
+            repair_fragment_metadata_replicas(&blob_roots, &fragment_hash, cfg.dry_run).await?;
 
         {
             let mut status = REPAIR_STATUS.write().await;
@@ -1410,29 +1413,7 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing N2 index replicas {}", fragment_hash);
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-        }
-
-        let (pmiss, pdiv, pcorrupt) =
-            repair_fragment_index_db(&index_roots, &fragment_hash, cfg.dry_run).await?;
-
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.missing_meta_repaired += pmiss;
-            status.divergent_meta_repaired += pdiv;
-            status.corrupt_found += pcorrupt;
-            status.total_repaired += pmiss + pdiv;
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-        }
-
-        if !cfg.dry_run && (pmiss > 0 || pdiv > 0 || pcorrupt > 0) {
-            global_namespace_runtime().evict_fragment(&fragment_hash);
-        }
-
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing N2 index replicas {}", fragment_hash);
+            status.phase = format!("Synchronizing N2 namespace log {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1450,7 +1431,7 @@ pub async fn run_repair_job_with_options(
                 || namespace_report.divergent_repaired > 0
                 || namespace_report.corrupt_found > 0
             {
-                status.last_repaired = Some(format!("index:{}", fragment_hash));
+                status.last_repaired = Some(format!("namespace:{}", fragment_hash));
                 status.last_disagreement = namespace_report.selected_source.clone();
             }
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
@@ -1775,11 +1756,13 @@ mod tests {
     async fn list_all_fragments_ignores_filesystem_trash_directories() {
         let base = std::env::temp_dir().join(format!("n2-repair-fragments-{}", Ulid::new()));
         let index_root = base.join("index-root");
+        let blob_root = base.join("blob-root");
         fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(&blob_root).expect("create blob root");
 
         let real_fragment = "real-fragment";
         let stable_fragment = "stable-fragment";
-        let real_fragment_dir = physical_fragment_root_on(&index_root, stable_fragment);
+        let real_fragment_dir = physical_fragment_root_on(&blob_root, stable_fragment);
         fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
         fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
             .expect("write fragment metadata marker");
@@ -1793,7 +1776,7 @@ mod tests {
         fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
         fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
 
-        let fragments = list_all_fragments(&[index_root]).await;
+        let fragments = list_all_fragments(&[index_root], &[blob_root]).await;
         assert_eq!(fragments, vec![stable_fragment.to_string()]);
 
         let _ = fs::remove_dir_all(base);

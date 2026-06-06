@@ -47,11 +47,11 @@ N2-native operators, peers, tools, and future internal systems.
 N2 stores object data as immutable versions. Each committed version has:
 
 - a namespace path used by users and APIs, such as `videos/mhw.mp4`;
-- an immutable object identity and version record;
+- a direct namespace pointer to an immutable `@o_<object-id>`;
+- an immutable `.ncdx` version record colocated with shard data;
 - shard and parity payloads placed across active cluster nodes;
 - a recorded layout, so reads use the layout that actually wrote the object;
-- a namespace head that can move, rename, trash, recover, or point to a newer
-  version without rewriting payload data.
+- max-ULID head selection without a mutable latest pointer.
 
 The result is simple operational behavior:
 
@@ -65,6 +65,12 @@ The result is simple operational behavior:
 - cluster monitoring exposes overview, nodes, topology, object-layout health,
   redistribution, jobs, namespace consensus, and upload activity in one
   efficient `/n2/cluster/monitor` snapshot.
+
+N2 supports separated and shared disk roles. With separated roots, fast index
+storage holds mutable namespace/control state while capacity storage holds
+colocated `.ncdx` and shard/parity data. With a shared root, the exact same path
+is configured for both roles and N2 maintains one canonical tree without a
+second metadata plane.
 
 ## Coordination Model
 
@@ -263,7 +269,11 @@ cargo test -p n2_native_client
 Run the N2 native hardening harness:
 
 ```bash
-scripts/bench/run_n2_hardening_native_proof.sh
+N2_PROOF_STORAGE_LAYOUT=separated \
+  scripts/bench/run_n2_hardening_native_proof.sh
+
+N2_PROOF_STORAGE_LAYOUT=shared \
+  scripts/bench/run_n2_hardening_native_proof.sh
 ```
 
 Run installer dry-run proof:
@@ -288,8 +298,10 @@ existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
 - N2 `1.0.0` means the product shape and architecture are finalized enough for
   the 1.0 line.
 - It is not an LTS statement yet.
-- Long soak, larger cluster proof, node loss/re-add proof, and wider UI
-  viewport proof remain release-validation work.
+- Long soak, clusters larger than three nodes, and wider UI viewport proof
+  remain release-validation work.
+- Earlier development layouts are intentionally rejected rather than migrated;
+  the 1.0 line uses the documented index/blob role split.
 - Per-fragment quota is monitoring-only in N2. Enforcement belongs in a
   business layer outside this repository.
 - S3 compatibility is not part of the N2 core. If needed, it should live as an

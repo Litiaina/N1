@@ -1,10 +1,11 @@
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
-use crate::core::disk_manager::{ObjectPathManager, ShardInfo};
+use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, ShardInfo};
 use crate::core::monitoring::system_health_snapshot;
 use crate::core::quota_manager::{
     FragmentBlobUsage, StorageRootUsage, StorageUsage, get_fragment_blob_usage,
     get_storage_root_usage, get_storage_usage,
 };
+use crate::core::{index, index_store};
 use crate::distribution::membership::active_cluster_runtime;
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::{
@@ -28,6 +29,7 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -102,11 +104,53 @@ pub struct PeerShardTarget {
     pub node_id: String,
     pub endpoint: String,
     pub fragment: String,
+    pub object_id: String,
     pub version_id: String,
     pub part_index: u64,
     pub shard_index: usize,
     pub is_parity: bool,
     pub expected_len: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerObjectMetadataRequest {
+    pub metadata: ObjectMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerObjectResolveRequest {
+    pub fragment: String,
+    pub object_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerObjectBatchResolveRequest {
+    pub fragment: String,
+    pub object_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PeerFragmentControlRequest {
+    Provision {
+        fragment_hash: String,
+        stable_fragment_id: String,
+        key: String,
+    },
+    Rename {
+        current_hash: String,
+        new_hash: String,
+        stable_fragment_id: String,
+    },
+    RotateKey {
+        fragment_hash: String,
+        key: String,
+    },
+    Delete {
+        stable_fragment_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -279,6 +323,7 @@ async fn native_put_peer_shard(
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
         fragment: target.fragment.clone(),
+        object_id: target.object_id.clone(),
         version_id: target.version_id.clone(),
         part_index: target.part_index,
         shard_index: target.shard_index,
@@ -418,6 +463,527 @@ pub(crate) fn authorize_peer(headers: &HeaderMap) -> Result<(), AppError> {
     } else {
         Err(AppError::Forbidden("N2 peer secret mismatch".into()))
     }
+}
+
+async fn post_object_metadata(endpoint: &str, metadata: &ObjectMetadata) -> Result<(), AppError> {
+    let client = peer_http_client()?;
+    let url = format!("{}/n2/peer/objects/publish", endpoint.trim_end_matches('/'));
+    let mut request = client.post(url).json(&PeerObjectMetadataRequest {
+        metadata: metadata.clone(),
+    });
+    if let Some(secret) = cluster_secret() {
+        request = request.header("x-n2-cluster-secret", secret);
+    }
+    let response = request
+        .timeout(PEER_WRITE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| {
+            AppError::ServiceUnavailable(format!("publish N2 object metadata to {endpoint}: {err}"))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::ServiceUnavailable(format!(
+            "publish N2 object metadata to {endpoint} returned {status}: {body}"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Result<(), AppError> {
+    let runtime = active_cluster_runtime()?;
+    let mut participant_ids = BTreeMap::<String, ()>::new();
+    for shard in metadata.parts.iter().flat_map(|part| part.shards.iter()) {
+        let locator = parse_peer_shard_locator(&shard.absolute_path).ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "N2 committed shard {} has no native placement locator",
+                shard.file_name
+            ))
+        })?;
+        participant_ids.insert(locator.node_id, ());
+    }
+    if participant_ids.is_empty() {
+        return Err(AppError::InternalServerError(
+            "N2 object metadata has no shard-bearing participants".into(),
+        ));
+    }
+
+    let mut tasks = futures_util::stream::FuturesUnordered::new();
+    for node_id in participant_ids.into_keys() {
+        let endpoint = runtime
+            .membership
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .map(|node| node.endpoint.clone())
+            .ok_or_else(|| {
+                AppError::InternalServerError(format!(
+                    "N2 shard-bearing participant {node_id} is absent from membership"
+                ))
+            })?;
+        let metadata = metadata.clone();
+        let local_node_id = runtime.local_node_id.clone();
+        tasks.push(async move {
+            if node_id == local_node_id {
+                index::publish_object(&metadata).await
+            } else {
+                post_object_metadata(&endpoint, &metadata).await
+            }
+        });
+    }
+
+    while let Some(result) = tasks.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+pub async fn peer_publish_object_metadata(
+    headers: HeaderMap,
+    Json(request): Json<PeerObjectMetadataRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    index::publish_object(&request.metadata).await?;
+    Ok(StatusCode::CREATED)
+}
+
+fn local_object_metadata(
+    request: &PeerObjectResolveRequest,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    if let Some(version_id) = request.version_id.as_deref() {
+        return Ok(index_store::read_live_version(
+            &request.fragment,
+            &request.object_id,
+            version_id,
+        )?
+        .into_iter()
+        .collect());
+    }
+    index_store::list_live_versions(&request.fragment, &request.object_id)
+}
+
+fn local_object_metadata_heads(
+    request: &PeerObjectBatchResolveRequest,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    if request.object_ids.len() > 10_000 {
+        return Err(AppError::BadRequest(
+            "object metadata batch exceeds 10000 ids".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    for object_id in &request.object_ids {
+        if let Some(metadata) = index_store::read_current_live_head(&request.fragment, object_id)? {
+            out.push(metadata);
+        }
+    }
+    Ok(out)
+}
+
+async fn post_object_resolve(
+    endpoint: &str,
+    request: &PeerObjectResolveRequest,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let client = peer_http_client()?;
+    let url = format!("{}/n2/peer/objects/resolve", endpoint.trim_end_matches('/'));
+    let mut builder = client.post(url).json(request);
+    if let Some(secret) = cluster_secret() {
+        builder = builder.header("x-n2-cluster-secret", secret);
+    }
+    let response = builder
+        .timeout(PEER_READ_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| {
+            AppError::ServiceUnavailable(format!(
+                "resolve N2 object metadata from {endpoint}: {err}"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "resolve N2 object metadata from {endpoint} returned {}",
+            response.status()
+        )));
+    }
+    response.json::<Vec<ObjectMetadata>>().await.map_err(|err| {
+        AppError::InternalServerError(format!("decode N2 object metadata from {endpoint}: {err}"))
+    })
+}
+
+async fn post_object_batch_resolve(
+    endpoint: &str,
+    request: &PeerObjectBatchResolveRequest,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let client = peer_http_client()?;
+    let url = format!(
+        "{}/n2/peer/objects/resolve-batch",
+        endpoint.trim_end_matches('/')
+    );
+    let mut builder = client.post(url).json(request);
+    if let Some(secret) = cluster_secret() {
+        builder = builder.header("x-n2-cluster-secret", secret);
+    }
+    let response = builder
+        .timeout(PEER_READ_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| {
+            AppError::ServiceUnavailable(format!(
+                "resolve N2 object metadata batch from {endpoint}: {err}"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "resolve N2 object metadata batch from {endpoint} returned {}",
+            response.status()
+        )));
+    }
+    response.json::<Vec<ObjectMetadata>>().await.map_err(|err| {
+        AppError::InternalServerError(format!(
+            "decode N2 object metadata batch from {endpoint}: {err}"
+        ))
+    })
+}
+
+fn merge_immutable_object_record(
+    by_object: &mut BTreeMap<String, ObjectMetadata>,
+    record: ObjectMetadata,
+) -> Result<(), AppError> {
+    let object_id = record.object_key.clone();
+    match by_object.get(&object_id) {
+        Some(existing)
+            if existing.version_id == record.version_id
+                && (existing.membership_epoch != record.membership_epoch
+                    || existing.data_shards != record.data_shards
+                    || existing.parity_shards != record.parity_shards
+                    || existing.total_size_bytes != record.total_size_bytes) =>
+        {
+            Err(AppError::InternalServerError(format!(
+                "divergent immutable N2 metadata for object {} version {}",
+                object_id, record.version_id
+            )))
+        }
+        Some(existing) if existing.version_id >= record.version_id => Ok(()),
+        _ => {
+            by_object.insert(object_id, record);
+            Ok(())
+        }
+    }
+}
+
+pub async fn resolve_cluster_object_heads(
+    fragment: &str,
+    object_ids: &[String],
+) -> Result<BTreeMap<String, ObjectMetadata>, AppError> {
+    if object_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if object_ids.len() > 10_000 {
+        return Err(AppError::BadRequest(
+            "object metadata batch exceeds 10000 ids".into(),
+        ));
+    }
+    let request = PeerObjectBatchResolveRequest {
+        fragment: fragment.to_string(),
+        object_ids: object_ids.to_vec(),
+    };
+    let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() else {
+        return local_object_metadata_heads(&request).map(|records| {
+            records
+                .into_iter()
+                .map(|record| (record.object_key.clone(), record))
+                .collect()
+        });
+    };
+
+    let mut tasks = futures_util::stream::FuturesUnordered::new();
+    for node in runtime.membership.readable_nodes() {
+        let request = request.clone();
+        let local_node_id = runtime.local_node_id.clone();
+        tasks.push(async move {
+            if node.id == local_node_id {
+                local_object_metadata_heads(&request)
+            } else {
+                post_object_batch_resolve(&node.endpoint, &request).await
+            }
+        });
+    }
+
+    let mut by_object = BTreeMap::new();
+    let mut successful_nodes = 0usize;
+    while let Some(result) = tasks.next().await {
+        let Ok(records) = result else {
+            continue;
+        };
+        successful_nodes += 1;
+        for record in records {
+            merge_immutable_object_record(&mut by_object, record)?;
+        }
+    }
+    if successful_nodes == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "no N2 metadata-bearing node was reachable".into(),
+        ));
+    }
+    Ok(by_object)
+}
+
+pub async fn resolve_cluster_object_versions(
+    fragment: &str,
+    object_id: &str,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let request = PeerObjectResolveRequest {
+        fragment: fragment.to_string(),
+        object_id: object_id.to_string(),
+        version_id: None,
+    };
+    let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() else {
+        return local_object_metadata(&request);
+    };
+    let mut tasks = futures_util::stream::FuturesUnordered::new();
+    for node in runtime.membership.readable_nodes() {
+        let request = request.clone();
+        let local_node_id = runtime.local_node_id.clone();
+        tasks.push(async move {
+            if node.id == local_node_id {
+                local_object_metadata(&request)
+            } else {
+                post_object_resolve(&node.endpoint, &request).await
+            }
+        });
+    }
+
+    let mut by_version = BTreeMap::<String, ObjectMetadata>::new();
+    let mut successful_nodes = 0usize;
+    while let Some(result) = tasks.next().await {
+        let Ok(records) = result else {
+            continue;
+        };
+        successful_nodes += 1;
+        for record in records {
+            match by_version.get(&record.version_id) {
+                Some(existing)
+                    if existing.membership_epoch != record.membership_epoch
+                        || existing.data_shards != record.data_shards
+                        || existing.parity_shards != record.parity_shards
+                        || existing.total_size_bytes != record.total_size_bytes =>
+                {
+                    return Err(AppError::InternalServerError(format!(
+                        "divergent immutable N2 metadata for object {} version {}",
+                        object_id, record.version_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    by_version.insert(record.version_id.clone(), record);
+                }
+            }
+        }
+    }
+    if successful_nodes == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "no N2 metadata-bearing node was reachable".into(),
+        ));
+    }
+    Ok(by_version.into_values().collect())
+}
+
+pub async fn resolve_cluster_object_version(
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+) -> Result<Option<ObjectMetadata>, AppError> {
+    Ok(resolve_cluster_object_versions(fragment, object_id)
+        .await?
+        .into_iter()
+        .find(|metadata| metadata.version_id == version_id))
+}
+
+pub async fn peer_resolve_object_metadata(
+    headers: HeaderMap,
+    Json(request): Json<PeerObjectResolveRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(local_object_metadata(&request)?))
+}
+
+pub async fn peer_resolve_object_metadata_batch(
+    headers: HeaderMap,
+    Json(request): Json<PeerObjectBatchResolveRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(local_object_metadata_heads(&request)?))
+}
+
+async fn apply_fragment_control(request: &PeerFragmentControlRequest) -> Result<(), AppError> {
+    match request {
+        PeerFragmentControlRequest::Provision {
+            fragment_hash,
+            stable_fragment_id,
+            key,
+        } => {
+            crate::core::fragment_manager::provision_fragment_local(
+                fragment_hash,
+                stable_fragment_id,
+                key,
+            )
+            .await
+        }
+        PeerFragmentControlRequest::Rename {
+            current_hash,
+            new_hash,
+            stable_fragment_id,
+        } => {
+            crate::core::fragment_manager::rename_fragment_alias_local(
+                current_hash,
+                new_hash,
+                stable_fragment_id,
+            )
+            .await
+        }
+        PeerFragmentControlRequest::RotateKey { fragment_hash, key } => {
+            crate::core::fragment_manager::rotate_fragment_key_local(fragment_hash, key).await
+        }
+        PeerFragmentControlRequest::Delete { stable_fragment_id } => {
+            crate::core::fragment_manager::delete_fragment_local(stable_fragment_id)
+        }
+    }
+}
+
+pub async fn replicate_fragment_control(
+    request: PeerFragmentControlRequest,
+) -> Result<(), AppError> {
+    let runtime = active_cluster_runtime()?;
+    let client = peer_http_client()?;
+    for node in runtime
+        .membership
+        .nodes
+        .iter()
+        .filter(|node| node.id != runtime.local_node_id)
+    {
+        let mut builder = client
+            .post(format!(
+                "{}/n2/peer/fragments/control",
+                node.endpoint.trim_end_matches('/')
+            ))
+            .json(&request);
+        if let Some(secret) = cluster_secret() {
+            builder = builder.header("x-n2-cluster-secret", secret);
+        }
+        let response = timeout(Duration::from_secs(20), builder.send())
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable(format!("fragment control timed out at {}", node.id))
+            })?
+            .map_err(|err| {
+                AppError::ServiceUnavailable(format!(
+                    "fragment control failed at {}: {err}",
+                    node.id
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::ServiceUnavailable(format!(
+                "fragment control returned {} from {}",
+                response.status(),
+                node.id
+            )));
+        }
+    }
+    apply_fragment_control(&request).await
+}
+
+async fn peer_fragment_snapshot(headers: HeaderMap) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(
+        crate::core::fragment_manager::local_fragment_control_snapshot().await?,
+    ))
+}
+
+pub async fn sync_fragment_controls_from_cluster() -> Result<usize, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let client = peer_http_client()?;
+    let mut by_alias =
+        BTreeMap::<String, crate::core::fragment_manager::FragmentControlSnapshot>::new();
+
+    for node in runtime
+        .membership
+        .nodes
+        .iter()
+        .filter(|node| node.id != runtime.local_node_id)
+    {
+        let mut request = client.get(format!(
+            "{}/n2/peer/fragments/snapshot",
+            node.endpoint.trim_end_matches('/')
+        ));
+        if let Some(secret) = cluster_secret() {
+            request = request.header("x-n2-cluster-secret", secret);
+        }
+        let response = match timeout(Duration::from_secs(10), request.send()).await {
+            Ok(Ok(response)) if response.status().is_success() => response,
+            _ => continue,
+        };
+        let snapshots = response
+            .json::<Vec<crate::core::fragment_manager::FragmentControlSnapshot>>()
+            .await
+            .map_err(|err| {
+                AppError::InternalServerError(format!(
+                    "decode fragment control snapshot from {}: {err}",
+                    node.id
+                ))
+            })?;
+        for snapshot in snapshots {
+            if let Some(existing) = by_alias.get(&snapshot.fragment_hash)
+                && existing.metadata.fragment != snapshot.metadata.fragment
+            {
+                return Err(AppError::Conflict(format!(
+                    "fragment alias {} resolves to conflicting stable identities {} and {}",
+                    snapshot.fragment_hash, existing.metadata.fragment, snapshot.metadata.fragment
+                )));
+            }
+            by_alias
+                .entry(snapshot.fragment_hash.clone())
+                .or_insert(snapshot);
+        }
+    }
+
+    let mut applied = 0usize;
+    for snapshot in by_alias.into_values() {
+        if let Ok(local) =
+            crate::core::fragment_metadata::read_fragment_metadata(&snapshot.fragment_hash).await
+            && local.fragment == snapshot.metadata.fragment
+            && local.updated >= snapshot.metadata.updated
+        {
+            continue;
+        }
+        crate::core::fragment_manager::apply_fragment_control_snapshot_local(&snapshot).await?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+pub fn spawn_fragment_control_sync_task() {
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match sync_fragment_controls_from_cluster().await {
+                Ok(0) => {}
+                Ok(count) => {
+                    tracing::debug!("synchronized {count} N2 fragment control record(s)")
+                }
+                Err(err) => tracing::warn!("fragment control synchronization failed: {err}"),
+            }
+        }
+    });
+}
+
+async fn peer_fragment_control(
+    headers: HeaderMap,
+    Json(request): Json<PeerFragmentControlRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    apply_fragment_control(&request).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn local_peer_usage_snapshot(
@@ -566,6 +1132,7 @@ pub struct PeerShardLocator {
     pub node_id: String,
     pub endpoint: String,
     pub fragment: String,
+    pub object_id: String,
     pub version_id: String,
     pub part_index: u64,
     pub shard_index: usize,
@@ -574,10 +1141,11 @@ pub struct PeerShardLocator {
 
 pub fn encode_peer_shard_locator(target: &PeerShardTarget) -> String {
     format!(
-        "n2-peer|{}|{}|{}|{}|{}|{}|{}",
+        "n2-peer|{}|{}|{}|{}|{}|{}|{}|{}",
         encode_segment(&target.node_id),
         encode_segment(&target.endpoint),
         encode_segment(&target.fragment),
+        encode_segment(&target.object_id),
         encode_segment(&target.version_id),
         target.part_index,
         target.shard_index,
@@ -593,6 +1161,7 @@ pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
     let node_id = decode_segment(parts.next()?)?;
     let endpoint = decode_segment(parts.next()?)?;
     let fragment = decode_segment(parts.next()?)?;
+    let object_id = decode_segment(parts.next()?)?;
     let version_id = decode_segment(parts.next()?)?;
     let part_index = parts.next()?.parse().ok()?;
     let shard_index = parts.next()?.parse().ok()?;
@@ -601,6 +1170,7 @@ pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
         node_id,
         endpoint,
         fragment,
+        object_id,
         version_id,
         part_index,
         shard_index,
@@ -610,9 +1180,10 @@ pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
 
 fn peer_shard_url(target: &PeerShardTarget) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}?parity={}&expected_len={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?parity={}&expected_len={}",
         target.endpoint.trim_end_matches('/'),
         encode_segment(&target.fragment),
+        encode_segment(&target.object_id),
         encode_segment(&target.version_id),
         target.part_index,
         target.shard_index,
@@ -623,9 +1194,10 @@ fn peer_shard_url(target: &PeerShardTarget) -> String {
 
 fn peer_shard_read_url(locator: &PeerShardLocator, offset: u64, length: usize) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}?parity={}&offset={}&length={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?parity={}&offset={}&length={}",
         locator.endpoint.trim_end_matches('/'),
         encode_segment(&locator.fragment),
+        encode_segment(&locator.object_id),
         encode_segment(&locator.version_id),
         locator.part_index,
         locator.shard_index,
@@ -724,6 +1296,7 @@ async fn native_get_peer_shard(
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
         fragment: locator.fragment.clone(),
+        object_id: locator.object_id.clone(),
         version_id: locator.version_id.clone(),
         part_index: locator.part_index,
         shard_index: locator.shard_index,
@@ -834,6 +1407,7 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
 
 fn shard_dir(
     fragment: &str,
+    object_id: &str,
     version_id: &str,
     part_index: u64,
     shard_index: usize,
@@ -846,12 +1420,18 @@ fn shard_dir(
         ));
     }
     let disk_idx = (part_index as usize + shard_index) % roots.len();
-    Ok(pm.get_shard_dir_on_disk(&roots[disk_idx], fragment, version_id))
+    Ok(pm.get_shard_dir_on_disk(&roots[disk_idx], fragment, object_id, version_id))
 }
 
 pub async fn peer_put_shard(
     headers: HeaderMap,
-    Path((fragment, version_id, part_index, shard_index)): Path<(String, String, u64, usize)>,
+    Path((fragment, object_id, version_id, part_index, shard_index)): Path<(
+        String,
+        String,
+        String,
+        u64,
+        usize,
+    )>,
     Query(query): Query<PeerShardQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
@@ -859,7 +1439,7 @@ pub async fn peer_put_shard(
     let started = Instant::now();
     let is_parity = query.parity.unwrap_or(false);
     let expected_len = query.expected_len.unwrap_or(0);
-    let dir = shard_dir(&fragment, &version_id, part_index, shard_index)?;
+    let dir = shard_dir(&fragment, &object_id, &version_id, part_index, shard_index)?;
     fs::create_dir_all(&dir)
         .await
         .map_err(|e| AppError::Io(e, format!("create peer shard dir {}", dir.display())))?;
@@ -931,11 +1511,17 @@ pub async fn peer_put_shard(
 
 pub async fn peer_get_shard(
     headers: HeaderMap,
-    Path((fragment, version_id, part_index, shard_index)): Path<(String, String, u64, usize)>,
+    Path((fragment, object_id, version_id, part_index, shard_index)): Path<(
+        String,
+        String,
+        String,
+        u64,
+        usize,
+    )>,
     Query(query): Query<PeerShardQuery>,
 ) -> Result<Response, AppError> {
     authorize_peer(&headers)?;
-    let dir = shard_dir(&fragment, &version_id, part_index, shard_index)?;
+    let dir = shard_dir(&fragment, &object_id, &version_id, part_index, shard_index)?;
     let file_name = stable_name(part_index, shard_index, query.parity.unwrap_or(false));
     let path = dir.join(file_name);
     let mut file = fs::File::open(&path)
@@ -1007,6 +1593,7 @@ pub struct NativePeerShardPayload {
     #[serde(default)]
     pub secret: Option<String>,
     pub fragment: String,
+    pub object_id: String,
     pub version_id: String,
     pub part_index: u64,
     pub shard_index: usize,
@@ -1043,6 +1630,7 @@ where
     let expected_len = payload.expected_len.unwrap_or(body_len);
     let dir = shard_dir(
         &payload.fragment,
+        &payload.object_id,
         &payload.version_id,
         payload.part_index,
         payload.shard_index,
@@ -1126,6 +1714,7 @@ pub async fn native_peer_get_shard_bytes(
     authorize_peer_secret(payload.secret.as_deref())?;
     let dir = shard_dir(
         &payload.fragment,
+        &payload.object_id,
         &payload.version_id,
         payload.part_index,
         payload.shard_index,
@@ -1180,7 +1769,27 @@ pub fn build_peer_routes() -> Router<Arc<AppState>> {
         .route("/n2/peer/usage", axum::routing::get(peer_usage))
         .route("/n2/peer/monitor", axum::routing::get(peer_monitor))
         .route(
-            "/n2/peer/shards/{:fragment}/{:version_id}/{:part_index}/{:shard_index}",
+            "/n2/peer/objects/publish",
+            axum::routing::post(peer_publish_object_metadata),
+        )
+        .route(
+            "/n2/peer/objects/resolve",
+            axum::routing::post(peer_resolve_object_metadata),
+        )
+        .route(
+            "/n2/peer/objects/resolve-batch",
+            axum::routing::post(peer_resolve_object_metadata_batch),
+        )
+        .route(
+            "/n2/peer/fragments/control",
+            axum::routing::post(peer_fragment_control),
+        )
+        .route(
+            "/n2/peer/fragments/snapshot",
+            axum::routing::get(peer_fragment_snapshot),
+        )
+        .route(
+            "/n2/peer/shards/{:fragment}/{:object_id}/{:version_id}/{:part_index}/{:shard_index}",
             put(peer_put_shard).get(peer_get_shard),
         )
 }
@@ -1195,6 +1804,7 @@ mod tests {
             node_id: "node-a".into(),
             endpoint: "https://node-a.local:50001".into(),
             fragment: "frag".into(),
+            object_id: "object-1".into(),
             version_id: "01KTEST".into(),
             part_index: 7,
             shard_index: 2,
@@ -1206,6 +1816,7 @@ mod tests {
         assert_eq!(decoded.node_id, target.node_id);
         assert_eq!(decoded.endpoint, target.endpoint);
         assert_eq!(decoded.fragment, target.fragment);
+        assert_eq!(decoded.object_id, target.object_id);
         assert_eq!(decoded.version_id, target.version_id);
         assert_eq!(decoded.part_index, target.part_index);
         assert_eq!(decoded.shard_index, target.shard_index);

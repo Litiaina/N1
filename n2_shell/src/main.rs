@@ -285,8 +285,6 @@ enum FragmentCommand {
         key: String,
         #[arg(long)]
         master_key: String,
-        #[arg(long)]
-        stable_fragment_id: Option<String>,
     },
 }
 
@@ -754,7 +752,6 @@ async fn run_fragment_command(
             name,
             key,
             master_key,
-            stable_fragment_id,
         } => {
             print_op(
                 client,
@@ -763,7 +760,6 @@ async fn run_fragment_command(
                     "name": name,
                     "key": key,
                     "secret": master_key,
-                    "stable_fragment_id": stable_fragment_id,
                 }),
                 json_output,
             )

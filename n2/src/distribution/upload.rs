@@ -4,11 +4,12 @@ use crate::core::disk_manager::{
     ShardInfo, UploadPartQuery,
 };
 use crate::core::ec::ErasureStreamWriter;
-use crate::core::index::{self, IndexReplicaWriteMode};
+use crate::core::index;
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
 use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
+    publish_cluster_object_metadata,
 };
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
 use crate::distribution::resolve_layout;
@@ -245,7 +246,12 @@ async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter
         ));
     }
     let disk_idx = (target.part_index as usize + target.shard_index) % roots.len();
-    let dir = pm.get_shard_dir_on_disk(&roots[disk_idx], &target.fragment, &target.version_id);
+    let dir = pm.get_shard_dir_on_disk(
+        &roots[disk_idx],
+        &target.fragment,
+        &target.object_id,
+        &target.version_id,
+    );
     fs::create_dir_all(&dir)
         .await
         .map_err(|e| AppError::Io(e, format!("create cluster shard dir {}", dir.display())))?;
@@ -290,6 +296,7 @@ async fn open_writers_for_plan(
                 .clone()
                 .unwrap_or_else(|| placement.endpoint.clone()),
             fragment: plan.fragment.clone(),
+            object_id: plan.object_key.clone(),
             version_id: plan.version_id.clone(),
             part_index,
             shard_index: placement.shard_index,
@@ -451,6 +458,7 @@ pub async fn initiate_cluster_upload(
     let manifest = UploadSessionManifest {
         fragment: fragment.clone(),
         object_key,
+        packed_ext_u64: params.packed_ext_u64,
         version_id: version_id.clone(),
         session_id: session_id.clone(),
         total_size_bytes: params.total_size_bytes,
@@ -526,13 +534,7 @@ where
         part.is_ok(),
     );
     let part = part?;
-    index::commit_session_part(
-        &fragment,
-        &version_id,
-        &part.part,
-        IndexReplicaWriteMode::BackgroundBestEffort,
-    )
-    .await?;
+    index::commit_session_part(&fragment, &version_id, &part.part).await?;
     index::commit_session_part_receipt(&fragment, &version_id, &state.manifest, &part.part).await?;
     Ok(())
 }
@@ -541,6 +543,7 @@ pub async fn upload_cluster_one_shot<S>(
     claims: Claims,
     fragment: String,
     object_key: String,
+    packed_ext_u64: u64,
     content_type: String,
     query: UploadPartQuery,
     body_stream: S,
@@ -586,6 +589,7 @@ where
     let part = part?;
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
+        packed_ext_u64,
         fragment: fragment.clone(),
         version_id: version_id.clone(),
         upload_session_id: session_id,
@@ -601,7 +605,7 @@ where
         stripe_size_bytes: stripe_size,
     };
     let _lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    index::publish_object(&object_meta).await?;
+    publish_cluster_object_metadata(&object_meta).await?;
     Ok(object_meta)
 }
 
@@ -647,6 +651,7 @@ pub async fn finalize_cluster_upload(
     let total_size_bytes = parts.iter().map(|part| part.size_bytes).sum();
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
+        packed_ext_u64: state.manifest.packed_ext_u64,
         fragment: fragment.clone(),
         version_id: version_id.clone(),
         upload_session_id: session_id,
@@ -666,7 +671,7 @@ pub async fn finalize_cluster_upload(
         stripe_size_bytes: state.manifest.stripe_size_bytes,
     };
     let _lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    index::publish_object(&object_meta).await?;
+    publish_cluster_object_metadata(&object_meta).await?;
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
     Ok(FinalizeUploadResult::Complete(object_meta))
 }
@@ -697,6 +702,7 @@ mod tests {
         UploadSessionManifest {
             fragment: "fragment".into(),
             object_key: "video.bin".into(),
+            packed_ext_u64: crate::core::index_store::packed_extension_key("video.bin"),
             version_id: "01TESTVERSION000000000000".into(),
             session_id: "01TESTSESSION000000000000".into(),
             total_size_bytes,

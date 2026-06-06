@@ -474,6 +474,7 @@ pub async fn rewrite_object_to_current_layout(
         total_size_bytes: total,
         expected_parts,
         part_size_bytes: Some(part_size_bytes),
+        packed_ext_u64: crate::core::index_store::packed_extension_key(&logical_path),
     };
     let init = initiate_cluster_upload(
         claims.clone(),
@@ -761,6 +762,7 @@ mod tests {
     fn base_meta(epoch: u64, data_shards: u16, parity_shards: u16) -> ObjectMetadata {
         ObjectMetadata {
             object_key: "obj".into(),
+            packed_ext_u64: 0,
             fragment: "frag".into(),
             version_id: "v".into(),
             upload_session_id: "s".into(),
@@ -804,6 +806,7 @@ mod tests {
                             .clone()
                             .unwrap_or_else(|| placement.endpoint.clone()),
                         fragment: "frag".into(),
+                        object_id: "obj".into(),
                         version_id: "v".into(),
                         part_index: 0,
                         shard_index: placement.shard_index,

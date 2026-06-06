@@ -29,9 +29,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     conf.with_section(Some("quota_config"))
         .set("fragment_quota_backend", "disabled");
 
-    conf.with_section(Some("index_config"))
-        .set("partition_count", "64");
-
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
         .set("file_ttl_seconds", "3600")
@@ -102,11 +99,6 @@ mod tests {
             .expect("cluster_config section");
         assert_eq!(cluster.get("cluster_layout_mode"), Some("auto"));
         assert_eq!(cluster.get("membership_file"), Some("n2_membership.json"));
-        let index = ini
-            .section(Some("index_config"))
-            .expect("index_config section");
-        assert_eq!(index.get("partition_count"), Some("64"));
-
         let _ = fs::remove_file(path);
     }
 }

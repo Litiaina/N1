@@ -4,7 +4,6 @@ use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
-use crate::core::fragment_metadata::set_configured_index_partition_count;
 use crate::core::io_scheduler::{DiskIoSchedulerConfig, configure_disk_io_scheduler};
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
@@ -441,18 +440,6 @@ fn is_auto_or_empty(raw: Option<&str>) -> bool {
     }
 }
 
-fn parse_index_partition_count(raw: Option<&str>) -> u16 {
-    match raw.map(str::trim) {
-        None | Some("") => {
-            panic!("index_config.partition_count must be explicitly set to one of: 32, 64, 256")
-        }
-        Some(v) => match v.parse::<u16>() {
-            Ok(32 | 64 | 256) => v.parse::<u16>().expect("validated above"),
-            _ => panic!("index_config.partition_count must be one of: 32, 64, 256"),
-        },
-    }
-}
-
 pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
 
@@ -764,7 +751,7 @@ pub async fn run_server() {
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
     tracing::info!(
-        "Storage mode: N2 distributed object storage with explicit .blobs payload roots"
+        "Storage mode: N2 distributed object storage with colocated immutable object metadata and shard payloads"
     );
 
     let https_endpoint = format!("https://{}:{}", host, https_port);
@@ -804,17 +791,6 @@ pub async fn run_server() {
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();
     let detected_ram_gib = ram_gib(detected_ram_bytes);
-
-    let index_section = config.section(Some("index_config"));
-    let configured_index_partition_count =
-        parse_index_partition_count(index_section.and_then(|s| s.get("partition_count")));
-    set_configured_index_partition_count(configured_index_partition_count)
-        .expect("index_config.partition_count must be one of: 32, 64, 256");
-
-    tracing::info!(
-        "Index layout: N2 namespace + object index, partition_count={} for intent routing",
-        configured_index_partition_count
-    );
 
     let upload_section = config.section(Some("upload_config"));
 
@@ -1105,6 +1081,8 @@ pub async fn run_server() {
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
     });
+
+    crate::distribution::peer::spawn_fragment_control_sync_task();
 
     tokio::spawn(async move {
         serve_native_protocol(native_listener, native_addr, native_state).await;

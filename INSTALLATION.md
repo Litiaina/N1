@@ -41,12 +41,53 @@ Recommended production paths:
 /var/lib/litiaina/n2-gateway/certificates/
 ```
 
-Use real mounted storage paths for index/blob roots, for example:
+Use real mounted storage paths. N2 supports two production layouts.
+
+Separated roots place mutable namespace/control IO on fast storage and
+immutable object/shard IO on capacity storage:
 
 ```text
-/mnt/n2/index
-/mnt/n2/blob
-/mnt/n2/fs
+/mnt/nvme/n2-index
+/mnt/hdd/n2-objects
+/mnt/nvme/n2-control
+```
+
+Shared roots use the same mounted path for both roles:
+
+```text
+/mnt/n2/storage
+/mnt/n2/control
+```
+
+The shared layout is the minimum valid N2 deployment. It does not duplicate
+object metadata: namespace entries and `.objects` coexist under the same stable
+fragment root.
+
+Roots are selected by configuration. Index roots hold mutable namespace/control
+state; blob roots hold immutable fragment metadata, object `.ncdx` records, and
+shard/parity payloads. There is no automatic migration from earlier development
+layouts.
+
+`fs_storage_path` holds membership, namespace-group assignments, namespace
+ledgers/snapshots, and maintenance state. Put it on durable low-latency storage
+when available.
+
+### Separated Disk Configuration
+
+```ini
+[disk_config]
+index_store_disks=/mnt/nvme/n2-index
+blob_store_disks=/mnt/hdd/n2-objects
+fs_storage_path=/mnt/nvme/n2-control
+```
+
+### Shared Disk Configuration
+
+```ini
+[disk_config]
+index_store_disks=/mnt/n2/storage
+blob_store_disks=/mnt/n2/storage
+fs_storage_path=/mnt/n2/control
 ```
 
 ## Build
@@ -174,9 +215,6 @@ auto_rebalance=false
 
 [quota_config]
 fragment_quota_backend=disabled
-
-[index_config]
-partition_count=64
 
 [garbage_collector]
 cleanup_interval_seconds=3600
@@ -411,11 +449,19 @@ scripts/proof/run_n2_installer_proof.sh
 Automated hardening proof:
 
 ```bash
-scripts/bench/run_n2_hardening_native_proof.sh
+N2_PROOF_STORAGE_LAYOUT=separated \
+  scripts/bench/run_n2_hardening_native_proof.sh
+
+N2_PROOF_STORAGE_LAYOUT=shared \
+  scripts/bench/run_n2_hardening_native_proof.sh
 ```
 
 The hardening proof uses temporary data roots and test ports. It does not kill
 existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
+It verifies canonical disk layout, absence of object data on separated index
+roots, byte-identical `.ncdx` participant copies, native shell access,
+coordinator multipart resume, degraded reads, missing-shard reconstruction,
+repair, namespace mutation, and targeted rebalance of only mismatched objects.
 
 Capacity expansion proof:
 

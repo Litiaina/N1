@@ -1161,12 +1161,13 @@ async fn rename_object_scoped(
 async fn initiate_object_upload_scoped(
     claims: Claims,
     Path(object_key): Path<String>,
-    AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
+    AxumJson(mut params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     if let Some(existing) = find_reusable_pending_upload(&fragment, &object_key, &params).await? {
         return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
     }
+    params.packed_ext_u64 = index_store::packed_extension_key(&object_key);
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let parsed =
         initiate_cluster_upload(claims, fragment.clone(), physical.clone(), params).await?;
@@ -1207,6 +1208,7 @@ async fn upload_object_one_shot_scoped(
         claims,
         fragment.clone(),
         physical.clone(),
+        index_store::packed_extension_key(&object_key),
         content_type,
         query,
         body_stream,

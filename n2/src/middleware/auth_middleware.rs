@@ -564,9 +564,6 @@ mod tests {
         if let Some(index_roots) = INDEX_STORE_DISKS.get() {
             roots.extend(index_roots.iter().map(std::path::PathBuf::from));
         }
-        if let Some(blob_roots) = BLOB_STORE_DISKS.get() {
-            roots.extend(blob_roots.iter().map(std::path::PathBuf::from));
-        }
         ensure_fragment_identity_on_roots(&roots, fragment, fragment)
             .await
             .expect("create fragment identity");

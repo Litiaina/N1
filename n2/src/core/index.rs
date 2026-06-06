@@ -1,5 +1,6 @@
 use crate::core::disk_manager::{
-    ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
+    IndexListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata,
+    ReservationReceipt,
 };
 use crate::core::index_store;
 use crate::core::upload::UploadSessionManifest;
@@ -11,12 +12,6 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 static OBJECT_OP_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IndexReplicaWriteMode {
-    BackgroundBestEffort,
-    SyncBestEffort,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSessionState {
@@ -108,7 +103,6 @@ pub async fn commit_session_part(
     fragment: &str,
     version_id: &str,
     part: &PartMetadata,
-    _replica_write_mode: IndexReplicaWriteMode,
 ) -> Result<(), AppError> {
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
@@ -219,17 +213,6 @@ pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     run_index_blocking(move || index_store::upsert_live_version(&metadata)).await
 }
 
-pub async fn publish_object_with_replica_mode(
-    metadata: &ObjectMetadata,
-    replica_write_mode: IndexReplicaWriteMode,
-) -> Result<(), AppError> {
-    let metadata = metadata.clone();
-    run_index_blocking(move || {
-        index_store::upsert_live_version_with_replica_mode(&metadata, replica_write_mode)
-    })
-    .await
-}
-
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
     let metadata = metadata.clone();
     run_index_blocking(move || index_store::upsert_live_version(&metadata)).await
@@ -247,14 +230,9 @@ pub async fn read_object_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    let version_id = version_id.to_string();
-    run_index_blocking(move || {
-        index_store::read_live_version(&fragment, &object_key, &version_id)?
-            .ok_or(AppError::NotFound)
-    })
-    .await
+    crate::distribution::peer::resolve_cluster_object_version(fragment, object_key, version_id)
+        .await?
+        .ok_or(AppError::NotFound)
 }
 
 pub async fn read_trashed_object_version(
@@ -262,32 +240,21 @@ pub async fn read_trashed_object_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    let version_id = version_id.to_string();
-    run_index_blocking(move || {
-        index_store::read_trash_version(&fragment, &object_key, &version_id)?
-            .ok_or(AppError::NotFound)
-    })
-    .await
+    read_object_version(fragment, object_key, version_id).await
 }
 
 pub async fn list_live_object_versions_metadata(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || index_store::list_live_versions(&fragment, &object_key)).await
+    crate::distribution::peer::resolve_cluster_object_versions(fragment, object_key).await
 }
 
 pub async fn list_trashed_object_versions_metadata(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || index_store::list_trash_versions(&fragment, &object_key)).await
+    list_live_object_versions_metadata(fragment, object_key).await
 }
 
 pub async fn list_live_object_version_ids(
@@ -324,24 +291,18 @@ pub async fn read_latest_object(
     fragment: &str,
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || {
-        index_store::read_current_live_head(&fragment, &object_key)?.ok_or(AppError::NotFound)
-    })
-    .await
+    crate::distribution::peer::resolve_cluster_object_versions(fragment, object_key)
+        .await?
+        .into_iter()
+        .max_by(|left, right| left.version_id.cmp(&right.version_id))
+        .ok_or(AppError::NotFound)
 }
 
 pub async fn read_latest_trashed_object(
     fragment: &str,
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || {
-        index_store::read_latest_trash(&fragment, &object_key)?.ok_or(AppError::NotFound)
-    })
-    .await
+    read_latest_object(fragment, object_key).await
 }
 
 pub async fn list_fragment_trash_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
@@ -354,22 +315,6 @@ pub async fn list_fragment_object_keys_with_trash_versions(
 ) -> Result<Vec<String>, AppError> {
     let fragment = fragment.to_string();
     run_index_blocking(move || index_store::list_object_keys_with_trash_versions(&fragment)).await
-}
-
-pub async fn list_active_trash_partition_ids(
-    fragment: &str,
-) -> Result<std::collections::BTreeSet<u16>, AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || index_store::list_active_trash_partition_ids(&fragment)).await
-}
-
-pub async fn list_partition_trash_entries(
-    fragment: &str,
-    partition_id: u16,
-) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || index_store::list_partition_trash_entries(&fragment, partition_id))
-        .await
 }
 
 pub async fn list_fragment_trash_catalog(
@@ -389,12 +334,6 @@ pub async fn list_trashed_object_version_ids_batch(
         index_store::list_trashed_object_version_ids_batch(&fragment, &object_keys)
     })
     .await
-}
-
-pub async fn object_partition_id(fragment: &str, object_key: &str) -> Result<u16, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || index_store::object_partition_id(&fragment, &object_key)).await
 }
 
 pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
@@ -432,17 +371,15 @@ pub async fn scan_fragment_live_metadata_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || {
-        index_store::scan_live_full_metadata_page(
-            &fragment,
-            prefix,
-            delimiter,
-            limit,
-            continuation_token,
-            include_internal,
-        )
-    })
+    scan_fragment_metadata_page(
+        fragment,
+        prefix,
+        delimiter,
+        limit,
+        continuation_token,
+        include_internal,
+        false,
+    )
     .await
 }
 
@@ -476,18 +413,78 @@ pub async fn scan_fragment_trash_metadata_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || {
-        index_store::scan_trash_full_metadata_page(
-            &fragment,
-            prefix,
-            delimiter,
-            limit,
-            continuation_token,
-            include_internal,
-        )
-    })
+    scan_fragment_metadata_page(
+        fragment,
+        prefix,
+        delimiter,
+        limit,
+        continuation_token,
+        include_internal,
+        true,
+    )
     .await
+}
+
+async fn scan_fragment_metadata_page(
+    fragment: &str,
+    prefix: Option<String>,
+    _delimiter: Option<String>,
+    limit: usize,
+    continuation_token: Option<String>,
+    _include_internal: bool,
+    include_trashed: bool,
+) -> Result<ListObjectsResult, AppError> {
+    let refs = if include_trashed {
+        crate::namespace::runtime::global_namespace_runtime()
+            .list_trash_object_refs_page(
+                fragment,
+                prefix.as_deref(),
+                continuation_token.as_deref(),
+                limit,
+            )
+            .await?
+    } else {
+        crate::namespace::runtime::global_namespace_runtime()
+            .list_live_object_refs_page(
+                fragment,
+                prefix.as_deref(),
+                continuation_token.as_deref(),
+                limit,
+            )
+            .await?
+    };
+    let object_ids = refs
+        .entries
+        .iter()
+        .map(|entry| entry.object_id.clone())
+        .collect::<Vec<_>>();
+    let heads =
+        crate::distribution::peer::resolve_cluster_object_heads(fragment, &object_ids).await?;
+    let mut entries = Vec::with_capacity(refs.entries.len());
+    let mut objects = Vec::with_capacity(refs.entries.len());
+    for object_ref in refs.entries {
+        let Some(metadata) = heads.get(&object_ref.object_id).cloned() else {
+            continue;
+        };
+        entries.push(IndexListEntry {
+            record: object_ref.path,
+            kind: "object".to_string(),
+            size_bytes: metadata.total_size_bytes,
+            created_at_unix_nanos: metadata.created_at.saturating_mul(1_000_000_000),
+            packed_ext_u64: Some(metadata.packed_ext_u64),
+            version_ulid: Some(metadata.version_id.clone()),
+        });
+        objects.push(metadata);
+    }
+    Ok(ListObjectsResult {
+        prefix,
+        limit: Some(limit),
+        entries,
+        objects,
+        common_prefixes: Vec::new(),
+        continuation_token: refs.continuation_token.clone(),
+        next_continuation_token: refs.continuation_token,
+    })
 }
 
 pub async fn move_object_version_to_trash_with_metadata(
@@ -613,23 +610,6 @@ pub async fn delete_object_fast(
     run_index_blocking(move || index_store::delete_object_fast(&fragment, &object_key)).await
 }
 
-pub async fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || index_store::sync_fragment_partition_replicas(&fragment)).await
-}
-
-pub async fn ensure_object_owner_partition_available(
-    fragment: &str,
-    object_key: &str,
-) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || {
-        index_store::ensure_object_owner_partition_available(&fragment, &object_key)
-    })
-    .await
-}
-
 pub async fn delete_object_version(
     fragment: &str,
     object_key: &str,
@@ -673,26 +653,5 @@ pub async fn clear_fragment_trash_in_partitions(
     let fragment = fragment.to_string();
     let object_key = object_key.map(ToOwned::to_owned);
     run_index_blocking(move || index_store::clear_fragment_trash(&fragment, object_key.as_deref()))
-        .await
-}
-
-pub async fn clear_fragment_trash_for_partitions(
-    fragment: &str,
-    touched_partitions: &std::collections::BTreeSet<u16>,
-) -> Result<usize, AppError> {
-    let fragment = fragment.to_string();
-    let touched_partitions = touched_partitions.clone();
-    run_index_blocking(move || {
-        index_store::clear_fragment_trash_for_partitions(&fragment, &touched_partitions)
-    })
-    .await
-}
-
-pub async fn clear_fragment_trash_partition(
-    fragment: &str,
-    partition_id: u16,
-) -> Result<usize, AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || index_store::clear_fragment_trash_partition(&fragment, partition_id))
         .await
 }

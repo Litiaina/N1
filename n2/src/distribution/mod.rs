@@ -4,6 +4,7 @@ pub mod layout;
 pub mod membership;
 pub mod monitor;
 pub mod namespace;
+pub mod namespace_group;
 pub mod peer;
 pub mod placement;
 pub mod rebalance;

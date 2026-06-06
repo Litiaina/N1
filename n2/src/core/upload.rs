@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use ulid::Ulid;
+use walkdir::WalkDir;
 
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
@@ -342,6 +343,8 @@ mod tests {
 pub struct UploadSessionManifest {
     pub fragment: String,
     pub object_key: String,
+    #[serde(default)]
+    pub packed_ext_u64: u64,
     pub version_id: String,
     pub session_id: String,
     pub total_size_bytes: u64,
@@ -983,8 +986,12 @@ fn shard_specs_for_part(
     for shard_index in 0..total_shards {
         let disk_idx = (part_index as usize + shard_index) % blob_roots.len();
         let disk_root = &blob_roots[disk_idx];
-        let shard_dir =
-            path_manager.get_shard_dir_on_disk(disk_root, &manifest.fragment, &manifest.version_id);
+        let shard_dir = path_manager.get_shard_dir_on_disk(
+            disk_root,
+            &manifest.fragment,
+            &manifest.object_key,
+            &manifest.version_id,
+        );
         let file_name = stable_shard_name(part_index, shard_index, data_shards);
         let stable_path = shard_dir.join(&file_name);
         out.push((
@@ -1032,6 +1039,7 @@ async fn ensure_version_shard_dirs(
         let shard_dir = path_manager.get_shard_dir_on_disk(
             &disk_root,
             &manifest.fragment,
+            &manifest.object_key,
             &manifest.version_id,
         );
         async move {
@@ -1223,6 +1231,7 @@ fn request_content_type(headers: &HeaderMap) -> Option<String> {
 async fn write_part_blob_to_disk(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     content_length: u64,
@@ -1244,6 +1253,7 @@ async fn write_part_blob_to_disk(
     write_part_blob_to_disk_from_stream(
         path_manager,
         fragment,
+        object_key,
         version_id,
         part_index,
         content_length,
@@ -1260,6 +1270,7 @@ async fn write_part_blob_to_disk(
 async fn write_part_blob_to_disk_from_stream<S>(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     content_length: u64,
@@ -1330,7 +1341,8 @@ where
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
         let disk_idx = (part_index as usize + i) % num_disks;
         let target_disk = &blob_roots[disk_idx];
-        let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
+        let shard_dir =
+            path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
 
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
@@ -1539,6 +1551,7 @@ where
 async fn write_part_blob_to_disk_from_reader<R>(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     content_length: u64,
@@ -1609,7 +1622,8 @@ where
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
         let disk_idx = (part_index as usize + i) % num_disks;
         let target_disk = &blob_roots[disk_idx];
-        let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
+        let shard_dir =
+            path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
 
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
@@ -1807,14 +1821,26 @@ async fn cleanup_blob_version_dirs_for_version(
     fragment: &str,
     version_id: &str,
 ) {
-    let futs = path_manager.get_blob_roots().into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
-        async move {
-            let parent = dir.parent().map(Path::to_path_buf);
-            let _ = tokio_fs::remove_dir_all(&dir).await;
-            if let Some(parent) = parent {
-                let _ = sync_dir(&parent).await;
+    let mut dirs = Vec::new();
+    for root in path_manager.get_blob_roots() {
+        let objects = crate::core::fragment_identity::fragment_root_on(&root, fragment)
+            .join(crate::core::constants::N2_BLOB_DIR);
+        for entry in WalkDir::new(objects)
+            .min_depth(6)
+            .max_depth(6)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_dir() && entry.file_name() == version_id {
+                dirs.push(entry.into_path());
             }
+        }
+    }
+    let futs = dirs.into_iter().map(|dir| async move {
+        let parent = dir.parent().map(Path::to_path_buf);
+        let _ = tokio_fs::remove_dir_all(&dir).await;
+        if let Some(parent) = parent {
+            let _ = sync_dir(&parent).await;
         }
     });
     let _ = join_all(futs).await;
@@ -1909,34 +1935,45 @@ async fn cleanup_blob_tmp_attempt_files_for_version(
     fragment: &str,
     version_id: &str,
 ) {
-    let blob_roots = path_manager.get_blob_roots();
-
-    let futs = blob_roots.into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
-        async move {
-            if !tokio_fs::try_exists(&dir).await.unwrap_or(false) {
-                return;
+    let mut dirs = Vec::new();
+    for root in path_manager.get_blob_roots() {
+        let objects = crate::core::fragment_identity::fragment_root_on(&root, fragment)
+            .join(crate::core::constants::N2_BLOB_DIR);
+        for entry in WalkDir::new(objects)
+            .min_depth(6)
+            .max_depth(6)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_dir() && entry.file_name() == version_id {
+                dirs.push(entry.into_path());
             }
-
-            let mut entries = match tokio_fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-
-                let name = entry.file_name().to_string_lossy().to_string();
-                if is_tmp_attempt_shard(&name) {
-                    let _ = tokio_fs::remove_file(&p).await;
-                }
-            }
-
-            let _ = sync_dir(&dir).await;
         }
+    }
+
+    let futs = dirs.into_iter().map(|dir| async move {
+        if !tokio_fs::try_exists(&dir).await.unwrap_or(false) {
+            return;
+        }
+
+        let mut entries = match tokio_fs::read_dir(&dir).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_tmp_attempt_shard(&name) {
+                let _ = tokio_fs::remove_file(&p).await;
+            }
+        }
+
+        let _ = sync_dir(&dir).await;
     });
 
     let _ = join_all(futs).await;
@@ -2008,6 +2045,7 @@ pub async fn initiate_object_upload_direct(
     let manifest = UploadSessionManifest {
         fragment: fragment.clone(),
         object_key: object_key.clone(),
+        packed_ext_u64: params.packed_ext_u64,
         version_id: version_id.clone(),
         session_id: session_id.clone(),
         total_size_bytes: params.total_size_bytes,
@@ -2246,6 +2284,7 @@ pub async fn object_upload_part(
     let part_meta = write_part_blob_to_disk(
         &path_manager,
         &fragment,
+        &manifest.object_key,
         &version_id,
         part_index,
         content_length,
@@ -2420,6 +2459,7 @@ where
     let part_meta = write_part_blob_to_disk_from_stream(
         &path_manager,
         &fragment,
+        &manifest.object_key,
         &version_id,
         part_index,
         content_length,
@@ -2544,6 +2584,7 @@ where
     let part_meta = write_part_blob_to_disk_from_reader(
         &path_manager,
         &fragment,
+        &manifest.object_key,
         &version_id,
         part_index,
         content_length,
@@ -2631,6 +2672,7 @@ async fn upload_object_one_shot_inner(
     let part_meta = match write_part_blob_to_disk(
         &path_manager,
         &fragment,
+        &object_key,
         &version_id,
         0,
         content_length,
@@ -2652,6 +2694,7 @@ async fn upload_object_one_shot_inner(
 
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
+        packed_ext_u64: crate::core::index_store::packed_extension_key(&object_key),
         fragment: fragment.clone(),
         version_id: version_id.clone(),
         upload_session_id: session_id,
@@ -2668,14 +2711,7 @@ async fn upload_object_one_shot_inner(
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
-    } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
-    };
-    if let Err(err) =
-        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
-    {
+    if let Err(err) = index::publish_object(&object_meta).await {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
         return Err(err);
     }
@@ -2805,6 +2841,7 @@ where
     let part_meta = match write_part_blob_to_disk_from_stream(
         &path_manager,
         &fragment,
+        &object_key,
         &version_id,
         0,
         content_length,
@@ -2826,6 +2863,7 @@ where
 
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
+        packed_ext_u64: crate::core::index_store::packed_extension_key(&object_key),
         fragment: fragment.clone(),
         version_id: version_id.clone(),
         upload_session_id: session_id,
@@ -2842,14 +2880,7 @@ where
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
-    } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
-    };
-    if let Err(err) =
-        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
-    {
+    if let Err(err) = index::publish_object(&object_meta).await {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
         return Err(err);
     }
@@ -2910,6 +2941,7 @@ where
     let part_meta = match write_part_blob_to_disk_from_reader(
         &path_manager,
         &fragment,
+        &object_key,
         &version_id,
         0,
         content_length,
@@ -2931,6 +2963,7 @@ where
 
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
+        packed_ext_u64: crate::core::index_store::packed_extension_key(&object_key),
         fragment: fragment.clone(),
         version_id: version_id.clone(),
         upload_session_id: session_id,
@@ -2947,14 +2980,7 @@ where
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
-    } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
-    };
-    if let Err(err) =
-        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
-    {
+    if let Err(err) = index::publish_object(&object_meta).await {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
         return Err(err);
     }
@@ -3042,7 +3068,8 @@ pub async fn finalize_object_upload_direct(
     let mut found_data_roots = 0usize;
 
     for root in &blob_roots {
-        let shard_dir_check = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
+        let shard_dir_check =
+            path_manager.get_shard_dir_on_disk(root, &fragment, &object_key, &version_id);
         if tokio_fs::try_exists(&shard_dir_check)
             .await
             .unwrap_or(false)
@@ -3145,6 +3172,10 @@ pub async fn finalize_object_upload_direct(
 
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
+        packed_ext_u64: manifest
+            .as_ref()
+            .map(|value| value.packed_ext_u64)
+            .unwrap_or_else(|| crate::core::index_store::packed_extension_key(&object_key)),
         fragment: fragment.clone(),
         version_id: version_id.clone(),
         upload_session_id: session_id.clone(),

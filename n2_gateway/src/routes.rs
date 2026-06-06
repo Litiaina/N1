@@ -166,93 +166,23 @@ async fn auth_fragment(
 
 async fn create_fragment(
     State(state): State<Arc<GatewayState>>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> Response<Body> {
-    let nodes = state.nodes.available_configs().await;
-    if nodes.is_empty() {
-        return text_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gateway has no available N2 nodes",
-        );
-    }
-
-    let mut stable_fragment_id = payload
-        .get("stable_fragment_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let mut fragment_hash = String::new();
-    let mut created = Vec::new();
-    let mut errors = Vec::new();
-    let mut first_body: Option<Value> = None;
-    let mut first_status = StatusCode::CREATED;
-
-    for node in nodes {
-        if let Some(stable) = &stable_fragment_id {
-            payload["stable_fragment_id"] = Value::String(stable.clone());
-        }
-
-        match post_json_to_node(&state, &node, "/n2/fragments", &payload).await {
-            Ok((status, body)) if status.is_success() => {
+    let node = match best_node(&state).await {
+        Ok(node) => node,
+        Err(response) => return response,
+    };
+    match post_json_to_node(&state, &node, "/n2/fragments", &payload).await {
+        Ok((status, body)) => {
+            if status.is_success() {
                 state.nodes.mark_route(&node.id).await;
-                if first_body.is_none() {
-                    first_status = status;
-                    first_body = Some(body.clone());
-                }
-                if stable_fragment_id.is_none() {
-                    stable_fragment_id = body
-                        .get("stable_fragment_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                }
-                if fragment_hash.is_empty() {
-                    fragment_hash = body
-                        .get("fragment_hash")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                }
-                created.push(json!({ "node": node.id, "status": status.as_u16() }));
-            }
-            Ok((status, body)) => {
-                if status.is_server_error() {
-                    state.nodes.mark_failure(&node.id).await;
-                }
-                errors.push(json!({
-                    "node": node.id,
-                    "status": status.as_u16(),
-                    "error": body.get("error")
-                        .or_else(|| body.get("message"))
-                        .cloned()
-                        .unwrap_or(body)
-                }));
-            }
-            Err(err) => {
+            } else if status.is_server_error() {
                 state.nodes.mark_failure(&node.id).await;
-                errors.push(json!({ "node": node.id, "status": 502, "error": err }));
             }
+            json_response_value(status, body)
         }
+        Err(err) => upstream_failed(&state, &node, err).await,
     }
-
-    if !errors.is_empty() {
-        return json_response_value(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({
-                "error": "fragment creation did not complete on every N2 node",
-                "created": created,
-                "errors": errors,
-                "fragment_hash": fragment_hash,
-                "stable_fragment_id": stable_fragment_id,
-            }),
-        );
-    }
-
-    let mut body = first_body.unwrap_or_else(|| json!({}));
-    body["gateway"] = json!({
-        "cluster_created": true,
-        "nodes": created,
-    });
-    json_response_value(first_status, body)
 }
 
 async fn multipart_init(

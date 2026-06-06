@@ -318,7 +318,7 @@ pub async fn stream_object_logic(
     let parts = parts.into_iter().map(Arc::new).collect::<Vec<_>>();
     let shard_dirs = blob_roots
         .iter()
-        .map(|disk| path_manager.get_shard_dir_on_disk(disk, &fragment, &version_id))
+        .map(|disk| path_manager.get_shard_dir_on_disk(disk, &fragment, &object_key, &version_id))
         .collect::<Vec<_>>();
 
     let initial_state = StreamState {
@@ -555,7 +555,7 @@ mod tests {
             checksum: None,
             shards: vec![ShardInfo {
                 file_name: "a.shard".into(),
-                absolute_path: "/d1/frag/.blobs/ver/a.shard".into(),
+                absolute_path: "/d1/@f_frag/.objects/ab/cd/ef/01/@o_object/ver/a.shard".into(),
                 checksum: "x".into(),
                 size_bytes: 1,
                 shard_index: 0,
