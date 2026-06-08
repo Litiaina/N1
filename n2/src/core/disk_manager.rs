@@ -78,12 +78,19 @@ impl ObjectPathManager {
         self.get_namespace_roots_for_path(fragment_hash, "")
     }
 
-    pub fn get_namespace_roots_for_path(&self, fragment_hash: &str, logical_path: &str) -> Vec<PathBuf> {
+    pub fn get_namespace_roots_for_path(
+        &self,
+        fragment_hash: &str,
+        logical_path: &str,
+    ) -> Vec<PathBuf> {
         let roots = self.get_all_index_roots();
         if roots.is_empty() {
             return Vec::new();
         }
-        vec![roots[Self::namespace_partition_index(fragment_hash, logical_path, roots.len())].clone()]
+        vec![
+            roots[Self::namespace_partition_index(fragment_hash, logical_path, roots.len())]
+                .clone(),
+        ]
     }
 
     pub fn get_all_namespace_roots(&self, _fragment_hash: &str) -> Vec<PathBuf> {

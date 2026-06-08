@@ -18,7 +18,8 @@ use crate::{
         disk_manager::ObjectPathManager,
         fragment_identity::{
             ensure_fragment_identity_on_roots, fragment_alias_path, fragment_root_on,
-            new_stable_fragment_id, physical_fragment_root_on, remove_fragment_aliases_for_stable_id,
+            new_stable_fragment_id, physical_fragment_root_on,
+            remove_fragment_aliases_for_stable_id,
         },
         fragment_metadata::{
             FragmentMetadata, init_fragment_metadata_strict, read_fragment_metadata,
@@ -173,21 +174,24 @@ async fn prepare_fragment_blob_roots_strict(stable_fragment_id: &str) -> Result<
 
     for root in blob_roots {
         let fragment_root = physical_fragment_root_on(&root, stable_fragment_id);
-        timeout(FRAGMENT_CREATE_IO_TIMEOUT, fs::create_dir_all(&fragment_root))
-            .await
-            .map_err(|_| {
-                AppError::ServiceUnavailable(format!(
-                    "timed out preparing blob fragment root {}",
-                    fragment_root.display()
-                ))
-            })?
-            .map_err(|e| {
-                AppError::ServiceUnavailable(format!(
-                    "failed to prepare blob fragment root {}: {}",
-                    fragment_root.display(),
-                    e
-                ))
-            })?;
+        timeout(
+            FRAGMENT_CREATE_IO_TIMEOUT,
+            fs::create_dir_all(&fragment_root),
+        )
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "timed out preparing blob fragment root {}",
+                fragment_root.display()
+            ))
+        })?
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "failed to prepare blob fragment root {}: {}",
+                fragment_root.display(),
+                e
+            ))
+        })?;
     }
 
     Ok(())

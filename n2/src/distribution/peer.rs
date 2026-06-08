@@ -41,6 +41,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 use tokio_util::io::ReaderStream;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::routes::storage_routes::AppState;
@@ -491,6 +492,10 @@ async fn post_object_metadata(endpoint: &str, metadata: &ObjectMetadata) -> Resu
     Ok(())
 }
 
+fn metadata_publish_quorum_requirement(data_shards: u16) -> usize {
+    usize::from(data_shards).max(1)
+}
+
 pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Result<(), AppError> {
     let runtime = active_cluster_runtime()?;
     let mut participant_ids = BTreeMap::<String, ()>::new();
@@ -509,6 +514,7 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
         ));
     }
 
+    let required_metadata_writes = metadata_publish_quorum_requirement(metadata.data_shards);
     let mut tasks = futures_util::stream::FuturesUnordered::new();
     for node_id in participant_ids.into_keys() {
         let endpoint = runtime
@@ -525,16 +531,46 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
         let metadata = metadata.clone();
         let local_node_id = runtime.local_node_id.clone();
         tasks.push(async move {
+            let participant = node_id.clone();
             if node_id == local_node_id {
-                index::publish_object(&metadata).await
+                index::publish_object(&metadata).await.map(|_| participant)
             } else {
-                post_object_metadata(&endpoint, &metadata).await
+                post_object_metadata(&endpoint, &metadata)
+                    .await
+                    .map(|_| participant)
             }
         });
     }
 
+    let mut successes = 0usize;
+    let mut failures = Vec::new();
     while let Some(result) = tasks.next().await {
-        result?;
+        match result {
+            Ok(_) => successes = successes.saturating_add(1),
+            Err(err) => failures.push(err.to_string()),
+        }
+    }
+    if successes < required_metadata_writes {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 object metadata publish quorum failed for {}/{} version {}: {} successful, {} required; {}",
+            metadata.fragment,
+            metadata.object_key,
+            metadata.version_id,
+            successes,
+            required_metadata_writes,
+            failures.join("; ")
+        )));
+    }
+    if !failures.is_empty() {
+        warn!(
+            "N2 object metadata for {}/{} version {} published with degraded participant coverage: {} successful, {} failed; {}",
+            metadata.fragment,
+            metadata.object_key,
+            metadata.version_id,
+            successes,
+            failures.len(),
+            failures.join("; ")
+        );
     }
     Ok(())
 }
@@ -1839,5 +1875,13 @@ mod tests {
         let large = peer_transfer_timeout(1024 * 1024 * 1024);
         assert!(large > small);
         assert!(small >= PEER_WRITE_TIMEOUT);
+    }
+
+    #[test]
+    fn metadata_publish_quorum_allows_degraded_but_repairable_finalize() {
+        assert_eq!(metadata_publish_quorum_requirement(0), 1);
+        assert_eq!(metadata_publish_quorum_requirement(1), 1);
+        assert_eq!(metadata_publish_quorum_requirement(2), 2);
+        assert_eq!(metadata_publish_quorum_requirement(6), 6);
     }
 }

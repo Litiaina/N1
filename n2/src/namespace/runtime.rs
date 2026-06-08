@@ -1289,7 +1289,11 @@ fn rename_live_path(
                 continue;
             }
             let object_id = read_namespace_symlink_object_id(&root, fragment, &source_path)?
-                .ok_or_else(|| AppError::InternalServerError("N2 file namespace entry is not an object link".into()))?;
+                .ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "N2 file namespace entry is not an object link".into(),
+                    )
+                })?;
             unix_fs::symlink(format!("@o_{object_id}"), &destination_path)
                 .map_err(|e| io_err(e, "create cross-partition rename namespace link"))?;
             fs::remove_file(&source_path)
@@ -1833,7 +1837,10 @@ mod tests {
                 trash_anchor_seen = true;
             }
         }
-        assert!(trash_anchor_seen, "soft delete should materialize a trash anchor");
+        assert!(
+            trash_anchor_seen,
+            "soft delete should materialize a trash anchor"
+        );
         for root in ObjectPathManager::new().get_blob_roots() {
             assert!(
                 live_object_dir(&root, &fragment, &object_id)

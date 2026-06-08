@@ -2835,8 +2835,8 @@ mod tests {
         let old_id = "01K00000000000000000000000";
         let new_id = "01K00000000000000000000001";
 
-        for root in ObjectPathManager::new()
-            .get_namespace_roots_for_path(&fragment, "docs/versioned.bin")
+        for root in
+            ObjectPathManager::new().get_namespace_roots_for_path(&fragment, "docs/versioned.bin")
         {
             publish_namespace_link(&root, &fragment, "docs/versioned.bin", &object_id)
                 .expect("publish namespace link");

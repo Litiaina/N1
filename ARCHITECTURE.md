@@ -304,6 +304,12 @@ client read on any node
 Reads never infer an old object's placement from the current cluster topology.
 The version record is authoritative.
 
+Namespace reads are partition-voter-first. If the assigned voter group returns
+an empty result for a path that may be stale, wiped, or partition-moved, N2
+falls back to other reachable readable nodes and merges the first non-empty
+answer. This fallback is only used after the owning partition read is empty;
+normal reads stay on the partition voter path.
+
 ## Layout Evolution
 
 N2 supports:
@@ -353,6 +359,37 @@ healthy + older_recorded_layout
 ```
 
 Health and topology age are separate facts.
+
+## Proof Status
+
+The current 1.0.0 implementation has been proven on three hardware nodes in
+both separated-root and shared-root layouts.
+
+The hardening proof covers:
+
+- multipart resume across restart;
+- POSIX list, rename, trash, recover, and read-after-recover;
+- node-b loss during reads and writes;
+- object status and object repair;
+- deliberate single-shard deletion and parity reconstruction;
+- cluster repair;
+- targeted rebalance of an older recorded layout into the current topology;
+- forbidden old layout checks for `.cluster`, `.namespace`, `.blobs`, `.nmtd`,
+  and `.ndx`;
+- canonical `.ncdx` colocation on shard-bearing roots.
+
+Recent three-node separated-root proof:
+
+```text
+payload: 64 MiB
+multipart resume upload: 10.71 MiB/s
+local download: 72.48 MiB/s
+node-b-loss download: 116.99 MiB/s
+single-shard delete reconstruct: 70.97 MiB/s
+targeted rebalance: scanned=1 rewritten=1 failed=0
+final health: healthy, 3 readable/write nodes, 2+1 layout
+max RSS: node-a 50.35 MiB, node-b 42.92 MiB, node-c 40.78 MiB
+```
 
 ## Failure Semantics
 

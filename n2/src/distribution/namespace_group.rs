@@ -59,7 +59,9 @@ pub fn namespace_partition_for_path(fragment: &str, path: &str) -> u16 {
 }
 
 fn group_path(fragment: &str, partition_id: u16) -> Result<PathBuf, AppError> {
-    Ok(group_root()?.join(fragment).join(format!("{partition_id:04}.json")))
+    Ok(group_root()?
+        .join(fragment)
+        .join(format!("{partition_id:04}.json")))
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
@@ -147,7 +149,10 @@ pub fn persist_namespace_group(assignment: &NamespaceGroupAssignment) -> Result<
     let bytes = serde_json::to_vec_pretty(assignment).map_err(|err| {
         AppError::InternalServerError(format!("encode N2 namespace group: {err}"))
     })?;
-    write_atomic(&group_path(&assignment.fragment, assignment.partition_id)?, &bytes)
+    write_atomic(
+        &group_path(&assignment.fragment, assignment.partition_id)?,
+        &bytes,
+    )
 }
 
 fn assignment_score(fragment: &str, partition_id: u16, node_id: &str) -> [u8; 32] {

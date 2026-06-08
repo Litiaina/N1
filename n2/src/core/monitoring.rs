@@ -841,14 +841,13 @@ async fn collect_system_health(
         target_fragment.as_deref(),
     )
     .await?;
-    let namespace_replica_debt =
-        detect_namespace_replica_debt(
-            &active_index_roots,
-            &active_blob_roots,
-            deep_scan,
-            target_fragment.as_deref(),
-        )
-            .await?;
+    let namespace_replica_debt = detect_namespace_replica_debt(
+        &active_index_roots,
+        &active_blob_roots,
+        deep_scan,
+        target_fragment.as_deref(),
+    )
+    .await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
         total_index as u64,

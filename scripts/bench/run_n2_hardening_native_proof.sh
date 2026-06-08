@@ -624,7 +624,8 @@ if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
 fi
 NATIVE_LOCATORS="$(wc -l < "$OUT/native-peer-locator-strings.txt" | tr -d ' ')"
 
-find "$L_BLOB_ROOT" -path '*/.objects/*/@o_*/*/*' -type f \( -name '*.shard' -o -name '*.parity' \) | sort | head -1 > "$OUT/deleted-shard.txt"
+find "$L_BLOB_ROOT" -path '*/.objects/*/@o_*/*/*' -type f \( -name '*.shard' -o -name '*.parity' \) | sort > "$OUT/local-shard-candidates.txt"
+head -1 "$OUT/local-shard-candidates.txt" > "$OUT/deleted-shard.txt"
 DELETED="$(cat "$OUT/deleted-shard.txt")"
 if [[ -z "$DELETED" ]]; then
   echo "no local cluster shard found for deletion proof" >&2

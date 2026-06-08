@@ -293,6 +293,21 @@ The proof harnesses are intended for multi-node correctness checks and write
 ignored local output under `.n2-bench/`. The hardening harness does not kill
 existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
 
+Latest three-node proof summary:
+
+```text
+N2 package tests: 111 passed
+Workspace tests: N2, gateway, shell, native client, and SIMD core passed
+Separated hardening proof: passed
+Shared-root hardening proof: passed
+Capacity expansion proof: passed
+Live gateway smoke: one-shot SHA matched, cluster health healthy
+```
+
+The separated proof covered node-b loss, read-on-recover, single-shard delete
+reconstruction, object repair, cluster repair, targeted rebalance, POSIX
+mutation, trash/recover, and old-layout rejection checks.
+
 ## Operational Boundaries
 
 - N2 `1.0.0` means the product shape and architecture are finalized enough for

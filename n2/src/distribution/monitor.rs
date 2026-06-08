@@ -620,15 +620,16 @@ fn namespace_consensus_summary(
     let mut notes = vec![
         "namespace mutation is quorum-gated; immutable object/layout metadata is not consensus-mutated after commit".to_string(),
     ];
-    let local_ledger = fragment.as_deref().and_then(|fragment| {
-        match aggregate_local_namespace_ledger(fragment) {
-            Ok(summary) => Some(summary),
-            Err(err) => {
-                notes.push(format!("local namespace ledger summary failed: {err}"));
-                None
-            }
-        }
-    });
+    let local_ledger =
+        fragment.as_deref().and_then(
+            |fragment| match aggregate_local_namespace_ledger(fragment) {
+                Ok(summary) => Some(summary),
+                Err(err) => {
+                    notes.push(format!("local namespace ledger summary failed: {err}"));
+                    None
+                }
+            },
+        );
     let status = if local_ledger.is_some() {
         "ledger_available"
     } else if fragment.is_some() {

@@ -2,10 +2,10 @@ use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManag
 use crate::core::index_store::{
     TRASH_DIR, fragment_root_on, internal_namespace_entry_name, read_namespace_symlink_object_id,
 };
-use crate::distribution::membership::active_cluster_runtime;
+use crate::distribution::membership::{ClusterNode, active_cluster_runtime, live_readable_nodes};
 use crate::distribution::namespace_group::{
-    NamespaceGroupAssignment, assignment_nodes, load_namespace_group, persist_namespace_group,
-    namespace_partition_count, namespace_partition_for_path, resolve_namespace_group,
+    NamespaceGroupAssignment, assignment_nodes, load_namespace_group, namespace_partition_count,
+    namespace_partition_for_path, persist_namespace_group, resolve_namespace_group,
 };
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
 use crate::enums::app_error_enum::AppError;
@@ -229,7 +229,10 @@ fn namespace_request_partition(request: &PeerNamespaceApplyRequest) -> u16 {
 }
 
 fn namespace_read_partition(request: &PeerNamespaceReadRequest) -> u16 {
-    namespace_partition_for_path(&request.fragment, request.path.as_deref().unwrap_or_default())
+    namespace_partition_for_path(
+        &request.fragment,
+        request.path.as_deref().unwrap_or_default(),
+    )
 }
 
 fn namespace_ledger_root() -> Result<std::path::PathBuf, AppError> {
@@ -258,7 +261,10 @@ pub fn append_namespace_mutation(
         .join(format!("{:04}.jsonl", record.partition_id));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            AppError::Io(e, format!("create N2 namespace ledger {}", parent.display()))
+            AppError::Io(
+                e,
+                format!("create N2 namespace ledger {}", parent.display()),
+            )
         })?;
     }
     let mut file = OpenOptions::new()
@@ -335,6 +341,204 @@ fn namespace_read_peer_url(endpoint: &str) -> String {
     format!("{}/n2/peer/namespace/read", endpoint.trim_end_matches('/'))
 }
 
+async fn post_namespace_read(
+    endpoint: &str,
+    request: &PeerNamespaceReadRequest,
+) -> Result<PeerNamespaceReadResponse, AppError> {
+    let client = peer_http_client()?;
+    let mut builder = client.post(namespace_read_peer_url(endpoint)).json(request);
+    if let Some(secret) = cluster_secret() {
+        builder = builder.header("x-n2-cluster-secret", secret);
+    }
+    let response = timeout(Duration::from_secs(20), builder.send())
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("namespace voter read timed out".into()))?
+        .map_err(|err| {
+            AppError::ServiceUnavailable(format!("namespace voter read failed: {err}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "namespace voter read returned {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<PeerNamespaceReadResponse>()
+        .await
+        .map_err(|err| {
+            AppError::InternalServerError(format!("decode namespace voter read response: {err}"))
+        })
+}
+
+async fn local_namespace_read_response(
+    request: &PeerNamespaceReadRequest,
+) -> Result<PeerNamespaceReadResponse, AppError> {
+    let namespace = global_namespace_runtime();
+    Ok(match request.kind {
+        PeerNamespaceReadKind::ListDir => {
+            let (entries, continuation_token) = namespace
+                .list_dir_page(
+                    &request.fragment,
+                    request.path.as_deref().unwrap_or_default(),
+                    request.include_trashed,
+                    request.limit.unwrap_or(100).clamp(1, 10_000),
+                    request.continuation_token.as_deref(),
+                )
+                .await?;
+            PeerNamespaceReadResponse::ListDir {
+                entries,
+                continuation_token,
+            }
+        }
+        PeerNamespaceReadKind::Entry => PeerNamespaceReadResponse::Entry(
+            namespace
+                .entry(
+                    &request.fragment,
+                    request.path.as_deref().unwrap_or_default(),
+                )
+                .await?,
+        ),
+        PeerNamespaceReadKind::TrashedEntry => PeerNamespaceReadResponse::Entry(
+            namespace
+                .trashed_entry(
+                    &request.fragment,
+                    request.path.as_deref().unwrap_or_default(),
+                )
+                .await?,
+        ),
+        PeerNamespaceReadKind::ResolveLiveObject => PeerNamespaceReadResponse::ObjectId(
+            namespace
+                .resolve_live_object_id(
+                    &request.fragment,
+                    request.path.as_deref().unwrap_or_default(),
+                )
+                .await?,
+        ),
+        PeerNamespaceReadKind::ObjectRefs => {
+            PeerNamespaceReadResponse::ObjectRefs(if request.include_trashed {
+                namespace
+                    .list_trash_object_refs_page(
+                        &request.fragment,
+                        request.prefix.as_deref(),
+                        request.continuation_token.as_deref(),
+                        request.limit.unwrap_or(100).clamp(1, 10_000),
+                    )
+                    .await?
+            } else {
+                namespace
+                    .list_live_object_refs_page(
+                        &request.fragment,
+                        request.prefix.as_deref(),
+                        request.continuation_token.as_deref(),
+                        request.limit.unwrap_or(100).clamp(1, 10_000),
+                    )
+                    .await?
+            })
+        }
+        PeerNamespaceReadKind::Reachability => PeerNamespaceReadResponse::Reachability(
+            crate::core::index_store::referenced_object_ids(&request.fragment)?,
+        ),
+    })
+}
+
+async fn namespace_read_from_node(
+    node: &ClusterNode,
+    local_node_id: &str,
+    request: &PeerNamespaceReadRequest,
+) -> Result<PeerNamespaceReadResponse, AppError> {
+    if node.id == local_node_id {
+        FORCE_LOCAL_NAMESPACE_READ
+            .scope(true, Box::pin(local_namespace_read_response(request)))
+            .await
+    } else {
+        post_namespace_read(&node.endpoint, request).await
+    }
+}
+
+fn namespace_response_is_empty(response: &PeerNamespaceReadResponse) -> bool {
+    match response {
+        PeerNamespaceReadResponse::ListDir { entries, .. } => entries.is_empty(),
+        PeerNamespaceReadResponse::Entry(entry) => entry.is_none(),
+        PeerNamespaceReadResponse::ObjectId(object_id) => object_id.is_none(),
+        PeerNamespaceReadResponse::ObjectRefs(page) => page.entries.is_empty(),
+        PeerNamespaceReadResponse::Reachability(object_ids) => object_ids.is_empty(),
+    }
+}
+
+fn merge_namespace_read_responses(
+    left: PeerNamespaceReadResponse,
+    right: PeerNamespaceReadResponse,
+) -> PeerNamespaceReadResponse {
+    match (left, right) {
+        (
+            PeerNamespaceReadResponse::ListDir {
+                mut entries,
+                continuation_token,
+            },
+            PeerNamespaceReadResponse::ListDir {
+                entries: other,
+                continuation_token: other_token,
+            },
+        ) => {
+            let mut seen = entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<BTreeSet<_>>();
+            for entry in other {
+                if seen.insert(entry.path.clone()) {
+                    entries.push(entry);
+                }
+            }
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            PeerNamespaceReadResponse::ListDir {
+                entries,
+                continuation_token: continuation_token.or(other_token),
+            }
+        }
+        (PeerNamespaceReadResponse::Entry(None), PeerNamespaceReadResponse::Entry(entry)) => {
+            PeerNamespaceReadResponse::Entry(entry)
+        }
+        (left @ PeerNamespaceReadResponse::Entry(Some(_)), PeerNamespaceReadResponse::Entry(_)) => {
+            left
+        }
+        (
+            PeerNamespaceReadResponse::ObjectId(None),
+            PeerNamespaceReadResponse::ObjectId(object_id),
+        ) => PeerNamespaceReadResponse::ObjectId(object_id),
+        (
+            left @ PeerNamespaceReadResponse::ObjectId(Some(_)),
+            PeerNamespaceReadResponse::ObjectId(_),
+        ) => left,
+        (
+            PeerNamespaceReadResponse::ObjectRefs(mut page),
+            PeerNamespaceReadResponse::ObjectRefs(other),
+        ) => {
+            let mut seen = page
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<BTreeSet<_>>();
+            for entry in other.entries {
+                if seen.insert(entry.path.clone()) {
+                    page.entries.push(entry);
+                }
+            }
+            page.entries
+                .sort_by(|left, right| left.path.cmp(&right.path));
+            page.continuation_token = page.continuation_token.or(other.continuation_token);
+            PeerNamespaceReadResponse::ObjectRefs(page)
+        }
+        (
+            PeerNamespaceReadResponse::Reachability(mut object_ids),
+            PeerNamespaceReadResponse::Reachability(other),
+        ) => {
+            object_ids.extend(other);
+            PeerNamespaceReadResponse::Reachability(object_ids)
+        }
+        (left, _) => left,
+    }
+}
+
 fn namespace_summary_peer_url(endpoint: &str, fragment: &str, partition_id: u16) -> String {
     format!(
         "{}/n2/peer/namespace/summary/{}/{}",
@@ -407,7 +611,12 @@ async fn most_current_reachable_voter(
         let summary = if node.id == runtime.local_node_id {
             namespace_local_ledger_summary(&assignment.fragment, assignment.partition_id)
         } else {
-            fetch_namespace_summary(&node.endpoint, &assignment.fragment, assignment.partition_id).await
+            fetch_namespace_summary(
+                &node.endpoint,
+                &assignment.fragment,
+                assignment.partition_id,
+            )
+            .await
         };
         if let Ok(summary) = summary {
             candidates.push((summary.committed_log_index, node));
@@ -446,36 +655,101 @@ pub async fn namespace_read_if_remote(
     };
     let partition_id = namespace_read_partition(&request);
     let assignment = resolve_namespace_group(&runtime, &request.fragment, partition_id).await?;
-    let voter = most_current_reachable_voter(&runtime, &assignment).await?;
-    if voter.id == runtime.local_node_id {
-        return Ok(None);
+    let mut candidates = Vec::new();
+    for node in assignment_nodes(&runtime, &assignment)? {
+        let summary = if node.id == runtime.local_node_id {
+            namespace_local_ledger_summary(&assignment.fragment, assignment.partition_id)
+        } else {
+            fetch_namespace_summary(
+                &node.endpoint,
+                &assignment.fragment,
+                assignment.partition_id,
+            )
+            .await
+        };
+        if let Ok(summary) = summary {
+            candidates.push((summary.committed_log_index, node));
+        }
     }
-    let client = peer_http_client()?;
-    let mut builder = client
-        .post(namespace_read_peer_url(&voter.endpoint))
-        .json(&request);
-    if let Some(secret) = cluster_secret() {
-        builder = builder.header("x-n2-cluster-secret", secret);
+    candidates.sort_by(|(left_pos, left_node), (right_pos, right_node)| {
+        right_pos
+            .cmp(left_pos)
+            .then_with(|| {
+                (right_node.id == runtime.local_node_id)
+                    .cmp(&(left_node.id == runtime.local_node_id))
+            })
+            .then_with(|| left_node.id.cmp(&right_node.id))
+    });
+    let Some((best_position, _)) = candidates.first().cloned() else {
+        return Err(AppError::ServiceUnavailable(
+            "no reachable namespace voter can serve this fragment".into(),
+        ));
+    };
+
+    let mut best_response: Option<PeerNamespaceReadResponse> = None;
+    let mut last_error: Option<AppError> = None;
+    let mut tried_node_ids = BTreeSet::new();
+    for (position, node) in candidates {
+        if position != best_position && best_response.is_some() {
+            break;
+        }
+        tried_node_ids.insert(node.id.clone());
+        let response = namespace_read_from_node(&node, &runtime.local_node_id, &request).await;
+        match response {
+            Ok(response) => {
+                best_response = Some(match best_response.take() {
+                    Some(existing) if position == best_position => {
+                        merge_namespace_read_responses(existing, response)
+                    }
+                    Some(existing) if namespace_response_is_empty(&existing) => response,
+                    Some(existing) => existing,
+                    None => response,
+                });
+                if best_response
+                    .as_ref()
+                    .is_some_and(|response| !namespace_response_is_empty(response))
+                {
+                    break;
+                }
+            }
+            Err(err) => last_error = Some(err),
+        }
     }
-    let response = timeout(Duration::from_secs(20), builder.send())
-        .await
-        .map_err(|_| AppError::ServiceUnavailable("namespace voter read timed out".into()))?
-        .map_err(|err| {
-            AppError::ServiceUnavailable(format!("namespace voter read failed: {err}"))
-        })?;
-    if !response.status().is_success() {
-        return Err(AppError::ServiceUnavailable(format!(
-            "namespace voter read returned {}",
-            response.status()
-        )));
+
+    if best_response
+        .as_ref()
+        .is_some_and(namespace_response_is_empty)
+    {
+        for node in live_readable_nodes(&runtime).await {
+            if tried_node_ids.contains(&node.id) {
+                continue;
+            }
+            tried_node_ids.insert(node.id.clone());
+            match namespace_read_from_node(&node, &runtime.local_node_id, &request).await {
+                Ok(response) => {
+                    best_response = Some(match best_response.take() {
+                        Some(existing) => merge_namespace_read_responses(existing, response),
+                        None => response,
+                    });
+                    if best_response
+                        .as_ref()
+                        .is_some_and(|response| !namespace_response_is_empty(response))
+                    {
+                        break;
+                    }
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
     }
-    response
-        .json::<PeerNamespaceReadResponse>()
-        .await
-        .map(Some)
-        .map_err(|err| {
-            AppError::InternalServerError(format!("decode namespace voter read response: {err}"))
+
+    best_response.map(Some).ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            AppError::ServiceUnavailable(
+                "no reachable namespace voter can serve this fragment".into(),
+            )
         })
+    })
 }
 
 fn ensure_request_mutation_id(mut request: PeerNamespaceApplyRequest) -> PeerNamespaceApplyRequest {
@@ -638,7 +912,10 @@ fn scan_snapshot_tree(
     Ok(())
 }
 
-fn build_namespace_snapshot(fragment: &str, partition_id: u16) -> Result<NamespaceSnapshot, AppError> {
+fn build_namespace_snapshot(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<NamespaceSnapshot, AppError> {
     let requests = read_request_ledger(fragment, partition_id)?;
     let mut entries = Vec::new();
     let roots = ObjectPathManager::new().get_all_namespace_roots(fragment);
@@ -781,10 +1058,11 @@ fn restore_namespace_snapshot_entry(
                 )
             })?;
         }
-        unix_fs::symlink(format!("@o_{}", object_id.as_deref().unwrap_or_default()), &path)
-            .map_err(|err| {
-                AppError::Io(err, format!("restore namespace link {}", path.display()))
-            })?;
+        unix_fs::symlink(
+            format!("@o_{}", object_id.as_deref().unwrap_or_default()),
+            &path,
+        )
+        .map_err(|err| AppError::Io(err, format!("restore namespace link {}", path.display())))?;
     }
     Ok(())
 }
@@ -912,12 +1190,19 @@ fn apply_namespace_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), AppError
     for entry in entries {
         restore_namespace_snapshot_entry(&snapshot.fragment, entry)?;
     }
-    write_request_ledger_atomic(&snapshot.fragment, snapshot.partition_id, &snapshot.requests)?;
+    write_request_ledger_atomic(
+        &snapshot.fragment,
+        snapshot.partition_id,
+        &snapshot.requests,
+    )?;
     persist_namespace_snapshot(snapshot)?;
     Ok(())
 }
 
-fn read_request_ledger(fragment: &str, partition_id: u16) -> Result<Vec<PeerNamespaceApplyRequest>, AppError> {
+fn read_request_ledger(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<Vec<PeerNamespaceApplyRequest>, AppError> {
     let path = namespace_request_ledger_path(fragment, partition_id)?;
     if !path.exists() {
         return Ok(Vec::new());
@@ -946,7 +1231,10 @@ fn read_request_ledger(fragment: &str, partition_id: u16) -> Result<Vec<PeerName
     Ok(out)
 }
 
-pub fn namespace_local_ledger_summary(fragment: &str, partition_id: u16) -> Result<NamespaceLedgerSummary, AppError> {
+pub fn namespace_local_ledger_summary(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<NamespaceLedgerSummary, AppError> {
     let path = namespace_request_ledger_path(fragment, partition_id)?;
     let requests = read_request_ledger(fragment, partition_id)?;
     let last = requests.last();
@@ -965,21 +1253,28 @@ pub fn namespace_local_ledger_summary(fragment: &str, partition_id: u16) -> Resu
     })
 }
 
-fn request_seen(fragment: &str, partition_id: u16, mutation_id: Option<&str>) -> Result<bool, AppError> {
+fn request_seen(
+    fragment: &str,
+    partition_id: u16,
+    mutation_id: Option<&str>,
+) -> Result<bool, AppError> {
     let Some(mutation_id) = mutation_id.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(false);
     };
-    Ok(read_request_ledger(fragment, partition_id)?.iter().any(|request| {
-        request
-            .mutation_id
-            .as_deref()
-            .is_some_and(|value| value == mutation_id)
-    }))
+    Ok(read_request_ledger(fragment, partition_id)?
+        .iter()
+        .any(|request| {
+            request
+                .mutation_id
+                .as_deref()
+                .is_some_and(|value| value == mutation_id)
+        }))
 }
 
 fn append_request_ledger(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
     let _ = append_namespace_mutation(namespace_ledger_record(request)?)?;
-    let path = namespace_request_ledger_path(&request.fragment, namespace_request_partition(request))?;
+    let path =
+        namespace_request_ledger_path(&request.fragment, namespace_request_partition(request))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             AppError::Io(
@@ -1317,8 +1612,12 @@ async fn fetch_namespace_prepared(
     log_index: u64,
 ) -> Result<Option<PreparedNamespaceMutation>, AppError> {
     let client = peer_http_client()?;
-    let mut request =
-        client.get(namespace_prepared_peer_url(endpoint, fragment, partition_id, log_index));
+    let mut request = client.get(namespace_prepared_peer_url(
+        endpoint,
+        fragment,
+        partition_id,
+        log_index,
+    ));
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
     }
@@ -1384,9 +1683,14 @@ async fn recover_prepared_slot(
         let prepared = if node.id == runtime.local_node_id {
             prepared_mutation_for_log_index(&assignment.fragment, partition_id, log_index)?
         } else {
-            fetch_namespace_prepared(&node.endpoint, &assignment.fragment, partition_id, log_index)
-                .await
-                .unwrap_or(None)
+            fetch_namespace_prepared(
+                &node.endpoint,
+                &assignment.fragment,
+                partition_id,
+                log_index,
+            )
+            .await
+            .unwrap_or(None)
         };
         let Some(prepared) = prepared else {
             continue;
@@ -1426,7 +1730,8 @@ async fn recover_prepared_slot(
         ));
     }
 
-    if let Some(local) = prepared_mutation_for_log_index(&assignment.fragment, partition_id, log_index)?
+    if let Some(local) =
+        prepared_mutation_for_log_index(&assignment.fragment, partition_id, log_index)?
         && local.request.mutation_id.as_deref() != Some(selected_id.as_str())
         && let Some(mutation_id) = local.request.mutation_id.as_deref()
     {
@@ -1695,12 +2000,20 @@ async fn apply_namespace_request(
     request: &PeerNamespaceApplyRequest,
 ) -> Result<NamespaceApplyOutcome, AppError> {
     let partition_id = namespace_request_partition(request);
-    if request_seen(&request.fragment, partition_id, request.mutation_id.as_deref())? {
+    if request_seen(
+        &request.fragment,
+        partition_id,
+        request.mutation_id.as_deref(),
+    )? {
         return Ok(NamespaceApplyOutcome::None);
     }
     let lock = namespace_partition_commit_lock(&request.fragment, partition_id)?;
     let _guard = lock.lock().await;
-    if request_seen(&request.fragment, partition_id, request.mutation_id.as_deref())? {
+    if request_seen(
+        &request.fragment,
+        partition_id,
+        request.mutation_id.as_deref(),
+    )? {
         return Ok(NamespaceApplyOutcome::None);
     }
     let outcome = materialize_namespace_request(request).await?;
@@ -1733,10 +2046,9 @@ fn validate_prepared_assignment(
             "this node is not a voter for the fragment namespace".into(),
         ));
     }
-    if let Some(existing) = load_namespace_group(
-        &prepared.request.fragment,
-        prepared.assignment.partition_id,
-    )? {
+    if let Some(existing) =
+        load_namespace_group(&prepared.request.fragment, prepared.assignment.partition_id)?
+    {
         if existing != prepared.assignment {
             return Err(AppError::Conflict(
                 "namespace group assignment differs from durable local assignment".into(),
@@ -1763,7 +2075,11 @@ async fn coordinate_namespace_commit(
     let _guard = lock.lock().await;
     let voters = assignment_nodes(&runtime, &assignment)?;
     while recover_prepared_slot(&runtime, &assignment, &voters).await? {}
-    if request_seen(&request.fragment, partition_id, request.mutation_id.as_deref())? {
+    if request_seen(
+        &request.fragment,
+        partition_id,
+        request.mutation_id.as_deref(),
+    )? {
         return Ok(NamespaceApplyOutcome::None);
     }
     validate_namespace_request(&request)?;
@@ -1775,9 +2091,11 @@ async fn coordinate_namespace_commit(
         request,
     };
     validate_prepared_assignment(&prepared, &runtime.local_node_id)?;
-    if let Some(existing) =
-        prepared_mutation_for_log_index(&prepared.request.fragment, partition_id, prepared.log_index)?
-    {
+    if let Some(existing) = prepared_mutation_for_log_index(
+        &prepared.request.fragment,
+        partition_id,
+        prepared.log_index,
+    )? {
         if existing.request.mutation_id != prepared.request.mutation_id {
             return Err(AppError::Conflict(format!(
                 "namespace log index {} is already prepared by mutation {}",
@@ -1937,9 +2255,11 @@ async fn peer_prepare_namespace(
             expected.saturating_sub(1)
         )));
     }
-    if let Some(existing) =
-        prepared_mutation_for_log_index(&prepared.request.fragment, partition_id, prepared.log_index)?
-    {
+    if let Some(existing) = prepared_mutation_for_log_index(
+        &prepared.request.fragment,
+        partition_id,
+        prepared.log_index,
+    )? {
         if existing.request.mutation_id == prepared.request.mutation_id {
             return Ok(StatusCode::NO_CONTENT);
         }
@@ -1950,7 +2270,8 @@ async fn peer_prepare_namespace(
         )));
     }
     if let Some(mutation_id) = prepared.request.mutation_id.as_deref()
-        && let Some(existing) = load_prepared_mutation(&prepared.request.fragment, partition_id, mutation_id)?
+        && let Some(existing) =
+            load_prepared_mutation(&prepared.request.fragment, partition_id, mutation_id)?
     {
         if existing.log_index == prepared.log_index
             && existing.request.mutation_id == prepared.request.mutation_id
@@ -2035,7 +2356,8 @@ async fn peer_abort_namespace(
         return Ok(StatusCode::NO_CONTENT);
     }
     if let Some(mutation_id) = prepared.request.mutation_id.as_deref()
-        && let Some(durable) = load_prepared_mutation(&prepared.request.fragment, partition_id, mutation_id)?
+        && let Some(durable) =
+            load_prepared_mutation(&prepared.request.fragment, partition_id, mutation_id)?
         && durable.log_index == prepared.log_index
         && durable.request.mutation_id == prepared.request.mutation_id
     {
@@ -2161,7 +2483,10 @@ pub async fn peer_namespace_summary(
     Path((fragment, partition_id)): Path<(String, u16)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     authorize_peer(&headers)?;
-    Ok(Json(namespace_local_ledger_summary(&fragment, partition_id)?))
+    Ok(Json(namespace_local_ledger_summary(
+        &fragment,
+        partition_id,
+    )?))
 }
 
 pub async fn peer_namespace_prepared(
@@ -2169,7 +2494,11 @@ pub async fn peer_namespace_prepared(
     Path((fragment, partition_id, log_index)): Path<(String, u16, u64)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     authorize_peer(&headers)?;
-    Ok(Json(prepared_mutation_for_log_index(&fragment, partition_id, log_index)?))
+    Ok(Json(prepared_mutation_for_log_index(
+        &fragment,
+        partition_id,
+        log_index,
+    )?))
 }
 
 async fn fetch_peer_namespace_requests(
@@ -2178,7 +2507,11 @@ async fn fetch_peer_namespace_requests(
     partition_id: u16,
 ) -> Result<Vec<PeerNamespaceApplyRequest>, AppError> {
     let client = peer_http_client()?;
-    let mut req = client.get(namespace_requests_peer_url(endpoint, fragment, partition_id));
+    let mut req = client.get(namespace_requests_peer_url(
+        endpoint,
+        fragment,
+        partition_id,
+    ));
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
@@ -2215,7 +2548,11 @@ async fn fetch_peer_namespace_snapshot(
     partition_id: u16,
 ) -> Result<NamespaceSnapshot, AppError> {
     let client = peer_http_client()?;
-    let mut request = client.get(namespace_snapshot_peer_url(endpoint, fragment, partition_id));
+    let mut request = client.get(namespace_snapshot_peer_url(
+        endpoint,
+        fragment,
+        partition_id,
+    ));
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
     }
@@ -2255,13 +2592,16 @@ async fn sync_namespace_from_peers_with_snapshot(
         if source.id == runtime.local_node_id {
             continue;
         }
-        let snapshot = fetch_peer_namespace_snapshot(&source.endpoint, fragment, partition_id).await?;
+        let snapshot =
+            fetch_peer_namespace_snapshot(&source.endpoint, fragment, partition_id).await?;
         let local_position = read_request_ledger(fragment, partition_id)?.len() as u64;
         if force_snapshot || snapshot.committed_log_index > local_position {
             apply_namespace_snapshot(&snapshot)?;
-            applied = applied.saturating_add(snapshot.committed_log_index.saturating_sub(local_position));
+            applied =
+                applied.saturating_add(snapshot.committed_log_index.saturating_sub(local_position));
         }
-        let requests = fetch_peer_namespace_requests(&source.endpoint, fragment, partition_id).await?;
+        let requests =
+            fetch_peer_namespace_requests(&source.endpoint, fragment, partition_id).await?;
         for request in requests {
             if request.fragment != fragment {
                 continue;
@@ -2333,6 +2673,7 @@ mod tests {
     use super::*;
     use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
     use crate::core::index_store::{publish_namespace_link, read_namespace_symlink_object_id};
+    use crate::namespace::models::{LifecycleState, NamespaceEntryKind};
 
     fn request(kind: NamespaceMutationKind) -> PeerNamespaceApplyRequest {
         PeerNamespaceApplyRequest {
@@ -2377,6 +2718,85 @@ mod tests {
         assert!(validate_namespace_request(&empty_trash).is_ok());
     }
 
+    fn test_entry(path: &str) -> NamespaceEntry {
+        NamespaceEntry {
+            fragment: "frag".into(),
+            path: path.into(),
+            parent_path: String::new(),
+            name: path.into(),
+            kind: NamespaceEntryKind::File,
+            object_id: Some("01KOBJECT000000000000000000".into()),
+            size_bytes: Some(7),
+            version_id: Some("01KVERSION00000000000000000".into()),
+            packed_ext_u64: None,
+            lifecycle: LifecycleState::Live,
+            trash_entry_id: None,
+            deleted_at_unix: None,
+            created_at_unix: 1,
+            updated_at_unix: 1,
+        }
+    }
+
+    #[test]
+    fn namespace_read_merge_prefers_non_empty_voter_results() {
+        assert!(namespace_response_is_empty(
+            &PeerNamespaceReadResponse::ObjectId(None)
+        ));
+
+        let merged = merge_namespace_read_responses(
+            PeerNamespaceReadResponse::ObjectId(None),
+            PeerNamespaceReadResponse::ObjectId(Some("01KOBJECT000000000000000000".into())),
+        );
+        match merged {
+            PeerNamespaceReadResponse::ObjectId(Some(object_id)) => {
+                assert_eq!(object_id, "01KOBJECT000000000000000000");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let merged = merge_namespace_read_responses(
+            PeerNamespaceReadResponse::ListDir {
+                entries: Vec::new(),
+                continuation_token: None,
+            },
+            PeerNamespaceReadResponse::ListDir {
+                entries: vec![test_entry("videos")],
+                continuation_token: Some("next".into()),
+            },
+        );
+        match merged {
+            PeerNamespaceReadResponse::ListDir {
+                entries,
+                continuation_token,
+            } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].path, "videos");
+                assert_eq!(continuation_token.as_deref(), Some("next"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_read_merge_unions_reachability_sets() {
+        let merged = merge_namespace_read_responses(
+            PeerNamespaceReadResponse::Reachability(BTreeSet::from(["a".to_string()])),
+            PeerNamespaceReadResponse::Reachability(BTreeSet::from([
+                "a".to_string(),
+                "b".to_string(),
+            ])),
+        );
+        match merged {
+            PeerNamespaceReadResponse::Reachability(object_ids) => {
+                assert_eq!(
+                    object_ids,
+                    BTreeSet::from(["a".to_string(), "b".to_string()])
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     #[test]
     fn namespace_snapshot_restores_live_and_trash_links() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
@@ -2391,7 +2811,8 @@ mod tests {
 
         let fragment = format!("snapshot-{}", Ulid::new());
         let partition_id = namespace_partition_for_path(&fragment, "docs/live.bin");
-        let roots = ObjectPathManager::new().get_namespace_roots_for_path(&fragment, "docs/live.bin");
+        let roots =
+            ObjectPathManager::new().get_namespace_roots_for_path(&fragment, "docs/live.bin");
         let root = roots.first().expect("namespace root");
         publish_namespace_link(
             root,
@@ -2425,7 +2846,7 @@ mod tests {
                     .join("docs/trash.bin");
                 read_namespace_symlink_object_id(trash_root, &fragment, &trash_path)
             }
-                .expect("read trash link"),
+            .expect("read trash link"),
             Some("01KTRASH000000000000000000".to_string())
         );
         let _ = fs::remove_dir_all(base);
