@@ -709,6 +709,160 @@ pub fn start_repair(req: ClusterRebalanceRequest) -> Result<ClusterRewriteJobSta
     Ok(repair_status())
 }
 
+pub async fn run_rewrite_fragment_once(
+    req: ClusterRebalanceRequest,
+    repair_only: bool,
+) -> ClusterRewriteJobStatus {
+    let job_name = if repair_only {
+        format!("cluster_repair:{}", req.fragment)
+    } else {
+        format!("cluster_rebalance:{}", req.fragment)
+    };
+    let job_kind = if repair_only {
+        IoJobKind::ClusterRepair
+    } else {
+        IoJobKind::ClusterRebalance
+    };
+    let priority = request_priority(&req);
+    let mut out = ClusterRewriteJobStatus {
+        running: true,
+        job: job_name.clone(),
+        fragment: req.fragment.clone(),
+        dry_run: req.dry_run,
+        mismatched_only: req.mismatched_only,
+        resumable: true,
+        priority: priority_label(priority),
+        continuation_token: req.continuation_token.clone(),
+        started_at_unix: Some(chrono::Utc::now().timestamp()),
+        ..ClusterRewriteJobStatus::default()
+    };
+    let job_guard = match register_io_job(&job_name, job_kind, priority) {
+        Ok(guard) => guard,
+        Err(err) => {
+            out.running = false;
+            out.failed = out.failed.saturating_add(1);
+            out.last_error = Some(err.to_string());
+            out.finished_at_unix = Some(chrono::Utc::now().timestamp());
+            return out;
+        }
+    };
+    let cancel = job_guard.token();
+    let mut budget = budget_for_request(&req);
+    out.budget = Some(budget.snapshot());
+
+    let runtime = match active_cluster_runtime() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            out.running = false;
+            out.failed = out.failed.saturating_add(1);
+            out.last_error = Some(err.to_string());
+            out.finished_at_unix = Some(chrono::Utc::now().timestamp());
+            return out;
+        }
+    };
+    let mut continuation = req.continuation_token.clone();
+    let mut remaining = req.limit.unwrap_or(usize::MAX).max(1);
+    while remaining > 0 {
+        if cancel.is_cancelled() || budget.exhausted() {
+            out.cancel_requested = cancel.is_cancelled();
+            out.budget_exhausted = budget.exhausted();
+            out.budget_reason = budget.snapshot().exhaustion_reason;
+            break;
+        }
+        let page = match global_namespace_runtime()
+            .list_live_object_refs_page(
+                &req.fragment,
+                req.prefix.as_deref(),
+                continuation.as_deref(),
+                remaining.min(256),
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(err) => {
+                out.failed = out.failed.saturating_add(1);
+                out.last_error = Some(err.to_string());
+                break;
+            }
+        };
+        if page.entries.is_empty() {
+            break;
+        }
+        for entry in page.entries {
+            if remaining == 0 {
+                break;
+            }
+            if cancel.is_cancelled() || budget.exhausted() {
+                out.cancel_requested = cancel.is_cancelled();
+                out.budget_exhausted = budget.exhausted();
+                out.budget_reason = budget.snapshot().exhaustion_reason;
+                break;
+            }
+            remaining = remaining.saturating_sub(1);
+            budget.record_object();
+            out.scanned = out.scanned.saturating_add(1);
+            out.last_object = Some(entry.path.clone());
+            out.budget = Some(budget.snapshot());
+            let meta =
+                match index::read_object_version(&req.fragment, &entry.object_id, &entry.version_id)
+                    .await
+                {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        out.failed = out.failed.saturating_add(1);
+                        out.last_error = Some(err.to_string());
+                        continue;
+                    }
+                };
+            let should_rewrite = if repair_only {
+                object_has_unreadable_shard(&meta).await
+            } else if req.mismatched_only {
+                !metadata_matches_current_layout(&meta, &runtime)
+            } else {
+                true
+            };
+            if !should_rewrite {
+                out.skipped = out.skipped.saturating_add(1);
+                if repair_only {
+                    out.skipped_healthy = out.skipped_healthy.saturating_add(1);
+                } else if req.mismatched_only {
+                    out.skipped_current_layout = out.skipped_current_layout.saturating_add(1);
+                }
+                continue;
+            }
+            let rewrite_bytes = meta.total_size_bytes;
+            budget.record_bytes(rewrite_bytes);
+            out.budget = Some(budget.snapshot());
+            out.budget_exhausted = budget.exhausted();
+            out.budget_reason = budget.snapshot().exhaustion_reason;
+            match rewrite_object_to_current_layout(entry.path, entry.object_id, meta, req.dry_run)
+                .await
+            {
+                Ok(true) => {
+                    out.rewritten = out.rewritten.saturating_add(1);
+                    if !req.dry_run {
+                        out.bytes_processed = out.bytes_processed.saturating_add(rewrite_bytes);
+                    }
+                }
+                Ok(false) => out.skipped = out.skipped.saturating_add(1),
+                Err(err) => {
+                    out.failed = out.failed.saturating_add(1);
+                    out.last_error = Some(err.to_string());
+                }
+            }
+        }
+        continuation = page.continuation_token;
+        out.continuation_token = continuation.clone();
+        out.budget = Some(budget.snapshot());
+        if continuation.is_none() {
+            break;
+        }
+    }
+    out.running = false;
+    out.finished_at_unix = Some(chrono::Utc::now().timestamp());
+    out
+}
+
 pub fn stop_rebalance() -> ClusterRewriteJobStatus {
     if request_io_job_cancel("cluster_rebalance") {
         mark_cancel_requested(&REBALANCE_STATUS);

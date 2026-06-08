@@ -2,6 +2,9 @@ use crate::distribution::health::cluster_health_snapshot;
 use crate::distribution::membership::{
     ClusterNode, active_cluster_runtime, live_active_write_nodes,
 };
+use crate::distribution::maintenance::{
+    distributed_maintenance_status, start_distributed_maintenance,
+};
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::peer::{
     PeerUsageResponse, cluster_secret, local_peer_usage_snapshot_refresh, peer_http_client,
@@ -375,4 +378,12 @@ pub fn build_cluster_routes() -> Router<Arc<AppState>> {
         .route("/n2/cluster/repair/start", post(repair_start))
         .route("/n2/cluster/repair/stop", post(repair_stop))
         .route("/n2/cluster/repair/status", get(repair_status_route))
+        .route(
+            "/n2/cluster/maintenance/distributed/start",
+            post(start_distributed_maintenance),
+        )
+        .route(
+            "/n2/cluster/maintenance/distributed/status",
+            get(distributed_maintenance_status),
+        )
 }

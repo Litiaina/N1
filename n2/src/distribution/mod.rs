@@ -1,6 +1,7 @@
 pub mod download;
 pub mod health;
 pub mod layout;
+pub mod maintenance;
 pub mod membership;
 pub mod monitor;
 pub mod namespace;

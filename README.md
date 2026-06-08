@@ -65,6 +65,8 @@ The result is simple operational behavior:
 - cluster monitoring exposes overview, nodes, topology, object-layout health,
   redistribution, jobs, namespace consensus, and upload activity in one
   efficient `/n2/cluster/monitor` snapshot.
+- distributed maintenance assigns fragments across reachable nodes for
+  fragment-level GC, repair, and targeted rebalance.
 
 N2 supports separated and shared disk roles. With separated roots, fast index
 storage holds mutable namespace/control state while capacity storage holds
@@ -307,6 +309,16 @@ Live gateway smoke: one-shot SHA matched, cluster health healthy
 The separated proof covered node-b loss, read-on-recover, single-shard delete
 reconstruction, object repair, cluster repair, targeted rebalance, POSIX
 mutation, trash/recover, and old-layout rejection checks.
+
+Latest distributed maintenance proof:
+
+```text
+Node C unreachable: 192.168.0.18 returned Destination Host Unreachable
+Live workers: node-a, node-b
+Distributed rebalance: 4 fragments, scanned=7, skipped=7, failed=0
+Distributed repair dry-run: 4 fragments, scanned=7, rewritten=7, failed=0
+Distributed GC: 4 fragments scanned, failed=0
+```
 
 ## Operational Boundaries
 

@@ -47,6 +47,7 @@ use crate::core::upload::{
 };
 use crate::core::{index, index_store};
 use crate::distribution::download::part_has_remote_shards;
+use crate::distribution::maintenance::build_distributed_maintenance_peer_routes;
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, build_namespace_peer_routes,
@@ -1650,6 +1651,7 @@ pub fn build_storage_routes_unbound_with_options(
         .route("/n2/fragments/hash", get(get_fragment_hash))
         .route("/n2/objects/signed-read", get(read_object_via_signed_url))
         .merge(build_peer_routes())
+        .merge(build_distributed_maintenance_peer_routes())
         .merge(build_namespace_peer_routes());
     let global_routes = layers.layer_global(global_routes);
 

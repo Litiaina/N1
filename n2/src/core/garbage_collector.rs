@@ -262,54 +262,45 @@ fn parse_gc_execution_mode(params: &HashMap<String, String>) -> GcExecutionMode 
     }
 }
 
-pub async fn run_garbage_collector(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let target_fragment = match parse_gc_target_fragment(&params) {
-        Some(fragment) => match resolve_stable_fragment_id(&fragment).await {
-            Ok(stable) => Some(stable),
-            Err(_) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!("Fragment {} was not found.", fragment),
-                );
-            }
-        },
-        None => None,
+pub async fn start_garbage_collector_job(
+    state: Arc<AppState>,
+    target_fragment: Option<String>,
+    mode: Option<String>,
+    fast_mode: Option<bool>,
+) -> Result<(), AppError> {
+    let execution_mode = match mode
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("strict") | Some("readonly") | Some("read_only") => GcExecutionMode::Strict,
+        Some("scrub") | Some("quiesced") | Some("offline") => GcExecutionMode::Scrub,
+        _ => GcExecutionMode::Availability,
     };
-    let execution_mode = parse_gc_execution_mode(&params);
-    let fast_mode = parse_bool_param(
-        &params,
-        "fast_mode",
-        execution_mode != GcExecutionMode::Availability,
-    );
+    let fast_mode = fast_mode.unwrap_or(execution_mode != GcExecutionMode::Availability);
     let options = GcRunOptions {
         execution_mode,
         fast_mode,
     };
     if GC_RUNNING.swap(true, Ordering::SeqCst) {
-        return (
-            StatusCode::CONFLICT,
+        return Err(AppError::Conflict(
             "GC is already running. Check /n2/maintenance/gc/status.".to_string(),
-        );
+        ));
     }
     GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
+    with_gc_status_write(|st| {
+        *st = GcJobStatus {
+            is_running: true,
+            phase: "Initializing".to_string(),
+            is_manual_run: true,
+            current_fragment: target_fragment.clone().unwrap_or_default(),
+            start_timestamp: Utc::now().timestamp(),
+            ..Default::default()
+        };
+    });
 
     tokio::spawn(async move {
-        {
-            with_gc_status_write(|st| {
-                *st = GcJobStatus {
-                    is_running: true,
-                    phase: "Initializing".to_string(),
-                    is_manual_run: true,
-                    current_fragment: target_fragment.clone().unwrap_or_default(),
-                    start_timestamp: Utc::now().timestamp(),
-                    ..Default::default()
-                };
-            });
-        }
-
         if let Err(err) = run_gc_scan_offthread(state.clone(), true, target_fragment, options).await
         {
             error!("Manual GC Scan failed: {}", err);
@@ -332,7 +323,43 @@ pub async fn run_garbage_collector(
         GC_RUNNING.store(false, Ordering::SeqCst);
     });
 
-    (StatusCode::ACCEPTED, "GC started".to_string())
+    Ok(())
+}
+
+pub async fn run_garbage_collector(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let target_fragment = match parse_gc_target_fragment(&params) {
+        Some(fragment) => match resolve_stable_fragment_id(&fragment).await {
+            Ok(stable) => Some(stable),
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("Fragment {} was not found.", fragment),
+                );
+            }
+        },
+        None => None,
+    };
+    let execution_mode = parse_gc_execution_mode(&params);
+    let fast_mode = parse_bool_param(
+        &params,
+        "fast_mode",
+        execution_mode != GcExecutionMode::Availability,
+    );
+    match start_garbage_collector_job(
+        state,
+        target_fragment,
+        Some(execution_mode.as_str().to_string()),
+        Some(fast_mode),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::ACCEPTED, "GC started".to_string()),
+        Err(AppError::Conflict(message)) => (StatusCode::CONFLICT, message),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
 }
 
 pub async fn stop_garbage_collector(

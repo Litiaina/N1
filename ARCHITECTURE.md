@@ -352,6 +352,39 @@ N2 maintenance uses immutable version metadata and recorded placement:
 - GC removes immutable object versions no longer reachable from live or trash
   namespace.
 
+Cluster maintenance is fragment-parallel. A distributed maintenance request
+first resolves the reachable write nodes, then assigns stable fragment IDs
+across those nodes:
+
+```text
+fragments: F1 F2 F3 F4
+live nodes: node-a node-b
+
+node-a -> F1, F3
+node-b -> F2, F4
+```
+
+Each node runs its assigned fragments locally through the same object repair,
+targeted rebalance, or GC worker. The coordinator records assignment and
+status; it does not become object truth, namespace truth, or gateway truth. If a
+node is offline, it is excluded from the assignment set and the remaining nodes
+continue.
+
+Distributed maintenance routes:
+
+```text
+POST /n2/cluster/maintenance/distributed/start
+GET  /n2/cluster/maintenance/distributed/status
+```
+
+Supported kinds:
+
+```text
+gc
+repair
+rebalance
+```
+
 An older recorded layout is not degradation:
 
 ```text
@@ -373,6 +406,7 @@ The hardening proof covers:
 - object status and object repair;
 - deliberate single-shard deletion and parity reconstruction;
 - cluster repair;
+- distributed fragment-level repair, rebalance, and GC across live nodes;
 - targeted rebalance of an older recorded layout into the current topology;
 - forbidden old layout checks for `.cluster`, `.namespace`, `.blobs`, `.nmtd`,
   and `.ndx`;
