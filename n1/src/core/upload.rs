@@ -23,7 +23,7 @@ use futures_util::future::join_all;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -47,7 +47,7 @@ use crate::core::disk_manager::{
 };
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
-use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, acquire_disk_io};
+use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, IoProgress, acquire_disk_io};
 use crate::core::quota_manager::{
     ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
     fragment_quota_enforcement_enabled,
@@ -66,7 +66,6 @@ pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 
-const UPLOAD_IO_GATE_WAIT_LOG_SECS: u64 = 30;
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
@@ -137,7 +136,17 @@ static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
 });
 
 pub(crate) struct AdaptiveIoGuard {
-    _guard: DiskIoGuard,
+    guard: DiskIoGuard,
+}
+
+impl AdaptiveIoGuard {
+    fn progress_handle(&self) -> IoProgress {
+        self.guard.progress_handle()
+    }
+
+    fn complete(self) {
+        self.guard.complete();
+    }
 }
 
 async fn acquire_adaptive_io_guard(
@@ -145,7 +154,7 @@ async fn acquire_adaptive_io_guard(
     context: &str,
 ) -> Result<AdaptiveIoGuard, AppError> {
     Ok(AdaptiveIoGuard {
-        _guard: acquire_disk_io(DiskIoClass::ForegroundWrite, Some(fragment), context).await?,
+        guard: acquire_disk_io(DiskIoClass::ForegroundWrite, Some(fragment), context).await?,
     })
 }
 
@@ -158,25 +167,7 @@ async fn acquire_upload_io_guard_with_timeout(
         return Ok(None);
     }
 
-    let started = std::time::Instant::now();
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(UPLOAD_IO_GATE_WAIT_LOG_SECS),
-            acquire_adaptive_io_guard(fragment, context),
-        )
-        .await
-        {
-            Ok(Ok(guard)) => return Ok(Some(guard)),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                warn!(
-                    "Upload IO gate still waiting after {}s ({}); preserving request instead of rejecting multipart progress",
-                    started.elapsed().as_secs(),
-                    context
-                );
-            }
-        }
-    }
+    acquire_adaptive_io_guard(fragment, context).await.map(Some)
 }
 
 pub(crate) async fn acquire_upload_io_guard_for_query(
@@ -213,6 +204,34 @@ enum UploadDurabilityMode {
 pub enum FinalizeUploadResult {
     Complete(ObjectMetadata),
     Incomplete(FinalizeIncompleteResponse),
+}
+
+struct ProgressReader<'a, R> {
+    inner: &'a mut R,
+    progress: Option<&'a IoProgress>,
+}
+
+impl<R> AsyncRead for ProgressReader<'_, R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            let read = buf.filled().len().saturating_sub(before);
+            if read > 0
+                && let Some(progress) = self.progress
+            {
+                progress.record(read as u64);
+            }
+        }
+        result
+    }
 }
 
 impl UploadDurabilityMode {
@@ -1282,6 +1301,7 @@ async fn write_part_blob_to_disk(
     body: Body,
     expected_checksum: Option<&str>,
     strict_durability: bool,
+    progress: Option<&IoProgress>,
 ) -> Result<PartMetadata, AppError> {
     let body_stream = body.into_data_stream().map(|chunk_result| {
         chunk_result.map_err(|e| {
@@ -1304,6 +1324,7 @@ async fn write_part_blob_to_disk(
         body_stream,
         expected_checksum,
         strict_durability,
+        progress,
     )
     .await
 }
@@ -1321,6 +1342,7 @@ async fn write_part_blob_to_disk_from_stream<S>(
     mut body_stream: S,
     expected_checksum: Option<&str>,
     strict_durability: bool,
+    progress: Option<&IoProgress>,
 ) -> Result<PartMetadata, AppError>
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
@@ -1483,6 +1505,9 @@ where
             }
 
             stream_writer.write(&chunk).await?;
+            if let Some(progress) = progress {
+                progress.record(chunk.len() as u64);
+            }
         }
 
         if total_bytes_read != content_length {
@@ -1602,6 +1627,7 @@ async fn write_part_blob_to_disk_from_reader<R>(
     reader: &mut R,
     expected_checksum: Option<&str>,
     strict_durability: bool,
+    progress: Option<&IoProgress>,
 ) -> Result<PartMetadata, AppError>
 where
     R: AsyncRead + Unpin + Send,
@@ -1749,8 +1775,12 @@ where
             block_size,
         )?;
 
+        let mut progress_reader = ProgressReader {
+            inner: reader,
+            progress,
+        };
         let total_bytes_read = stream_writer
-            .write_exact_from_reader(reader, content_length)
+            .write_exact_from_reader(&mut progress_reader, content_length)
             .await?;
 
         stream_writer.finalize().await?;
@@ -2234,9 +2264,10 @@ pub async fn object_upload_part(
         "fragment={}, version={}, part={}",
         fragment, version_id, part_index
     );
-    let _io_guard =
+    let io_guard =
         acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
             .await?;
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
 
     if content_length > max_part_size {
         return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
@@ -2287,6 +2318,9 @@ pub async fn object_upload_part(
                 fragment, version_id, part_index, err
             );
         }
+        if let Some(guard) = io_guard {
+            guard.complete();
+        }
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
     if let Some(expected_size) = expected_size {
@@ -2312,6 +2346,7 @@ pub async fn object_upload_part(
         body,
         expected_checksum,
         strict_durability,
+        io_progress.as_ref(),
     )
     .await?;
 
@@ -2346,6 +2381,9 @@ pub async fn object_upload_part(
         return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
     }
 
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
 
@@ -2425,9 +2463,10 @@ where
         "fragment={}, version={}, part={}",
         fragment, version_id, part_index
     );
-    let _io_guard =
+    let io_guard =
         acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
             .await?;
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
 
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge("Part too large".into()));
@@ -2476,6 +2515,9 @@ where
                 fragment, version_id, part_index, err
             );
         }
+        if let Some(guard) = io_guard {
+            guard.complete();
+        }
         return Ok(());
     }
     if let Some(expected_size) = expected_size {
@@ -2499,6 +2541,7 @@ where
         body_stream,
         expected_checksum,
         strict_durability,
+        io_progress.as_ref(),
     )
     .await?;
 
@@ -2533,6 +2576,9 @@ where
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     Ok(())
 }
 
@@ -2562,9 +2608,10 @@ where
         "fragment={}, version={}, part={}",
         fragment, version_id, part_index
     );
-    let _io_guard =
+    let io_guard =
         acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
             .await?;
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
 
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge("Part too large".into()));
@@ -2613,6 +2660,9 @@ where
                 fragment, version_id, part_index, err
             );
         }
+        if let Some(guard) = io_guard {
+            guard.complete();
+        }
         return Ok(());
     }
     if let Some(expected_size) = expected_size {
@@ -2636,6 +2686,7 @@ where
         reader,
         expected_checksum,
         strict_durability,
+        io_progress.as_ref(),
     )
     .await?;
 
@@ -2670,6 +2721,9 @@ where
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     Ok(())
 }
 
@@ -2693,12 +2747,13 @@ async fn upload_object_one_shot_inner(
     let strict_durability = durability_mode.strict();
     let content_length = request_content_length(&headers)?;
     let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
-    let _io_guard = if acquire_io_gate {
+    let io_guard = if acquire_io_gate {
         acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
             .await?
     } else {
         None
     };
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Ok((
@@ -2736,6 +2791,7 @@ async fn upload_object_one_shot_inner(
         body,
         expected_checksum,
         strict_durability,
+        io_progress.as_ref(),
     )
     .await
     {
@@ -2786,6 +2842,9 @@ async fn upload_object_one_shot_inner(
         .map_err(|e| {
             AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
         })?;
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
 }
 
@@ -2877,12 +2936,13 @@ where
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
     let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
-    let _io_guard = if acquire_io_gate {
+    let io_guard = if acquire_io_gate {
         acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
             .await?
     } else {
         None
     };
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge(
@@ -2917,6 +2977,7 @@ where
         body_stream,
         expected_checksum,
         strict_durability,
+        io_progress.as_ref(),
     )
     .await
     {
@@ -2963,6 +3024,9 @@ where
         return Err(err);
     }
 
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     Ok(object_meta.without_internal_layout())
 }
 
@@ -2989,12 +3053,13 @@ where
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
     let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
-    let _io_guard = if acquire_io_gate {
+    let io_guard = if acquire_io_gate {
         acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
             .await?
     } else {
         None
     };
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge(
@@ -3029,6 +3094,7 @@ where
         reader,
         expected_checksum,
         strict_durability,
+        io_progress.as_ref(),
     )
     .await
     {
@@ -3075,6 +3141,9 @@ where
         return Err(err);
     }
 
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     Ok(object_meta.without_internal_layout())
 }
 

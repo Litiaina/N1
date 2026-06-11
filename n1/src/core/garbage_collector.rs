@@ -6,7 +6,7 @@ use crate::core::fragment_identity::{
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::index_store;
-use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
+use crate::core::io_scheduler::{DiskIoClass, IoProgress, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
@@ -540,12 +540,13 @@ async fn perform_gc_scan(
     } else {
         None
     };
-    let _io_guard = acquire_disk_io(
+    let io_guard = acquire_disk_io(
         DiskIoClass::BackgroundGc,
         scheduler_fragment,
         "garbage collection",
     )
     .await?;
+    let io_progress = io_guard.progress_handle();
     with_gc_status_write(|st| {
         st.is_running = true;
         st.phase = format!(
@@ -574,6 +575,7 @@ async fn perform_gc_scan(
         if should_stop_gc() {
             break;
         }
+        io_guard.heartbeat();
         with_gc_status_write(|st| {
             st.current_fragment = fragment.clone();
             st.phase = format!("Processing fragment {}", fragment);
@@ -587,8 +589,10 @@ async fn perform_gc_scan(
             is_manual_run,
             options,
             &state,
+            &io_progress,
         )
         .await;
+        io_guard.record_progress(stats.refund_bytes);
 
         with_gc_status_write(|st| {
             st.total_fragments_scanned += 1;
@@ -607,6 +611,7 @@ async fn perform_gc_scan(
             st.phase = "Stopped by User".to_string();
             st.duration_seconds = start.elapsed().as_secs();
         });
+        io_guard.complete();
         return Ok(());
     }
 
@@ -615,6 +620,7 @@ async fn perform_gc_scan(
         st.phase = "Finalizing".to_string();
         st.duration_seconds = start.elapsed().as_secs();
     });
+    io_guard.complete();
     Ok(())
 }
 
@@ -639,6 +645,7 @@ async fn process_fragment_gc(
     is_manual_run: bool,
     _options: GcRunOptions,
     _state: &Arc<AppState>,
+    io_progress: &IoProgress,
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
     let mut live_versions = HashSet::<String>::new();
@@ -678,6 +685,7 @@ async fn process_fragment_gc(
         live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
     } else {
         for meta in &physical_live_objects {
+            io_progress.heartbeat();
             protected_live_object_ids.insert(meta.object_key.clone());
             match index::list_live_object_versions_metadata(fragment, &meta.object_key).await {
                 Ok(version_metas) => {
@@ -731,6 +739,7 @@ async fn process_fragment_gc(
     match index::list_fragment_trash_catalog(fragment).await {
         Ok(trash_entries) => {
             for entry in trash_entries {
+                io_progress.heartbeat();
                 if should_stop_gc() {
                     return stats;
                 }
@@ -770,6 +779,7 @@ async fn process_fragment_gc(
     }
 
     for object_id in purged_object_ids {
+        io_progress.heartbeat();
         if should_stop_gc() {
             return stats;
         }
@@ -827,6 +837,7 @@ async fn process_fragment_gc(
     }
 
     for object_id in namespace_absent_gc_candidates {
+        io_progress.heartbeat();
         if should_stop_gc() {
             return stats;
         }
@@ -899,6 +910,7 @@ async fn process_fragment_gc(
     stats.trash_versions_expired += expired_versions.len() as u64;
 
     for (ver, meta) in &expired_versions {
+        io_progress.heartbeat();
         if should_stop_gc() {
             return stats;
         }
@@ -925,6 +937,7 @@ async fn process_fragment_gc(
     stats.sessions_deleted += sessions_to_delete.len() as u64;
 
     for (version_id, _) in &sessions_to_delete {
+        io_progress.heartbeat();
         if should_stop_gc() {
             return stats;
         }
@@ -932,6 +945,7 @@ async fn process_fragment_gc(
     }
 
     for root in blob_roots {
+        io_progress.heartbeat();
         if should_stop_gc() {
             return stats;
         }
@@ -939,6 +953,7 @@ async fn process_fragment_gc(
             continue;
         };
         for (object_dir, object_id) in object_dirs {
+            io_progress.heartbeat();
             if should_stop_gc() {
                 return stats;
             }

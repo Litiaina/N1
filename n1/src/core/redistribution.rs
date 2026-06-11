@@ -1644,7 +1644,7 @@ pub async fn run_redistribution_job_with_options(
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
     let _write_gate = acquire_maintenance_mode(opts.execution_mode.maintenance_access_mode());
-    let _io_guard = acquire_disk_io(
+    let io_guard = acquire_disk_io(
         DiskIoClass::BackgroundRedistribution,
         opts.target_fragment.as_deref(),
         "redistribution job",
@@ -1775,6 +1775,7 @@ pub async fn run_redistribution_job_with_options(
         if should_stop() {
             break;
         }
+        io_guard.heartbeat();
 
         layout.refresh_if_needed().await;
         let live_blob = layout.live_blob.clone();
@@ -1900,6 +1901,7 @@ pub async fn run_redistribution_job_with_options(
             if should_stop() {
                 break;
             }
+            io_guard.heartbeat();
 
             let mut delta = StatusDelta {
                 scanned: 0,
@@ -1915,6 +1917,7 @@ pub async fn run_redistribution_job_with_options(
                 if should_stop() {
                     break;
                 }
+                io_guard.heartbeat();
 
                 let page = if is_trash {
                     index::scan_fragment_trash_metadata_page(
@@ -1939,6 +1942,7 @@ pub async fn run_redistribution_job_with_options(
                 };
 
                 for meta in page.objects {
+                    io_guard.heartbeat();
                     let is_trash_flag = is_trash;
                     let id = dedupe_id_from_metadata(&meta, is_trash_flag);
                     if !seen_meta_ids.insert(id) {
@@ -2093,6 +2097,7 @@ pub async fn run_redistribution_job_with_options(
 
                     while in_flight.len() >= object_concurrency {
                         if let Some(res) = in_flight.next().await {
+                            io_guard.heartbeat();
                             match res {
                                 Ok(Some((fragment, key, version, task_is_trash))) => {
                                     touched_fragments.insert(fragment.clone());
@@ -2134,6 +2139,7 @@ pub async fn run_redistribution_job_with_options(
             }
 
             while let Some(res) = in_flight.next().await {
+                io_guard.heartbeat();
                 match res {
                     Ok(Some((fragment, key, version, task_is_trash))) => {
                         touched_fragments.insert(fragment.clone());
@@ -2224,6 +2230,7 @@ pub async fn run_redistribution_job_with_options(
         return Err(AppError::InternalServerError(message));
     }
 
+    io_guard.complete();
     Ok(())
 }
 

@@ -112,6 +112,34 @@ N1 2.0.0 two-disk proof completed on June 11, 2026:
   the benchmark is a measurement of this local disk pair, not a universal N1
   throughput ceiling.
 
+N1 2.0.0 IO-control proof completed on June 11, 2026:
+
+- `RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets` passed with all
+  `102` N1 library tests.
+- `cargo test --workspace --all-targets` passed, including the `7` N1 Shell
+  integration tests, `107` SIMD unit tests, `5` SIMD integration tests, and
+  the SIMD benchmark targets.
+- The real two-disk release proof on `/mnt/disk-00` and `/mnt/disk-01`
+  completed with `N1_RELEASE_PROOF PASS`.
+- The proof produced `164` live objects. Nineteen gates passed; the quota gate
+  was intentionally skipped because the proof ran with
+  `QUOTA_BACKEND=disabled`.
+- The `256 MiB` multipart upload restarted after three parts, resumed,
+  finalized in `7.220 s`, and downloaded with a matching SHA-256. Measured
+  upload throughput was `35.459 MiB/s` on this local HDD pair.
+- Native protocol, restart persistence, permission boundaries, namespace
+  deltas, concurrent multipart, same-key contention, multi-fragment
+  isolation, CRUD/POSIX/trash/recover/GC, archive, recover-on-read, object
+  repair, disk-format repair, and `2 -> 1 -> 2` redistribution all passed.
+- Strict disk-format repair scanned `163` objects, repaired `190` shards and
+  `2` missing metadata replicas, and reported `0` corrupt records.
+- Object-level redistribution scanned one mismatched object, migrated it into
+  the restored topology, and reported `0` errors.
+- Peak RSS was `128152 KiB` during recover-on-read/object repair. Final RSS
+  after redistribution and clean health was `47996 KiB`.
+- The final log scan passed with `bad_lines: []`.
+- Evidence: `/tmp/n1-2.0-io-control-proof/summary.json`.
+
 ## Extended LTS Proof Matrix
 
 The full LTS proof should include:

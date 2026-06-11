@@ -331,8 +331,23 @@ N1 applies bounded admission above disk-heavy work:
 - background redistribution
 
 Foreground concurrency adapts to available memory, CPU pressure, disk count,
-and configured EC width. Background lanes are smaller and fragment-scoped so
-maintenance cannot consume the complete live IO path.
+configured EC width, and observed no-progress stalls. Healthy full utilization
+is not treated as a reason to throttle. Background lanes are smaller and
+fragment-scoped so maintenance cannot consume the complete live IO path.
+
+Scheduler admission, progress tracking, and execution remain separate:
+
+- foreground queue admission is bounded and returns `503` when the configured
+  wait expires
+- admitted operations have no arbitrary whole-operation deadline
+- upload/download streams record logical byte progress
+- repair, GC, and redistribution heartbeat during scans and rewrites
+- per-class latency, queue depth, failure, slow-path, and stall telemetry is
+  bounded in memory
+
+IO control is not a second maintenance coordinator. Repair, redistribution,
+and GC retain their existing stop signals and durability rules. N1 does not
+inherit N2 peer quorum, peer routing, or cluster job authority.
 
 Multipart encoding remains streaming. Shard writes and final flushes run in
 parallel within the admitted request budget. N1 does not buffer whole objects

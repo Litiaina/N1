@@ -125,7 +125,7 @@ pub(crate) async fn download_object_chunk_from_metadata(
     params: &ChunkQuery,
 ) -> Result<(Vec<u8>, Option<String>), AppError> {
     validate_chunk_query(params)?;
-    let _io_guard = acquire_disk_io(
+    let io_guard = acquire_disk_io(
         DiskIoClass::ForegroundRead,
         Some(&metadata.fragment),
         "download chunk",
@@ -217,6 +217,7 @@ pub(crate) async fn download_object_chunk_from_metadata(
                 .await?;
 
                 result_buffer.extend_from_slice(&chunk_data);
+                io_guard.record_progress(chunk_data.len() as u64);
 
                 bytes_to_read -= chunk_len;
                 cursor_in_part += chunk_len as u64;
@@ -229,6 +230,7 @@ pub(crate) async fn download_object_chunk_from_metadata(
         }
     }
 
+    io_guard.complete();
     Ok((result_buffer, checksum_header))
 }
 
@@ -253,7 +255,7 @@ where
         return Ok(0);
     }
 
-    let _io_guard = acquire_disk_io(
+    let io_guard = acquire_disk_io(
         DiskIoClass::ForegroundRead,
         Some(&metadata.fragment),
         "native download stream",
@@ -335,6 +337,7 @@ where
                     .map_err(|err| AppError::Io(err, "download stream write".into()))?;
 
                 written = written.saturating_add(chunk_data.len() as u64);
+                io_guard.record_progress(chunk_data.len() as u64);
                 bytes_to_read -= chunk_len;
                 cursor_in_part += chunk_len as u64;
             }
@@ -350,6 +353,7 @@ where
         .flush()
         .await
         .map_err(|err| AppError::Io(err, "download stream flush".into()))?;
+    io_guard.complete();
     Ok(written)
 }
 

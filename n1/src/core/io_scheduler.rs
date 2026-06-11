@@ -1,8 +1,11 @@
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::{
+    ProgressTracker, StallSnapshot, foreground_wait_timeout, record_io_latency, stall_threshold,
+};
 use once_cell::sync::{Lazy, OnceCell};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -23,8 +26,19 @@ static BACKGROUND_FRAGMENT_GATES: Lazy<Mutex<HashMap<String, Arc<Semaphore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_FOREGROUND_IO: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static ACTIVE_BACKGROUND_IO: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+static QUEUED_FOREGROUND_IO: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+static QUEUED_BACKGROUND_IO: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_OPERATIONS: Lazy<Mutex<HashMap<u64, Arc<ActiveIoOperation>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static CLASS_COUNTERS: Lazy<Vec<ClassCounters>> = Lazy::new(|| {
+    (0..DiskIoClass::COUNT)
+        .map(|_| ClassCounters::default())
+        .collect()
+});
 
 const DISK_IO_WAIT_LOG_SECS: u64 = 30;
+const MAX_ACTIVE_OPERATION_SNAPSHOTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct DiskIoSchedulerConfig {
@@ -51,6 +65,15 @@ pub enum DiskIoClass {
 }
 
 impl DiskIoClass {
+    const COUNT: usize = 5;
+    const ALL: [Self; Self::COUNT] = [
+        Self::ForegroundRead,
+        Self::ForegroundWrite,
+        Self::BackgroundRepair,
+        Self::BackgroundGc,
+        Self::BackgroundRedistribution,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::ForegroundRead => "foreground read",
@@ -61,25 +84,156 @@ impl DiskIoClass {
         }
     }
 
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::ForegroundRead => "foreground_read",
+            Self::ForegroundWrite => "foreground_write",
+            Self::BackgroundRepair => "background_repair",
+            Self::BackgroundGc => "background_gc",
+            Self::BackgroundRedistribution => "background_redistribution",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::ForegroundRead => 0,
+            Self::ForegroundWrite => 1,
+            Self::BackgroundRepair => 2,
+            Self::BackgroundGc => 3,
+            Self::BackgroundRedistribution => 4,
+        }
+    }
+
     fn is_foreground(self) -> bool {
         matches!(self, Self::ForegroundRead | Self::ForegroundWrite)
     }
 }
 
-pub struct DiskIoGuard {
+#[derive(Default)]
+struct ClassCounters {
+    queued: AtomicUsize,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    bytes: AtomicU64,
+    stalls: AtomicU64,
+}
+
+struct ActiveIoOperation {
+    id: u64,
     class: DiskIoClass,
+    context: String,
+    fragment: Option<String>,
+    progress: Arc<ProgressTracker>,
+    stall_reported: AtomicBool,
+}
+
+#[derive(Clone)]
+pub struct IoProgress {
+    progress: Arc<ProgressTracker>,
+}
+
+impl IoProgress {
+    pub fn record(&self, bytes: u64) {
+        self.progress.record(bytes);
+    }
+
+    pub fn heartbeat(&self) {
+        self.progress.heartbeat();
+    }
+}
+
+pub struct DiskIoGuard {
+    operation: Arc<ActiveIoOperation>,
+    started: Instant,
+    completed: bool,
     _total: OwnedSemaphorePermit,
     _class: OwnedSemaphorePermit,
     _fragment: Option<OwnedSemaphorePermit>,
 }
 
+impl DiskIoGuard {
+    pub fn record_progress(&self, bytes: u64) {
+        self.operation.progress.record(bytes);
+    }
+
+    pub fn heartbeat(&self) {
+        self.operation.progress.heartbeat();
+    }
+
+    pub fn progress_handle(&self) -> IoProgress {
+        IoProgress {
+            progress: self.operation.progress.clone(),
+        }
+    }
+
+    pub fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
 impl Drop for DiskIoGuard {
     fn drop(&mut self) {
-        if self.class.is_foreground() {
+        if self.operation.class.is_foreground() {
             ACTIVE_FOREGROUND_IO.fetch_sub(1, Ordering::Relaxed);
         } else {
             ACTIVE_BACKGROUND_IO.fetch_sub(1, Ordering::Relaxed);
         }
+
+        if let Ok(mut active) = ACTIVE_OPERATIONS.lock() {
+            active.remove(&self.operation.id);
+        }
+
+        let snapshot = self.operation.progress.snapshot(stall_threshold());
+        let counters = class_counters(self.operation.class);
+        counters.bytes.fetch_add(snapshot.bytes, Ordering::Relaxed);
+        if self.completed {
+            counters.completed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        if snapshot.stalled && !self.operation.stall_reported.swap(true, Ordering::Relaxed) {
+            counters.stalls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        record_io_latency(
+            format!("disk.operation.{}", self.operation.class.metric_label()),
+            self.started.elapsed(),
+            snapshot.bytes,
+            self.completed,
+        );
+    }
+}
+
+struct QueueRegistration {
+    foreground: bool,
+    class: DiskIoClass,
+}
+
+impl QueueRegistration {
+    fn new(class: DiskIoClass) -> Self {
+        if class.is_foreground() {
+            QUEUED_FOREGROUND_IO.fetch_add(1, Ordering::Relaxed);
+        } else {
+            QUEUED_BACKGROUND_IO.fetch_add(1, Ordering::Relaxed);
+        }
+        class_counters(class).queued.fetch_add(1, Ordering::Relaxed);
+        Self {
+            foreground: class.is_foreground(),
+            class,
+        }
+    }
+}
+
+impl Drop for QueueRegistration {
+    fn drop(&mut self) {
+        if self.foreground {
+            QUEUED_FOREGROUND_IO.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            QUEUED_BACKGROUND_IO.fetch_sub(1, Ordering::Relaxed);
+        }
+        class_counters(self.class)
+            .queued
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -95,28 +249,128 @@ pub fn disk_io_scheduler_config() -> DiskIoSchedulerConfig {
     scheduler_config()
 }
 
-pub fn disk_io_scheduler_snapshot() -> DiskIoSchedulerSnapshot {
-    let cfg = scheduler_config();
-    DiskIoSchedulerSnapshot {
-        config: cfg,
-        foreground_target: foreground_target(),
-        active_foreground: ACTIVE_FOREGROUND_IO.load(Ordering::Relaxed),
-        active_background: ACTIVE_BACKGROUND_IO.load(Ordering::Relaxed),
-        total_available: TOTAL_GATE.available_permits(),
-        foreground_available: FOREGROUND_GATE.available_permits(),
-        background_available: BACKGROUND_GATE.available_permits(),
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskIoPressure {
+    Idle,
+    Normal,
+    Pressured,
+    Saturated,
+    Stalled,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
+pub struct DiskIoClassSnapshot {
+    pub class: String,
+    pub active: usize,
+    pub queued: usize,
+    pub completed: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    pub stall_events: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ActiveDiskIoSnapshot {
+    pub operation_id: u64,
+    pub class: String,
+    pub context: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<String>,
+    pub progress: StallSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct DiskIoSchedulerSnapshot {
     pub config: DiskIoSchedulerConfig,
     pub foreground_target: usize,
+    pub pressure: DiskIoPressure,
     pub active_foreground: usize,
     pub active_background: usize,
+    pub queued_foreground: usize,
+    pub queued_background: usize,
     pub total_available: usize,
     pub foreground_available: usize,
     pub background_available: usize,
+    pub classes: Vec<DiskIoClassSnapshot>,
+    pub active_operations: Vec<ActiveDiskIoSnapshot>,
+}
+
+pub fn disk_io_scheduler_snapshot() -> DiskIoSchedulerSnapshot {
+    let cfg = scheduler_config();
+    let active_foreground = ACTIVE_FOREGROUND_IO.load(Ordering::Relaxed);
+    let active_background = ACTIVE_BACKGROUND_IO.load(Ordering::Relaxed);
+    let queued_foreground = QUEUED_FOREGROUND_IO.load(Ordering::Relaxed);
+    let queued_background = QUEUED_BACKGROUND_IO.load(Ordering::Relaxed);
+    let active_operations = active_operation_snapshots();
+    let pressure = calculate_pressure(
+        active_foreground,
+        active_background,
+        queued_foreground,
+        queued_background,
+        cfg.total_permits,
+        active_operations
+            .iter()
+            .any(|operation| operation.progress.stalled),
+    );
+
+    let classes = DiskIoClass::ALL
+        .iter()
+        .copied()
+        .map(|class| {
+            let counters = class_counters(class);
+            DiskIoClassSnapshot {
+                class: class.metric_label().to_string(),
+                active: active_operations
+                    .iter()
+                    .filter(|operation| operation.class == class.metric_label())
+                    .count(),
+                queued: counters.queued.load(Ordering::Relaxed),
+                completed: counters.completed.load(Ordering::Relaxed),
+                failed: counters.failed.load(Ordering::Relaxed),
+                bytes: counters.bytes.load(Ordering::Relaxed),
+                stall_events: counters.stalls.load(Ordering::Relaxed),
+            }
+        })
+        .collect();
+
+    DiskIoSchedulerSnapshot {
+        config: cfg,
+        foreground_target: foreground_target(),
+        pressure,
+        active_foreground,
+        active_background,
+        queued_foreground,
+        queued_background,
+        total_available: TOTAL_GATE.available_permits(),
+        foreground_available: FOREGROUND_GATE.available_permits(),
+        background_available: BACKGROUND_GATE.available_permits(),
+        classes,
+        active_operations,
+    }
+}
+
+pub fn disk_io_pressure() -> DiskIoPressure {
+    let active_foreground = ACTIVE_FOREGROUND_IO.load(Ordering::Relaxed);
+    let active_background = ACTIVE_BACKGROUND_IO.load(Ordering::Relaxed);
+    let queued_foreground = QUEUED_FOREGROUND_IO.load(Ordering::Relaxed);
+    let queued_background = QUEUED_BACKGROUND_IO.load(Ordering::Relaxed);
+    let stalled = ACTIVE_OPERATIONS
+        .lock()
+        .map(|operations| {
+            operations
+                .values()
+                .any(|operation| operation.progress.snapshot(stall_threshold()).stalled)
+        })
+        .unwrap_or(false);
+    calculate_pressure(
+        active_foreground,
+        active_background,
+        queued_foreground,
+        queued_background,
+        scheduler_config().total_permits,
+        stalled,
+    )
 }
 
 pub async fn acquire_disk_io(
@@ -124,57 +378,102 @@ pub async fn acquire_disk_io(
     fragment: Option<&str>,
     context: &str,
 ) -> Result<DiskIoGuard, AppError> {
-    let started = Instant::now();
-    loop {
+    let queued_at = Instant::now();
+    let _queued = QueueRegistration::new(class);
+    let result = if class.is_foreground() {
         match tokio::time::timeout(
-            Duration::from_secs(DISK_IO_WAIT_LOG_SECS),
-            acquire_disk_io_inner(class, fragment),
+            foreground_wait_timeout(),
+            acquire_disk_io_inner(class, fragment, context),
         )
         .await
         {
-            Ok(result) => return result,
-            Err(_) => warn!(
-                "N1 disk scheduler still waiting after {}s (class={}, context={}); preserving operation and applying backpressure",
-                started.elapsed().as_secs(),
+            Ok(result) => result,
+            Err(_) => Err(AppError::ServiceUnavailable(format!(
+                "disk scheduler admission timed out for {} after {}ms",
                 class.label(),
-                context
-            ),
+                foreground_wait_timeout().as_millis()
+            ))),
         }
-    }
+    } else {
+        loop {
+            match tokio::time::timeout(
+                Duration::from_secs(DISK_IO_WAIT_LOG_SECS),
+                acquire_disk_io_inner(class, fragment, context),
+            )
+            .await
+            {
+                Ok(result) => break result,
+                Err(_) => warn!(
+                    "N1 disk scheduler still waiting after {}s (class={}, context={}); preserving maintenance operation",
+                    queued_at.elapsed().as_secs(),
+                    class.label(),
+                    context
+                ),
+            }
+        }
+    };
+    record_io_latency(
+        format!("disk.queue.{}", class.metric_label()),
+        queued_at.elapsed(),
+        0,
+        result.is_ok(),
+    );
+    result
 }
 
 pub fn try_acquire_disk_io(
     class: DiskIoClass,
     fragment: Option<&str>,
 ) -> Result<DiskIoGuard, AppError> {
-    let total = TOTAL_GATE.clone().try_acquire_owned().map_err(|_| {
-        AppError::ServiceUnavailable(format!("disk scheduler is saturated for {}", class.label()))
-    })?;
-    let class_permit = class_gate(class).clone().try_acquire_owned().map_err(|_| {
-        AppError::ServiceUnavailable(format!(
-            "disk scheduler class '{}' is saturated",
-            class.label()
-        ))
-    })?;
-    let fragment_permit = fragment
-        .map(|fragment| fragment_gate(class, fragment))
-        .transpose()?
-        .map(|gate| {
-            gate.try_acquire_owned().map_err(|_| {
-                AppError::ServiceUnavailable(format!(
-                    "disk scheduler is saturated for this fragment ({})",
-                    class.label()
-                ))
+    let started = Instant::now();
+    let result = (|| {
+        let total = TOTAL_GATE.clone().try_acquire_owned().map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "disk scheduler is saturated for {}",
+                class.label()
+            ))
+        })?;
+        let class_permit = class_gate(class).clone().try_acquire_owned().map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "disk scheduler class '{}' is saturated",
+                class.label()
+            ))
+        })?;
+        let fragment_permit = fragment
+            .map(|fragment| fragment_gate(class, fragment))
+            .transpose()?
+            .map(|gate| {
+                gate.try_acquire_owned().map_err(|_| {
+                    AppError::ServiceUnavailable(format!(
+                        "disk scheduler is saturated for this fragment ({})",
+                        class.label()
+                    ))
+                })
             })
-        })
-        .transpose()?;
+            .transpose()?;
 
-    register_active(class, total, class_permit, fragment_permit)
+        register_active(
+            class,
+            fragment,
+            class.label(),
+            total,
+            class_permit,
+            fragment_permit,
+        )
+    })();
+    record_io_latency(
+        format!("disk.queue.{}", class.metric_label()),
+        started.elapsed(),
+        0,
+        result.is_ok(),
+    );
+    result
 }
 
 async fn acquire_disk_io_inner(
     class: DiskIoClass,
     fragment: Option<&str>,
+    context: &str,
 ) -> Result<DiskIoGuard, AppError> {
     loop {
         let total = TOTAL_GATE
@@ -199,7 +498,14 @@ async fn acquire_disk_io_inner(
             None => None,
         };
 
-        match register_active(class, total, class_permit, fragment_permit) {
+        match register_active(
+            class,
+            fragment,
+            context,
+            total,
+            class_permit,
+            fragment_permit,
+        ) {
             Ok(guard) => return Ok(guard),
             Err(AppError::ServiceUnavailable(_)) if class.is_foreground() => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
@@ -211,6 +517,8 @@ async fn acquire_disk_io_inner(
 
 fn register_active(
     class: DiskIoClass,
+    fragment: Option<&str>,
+    context: &str,
     total: OwnedSemaphorePermit,
     class_permit: OwnedSemaphorePermit,
     fragment_permit: Option<OwnedSemaphorePermit>,
@@ -228,23 +536,90 @@ fn register_active(
                 .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                return Ok(DiskIoGuard {
-                    class,
-                    _total: total,
-                    _class: class_permit,
-                    _fragment: fragment_permit,
-                });
+                break;
             }
         }
+    } else {
+        ACTIVE_BACKGROUND_IO.fetch_add(1, Ordering::Relaxed);
     }
 
-    ACTIVE_BACKGROUND_IO.fetch_add(1, Ordering::Relaxed);
-    Ok(DiskIoGuard {
+    let operation = Arc::new(ActiveIoOperation {
+        id: NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed),
         class,
+        context: context.to_string(),
+        fragment: fragment.map(str::to_string),
+        progress: Arc::new(ProgressTracker::new()),
+        stall_reported: AtomicBool::new(false),
+    });
+    if let Ok(mut active) = ACTIVE_OPERATIONS.lock() {
+        active.insert(operation.id, operation.clone());
+    }
+
+    Ok(DiskIoGuard {
+        operation,
+        started: Instant::now(),
+        completed: false,
         _total: total,
         _class: class_permit,
         _fragment: fragment_permit,
     })
+}
+
+fn active_operation_snapshots() -> Vec<ActiveDiskIoSnapshot> {
+    let Ok(operations) = ACTIVE_OPERATIONS.lock() else {
+        return Vec::new();
+    };
+    let mut snapshots = operations
+        .values()
+        .map(|operation| {
+            let progress = operation.progress.snapshot(stall_threshold());
+            if progress.stalled && !operation.stall_reported.swap(true, Ordering::Relaxed) {
+                class_counters(operation.class)
+                    .stalls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ActiveDiskIoSnapshot {
+                operation_id: operation.id,
+                class: operation.class.metric_label().to_string(),
+                context: operation.context.clone(),
+                fragment: operation.fragment.clone(),
+                progress,
+            }
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|operation| operation.operation_id);
+    snapshots.truncate(MAX_ACTIVE_OPERATION_SNAPSHOTS);
+    snapshots
+}
+
+fn calculate_pressure(
+    active_foreground: usize,
+    active_background: usize,
+    queued_foreground: usize,
+    queued_background: usize,
+    total_permits: usize,
+    stalled: bool,
+) -> DiskIoPressure {
+    if stalled {
+        return DiskIoPressure::Stalled;
+    }
+    let active = active_foreground.saturating_add(active_background);
+    let queued = queued_foreground.saturating_add(queued_background);
+    if queued_foreground > 0 && active >= total_permits.max(1) {
+        return DiskIoPressure::Saturated;
+    }
+    if queued > 0 || active.saturating_mul(100) >= total_permits.max(1).saturating_mul(75) {
+        return DiskIoPressure::Pressured;
+    }
+    if active > 0 {
+        DiskIoPressure::Normal
+    } else {
+        DiskIoPressure::Idle
+    }
+}
+
+fn class_counters(class: DiskIoClass) -> &'static ClassCounters {
+    &CLASS_COUNTERS[class.index()]
 }
 
 fn class_gate(class: DiskIoClass) -> &'static Arc<Semaphore> {
@@ -320,7 +695,7 @@ fn derive_scheduler_config(max_concurrent_io: usize, blob_roots: usize) -> DiskI
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskIoClass, derive_scheduler_config};
+    use super::{DiskIoClass, DiskIoPressure, calculate_pressure, derive_scheduler_config};
 
     #[test]
     fn scheduler_config_reserves_small_background_lane() {
@@ -346,5 +721,21 @@ mod tests {
     fn scheduler_class_labels_are_operator_readable() {
         assert_eq!(DiskIoClass::ForegroundWrite.label(), "foreground write");
         assert_eq!(DiskIoClass::BackgroundRepair.label(), "background repair");
+    }
+
+    #[test]
+    fn pressure_prioritizes_stalls_and_foreground_saturation() {
+        assert_eq!(
+            calculate_pressure(1, 0, 0, 0, 8, true),
+            DiskIoPressure::Stalled
+        );
+        assert_eq!(
+            calculate_pressure(7, 1, 1, 0, 8, false),
+            DiskIoPressure::Saturated
+        );
+        assert_eq!(
+            calculate_pressure(6, 0, 0, 0, 8, false),
+            DiskIoPressure::Pressured
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::core::io_scheduler::DISK_IO_TARGET_ATOMIC;
+use crate::core::io_scheduler::{DISK_IO_TARGET_ATOMIC, DiskIoPressure, disk_io_pressure};
 use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
@@ -89,14 +89,20 @@ pub async fn run_adaptive_concurrency_loop() {
             .max(1.0);
         let load_ratio = m.load_avg_1m / cores;
 
-        let (down_pct, up_pct) = if m.cpu_usage_percent >= 95.0
+        let io_pressure = disk_io_pressure();
+        let (down_pct, up_pct) = if io_pressure == DiskIoPressure::Stalled
+            || m.cpu_usage_percent >= 95.0
             || m.ram_usage_percent >= 95.0
             || load_ratio >= 2.0
         {
             (50, 0)
         } else if m.cpu_usage_percent >= 85.0 || m.ram_usage_percent >= 90.0 || load_ratio >= 1.3 {
             (25, 0)
-        } else if m.cpu_usage_percent <= 55.0 && m.ram_usage_percent <= 75.0 && load_ratio <= 0.8 {
+        } else if io_pressure <= DiskIoPressure::Normal
+            && m.cpu_usage_percent <= 55.0
+            && m.ram_usage_percent <= 75.0
+            && load_ratio <= 0.8
+        {
             (0, 10)
         } else {
             (0, 0)

@@ -24,6 +24,7 @@ use crate::core::upload::{
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
+use crate::io_control::{IoControlConfig, configure_io_control};
 use crate::protocol::{bind_native_protocol, serve_native_protocol};
 use crate::routes::storage_routes::{apply_runtime_http_layers, build_storage_routes_unbound};
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
@@ -848,6 +849,32 @@ pub async fn run_server() {
     );
 
     let upload_section = config.section(Some("upload_config"));
+    let io_control_section = config.section(Some("io_control"));
+
+    let io_control_config = IoControlConfig {
+        foreground_wait_timeout_ms: io_control_section
+            .and_then(|section| section.get("foreground_wait_timeout_ms"))
+            .unwrap_or("30000")
+            .parse::<u64>()
+            .expect("foreground_wait_timeout_ms must be a positive integer"),
+        stall_threshold_ms: io_control_section
+            .and_then(|section| section.get("stall_threshold_ms"))
+            .unwrap_or("20000")
+            .parse::<u64>()
+            .expect("stall_threshold_ms must be a positive integer"),
+        slow_io_threshold_ms: io_control_section
+            .and_then(|section| section.get("slow_io_threshold_ms"))
+            .unwrap_or("1000")
+            .parse::<u64>()
+            .expect("slow_io_threshold_ms must be a positive integer"),
+        latency_samples_per_class: io_control_section
+            .and_then(|section| section.get("latency_samples_per_class"))
+            .unwrap_or("1024")
+            .parse::<usize>()
+            .expect("latency_samples_per_class must be a positive integer"),
+    }
+    .normalized();
+    configure_io_control(io_control_config).expect("Double initialization of N1 IO control");
 
     let data_shards_value = upload_section
         .and_then(|s| s.get("data_shards"))
@@ -962,7 +989,7 @@ pub async fn run_server() {
     let upload_io_gate_enabled = configured_upload_io_gate_enabled;
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), disk_scheduler={{total:{}, foreground:{}, background:{}, fg_fragment:{}, bg_fragment:{}}}, writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), disk_scheduler={{total:{}, foreground:{}, background:{}, fg_fragment:{}, bg_fragment:{}}}, io_control={{foreground_wait_ms:{}, stall_ms:{}, slow_io_ms:{}, latency_samples:{}}}, writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
         cpu_cores,
         detected_ram_gib,
         blob_disk_count,
@@ -981,6 +1008,10 @@ pub async fn run_server() {
         disk_io_scheduler.background_permits,
         disk_io_scheduler.foreground_per_fragment_permits,
         disk_io_scheduler.background_per_fragment_permits,
+        io_control_config.foreground_wait_timeout_ms,
+        io_control_config.stall_threshold_ms,
+        io_control_config.slow_io_threshold_ms,
+        io_control_config.latency_samples_per_class,
         writer_buffer_size,
         upload_part_strict_durability_default,
         upload_io_gate_enabled

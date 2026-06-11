@@ -18,6 +18,7 @@ use crate::core::repair_manager::get_repair_status;
 use crate::core::system::{SystemMetrics, get_system_metrics};
 use crate::core::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC};
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::{IoControlSnapshot, io_control_snapshot};
 use crate::namespace::replica::inspect_namespace_replicas;
 use crate::namespace::runtime::{NamespaceRuntimeStats, global_namespace_runtime};
 use crate::routes::storage_routes::AppState;
@@ -220,6 +221,7 @@ pub struct SystemHealthResponse {
     pub system: SystemMetrics,
     pub uploads: UploadRuntimeStats,
     pub io_scheduler: DiskIoSchedulerSnapshot,
+    pub io_control: IoControlSnapshot,
     pub index_runtime: IndexRuntimeStats,
     pub namespace_runtime: NamespaceRuntimeStats,
     pub storage: StoragePlaneStats,
@@ -1059,6 +1061,7 @@ async fn collect_system_health(
         system: system_metrics,
         uploads,
         io_scheduler: disk_io_scheduler_snapshot(),
+        io_control: io_control_snapshot(),
         index_runtime: IndexRuntimeStats {
             loaded_index_records: total_index_records,
             index_roots_online: online_index_count as u64,

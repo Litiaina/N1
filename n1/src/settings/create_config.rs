@@ -63,6 +63,12 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("parity_shards", "0")
         .set("stripe_block_size", "262144");
 
+    conf.with_section(Some("io_control"))
+        .set("foreground_wait_timeout_ms", "30000")
+        .set("stall_threshold_ms", "20000")
+        .set("slow_io_threshold_ms", "1000")
+        .set("latency_samples_per_class", "1024");
+
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
@@ -95,6 +101,9 @@ mod tests {
             .section(Some("index_config"))
             .expect("index_config section");
         assert_eq!(index.get("partition_count"), Some("64"));
+        let io_control = ini.section(Some("io_control")).expect("io_control section");
+        assert_eq!(io_control.get("foreground_wait_timeout_ms"), Some("30000"));
+        assert_eq!(io_control.get("stall_threshold_ms"), Some("20000"));
 
         let _ = fs::remove_file(path);
     }

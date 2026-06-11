@@ -136,6 +136,12 @@ max_concurrent_io=auto
 upload_memory_budget_bytes=auto
 adaptive_concurrency_enabled=true
 upload_io_gate_enabled=true
+
+[io_control]
+foreground_wait_timeout_ms=30000
+stall_threshold_ms=20000
+slow_io_threshold_ms=1000
+latency_samples_per_class=1024
 ```
 
 `n1.env` must provide the secrets used by N1:
@@ -1225,7 +1231,37 @@ The scheduler separates:
 
 This prevents one hot fragment or one background job from consuming the whole disk path. It does not change object metadata, blob layout, durability semantics, or namespace behavior.
 
-The health response includes an `io_scheduler` object with configured permits, active foreground/background counts, and currently available lanes.
+N1 IO control adds bounded foreground admission without imposing a total
+operation timeout. A foreground request that cannot enter the scheduler within
+`foreground_wait_timeout_ms` receives `503 Service Unavailable`; an admitted
+stream remains active as long as it continues making progress. Background
+maintenance waits for its reserved lane and remains governed by its existing
+stop/cancel authority.
+
+The health response includes:
+
+- `io_scheduler`: configured lanes, adaptive foreground target, queue depth,
+  pressure state, per-class operation/byte/failure counters, and active
+  operation progress/stall state
+- `io_control`: configured thresholds, bounded p50/p95/p99 latency samples,
+  recent slow paths, process RSS, thread count, and open file descriptors
+
+Upload and download counters report logical payload bytes. GC reports reclaimed
+logical bytes. Repair and redistribution use progress heartbeats while scanning
+and rewriting so long-running healthy work is not mislabeled as stalled.
+
+The pressure states are:
+
+- `idle`: no disk-heavy operation is active
+- `normal`: work is active without scheduler queue pressure
+- `pressured`: lanes are busy or work is queued
+- `saturated`: foreground work is queued while all scheduler lanes are occupied
+- `stalled`: at least one active operation has made no progress for
+  `stall_threshold_ms`
+
+Adaptive concurrency does not reduce throughput merely because disks are fully
+utilized. It blocks upward growth under pressure and cuts concurrency only when
+an actual no-progress stall or system CPU/RAM/load pressure is observed.
 
 ### Health
 
