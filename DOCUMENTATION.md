@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 1.0.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 2.0.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -13,8 +13,8 @@ For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). For release 
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
 - **Trash:** Soft delete moves namespace entries into `.trash`. Trash listing reads `.trash`. Recover moves paths back to live namespace. Hard delete and empty trash remove `.trash` paths first; GC later reclaims blob bytes that no remaining namespace metadata references.
-- **Repair:** Rebuilds missing or corrupt shard/parity/index replicas when enough data remains.
-- **Redistribution:** Rebalances index/blob placement after disk topology changes.
+- **Repair:** Rebuilds missing namespace/control replicas, immutable object metadata placements, and shard/parity payload when enough data remains.
+- **Redistribution:** Explicitly rewrites selected object versions into the current blob/EC topology. Existing objects remain valid under their recorded topology until redistributed.
 
 ## Installation
 
@@ -109,7 +109,7 @@ preflights XFS project quota unless `fragment_quota_backend=disabled` or
 
 N1 reads `n1_config.ini` and `n1.env` from the server working directory.
 
-Minimal two-disk configuration where both disks house index and blob data:
+Minimal two-disk configuration where both disks house index and blob roles:
 
 ```ini
 [server]
@@ -158,23 +158,35 @@ Fragment quota is a storage partition limit. Creating a fragment requires `quota
 
 ### Fragment Identity Layout
 
-N1 1.0.0 separates the mutable fragment name/hash from the physical fragment root:
+N1 2.0.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
 
 ```text
-<root>/
+<index_root>/
   .fragment/
     <fragment_hash> -> ../@f_<stable_fragment_id>
 
   @f_<stable_fragment_id>/
     .fragment.ndx
-    .objects/
     .uploads/
     .trash/
-    .blobs/
     <namespace directories>
+
+<blob_root>/
+  @f_<stable_fragment_id>/
+    .objects/
+      ab/
+        cd/
+          @o_<object-id>/
+            <version>.<size>.<time>.<extension>.ndx
+            <version>/
+              <shard-or-parity-files>
 ```
 
-The `.fragment/<fragment_hash>` symlink is the mount/auth namespace. The `@f_<stable_fragment_id>` directory is immutable. Renaming a fragment changes the alias and `.fragment.ndx`; it does not move blob payloads or rewrite immutable object `.ndx` records. This keeps absolute shard/parity paths valid after fragment rename.
+The `.fragment/<fragment_hash>` symlink is the mount/auth alias. The `@f_<stable_fragment_id>` identity is immutable. Renaming a fragment changes only index-plane alias/control state; it does not move namespace contents, blob payload, or immutable object `.ndx` records.
+
+Object `.ndx` metadata is stored only on blob roots that carry a shard or parity file for that version. The metadata and EC payload therefore share one durability topology. Index-only roots do not carry object metadata capacity.
+
+N1 2.0.0 does not read or migrate N1 1.x disk layouts.
 
 ## Quick Start
 
@@ -296,7 +308,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.0.0 includes the native N1 protocol:
+N1 2.0.0 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -500,7 +512,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.0.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 2.0.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -1176,7 +1188,7 @@ Soft delete moves a file or folder into `.trash`. Live listing no longer shows i
 
 Hard delete removes trash namespace entries. Bytes are returned after GC determines no live or trash namespace path references the blob versions.
 
-N1 1.0.0 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
+N1 2.0.0 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
 
 Empty trash:
 

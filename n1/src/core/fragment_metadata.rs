@@ -22,7 +22,6 @@ use std::sync::{LazyLock, Mutex};
 
 pub const DEFAULT_INDEX_PARTITION_COUNT: u16 = 64;
 pub const SUPPORTED_INDEX_PARTITION_COUNTS: [u16; 3] = [32, 64, 256];
-const LEGACY_FRAGMENT_METADATA_FILE: &str = "fragment.metadata.msgpack";
 
 static CONFIGURED_INDEX_PARTITION_COUNT: LazyLock<AtomicU16> =
     LazyLock::new(|| AtomicU16::new(DEFAULT_INDEX_PARTITION_COUNT));
@@ -31,9 +30,7 @@ static FRAGMENT_INDEX_PARTITION_COUNT_CACHE: LazyLock<Mutex<HashMap<String, u16>
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMetadata {
-    pub fragment: String,
-    #[serde(default)]
-    pub stable_fragment_id: Option<String>,
+    pub stable_fragment_id: String,
     pub key_phc: String,
     #[serde(default)]
     pub nt_hash_hex: Option<String>,
@@ -94,36 +91,38 @@ fn decode_index_fragment_meta(raw: &[u8]) -> Result<IndexFragmentMeta, AppError>
 }
 
 fn fragment_metadata_from_index(meta: IndexFragmentMeta) -> FragmentMetadata {
-    let stable_fragment_id = meta
-        .stable_fragment_id
-        .clone()
-        .or_else(|| Some(meta.fragment_id.clone()));
     FragmentMetadata {
-        fragment: meta.fragment_id,
-        stable_fragment_id,
+        stable_fragment_id: meta.stable_fragment_id,
         key_phc: meta.key_phc.unwrap_or_default(),
         nt_hash_hex: meta.nt_hash_hex,
-        index_partition_count: meta
-            .index_partition_count
-            .unwrap_or_else(configured_index_partition_count),
+        index_partition_count: meta.index_partition_count,
         created: unix_to_rfc3339(meta.created_at_unix),
         updated: Some(unix_to_rfc3339(meta.updated_at_unix)),
     }
 }
 
-fn normalize_fragment_metadata_identity(
-    mut meta: FragmentMetadata,
+fn validate_fragment_metadata_identity(
+    meta: FragmentMetadata,
     root: &Path,
     requested_fragment: &str,
-) -> FragmentMetadata {
-    let stable = meta
-        .stable_fragment_id
-        .clone()
-        .or_else(|| fragment_identity::stable_fragment_id_for_root(root, requested_fragment))
-        .unwrap_or_else(|| meta.fragment.clone());
-    meta.fragment = stable.clone();
-    meta.stable_fragment_id = Some(stable);
-    meta
+) -> Result<FragmentMetadata, AppError> {
+    let resolved = fragment_identity::stable_fragment_id_for_root(root, requested_fragment)
+        .ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "fragment {} has no stable identity on {}",
+                requested_fragment,
+                root.display()
+            ))
+        })?;
+    if meta.stable_fragment_id != resolved {
+        return Err(AppError::InternalServerError(format!(
+            "fragment metadata identity mismatch on {}: record={}, alias={}",
+            root.display(),
+            meta.stable_fragment_id,
+            resolved
+        )));
+    }
+    Ok(meta)
 }
 
 fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
@@ -132,10 +131,6 @@ fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
 
 fn fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
     fragment_identity::fragment_root_on(root, fragment_hash).join(FRAGMENT_METADATA_FILE)
-}
-
-fn legacy_fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
-    fragment_identity::fragment_root_on(root, fragment_hash).join(LEGACY_FRAGMENT_METADATA_FILE)
 }
 
 async fn sync_dir(dir: &Path) -> Result<(), AppError> {
@@ -234,8 +229,7 @@ pub async fn init_fragment_metadata(
     }
 
     let meta = FragmentMetadata {
-        fragment: fragment_hash.to_string(),
-        stable_fragment_id: None,
+        stable_fragment_id: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
         nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
         index_partition_count: configured_index_partition_count(),
@@ -256,8 +250,7 @@ pub async fn init_fragment_metadata_strict(
     }
 
     let meta = FragmentMetadata {
-        fragment: fragment_hash.to_string(),
-        stable_fragment_id: None,
+        stable_fragment_id: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
         nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
         index_partition_count: configured_index_partition_count(),
@@ -286,11 +279,7 @@ pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetad
         let meta = decode_fragment_metadata(&raw)?;
 
         if !meta.key_phc.trim().is_empty() {
-            return Ok(normalize_fragment_metadata_identity(
-                meta,
-                &root,
-                fragment_hash,
-            ));
+            return validate_fragment_metadata_identity(meta, &root, fragment_hash);
         }
     }
 
@@ -311,11 +300,7 @@ pub fn read_fragment_metadata_sync(fragment_hash: &str) -> Result<FragmentMetada
             std::fs::read(&p).map_err(|e| AppError::Io(e, format!("read {}", p.display())))?;
         let meta = decode_fragment_metadata(&raw)?;
         if !meta.key_phc.trim().is_empty() {
-            return Ok(normalize_fragment_metadata_identity(
-                meta,
-                &root,
-                fragment_hash,
-            ));
+            return validate_fragment_metadata_identity(meta, &root, fragment_hash);
         }
     }
 
@@ -323,11 +308,11 @@ pub fn read_fragment_metadata_sync(fragment_hash: &str) -> Result<FragmentMetada
 }
 
 pub async fn resolve_stable_fragment_id(fragment: &str) -> Result<String, AppError> {
-    Ok(read_fragment_metadata(fragment).await?.fragment)
+    Ok(read_fragment_metadata(fragment).await?.stable_fragment_id)
 }
 
 pub fn resolve_stable_fragment_id_sync(fragment: &str) -> Result<String, AppError> {
-    Ok(read_fragment_metadata_sync(fragment)?.fragment)
+    Ok(read_fragment_metadata_sync(fragment)?.stable_fragment_id)
 }
 
 pub fn fragment_index_partition_count(fragment_hash: &str) -> Result<u16, AppError> {
@@ -365,13 +350,12 @@ async fn write_fragment_metadata_with_policy(
     let mut failed_paths = Vec::new();
 
     for root in roots {
-        let p = fragment_meta_path(&root, &meta.fragment);
+        let p = fragment_meta_path(&root, &meta.stable_fragment_id);
         let now = Utc::now().timestamp();
         let mut edge = match read_index_fragment_meta_if_exists(&p).await {
             Ok(Some(existing)) => existing,
             Ok(None) => IndexFragmentMeta {
-                fragment_id: meta.fragment.clone(),
-                stable_fragment_id: None,
+                stable_fragment_id: meta.stable_fragment_id.clone(),
                 state: "active".to_string(),
                 quota_bytes: 0,
                 quota_project_id: None,
@@ -382,21 +366,25 @@ async fn write_fragment_metadata_with_policy(
                 updated_at_unix: now,
                 key_phc: None,
                 nt_hash_hex: None,
-                index_partition_count: None,
+                index_partition_count: meta.index_partition_count,
             },
             Err(err) => {
                 failed_paths.push(format!("{} ({})", p.display(), err));
                 continue;
             }
         };
-        edge.stable_fragment_id = meta
-            .stable_fragment_id
-            .clone()
-            .or_else(|| fragment_identity::stable_fragment_id_for_root(&root, &meta.fragment));
-        edge.fragment_id = meta.fragment.clone();
+        if edge.stable_fragment_id != meta.stable_fragment_id {
+            failed_paths.push(format!(
+                "{} (stable fragment identity mismatch: record={}, requested={})",
+                p.display(),
+                edge.stable_fragment_id,
+                meta.stable_fragment_id
+            ));
+            continue;
+        }
         edge.key_phc = Some(meta.key_phc.clone());
         edge.nt_hash_hex = meta.nt_hash_hex.clone();
-        edge.index_partition_count = Some(meta.index_partition_count);
+        edge.index_partition_count = meta.index_partition_count;
         edge.updated_at_unix = now;
         let bytes = match rmp_serde::to_vec_named(&edge) {
             Ok(bytes) => bytes,
@@ -412,8 +400,6 @@ async fn write_fragment_metadata_with_policy(
 
         match durable_atomic_write(&p, &bytes).await {
             Ok(()) => {
-                let _ =
-                    tokio_fs::remove_file(legacy_fragment_meta_path(&root, &meta.fragment)).await;
                 any_ok = true;
             }
             Err(err) => {
@@ -436,7 +422,7 @@ async fn write_fragment_metadata_with_policy(
     }
 
     if let Ok(mut cache) = FRAGMENT_INDEX_PARTITION_COUNT_CACHE.lock() {
-        cache.insert(meta.fragment.clone(), meta.index_partition_count);
+        cache.insert(meta.stable_fragment_id.clone(), meta.index_partition_count);
     }
 
     Ok(())
@@ -450,8 +436,7 @@ pub async fn rotate_fragment_key(fragment_hash: &str, new_key: &str) -> Result<(
     let mut meta = match read_fragment_metadata(fragment_hash).await {
         Ok(m) => m,
         Err(_) => FragmentMetadata {
-            fragment: fragment_hash.to_string(),
-            stable_fragment_id: None,
+            stable_fragment_id: fragment_hash.to_string(),
             key_phc: String::new(),
             nt_hash_hex: None,
             index_partition_count: configured_index_partition_count(),
@@ -516,8 +501,7 @@ mod tests {
     #[test]
     fn decode_fragment_metadata_accepts_n1_fragment_ndx_shape() {
         let current = IndexFragmentMeta {
-            fragment_id: "abc".to_string(),
-            stable_fragment_id: Some("01KSTABLEFRAGMENT000000000".to_string()),
+            stable_fragment_id: "01KSTABLEFRAGMENT000000000".to_string(),
             state: "active".to_string(),
             quota_bytes: 1024,
             quota_project_id: Some(12_345),
@@ -528,7 +512,7 @@ mod tests {
             updated_at_unix: 1_777_905_001,
             key_phc: Some("phc".to_string()),
             nt_hash_hex: Some("00112233445566778899aabbccddeeff".to_string()),
-            index_partition_count: Some(64),
+            index_partition_count: 64,
         };
         let raw = rmp_serde::to_vec_named(&current).expect("encode current N1 fragment ndx");
         assert!(
@@ -537,7 +521,7 @@ mod tests {
             "fragment metadata must be encoded as a named MessagePack map"
         );
         let decoded = decode_fragment_metadata(&raw).expect("decode current");
-        assert_eq!(decoded.fragment, current.fragment_id);
+        assert_eq!(decoded.stable_fragment_id, current.stable_fragment_id);
         assert_eq!(decoded.key_phc, current.key_phc.unwrap());
         assert_eq!(decoded.nt_hash_hex, current.nt_hash_hex);
         assert_eq!(decoded.index_partition_count, 64);
@@ -555,6 +539,43 @@ mod tests {
             matches!(err, AppError::InternalServerError(_)),
             "unexpected legacy decode error: {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn decode_fragment_metadata_rejects_missing_stable_identity() {
+        #[derive(Serialize)]
+        struct MissingIdentity<'a> {
+            state: &'a str,
+            quota_bytes: u64,
+            quota_project_id: Option<u32>,
+            committed_bytes: u64,
+            reserved_bytes: u64,
+            trash_bytes: u64,
+            created_at_unix: i64,
+            updated_at_unix: i64,
+            key_phc: Option<&'a str>,
+            nt_hash_hex: Option<&'a str>,
+            index_partition_count: u16,
+        }
+
+        let raw = rmp_serde::to_vec_named(&MissingIdentity {
+            state: "active",
+            quota_bytes: 0,
+            quota_project_id: None,
+            committed_bytes: 0,
+            reserved_bytes: 0,
+            trash_bytes: 0,
+            created_at_unix: 1,
+            updated_at_unix: 1,
+            key_phc: Some("phc"),
+            nt_hash_hex: None,
+            index_partition_count: 64,
+        })
+        .expect("encode metadata without stable identity");
+        assert!(
+            decode_fragment_metadata(&raw).is_err(),
+            "2.0 must not guess stable fragment identity from a pre-2.0 record"
         );
     }
 }

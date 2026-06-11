@@ -80,7 +80,7 @@ fn count_files_with_suffix(root: &Path, suffix: &str) -> ProofResult<usize> {
     Ok(count)
 }
 
-fn count_symlinks_excluding(root: &Path, excluded_segment: &str) -> ProofResult<usize> {
+fn count_live_namespace_links(root: &Path) -> ProofResult<usize> {
     if !root.exists() {
         return Ok(0);
     }
@@ -92,14 +92,21 @@ fn count_symlinks_excluding(root: &Path, excluded_segment: &str) -> ProofResult<
             let path = entry.path();
             let ty = fs::symlink_metadata(&path)?.file_type();
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            let excluded = rel
+            let in_trash = rel
                 .components()
-                .any(|part| part.as_os_str() == excluded_segment);
-            if excluded {
+                .any(|part| part.as_os_str() == ".trash");
+            if in_trash {
                 continue;
             }
             if ty.is_symlink() {
-                count += 1;
+                let target = fs::read_link(&path)?;
+                let is_object_link = target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("@o_"));
+                if is_object_link {
+                    count += 1;
+                }
             } else if ty.is_dir() {
                 stack.push(path);
             }
@@ -108,51 +115,76 @@ fn count_symlinks_excluding(root: &Path, excluded_segment: &str) -> ProofResult<
     Ok(count)
 }
 
-fn count_object_record_dirs(root: &Path) -> ProofResult<usize> {
+fn fragment_alias_stable_id(root: &Path, fragment: &str) -> ProofResult<String> {
+    let alias = root.join(".fragment").join(fragment);
+    let target = fs::read_link(&alias)
+        .map_err(|err| format!("read fragment alias {}: {err}", alias.display()))?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("fragment alias has invalid target: {}", alias.display()))?;
+    name.strip_prefix("@f_")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("fragment alias target is not an @f_ root: {name}").into())
+}
+
+fn physical_fragment_root(root: &Path, stable_fragment_id: &str) -> PathBuf {
+    root.join(format!("@f_{stable_fragment_id}"))
+}
+
+fn collect_object_dirs(root: &Path) -> ProofResult<Vec<PathBuf>> {
     if !root.exists() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let mut count = 0;
+    let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
-            let path = entry.path();
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if name.starts_with("@o_") {
-                if count_files_with_suffix(&path, ".ndx")? == 0 {
-                    return Err(format!(
-                        "object record directory has no committed .ndx: {}",
-                        path.display()
-                    )
-                    .into());
-                }
-                count += 1;
+            let path = entry.path();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("@o_") {
+                out.push(path);
             } else {
                 stack.push(path);
             }
         }
     }
-    Ok(count)
+    Ok(out)
 }
 
-fn count_dirs(root: &Path) -> ProofResult<usize> {
-    if !root.exists() {
-        return Ok(0);
-    }
-    let mut count = 0;
-    for entry in fs::read_dir(root)? {
-        if entry?.file_type()?.is_dir() {
-            count += 1;
+fn verify_colocated_object_dir(object_dir: &Path) -> ProofResult<(usize, usize)> {
+    let mut metadata_versions = BTreeSet::new();
+    let mut payload_versions = BTreeSet::new();
+    for entry in fs::read_dir(object_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Some(version) = entry.file_name().to_str() {
+                payload_versions.insert(version.to_string());
+            }
+            continue;
         }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(version) = name.strip_suffix(".ndx").and_then(|stem| stem.split('.').next())
+        else {
+            continue;
+        };
+        metadata_versions.insert(version.to_string());
     }
-    Ok(count)
+    if metadata_versions != payload_versions {
+        return Err(format!(
+            "colocated object version mismatch under {}: metadata={metadata_versions:?} payload={payload_versions:?}",
+            object_dir.display()
+        )
+        .into());
+    }
+    Ok((metadata_versions.len(), payload_versions.len()))
 }
 
 fn deterministic_payload(size: usize, seed: &[u8]) -> Vec<u8> {

@@ -62,20 +62,11 @@ impl Proof {
             self.upload_bytes(&trash_child, payload, "text/plain")
                 .await?;
             expected.insert(trash_child.clone());
-            let trash = self
-                .posix_post("/n1/posix/trash", json!({"path": trash_root}))
+            self.posix_post("/n1/posix/trash", json!({"path": trash_root}))
                 .await?;
             expected.remove(&trash_child);
-            let trash_entry_id = trash
-                .get("trash_entry_id")
-                .and_then(Value::as_str)
-                .ok_or("chaos trash did not return trash_entry_id")?
-                .to_string();
-            self.posix_post(
-                "/n1/posix/recover",
-                json!({"path": trash_root, "trash_entry_id": trash_entry_id}),
-            )
-            .await?;
+            self.posix_post("/n1/posix/recover", json!({"path": trash_root}))
+                .await?;
             self.assert_download_sha256(&trash_child, &trash_sha)
                 .await?;
             expected.insert(trash_child.clone());
@@ -318,6 +309,32 @@ impl Proof {
             .await
     }
 
+    async fn run_object_redistribution_and_wait(
+        &self,
+        object_key: &str,
+    ) -> ProofResult<Value> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/n1/maintenance/objects/redistribution/start/{}?mode=scrub&fast_mode=true&durability=batched",
+                self.base_url,
+                encode_path(object_key)
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        if response.status() != StatusCode::ACCEPTED {
+            return Err(format!(
+                "object redistribution start failed for {object_key}: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+        self.wait_job("/n1/maintenance/redistribution/status", "object redistribution")
+            .await
+    }
+
     async fn start_redistribution_job(&self) -> ProofResult<Value> {
         let response = self
             .client
@@ -446,21 +463,128 @@ impl Proof {
             .ok_or_else(|| format!("no versions for {object_key}").into())
     }
 
+    fn resolve_stable_fragment_id(&self) -> ProofResult<String> {
+        let mut resolved = None::<String>;
+        for root in self.index_roots.iter().take(self.active_disk_count) {
+            let stable = fragment_alias_stable_id(root, &self.fragment)?;
+            if resolved.as_ref().is_some_and(|current| current != &stable) {
+                return Err(format!(
+                    "fragment alias resolves inconsistently: expected={resolved:?} root={} actual={stable}",
+                    root.display()
+                )
+                .into());
+            }
+            resolved = Some(stable);
+        }
+        resolved.ok_or_else(|| "no active index root resolved the stable fragment identity".into())
+    }
+
+    fn object_version_dirs(&self, version_id: &str) -> ProofResult<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for root in &self.blob_roots {
+            let objects =
+                physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
+            for object_dir in collect_object_dirs(&objects)? {
+                let version_dir = object_dir.join(version_id);
+                if version_dir.is_dir() {
+                    out.push(version_dir);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn assert_object_version_placement(&self, version_id: &str) -> ProofResult<Value> {
+        let mut placements = Vec::new();
+        for root in self.blob_roots.iter().take(self.active_disk_count) {
+            let objects =
+                physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
+            let mut payload = None;
+            let mut metadata = None;
+            for object_dir in collect_object_dirs(&objects)? {
+                let version_dir = object_dir.join(version_id);
+                if !version_dir.is_dir() {
+                    continue;
+                }
+                payload = Some(version_dir);
+                metadata = fs::read_dir(&object_dir)?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with(version_id) && name.ends_with(".ndx")
+                            })
+                    });
+                break;
+            }
+            if let Some(payload) = payload {
+                let metadata = metadata.ok_or_else(|| {
+                    format!(
+                        "payload placement {} has no colocated .ndx for version {version_id}",
+                        payload.display()
+                    )
+                })?;
+                placements.push(json!({
+                    "blob_root": root,
+                    "payload": payload,
+                    "metadata": metadata,
+                }));
+            }
+        }
+
+        let expected_roots = usize::from(self.data_shards + self.parity_shards)
+            .min(self.active_disk_count)
+            .max(1);
+        if placements.len() != expected_roots {
+            return Err(format!(
+                "version {version_id} placement mismatch: expected {expected_roots} shard-bearing roots, found {}: {placements:?}",
+                placements.len()
+            )
+            .into());
+        }
+        Ok(json!({
+            "version_id": version_id,
+            "expected_shard_bearing_roots": expected_roots,
+            "placements": placements,
+        }))
+    }
+
+    fn physical_fragment_roots_for_disk(&self, disk_index: usize) -> BTreeSet<PathBuf> {
+        let mut roots = BTreeSet::new();
+        if let Some(root) = self.index_roots.get(disk_index) {
+            roots.insert(physical_fragment_root(root, &self.stable_fragment_id));
+        }
+        if let Some(root) = self.blob_roots.get(disk_index) {
+            roots.insert(physical_fragment_root(root, &self.stable_fragment_id));
+        }
+        roots
+    }
+
     fn remove_one_shard(&self, version_id: &str) -> ProofResult<PathBuf> {
-        let version_dir = self.blob_roots[0]
-            .join(&self.fragment)
-            .join(".blobs")
-            .join(version_id);
-        let mut shard_files = fs::read_dir(&version_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
+        let mut shard_files = Vec::new();
+        for version_dir in self.object_version_dirs(version_id)? {
+            shard_files.extend(
+                fs::read_dir(&version_dir)?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.is_file()
+                            && path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .is_some_and(|ext| matches!(ext, "shard" | "parity"))
+                    }),
+            );
+        }
         shard_files.sort();
         let removed = shard_files
             .into_iter()
             .next()
-            .ok_or_else(|| format!("no shard files under {}", version_dir.display()))?;
+            .ok_or_else(|| format!("no shard files for version {version_id}"))?;
         fs::remove_file(&removed)?;
         Ok(removed)
     }
@@ -488,18 +612,44 @@ impl Proof {
     }
 
     fn blob_version_exists(&self, version_id: &str) -> bool {
-        self.blob_roots.iter().any(|root| {
-            root.join(&self.fragment)
-                .join(".blobs")
-                .join(version_id)
-                .exists()
-        })
+        self.object_version_dirs(version_id)
+            .is_ok_and(|dirs| !dirs.is_empty())
+            || self.blob_roots.iter().any(|root| {
+                let objects = physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
+                count_files_with_suffix(&objects, ".ndx").is_ok_and(|count| {
+                    count > 0
+                        && collect_object_dirs(&objects).is_ok_and(|dirs| {
+                            dirs.into_iter().any(|dir| {
+                                fs::read_dir(dir).is_ok_and(|entries| {
+                                    entries.filter_map(Result::ok).any(|entry| {
+                                        entry
+                                            .file_name()
+                                            .to_str()
+                                            .is_some_and(|name| {
+                                                name.starts_with(version_id)
+                                                    && name.ends_with(".ndx")
+                                            })
+                                    })
+                                })
+                            })
+                        })
+                })
+            })
     }
 
     fn inspect_index(&self, expected_live_objects: usize) -> ProofResult<Value> {
-        let mut inspections = Vec::new();
+        let mut index_inspections = Vec::new();
+        let mut blob_inspections = Vec::new();
+        let mut unique_objects = BTreeSet::new();
         for root in &self.index_roots {
-            let fragment_root = root.join(&self.fragment);
+            let fragment_root = physical_fragment_root(root, &self.stable_fragment_id);
+            if !fragment_root.join(".fragment.ndx").is_file() {
+                return Err(format!(
+                    "index root is missing .fragment.ndx: {}",
+                    fragment_root.display()
+                )
+                .into());
+            }
             if fragment_root.join("indexdb").exists() {
                 return Err(format!(
                     "N1 fragment must not contain indexdb: {}",
@@ -507,30 +657,7 @@ impl Proof {
                 )
                 .into());
             }
-            let object_root = fragment_root.join(".objects");
-            let live_ndx = count_files_with_suffix(&object_root, ".ndx")?;
-            let object_record_dirs = count_object_record_dirs(&object_root)?;
-            let namespace_symlinks = count_symlinks_excluding(&fragment_root, ".trash")?;
-            let blob_root = self
-                .blob_roots
-                .get(
-                    self.index_roots
-                        .iter()
-                        .position(|value| value == root)
-                        .unwrap_or(0),
-                )
-                .unwrap_or(&self.blob_roots[0]);
-            let blob_version_dirs =
-                count_dirs(blob_root.join(&self.fragment).join(".blobs").as_path())?;
-            if object_record_dirs != expected_live_objects {
-                return Err(format!(
-                    "index inspection failed under {}: object_record_dirs={} expected={}",
-                    fragment_root.display(),
-                    object_record_dirs,
-                    expected_live_objects
-                )
-                .into());
-            }
+            let namespace_symlinks = count_live_namespace_links(&fragment_root)?;
             if namespace_symlinks != expected_live_objects {
                 return Err(format!(
                     "index inspection failed under {}: namespace_symlinks={} expected={}",
@@ -540,34 +667,74 @@ impl Proof {
                 )
                 .into());
             }
-            if live_ndx < expected_live_objects {
+            let root_is_blob = self.blob_roots.iter().any(|blob| blob == root);
+            if !root_is_blob && fragment_root.join(".objects").exists() {
                 return Err(format!(
-                    "index inspection failed under {}: live_ndx={} expected_at_least={}",
-                    fragment_root.display(),
-                    live_ndx,
-                    expected_live_objects
+                    "index-only root contains immutable object plane: {}",
+                    fragment_root.join(".objects").display()
                 )
                 .into());
             }
-            if blob_version_dirs < expected_live_objects {
-                return Err(format!(
-                    "blob inspection failed under {}: blob_version_dirs={} expected_at_least={}",
-                    blob_root.display(),
-                    blob_version_dirs,
-                    expected_live_objects
-                )
-                .into());
-            }
-            inspections.push(json!({
+            index_inspections.push(json!({
                 "index_root": root,
-                "blob_root": blob_root,
-                "object_record_dirs": object_record_dirs,
-                "live_ndx": live_ndx,
+                "physical_fragment_root": fragment_root,
                 "namespace_symlinks": namespace_symlinks,
-                "blob_version_dirs": blob_version_dirs,
+                "colocated_blob_role": root_is_blob,
             }));
         }
-        Ok(json!(inspections))
+        for root in &self.blob_roots {
+            let fragment_root = physical_fragment_root(root, &self.stable_fragment_id);
+            let objects_root = fragment_root.join(".objects");
+            let object_dirs = collect_object_dirs(&objects_root)?;
+            let mut metadata_versions = 0usize;
+            let mut payload_versions = 0usize;
+            for object_dir in &object_dirs {
+                let name = object_dir
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| format!("invalid object directory {}", object_dir.display()))?;
+                unique_objects.insert(name.to_string());
+                let (metadata, payload) = verify_colocated_object_dir(object_dir)?;
+                metadata_versions += metadata;
+                payload_versions += payload;
+            }
+            let root_is_index = self.index_roots.iter().any(|index| index == root);
+            if !root_is_index
+                && (fragment_root.join(".fragment.ndx").exists()
+                    || fragment_root.join(".uploads").exists()
+                    || fragment_root.join(".trash").exists()
+                    || root.join(".fragment").exists())
+            {
+                return Err(format!(
+                    "blob-only root contains namespace/control state: {}",
+                    root.display()
+                )
+                .into());
+            }
+            blob_inspections.push(json!({
+                "blob_root": root,
+                "physical_fragment_root": fragment_root,
+                "object_record_dirs": object_dirs.len(),
+                "metadata_versions": metadata_versions,
+                "payload_versions": payload_versions,
+                "colocated_index_role": root_is_index,
+            }));
+        }
+        if unique_objects.len() != expected_live_objects {
+            return Err(format!(
+                "blob inspection found {} unique objects; expected {}",
+                unique_objects.len(),
+                expected_live_objects
+            )
+            .into());
+        }
+        Ok(json!({
+            "stable_fragment_id": self.stable_fragment_id,
+            "colocated_roots": self.args.colocated_roots,
+            "unique_objects": unique_objects.len(),
+            "index_roots": index_inspections,
+            "blob_roots": blob_inspections,
+        }))
     }
 
     async fn sha256_file(&self, path: &Path) -> ProofResult<String> {
@@ -697,10 +864,14 @@ impl Proof {
     }
 
     fn cleanup_roots(&self) -> ProofResult<()> {
+        let mut parents = BTreeSet::new();
         for root in self.index_roots.iter().chain(self.blob_roots.iter()) {
             if let Some(parent) = root.parent() {
-                let _ = fs::remove_dir_all(parent);
+                parents.insert(parent.to_path_buf());
             }
+        }
+        for parent in parents {
+            let _ = fs::remove_dir_all(parent);
         }
         Ok(())
     }

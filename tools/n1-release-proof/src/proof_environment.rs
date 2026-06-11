@@ -3,6 +3,7 @@ impl Proof {
         if !self.args.binary.is_file() {
             return Err(format!("N1 binary does not exist: {}", self.args.binary.display()).into());
         }
+        self.args.binary = fs::canonicalize(&self.args.binary)?;
         if !self.args.source_file.is_file() {
             return Err(format!(
                 "source file does not exist: {}",
@@ -10,6 +11,7 @@ impl Proof {
             )
             .into());
         }
+        self.args.source_file = fs::canonicalize(&self.args.source_file)?;
         if !self.args.prefix.ends_with('/') {
             self.args.prefix.push('/');
         }
@@ -81,8 +83,16 @@ impl Proof {
         let proof_root = format!("n1-release-proof-{}", self.stamp);
         for disk in self.disk_roots()? {
             let root = disk.join(&proof_root);
-            let index = root.join("index");
-            let blob = root.join("blob");
+            let index = if self.args.colocated_roots {
+                root.join("store")
+            } else {
+                root.join("index")
+            };
+            let blob = if self.args.colocated_roots {
+                index.clone()
+            } else {
+                root.join("blob")
+            };
             fs::create_dir_all(&index)?;
             fs::create_dir_all(&blob)?;
             self.index_roots.push(index);
@@ -286,6 +296,7 @@ stripe_block_size=262144
         }
         let created: FragmentCreate = response.json().await?;
         self.fragment = created.fragment_hash;
+        self.stable_fragment_id = self.resolve_stable_fragment_id()?;
         Ok(())
     }
 

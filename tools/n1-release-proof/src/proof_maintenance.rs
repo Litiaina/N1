@@ -33,22 +33,16 @@ impl Proof {
         self.assert_download_sha256(&moved_child, &child_sha)
             .await?;
 
-        let trash = self
-            .posix_post(
-                "/n1/posix/trash",
-                json!({"path": format!("{base}/folder-renamed")}),
-            )
-            .await?;
-        let trash_entry_id = trash
-            .get("trash_entry_id")
-            .and_then(Value::as_str)
-            .ok_or("trash did not return trash_entry_id")?
-            .to_string();
+        self.posix_post(
+            "/n1/posix/trash",
+            json!({"path": format!("{base}/folder-renamed")}),
+        )
+        .await?;
         self.posix_stat(&format!("{base}/folder-renamed"), true)
             .await?;
         self.posix_post(
             "/n1/posix/recover",
-            json!({"path": format!("{base}/folder-renamed"), "trash_entry_id": trash_entry_id}),
+            json!({"path": format!("{base}/folder-renamed")}),
         )
         .await?;
         self.assert_download_sha256(&moved_child, &child_sha)
@@ -60,14 +54,10 @@ impl Proof {
         let version_id = self
             .upload_bytes(&delete_me, delete_payload, "application/octet-stream")
             .await?;
-        let trash = self
-            .posix_post("/n1/posix/trash", json!({"path": delete_me}))
+        self.posix_post("/n1/posix/trash", json!({"path": delete_me}))
             .await?;
-        self.posix_post(
-            "/n1/posix/purge",
-            json!({"path": delete_me, "trash_entry_id": trash.get("trash_entry_id").and_then(Value::as_str).unwrap_or("")}),
-        )
-        .await?;
+        self.posix_post("/n1/posix/purge", json!({"path": delete_me}))
+            .await?;
         self.run_gc_and_wait().await?;
         if self.blob_version_exists(&version_id) {
             return Err(format!("GC did not reclaim purged version {version_id}").into());
@@ -401,10 +391,10 @@ impl Proof {
         sample_sha: &str,
     ) -> ProofResult<Value> {
         self.stop_server()?;
-        let removed_index = self.index_roots[0].join(&self.fragment);
-        let removed_blob = self.blob_roots[0].join(&self.fragment);
-        let _ = fs::remove_dir_all(&removed_index);
-        let _ = fs::remove_dir_all(&removed_blob);
+        let removed_roots = self.physical_fragment_roots_for_disk(0);
+        for root in &removed_roots {
+            let _ = fs::remove_dir_all(root);
+        }
         self.start_server("fragment-scrub-blocking").await?;
         self.auth().await?;
 
@@ -440,8 +430,7 @@ impl Proof {
             .await?;
 
         Ok(json!({
-            "removed_index": removed_index,
-            "removed_blob": removed_blob,
+            "removed_physical_roots": removed_roots,
             "start": start,
             "running": running,
             "blocked_object_status": {
@@ -463,17 +452,17 @@ impl Proof {
         sample_sha: &str,
     ) -> ProofResult<Value> {
         self.stop_server()?;
-        let removed_index = self.index_roots[0].join(&self.fragment);
-        let removed_blob = self.blob_roots[0].join(&self.fragment);
-        let _ = fs::remove_dir_all(&removed_index);
-        let _ = fs::remove_dir_all(&removed_blob);
+        let removed_roots = self.physical_fragment_roots_for_disk(0);
+        for root in &removed_roots {
+            let _ = fs::remove_dir_all(root);
+        }
         self.start_server("disk-format").await?;
         self.auth().await?;
         self.run_repair_and_wait().await?;
         self.assert_expected_visible(expected).await?;
         self.assert_download_sha256(sample_key, sample_sha).await?;
         self.assert_health_clean("after_disk_format_repair").await?;
-        Ok(json!({"removed_index": removed_index, "removed_blob": removed_blob}))
+        Ok(json!({"removed_physical_roots": removed_roots}))
     }
 
     async fn redistribution_proof(
@@ -505,12 +494,26 @@ impl Proof {
         self.write_config()?;
         self.start_server("two-disk-again").await?;
         self.auth().await?;
+        let object_redistribution = self
+            .run_object_redistribution_and_wait(&one_disk_key)
+            .await?;
+        let one_disk_version = self.latest_version_id(&one_disk_key).await?;
+        let object_placement = self.assert_object_version_placement(&one_disk_version)?;
+        self.assert_download_sha256(&one_disk_key, &sha).await?;
+        self.assert_object_status_clean(&one_disk_key, "after_object_redistribution")
+            .await?;
         self.run_redistribution_and_wait().await?;
         self.run_repair_and_wait().await?;
         self.assert_expected_visible(expected).await?;
         self.assert_download_sha256(&one_disk_key, &sha).await?;
         self.assert_health_clean("after_redistribution").await?;
-        Ok(json!({"one_disk_object": one_disk_key, "active_disk_count": self.active_disk_count}))
+        Ok(json!({
+            "one_disk_object": one_disk_key,
+            "one_disk_version": one_disk_version,
+            "object_redistribution": object_redistribution,
+            "object_placement": object_placement,
+            "active_disk_count": self.active_disk_count,
+        }))
     }
 
     async fn redistribution_interrupt_resume_proof(

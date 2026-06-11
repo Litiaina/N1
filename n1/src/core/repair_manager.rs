@@ -12,6 +12,9 @@ use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_i
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
+use crate::core::upload::{
+    DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, target_stripe_size_for_metadata,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::replica::repair_namespace_replicas;
 use crate::namespace::runtime::global_namespace_runtime;
@@ -72,6 +75,23 @@ pub struct ObjectRepairStatus {
     pub repairable: bool,
     pub repaired_shards: u64,
     pub failed_repairs: u64,
+    pub layout: ObjectLayoutStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectLayoutStatus {
+    pub recorded_data_shards: usize,
+    pub recorded_parity_shards: usize,
+    pub current_data_shards: usize,
+    pub current_parity_shards: usize,
+    pub recorded_stripe_size_bytes: usize,
+    pub current_stripe_size_bytes: usize,
+    pub configured_blob_roots: usize,
+    pub layout_matches_current: bool,
+    pub placement_matches_current: bool,
+    pub state: String,
+    pub redistributable: bool,
+    pub mismatch_reasons: Vec<String>,
 }
 
 static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
@@ -559,6 +579,7 @@ fn expected_shard_path(
     path_manager: &ObjectPathManager,
     blob_roots: &[PathBuf],
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     shard_index: usize,
@@ -573,7 +594,7 @@ fn expected_shard_path(
         return None;
     }
     let disk_root = &blob_roots[disk_idx];
-    let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment, version_id);
+    let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment, object_key, version_id);
     let name = stable_shard_file_name(part_index, shard_index, is_parity);
     Some(shard_dir.join(name))
 }
@@ -582,6 +603,7 @@ async fn normalize_part_paths_for_repair(
     path_manager: &ObjectPathManager,
     blob_roots: &[PathBuf],
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     mut part: PartMetadata,
 ) -> PartMetadata {
@@ -597,6 +619,7 @@ async fn normalize_part_paths_for_repair(
             path_manager,
             blob_roots,
             fragment,
+            object_key,
             version_id,
             part.part_index,
             shard.shard_index,
@@ -642,6 +665,7 @@ async fn inspect_object_parts(
 ) -> Result<(ObjectRepairStatus, Vec<PartMetadata>, Vec<Vec<usize>>), AppError> {
     let path_manager = ObjectPathManager::new();
     let blob_roots = reachable_dir_roots(path_manager.get_blob_roots()).await;
+    let layout = object_layout_status(meta, &path_manager);
     let mut report = ObjectRepairStatus {
         object_key: meta.object_key.clone(),
         version_id: meta.version_id.clone(),
@@ -654,6 +678,7 @@ async fn inspect_object_parts(
         repairable: true,
         repaired_shards: 0,
         failed_repairs: 0,
+        layout,
     };
 
     let mut normalized_parts = Vec::with_capacity(meta.parts.len());
@@ -667,6 +692,7 @@ async fn inspect_object_parts(
             &path_manager,
             &blob_roots,
             &meta.fragment,
+            &meta.object_key,
             &meta.version_id,
             part.clone(),
         )
@@ -743,6 +769,86 @@ async fn inspect_object_parts(
     };
 
     Ok((report, normalized_parts, repair_targets))
+}
+
+fn object_layout_status(
+    meta: &ObjectMetadata,
+    path_manager: &ObjectPathManager,
+) -> ObjectLayoutStatus {
+    let blob_roots = path_manager.get_blob_roots();
+    let current_data = DATA_SHARDS_ATOMIC
+        .get()
+        .map(|value| value.load(Ordering::Relaxed))
+        .unwrap_or_else(|| usize::from(meta.data_shards));
+    let current_parity = PARITY_SHARDS_ATOMIC
+        .get()
+        .map(|value| value.load(Ordering::Relaxed))
+        .unwrap_or_else(|| usize::from(meta.parity_shards));
+    let configured_stripe_ceiling = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|value| value.load(Ordering::Relaxed))
+        .unwrap_or(meta.stripe_size_bytes);
+    let current_stripe = target_stripe_size_for_metadata(meta, configured_stripe_ceiling);
+    let recorded_data = usize::from(meta.data_shards);
+    let recorded_parity = usize::from(meta.parity_shards);
+    let current_total = current_data.saturating_add(current_parity);
+
+    let mut mismatch_reasons = Vec::new();
+    if recorded_data != current_data || recorded_parity != current_parity {
+        mismatch_reasons.push("ec_layout".to_string());
+    }
+    if meta.stripe_size_bytes != current_stripe {
+        mismatch_reasons.push("stripe_size".to_string());
+    }
+
+    let placement_matches_current = !blob_roots.is_empty()
+        && meta.parts.iter().all(|part| {
+            part.shards.iter().all(|shard| {
+                if shard.shard_index >= current_total {
+                    return false;
+                }
+                let root_index = (part.part_index as usize + shard.shard_index) % blob_roots.len();
+                let expected = path_manager
+                    .get_shard_dir_on_disk(
+                        &blob_roots[root_index],
+                        &meta.fragment,
+                        &meta.object_key,
+                        &meta.version_id,
+                    )
+                    .join(&shard.file_name);
+                Path::new(&shard.absolute_path) == expected
+            })
+        });
+    if !placement_matches_current {
+        mismatch_reasons.push("placement".to_string());
+    }
+
+    let layout_matches_current = recorded_data == current_data
+        && recorded_parity == current_parity
+        && meta.stripe_size_bytes == current_stripe;
+    let current = layout_matches_current && placement_matches_current;
+
+    ObjectLayoutStatus {
+        recorded_data_shards: recorded_data,
+        recorded_parity_shards: recorded_parity,
+        current_data_shards: current_data,
+        current_parity_shards: current_parity,
+        recorded_stripe_size_bytes: meta.stripe_size_bytes,
+        current_stripe_size_bytes: current_stripe,
+        configured_blob_roots: blob_roots.len(),
+        layout_matches_current,
+        placement_matches_current,
+        state: if current {
+            "current_layout".to_string()
+        } else {
+            "recorded_layout".to_string()
+        },
+        redistributable: !current
+            && current_data > 0
+            && current_total > 0
+            && blob_roots.len() >= current_total,
+        mismatch_reasons,
+    }
 }
 
 pub async fn inspect_object_status(
@@ -1165,6 +1271,7 @@ async fn process_object_repair(
             &path_manager,
             blob_roots,
             &meta_arc.fragment,
+            &meta_arc.object_key,
             &meta_arc.version_id,
             part.clone(),
         )
@@ -1235,6 +1342,10 @@ async fn process_object_repair(
                 }
             }
         }
+    }
+
+    if !cfg.dry_run {
+        index::upsert_object_version(meta_arc.as_ref()).await?;
     }
 
     Ok((repaired_total, corrupt_found, last_repaired))

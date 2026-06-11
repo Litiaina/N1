@@ -1,91 +1,45 @@
 # N1 Object Storage Architecture
 
-This document describes how N1 stores object metadata, namespace state, and payloads on disk. Operators should start with [DOCUMENTATION.md](DOCUMENTATION.md). This document is for maintainers, reviewers, and administrators who need to reason about repair, GC, redistribution, and failure recovery.
+This document defines the N1 2.0.0 storage contract. It is the reference for
+object identity, namespace behavior, upload commit, repair, redistribution, and
+garbage collection.
 
-## Storage Planes
+N1 2.0.0 intentionally uses a new on-disk layout. It does not read or migrate
+N1 1.x disk layouts.
 
-N1 has three storage planes and two transport faces:
+## Core Rule
 
-- **Namespace plane:** real directories and file symlinks.
-- **Object index plane:** fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories with immutable `.ndx` version records.
-- **Blob plane:** shard/parity payload files under `.blobs/<version_id>/`.
-- **HTTPS/LOA face:** the universal `/n1/...` API.
-- **Native `n1://` face:** a MessagePack-framed protocol for N1 Console, N1 Shell, NS, N2, and trusted internal native clients.
-
-The transport faces call the same N1 core/service graph. `n1://` is not a separate metadata path and does not own storage truth.
-
-The workspace `n1_native_client` crate is the canonical Rust client implementation for this transport. N1 Shell uses it directly, and N2, NS, desktop tools, and future operators should use the same crate instead of copying frame/auth/streaming code.
-
-## Native Protocol Plane
-
-N1 1.0.0 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the N1 object storage system without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
-
-The native plane is intentionally thin:
+N1 separates mutable namespace/control state from immutable object truth:
 
 ```text
-TCP connection
-  u32_be frame length
-  MessagePack NativeRequest
-    id
-    op
-    payload: JSON text
-    body: optional binary bytes
-  MessagePack NativeResponse
-    id
-    ok
-    status
-    body: MessagePack-encoded operation result bytes
+index roots = namespace and control
+blob roots  = immutable object metadata and EC payload
 ```
 
-The server stores auth state per native connection. `auth.fragment` calls the fragment authorization core directly, then the returned JWT is attached to later typed native operations. Native does not contain an HTTP route bridge and does not dispatch through Axum. Operations such as `namespace.stat`, `maintenance.health`, `object.status`, and `fragment.quota` call the same N1 core/service functions that HTTPS routes use.
+The namespace points to stable object identities. It never points to a shard,
+parity file, version path, or mutable head record.
 
-Native protocol performance depends on avoiding small-frame TCP latency and avoiding binary payload inflation. N1 sets `TCP_NODELAY` on accepted native sockets. Protocol `n1/0.4` sends upload payloads as raw bytes after a small MessagePack control frame instead of embedding large bodies inside the MessagePack frame. Streaming download responses send a small MessagePack response frame with `body_len`, then stream the object bytes directly on the same socket. Native upload dispatch streams raw request bytes through a bounded internal pipe into the same N1 upload core, so one-shot and multipart parts are not materialized as whole protocol buffers on the server. The Rust release proof includes native namespace, upload, resume, and streaming download benchmarks so delayed-ACK/Nagle regressions and native data-plane regressions are caught.
+Each committed object version stores its immutable `.ndx` record beside its
+shard or parity payload on every shard-bearing blob root. Object metadata
+durability therefore follows the recorded EC placement instead of consuming
+the index plane.
 
-The native plane must not:
+## Storage Roles
 
-- own namespace truth
-- bypass fragment auth
-- bypass object maintenance gates
-- bypass upload accounting
-- bypass repair, GC, redistribution, or validation logic
-- implement a separate object metadata path
+### Index Root
 
-Native is a lower-latency core face for the same N1 object storage system, not a fourth storage plane and not masked HTTP.
-
-## Disk IO Scheduler
-
-N1 includes a shared disk IO scheduler above the storage planes. The scheduler is not a metadata authority and does not change the object/index/blob layout. It only controls admission into disk-heavy work.
-
-Scheduler lanes:
-
-- foreground read
-- foreground write
-- background repair
-- background GC
-- background redistribution
-
-Foreground work uses the adaptive upload target so live traffic can contract under CPU/RAM pressure. Background work has its own smaller lane and per-fragment gate, so GC, repair, and redistribution cannot consume the whole disk path while users are uploading or reading. Object status and repair also pass through the scheduler in addition to their object-scoped maintenance gates.
-
-The scheduler is intentionally coarse: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the object-storage invariants stable while removing avoidable per-shard serialization from large uploads.
-
-N1 still serializes the same `(fragment, version_id, part_index)` upload part. Different parts can move in parallel, but two clients cannot race the same receipt or stable shard set for the same part. Large-upload clients should keep part concurrency bounded; too much concurrency can overload weak two-disk deployments instead of improving them.
-
-Each configured root can house both index and blob data:
+An index root stores mutable fragment aliases, fragment control state, upload
+receipts, trash, and the user namespace:
 
 ```text
-<root>/
+<index_root>/
   .fragment/
-    <name_hash> -> ../@f_<stable_fragment_id>
+    <fragment-alias-hash> -> ../@f_<stable-fragment-id>
 
-  @f_<stable_fragment_id>/
+  @f_<stable-fragment-id>/
     .fragment.ndx
-    .objects/
-      ab/
-        cd/
-          @o_<object-id>/
-            <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
     .uploads/
-      <version_id>/
+      <version-id>/
         manifest.ndx
         binding.ndx
         part_p00000000000000000000.<crc32>.receipt
@@ -93,36 +47,112 @@ Each configured root can house both index and blob data:
     .trash/
       docs/
         video.mp4 -> @o_<object-id>
-    .blobs/
-      <version_id>/
-        <shard-or-parity-file>
+
     docs/
       video.mp4 -> @o_<object-id>
 ```
 
-The `.fragment/<name_hash>` entry is the mutable fragment namespace alias. The `@f_<stable_fragment_id>` directory is the immutable physical fragment root. Fragment rename changes the alias and fragment control metadata; it does not move object records, blob files, upload receipts, or namespace directories. Because blob shard paths are absolute and object `.ndx` records are immutable, fragment rename must never require rewriting existing object metadata.
+An index-only root must not contain `.objects` or object payload.
 
-## Fragment Record
+### Blob Root
 
-`.fragment.ndx` is the per-fragment control record. It stores fragment-level operational state such as quota/project identity, state, timestamps, key material metadata, and index partition count.
+A blob root stores immutable object records and their EC payload:
 
-`.fragment.ndx` also records the stable physical fragment identity. It is not object truth and not namespace truth.
+```text
+<blob_root>/
+  @f_<stable-fragment-id>/
+    .objects/
+      ab/
+        cd/
+          @o_<object-id>/
+            <version-ulid>.<size>.<unix-nanos>.<packed-ext>.ndx
+            <version-ulid>/
+              part_0_shard_0.shard
+              part_0_shard_1.shard
+              part_0_shard_2.parity
+```
 
-## Namespace Plane
+A blob-only root must not contain:
 
-Folders are real directories. Files are symlinks whose payload is a stable object id:
+- `.fragment/`
+- `.fragment.ndx`
+- `.uploads/`
+- `.trash/`
+- user namespace paths
+
+Only roots that hold a shard or parity file for a version hold that version's
+`.ndx`. The `.ndx` and payload placement form one immutable object-version
+record.
+
+### Colocated Root
+
+The same physical disk may be configured as both an index root and a blob root.
+This is the minimum and low-disk-count deployment model:
+
+```text
+<root>/
+  .fragment/
+  @f_<stable-fragment-id>/
+    .fragment.ndx
+    .uploads/
+    .trash/
+    <user namespace>
+    .objects/
+```
+
+Colocation combines disk roles, not ownership rules. Namespace/control code
+does not own `.objects`, and object-placement code does not own namespace
+state.
+
+## Stable Fragment Identity
+
+The public fragment alias is mutable:
+
+```text
+.fragment/<alias-hash> -> ../@f_<stable-fragment-id>
+```
+
+The `@f_<stable-fragment-id>` identity is immutable. Authentication may begin
+with the alias hash, but core operations resolve it to the stable fragment
+identity before touching object or namespace state.
+
+`.fragment.ndx` is a control record stored only on index roots. It records the
+stable fragment identity, state, quota/project identity, timestamps, key
+material metadata, and namespace partition count.
+
+Fragment rename changes only the index-plane alias and mutable display
+identity. It does not move or rewrite:
+
+- object `.ndx` records
+- shard or parity files
+- object ids
+- upload payload
+- namespace contents
+
+## Namespace
+
+Folders are real directories. Files are symlinks to stable object ids:
 
 ```text
 docs/video.mp4 -> @o_<object-id>
 ```
 
-The symlink target is not a relative filesystem path. Moving or renaming a folder does not require rewriting child symlinks.
+The symlink target is an identity token, not a relative payload path.
 
-File rename changes only the namespace symlink name. Folder rename changes only the directory path. Blob files and object version records are not moved by namespace operations.
+Namespace operations are therefore lightweight:
+
+- file rename changes a symlink name
+- folder rename changes a directory name
+- move changes namespace placement
+- soft delete moves namespace entries into `.trash`
+- recover moves entries from `.trash` back to the live namespace
+
+These operations do not rewrite object metadata or EC payload.
 
 Reserved internal names are rejected in user paths:
 
 ```text
+.fragment
 .objects
 .uploads
 .trash
@@ -132,112 +162,218 @@ Reserved internal names are rejected in user paths:
 .repair
 .intents
 .trash-jobs
-.blobs
-.fragment
 @o_*
 @f_*
 ```
 
-## Object Index Plane
+## Object Identity And Versions
 
-Object directories are fanned out by object id hash:
+Object directories use two-level fanout:
 
 ```text
 .objects/<hh>/<hh>/@o_<object-id>/
 ```
 
-Each committed version is one immutable `.ndx`:
+Each committed version has:
+
+```text
+<ulid>.<size>.<unix-nanos>.<packed-ext>.ndx
+<ulid>/
+  <shard-or-parity-files>
+```
+
+The `.ndx` body stores immutable object metadata:
+
+- object key at commit time
+- stable fragment identity
+- version and upload-session ids
+- owner and content type
+- logical size and timestamps
+- recorded data/parity shard counts
+- recorded stripe size
+- parts
+- absolute shard/parity paths
+- checksums and shard roles
+
+There is no mutable head pointer. The head is the greatest valid version ULID
+found across the object's healthy blob placements.
+
+## Zero-Decode Summary
+
+The `.ndx` filename is a listing summary:
 
 ```text
 <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
 ```
 
-The filename is a zero-decode listing summary:
+Listing resolves the namespace symlink to `@o_<object-id>`, finds the greatest
+ULID filename across blob roots, and parses the filename fields. It does not
+decode the `.ndx` body.
 
-- ULID: version identity and sort order
-- size bytes: list/display size
-- unix nanos: timestamp
-- packed extension: compact extension key
-
-The `.ndx` body stores full immutable object metadata for reads, repair, redistribution, archive download, recover-on-read, and GC.
-
-Head/latest is the greatest valid ULID filename in the object directory. There is no mutable head pointer.
-
-## Packed Extension
-
-The packed extension is a u64:
+The packed extension is a `u64`:
 
 - byte 0 stores extension length
 - bytes 1 through 7 store lowercase ASCII extension bytes
-- extensions longer than 7 bytes store `0`
+- unsupported or longer extensions store `0`
 
-This keeps list output useful without decoding `.ndx` bodies.
+Full `.ndx` decoding is reserved for reads, repair, redistribution, status,
+recover-on-read, archive operations, and GC.
 
-## Normal Listing
+## Upload And Commit
 
-Normal listing opens the requested namespace directory and reads direct children only:
-
-```text
-prefix=docs/
-resolve <root>/.fragment/<fragment_hash> -> @f_<stable_fragment_id>
-open <root>/@f_<stable_fragment_id>/docs/
-read direct children
-```
-
-For file symlinks, N1 reads the object id from the symlink, opens the object directory, selects the greatest ULID `.ndx` filename, parses the filename summary, and returns the entry.
-
-Normal listing does not decode `.ndx` bodies.
-
-## Upload State
-
-Incomplete multipart state lives outside the live namespace:
+Incomplete upload state lives only in the index/control plane:
 
 ```text
-.uploads/<version_id>/
+.uploads/<version-id>/
   manifest.ndx
   binding.ndx
   part_p<part-index>.<crc32>.receipt
   shard_p<part-index>_s<shard-index>.<crc32>.receipt
 ```
 
-`manifest.ndx` and `binding.ndx` are written during session setup. Receipt filenames are the lightweight durable progress record. Finalize reads session state, rebuilds full object metadata, writes the committed `.ndx`, and publishes the namespace symlink.
+Multipart parts stream through EC into temporary shard files. Receipts record
+durable progress without retaining the object body in memory.
 
-## Trash Lifecycle
+Finalize:
 
-Soft delete moves namespace entries into `.trash`.
+1. validates the upload binding and part receipts
+2. validates or publishes stable shard/parity files
+3. builds the immutable object `.ndx`
+4. writes that `.ndx` to every shard-bearing blob root
+5. publishes or updates the namespace symlink
+6. retires upload-session state
 
-Recover moves namespace entries out of `.trash`.
+The namespace becomes visible only after immutable object truth is durable.
 
-Hard delete removes trash namespace entries. When no live or trash symlink references an object id, N1 removes the unreferenced object index record. GC later reclaims headless blob payloads.
+## Erasure Placement
 
-Trash/recover never moves blob payloads.
+N1 records EC topology per object version. For `3 + 1`, each part has three
+data shards and one parity shard placed across four selected blob roots. Each
+of those roots also stores the same immutable `.ndx` for that version.
 
-## GC Reachability
+This provides:
 
-GC scans live and trash namespace references, resolves object ids, decodes committed `.ndx` bodies when full blob references are needed, and protects referenced payloads.
+- metadata survival with surviving shard placements
+- self-describing blob placements
+- no object-metadata capacity pressure on index-only disks
+- independent recovery of missing metadata and missing payload
 
-Blob payloads with no reachable committed metadata become reclaim candidates.
+Absolute shard paths remain recorded because they are direct storage truth on
+one machine. Stable fragment ids ensure fragment rename cannot invalidate
+those paths.
 
-## Repair Model
+## Topology Changes
 
-Repair restores:
+Changing configured disks or EC values does not rewrite existing objects.
 
-- missing namespace/index replicas from healthy roots
-- split immutable object-version records across index replicas
-- missing or corrupt shard/parity payloads where enough data remains
-- missing metadata replicas after disk loss or reformat
-- readable objects after recover-on-read or full repair
+- old objects remain governed by their recorded topology
+- new objects use the current configured topology
+- health compares each version against its recorded layout
+- redistribution is explicit
 
-Index repair treats `.ndx` version files as immutable records. Before mirroring an index replica, N1 merges valid object-version records found across active index roots into the selected source, then normalizes the replicas. That prevents a stale but record-rich replica from overwriting a newer version that only exists on another index root after an interrupted write, remount, or historical repair gap.
+Object-level redistribution rewrites one selected version into the current
+topology. Fragment redistribution scans that fragment and rewrites only
+objects that do not already match the requested target.
 
-Object-level repair scopes the operation to one object. Fragment repair scans the whole fragment.
+Redistribution preserves object id and namespace identity while creating new
+payload placement and colocated `.ndx` copies transactionally. Old payload is
+retired through GC staging after the new placement is committed.
 
-## Redistribution Model
+## Repair
 
-Redistribution adapts index and blob placement to the current configured roots. It supports shrinking and expanding disk topology, including `2 roots -> 1 root -> 2 roots`.
+Repair has two independent responsibilities.
 
-Redistribution must preserve namespace symlinks, stable object ids, immutable `.ndx` records, and blob references.
+Namespace/control repair restores index replicas:
 
-## Public Identity
+- fragment aliases
+- `.fragment.ndx`
+- upload/control state when applicable
+- live namespace
+- trash namespace
 
-Public documentation should call this system N1, the N1 object storage system, the N1 namespace, the N1 object index, and the N1 blob plane. Implementation files such as `.fragment.ndx`, `.objects`, `.uploads`, and `.blobs` are valid architecture terms, but they should not be presented as a separate database product or as a filesystem product.
+It must never copy, delete, merge, or rewrite blob-plane `.objects`.
+
+Object repair uses the immutable `.ndx` and surviving shards to restore:
+
+- missing or corrupt shard/parity files
+- missing `.ndx` copies on shard-bearing placements
+- readable object state after disk loss
+
+Recover-on-read uses the same recorded object topology and repair primitives.
+
+## Garbage Collection
+
+The namespace is reachability truth.
+
+GC:
+
+1. scans live and trash namespace links
+2. builds the reachable object-id set
+3. scans blob-root `.objects`
+4. protects reachable versions and active uploads
+5. reclaims headless object metadata and payload after retention rules allow it
+
+Soft delete does not rewrite object truth. Empty trash retires namespace
+references; GC performs physical reclamation later.
+
+Redistribution may temporarily stage old payload as `.gc` files with
+compatibility symlinks. Those entries are object-plane retirement state, not
+namespace entries.
+
+## IO Control
+
+N1 applies bounded admission above disk-heavy work:
+
+- foreground reads
+- foreground writes
+- background repair
+- background GC
+- background redistribution
+
+Foreground concurrency adapts to available memory, CPU pressure, disk count,
+and configured EC width. Background lanes are smaller and fragment-scoped so
+maintenance cannot consume the complete live IO path.
+
+Multipart encoding remains streaming. Shard writes and final flushes run in
+parallel within the admitted request budget. N1 does not buffer whole objects
+for EC.
+
+## Transport Faces
+
+N1 exposes:
+
+- `/n1/...` over HTTPS for universal clients
+- `n1://` for N1-owned low-level tools and trusted services
+
+Both call the same N1 core. The native protocol does not bridge through Axum
+and does not own separate storage semantics.
+
+Native data operations use a small MessagePack control frame followed by raw
+body bytes. Upload bodies stream into the same bounded upload core, and
+downloads stream raw bytes after the response control frame.
+
+The native face must not bypass:
+
+- fragment authentication
+- namespace rules
+- upload accounting
+- maintenance gates
+- EC validation
+- repair, redistribution, or GC invariants
+
+## Locked Invariants
+
+N1 2.0.0 is correct only while all of these remain true:
+
+1. Index roots own namespace/control state only.
+2. Blob roots own immutable object metadata and payload.
+3. A version `.ndx` exists only on shard-bearing blob roots.
+4. Namespace files point only to stable `@o_` identities.
+5. Fragment aliases resolve to immutable `@f_` identities.
+6. Head is max ULID; no mutable head record exists.
+7. Listing remains zero-decode.
+8. Object versions retain their recorded EC topology until explicit redistribution.
+9. Namespace repair never mutates `.objects`.
+10. Fragment rename never rewrites object metadata or payload.
+11. GC derives reachability from live and trash namespace state.
+12. Upload and download remain streaming and memory-bounded.

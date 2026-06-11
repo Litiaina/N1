@@ -7,8 +7,8 @@ use walkdir::WalkDir;
 
 use crate::{
     core::{
-        constants::N1_BLOB_DIR, disk_manager::ObjectPathManager,
-        fragment_identity::fragment_root_on,
+        constants::N1_OBJECTS_DIR, disk_manager::ObjectPathManager,
+        fragment_identity::physical_fragment_root_on,
     },
     enums::app_error_enum::AppError,
     structs::auth_structs::Claims,
@@ -34,9 +34,10 @@ pub struct CreateFragmentResponse {
 pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
+    let stable_fragment_id = path_manager.resolve_stable_fragment_id(fragment_hash);
 
     for root in blob_roots {
-        let blob_dir = fragment_root_on(&root, fragment_hash).join(N1_BLOB_DIR);
+        let blob_dir = physical_fragment_root_on(&root, &stable_fragment_id).join(N1_OBJECTS_DIR);
 
         let exists_check = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await;
 
@@ -70,6 +71,7 @@ pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
 pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
+    let stable_fragment_id = path_manager.resolve_stable_fragment_id(fragment_hash);
 
     if blob_roots.is_empty() {
         return Err(AppError::ServiceUnavailable(
@@ -78,7 +80,7 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
     }
 
     for root in blob_roots {
-        let blob_dir = fragment_root_on(&root, fragment_hash).join(N1_BLOB_DIR);
+        let blob_dir = physical_fragment_root_on(&root, &stable_fragment_id).join(N1_OBJECTS_DIR);
 
         match timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await {
             Ok(Ok(false)) => {
@@ -144,10 +146,11 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
 async fn sweep_fragment_gc_files(fragment_hash: String) {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
+    let stable_fragment_id = path_manager.resolve_stable_fragment_id(&fragment_hash);
 
     tokio::task::spawn_blocking(move || {
         for root in blob_roots {
-            let fragment_root = fragment_root_on(&root, &fragment_hash);
+            let fragment_root = physical_fragment_root_on(&root, &stable_fragment_id);
             if !fragment_root.exists() {
                 continue;
             }

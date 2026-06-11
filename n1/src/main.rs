@@ -814,7 +814,9 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
-    tracing::info!("Storage mode: N1 object storage system with explicit .blobs payload roots");
+    tracing::info!(
+        "Storage mode: N1 object storage system with namespace-only index roots and colocated object metadata/payload roots"
+    );
 
     let quota_section = config.section(Some("quota_config"));
     let fragment_quota_backend =
@@ -841,7 +843,7 @@ pub async fn run_server() {
         .expect("index_config.partition_count must be one of: 32, 64, 256");
 
     tracing::info!(
-        "Index layout: N1 namespace + object index, partition_count={} for intent routing",
+        "Index layout: N1 namespace/control only, partition_count={} for intent routing",
         configured_index_partition_count
     );
 

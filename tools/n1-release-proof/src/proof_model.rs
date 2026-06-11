@@ -37,6 +37,8 @@ struct Args {
     fragment_name: String,
     #[arg(long, default_value_t = false)]
     cleanup_roots: bool,
+    #[arg(long, default_value_t = false)]
+    colocated_roots: bool,
     #[arg(long, default_value_t = 10_800)]
     job_timeout_seconds: u64,
     #[arg(long, default_value_t = 2)]
@@ -117,6 +119,7 @@ struct Proof {
     blob_roots: Vec<PathBuf>,
     server: Option<Child>,
     fragment: String,
+    stable_fragment_id: String,
     token: String,
     summary: Value,
     active_disk_count: usize,
@@ -168,6 +171,7 @@ impl Proof {
             blob_roots: Vec::new(),
             server: None,
             fragment: String::new(),
+            stable_fragment_id: String::new(),
             token: String::new(),
             summary: json!({}),
             active_disk_count: 0,

@@ -362,6 +362,20 @@ async fn trigger_fragment_redistribution_job(
     trigger_redistribution_job_api(claims, State(state), Query(params)).await
 }
 
+async fn trigger_object_redistribution_job(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(object_key): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let object_id = resolve_logical_read_key(&fragment, &object_key).await?;
+    params.insert("fragment".to_string(), fragment);
+    params.insert("object_key".to_string(), object_id);
+    params.insert("scope".to_string(), "object".to_string());
+    trigger_redistribution_job_api(claims, State(state), Query(params)).await
+}
+
 async fn get_fragment_health(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -1371,6 +1385,10 @@ pub fn build_storage_routes_unbound_with_options(
                 post(trigger_fragment_redistribution_job),
             )
             .route(
+                "/n1/maintenance/objects/redistribution/start/{*object_key}",
+                post(trigger_object_redistribution_job),
+            )
+            .route(
                 "/n1/maintenance/redistribution/stop",
                 post(stop_redistribution_job_api),
             )
@@ -1455,4 +1473,17 @@ pub async fn serve_storage_routes() -> Router {
 
 async fn ping() -> &'static str {
     "pong"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_redistribution_route_places_catch_all_last() {
+        let _: Router<Arc<AppState>> = Router::new().route(
+            "/n1/maintenance/objects/redistribution/start/{*object_key}",
+            post(trigger_object_redistribution_job),
+        );
+    }
 }

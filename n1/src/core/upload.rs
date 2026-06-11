@@ -251,9 +251,9 @@ mod tests {
     use super::{
         UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode,
         acquire_upload_io_guard_with_timeout, choose_upload_stripe_size_for_len_with_ceiling,
-        parse_upload_durability_mode,
+        parse_upload_durability_mode, target_stripe_size_for_metadata,
     };
-    use crate::core::disk_manager::UploadPartQuery;
+    use crate::core::disk_manager::{ObjectMetadata, PartMetadata, UploadPartQuery};
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -336,6 +336,42 @@ mod tests {
             16 * 1024
         );
     }
+
+    #[test]
+    fn recorded_layout_uses_the_same_adaptive_stripe_rule_as_upload() {
+        let metadata = ObjectMetadata {
+            object_key: "01KOBJECT".to_string(),
+            fragment: "01KFRAGMENT".to_string(),
+            version_id: "01KVERSION".to_string(),
+            upload_session_id: "01KSESSION".to_string(),
+            owner_uid: "01KFRAGMENT".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            total_size_bytes: 96 * 1024,
+            created_at: 1,
+            data_shards: 1,
+            parity_shards: 1,
+            parts: vec![
+                PartMetadata {
+                    part_index: 0,
+                    size_bytes: 48 * 1024,
+                    created_at: 1,
+                    shards: Vec::new(),
+                    checksum: None,
+                },
+                PartMetadata {
+                    part_index: 1,
+                    size_bytes: 48 * 1024,
+                    created_at: 1,
+                    shards: Vec::new(),
+                    checksum: None,
+                },
+            ],
+            is_delete_marker: false,
+            stripe_size_bytes: 4096,
+        };
+
+        assert_eq!(target_stripe_size_for_metadata(&metadata, 262_144), 4096);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,14 +382,11 @@ pub struct UploadSessionManifest {
     pub session_id: String,
     pub total_size_bytes: u64,
     pub expected_parts: u64,
-    #[serde(default)]
     pub part_size_bytes: u64,
     pub content_type: String,
     pub created_at: i64,
     pub stripe_size_bytes: usize,
-    #[serde(default)]
     pub data_shards: u16,
-    #[serde(default)]
     pub parity_shards: u16,
 }
 
@@ -825,12 +858,7 @@ fn configured_parity_shards() -> usize {
 }
 
 fn manifest_data_shards(manifest: &UploadSessionManifest) -> usize {
-    let configured = usize::from(manifest.data_shards);
-    if configured == 0 {
-        configured_data_shards()
-    } else {
-        configured
-    }
+    usize::from(manifest.data_shards)
 }
 
 fn manifest_parity_shards(manifest: &UploadSessionManifest) -> usize {
@@ -848,7 +876,10 @@ fn configured_block_size() -> usize {
         .unwrap_or_else(default_stripe_size)
 }
 
-fn choose_upload_stripe_size_for_len_with_ceiling(content_length: u64, configured: usize) -> usize {
+pub(crate) fn choose_upload_stripe_size_for_len_with_ceiling(
+    content_length: u64,
+    configured: usize,
+) -> usize {
     if configured <= MIN_DYNAMIC_STRIPE_SIZE {
         return configured;
     }
@@ -866,6 +897,19 @@ fn choose_upload_stripe_size_for_len_with_ceiling(content_length: u64, configure
 
 fn choose_upload_stripe_size_for_len(content_length: u64) -> usize {
     choose_upload_stripe_size_for_len_with_ceiling(content_length, configured_block_size())
+}
+
+pub(crate) fn target_stripe_size_for_metadata(
+    metadata: &ObjectMetadata,
+    configured_ceiling: usize,
+) -> usize {
+    let largest_part = metadata
+        .parts
+        .iter()
+        .map(|part| part.size_bytes)
+        .max()
+        .unwrap_or(metadata.total_size_bytes);
+    choose_upload_stripe_size_for_len_with_ceiling(largest_part, configured_ceiling)
 }
 
 fn choose_upload_stripe_size_for_parts(part_sizes: &[u64]) -> usize {
@@ -982,8 +1026,12 @@ fn shard_specs_for_part(
     for shard_index in 0..total_shards {
         let disk_idx = (part_index as usize + shard_index) % blob_roots.len();
         let disk_root = &blob_roots[disk_idx];
-        let shard_dir =
-            path_manager.get_shard_dir_on_disk(disk_root, &manifest.fragment, &manifest.version_id);
+        let shard_dir = path_manager.get_shard_dir_on_disk(
+            disk_root,
+            &manifest.fragment,
+            &manifest.object_key,
+            &manifest.version_id,
+        );
         let file_name = stable_shard_name(part_index, shard_index, data_shards);
         let stable_path = shard_dir.join(&file_name);
         out.push((
@@ -1027,17 +1075,19 @@ async fn ensure_version_shard_dirs(
     path_manager: &ObjectPathManager,
     manifest: &UploadSessionManifest,
 ) -> Result<(), AppError> {
-    let create_futs = path_manager.get_blob_roots().into_iter().map(|disk_root| {
-        let shard_dir = path_manager.get_shard_dir_on_disk(
-            &disk_root,
-            &manifest.fragment,
-            &manifest.version_id,
-        );
-        async move {
-            tokio_fs::create_dir_all(&shard_dir)
-                .await
-                .map_err(|e| AppError::Io(e, format!("mkdir shard dir {}", shard_dir.display())))
+    let mut shard_dirs = BTreeSet::new();
+    for part_index in 0..manifest.expected_parts {
+        for (_, _, shard_path, _) in shard_specs_for_part(path_manager, manifest, part_index)? {
+            if let Some(parent) = shard_path.parent() {
+                shard_dirs.insert(parent.to_path_buf());
+            }
         }
+    }
+
+    let create_futs = shard_dirs.into_iter().map(|shard_dir| async move {
+        tokio_fs::create_dir_all(&shard_dir)
+            .await
+            .map_err(|e| AppError::Io(e, format!("mkdir shard dir {}", shard_dir.display())))
     });
 
     for result in join_all(create_futs).await {
@@ -1222,6 +1272,7 @@ fn request_content_type(headers: &HeaderMap) -> Option<String> {
 async fn write_part_blob_to_disk(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     content_length: u64,
@@ -1243,6 +1294,7 @@ async fn write_part_blob_to_disk(
     write_part_blob_to_disk_from_stream(
         path_manager,
         fragment,
+        object_key,
         version_id,
         part_index,
         content_length,
@@ -1259,6 +1311,7 @@ async fn write_part_blob_to_disk(
 async fn write_part_blob_to_disk_from_stream<S>(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     content_length: u64,
@@ -1329,7 +1382,8 @@ where
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
         let disk_idx = (part_index as usize + i) % num_disks;
         let target_disk = &blob_roots[disk_idx];
-        let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
+        let shard_dir =
+            path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
 
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
@@ -1538,6 +1592,7 @@ where
 async fn write_part_blob_to_disk_from_reader<R>(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
     part_index: u64,
     content_length: u64,
@@ -1608,7 +1663,8 @@ where
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
         let disk_idx = (part_index as usize + i) % num_disks;
         let target_disk = &blob_roots[disk_idx];
-        let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
+        let shard_dir =
+            path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
 
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
@@ -1804,10 +1860,11 @@ async fn cleanup_files_best_effort(paths: &[PathBuf]) {
 async fn cleanup_blob_version_dirs_for_version(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
 ) {
     let futs = path_manager.get_blob_roots().into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
+        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, object_key, version_id);
         async move {
             let parent = dir.parent().map(Path::to_path_buf);
             let _ = tokio_fs::remove_dir_all(&dir).await;
@@ -1906,12 +1963,13 @@ fn is_tmp_attempt_shard(name: &str) -> bool {
 async fn cleanup_blob_tmp_attempt_files_for_version(
     path_manager: &ObjectPathManager,
     fragment: &str,
+    object_key: &str,
     version_id: &str,
 ) {
     let blob_roots = path_manager.get_blob_roots();
 
     let futs = blob_roots.into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
+        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, object_key, version_id);
         async move {
             if !tokio_fs::try_exists(&dir).await.unwrap_or(false) {
                 return;
@@ -2244,6 +2302,7 @@ pub async fn object_upload_part(
     let part_meta = write_part_blob_to_disk(
         &path_manager,
         &fragment,
+        &manifest.object_key,
         &version_id,
         part_index,
         content_length,
@@ -2257,7 +2316,13 @@ pub async fn object_upload_part(
     .await?;
 
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(
+            &path_manager,
+            &fragment,
+            &manifest.object_key,
+            &version_id,
+        )
+        .await;
         return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
     }
 
@@ -2271,7 +2336,13 @@ pub async fn object_upload_part(
     }
 
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(
+            &path_manager,
+            &fragment,
+            &manifest.object_key,
+            &version_id,
+        )
+        .await;
         return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
     }
 
@@ -2418,6 +2489,7 @@ where
     let part_meta = write_part_blob_to_disk_from_stream(
         &path_manager,
         &fragment,
+        &manifest.object_key,
         &version_id,
         part_index,
         content_length,
@@ -2431,7 +2503,13 @@ where
     .await?;
 
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(
+            &path_manager,
+            &fragment,
+            &manifest.object_key,
+            &version_id,
+        )
+        .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -2445,7 +2523,13 @@ where
     }
 
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(
+            &path_manager,
+            &fragment,
+            &manifest.object_key,
+            &version_id,
+        )
+        .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -2542,6 +2626,7 @@ where
     let part_meta = write_part_blob_to_disk_from_reader(
         &path_manager,
         &fragment,
+        &manifest.object_key,
         &version_id,
         part_index,
         content_length,
@@ -2555,7 +2640,13 @@ where
     .await?;
 
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(
+            &path_manager,
+            &fragment,
+            &manifest.object_key,
+            &version_id,
+        )
+        .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -2569,7 +2660,13 @@ where
     }
 
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(
+            &path_manager,
+            &fragment,
+            &manifest.object_key,
+            &version_id,
+        )
+        .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -2629,6 +2726,7 @@ async fn upload_object_one_shot_inner(
     let part_meta = match write_part_blob_to_disk(
         &path_manager,
         &fragment,
+        &object_key,
         &version_id,
         0,
         content_length,
@@ -2643,7 +2741,13 @@ async fn upload_object_one_shot_inner(
     {
         Ok(part_meta) => part_meta,
         Err(err) => {
-            cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+            cleanup_blob_version_dirs_for_version(
+                &path_manager,
+                &fragment,
+                &object_key,
+                &version_id,
+            )
+            .await;
             return Err(err);
         }
     };
@@ -2657,6 +2761,8 @@ async fn upload_object_one_shot_inner(
         content_type,
         total_size_bytes: content_length,
         created_at,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2671,7 +2777,8 @@ async fn upload_object_one_shot_inner(
     if let Err(err) =
         index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
     {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
+            .await;
         return Err(err);
     }
 
@@ -2800,6 +2907,7 @@ where
     let part_meta = match write_part_blob_to_disk_from_stream(
         &path_manager,
         &fragment,
+        &object_key,
         &version_id,
         0,
         content_length,
@@ -2814,7 +2922,13 @@ where
     {
         Ok(part_meta) => part_meta,
         Err(err) => {
-            cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+            cleanup_blob_version_dirs_for_version(
+                &path_manager,
+                &fragment,
+                &object_key,
+                &version_id,
+            )
+            .await;
             return Err(err);
         }
     };
@@ -2828,6 +2942,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2842,7 +2958,8 @@ where
     if let Err(err) =
         index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
     {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
+            .await;
         return Err(err);
     }
 
@@ -2902,6 +3019,7 @@ where
     let part_meta = match write_part_blob_to_disk_from_reader(
         &path_manager,
         &fragment,
+        &object_key,
         &version_id,
         0,
         content_length,
@@ -2916,7 +3034,13 @@ where
     {
         Ok(part_meta) => part_meta,
         Err(err) => {
-            cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+            cleanup_blob_version_dirs_for_version(
+                &path_manager,
+                &fragment,
+                &object_key,
+                &version_id,
+            )
+            .await;
             return Err(err);
         }
     };
@@ -2930,6 +3054,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2944,7 +3070,8 @@ where
     if let Err(err) =
         index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
     {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
+            .await;
         return Err(err);
     }
 
@@ -3027,11 +3154,15 @@ pub async fn finalize_object_upload_direct(
     }
 
     let blob_roots = path_manager.get_blob_roots();
-    let required_data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
+    let required_data_shards = manifest
+        .as_ref()
+        .map(manifest_data_shards)
+        .unwrap_or_else(configured_data_shards);
     let mut found_data_roots = 0usize;
 
     for root in &blob_roots {
-        let shard_dir_check = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
+        let shard_dir_check =
+            path_manager.get_shard_dir_on_disk(root, &fragment, &object_key, &version_id);
         if tokio_fs::try_exists(&shard_dir_check)
             .await
             .unwrap_or(false)
@@ -3135,6 +3266,14 @@ pub async fn finalize_object_upload_direct(
             .as_ref()
             .map(|m| m.created_at)
             .unwrap_or_else(|| Utc::now().timestamp()),
+        data_shards: manifest
+            .as_ref()
+            .map(manifest_data_shards)
+            .unwrap_or_else(configured_data_shards) as u16,
+        parity_shards: manifest
+            .as_ref()
+            .map(manifest_parity_shards)
+            .unwrap_or_else(configured_parity_shards) as u16,
         parts,
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -3193,9 +3332,10 @@ pub async fn cancel_upload_session_direct(
         ));
     }
 
-    cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &version_id).await;
+    cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &object_key, &version_id)
+        .await;
     let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
-    cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+    cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id).await;
 
     Ok(())
 }

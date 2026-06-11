@@ -1,4 +1,3 @@
-use crate::core::constants::N1_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::fragment_identity::{
@@ -39,10 +38,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
@@ -61,7 +60,6 @@ static REDIST_INTENT_DEBT_CACHE: LazyLock<
     Arc<tokio::sync::RwLock<Option<CachedRedistributionIntentDebt>>>,
 > = LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 const REDIST_INTENT_DEBT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(5);
 
 fn monitor_interval() -> Duration {
     let secs = MONITOR_INTERVAL_SECS_ATOMIC
@@ -249,52 +247,71 @@ struct FragmentRedundancyDebt {
     sampled_degraded_fragments: Vec<String>,
 }
 
-fn should_count_index_record(path: &std::path::Path) -> bool {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    if !name.ends_with(".ndx") {
-        return false;
-    }
-
+fn should_count_index_record(path: &Path) -> bool {
     if path.components().any(|component| {
         matches!(
             component.as_os_str().to_str(),
-            Some(".trash" | ".uploads" | ".intents")
+            Some(
+                ".fragment"
+                    | ".trash"
+                    | ".uploads"
+                    | ".intents"
+                    | ".repair"
+                    | ".gc"
+                    | ".locks"
+                    | ".tmp"
+                    | ".objects"
+            )
         )
     }) {
         return false;
     }
 
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    parent
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|parent_name| parent_name.starts_with("@o_"))
+    std::fs::read_link(path)
+        .ok()
+        .and_then(|target| {
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|target_name| target_name.starts_with("@o_"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{is_fragment_scoped_health_request, should_count_index_record};
     use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::symlink;
     use std::path::Path;
+    use ulid::Ulid;
 
     #[test]
-    fn deep_scan_counts_only_live_index_records() {
-        assert!(should_count_index_record(Path::new(
-            "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
-        )));
+    fn deep_scan_counts_only_live_namespace_links() {
+        let root = std::env::temp_dir().join(format!("n1-health-index-scan-{}", Ulid::new()));
+        let live_dir = root.join("@f_stable/docs");
+        let trash_dir = root.join("@f_stable/.trash/docs");
+        let object_dir = root.join("@f_stable/.objects/ab/cd/@o_abc");
+        fs::create_dir_all(&live_dir).expect("create live namespace");
+        fs::create_dir_all(&trash_dir).expect("create trash namespace");
+        fs::create_dir_all(&object_dir).expect("create object plane");
+        let live = live_dir.join("report.pdf");
+        let trash = trash_dir.join("old.pdf");
+        symlink("@o_abc", &live).expect("create live link");
+        symlink("@o_def", &trash).expect("create trash link");
+
+        assert!(should_count_index_record(&live));
+        assert!(!should_count_index_record(&trash));
         assert!(!should_count_index_record(Path::new(
             "frag/.intents/0001.pending.redist.intent.msgpack"
         )));
         assert!(!should_count_index_record(Path::new("frag/.fragment.ndx")));
         assert!(!should_count_index_record(Path::new(
-            "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
+            "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -444,43 +461,22 @@ async fn list_known_fragments(roots: &[PathBuf]) -> Vec<String> {
 async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bool {
     let fragment = fragment.to_string();
     let roots = blob_roots.to_vec();
-    let active_session_ids = index::list_active_sessions(&fragment)
-        .await
-        .map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
-                .map(|session| session.manifest.version_id)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = fragment_root_on(&root, &fragment).join(N1_BLOB_DIR);
-            let Ok(entries) = std::fs::read_dir(&blob_dir) else {
+            let Ok(object_dirs) = index_store::local_object_dirs_under_root(&root, &fragment)
+            else {
                 continue;
             };
-            for entry in entries.filter_map(|entry| entry.ok()) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let version_id = entry.file_name().to_string_lossy().to_string();
-                if active_session_ids.contains(&version_id) {
-                    continue;
-                }
-                let modified = std::fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(now);
-                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= ORPHAN_BLOB_GRACE {
-                    continue;
-                }
-                if std::fs::read_dir(&path)
-                    .ok()
-                    .and_then(|mut parts| parts.next())
-                    .is_some()
-                {
+            for (object_dir, _) in object_dirs {
+                if std::fs::read_dir(&object_dir).ok().is_some_and(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        entry.path().is_dir()
+                            && std::fs::read_dir(entry.path())
+                                .ok()
+                                .and_then(|mut files| files.next())
+                                .is_some()
+                    })
+                }) {
                     return true;
                 }
             }
@@ -493,26 +489,12 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
 
 async fn fragment_has_indexed_payload(
     fragment: &str,
-    active_index_roots: &[PathBuf],
+    _active_index_roots: &[PathBuf],
 ) -> Result<bool, AppError> {
-    let fragment_owned = fragment.to_string();
-    let roots = active_index_roots.to_vec();
-    let has_object_index = tokio::task::spawn_blocking(move || {
-        index_store::fragment_has_object_index_records(&fragment_owned, &roots)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("N1 object index scan join: {e}")))?;
-    if has_object_index {
-        return Ok(true);
-    }
-
-    let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
-    if !live.objects.is_empty() {
-        return Ok(true);
-    }
-    let trash =
-        index::scan_fragment_trash_metadata_page(fragment, None, None, 1, None, true).await?;
-    Ok(!trash.objects.is_empty())
+    Ok(global_namespace_runtime()
+        .reachability_snapshot_if_present(fragment)
+        .await?
+        .is_some_and(|snapshot| !snapshot.referenced_object_ids.is_empty()))
 }
 
 async fn fragment_has_sampled_redundancy_debt(
@@ -564,7 +546,7 @@ async fn fragment_has_sampled_redundancy_debt(
             )
             .await;
 
-            if needs.blob || needs.index {
+            if needs.payload || needs.metadata {
                 return Ok(true);
             }
 
@@ -839,7 +821,7 @@ async fn collect_system_health(
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_file() && should_count_index_record(path) {
+                        if entry.file_type().is_symlink() && should_count_index_record(path) {
                             current_disk_count += 1;
                         }
 

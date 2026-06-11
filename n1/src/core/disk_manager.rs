@@ -1,4 +1,3 @@
-use crate::core::constants::N1_BLOB_DIR;
 use crate::core::fragment_identity;
 use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
@@ -119,6 +118,40 @@ impl ObjectPathManager {
         object_key.trim_start_matches('/').to_string()
     }
 
+    pub fn resolve_stable_fragment_id(&self, fragment_hash: &str) -> String {
+        for root in self.get_all_index_roots() {
+            if let Some(stable) =
+                fragment_identity::stable_fragment_id_for_root(&root, fragment_hash)
+            {
+                return stable;
+            }
+        }
+        fragment_hash
+            .strip_prefix(fragment_identity::PHYSICAL_FRAGMENT_PREFIX)
+            .unwrap_or(fragment_hash)
+            .to_string()
+    }
+
+    pub fn object_fanout_segments(object_id: &str) -> [String; 2] {
+        let hash = Sha256::digest(object_id.as_bytes());
+        [format!("{:02x}", hash[0]), format!("{:02x}", hash[1])]
+    }
+
+    pub fn get_object_dir_on_disk(
+        &self,
+        disk_root: &PathBuf,
+        fragment_hash: &str,
+        object_id: &str,
+    ) -> PathBuf {
+        let stable_fragment_id = self.resolve_stable_fragment_id(fragment_hash);
+        let fanout = Self::object_fanout_segments(object_id);
+        fragment_identity::physical_fragment_root_on(disk_root, &stable_fragment_id)
+            .join(".objects")
+            .join(&fanout[0])
+            .join(&fanout[1])
+            .join(format!("@o_{object_id}"))
+    }
+
     pub fn get_all_object_intent_partition_paths(
         &self,
         fragment_hash: &str,
@@ -137,14 +170,10 @@ impl ObjectPathManager {
         &self,
         disk_root: &PathBuf,
         fragment_hash: &str,
+        object_id: &str,
         version_id: &str,
     ) -> PathBuf {
-        disk_root
-            .join(fragment_identity::resolve_physical_fragment_dir_name(
-                disk_root,
-                fragment_hash,
-            ))
-            .join(N1_BLOB_DIR)
+        self.get_object_dir_on_disk(disk_root, fragment_hash, object_id)
             .join(version_id)
     }
 }
@@ -212,6 +241,8 @@ pub struct ObjectMetadata {
     pub content_type: String,
     pub total_size_bytes: u64,
     pub created_at: i64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
     pub parts: Vec<PartMetadata>,
     #[serde(default)]
     pub is_delete_marker: bool,
@@ -240,6 +271,8 @@ pub struct ObjectSummary {
     pub content_type: String,
     pub total_size_bytes: u64,
     pub created_at: i64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
     #[serde(rename = "parts")]
     pub _parts_ignored: IgnoredAny,
     #[serde(default)]
@@ -259,6 +292,8 @@ impl From<ObjectSummary> for ObjectMetadata {
             content_type: summary.content_type,
             total_size_bytes: summary.total_size_bytes,
             created_at: summary.created_at,
+            data_shards: summary.data_shards,
+            parity_shards: summary.parity_shards,
             parts: Vec::new(),
             is_delete_marker: summary.is_delete_marker,
             stripe_size_bytes: summary.stripe_size_bytes,

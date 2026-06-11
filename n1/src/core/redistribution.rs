@@ -1,5 +1,5 @@
 use crate::core::constants::{
-    FRAGMENT_METADATA_FILE, GC_SUFFIX, N1_BLOB_DIR, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX,
+    FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX,
 };
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
@@ -21,7 +21,7 @@ use crate::core::quota_manager::validate_fragment_project_headroom_for_redistrib
 use crate::core::recovery::read_or_recover_chunk;
 use crate::core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
-    sync_dir,
+    sync_dir, target_stripe_size_for_metadata,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
@@ -44,7 +44,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,8 +89,6 @@ static REDIST_STATUS: LazyLock<Arc<tokio::sync::RwLock<RedistributionJobStatus>>
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 const REDIST_INTENT_SUFFIX: &str = ".redist.intent.msgpack";
-const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(5);
-
 #[derive(Clone, Copy, Debug)]
 pub enum RedistributionDurabilityMode {
     Auto,
@@ -120,23 +118,23 @@ pub enum RedistributionExecutionMode {
 pub enum RedistributionScope {
     #[default]
     All,
-    Blob,
-    Index,
+    Object,
+    Namespace,
 }
 
 impl RedistributionScope {
     fn as_str(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::Blob => "blob",
-            Self::Index => "index",
+            Self::Object => "object",
+            Self::Namespace => "namespace",
         }
     }
 
     fn from_str(raw: &str) -> Self {
         match raw {
-            "blob" | "blob_only" => Self::Blob,
-            "index" | "index_only" => Self::Index,
+            "object" => Self::Object,
+            "namespace" => Self::Namespace,
             _ => Self::All,
         }
     }
@@ -185,6 +183,8 @@ pub struct RedistributionRunOptions {
     pub execution_mode: RedistributionExecutionMode,
     pub scope: RedistributionScope,
     pub target_fragment: Option<String>,
+    pub target_object: Option<String>,
+    pub target_version: Option<String>,
     pub durability_mode: RedistributionDurabilityMode,
     pub object_concurrency: usize,
     pub status_batch: u64,
@@ -368,6 +368,8 @@ impl Default for RedistributionRunOptions {
             execution_mode: RedistributionExecutionMode::Availability,
             scope: RedistributionScope::All,
             target_fragment: None,
+            target_object: None,
+            target_version: None,
             durability_mode: RedistributionDurabilityMode::Auto,
             object_concurrency: default_object_concurrency(
                 RedistributionExecutionMode::Availability,
@@ -503,8 +505,8 @@ fn parse_scope_param(params: &HashMap<String, String>) -> RedistributionScope {
         .or_else(|| params.get("redistribution_scope"))
         .map(|v| v.trim().to_ascii_lowercase());
     match scope.as_deref() {
-        Some("blob") | Some("blob_only") => RedistributionScope::Blob,
-        Some("index") | Some("index_only") => RedistributionScope::Index,
+        Some("object") => RedistributionScope::Object,
+        Some("namespace") => RedistributionScope::Namespace,
         _ => RedistributionScope::All,
     }
 }
@@ -535,8 +537,14 @@ struct StatusDelta {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RedistributionNeeds {
-    pub blob: bool,
-    pub index: bool,
+    pub payload: bool,
+    pub metadata: bool,
+}
+
+impl RedistributionNeeds {
+    fn object(self) -> bool {
+        self.payload || self.metadata
+    }
 }
 
 async fn flush_status_delta(
@@ -642,6 +650,24 @@ pub async fn trigger_redistribution_job_api(
         Some(fragment) => Some(resolve_stable_fragment_id(&fragment).await?),
         None => None,
     };
+    let target_object = params
+        .get("object_key")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let target_version = params
+        .get("version_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if target_object.is_some() && target_fragment.is_none() {
+        return Err(AppError::BadRequest(
+            "object redistribution requires a fragment".into(),
+        ));
+    }
+    if target_object.is_some() && scope == RedistributionScope::Namespace {
+        return Err(AppError::BadRequest(
+            "object redistribution cannot use namespace scope".into(),
+        ));
+    }
     let mut execution_mode = parse_execution_mode_param(&params);
     if read_only_fast && execution_mode == RedistributionExecutionMode::Availability {
         execution_mode = RedistributionExecutionMode::Strict;
@@ -677,6 +703,8 @@ pub async fn trigger_redistribution_job_api(
         execution_mode,
         scope,
         target_fragment,
+        target_object,
+        target_version,
         durability_mode,
         object_concurrency,
         status_batch,
@@ -734,13 +762,17 @@ pub async fn stop_redistribution_job_api(
 fn get_shard_dir_custom(
     disk_root: &Path,
     fragment_hash: &str,
+    object_id: &str,
     version_id: &str,
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    fragment_root_on(disk_root, fragment_hash)
-        .join(N1_BLOB_DIR)
-        .join(version_id)
+    ObjectPathManager::new().get_shard_dir_on_disk(
+        &disk_root.to_path_buf(),
+        fragment_hash,
+        object_id,
+        version_id,
+    )
 }
 
 fn get_partition_intent_paths_custom(
@@ -812,37 +844,6 @@ fn get_all_intent_paths_custom(
             ))
         })
         .collect()
-}
-
-fn object_index_dir_for_root(
-    root: &Path,
-    fragment_hash: &str,
-    object_key: &str,
-    _is_trash: bool,
-) -> PathBuf {
-    let object_id = object_key
-        .trim()
-        .trim_start_matches('/')
-        .strip_prefix("@o_")
-        .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
-    index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
-        fragment_root_on(root, fragment_hash)
-            .join(".objects")
-            .join(".invalid-object-id")
-    })
-}
-
-async fn object_index_dir_has_ndx(path: &Path) -> bool {
-    let Ok(mut entries) = tokio_fs::read_dir(path).await else {
-        return false;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        if name.to_string_lossy().ends_with(".ndx") {
-            return true;
-        }
-    }
-    false
 }
 
 fn intent_dedupe_key(fragment: &str, object_key: &str, version_id: &str, is_trash: bool) -> String {
@@ -1117,7 +1118,11 @@ async fn replay_pending_intents_for_fragment(
         };
 
         let scope = intent.scope_mode();
-        if scope != RedistributionScope::Index && live_blob.is_empty() {
+        if scope == RedistributionScope::Namespace {
+            remove_intent_paths_best_effort(&all_intent_paths).await;
+            continue;
+        }
+        if live_blob.is_empty() {
             continue;
         }
         let needs = check_needs_redistribution(
@@ -1133,67 +1138,24 @@ async fn replay_pending_intents_for_fragment(
         )
         .await;
 
-        if !needs.blob && !needs.index {
+        if !needs.object() {
             remove_intent_paths_best_effort(&all_intent_paths).await;
             continue;
         }
 
-        let resume_result = match scope {
-            RedistributionScope::Index => {
-                if !needs.index {
-                    Ok(())
-                } else {
-                    redistribute_object_index_only(
-                        &meta,
-                        live_index,
-                        intent.is_trash,
-                        strict_durability,
-                    )
-                    .await
-                }
-            }
-            RedistributionScope::Blob => {
-                if !needs.blob {
-                    Ok(())
-                } else {
-                    redistribute_object_streaming(
-                        &mut meta,
-                        target_data_shards,
-                        target_parity_shards,
-                        target_stripe_size,
-                        live_blob,
-                        live_index,
-                        intent.is_trash,
-                        strict_durability,
-                    )
-                    .await
-                }
-            }
-            RedistributionScope::All => {
-                if needs.blob {
-                    redistribute_object_streaming(
-                        &mut meta,
-                        target_data_shards,
-                        target_parity_shards,
-                        target_stripe_size,
-                        live_blob,
-                        live_index,
-                        intent.is_trash,
-                        strict_durability,
-                    )
-                    .await
-                } else if needs.index {
-                    redistribute_object_index_only(
-                        &meta,
-                        live_index,
-                        intent.is_trash,
-                        strict_durability,
-                    )
-                    .await
-                } else {
-                    Ok(())
-                }
-            }
+        let resume_result = if needs.payload {
+            redistribute_object_streaming(
+                &mut meta,
+                target_data_shards,
+                target_parity_shards,
+                target_stripe_size,
+                live_blob,
+                intent.is_trash,
+                strict_durability,
+            )
+            .await
+        } else {
+            restore_colocated_metadata(&meta, intent.is_trash).await
         };
 
         match resume_result {
@@ -1415,43 +1377,22 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
 async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bool {
     let fragment = fragment.to_string();
     let roots = blob_roots.to_vec();
-    let active_session_ids = index::list_active_sessions(&fragment)
-        .await
-        .map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
-                .map(|session| session.manifest.version_id)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = fragment_root_on(&root, &fragment).join(N1_BLOB_DIR);
-            let Ok(entries) = std::fs::read_dir(&blob_dir) else {
+            let Ok(object_dirs) = index_store::local_object_dirs_under_root(&root, &fragment)
+            else {
                 continue;
             };
-            for entry in entries.filter_map(|entry| entry.ok()) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let version_id = entry.file_name().to_string_lossy().to_string();
-                if active_session_ids.contains(&version_id) {
-                    continue;
-                }
-                let modified = std::fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(now);
-                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= ORPHAN_BLOB_GRACE {
-                    continue;
-                }
-                if std::fs::read_dir(&path)
-                    .ok()
-                    .and_then(|mut parts| parts.next())
-                    .is_some()
-                {
+            for (object_dir, _) in object_dirs {
+                if std::fs::read_dir(&object_dir).ok().is_some_and(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        entry.path().is_dir()
+                            && std::fs::read_dir(entry.path())
+                                .ok()
+                                .and_then(|mut files| files.next())
+                                .is_some()
+                    })
+                }) {
                     return true;
                 }
             }
@@ -1609,6 +1550,83 @@ async fn publish_tmp_overwrite(
     Ok(())
 }
 
+async fn redistribute_target_object(
+    fragment: &str,
+    object_id: &str,
+    version_id: Option<&str>,
+    dry_run: bool,
+    target_data_shards: usize,
+    target_parity_shards: usize,
+    target_stripe_size: usize,
+    live_blob: &[PathBuf],
+    live_index: &[PathBuf],
+    strict_durability: bool,
+) -> Result<bool, AppError> {
+    let mut meta = match version_id {
+        Some(version_id) => index::read_object_version(fragment, object_id, version_id).await?,
+        None => index::read_latest_object(fragment, object_id).await?,
+    };
+    let needs = check_needs_redistribution(
+        &meta,
+        RedistributionScope::Object,
+        target_data_shards,
+        target_parity_shards,
+        target_stripe_size,
+        live_blob.len(),
+        live_blob,
+        live_index,
+        false,
+    )
+    .await;
+    if !needs.object() || dry_run {
+        return Ok(needs.object());
+    }
+
+    let intent_paths =
+        get_all_intent_paths_custom(live_index, fragment, object_id, &meta.version_id, false);
+    let now = Utc::now().timestamp_millis();
+    let mut intent = RedistributionIntent {
+        tx_id: Ulid::new().to_string(),
+        fragment: fragment.to_string(),
+        object_key: object_id.to_string(),
+        version_id: meta.version_id.clone(),
+        is_trash: false,
+        scope: RedistributionScope::Object.as_str().to_string(),
+        phase: "running".to_string(),
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+    write_intent_state(&intent_paths, &intent, strict_durability).await?;
+
+    let result = if needs.payload {
+        redistribute_object_streaming(
+            &mut meta,
+            target_data_shards,
+            target_parity_shards,
+            target_stripe_size,
+            live_blob,
+            false,
+            strict_durability,
+        )
+        .await
+    } else {
+        restore_colocated_metadata(&meta, false).await
+    };
+
+    match result {
+        Ok(()) => {
+            remove_intent_paths_best_effort(&intent_paths).await;
+            Ok(true)
+        }
+        Err(err) => {
+            intent.phase = "failed".to_string();
+            intent.updated_at_unix_ms = Utc::now().timestamp_millis();
+            let _ = write_intent_state(&intent_paths, &intent, strict_durability).await;
+            Err(err)
+        }
+    }
+}
+
 #[cfg(test)]
 pub async fn run_redistribution_job(
     dry_run: bool,
@@ -1691,7 +1709,7 @@ pub async fn run_redistribution_job_with_options(
 
     let mut layout = LiveLayout::new(blob_roots_cfg.clone(), index_roots_cfg.clone()).await;
 
-    if opts.scope != RedistributionScope::Index && layout.live_blob.is_empty() {
+    if opts.scope != RedistributionScope::Namespace && layout.live_blob.is_empty() {
         return Err(AppError::InternalServerError(
             "No reachable blob disks".into(),
         ));
@@ -1763,13 +1781,13 @@ pub async fn run_redistribution_job_with_options(
         let live_index = layout.live_index.clone();
 
         if live_index.is_empty()
-            || (opts.scope != RedistributionScope::Index && live_blob.is_empty())
+            || (opts.scope != RedistributionScope::Namespace && live_blob.is_empty())
         {
             continue;
         }
 
         replicate_fragment_metadata_best_effort(&fragment_hash).await;
-        if !dry_run && opts.scope != RedistributionScope::Index {
+        if !dry_run && opts.scope != RedistributionScope::Namespace {
             validate_fragment_project_headroom_for_redistribution(
                 &fragment_hash,
                 live_blob.as_ref(),
@@ -1803,6 +1821,67 @@ pub async fn run_redistribution_job_with_options(
             ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
         scanned_fragments.insert(fragment_hash.clone());
+
+        if matches!(
+            opts.scope,
+            RedistributionScope::All | RedistributionScope::Namespace
+        ) {
+            let inspection = index_store::inspect_fragment_partition_replicas(
+                &fragment_hash,
+                live_index.as_ref(),
+            );
+            if !inspection.healthy {
+                {
+                    let mut st = REDIST_STATUS.write().await;
+                    st.total_objects_need_redistribution =
+                        st.total_objects_need_redistribution.saturating_add(1);
+                    st.last_object = Some(format!("{fragment_hash}:namespace"));
+                }
+                if !dry_run {
+                    index::sync_fragment_partition_replicas(&fragment_hash).await?;
+                    touched_fragments.insert(fragment_hash.clone());
+                    let mut st = REDIST_STATUS.write().await;
+                    st.total_objects_migrated = st.total_objects_migrated.saturating_add(1);
+                }
+            }
+        }
+        if opts.scope == RedistributionScope::Namespace {
+            continue;
+        }
+
+        if let Some(object_id) = opts.target_object.as_deref() {
+            {
+                let mut st = REDIST_STATUS.write().await;
+                st.total_objects_scanned = st.total_objects_scanned.saturating_add(1);
+                st.last_object = Some(match opts.target_version.as_deref() {
+                    Some(version) => format!("{fragment_hash}/{object_id} (v:{version})"),
+                    None => format!("{fragment_hash}/{object_id} (head)"),
+                });
+            }
+            let changed = redistribute_target_object(
+                &fragment_hash,
+                object_id,
+                opts.target_version.as_deref(),
+                dry_run,
+                target_data_shards,
+                target_parity_shards,
+                target_stripe_size,
+                live_blob.as_ref(),
+                live_index.as_ref(),
+                strict_durability,
+            )
+            .await?;
+            if changed {
+                let mut st = REDIST_STATUS.write().await;
+                st.total_objects_need_redistribution =
+                    st.total_objects_need_redistribution.saturating_add(1);
+                if !dry_run {
+                    st.total_objects_migrated = st.total_objects_migrated.saturating_add(1);
+                    touched_fragments.insert(fragment_hash.clone());
+                }
+            }
+            continue;
+        }
 
         let has_blob_payload = fragment_has_blob_payload(&fragment_hash, live_blob.as_ref()).await;
         let has_indexed_payload =
@@ -1889,7 +1968,7 @@ pub async fn run_redistribution_job_with_options(
                     )
                     .await;
 
-                    if !needs.blob && !needs.index {
+                    if !needs.object() {
                         continue;
                     }
 
@@ -1964,62 +2043,19 @@ pub async fn run_redistribution_job_with_options(
                             ));
                         }
 
-                        let result = match task_scope {
-                            RedistributionScope::Index => {
-                                if !task_needs.index {
-                                    Ok(())
-                                } else {
-                                    redistribute_object_index_only(
-                                        &meta,
-                                        &live_index_for_task,
-                                        is_trash_flag,
-                                        task_strict_durability,
-                                    )
-                                    .await
-                                }
-                            }
-                            RedistributionScope::Blob => {
-                                if !task_needs.blob {
-                                    Ok(())
-                                } else {
-                                    redistribute_object_streaming(
-                                        &mut meta,
-                                        target_data_shards,
-                                        target_parity_shards,
-                                        target_stripe_size,
-                                        &live_blob_for_task,
-                                        &live_index_for_task,
-                                        is_trash_flag,
-                                        task_strict_durability,
-                                    )
-                                    .await
-                                }
-                            }
-                            RedistributionScope::All => {
-                                if task_needs.blob {
-                                    redistribute_object_streaming(
-                                        &mut meta,
-                                        target_data_shards,
-                                        target_parity_shards,
-                                        target_stripe_size,
-                                        &live_blob_for_task,
-                                        &live_index_for_task,
-                                        is_trash_flag,
-                                        task_strict_durability,
-                                    )
-                                    .await
-                                } else if task_needs.index {
-                                    redistribute_object_index_only(
-                                        &meta,
-                                        &live_index_for_task,
-                                        is_trash_flag,
-                                        task_strict_durability,
-                                    )
-                                    .await
-                                } else {
-                                    Ok(())
-                                }
-                            }
+                        let result = if task_needs.payload {
+                            redistribute_object_streaming(
+                                &mut meta,
+                                target_data_shards,
+                                target_parity_shards,
+                                target_stripe_size,
+                                &live_blob_for_task,
+                                is_trash_flag,
+                                task_strict_durability,
+                            )
+                            .await
+                        } else {
+                            restore_colocated_metadata(&meta, is_trash_flag).await
                         };
 
                         match result {
@@ -2196,79 +2232,76 @@ pub(crate) async fn check_needs_redistribution(
     scope: RedistributionScope,
     target_data: usize,
     target_parity: usize,
-    _target_stripe_size: usize,
+    target_stripe_size: usize,
     target_num_disks: usize,
     target_blob_roots: &[PathBuf],
-    target_index_roots: &[PathBuf],
-    is_trash: bool,
+    _target_index_roots: &[PathBuf],
+    _is_trash: bool,
 ) -> RedistributionNeeds {
-    let check_blob = scope != RedistributionScope::Index;
-    let check_index = scope != RedistributionScope::Blob;
     let mut needs = RedistributionNeeds::default();
+    if scope == RedistributionScope::Namespace {
+        return needs;
+    }
 
-    if check_blob {
-        if meta.parts.is_empty() {
-            return needs;
-        }
+    let target_stripe_size = target_stripe_size_for_metadata(meta, target_stripe_size);
+    let total_shards = target_data.saturating_add(target_parity);
+    if target_data == 0
+        || total_shards == 0
+        || target_num_disks < total_shards
+        || target_blob_roots.len() != target_num_disks
+        || meta.parts.is_empty()
+        || usize::from(meta.data_shards) != target_data
+        || usize::from(meta.parity_shards) != target_parity
+        || meta.stripe_size_bytes != target_stripe_size
+    {
+        needs.payload = true;
+    }
 
-        let part0 = &meta.parts[0];
-        let cur_data = part0.shards.iter().filter(|s| !s.is_parity).count();
-        let cur_parity = part0.shards.iter().filter(|s| s.is_parity).count();
+    if !needs.payload {
+        let path_manager = ObjectPathManager::new();
+        for part in &meta.parts {
+            let data_count = part.shards.iter().filter(|shard| !shard.is_parity).count();
+            let parity_count = part.shards.iter().filter(|shard| shard.is_parity).count();
+            if data_count != target_data
+                || parity_count != target_parity
+                || part.shards.len() != total_shards
+            {
+                needs.payload = true;
+                break;
+            }
 
-        if cur_data != target_data || cur_parity != target_parity {
-            needs.blob = true;
-        }
-
-        if target_num_disks == 0 {
-            needs.blob = true;
-        }
-
-        if !needs.blob {
-            for part in &meta.parts {
-                for shard in &part.shards {
-                    let expected =
-                        (part.part_index as usize + shard.shard_index) % target_num_disks;
-                    if expected >= target_blob_roots.len() {
-                        needs.blob = true;
-                        break;
-                    }
-
-                    let target_disk_path = target_blob_roots[expected].to_string_lossy();
-                    if !shard.absolute_path.starts_with(target_disk_path.as_ref()) {
-                        needs.blob = true;
-                        break;
-                    }
-
-                    if !tokio_fs::try_exists(Path::new(&shard.absolute_path))
-                        .await
-                        .unwrap_or(false)
-                    {
-                        needs.blob = true;
-                        break;
-                    }
-
-                    let in_trash_path = shard.absolute_path.contains(".trash");
-                    if is_trash != in_trash_path {
-                        needs.blob = true;
-                        break;
-                    }
+            for shard in &part.shards {
+                if shard.shard_index >= total_shards
+                    || shard.is_parity != (shard.shard_index >= target_data)
+                {
+                    needs.payload = true;
+                    break;
                 }
-                if needs.blob {
+                let root_index = (part.part_index as usize + shard.shard_index) % target_num_disks;
+                let expected_path = path_manager
+                    .get_shard_dir_on_disk(
+                        &target_blob_roots[root_index],
+                        &meta.fragment,
+                        &meta.object_key,
+                        &meta.version_id,
+                    )
+                    .join(&shard.file_name);
+                if Path::new(&shard.absolute_path) != expected_path
+                    || !tokio_fs::try_exists(&expected_path).await.unwrap_or(false)
+                {
+                    needs.payload = true;
                     break;
                 }
             }
-        }
-    }
-
-    if check_index {
-        for root in target_index_roots {
-            let path = object_index_dir_for_root(root, &meta.fragment, &meta.object_key, is_trash);
-            if !object_index_dir_has_ndx(&path).await {
-                needs.index = true;
+            if needs.payload {
                 break;
             }
         }
     }
+
+    needs.metadata = index_store::object_metadata_placements_healthy(meta)
+        .map(|healthy| !healthy)
+        .unwrap_or(true);
 
     needs
 }
@@ -2281,9 +2314,7 @@ async fn cleanup_tmp_files(files: &[PathBuf]) {
 
 async fn write_redistributed_metadata(
     meta: &ObjectMetadata,
-    _target_index_roots: &[PathBuf],
     is_trash: bool,
-    _strict_durability: bool,
 ) -> Result<(), AppError> {
     if is_trash {
         index::publish_trashed_object_version_for_maintenance(meta).await
@@ -2292,18 +2323,12 @@ async fn write_redistributed_metadata(
     }
 }
 
-async fn redistribute_object_index_only(
-    meta: &ObjectMetadata,
-    target_index_roots: &[PathBuf],
-    is_trash: bool,
-    strict_durability: bool,
-) -> Result<(), AppError> {
+async fn restore_colocated_metadata(meta: &ObjectMetadata, is_trash: bool) -> Result<(), AppError> {
     let _object_lock =
         index::acquire_object_operation_lock(&meta.fragment, &meta.object_key).await?;
     if should_stop() {
         return Err(AppError::InternalServerError("Stopped".into()));
     }
-
     let still_present = if is_trash {
         index::read_trashed_object_version(&meta.fragment, &meta.object_key, &meta.version_id)
             .await
@@ -2313,16 +2338,9 @@ async fn redistribute_object_index_only(
             .await
             .is_ok()
     };
-    if !still_present {
-        return Ok(());
+    if still_present {
+        write_redistributed_metadata(meta, is_trash).await?;
     }
-
-    write_redistributed_metadata(meta, target_index_roots, is_trash, strict_durability).await?;
-
-    info!(
-        "Redistributed index metadata {}/{} (v:{}) [Trash:{}].",
-        meta.fragment, meta.object_key, meta.version_id, is_trash
-    );
     Ok(())
 }
 
@@ -2391,9 +2409,8 @@ async fn redistribute_object_streaming(
     meta: &mut ObjectMetadata,
     target_data_shards: usize,
     target_parity_shards: usize,
-    _target_stripe_size: usize,
+    target_stripe_size: usize,
     target_blob_roots: &[PathBuf],
-    _target_index_roots: &[PathBuf],
     is_trash: bool,
     strict_durability: bool,
 ) -> Result<(), AppError> {
@@ -2426,7 +2443,7 @@ async fn redistribute_object_streaming(
     }
 
     let old_block_size = meta.stripe_size_bytes;
-    let new_block_size = old_block_size;
+    let new_block_size = target_stripe_size_for_metadata(meta, target_stripe_size);
     let verify_tmp_crc = strict_durability;
 
     let mut file_cache: HashMap<String, tokio::fs::File> = HashMap::new();
@@ -2492,8 +2509,13 @@ async fn redistribute_object_streaming(
                 ));
             }
 
-            let shard_dir =
-                get_shard_dir_custom(disk_root, &meta.fragment, &meta.version_id, is_trash);
+            let shard_dir = get_shard_dir_custom(
+                disk_root,
+                &meta.fragment,
+                &meta.object_key,
+                &meta.version_id,
+                is_trash,
+            );
             let _ = tokio_fs::create_dir_all(&shard_dir).await;
 
             let final_path = shard_dir.join(&file_name);
@@ -2711,6 +2733,12 @@ async fn redistribute_object_streaming(
     }
 
     meta.parts = new_parts;
+    meta.data_shards = u16::try_from(target_data_shards).map_err(|_| {
+        AppError::InternalServerError("target data shard count exceeds metadata format".into())
+    })?;
+    meta.parity_shards = u16::try_from(target_parity_shards).map_err(|_| {
+        AppError::InternalServerError("target parity shard count exceeds metadata format".into())
+    })?;
     meta.stripe_size_bytes = new_block_size;
 
     let still_present = if is_trash {
@@ -2733,7 +2761,7 @@ async fn redistribute_object_streaming(
         return Ok(());
     }
 
-    write_redistributed_metadata(meta, _target_index_roots, is_trash, strict_durability).await?;
+    write_redistributed_metadata(meta, is_trash).await?;
 
     for old in old_shards_for_gc {
         if should_stop() {
@@ -2904,11 +2932,11 @@ mod tests {
         let mut params = HashMap::new();
         assert_eq!(parse_scope_param(&params), RedistributionScope::All);
 
-        params.insert("scope".to_string(), "blob".to_string());
-        assert_eq!(parse_scope_param(&params), RedistributionScope::Blob);
+        params.insert("scope".to_string(), "object".to_string());
+        assert_eq!(parse_scope_param(&params), RedistributionScope::Object);
 
-        params.insert("scope".to_string(), "index_only".to_string());
-        assert_eq!(parse_scope_param(&params), RedistributionScope::Index);
+        params.insert("scope".to_string(), "namespace".to_string());
+        assert_eq!(parse_scope_param(&params), RedistributionScope::Namespace);
     }
 
     #[tokio::test]

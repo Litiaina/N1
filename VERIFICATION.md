@@ -22,6 +22,10 @@ Before an LTS release, N1 should pass:
 - memory/RSS observation under sustained load
 - UI-backed smoke against the real N1 API
 - native `n1://` auth/list/stat/CRUD smoke and transport benchmark
+- index-only roots contain no object metadata or payload
+- blob-only roots contain no alias, upload, trash, or user namespace state
+- every shard-bearing placement has a colocated immutable `.ndx`
+- adaptive small-object stripe sizes do not create false topology drift
 
 ## Rust Release Proof Runner
 
@@ -61,16 +65,52 @@ Measured loopback results after enabling `TCP_NODELAY`:
 
 Interpretation: native `n1://` is materially faster for small control-plane and metadata calls. Listing is less transport-bound because direct namespace work and response body size dominate. The benchmark also caught a real protocol weakness before release: without `TCP_NODELAY`, tiny native frames hit delayed-ACK/Nagle latency around 82 ms per operation.
 
-Latest local proof run recorded in the previous documentation set:
+Previous N1 1.x local proof:
 
 - `cargo test -p n1 --all-targets` passed with `RUSTFLAGS=-D warnings`.
 - Real proof on `/mnt/disk-00` and `/mnt/disk-01` passed CRUD, POSIX, archive, multipart, recover-on-read, simulated disk-format repair, and redistribution `2 roots -> 1 root -> 2 roots`.
-- The proof ended with `live_ndx=904`, `namespace_symlinks=904`, and `blob_version_dirs=904` on both roots after re-expansion.
+- The proof ended with matching object and namespace counts on both roots after re-expansion.
 - Server RSS stayed around `52 MiB` during that focused proof.
 - Four-user storm passed on the same two disks: `12,000` one-shot objects plus `4` multipart objects of `16 MiB` each.
 - POSIX listing returned `12,004` objects exactly after the storm.
 - Storm memory remained bounded: max server RSS was about `258 MiB` with `42` threads.
 - Storm throughput on the bad-disk tiny-object workload was `14.343 objects/s` and `0.203 MiB/s`, matching the expected IO/fsync-heavy small-object tradeoff.
+
+N1 2.0.0 evidence is recorded only after the namespace-only index and
+colocated object metadata/payload layout passes the full two-disk proof. N1 1.x
+proof results do not establish N1 2.0.0 disk-layout correctness.
+
+N1 2.0.0 two-disk proof completed on June 11, 2026:
+
+- Colocated mode: `PASS`, `212` live objects, identical `212`-link namespace
+  replicas, `256 MiB` restart/resume multipart, native protocol, CRUD, GC,
+  recover-on-read, object repair, disk-format repair, and `2 -> 1 -> 2`
+  redistribution.
+- Split mode: `PASS`, `94` live objects, identical `94`-link namespace
+  replicas, the same recovery matrix, zero namespace/control entries on
+  blob-only roots, and zero `.objects` entries on index-only roots.
+- Colocated peak RSS: `158476 KiB`.
+- Split-root peak RSS: `125652 KiB`.
+- Both final log scans: `PASS` with no bad lines.
+- The explicit object-level redistribution drill wrote one object under the
+  one-disk `1 + 0` topology, restored the two-disk `1 + 1` topology, scanned
+  exactly one object, detected one mismatch, migrated one object, and reported
+  zero errors. Physical inspection found its immutable `.ndx` and payload on
+  both shard-bearing roots before fragment redistribution processed the
+  remaining objects.
+- Optimized colocated upload benchmark, three samples per mode:
+  - HTTP one-shot: `32.35 MiB/s` average.
+  - HTTP multipart: `37.57 MiB/s` average with conservative concurrency `1`;
+    `39.25 MiB/s` average with concurrency `2`.
+  - HTTP pipelined multipart: `41.47 MiB/s` average with concurrency `2`.
+  - Native multipart: `37.14 MiB/s` average with concurrency `1`;
+    `40.82 MiB/s` average with concurrency `2`.
+  - Native pipelined multipart: `36.34 MiB/s` average with concurrency `2`.
+  - Benchmark peak RSS stayed below `87 MiB`; both benchmark log scans passed
+    with no bad lines.
+- Disk telemetry identified the slower `/dev/sdb` path as the limiting device;
+  the benchmark is a measurement of this local disk pair, not a universal N1
+  throughput ceiling.
 
 ## Extended LTS Proof Matrix
 

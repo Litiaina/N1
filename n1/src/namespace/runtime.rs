@@ -11,10 +11,9 @@ use serde::Serialize;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
 use crate::core::index_store::{
     self, PendingUploadBinding, TRASH_DIR, TrashKind, TrashRecord, fragment_root_on,
-    internal_namespace_entry_name, latest_summary_metadata_in_object_dir, live_object_dir,
-    namespace_path, new_object_id, publish_namespace_link, read_dir_names,
-    read_namespace_symlink_object_id, reject_reserved_user_path, scan_trash_records,
-    write_pending_binding,
+    internal_namespace_entry_name, namespace_path, new_object_id, publish_namespace_link,
+    read_dir_names, read_namespace_symlink_object_id, reject_reserved_user_path,
+    scan_trash_records, write_pending_binding,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -459,7 +458,7 @@ impl NamespaceRuntime {
         let fragment = fragment.to_string();
         let logical_path = normalize_user_path(logical_path)?;
         let physical_object_id = physical_object_id.to_string();
-        let mut metadata = metadata.clone();
+        let metadata = metadata.clone();
         let lock_key = format!("{fragment}\0{logical_path}");
         let lock = {
             let mut locks = FINALIZE_LOCKS.lock().await;
@@ -485,9 +484,8 @@ impl NamespaceRuntime {
             };
 
             if final_object_id != physical_object_id {
-                metadata.object_key = final_object_id.clone();
-                index_store::upsert_live_version(&metadata)?;
-                index_store::delete_unreferenced_object_index(&fragment, &physical_object_id)?;
+                let _ =
+                    index_store::rebind_unpublished_object_version(&metadata, &final_object_id)?;
             }
 
             for root in index_roots() {
@@ -628,12 +626,8 @@ impl NamespaceRuntime {
                             if !seen.insert(child_rel.clone()) {
                                 continue;
                             }
-                            let object_dir = live_object_dir(&root, &fragment, &object_id)?;
-                            let Some(meta) = latest_summary_metadata_in_object_dir(
-                                &fragment,
-                                &object_id,
-                                &object_dir,
-                            )?
+                            let Some(meta) =
+                                index_store::read_current_live_head(&fragment, &object_id)?
                             else {
                                 continue;
                             };
@@ -773,10 +767,7 @@ fn live_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppE
     for root in index_roots() {
         let direct = namespace_path(&root, fragment, path);
         if let Some(object_id) = read_namespace_symlink_object_id(&root, fragment, &direct)? {
-            let object_dir = live_object_dir(&root, fragment, &object_id)?;
-            let Some(meta) =
-                latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
-            else {
+            let Some(meta) = index_store::read_current_live_head(fragment, &object_id)? else {
                 continue;
             };
             let size_time = Some((meta.created_at, meta.created_at));
@@ -844,10 +835,7 @@ fn list_live_dir_page(
                 if !seen.insert(display_name.clone()) {
                     continue;
                 }
-                let object_dir = live_object_dir(&root, fragment, &object_id)?;
-                let Some(meta) =
-                    latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
-                else {
+                let Some(meta) = index_store::read_current_live_head(fragment, &object_id)? else {
                     continue;
                 };
                 let size_time = Some((meta.created_at, meta.created_at));
@@ -1017,15 +1005,11 @@ fn trash_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, App
                 Some(deleted_at),
                 Some((deleted_at, deleted_at)),
             );
-            if let Ok(object_dir) = live_object_dir(&root, fragment, &object_id) {
-                if let Some(head) =
-                    latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
-                {
-                    entry.size_bytes = Some(head.total_size_bytes);
-                    entry.version_id = Some(head.version_id);
-                    entry.created_at_unix = head.created_at;
-                    entry.updated_at_unix = head.created_at;
-                }
+            if let Some(head) = index_store::read_current_live_head(fragment, &object_id)? {
+                entry.size_bytes = Some(head.total_size_bytes);
+                entry.version_id = Some(head.version_id);
+                entry.created_at_unix = head.created_at;
+                entry.updated_at_unix = head.created_at;
             }
             return Ok(Some(entry));
         }
@@ -1375,13 +1359,30 @@ pub fn unexpected_response(status: axum::http::StatusCode, context: &str) -> App
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::disk_manager::{INDEX_STORE_DISKS, ObjectMetadata};
+    use crate::core::disk_manager::{
+        BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
+        ShardInfo,
+    };
     use crate::core::index_store;
     use ulid::Ulid;
 
     fn ensure_test_index_roots() -> Vec<PathBuf> {
         let base = std::env::temp_dir().join("n1-index-tests");
         let roots = vec![base.join("index-00"), base.join("index-01")];
+        let blob_roots = vec![base.join("blob-00"), base.join("blob-01")];
+        if BLOB_STORE_DISKS.get().is_none() {
+            BLOB_STORE_DISKS
+                .set(
+                    blob_roots
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("set N1 test blob roots");
+        }
+        for root in BLOB_STORE_DISKS.get().expect("N1 test blob roots") {
+            std::fs::create_dir_all(root).expect("create N1 test blob root");
+        }
         if INDEX_STORE_DISKS.get().is_none() {
             INDEX_STORE_DISKS
                 .set(
@@ -1400,16 +1401,47 @@ mod tests {
     }
 
     fn test_metadata(fragment: &str, object_key: &str, size: u64) -> ObjectMetadata {
+        let version_id = Ulid::new().to_string();
+        let blob_root = ObjectPathManager::new()
+            .get_blob_roots()
+            .into_iter()
+            .next()
+            .expect("N1 test blob root");
+        let version_dir = ObjectPathManager::new().get_shard_dir_on_disk(
+            &blob_root,
+            fragment,
+            object_key,
+            &version_id,
+        );
+        std::fs::create_dir_all(&version_dir).expect("create N1 test placement");
+        let shard_path = version_dir.join("part_0_shard_0.shard");
+        std::fs::write(&shard_path, vec![0u8; size.min(4096) as usize])
+            .expect("write N1 test shard");
         ObjectMetadata {
             object_key: object_key.to_string(),
             fragment: fragment.to_string(),
-            version_id: Ulid::new().to_string(),
+            version_id,
             upload_session_id: "session".to_string(),
             owner_uid: "owner".to_string(),
             content_type: "application/octet-stream".to_string(),
             total_size_bytes: size,
             created_at: Utc::now().timestamp(),
-            parts: Vec::new(),
+            data_shards: 1,
+            parity_shards: 0,
+            parts: vec![PartMetadata {
+                part_index: 0,
+                size_bytes: size,
+                created_at: Utc::now().timestamp(),
+                shards: vec![ShardInfo {
+                    shard_index: 0,
+                    file_name: "part_0_shard_0.shard".to_string(),
+                    absolute_path: shard_path.to_string_lossy().into_owned(),
+                    size_bytes: size.min(4096),
+                    checksum: String::new(),
+                    is_parity: false,
+                }],
+                checksum: None,
+            }],
             is_delete_marker: false,
             stripe_size_bytes: crate::core::disk_manager::default_stripe_size(),
         }
@@ -1560,6 +1592,7 @@ mod tests {
     async fn n1_soft_delete_and_purge_retire_namespace_before_gc_reclaims_index() {
         let _guard = crate::test_support::global_test_lock().lock().await;
         let roots = ensure_test_index_roots();
+        let blob_roots = ObjectPathManager::new().get_blob_roots();
         let fragment = format!("n1-trash-{}", Ulid::new());
         let object_id = publish_logical_object(&roots, &fragment, "video/my-video.mp4", 123);
 
@@ -1580,12 +1613,16 @@ mod tests {
                     .join("video/my-video.mp4")
             ));
             assert!(
-                live_object_dir(root, &fragment, &object_id)
-                    .expect("object dir")
-                    .is_dir(),
-                "soft delete must not move immutable object index"
+                !fragment_root_on(root, &fragment)
+                    .join(index_store::OBJECTS_DIR)
+                    .exists()
             );
         }
+        assert!(blob_roots.iter().any(|root| {
+            index_store::live_object_dir(root, &fragment, &object_id)
+                .map(|path| path.is_dir())
+                .unwrap_or(false)
+        }));
 
         global_namespace_runtime()
             .purge_trash_path(&fragment, "video/my-video.mp4")
@@ -1597,13 +1634,12 @@ mod tests {
                     .join(TRASH_DIR)
                     .join("video/my-video.mp4")
             ));
-            assert!(
-                live_object_dir(root, &fragment, &object_id)
-                    .expect("object dir")
-                    .exists(),
-                "hard delete must only retire namespace; GC reclaims headless object index later"
-            );
         }
+        assert!(blob_roots.iter().any(|root| {
+            index_store::live_object_dir(root, &fragment, &object_id)
+                .map(|path| path.exists())
+                .unwrap_or(false)
+        }));
         assert!(
             !index_store::referenced_object_ids(&fragment)
                 .expect("referenced object ids")

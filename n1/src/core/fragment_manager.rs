@@ -22,7 +22,7 @@ use crate::{
         },
         fragment_metadata::{
             init_fragment_metadata_strict, read_fragment_metadata, resolve_stable_fragment_id,
-            rotate_fragment_key, write_fragment_metadata,
+            rotate_fragment_key,
         },
         index_store::{
             active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
@@ -214,13 +214,10 @@ pub async fn create_fragment(
     enforce_fragment_quota_request(requested_quota).await?;
 
     let path_manager = ObjectPathManager::new();
-    let mut identity_roots = path_manager.get_all_index_roots();
-    identity_roots.extend(path_manager.get_blob_roots());
-    identity_roots.sort();
-    identity_roots.dedup();
+    let identity_roots = path_manager.get_all_index_roots();
     let stable_fragment_id = existing_meta
         .as_ref()
-        .and_then(|meta| meta.stable_fragment_id.clone())
+        .map(|meta| meta.stable_fragment_id.clone())
         .unwrap_or_else(new_stable_fragment_id);
     ensure_fragment_identity_on_roots(&identity_roots, &hash, &stable_fragment_id).await?;
 
@@ -295,7 +292,6 @@ pub async fn update_fragment(
 
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
-    let blob_roots = path_manager.get_blob_roots();
 
     let mut current_hash = fragment_hash.clone();
     let mut new_name_display = None;
@@ -309,8 +305,7 @@ pub async fn update_fragment(
             let existing_meta = read_fragment_metadata(&current_hash).await.ok();
             let stable_fragment_id = existing_meta
                 .as_ref()
-                .and_then(|meta| meta.stable_fragment_id.clone())
-                .or_else(|| existing_meta.as_ref().map(|meta| meta.fragment.clone()))
+                .map(|meta| meta.stable_fragment_id.clone())
                 .ok_or_else(|| {
                     AppError::InternalServerError(format!(
                         "fragment {} has no stable fragment identity",
@@ -327,35 +322,14 @@ pub async fn update_fragment(
                 }
             }
 
-            let mut identity_roots = index_roots.clone();
-            identity_roots.extend(blob_roots.clone());
-            identity_roots.sort();
-            identity_roots.dedup();
-            ensure_fragment_identity_on_roots(&identity_roots, &new_hash, &stable_fragment_id)
-                .await?;
+            ensure_fragment_identity_on_roots(&index_roots, &new_hash, &stable_fragment_id).await?;
 
-            for root in &identity_roots {
+            for root in &index_roots {
                 let old_alias = fragment_alias_path(root, &current_hash);
                 if fs::try_exists(&old_alias).await.unwrap_or(false) {
                     let _ = fs::remove_file(&old_alias).await;
                 }
             }
-
-            let mut meta =
-                existing_meta.unwrap_or_else(|| crate::core::fragment_metadata::FragmentMetadata {
-                    fragment: new_hash.clone(),
-                    stable_fragment_id: None,
-                    key_phc: String::new(),
-                    nt_hash_hex: None,
-                    index_partition_count:
-                        crate::core::fragment_metadata::configured_index_partition_count(),
-                    created: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    updated: None,
-                });
-
-            meta.fragment = stable_fragment_id.clone();
-            meta.stable_fragment_id = Some(stable_fragment_id);
-            write_fragment_metadata(&meta).await?;
 
             info!(
                 "Renamed fragment {} -> {} ({})",

@@ -133,7 +133,7 @@ pub async fn authorize_fragment_core(payload: AuthorizationRequest) -> Result<Au
     let meta = read_fragment_metadata(&payload.fragment)
         .await
         .map_err(|_| AuthError::InternalError)?;
-    let stable_fragment = meta.fragment;
+    let stable_fragment = meta.stable_fragment_id;
 
     mint_fragment_auth_body(
         stable_fragment,
@@ -610,7 +610,7 @@ mod tests {
             crate::core::fragment_metadata::read_fragment_metadata(&requested_fragment)
                 .await
                 .expect("read stable fragment metadata")
-                .fragment;
+                .stable_fragment_id;
         assert_eq!(decoded.claims.fragment, stable_fragment);
         assert_eq!(
             decoded.claims.fragment_alias.as_deref(),

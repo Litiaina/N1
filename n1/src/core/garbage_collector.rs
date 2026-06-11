@@ -1,10 +1,11 @@
-use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX, N1_BLOB_DIR};
+use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
+use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
@@ -359,10 +360,6 @@ pub async fn stop_garbage_collector(
     (StatusCode::OK, "Stop signal sent to GC.")
 }
 
-fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
-    fragment_root_on(disk_root, fragment_hash).join(".trash")
-}
-
 fn trash_deleted_age(deleted_at: i64, now_unix: i64) -> Duration {
     Duration::from_secs(now_unix.saturating_sub(deleted_at.max(0)).max(0) as u64)
 }
@@ -647,7 +644,6 @@ async fn process_fragment_gc(
     let mut live_versions = HashSet::<String>::new();
     let mut trash_versions = HashSet::<String>::new();
     let mut expired_versions: HashMap<String, ObjectMetadata> = HashMap::new();
-    let mut purged_namespace_version_ids = HashSet::<String>::new();
 
     let now = SystemTime::now();
     let now_unix = Utc::now().timestamp();
@@ -817,8 +813,7 @@ async fn process_fragment_gc(
             .map(|version| version.total_size_bytes)
             .sum::<u64>();
         match index::delete_object_fast(fragment, &object_id).await {
-            Ok(Some(version_ids)) => {
-                purged_namespace_version_ids.extend(version_ids);
+            Ok(Some(_version_ids)) => {
                 stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
             }
             Ok(None) => {}
@@ -870,8 +865,7 @@ async fn process_fragment_gc(
         }
 
         match index::delete_object_fast(fragment, &object_id).await {
-            Ok(Some(version_ids)) => {
-                purged_namespace_version_ids.extend(version_ids);
+            Ok(Some(_version_ids)) => {
                 stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
             }
             Ok(None) => {}
@@ -910,38 +904,6 @@ async fn process_fragment_gc(
         }
         let _ = index::delete_trashed_object_version(fragment, &meta.object_key, ver).await;
     }
-    for root in blob_roots {
-        if should_stop_gc() {
-            return stats;
-        }
-        for ver in expired_versions.keys() {
-            if should_stop_gc() {
-                return stats;
-            }
-            let live_path = fragment_root_on(root, fragment).join(N1_BLOB_DIR).join(ver);
-            let trash_path = get_trash_root(root, fragment).join(N1_BLOB_DIR).join(ver);
-            if live_path.exists() {
-                let _ = std::fs::remove_dir_all(&live_path);
-            }
-            if trash_path.exists() {
-                let _ = std::fs::remove_dir_all(&trash_path);
-            }
-        }
-        for ver in &purged_namespace_version_ids {
-            if should_stop_gc() {
-                return stats;
-            }
-            let live_path = fragment_root_on(root, fragment).join(N1_BLOB_DIR).join(ver);
-            let trash_path = get_trash_root(root, fragment).join(N1_BLOB_DIR).join(ver);
-            if live_path.exists() {
-                let _ = std::fs::remove_dir_all(&live_path);
-            }
-            if trash_path.exists() {
-                let _ = std::fs::remove_dir_all(&trash_path);
-            }
-        }
-    }
-
     let now_ts = Utc::now().timestamp();
     let ttl_secs = CONFIG.garbage_collector.file_ttl_seconds as i64;
     let mut active_session_versions = HashSet::<String>::new();
@@ -973,40 +935,51 @@ async fn process_fragment_gc(
         if should_stop_gc() {
             return stats;
         }
-        let blob_root = fragment_root_on(root, fragment).join(N1_BLOB_DIR);
-        if !blob_root.exists() {
+        let Ok(object_dirs) = index_store::local_object_dirs_under_root(root, fragment) else {
             continue;
-        }
+        };
+        for (object_dir, object_id) in object_dirs {
+            if should_stop_gc() {
+                return stats;
+            }
+            if protected_live_object_ids.contains(&object_id)
+                || namespace_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id))
+            {
+                continue;
+            }
 
-        if let Ok(entries) = std::fs::read_dir(&blob_root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if should_stop_gc() {
-                    return stats;
-                }
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
-
-                let ver_id = entry.file_name().to_string_lossy().to_string();
-
-                if !live_versions.contains(&ver_id)
-                    && !trash_versions.contains(&ver_id)
-                    && !expired_versions.contains_key(&ver_id)
-                    && !active_session_versions.contains(&ver_id)
-                {
-                    let modified = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(now);
-                    let orphan_age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-                    if orphan_blob_age_expired(orphan_age, file_ttl) {
-                        if std::fs::remove_dir_all(path).is_ok() {
-                            stats.orphan_blob_dirs_deleted += 1;
-                        }
+            let mut has_active_session = false;
+            if let Ok(entries) = std::fs::read_dir(&object_dir) {
+                for entry in entries.filter_map(Result::ok) {
+                    if should_stop_gc() {
+                        return stats;
+                    }
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
+                    let version_id = entry.file_name().to_string_lossy().to_string();
+                    if active_session_versions.contains(&version_id) {
+                        has_active_session = true;
+                        break;
                     }
                 }
+            }
+            if has_active_session {
+                continue;
+            }
+
+            let modified = fs::metadata(&object_dir)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(now);
+            let orphan_age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if orphan_blob_age_expired(orphan_age, file_ttl)
+                && std::fs::remove_dir_all(&object_dir).is_ok()
+            {
+                stats.orphan_blob_dirs_deleted += 1;
             }
         }
     }

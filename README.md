@@ -37,22 +37,28 @@ through its supported APIs or through the native client crate.
 
 ## Storage Identity
 
-N1 separates mutable namespace identity from stable storage identity.
+N1 separates mutable namespace/control state from immutable object truth.
 
 ```text
-<root>/
+<index_root>/
   .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
   @f_<stable_fragment_id>/
     .fragment.ndx
-    .objects/
-    .blobs/
-    .uploads/
     .trash/
+    .uploads/
+    <namespace paths>
+
+<blob_root>/
+  @f_<stable_fragment_id>/
+    .objects/
+      <fanout>/@o_<object-id>/
+        <version-summary>.ndx
+        <version-id>/<shard-or-parity-files>
 ```
 
-Fragment names and aliases may change. Stable fragment roots do not. Object
-records are immutable, payload versions are immutable, and namespace movement
-does not rewrite object truth.
+Fragment aliases may change. Stable fragment roots, object records, and payload
+versions do not. Each immutable `.ndx` is stored beside its shard/parity
+placement, while namespace movement remains confined to index roots.
 
 ## API Faces
 

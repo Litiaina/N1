@@ -1,7 +1,6 @@
-use crate::core::constants::N1_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
-use crate::core::fragment_identity::fragment_root_on;
 use crate::core::index;
+use crate::core::index_store;
 use crate::enums::app_error_enum::AppError;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -24,54 +23,54 @@ async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError
         .filter(|meta| !meta.is_delete_marker)
         .map(|meta| meta.total_size_bytes)
         .sum::<u64>();
-    let valid_versions = live_objects
+    let referenced_object_ids = index_store::referenced_object_ids(fragment)?;
+    let active_session_versions = active_sessions
         .into_iter()
-        .map(|meta| meta.version_id)
-        .chain(
-            active_sessions
-                .into_iter()
-                .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
-                .map(|session| session.manifest.version_id),
-        )
+        .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
+        .map(|session| session.manifest.version_id)
         .collect::<HashSet<_>>();
 
     let orphans_removed = tokio::task::spawn_blocking(move || -> Result<i32, AppError> {
         let mut orphans_count = 0;
 
         for root in blob_roots {
-            let blob_root = fragment_root_on(&root, &fragment_owned).join(N1_BLOB_DIR);
-
-            if !blob_root.exists() {
+            let Ok(object_dirs) = index_store::local_object_dirs_under_root(&root, &fragment_owned)
+            else {
                 continue;
-            }
-
-            if let Ok(entries) = std::fs::read_dir(&blob_root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-
-                    let version_id = entry.file_name().to_string_lossy().to_string();
-
-                    if !valid_versions.contains(&version_id) {
-                        let modified = std::fs::metadata(&path)
-                            .and_then(|m| m.modified())
-                            .unwrap_or(now);
-                        if now.duration_since(modified).unwrap_or(Duration::ZERO) <= file_ttl {
-                            continue;
-                        }
-
-                        if let Err(e) = std::fs::remove_dir_all(&path) {
-                            error!("Sync: Failed to remove orphaned blob {:?}: {}", path, e);
-                        } else {
-                            orphans_count += 1;
-                        }
-                    }
+            };
+            for (object_dir, object_id) in object_dirs {
+                if referenced_object_ids.contains(&object_id) {
+                    continue;
+                }
+                let has_active_session = std::fs::read_dir(&object_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        entry.path().is_dir()
+                            && active_session_versions
+                                .contains(&entry.file_name().to_string_lossy().to_string())
+                    });
+                if has_active_session {
+                    continue;
+                }
+                let modified = std::fs::metadata(&object_dir)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(now);
+                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= file_ttl {
+                    continue;
+                }
+                if let Err(err) = std::fs::remove_dir_all(&object_dir) {
+                    error!(
+                        "Sync: Failed to remove orphaned object {:?}: {}",
+                        object_dir, err
+                    );
+                } else {
+                    orphans_count += 1;
                 }
             }
         }
-
         Ok(orphans_count)
     })
     .await

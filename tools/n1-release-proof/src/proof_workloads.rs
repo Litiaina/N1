@@ -262,21 +262,13 @@ impl Proof {
         self.assert_download_sha256(&renamed, &sha).await?;
         expected.insert(renamed.clone());
 
-        let trash = self
-            .posix_post("/n1/posix/trash", json!({"path": &dir}))
+        self.posix_post("/n1/posix/trash", json!({"path": &dir}))
             .await?;
         let trash_event = self
             .wait_ws_namespace_event(&mut ws, "trash", Some(&dir), None)
             .await?;
-        let trash_entry_id = trash
-            .get("trash_entry_id")
-            .and_then(Value::as_str)
-            .ok_or("websocket trash missing trash_entry_id")?;
-        self.posix_post(
-            "/n1/posix/recover",
-            json!({"path": &dir, "trash_entry_id": trash_entry_id}),
-        )
-        .await?;
+        self.posix_post("/n1/posix/recover", json!({"path": &dir}))
+            .await?;
         let recover_event = self
             .wait_ws_namespace_event(&mut ws, "recover", Some(&dir), None)
             .await?;
@@ -753,18 +745,12 @@ impl Proof {
             "application/octet-stream",
         )
         .await?;
-        let trash = self
-            .posix_post_with_token(token, "/n1/posix/trash", json!({"path": &recover_dir}))
+        self.posix_post_with_token(token, "/n1/posix/trash", json!({"path": &recover_dir}))
             .await?;
-        let trash_entry_id = trash
-            .get("trash_entry_id")
-            .and_then(Value::as_str)
-            .ok_or("mixed user trash did not return trash_entry_id")?
-            .to_string();
         self.posix_post_with_token(
             token,
             "/n1/posix/recover",
-            json!({"path": recover_dir, "trash_entry_id": trash_entry_id}),
+            json!({"path": recover_dir}),
         )
         .await?;
         self.assert_download_sha256_with_token(token, &recover_child, &recover_sha)
@@ -782,16 +768,12 @@ impl Proof {
             "application/octet-stream",
         )
         .await?;
-        let trash = self
-            .posix_post_with_token(token, "/n1/posix/trash", json!({"path": &purge_dir}))
+        self.posix_post_with_token(token, "/n1/posix/trash", json!({"path": &purge_dir}))
             .await?;
         self.posix_post_with_token(
             token,
             "/n1/posix/purge",
-            json!({
-                "path": purge_dir,
-                "trash_entry_id": trash.get("trash_entry_id").and_then(Value::as_str).unwrap_or(""),
-            }),
+            json!({"path": purge_dir}),
         )
         .await?;
 
