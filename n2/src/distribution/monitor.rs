@@ -74,6 +74,10 @@ pub struct ClusterMonitorOverview {
     pub configured_nodes: usize,
     pub data_shards: usize,
     pub parity_shards: usize,
+    pub data_plane_readable: bool,
+    pub data_plane_writable: bool,
+    pub namespace_quorum_writable: bool,
+    pub effective_client_writable: bool,
     pub adaptive_layout: bool,
     pub automatic_rebalance: bool,
     pub layout_drift_is_health_failure: bool,
@@ -120,12 +124,18 @@ pub struct ClusterMonitorTopology {
     pub policy_mode: String,
     pub fixed_data_shards: Option<usize>,
     pub fixed_parity_shards: Option<usize>,
+    pub auto_max_data_shards: usize,
+    pub auto_max_parity_shards: usize,
     pub current_data_shards: usize,
     pub current_parity_shards: usize,
     pub current_total_shards: usize,
     pub active_write_nodes: usize,
     pub readable_nodes: usize,
+    pub namespace_voters: usize,
+    pub estimated_namespace_reachable_voters: usize,
+    pub namespace_quorum_required: usize,
     pub object_level_erasure_layout: bool,
+    pub bounded_object_erasure_set: bool,
     pub old_layouts_remain_valid: bool,
     pub manual_redistribution_only: bool,
 }
@@ -194,7 +204,9 @@ pub struct ClusterNamespaceConsensusSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragment: Option<String>,
     pub total_voters: usize,
+    pub estimated_reachable_voters: usize,
     pub quorum_required: usize,
+    pub quorum_writable: bool,
     pub local_node_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_ledger: Option<NamespaceLedgerSummary>,
@@ -248,7 +260,7 @@ pub async fn cluster_monitor_snapshot(
     .await;
     let uploads = summarize_uploads(&nodes);
     let object_health = sample_object_health(&runtime, fragment.clone(), &query).await;
-    let namespace_consensus = namespace_consensus_summary(&runtime, fragment.clone());
+    let namespace_consensus = namespace_consensus_summary(&runtime, fragment.clone(), &health);
     let repair = repair_status();
     let rebalance = rebalance_status();
     let gc = serde_json::to_value(get_gc_status().await).unwrap_or(Value::Null);
@@ -281,16 +293,21 @@ pub async fn cluster_monitor_snapshot(
             configured_nodes: runtime.membership.nodes.len(),
             data_shards: health.data_shards,
             parity_shards: health.parity_shards,
+            data_plane_readable: health.data_plane_readable,
+            data_plane_writable: health.data_plane_writable,
+            namespace_quorum_writable: health.namespace_quorum_writable,
+            effective_client_writable: health.effective_client_writable,
             adaptive_layout: health.adaptive_layout,
             automatic_rebalance: health.automatic_rebalance,
             layout_drift_is_health_failure: health.layout_drift_is_health_failure,
             summary: format!(
-                "{} • epoch {} • layout {}+{} • writable {} • readable {}",
+                "{} • epoch {} • layout {}+{} • data_writable {} • namespace_writable {} • readable {}",
                 format!("{:?}", health.state).to_ascii_lowercase(),
                 runtime.membership.epoch,
                 health.data_shards,
                 health.parity_shards,
-                health.active_write_nodes,
+                health.data_plane_writable,
+                health.namespace_quorum_writable,
                 health.readable_nodes
             ),
         },
@@ -300,12 +317,18 @@ pub async fn cluster_monitor_snapshot(
             policy_mode: format!("{:?}", runtime.layout_policy.mode).to_ascii_lowercase(),
             fixed_data_shards: runtime.layout_policy.fixed_data_shards,
             fixed_parity_shards: runtime.layout_policy.fixed_parity_shards,
+            auto_max_data_shards: runtime.layout_policy.auto_max_data_shards,
+            auto_max_parity_shards: runtime.layout_policy.auto_max_parity_shards,
             current_data_shards: layout.data_shards,
             current_parity_shards: layout.parity_shards,
             current_total_shards: layout.total_shards(),
             active_write_nodes: active.len(),
             readable_nodes: readable.len(),
+            namespace_voters: health.namespace_voters,
+            estimated_namespace_reachable_voters: health.estimated_namespace_reachable_voters,
+            namespace_quorum_required: health.namespace_quorum_required,
             object_level_erasure_layout: true,
+            bounded_object_erasure_set: true,
             old_layouts_remain_valid: true,
             manual_redistribution_only: !runtime.auto_rebalance,
         },
@@ -614,9 +637,8 @@ fn push_object_sample(
 fn namespace_consensus_summary(
     runtime: &crate::distribution::membership::ClusterRuntime,
     fragment: Option<String>,
+    health: &ClusterHealthSnapshot,
 ) -> ClusterNamespaceConsensusSummary {
-    let total_voters = runtime.membership.readable_nodes().len().max(1);
-    let quorum_required = (total_voters / 2).saturating_add(1).max(1);
     let mut notes = vec![
         "namespace mutation is quorum-gated; immutable object/layout metadata is not consensus-mutated after commit".to_string(),
     ];
@@ -640,8 +662,10 @@ fn namespace_consensus_summary(
     .to_string();
     ClusterNamespaceConsensusSummary {
         fragment,
-        total_voters,
-        quorum_required,
+        total_voters: health.namespace_voters,
+        estimated_reachable_voters: health.estimated_namespace_reachable_voters,
+        quorum_required: health.namespace_quorum_required,
+        quorum_writable: health.namespace_quorum_writable,
         local_node_id: runtime.local_node_id.clone(),
         local_ledger,
         status,

@@ -70,6 +70,9 @@ pub struct ClusterRebalancePlan {
     pub active_nodes: usize,
     pub data_shards: usize,
     pub parity_shards: usize,
+    pub bounded_object_erasure_set: bool,
+    pub max_auto_data_shards: usize,
+    pub max_auto_parity_shards: usize,
     pub automatic_rebalance: bool,
     pub recommendation: String,
 }
@@ -116,12 +119,15 @@ pub fn plan_rebalance(runtime: &ClusterRuntime) -> Result<ClusterRebalancePlan, 
         active_nodes: active_nodes.len(),
         data_shards: layout.data_shards,
         parity_shards: layout.parity_shards,
+        bounded_object_erasure_set: true,
+        max_auto_data_shards: runtime.layout_policy.auto_max_data_shards,
+        max_auto_parity_shards: runtime.layout_policy.auto_max_parity_shards,
         automatic_rebalance: runtime.auto_rebalance,
         recommendation: if runtime.auto_rebalance {
-            "automatic rebalance is enabled for background rewrite jobs; new objects always use the current layout"
+            "automatic rebalance is enabled for background rewrite jobs; new objects always use the current bounded layout"
                 .to_string()
         } else {
-            "new objects use the current layout; old objects stay on their recorded layout until manual rebalance"
+            "new objects use the current bounded layout; old objects stay on their recorded layout until manual rebalance"
                 .to_string()
         },
     })

@@ -217,6 +217,18 @@ logical path, then each partition gets a stable voter group from the current
 membership epoch. This spreads namespace write pressure without dragging
 immutable object bytes or object `.ncdx` records into consensus.
 
+This is the point where N2 keeps object storage durable while preserving fast,
+POSIX-style namespace behavior. User-facing path operations mutate tiny
+namespace pointers, not object payloads. Listing a directory reads namespace
+entries. Rename, move, trash, and recover update namespace state. They do not
+scan object shards, rewrite erasure-coded payloads, or mutate immutable
+`.ncdx` records.
+
+The result is object storage with namespace ergonomics: N2 is still not an
+operating-system filesystem, but it avoids the common object-storage weakness
+where path-oriented workflows become expensive metadata scans or data-plane
+rewrites.
+
 ```text
 fragment + logical path
   -> namespace partition
@@ -319,16 +331,22 @@ auto
 fixed
 ```
 
-Auto mode derives an EC shape from writable node count:
+Auto mode derives a bounded object erasure set from writable node count. The
+default bound is `8 data + 3 parity`, so small clusters grow naturally while
+large clusters stop expanding one object's shard set across every node:
 
 ```text
-1 node  -> 1 + 0
-2 nodes -> 1 + 1
-3 nodes -> 2 + 1
-4 nodes -> 3 + 1
+1 node     -> 1 + 0
+2 nodes    -> 1 + 1
+3 nodes    -> 2 + 1
+4 nodes    -> 3 + 1
+10 nodes   -> 8 + 2
+11+ nodes  -> 8 + 3
 ```
 
-Fixed mode lets the operator preserve a deliberate production EC shape.
+The bounds are configured with `auto_max_data_shards` and
+`auto_max_parity_shards`. Fixed mode still lets the operator preserve a
+deliberate production EC shape.
 
 Every object version records its resolved layout. Therefore:
 

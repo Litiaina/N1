@@ -31,6 +31,18 @@ fn group_size() -> usize {
         .clamp(1, 5)
 }
 
+pub fn namespace_group_size() -> usize {
+    group_size()
+}
+
+pub fn namespace_voter_count_for_membership(total_nodes: usize) -> usize {
+    total_nodes.max(1).min(group_size())
+}
+
+pub fn namespace_quorum_required(voter_count: usize) -> usize {
+    (voter_count / 2).saturating_add(1).max(1)
+}
+
 fn group_root() -> Result<PathBuf, AppError> {
     let root = FS_STORAGE_ROOT.get().ok_or_else(|| {
         AppError::InternalServerError("N2 fs storage root is not initialized".into())
@@ -309,6 +321,7 @@ mod tests {
                 mode: ClusterLayoutMode::Auto,
                 fixed_data_shards: None,
                 fixed_parity_shards: None,
+                ..ClusterLayoutPolicy::default()
             },
             membership: ClusterMembership {
                 cluster_id: "test".into(),

@@ -977,6 +977,9 @@ async fn execute_native_op_inner(
                 "policy": runtime.layout_policy,
                 "active_write_nodes": active.len(),
                 "layout": layout,
+                "bounded_object_erasure_set": true,
+                "max_auto_data_shards": runtime.layout_policy.auto_max_data_shards,
+                "max_auto_parity_shards": runtime.layout_policy.auto_max_parity_shards,
                 "adaptive_without_rebalance": true,
                 "automatic_rebalance": runtime.auto_rebalance,
             }))

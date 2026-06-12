@@ -19,6 +19,13 @@ namespace, and maintenance operations on any healthy node, places immutable
 object shards across the cluster, and keeps namespace mutation as the
 coordination boundary.
 
+N2 deliberately keeps POSIX-style namespace operations fast without becoming a
+filesystem. Directory listing, rename, move, trash, and recover operate on a
+small partitioned namespace quorum of logical pointers, while object bytes and
+`.ncdx` records remain immutable in the distributed blob plane. This avoids a
+common object-storage weakness where path-oriented workflows degrade into
+large metadata scans or payload rewrites.
+
 N2 is not an S3 clone and does not use S3 as its core identity. Its public
 surface is LOA-style `/n2/...` HTTP API plus the `n2://` native protocol for
 N2-native operators, peers, tools, and future internal systems.
@@ -180,6 +187,8 @@ node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
 cluster_layout_mode=auto
+auto_max_data_shards=8
+auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false

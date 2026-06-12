@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_AUTO_MAX_DATA_SHARDS: usize = 8;
+pub const DEFAULT_AUTO_MAX_PARITY_SHARDS: usize = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterLayoutMode {
@@ -24,6 +27,18 @@ pub struct ClusterLayoutPolicy {
     pub mode: ClusterLayoutMode,
     pub fixed_data_shards: Option<usize>,
     pub fixed_parity_shards: Option<usize>,
+    #[serde(default = "default_auto_max_data_shards")]
+    pub auto_max_data_shards: usize,
+    #[serde(default = "default_auto_max_parity_shards")]
+    pub auto_max_parity_shards: usize,
+}
+
+pub fn default_auto_max_data_shards() -> usize {
+    DEFAULT_AUTO_MAX_DATA_SHARDS
+}
+
+pub fn default_auto_max_parity_shards() -> usize {
+    DEFAULT_AUTO_MAX_PARITY_SHARDS
 }
 
 impl Default for ClusterLayoutPolicy {
@@ -32,20 +47,52 @@ impl Default for ClusterLayoutPolicy {
             mode: ClusterLayoutMode::Auto,
             fixed_data_shards: None,
             fixed_parity_shards: None,
+            auto_max_data_shards: DEFAULT_AUTO_MAX_DATA_SHARDS,
+            auto_max_parity_shards: DEFAULT_AUTO_MAX_PARITY_SHARDS,
         }
     }
 }
 
 pub fn derive_auto_layout(active_nodes: usize) -> ClusterEcLayout {
+    derive_auto_layout_with_bounds(
+        active_nodes,
+        DEFAULT_AUTO_MAX_DATA_SHARDS,
+        DEFAULT_AUTO_MAX_PARITY_SHARDS,
+    )
+}
+
+pub fn derive_auto_layout_with_bounds(
+    active_nodes: usize,
+    max_data_shards: usize,
+    max_parity_shards: usize,
+) -> ClusterEcLayout {
+    let max_data_shards = max_data_shards.max(1);
     match active_nodes {
         0 | 1 => ClusterEcLayout {
             data_shards: 1,
             parity_shards: 0,
         },
-        nodes => ClusterEcLayout {
-            data_shards: nodes.saturating_sub(1),
-            parity_shards: 1,
-        },
+        nodes => {
+            let max_total = max_data_shards
+                .saturating_add(max_parity_shards)
+                .max(max_data_shards);
+            let target_total = nodes.min(max_total).max(1);
+            if max_parity_shards == 0 {
+                return ClusterEcLayout {
+                    data_shards: target_total,
+                    parity_shards: 0,
+                };
+            }
+            let parity_shards = target_total
+                .saturating_sub(max_data_shards)
+                .max(1)
+                .min(max_parity_shards)
+                .min(target_total.saturating_sub(1));
+            ClusterEcLayout {
+                data_shards: target_total.saturating_sub(parity_shards).max(1),
+                parity_shards,
+            }
+        }
     }
 }
 
@@ -54,7 +101,11 @@ pub fn resolve_layout(
     policy: &ClusterLayoutPolicy,
 ) -> Result<ClusterEcLayout, String> {
     let layout = match policy.mode {
-        ClusterLayoutMode::Auto => derive_auto_layout(active_nodes),
+        ClusterLayoutMode::Auto => derive_auto_layout_with_bounds(
+            active_nodes,
+            policy.auto_max_data_shards,
+            policy.auto_max_parity_shards,
+        ),
         ClusterLayoutMode::Fixed => ClusterEcLayout {
             data_shards: policy
                 .fixed_data_shards
@@ -85,7 +136,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_layout_treats_nodes_as_cluster_shards() {
+    fn auto_layout_uses_bounded_cluster_shards() {
         assert_eq!(
             derive_auto_layout(1),
             ClusterEcLayout {
@@ -107,6 +158,38 @@ mod tests {
                 parity_shards: 1
             }
         );
+        assert_eq!(
+            derive_auto_layout(10),
+            ClusterEcLayout {
+                data_shards: 8,
+                parity_shards: 2
+            }
+        );
+        assert_eq!(
+            derive_auto_layout(1_000),
+            ClusterEcLayout {
+                data_shards: 8,
+                parity_shards: 3
+            }
+        );
+    }
+
+    #[test]
+    fn auto_layout_uses_configured_bounds() {
+        assert_eq!(
+            derive_auto_layout_with_bounds(32, 4, 2),
+            ClusterEcLayout {
+                data_shards: 4,
+                parity_shards: 2
+            }
+        );
+        assert_eq!(
+            derive_auto_layout_with_bounds(32, 6, 0),
+            ClusterEcLayout {
+                data_shards: 6,
+                parity_shards: 0
+            }
+        );
     }
 
     #[test]
@@ -115,6 +198,7 @@ mod tests {
             mode: ClusterLayoutMode::Fixed,
             fixed_data_shards: Some(2),
             fixed_parity_shards: Some(1),
+            ..ClusterLayoutPolicy::default()
         };
         assert!(resolve_layout(3, &policy).is_ok());
         assert!(resolve_layout(2, &policy).is_err());

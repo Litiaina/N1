@@ -58,6 +58,12 @@ videos/mhw.mp4
 N2 supports object-style operations and POSIX-style namespace operations. Both
 address the same namespace truth.
 
+The POSIX-style API is intentionally namespace control, not filesystem
+emulation. Path operations stay fast because they mutate or read partitioned
+namespace pointer state; immutable object metadata and shard/parity payloads
+remain in the blob plane and are not rewritten for list, rename, move, trash,
+or recover.
+
 ### Object Version
 
 Each upload creates an immutable object version. The namespace head points to
@@ -66,15 +72,19 @@ deleted by version where the API supports it.
 
 ### Cluster Layout
 
-N2 treats active nodes as the cluster-level erasure layout.
+N2 treats active nodes as the candidate pool for object-level erasure
+placement. Each object uses a bounded erasure set selected from that pool.
 
-`cluster_layout_mode=auto` derives the layout from writable node count:
+`cluster_layout_mode=auto` derives a bounded layout from writable node count.
+The default bound is `8 data + 3 parity`:
 
 ```text
-1 writable node  -> 1 + 0
-2 writable nodes -> 1 + 1
-3 writable nodes -> 2 + 1
-4 writable nodes -> 3 + 1
+1 writable node    -> 1 + 0
+2 writable nodes   -> 1 + 1
+3 writable nodes   -> 2 + 1
+4 writable nodes   -> 3 + 1
+10 writable nodes  -> 8 + 2
+11+ writable nodes -> 8 + 3
 ```
 
 `cluster_layout_mode=fixed` pins the layout to explicit `data + parity` counts.
@@ -215,6 +225,8 @@ node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
 cluster_layout_mode=auto
+auto_max_data_shards=8
+auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false
@@ -273,8 +285,11 @@ Notes:
   namespace voter assignments, ledgers, snapshots, and jobs.
 - `membership_file` is relative to `fs_storage_path` unless absolute.
 - `cluster_layout_mode=auto` is recommended for normal N2 deployments.
-- `auto_rebalance=false` means new objects adapt to current layout, while old
-  objects stay in their recorded layout until manual rebalance.
+- `auto_max_data_shards` and `auto_max_parity_shards` bound each object's
+  erasure set so large clusters do not place one object across every node.
+- `auto_rebalance=false` means new objects adapt to the current bounded
+  layout, while old objects stay in their recorded layout until manual
+  rebalance.
 - N2 rejects fragment quota during creation. Use cluster usage monitoring.
 
 ### Storage Layout Modes
@@ -450,6 +465,8 @@ node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
 cluster_layout_mode=auto
+auto_max_data_shards=8
+auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false

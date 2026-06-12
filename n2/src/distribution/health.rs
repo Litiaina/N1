@@ -3,6 +3,9 @@ use crate::distribution::layout::resolve_layout;
 use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
 };
+use crate::distribution::namespace_group::{
+    namespace_quorum_required, namespace_voter_count_for_membership,
+};
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
@@ -35,6 +38,13 @@ pub struct ClusterHealthSnapshot {
     pub readable_nodes: usize,
     pub data_shards: usize,
     pub parity_shards: usize,
+    pub data_plane_readable: bool,
+    pub data_plane_writable: bool,
+    pub namespace_voters: usize,
+    pub estimated_namespace_reachable_voters: usize,
+    pub namespace_quorum_required: usize,
+    pub namespace_quorum_writable: bool,
+    pub effective_client_writable: bool,
     pub adaptive_layout: bool,
     pub manual_rebalance_available: bool,
     pub layout_drift_is_health_failure: bool,
@@ -61,16 +71,26 @@ pub fn cluster_health_snapshot_with_live_nodes(
     let configured_active = runtime.membership.active_write_nodes();
     let layout =
         resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let data_plane_readable = readable.len() >= layout.data_shards;
+    let data_plane_writable = active.len() >= layout.total_shards();
+    let namespace_voters = namespace_voter_count_for_membership(runtime.membership.nodes.len());
+    let namespace_quorum_required = namespace_quorum_required(namespace_voters);
+    let estimated_namespace_reachable_voters = readable.len().min(namespace_voters);
+    let namespace_quorum_writable =
+        estimated_namespace_reachable_voters >= namespace_quorum_required;
+    let effective_client_writable = data_plane_writable && namespace_quorum_writable;
     let missing_writable = configured_active.len().saturating_sub(active.len());
     let live_node_ids = readable
         .iter()
         .map(|node| node.id.clone())
         .collect::<HashSet<_>>();
-    let state = if readable.len() < layout.data_shards {
+    let state = if !data_plane_readable {
         ClusterHealthState::Critical
+    } else if !effective_client_writable {
+        ClusterHealthState::Degraded
     } else if missing_writable > 0 {
         ClusterHealthState::Degraded
-    } else if readable.len() >= layout.data_shards {
+    } else if data_plane_readable {
         ClusterHealthState::Healthy
     } else {
         ClusterHealthState::Critical
@@ -108,17 +128,36 @@ pub fn cluster_health_snapshot_with_live_nodes(
         ));
     }
     if missing_writable > 0 {
-        notes.push(format!(
-            "{} configured writable node(s) are currently unreachable; new writes use the live topology, while older objects keep their recorded layout",
-            missing_writable
-        ));
+        if namespace_quorum_writable {
+            notes.push(format!(
+                "{} configured writable node(s) are currently unreachable; namespace quorum is still writable and new objects use the live data layout, while older objects keep their recorded layout",
+                missing_writable
+            ));
+        } else {
+            notes.push(format!(
+                "{} configured writable node(s) are currently unreachable; object reads may still work, but namespace quorum is not writable so new client mutations are unavailable",
+                missing_writable
+            ));
+        }
     }
-    if readable.len() < layout.data_shards {
+    if !data_plane_readable {
         notes.push(format!(
             "cluster cannot read the current live layout: requires {} readable node(s), has {}",
             layout.data_shards,
             readable.len()
         ));
+    }
+    if !namespace_quorum_writable {
+        notes.push(format!(
+            "namespace quorum is not writable: requires {} voter(s), has {} reachable voter estimate",
+            namespace_quorum_required, estimated_namespace_reachable_voters
+        ));
+    }
+    if data_plane_writable && !namespace_quorum_writable {
+        notes.push(
+            "data-plane placement can accept shards, but client writes still require namespace pointer quorum"
+                .to_string(),
+        );
     }
 
     Ok(ClusterHealthSnapshot {
@@ -128,6 +167,13 @@ pub fn cluster_health_snapshot_with_live_nodes(
         readable_nodes: readable.len(),
         data_shards: layout.data_shards,
         parity_shards: layout.parity_shards,
+        data_plane_readable,
+        data_plane_writable,
+        namespace_voters,
+        estimated_namespace_reachable_voters,
+        namespace_quorum_required,
+        namespace_quorum_writable,
+        effective_client_writable,
         adaptive_layout: matches!(runtime.layout_policy.mode, ClusterLayoutMode::Auto),
         manual_rebalance_available: active.len() > 1,
         layout_drift_is_health_failure: false,
@@ -150,7 +196,7 @@ pub fn cluster_health_snapshot_with_live_nodes(
                 };
                 ClusterNodeHealth {
                     node_id: node.id.clone(),
-                    accepts_writes: state.accepts_new_writes(),
+                    accepts_writes: state.accepts_new_writes() && effective_client_writable,
                     readable: state.is_readable(),
                     state,
                     endpoint: node.endpoint.clone(),
@@ -177,6 +223,7 @@ mod tests {
                 mode: ClusterLayoutMode::Auto,
                 fixed_data_shards: None,
                 fixed_parity_shards: None,
+                ..ClusterLayoutPolicy::default()
             },
             membership: ClusterMembership {
                 cluster_id: "test".into(),
@@ -219,6 +266,13 @@ mod tests {
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.adaptive_layout);
         assert!(snap.manual_rebalance_available);
+        assert!(snap.data_plane_readable);
+        assert!(snap.data_plane_writable);
+        assert_eq!(snap.namespace_voters, 2);
+        assert_eq!(snap.estimated_namespace_reachable_voters, 2);
+        assert_eq!(snap.namespace_quorum_required, 2);
+        assert!(snap.namespace_quorum_writable);
+        assert!(snap.effective_client_writable);
         assert!(!snap.layout_drift_is_health_failure);
         assert_eq!(
             snap.nodes[0].native_endpoint.as_deref(),
@@ -244,6 +298,30 @@ mod tests {
         assert_eq!(snap.active_write_nodes, 2);
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
+        assert!(snap.data_plane_writable);
+        assert!(snap.namespace_quorum_writable);
+        assert!(snap.effective_client_writable);
         assert_eq!(snap.nodes[2].state, NodeState::Offline);
+    }
+
+    #[test]
+    fn health_reports_namespace_quorum_blocking_writes() {
+        let runtime = runtime(vec![
+            node("a", NodeState::Online),
+            node("b", NodeState::Online),
+        ]);
+        let live = vec![runtime.membership.nodes[0].clone()];
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
+        assert_eq!(snap.state, ClusterHealthState::Degraded);
+        assert!(snap.data_plane_readable);
+        assert!(snap.data_plane_writable);
+        assert!(!snap.namespace_quorum_writable);
+        assert!(!snap.effective_client_writable);
+        assert!(snap.nodes.iter().all(|node| !node.accepts_writes));
+        assert!(
+            snap.notes
+                .iter()
+                .any(|note| note.contains("namespace quorum is not writable"))
+        );
     }
 }

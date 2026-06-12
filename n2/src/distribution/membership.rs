@@ -1,4 +1,7 @@
-use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
+use crate::distribution::layout::{
+    ClusterLayoutMode, ClusterLayoutPolicy, DEFAULT_AUTO_MAX_DATA_SHARDS,
+    DEFAULT_AUTO_MAX_PARITY_SHARDS,
+};
 use crate::enums::app_error_enum::AppError;
 use chrono::Utc;
 use futures_util::future::join_all;
@@ -212,6 +215,15 @@ fn parse_optional_usize(raw: Option<&str>, key: &str) -> Result<Option<usize>, A
     }
 }
 
+fn parse_usize(raw: Option<&str>, key: &str, default_value: usize) -> Result<usize, AppError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(default_value),
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            AppError::BadRequest(format!("{key} must be a non-negative integer or empty"))
+        }),
+    }
+}
+
 fn parse_bool(raw: Option<&str>, default_value: bool) -> bool {
     match raw.map(str::trim) {
         None | Some("") => default_value,
@@ -362,7 +374,22 @@ pub fn init_cluster_runtime(
             section.and_then(|s| s.get("fixed_parity_shards")),
             "fixed_parity_shards",
         )?,
+        auto_max_data_shards: parse_usize(
+            section.and_then(|s| s.get("auto_max_data_shards")),
+            "auto_max_data_shards",
+            DEFAULT_AUTO_MAX_DATA_SHARDS,
+        )?,
+        auto_max_parity_shards: parse_usize(
+            section.and_then(|s| s.get("auto_max_parity_shards")),
+            "auto_max_parity_shards",
+            DEFAULT_AUTO_MAX_PARITY_SHARDS,
+        )?,
     };
+    if layout_policy.auto_max_data_shards == 0 {
+        return Err(AppError::BadRequest(
+            "auto_max_data_shards must be greater than zero".into(),
+        ));
+    }
     let auto_rebalance = parse_bool(section.and_then(|s| s.get("auto_rebalance")), false);
     let membership = load_or_create_membership(
         &membership_path,

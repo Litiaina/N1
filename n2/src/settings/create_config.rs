@@ -22,6 +22,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("native_endpoint", "n2://127.0.0.1:50002")
         .set("membership_file", "n2_membership.json")
         .set("cluster_layout_mode", "auto")
+        .set("auto_max_data_shards", "8")
+        .set("auto_max_parity_shards", "3")
         .set("fixed_data_shards", "")
         .set("fixed_parity_shards", "")
         .set("auto_rebalance", "false");
@@ -98,6 +100,8 @@ mod tests {
             .section(Some("cluster_config"))
             .expect("cluster_config section");
         assert_eq!(cluster.get("cluster_layout_mode"), Some("auto"));
+        assert_eq!(cluster.get("auto_max_data_shards"), Some("8"));
+        assert_eq!(cluster.get("auto_max_parity_shards"), Some("3"));
         assert_eq!(cluster.get("membership_file"), Some("n2_membership.json"));
         let _ = fs::remove_file(path);
     }
