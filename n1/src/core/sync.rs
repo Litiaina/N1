@@ -21,8 +21,6 @@ pub struct CreateFragmentRequest {
     pub name: String,
     pub secret: String,
     pub key: String,
-    #[serde(default)]
-    pub quota_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]

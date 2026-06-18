@@ -57,8 +57,6 @@ pub struct CreateFragmentRequest {
     pub name: String,
     pub key: String,
     pub secret: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quota_bytes: Option<u64>,
 }
 
 pub struct AuthSession {

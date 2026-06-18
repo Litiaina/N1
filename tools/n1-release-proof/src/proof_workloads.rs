@@ -73,86 +73,34 @@ impl Proof {
         }))
     }
 
-    async fn quota_api_proof(&self) -> ProofResult<Value> {
+    async fn fragment_usage_api_proof(&self) -> ProofResult<Value> {
         let usage = self
             .client
-            .get(format!("{}/n1/capacity/quota", self.base_url))
+            .get(format!("{}/n1/capacity/fragment", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .await?;
         if usage.status() != StatusCode::OK {
             return Err(format!(
-                "quota usage failed: {} {}",
+                "fragment usage failed: {} {}",
                 usage.status(),
                 usage.text().await?
             )
             .into());
         }
         let usage_body: Value = usage.json().await?;
-        let quota_bytes = usage_body
-            .get("quota_bytes")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("quota usage missing quota_bytes: {usage_body}"))?;
-        if quota_bytes != self.args.quota_bytes {
-            return Err(format!(
-                "quota usage reported wrong quota_bytes: expected={} actual={} body={}",
-                self.args.quota_bytes, quota_bytes, usage_body
-            )
-            .into());
-        }
         let used_bytes = usage_body
             .get("used_bytes")
             .and_then(Value::as_u64)
-            .ok_or_else(|| format!("quota usage missing used_bytes: {usage_body}"))?;
+            .ok_or_else(|| format!("fragment usage missing used_bytes: {usage_body}"))?;
         if used_bytes == 0 {
             return Err(
-                format!("quota usage stayed at zero after large upload: {usage_body}").into(),
+                format!("fragment usage stayed at zero after large upload: {usage_body}").into(),
             );
         }
 
-        let too_small = self
-            .client
-            .patch(format!(
-                "{}/n1/fragments/{}/quota",
-                self.base_url, self.fragment
-            ))
-            .bearer_auth(&self.token)
-            .json(&json!({"secret": self.args.master_key, "quota_bytes": 1_u64}))
-            .send()
-            .await?;
-        if too_small.status() != StatusCode::CONFLICT {
-            return Err(format!(
-                "quota shrink below used bytes returned wrong status: {} {}",
-                too_small.status(),
-                too_small.text().await?
-            )
-            .into());
-        }
-
-        let unchanged = self
-            .client
-            .patch(format!(
-                "{}/n1/fragments/{}/quota",
-                self.base_url, self.fragment
-            ))
-            .bearer_auth(&self.token)
-            .json(&json!({"secret": self.args.master_key, "quota_bytes": self.args.quota_bytes}))
-            .send()
-            .await?;
-        if unchanged.status() != StatusCode::OK {
-            return Err(format!(
-                "quota unchanged resize failed: {} {}",
-                unchanged.status(),
-                unchanged.text().await?
-            )
-            .into());
-        }
-        let unchanged_body: Value = unchanged.json().await?;
-
         Ok(json!({
             "usage": usage_body,
-            "shrink_below_used_status": StatusCode::CONFLICT.as_u16(),
-            "unchanged_resize": unchanged_body,
         }))
     }
 
@@ -630,12 +578,11 @@ impl Proof {
         let start = Instant::now();
         let users = self.args.multi_fragment_users;
         let files_per_user = self.args.multi_fragment_files_per_user;
-        let quota_bytes = self.auxiliary_fragment_quota_bytes(files_per_user);
         let mut fragments = Vec::new();
         for user in 0..users {
             let key = format!("{}-mf-{user:02}", self.args.fragment_key);
             let name = format!("release-proof-mf-{}-{user:02}", self.stamp);
-            let fragment = self.create_named_fragment(&name, &key, quota_bytes).await?;
+            let fragment = self.create_named_fragment(&name, &key).await?;
             let token = self.auth_fragment(&fragment, &key).await?;
             fragments.push((user, fragment, token));
         }
@@ -659,7 +606,6 @@ impl Proof {
         Ok(json!({
             "users": users,
             "files_per_user": files_per_user,
-            "quota_bytes_per_fragment": quota_bytes,
             "elapsed_s": round3(start.elapsed().as_secs_f64()),
             "reports": reports,
         }))

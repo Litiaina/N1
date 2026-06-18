@@ -112,7 +112,7 @@ pub struct Cli {
 pub enum Commands {
     #[command(
         about = "Open a stateful native N1 operator shell.",
-        long_about = "Open a persistent n1:// session for monitoring, listing, object status/repair, GC, repair, redistribution, and quota checks."
+        long_about = "Open a persistent n1:// session for monitoring, listing, object status/repair, GC, repair, redistribution, and usage checks."
     )]
     Shell,
 
@@ -204,11 +204,8 @@ pub enum FragmentCommands {
         fragment: Option<String>,
     },
 
-    #[command(about = "Show quota/usage for the authenticated fragment.")]
-    Quota,
-
-    #[command(about = "Resize a fragment quota as an explicit admin operation.")]
-    ResizeQuota(FragmentResizeQuotaArgs),
+    #[command(about = "Show storage usage for the authenticated fragment.")]
+    Usage,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -276,21 +273,6 @@ pub struct FragmentCreateArgs {
 
     #[arg(long, help = "Secret key that protects the fragment.")]
     pub key: String,
-
-    #[arg(long, help = "Fragment quota in bytes.")]
-    pub quota_bytes: u64,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct FragmentResizeQuotaArgs {
-    #[arg(long, help = "New fragment quota in bytes.")]
-    pub quota_bytes: u64,
-
-    #[arg(
-        long,
-        help = "N1 master secret authorizing the virtual partition resize."
-    )]
-    pub master_secret: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]

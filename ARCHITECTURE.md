@@ -117,7 +117,7 @@ with the alias hash, but core operations resolve it to the stable fragment
 identity before touching object or namespace state.
 
 `.fragment.ndx` is a control record stored only on index roots. It records the
-stable fragment identity, state, quota/project identity, timestamps, key
+stable fragment identity, state, timestamps, key
 material metadata, and namespace partition count.
 
 Fragment rename changes only the index-plane alias and mutable display

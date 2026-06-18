@@ -16,8 +16,8 @@ use crate::core::fragment_metadata::{
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
+use crate::core::linux_io;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
-use crate::core::quota_manager::validate_fragment_project_headroom_for_redistribution;
 use crate::core::recovery::read_or_recover_chunk;
 use crate::core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
@@ -40,6 +40,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +48,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use tokio::fs as tokio_fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
@@ -1249,49 +1250,9 @@ async fn durable_atomic_write_bytes_with_mode(
     bytes: &[u8],
     strict_durability: bool,
 ) -> Result<(), AppError> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::InternalServerError(format!("missing parent for {}", path.display()))
-    })?;
-
-    tokio_fs::create_dir_all(parent)
-        .await
-        .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("file")
-        .to_string();
-
-    let tmp = parent.join(format!(".{}.tmp.{}", file_name, Ulid::new().to_string()));
-
-    let mut f = tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create tmp {}", tmp.display())))?;
-
-    f.write_all(bytes)
-        .await
-        .map_err(|e| AppError::Io(e, format!("write tmp {}", tmp.display())))?;
-
-    if strict_durability {
-        let _ = f.sync_all().await;
-    }
-    drop(f);
-
-    tokio_fs::rename(&tmp, path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), path.display())))?;
-
-    if strict_durability {
-        let _ = sync_dir(parent).await;
-    }
-    Ok(())
+    linux_io::atomic_write_with_durability(path, bytes.to_vec(), strict_durability).await
 }
 
-#[cfg(unix)]
 async fn stage_old_shard_gc_with_symlink(old_abs: &str) -> Result<(), AppError> {
     let old_path = PathBuf::from(old_abs);
     if !tokio_fs::try_exists(&old_path).await.unwrap_or(false) {
@@ -1308,9 +1269,7 @@ async fn stage_old_shard_gc_with_symlink(old_abs: &str) -> Result<(), AppError> 
         .ok_or_else(|| AppError::InternalServerError("missing shard parent".into()))?
         .to_path_buf();
 
-    tokio_fs::rename(&old_path, &gc_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("rename shard -> gc {}", old_path.display())))?;
+    linux_io::rename(&old_path, &gc_path).await?;
 
     let target_name = gc_path
         .file_name()
@@ -1329,16 +1288,11 @@ async fn stage_old_shard_gc_with_symlink(old_abs: &str) -> Result<(), AppError> 
     .map_err(|_| AppError::InternalServerError("symlink join failed".into()))?;
 
     if let Err(e) = symlink_res {
-        let _ = tokio_fs::rename(&gc_path, &old_path).await;
+        let _ = linux_io::rename(&gc_path, &old_path).await;
         return Err(AppError::Io(e, "create gc symlink".into()));
     }
 
     let _ = sync_dir(&parent_clone).await;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn stage_old_shard_gc_with_symlink(_old_abs: &str) -> Result<(), AppError> {
     Ok(())
 }
 
@@ -1459,29 +1413,8 @@ impl LiveLayout {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn rename_exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let a_c = CString::new(a.as_os_str().as_bytes()).unwrap();
-    let b_c = CString::new(b.as_os_str().as_bytes()).unwrap();
-
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            a_c.as_ptr(),
-            libc::AT_FDCWD,
-            b_c.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    linux_io::rename_exchange_blocking(a, b)
 }
 
 async fn publish_tmp_overwrite(
@@ -1494,16 +1427,13 @@ async fn publish_tmp_overwrite(
     let final_exists = tokio_fs::try_exists(final_p).await.unwrap_or(false);
 
     if !final_exists {
-        tokio_fs::rename(tmp, final_p)
-            .await
-            .map_err(|e| AppError::Io(e, "commit rename".into()))?;
+        linux_io::rename(tmp, final_p).await?;
         if sync_parent_immediately {
             let _ = sync_dir(parent).await;
         }
         return Ok(());
     }
 
-    #[cfg(target_os = "linux")]
     {
         let a = tmp.to_path_buf();
         let b = final_p.to_path_buf();
@@ -1520,7 +1450,7 @@ async fn publish_tmp_overwrite(
                 GC_SUFFIX
             );
             let gc_path = parent.join(gc_name);
-            let _ = tokio_fs::rename(tmp, &gc_path).await;
+            let _ = linux_io::rename(tmp, &gc_path).await;
             if sync_parent_immediately {
                 let _ = sync_dir(parent).await;
             }
@@ -1536,13 +1466,9 @@ async fn publish_tmp_overwrite(
     );
     let gc_path = parent.join(gc_name);
 
-    tokio_fs::rename(final_p, &gc_path)
-        .await
-        .map_err(|e| AppError::Io(e, "rename final->gc".into()))?;
+    linux_io::rename(final_p, &gc_path).await?;
 
-    tokio_fs::rename(tmp, final_p)
-        .await
-        .map_err(|e| AppError::Io(e, "rename tmp->final".into()))?;
+    linux_io::rename(tmp, final_p).await?;
 
     if sync_parent_immediately {
         let _ = sync_dir(parent).await;
@@ -1788,13 +1714,6 @@ pub async fn run_redistribution_job_with_options(
         }
 
         replicate_fragment_metadata_best_effort(&fragment_hash).await;
-        if !dry_run && opts.scope != RedistributionScope::Namespace {
-            validate_fragment_project_headroom_for_redistribution(
-                &fragment_hash,
-                live_blob.as_ref(),
-            )
-            .await?;
-        }
         if !dry_run {
             if let Err(err) = replay_pending_intents_for_fragment(
                 &fragment_hash,
@@ -2453,7 +2372,7 @@ async fn redistribute_object_streaming(
     let new_block_size = target_stripe_size_for_metadata(meta, target_stripe_size);
     let verify_tmp_crc = strict_durability;
 
-    let mut file_cache: HashMap<String, tokio::fs::File> = HashMap::new();
+    let mut file_cache: HashMap<String, File> = HashMap::new();
 
     let old_parts = std::mem::take(&mut meta.parts);
     let mut new_parts: Vec<PartMetadata> = Vec::with_capacity(old_parts.len());

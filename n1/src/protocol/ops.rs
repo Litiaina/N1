@@ -36,9 +36,7 @@ use crate::core::repair_manager::{
     trigger_repair_job_api,
 };
 use crate::core::retrieve::{get_object_metadata_direct, list_fragments};
-use crate::core::storage_capacity_parser::{
-    ResizeFragmentQuotaRequest, get_capacity_usage, get_fragment_quota_usage, resize_fragment_quota,
-};
+use crate::core::storage_capacity_parser::{get_capacity_usage, get_fragment_usage};
 use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
     FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
@@ -842,10 +840,6 @@ async fn execute_native_op_inner(
                 name: required_string(&payload, "name")?,
                 key: required_string(&payload, "key")?,
                 secret: required_string(&payload, "secret")?,
-                quota_bytes: Some(
-                    u64_field(&payload, "quota_bytes")
-                        .ok_or_else(|| AppError::BadRequest("quota_bytes is required".into()))?,
-                ),
             };
             native_from_response(create_fragment(axum::Json(req)).await?).await
         }
@@ -888,28 +882,14 @@ async fn execute_native_op_inner(
             }
             native_body(json!({"fragment": fragment, "fragment_hash": hash}))
         }
-        "fragment.quota" => {
+        "fragment.usage" | "capacity.fragment" => {
             let claims = claims_required(claims)?;
-            native_from_response(get_fragment_quota_usage(claims).await?).await
+            native_from_response(get_fragment_usage(claims).await?).await
         }
         "capacity.usage" => {
             let claims = claims_required(claims)?;
             let fragment = claims.fragment.clone();
             native_from_response(get_capacity_usage(claims, Path(fragment)).await?).await
-        }
-        "fragment.resize_quota" => {
-            let claims = claims_required(claims)?;
-            let fragment =
-                string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
-            let req = ResizeFragmentQuotaRequest {
-                quota_bytes: u64_field(&payload, "quota_bytes")
-                    .ok_or_else(|| AppError::BadRequest("quota_bytes is required".into()))?,
-                secret: required_string(&payload, "secret")?,
-            };
-            native_from_response(
-                resize_fragment_quota(claims, Path(fragment), axum::Json(req)).await?,
-            )
-            .await
         }
         "uploads.list" | "multipart.list" => {
             let claims = claims_required(claims)?;

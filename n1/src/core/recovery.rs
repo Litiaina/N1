@@ -1,27 +1,22 @@
 use crate::core::constants::{GC_SUFFIX, N1_OBJECTS_DIR};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
+use crate::core::linux_io;
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
 use crc32fast::Hasher;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions as StdOpenOptions;
-use std::io::SeekFrom;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use ulid::Ulid;
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
 
 static RECOVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 static REPAIR_INFLIGHT: LazyLock<Mutex<HashSet<PathBuf>>> =
@@ -199,37 +194,17 @@ async fn should_schedule_background_repair(shard: &ShardInfo) -> bool {
 }
 
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
-    let path_clone = path.clone();
-
-    tokio::task::spawn_blocking(move || {
-        if let Some(parent) = path_clone.parent() {
-            if !parent.exists() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
-
-        let mut options = StdOpenOptions::new();
-        options.write(true).create(true).truncate(true);
-
-        #[cfg(target_os = "linux")]
-        {
-            options.custom_flags(libc::O_DIRECT);
-        }
-        #[cfg(windows)]
-        {
-            const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-            options.custom_flags(FILE_FLAG_NO_BUFFERING);
-        }
-
-        options
-            .open(&path_clone)
-            .map_err(|e| AppError::Io(e, format!("create repair file {}", path_clone.display())))
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Spawn blocking failed: {}", e)))?
+    linux_io::open_direct_write(path).await
 }
 
-pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) -> bool {
+async fn read_exact_from_file_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let cloned = file.try_clone()?;
+    linux_io::pread_exact_at_async(cloned, len, offset)
+        .await
+        .map(|(_, buf)| buf)
+}
+
+pub async fn verify_shard_integrity(file: &File, expected_checksum: &str) -> bool {
     if expected_checksum.is_empty() {
         return true;
     }
@@ -237,27 +212,33 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
         return false;
     }
 
-    let original_pos = match file.seek(SeekFrom::Current(0)).await {
-        Ok(pos) => pos,
-        Err(_) => return false,
-    };
-
-    if file.seek(SeekFrom::Start(0)).await.is_err() {
-        return false;
-    }
-
     let mut hasher = Hasher::new();
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut offset = 0u64;
 
     loop {
-        match file.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buffer[..n]),
-            Err(_) => {
-                let _ = file.seek(SeekFrom::Start(original_pos)).await;
-                return false;
-            }
+        let cloned = match file.try_clone() {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let chunk = match tokio::task::spawn_blocking(move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            let read = linux_io::pread_at(&cloned, &mut chunk, offset)?;
+            chunk.truncate(read);
+            Ok::<_, std::io::Error>(chunk)
+        })
+        .await
+        {
+            Ok(Ok(chunk)) => chunk,
+            Err(_) => return false,
+            Ok(Err(_)) => return false,
+        };
+
+        if chunk.is_empty() {
+            break;
         }
+
+        hasher.update(&chunk);
+        offset = offset.saturating_add(chunk.len() as u64);
     }
 
     let calculated = hasher.finalize();
@@ -265,8 +246,6 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
         Ok(v) => v,
         Err(_) => return false,
     };
-
-    let _ = file.seek(SeekFrom::Start(original_pos)).await;
 
     calculated == expected
 }
@@ -276,8 +255,8 @@ async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
         return None;
     }
 
-    if let Ok(mut f) = File::open(path).await {
-        if verify_shard_integrity(&mut f, checksum).await {
+    if let Ok(f) = linux_io::open_read(Path::new(path)).await {
+        if verify_shard_integrity(&f, checksum).await {
             return Some(f);
         } else {
             warn!("Shard failed integrity check: {}", path);
@@ -291,7 +270,7 @@ async fn try_open_unverified(path: &str) -> Option<File> {
         return None;
     }
 
-    File::open(path).await.ok()
+    linux_io::open_read(Path::new(path)).await.ok()
 }
 
 async fn preexisting_gc_candidates(path: &str) -> Vec<String> {
@@ -325,7 +304,7 @@ async fn get_or_open_shard_ha(
     version_dir_hint: Option<&Path>,
 ) -> Option<File> {
     if let Some(file) = file_cache.get(&shard_info.file_name) {
-        return file.try_clone().await.ok();
+        return file.try_clone().ok();
     }
 
     let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
@@ -367,7 +346,7 @@ async fn get_or_open_shard_ha(
         }
 
         if let Some(f) = try_open_verified(&cand, &shard_info.checksum).await {
-            if let Ok(cloned) = f.try_clone().await {
+            if let Ok(cloned) = f.try_clone() {
                 file_cache.insert(shard_info.file_name.clone(), cloned);
                 return Some(f);
             }
@@ -378,7 +357,7 @@ async fn get_or_open_shard_ha(
                 continue;
             }
             if let Some(f) = try_open_verified(&preexisting, &shard_info.checksum).await {
-                if let Ok(cloned) = f.try_clone().await {
+                if let Ok(cloned) = f.try_clone() {
                     file_cache.insert(shard_info.file_name.clone(), cloned);
                     return Some(f);
                 }
@@ -395,7 +374,7 @@ async fn get_or_open_shard_fast(
     version_dir_hint: Option<&Path>,
 ) -> Option<File> {
     if let Some(file) = file_cache.get(&shard_info.file_name) {
-        return file.try_clone().await.ok();
+        return file.try_clone().ok();
     }
 
     let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
@@ -437,7 +416,7 @@ async fn get_or_open_shard_fast(
         }
 
         if let Some(f) = try_open_unverified(&cand).await {
-            if let Ok(cloned) = f.try_clone().await {
+            if let Ok(cloned) = f.try_clone() {
                 file_cache.insert(shard_info.file_name.clone(), cloned);
                 return Some(f);
             }
@@ -448,7 +427,7 @@ async fn get_or_open_shard_fast(
                 continue;
             }
             if let Some(f) = try_open_unverified(&preexisting).await {
-                if let Ok(cloned) = f.try_clone().await {
+                if let Ok(cloned) = f.try_clone() {
                     file_cache.insert(shard_info.file_name.clone(), cloned);
                     return Some(f);
                 }
@@ -486,8 +465,6 @@ pub async fn read_or_recover_chunk(
     len: usize,
     block_size: usize,
 ) -> Result<Vec<u8>, AppError> {
-    let mut buf = vec![0u8; len];
-
     let target_shard = nth_data_shard(&part, shard_idx)
         .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
 
@@ -497,11 +474,9 @@ pub async fn read_or_recover_chunk(
         Some(version_dir)
     };
 
-    if let Some(mut file) = get_or_open_shard_ha(file_cache, target_shard, vdir_hint).await {
-        if file.seek(SeekFrom::Start(offset)).await.is_ok() {
-            if file.read_exact(&mut buf).await.is_ok() {
-                return Ok(buf);
-            }
+    if let Some(file) = get_or_open_shard_ha(file_cache, target_shard, vdir_hint).await {
+        if let Ok(read) = read_exact_from_file_at(&file, offset, len).await {
+            return Ok(read);
         }
         warn!("Read failed for validated shard, attempting recovery.");
     }
@@ -525,19 +500,14 @@ pub async fn read_or_recover_chunk(
             continue;
         }
 
-        let mut file = match get_or_open_shard_ha(file_cache, s, vdir_hint).await {
+        let file = match get_or_open_shard_ha(file_cache, s, vdir_hint).await {
             Some(f) => f,
             None => continue,
         };
 
-        if file.seek(SeekFrom::Start(offset)).await.is_err() {
+        let Ok(chunk) = read_exact_from_file_at(&file, offset, recovery_len).await else {
             continue;
-        }
-
-        let mut chunk = vec![0u8; recovery_len];
-        if file.read_exact(&mut chunk).await.is_err() {
-            continue;
-        }
+        };
 
         let res = if s.is_parity {
             decoder.add_recovery_shard(s.shard_index - data_count, chunk)
@@ -606,11 +576,8 @@ pub async fn read_or_recover_chunk_streaming(
         Some(version_dir)
     };
 
-    if let Some(mut file) = get_or_open_shard_fast(file_cache, target_shard, vdir_hint).await {
-        let mut buf = vec![0u8; len];
-        if file.seek(SeekFrom::Start(offset)).await.is_ok()
-            && file.read_exact(&mut buf).await.is_ok()
-        {
+    if let Some(file) = get_or_open_shard_fast(file_cache, target_shard, vdir_hint).await {
+        if let Ok(buf) = read_exact_from_file_at(&file, offset, len).await {
             return Ok(buf);
         }
         file_cache.remove(&target_shard.file_name);
@@ -672,12 +639,12 @@ pub async fn repair_entire_shard(
     }
 
     if !fs::try_exists(&parent_dir).await.unwrap_or(false) {
-        let _ = fs::create_dir_all(&parent_dir).await;
+        let _ = linux_io::ensure_dir_all(&parent_dir).await;
     }
 
     if fs::try_exists(&final_path).await.unwrap_or(false) {
-        if let Ok(mut f) = File::open(&final_path).await {
-            if verify_shard_integrity(&mut f, &target_shard.checksum).await {
+        if let Ok(f) = linux_io::open_read(&final_path).await {
+            if verify_shard_integrity(&f, &target_shard.checksum).await {
                 return Ok(());
             }
         }
@@ -688,8 +655,8 @@ pub async fn repair_entire_shard(
             break guard;
         }
         if fs::try_exists(&final_path).await.unwrap_or(false) {
-            if let Ok(mut f) = File::open(&final_path).await {
-                if verify_shard_integrity(&mut f, &target_shard.checksum).await {
+            if let Ok(f) = linux_io::open_read(&final_path).await {
+                if verify_shard_integrity(&f, &target_shard.checksum).await {
                     return Ok(());
                 }
             }
@@ -698,8 +665,8 @@ pub async fn repair_entire_shard(
     };
 
     if fs::try_exists(&final_path).await.unwrap_or(false) {
-        if let Ok(mut f) = File::open(&final_path).await {
-            if verify_shard_integrity(&mut f, &target_shard.checksum).await {
+        if let Ok(f) = linux_io::open_read(&final_path).await {
+            if verify_shard_integrity(&f, &target_shard.checksum).await {
                 return Ok(());
             }
         }
@@ -747,7 +714,7 @@ pub async fn repair_entire_shard(
 
     if data_count == 0 {
         drop(temp_file);
-        let _ = fs::remove_file(&temp_path).await;
+        let _ = linux_io::remove_file_if_exists(&temp_path).await;
         return Err(AppError::InternalServerError("No data shards".into()));
     }
 
@@ -784,27 +751,22 @@ pub async fn repair_entire_shard(
             let mut need_reopen = false;
 
             if let Some(f) = file_opt {
-                if f.seek(SeekFrom::Start(offset)).await.is_err() {
-                    need_reopen = true;
-                } else {
-                    let mut buf = vec![0u8; cur];
-                    if f.read_exact(&mut buf).await.is_ok() {
-                        let res = if s_info.is_parity {
-                            decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
-                        } else {
-                            let add = decoder.add_original_shard(s_info.shard_index, &buf);
-                            if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
-                                stripe_data[s_info.shard_index] = Some(buf);
-                            }
-                            add
-                        };
-
-                        if res.is_ok() {
-                            shards_found += 1;
-                        }
+                if let Ok(buf) = read_exact_from_file_at(f, offset, cur).await {
+                    let res = if s_info.is_parity {
+                        decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
                     } else {
-                        need_reopen = true;
+                        let add = decoder.add_original_shard(s_info.shard_index, &buf);
+                        if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
+                            stripe_data[s_info.shard_index] = Some(buf);
+                        }
+                        add
+                    };
+
+                    if res.is_ok() {
+                        shards_found += 1;
                     }
+                } else {
+                    need_reopen = true;
                 }
             } else {
                 need_reopen = true;
@@ -817,7 +779,7 @@ pub async fn repair_entire_shard(
 
         if shards_found < data_count {
             drop(temp_file);
-            let _ = fs::remove_file(&temp_path).await;
+            let _ = linux_io::remove_file_if_exists(&temp_path).await;
             return Err(AppError::InternalServerError(
                 "Not enough healthy shards to repair on disk".into(),
             ));
@@ -851,7 +813,7 @@ pub async fn repair_entire_shard(
 
             if stripe_data.iter().any(|d| d.is_none()) {
                 drop(temp_file);
-                let _ = fs::remove_file(&temp_path).await;
+                let _ = linux_io::remove_file_if_exists(&temp_path).await;
                 return Err(AppError::InternalServerError(
                     "Missing data shards required to recompute parity".into(),
                 ));
@@ -893,14 +855,12 @@ pub async fn repair_entire_shard(
         .await
         .map_err(|e| AppError::Io(e, "fsync repair".into()))?;
 
-    match fs::rename(&temp_path, &final_path).await {
+    match linux_io::rename(&temp_path, &final_path).await {
         Ok(_) => {}
         Err(e) => {
             warn!("Rename failed (will retry after mkdir): {}", e);
-            let _ = fs::create_dir_all(&parent_dir).await;
-            fs::rename(&temp_path, &final_path)
-                .await
-                .map_err(|e2| AppError::Io(e2, "rename repaired file".into()))?;
+            let _ = linux_io::ensure_dir_all(&parent_dir).await;
+            linux_io::rename(&temp_path, &final_path).await?;
         }
     }
     let _ = sync_dir(&parent_dir).await;

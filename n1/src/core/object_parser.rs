@@ -10,10 +10,10 @@ use chrono::{TimeZone, Utc};
 use futures_util::stream;
 use once_cell::sync::{Lazy, OnceCell};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::fs::File;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Duration;
 

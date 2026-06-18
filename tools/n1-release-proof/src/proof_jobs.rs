@@ -564,7 +564,10 @@ impl Proof {
         roots
     }
 
-    fn remove_one_shard(&self, version_id: &str) -> ProofResult<PathBuf> {
+    fn remove_one_shard_matching<F>(&self, version_id: &str, keep: F) -> ProofResult<PathBuf>
+    where
+        F: Fn(&Path) -> bool,
+    {
         let mut shard_files = Vec::new();
         for version_dir in self.object_version_dirs(version_id)? {
             shard_files.extend(
@@ -577,6 +580,7 @@ impl Proof {
                                 .extension()
                                 .and_then(|ext| ext.to_str())
                                 .is_some_and(|ext| matches!(ext, "shard" | "parity"))
+                            && keep(path)
                     }),
             );
         }
@@ -584,9 +588,21 @@ impl Proof {
         let removed = shard_files
             .into_iter()
             .next()
-            .ok_or_else(|| format!("no shard files for version {version_id}"))?;
+            .ok_or_else(|| format!("no matching shard files for version {version_id}"))?;
         fs::remove_file(&removed)?;
         Ok(removed)
+    }
+
+    fn remove_one_shard(&self, version_id: &str) -> ProofResult<PathBuf> {
+        self.remove_one_shard_matching(version_id, |_| true)
+    }
+
+    fn remove_one_data_shard(&self, version_id: &str) -> ProofResult<PathBuf> {
+        self.remove_one_shard_matching(version_id, |path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "shard")
+        })
     }
 
     async fn wait_for_path(

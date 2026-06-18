@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, patch, post},
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -43,18 +43,11 @@ struct FragmentCreatePayload {
     name: String,
     key: String,
     secret: String,
-    quota_bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
 struct FragmentHashPayload {
     fragment: String,
-}
-
-#[derive(serde::Deserialize)]
-struct FragmentQuotaResizePayload {
-    quota_bytes: u64,
-    secret: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -122,11 +115,7 @@ async fn refresh_handler(
 }
 
 async fn create_fragment_handler(Json(payload): Json<FragmentCreatePayload>) -> impl IntoResponse {
-    if payload.name != "clinic"
-        || payload.key != "clinic-key"
-        || payload.secret != SECRET
-        || payload.quota_bytes != 1_048_576
-    {
+    if payload.name != "clinic" || payload.key != "clinic-key" || payload.secret != SECRET {
         return (StatusCode::BAD_REQUEST, "bad fragment payload").into_response();
     }
     (
@@ -157,27 +146,26 @@ async fn fragment_hash_handler(Json(payload): Json<FragmentHashPayload>) -> impl
         .into_response()
 }
 
-async fn resize_quota_handler(
-    Path(fragment): Path<String>,
-    headers: HeaderMap,
-    Json(payload): Json<FragmentQuotaResizePayload>,
-) -> impl IntoResponse {
-    if fragment != AUTH_FRAGMENT_HASH || !authorized(&headers) {
+async fn fragment_usage_handler(headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if payload.quota_bytes != 2_097_152 || payload.secret != "master-secret" {
-        return (StatusCode::BAD_REQUEST, "bad quota resize payload").into_response();
     }
     (
         StatusCode::OK,
         Json(json!({
-            "fragment": fragment,
-            "previous_quota_bytes": 1_048_576_u64,
-            "quota_bytes": payload.quota_bytes,
-            "used_bytes": 524_288_u64,
-            "available_bytes": 1_572_864_u64,
-            "changed": true,
-            "direction": "increase"
+            "fragment": AUTH_FRAGMENT_HASH,
+            "state": "active",
+            "committed_bytes": 524_288_u64,
+            "reserved_bytes": 0_u64,
+            "trash_bytes": 4096_u64,
+            "used_bytes": 528_384_u64,
+            "capacity_used": 1_048_576_u64,
+            "capacity_allocated": 4_194_304_u64,
+            "capacity_available": 3_145_728_u64,
+            "filesystem_count": 1_u64,
+            "capacity_usage_percent": 25.0_f64,
+            "created_at_unix": 1_i64,
+            "updated_at_unix": 2_i64
         })),
     )
         .into_response()
@@ -407,8 +395,6 @@ async fn fragment_create_uses_direct_route() {
             "clinic",
             "--key",
             "clinic-key",
-            "--quota-bytes",
-            "1048576",
         ])
         .output()
         .unwrap();
@@ -422,14 +408,11 @@ async fn fragment_create_uses_direct_route() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fragment_resize_quota_uses_authenticated_admin_route() {
+async fn fragment_usage_uses_authenticated_route() {
     let router = Router::new()
         .route("/n1/auth/fragment", post(auth_handler))
         .route("/n1/fragments/hash", get(fragment_hash_handler))
-        .route(
-            "/n1/fragments/{fragment}/quota",
-            patch(resize_quota_handler),
-        );
+        .route("/n1/capacity/fragment", get(fragment_usage_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-shell")
@@ -442,11 +425,7 @@ async fn fragment_resize_quota_uses_authenticated_admin_route() {
             "--fragment",
             AUTH_FRAGMENT_NAME,
             "fragment",
-            "resize-quota",
-            "--quota-bytes",
-            "2097152",
-            "--master-secret",
-            "master-secret",
+            "usage",
         ])
         .output()
         .unwrap();
@@ -455,8 +434,8 @@ async fn fragment_resize_quota_uses_authenticated_admin_route() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"quota_bytes\":2097152"));
-    assert!(stdout.contains("\"direction\":\"increase\""));
+    assert!(stdout.contains("\"used_bytes\": 528384"));
+    assert!(stdout.contains("\"capacity_available\": 3145728"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

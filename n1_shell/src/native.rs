@@ -18,11 +18,10 @@ use crate::args::{
     Cli, Commands, FragmentCommands, NamespaceCommands, ObjectCommands, UploadCommands,
 };
 use crate::client::{
-    DirectAction, FragmentHashLookupRequest, FragmentHashLookupResponse,
-    ResizeFragmentQuotaRequest, build_gc_start_query, build_redistribution_start_query,
-    build_repair_start_query, direct_action, looks_like_fragment_hash,
-    resolve_cli_auth_fragment_hint, selected_execution_mode, selected_gc_mode,
-    selected_repair_mode,
+    DirectAction, FragmentHashLookupRequest, FragmentHashLookupResponse, build_gc_start_query,
+    build_redistribution_start_query, build_repair_start_query, direct_action,
+    looks_like_fragment_hash, resolve_cli_auth_fragment_hint, selected_execution_mode,
+    selected_gc_mode, selected_repair_mode,
 };
 use crate::output::{
     format_gc_status, format_health, format_health_watch_line, format_redistribution_status,
@@ -54,7 +53,6 @@ pub async fn run_native(cli: Cli) -> Result<(), DynError> {
                         name: args.name.clone(),
                         key: args.key.clone(),
                         secret,
-                        quota_bytes: Some(args.quota_bytes),
                     })?),
                 )
                 .await?;
@@ -471,33 +469,11 @@ async fn handle_native_fragment_command(
                 .await?;
             print_json_value(cli.json, &value)
         }
-        FragmentCommands::Quota => {
+        FragmentCommands::Usage => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/capacity/quota", None)
+                .mapped_json(Method::GET, "/n1/capacity/fragment", None)
                 .await?;
             print_json_value(cli.json, &value)
-        }
-        FragmentCommands::ResizeQuota(args) => {
-            let target = cli
-                .fragment
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    io::Error::other("Pass --fragment <name-or-hash> for quota resize.")
-                })?;
-            let fragment = resolve_n1_auth_fragment_native(client, target).await?;
-            let response = client
-                .mapped_request(
-                    Method::PATCH,
-                    &format!("/n1/fragments/{}/quota", encode_path(&fragment)),
-                    Some(serde_json::to_value(ResizeFragmentQuotaRequest {
-                        quota_bytes: args.quota_bytes,
-                        secret: args.master_secret.clone(),
-                    })?),
-                )
-                .await?;
-            print_native_response(response)
         }
     }
 }
@@ -543,9 +519,9 @@ async fn handle_shell_line(
                 .await?;
             print_output(cli.json, &health, &format_health(&health))
         }
-        ["quota"] => {
+        ["usage"] => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/capacity/quota", None)
+                .mapped_json(Method::GET, "/n1/capacity/fragment", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
@@ -678,7 +654,7 @@ async fn handle_shell_line(
 
 fn print_console_help() {
     println!(
-        "commands:\n  health\n  quota\n  fragments\n  list [path]\n  stat <path>\n  uploads\n  upload <version_id>\n  gc status|start|stop\n  repair status|start|stop\n  redistribute status|start|stop\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  session\n  exit"
+        "commands:\n  health\n  usage\n  fragments\n  list [path]\n  stat <path>\n  uploads\n  upload <version_id>\n  gc status|start|stop\n  repair status|start|stop\n  redistribute status|start|stop\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  session\n  exit"
     );
 }
 
@@ -836,7 +812,7 @@ fn native_op_from_mapped_call(
             merge_json(&mut payload);
             "fragment.hash.public"
         }
-        (Method::GET, "/n1/capacity/quota") => "fragment.quota",
+        (Method::GET, "/n1/capacity/fragment") => "fragment.usage",
         (Method::GET, "/n1/maintenance/health") => "maintenance.health",
         (Method::GET, "/n1/posix/list") => "namespace.list",
         (Method::GET, "/n1/posix/stat") => "namespace.stat",
@@ -854,14 +830,6 @@ fn native_op_from_mapped_call(
             "maintenance.redistribution.status"
         }
         (Method::POST, "/n1/maintenance/redistribution/stop") => "maintenance.redistribution.stop",
-        (Method::PATCH, path) if path.starts_with("/n1/fragments/") && path.ends_with("/quota") => {
-            let fragment = path
-                .trim_start_matches("/n1/fragments/")
-                .trim_end_matches("/quota");
-            payload["fragment"] = Value::String(fragment.to_string());
-            merge_json(&mut payload);
-            "fragment.resize_quota"
-        }
         (Method::GET, path) if path.starts_with("/n1/upload/multipart/") => {
             payload["version_id"] =
                 Value::String(path.trim_start_matches("/n1/upload/multipart/").to_string());

@@ -155,9 +155,6 @@ index_store_disks={}
 blob_store_disks={}
 fs_storage_path={}
 
-[quota_config]
-fragment_quota_backend={}
-
 [index_config]
 partition_count=64
 per_db_cache_bytes=auto
@@ -179,7 +176,7 @@ max_file_size=1099511627776
 login_token_expiration=900
 
 [rate_limiter_config]
-enable_rate_limiting=false
+enable_rate_limiting={}
 auth_limit_per_second=5000
 auth_limit_burst_size=10000
 view_limit_per_second=5000
@@ -215,7 +212,7 @@ stripe_block_size=262144
             index_roots,
             blob_roots,
             self.args.out_dir.join("fs").display(),
-            self.args.quota_backend,
+            self.args.rate_limiter_enabled,
             self.args.max_part_size,
             self.data_shards,
             self.parity_shards
@@ -278,7 +275,6 @@ stripe_block_size=262144
             "name": name,
             "secret": self.args.master_key,
             "key": self.args.fragment_key,
-            "quota_bytes": self.args.quota_bytes,
         });
         let response = self
             .client

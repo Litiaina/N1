@@ -19,6 +19,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use std::collections::{HashMap, HashSet};
+use std::fs::File as StdFile;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
@@ -931,7 +932,7 @@ fn create_multipart_reader(
         parts_queue: std::collections::VecDeque<PartMetadata>,
         blob_dir: PathBuf,
         cursor_in_part: u64,
-        file_cache: HashMap<String, File>,
+        file_cache: HashMap<String, StdFile>,
         stripe_size: usize,
     }
 

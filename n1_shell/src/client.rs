@@ -36,12 +36,6 @@ pub(crate) struct FragmentHashLookupRequest {
     pub(crate) fragment: String,
 }
 
-#[derive(Serialize)]
-pub(crate) struct ResizeFragmentQuotaRequest {
-    pub(crate) quota_bytes: u64,
-    pub(crate) secret: String,
-}
-
 pub(crate) fn looks_like_fragment_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -281,17 +275,13 @@ async fn handle_fragment_command(
                     name: args.name.clone(),
                     key: args.key.clone(),
                     secret,
-                    quota_bytes: Some(args.quota_bytes),
                 })
                 .send()
                 .await?;
 
             print_response_message(response).await
         }
-        FragmentCommands::ResizeQuota(_) => {
-            unreachable!("fragment quota resize is handled after fragment authentication")
-        }
-        FragmentCommands::List | FragmentCommands::Hash { .. } | FragmentCommands::Quota => {
+        FragmentCommands::List | FragmentCommands::Hash { .. } | FragmentCommands::Usage => {
             unreachable!("fragment read commands are handled after fragment authentication")
         }
     }
@@ -724,33 +714,15 @@ async fn handle_authenticated_fragment_command(
             .await?;
             print_response_message(response).await
         }
-        FragmentCommands::Quota => {
+        FragmentCommands::Usage => {
             let value: Value = fetch_json(
                 client,
                 base_url,
                 session,
-                &api_url(base_url, "/n1/capacity/quota"),
+                &api_url(base_url, "/n1/capacity/fragment"),
             )
             .await?;
             print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
-        }
-        FragmentCommands::ResizeQuota(args) => {
-            let target_fragment = resolve_target_fragment(client, base_url, cli).await?;
-            let url = api_url(
-                base_url,
-                &format!("/n1/fragments/{}/quota", target_fragment),
-            );
-            let response = send_with_session(client, base_url, session, |token| {
-                client
-                    .patch(&url)
-                    .bearer_auth(token)
-                    .json(&ResizeFragmentQuotaRequest {
-                        quota_bytes: args.quota_bytes,
-                        secret: args.master_secret.clone(),
-                    })
-            })
-            .await?;
-            print_response_message(response).await
         }
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs::File as StdFile;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -20,25 +20,17 @@ use crc32fast::Hasher;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-#[cfg(target_os = "linux")]
-use io_uring::{IoUring, opcode, types};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::FileExt;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
-
+use crate::core::capacity_manager::{
+    ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
+};
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
@@ -48,10 +40,8 @@ use crate::core::disk_manager::{
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
 use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, IoProgress, acquire_disk_io};
-use crate::core::quota_manager::{
-    ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
-    fragment_quota_enforcement_enabled,
-};
+use crate::core::linux_io;
+pub use crate::core::linux_io::sync_dir;
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -104,36 +94,6 @@ async fn acquire_multipart_part_lock(
         _guard: lock.lock_owned().await,
     })
 }
-
-#[cfg(target_os = "linux")]
-static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
-    // The current ring path constructs a short-lived ring per direct write. Keep
-    // it opt-in until this writer owns a reusable ring per file/worker.
-    let enabled = std::env::var("N1_IO_URING_ENABLED")
-        .ok()
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(false);
-
-    if !enabled {
-        return false;
-    }
-
-    match IoUring::new(8) {
-        Ok(_) => true,
-        Err(err) => {
-            warn!(
-                "io_uring unavailable for N1 direct writer, falling back to O_DIRECT blocking writes: {}",
-                err
-            );
-            false
-        }
-    }
-});
 
 pub(crate) struct AdaptiveIoGuard {
     guard: DiskIoGuard,
@@ -447,7 +407,7 @@ fn committed_session_progress(state: &index::IndexSessionState) -> (u64, u64) {
 }
 
 pub struct DirectWriter {
-    file: Arc<fs::File>,
+    file: Arc<StdFile>,
     write_buffer: AlignedBuffer,
     next_offset: u64,
     write_task: Option<tokio::task::JoinHandle<Result<AlignedBuffer, std::io::Error>>>,
@@ -500,120 +460,8 @@ impl AsyncWrite for UploadShardWriter {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn write_all_at_blocking(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
-    let mut written = 0usize;
-    while written < buf.len() {
-        let n = file.write_at(&buf[written..], offset + written as u64)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write_at returned 0",
-            ));
-        }
-        written += n;
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn write_all_at_blocking(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
-
-    let mut cloned = file.try_clone()?;
-    cloned.seek(SeekFrom::Start(offset))?;
-    cloned.write_all(buf)
-}
-
-#[cfg(target_os = "linux")]
-fn write_all_at_io_uring(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
-    let mut ring = IoUring::new(8)?;
-    let fd = types::Fd(file.as_raw_fd());
-    let mut written = 0usize;
-
-    while written < buf.len() {
-        let ptr = unsafe { buf.as_ptr().add(written) };
-        let len = (buf.len() - written) as u32;
-        let entry = opcode::Write::new(fd, ptr, len)
-            .offset(offset + written as u64)
-            .build()
-            .user_data(1);
-
-        unsafe {
-            ring.submission()
-                .push(&entry)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
-        }
-
-        ring.submit_and_wait(1)?;
-        let cqe = ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring completion missing"))?;
-        let result = cqe.result();
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result));
-        }
-        if result == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "io_uring write returned 0",
-            ));
-        }
-        written += result as usize;
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn write_all_direct(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
-    if *IO_URING_ENABLED {
-        write_all_at_io_uring(file, buf, offset)
-    } else {
-        write_all_at_blocking(file, buf, offset)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn write_all_direct(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
-    write_all_at_blocking(file, buf, offset)
-}
-
-#[cfg(target_os = "linux")]
-fn sync_file_direct(file: &fs::File) -> io::Result<()> {
-    if *IO_URING_ENABLED {
-        let mut ring = IoUring::new(8)?;
-        let entry = opcode::Fsync::new(types::Fd(file.as_raw_fd()))
-            .build()
-            .user_data(1);
-        unsafe {
-            ring.submission()
-                .push(&entry)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
-        }
-        ring.submit_and_wait(1)?;
-        let cqe = ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring completion missing"))?;
-        let result = cqe.result();
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result));
-        }
-        Ok(())
-    } else {
-        file.sync_all()
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn sync_file_direct(file: &fs::File) -> io::Result<()> {
-    file.sync_all()
-}
-
 impl DirectWriter {
-    pub fn new(file: fs::File) -> Self {
+    pub fn new(file: StdFile) -> Self {
         let configured = WRITER_BUFFER_SIZE_ATOMIC
             .get()
             .map(|v| v.load(Ordering::Relaxed))
@@ -659,7 +507,7 @@ impl DirectWriter {
         self.next_offset = self.next_offset.saturating_add(to_write.len() as u64);
 
         let task = tokio::task::spawn_blocking(move || {
-            write_all_direct(&file, to_write.as_slice(), offset)?;
+            linux_io::pwrite_all_at(&*file, to_write.as_slice(), offset)?;
             to_write.clear();
             Ok::<AlignedBuffer, std::io::Error>(to_write)
         });
@@ -669,7 +517,7 @@ impl DirectWriter {
 
     pub async fn sync_data(&self) -> Result<(), std::io::Error> {
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || sync_file_direct(&file)).await?
+        tokio::task::spawn_blocking(move || linux_io::fdatasync_blocking(&*file)).await?
     }
 }
 
@@ -723,139 +571,17 @@ impl AsyncWrite for DirectWriter {
     }
 }
 
-pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
-    let path_clone = path.clone();
-
-    if let Some(parent) = path.parent() {
-        let _ = tokio_fs::create_dir_all(parent).await;
-    }
-
-    tokio::task::spawn_blocking(move || {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-
-        #[cfg(target_os = "linux")]
-        {
-            options.custom_flags(libc::O_DIRECT);
-        }
-
-        #[cfg(windows)]
-        {
-            const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-            options.custom_flags(FILE_FLAG_NO_BUFFERING);
-        }
-
-        options
-            .open(&path_clone)
-            .map_err(|e| AppError::Io(e, format!("create {}", path_clone.display())))
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Spawn blocking failed: {}", e)))?
+pub async fn create_direct_file(path: &PathBuf) -> Result<StdFile, AppError> {
+    linux_io::open_direct_write(path).await
 }
 
 async fn create_buffered_file(path: &PathBuf) -> Result<tokio_fs::File, AppError> {
-    if let Some(parent) = path.parent() {
-        tokio_fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::Io(e, format!("create {}", parent.display())))?;
-    }
-
-    tokio_fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create {}", path.display())))
-}
-
-#[cfg(unix)]
-pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    let dir = tokio_fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open dir for sync: {:?}", path)))?;
-
-    dir.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, format!("sync dir: {:?}", path)))?;
-    Ok(())
-}
-
-#[cfg(windows)]
-pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-
-        let result = OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&path);
-
-        match result {
-            Ok(file) => {
-                let _ = file.sync_all();
-            }
-            Err(e) => {
-                warn!(
-                    "Windows: Failed to open directory for sync (non-fatal): {} - {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
-
-        Ok::<(), AppError>(())
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("sync dir task: {}", e)))?
-}
-
-#[cfg(not(any(unix, windows)))]
-pub async fn sync_dir(_path: &std::path::Path) -> Result<(), AppError> {
-    Ok(())
+    let file = linux_io::open_buffered_write(path).await?;
+    Ok(tokio_fs::File::from_std(file))
 }
 
 pub async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), AppError> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::InternalServerError(format!("No parent dir for {}", path.display()))
-    })?;
-
-    tokio_fs::create_dir_all(parent)
-        .await
-        .map_err(|e| AppError::Io(e, "create parent dir".into()))?;
-
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-        Ulid::new().to_string()
-    ));
-
-    let mut f = tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open tmp {}", tmp.display())))?;
-
-    f.write_all(data)
-        .await
-        .map_err(|e| AppError::Io(e, "write tmp".into()))?;
-
-    f.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, "sync tmp".into()))?;
-    drop(f);
-
-    tokio_fs::rename(&tmp, path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), path.display())))?;
-
-    sync_dir(parent).await?;
-    Ok(())
+    linux_io::atomic_write(path, data.to_vec()).await
 }
 
 async fn read_manifest_any(
@@ -937,9 +663,6 @@ fn choose_upload_stripe_size_for_parts(part_sizes: &[u64]) -> usize {
 }
 
 async fn preflight_upload_capacity(required_bytes: u64) -> Result<(), AppError> {
-    if fragment_quota_enforcement_enabled() {
-        return Ok(());
-    }
     ensure_capacity_available(required_bytes).await
 }
 
@@ -950,9 +673,6 @@ async fn preflight_blob_placement_capacity_for_parts(
     parity_shards: usize,
     block_size: usize,
 ) -> Result<(), AppError> {
-    if fragment_quota_enforcement_enabled() {
-        return Ok(());
-    }
     ensure_blob_placement_capacity_available_for_parts(
         start_part_index,
         part_sizes,
@@ -1103,11 +823,9 @@ async fn ensure_version_shard_dirs(
         }
     }
 
-    let create_futs = shard_dirs.into_iter().map(|shard_dir| async move {
-        tokio_fs::create_dir_all(&shard_dir)
-            .await
-            .map_err(|e| AppError::Io(e, format!("mkdir shard dir {}", shard_dir.display())))
-    });
+    let create_futs = shard_dirs
+        .into_iter()
+        .map(|shard_dir| async move { linux_io::ensure_dir_all(&shard_dir).await });
 
     for result in join_all(create_futs).await {
         result?;
@@ -1882,7 +1600,7 @@ where
 
 async fn cleanup_files_best_effort(paths: &[PathBuf]) {
     let futs = paths.iter().cloned().map(|p| async move {
-        let _ = tokio_fs::remove_file(&p).await;
+        let _ = linux_io::remove_file_if_exists(&p).await;
     });
     let _ = join_all(futs).await;
 }
@@ -1907,22 +1625,28 @@ async fn cleanup_blob_version_dirs_for_version(
 }
 
 async fn crc32_file_hex(path: &Path) -> Result<String, AppError> {
-    let mut f = tokio_fs::File::open(path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open for crc32 {}", path.display())))?;
-
+    let file = linux_io::open_read(path).await?;
     let mut hasher = Hasher::new();
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut offset = 0u64;
 
     loop {
-        let n = f
-            .read(&mut buf)
-            .await
-            .map_err(|e| AppError::Io(e, format!("read crc32 {}", path.display())))?;
-        if n == 0 {
+        let cloned = file
+            .try_clone()
+            .map_err(|e| AppError::Io(e, format!("clone for crc32 {}", path.display())))?;
+        let chunk = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 256 * 1024];
+            let read = linux_io::pread_at(&cloned, &mut buf, offset)?;
+            buf.truncate(read);
+            Ok::<_, std::io::Error>(buf)
+        })
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("crc32 read task: {}", e)))?
+        .map_err(|e| AppError::Io(e, format!("read crc32 {}", path.display())))?;
+        if chunk.is_empty() {
             break;
         }
-        hasher.update(&buf[..n]);
+        offset = offset.saturating_add(chunk.len() as u64);
+        hasher.update(&chunk);
     }
 
     Ok(format!("{:08x}", hasher.finalize()))
@@ -1935,16 +1659,7 @@ async fn publish_one_shard(
     expected_crc32: Option<&str>,
 ) -> Result<(), AppError> {
     if !tokio_fs::try_exists(stable_path).await.unwrap_or(false) {
-        tokio_fs::rename(tmp_path, stable_path).await.map_err(|e| {
-            AppError::Io(
-                e,
-                format!(
-                    "rename tmp->stable {} -> {}",
-                    tmp_path.display(),
-                    stable_path.display()
-                ),
-            )
-        })?;
+        linux_io::rename(tmp_path, stable_path).await?;
         return Ok(());
     }
 
@@ -1957,26 +1672,17 @@ async fn publish_one_shard(
         if let Some(exp) = expected_crc32.filter(|s| !s.is_empty()) {
             let got = crc32_file_hex(stable_path).await?;
             if got.eq_ignore_ascii_case(exp) {
-                let _ = tokio_fs::remove_file(tmp_path).await;
+                let _ = linux_io::remove_file_if_exists(tmp_path).await;
                 return Ok(());
             }
         } else {
-            let _ = tokio_fs::remove_file(tmp_path).await;
+            let _ = linux_io::remove_file_if_exists(tmp_path).await;
             return Ok(());
         }
     }
 
-    let _ = tokio_fs::remove_file(stable_path).await;
-    tokio_fs::rename(tmp_path, stable_path).await.map_err(|e| {
-        AppError::Io(
-            e,
-            format!(
-                "rename tmp->stable {} -> {}",
-                tmp_path.display(),
-                stable_path.display()
-            ),
-        )
-    })?;
+    let _ = linux_io::remove_file_if_exists(stable_path).await;
+    linux_io::rename(tmp_path, stable_path).await?;
 
     Ok(())
 }
@@ -2018,7 +1724,7 @@ async fn cleanup_blob_tmp_attempt_files_for_version(
 
                 let name = entry.file_name().to_string_lossy().to_string();
                 if is_tmp_attempt_shard(&name) {
-                    let _ = tokio_fs::remove_file(&p).await;
+                    let _ = linux_io::remove_file_if_exists(&p).await;
                 }
             }
 

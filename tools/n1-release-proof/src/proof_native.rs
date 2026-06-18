@@ -317,40 +317,23 @@ impl Proof {
             "native object repair",
         )?;
 
-        let quota = native_round_trip(
+        let usage = native_round_trip(
             &mut stream,
-            "native-fragment-quota",
-            "fragment.quota",
+            "native-fragment-usage",
+            "fragment.usage",
             json!({}),
             None,
         )
         .await?;
-        ensure_native_status(&quota, 200, "native fragment quota")?;
-        let quota_body = native_json_body(&quota)?;
-        let used_bytes = quota_body
+        ensure_native_status(&usage, 200, "native fragment usage")?;
+        let usage_body = native_json_body(&usage)?;
+        let used_bytes = usage_body
             .get("used_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let quota_bytes = self
-            .args
-            .quota_bytes
-            .max(used_bytes.saturating_add(1024 * 1024 * 1024));
-        ensure_native_status(
-            &native_round_trip(
-                &mut stream,
-                "native-fragment-quota-resize",
-                "fragment.resize_quota",
-                json!({
-                    "fragment": self.fragment,
-                    "quota_bytes": quota_bytes,
-                    "secret": self.args.master_key,
-                }),
-                None,
-            )
-            .await?,
-            200,
-            "native fragment quota resize",
-        )?;
+        if used_bytes == 0 {
+            return Err(format!("native fragment usage reported zero bytes: {usage_body}").into());
+        }
 
         let rename_source = format!("{}native-protocol/rename-source.bin", self.args.prefix);
         let rename_dest = format!("{}native-protocol/rename-dest.bin", self.args.prefix);
@@ -834,8 +817,8 @@ impl Proof {
                 "object.bulk_delete",
                 "object.bulk_recover",
                 "object.bulk_purge",
-                "fragment.quota",
-                "fragment.resize_quota",
+                "fragment.usage",
+                "capacity.usage",
                 "maintenance.gc.status",
                 "maintenance.gc.start",
                 "maintenance.gc.stop",

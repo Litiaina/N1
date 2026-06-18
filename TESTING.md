@@ -12,7 +12,7 @@ Run this on every code change:
 RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 ```
 
-This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, object-level repair/status, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, real filesystem quota, or real disk behavior.
+This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, object-level repair/status, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, capacity/placement behavior, or real disk behavior.
 
 ## Gate 2: Release Drills
 
@@ -43,7 +43,6 @@ redistribution, GC, UI, and long chaos still need their Rust-owned gates.
 ```bash
 SOURCE_FILE=/home/administrator/Downloads/INCDT\ 122225.mp4 \
 DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
-QUOTA_BACKEND=disabled \
 scripts/bench/run_n1_release_proof.sh
 ```
 
@@ -76,8 +75,6 @@ Useful knobs:
 PORT=50491
 CONCURRENCY=16
 MAX_FILES=0
-QUOTA_BACKEND=disabled
-QUOTA_BYTES=10737418240
 CLEANUP_ROOTS=0
 OUT_DIR=/tmp/n1-real-proof
 ```
@@ -108,7 +105,7 @@ scripts/bench/run_release_drills.sh
 SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_release_proof.sh
 ```
 
-Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
+Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
 ## N1 2.0.0 Evidence
 

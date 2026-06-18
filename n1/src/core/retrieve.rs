@@ -1,10 +1,10 @@
+use crate::core::capacity_manager::get_storage_usage;
 use crate::core::constants::BROWSER_CACHE_MAX_AGE;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use crate::core::fragment_identity::list_fragment_aliases;
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
-use crate::core::quota_manager::get_storage_usage;
 use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};

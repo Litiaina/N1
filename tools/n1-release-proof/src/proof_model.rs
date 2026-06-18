@@ -19,10 +19,8 @@ struct Args {
     native_port: u16,
     #[arg(long, default_value = "release-proof/")]
     prefix: String,
-    #[arg(long, default_value_t = 2_147_483_648)]
-    quota_bytes: u64,
-    #[arg(long, default_value = "disabled")]
-    quota_backend: String,
+    #[arg(long, default_value_t = false)]
+    rate_limiter_enabled: bool,
     #[arg(long, default_value_t = DEFAULT_MAX_PART_SIZE)]
     max_part_size: u64,
     #[arg(long, default_value_t = 1)]
@@ -178,13 +176,6 @@ impl Proof {
             data_shards,
             parity_shards,
         })
-    }
-
-    fn quota_backend_enforced(&self) -> bool {
-        !matches!(
-            self.args.quota_backend.trim().to_ascii_lowercase().as_str(),
-            "" | "disabled" | "disable" | "none" | "off" | "false" | "0"
-        )
     }
 
     fn native_port(&self) -> u16 {

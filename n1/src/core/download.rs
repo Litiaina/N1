@@ -12,8 +12,8 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
+use std::fs::File;
 use std::sync::Arc;
-use tokio::fs::File;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 const MAX_DOWNLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;

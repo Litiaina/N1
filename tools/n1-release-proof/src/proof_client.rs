@@ -1,19 +1,5 @@
 impl Proof {
-    fn auxiliary_fragment_quota_bytes(&self, files_per_user: usize) -> u64 {
-        let estimated_payload = (files_per_user as u64 * 8 * 1024)
-            + (16 * 32 * 1024)
-            + (64 * 1024)
-            + (32 * 1024)
-            + (256 * 1024 * 1024);
-        estimated_payload.max(512 * 1024 * 1024)
-    }
-
-    async fn create_named_fragment(
-        &self,
-        name: &str,
-        key: &str,
-        quota_bytes: u64,
-    ) -> ProofResult<String> {
+    async fn create_named_fragment(&self, name: &str, key: &str) -> ProofResult<String> {
         let response = self
             .client
             .post(format!("{}/n1/fragments", self.base_url))
@@ -21,7 +7,6 @@ impl Proof {
                 "name": name,
                 "secret": self.args.master_key,
                 "key": key,
-                "quota_bytes": quota_bytes,
             }))
             .send()
             .await?;

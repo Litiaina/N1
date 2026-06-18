@@ -9,6 +9,7 @@ use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_io};
+use crate::core::linux_io;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::fs::{self, File};
+use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -715,9 +716,9 @@ async fn inspect_object_parts(
                         report.corrupt_shards += 1;
                         bad_indexes.push(shard.shard_index);
                     } else if check_mode.verifies_full_integrity() {
-                        match File::open(&shard_path).await {
-                            Ok(mut file) => {
-                                if verify_shard_integrity(&mut file, &shard.checksum).await {
+                        match linux_io::open_read(&shard_path).await {
+                            Ok(file) => {
+                                if verify_shard_integrity(&file, &shard.checksum).await {
                                     report.healthy_shards += 1;
                                     healthy_in_part += 1;
                                 } else {
@@ -1306,8 +1307,8 @@ async fn process_object_repair(
                             warn!("Size mismatch shard (availability): {:?}", shard_path);
                         }
                     } else {
-                        if let Ok(mut f) = File::open(&shard_path).await {
-                            healthy = verify_shard_integrity(&mut f, &shard.checksum).await;
+                        if let Ok(f) = linux_io::open_read(&shard_path).await {
+                            healthy = verify_shard_integrity(&f, &shard.checksum).await;
                             if !healthy {
                                 corrupt_found += 1;
                                 warn!("Corrupt shard found: {:?}", shard_path);

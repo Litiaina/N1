@@ -8,7 +8,7 @@ For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). For release 
 
 ## Core Concepts
 
-- **Fragment:** A quota-bound virtual storage partition. Clients mount/authenticate a fragment before using the API. The public fragment hash is a mutable namespace alias; N1 stores data under an immutable `@f_<stable_fragment_id>` physical fragment root.
+- **Fragment:** An authenticated namespace and object-placement scope. Clients mount/authenticate a fragment before using the API. The public fragment hash is a mutable namespace alias; N1 stores data under an immutable `@f_<stable_fragment_id>` physical fragment root.
 - **Namespace:** The user-facing tree of folders and files. This is what `/n1/posix/*` and the UI show.
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
@@ -43,15 +43,16 @@ a fresh deployment directory, it creates the local files it needs for that
 machine:
 
 - `n1.env` - local secret material.
-- `n1_config.ini` - local machine configuration: ports, disk roots, fragment
-  quota backend, erasure layout, and deployment settings.
+- `n1_config.ini` - local machine configuration: ports, disk roots, erasure
+  layout, and deployment settings.
 
 These files are intentionally ignored by git. Start N1 once in the deployment
 directory to generate them, stop the process, then fill the real machine values
 before installing the service.
 
-Production disks should already be mounted before N1 starts. If XFS quota is
-enabled, mount the disks with project quota support.
+Production disks should already be mounted before N1 starts. N1 monitors disk
+capacity and placement availability directly; it does not require special
+filesystem accounting support.
 
 ## Production Systemd Install
 
@@ -79,10 +80,9 @@ sudo scripts/install-n1-systemd.sh \
   --start
 ```
 
-The production default runs as root because strict XFS project quota needs
-filesystem quota privileges. Advanced non-root deployments can use
-`--privilege cap-sys-admin --user <user> --group <group>`, but root mode is the
-simple operational path.
+The installer writes into `/etc/systemd/system`, so installation normally uses
+`sudo`. The service itself defaults to the original sudo user and can be pinned
+explicitly with `--user <user> --group <group>`.
 
 Check the service:
 
@@ -97,13 +97,10 @@ Installer proof commands:
 bash -n scripts/install-n1-systemd.sh
 sudo scripts/install-n1-systemd.sh \
   --install-dir /home/administrator/SERVERS/N1-SERVER \
-  --dry-run \
-  --skip-quota-preflight
+  --dry-run
 ```
 
-`--dry-run` renders the exact unit without installing it. A real install also
-preflights XFS project quota unless `fragment_quota_backend=disabled` or
-`--skip-quota-preflight` is supplied.
+`--dry-run` renders the exact unit without installing it.
 
 ## Configuration
 
@@ -123,9 +120,6 @@ key_path=key.pem
 index_store_disks=/mnt/disk-00,/mnt/disk-01
 blob_store_disks=/mnt/disk-00,/mnt/disk-01
 fs_storage_path=/home/administrator/Server Deploy Test/fs-disk
-
-[quota_config]
-fragment_quota_backend=xfs_project
 
 [upload_config]
 data_shards=1
@@ -152,15 +146,11 @@ MASTER_KEY=change-this-master-key
 SIGNED_READ_URL_SECRET=change-this-signed-url-secret
 ```
 
-### Disk And Quota Notes
+### Disk And Capacity Notes
 
-N1 recommends XFS with project quota enabled for production fragment quotas:
-
-```bash
-sudo mount -o prjquota /dev/<device> /mnt/disk-00
-```
-
-Fragment quota is a storage partition limit. Creating a fragment requires `quota_bytes`. N1 refuses fragment creation when the requested quota exceeds available allocatable capacity.
+N1 is Linux-only and works with normal mounted disks. It uses `statvfs`-based
+capacity checks plus per-placement upload preflight so aggregate capacity and
+the placement-limiting disk are both considered before writes proceed.
 
 ### Fragment Identity Layout
 
@@ -217,8 +207,7 @@ curl -k "$BASE/n1/fragments" \
   -d '{
     "name": "mainframe",
     "secret": "'"$MASTER"'",
-    "key": "fragment-local-secret",
-    "quota_bytes": 322122547200
+    "key": "fragment-local-secret"
   }'
 ```
 
@@ -310,7 +299,7 @@ Fragment tokens carry independent permissions:
 - `version_id` is the persistent upload/object-version id. Multipart part upload and status use `version_id`; finalize also requires the `session_id` returned by init.
 - Empty trash and hard delete remove namespace references first. Blob bytes are reclaimed after GC proves no live or trash metadata references them.
 - Object status/repair is object-scoped. A repair or scrub for one object does not lock the whole fragment.
-- When an operation returns `503 Service Unavailable`, retry later. This can mean maintenance is running, object maintenance gates are saturated, or quota/disk provisioning prevents safe progress.
+- When an operation returns `503 Service Unavailable`, retry later. This can mean maintenance is running, object maintenance gates are saturated, or disk provisioning prevents safe progress.
 
 ## Native N1 Protocol
 
@@ -491,8 +480,8 @@ Fragment:
 - `fragment.list`
 - `fragment.hash`
 - `fragment.hash.public`
-- `fragment.quota`
-- `fragment.resize_quota`
+- `fragment.usage`
+- `capacity.usage`
 
 Typed stat example:
 
@@ -561,7 +550,7 @@ cargo run -p n1_shell -- --secret <secret> --fragment <fragment> shell
 The shell keeps one native session open and supports read/maintenance operations:
 
 - `health`
-- `quota`
+- `usage`
 - `fragments`
 - `list [path]`
 - `stat <path>`
@@ -639,7 +628,7 @@ Body:
 
 ### `POST /n1/fragments`
 
-Creates a quota-bound fragment. This route uses the master secret and does not use a fragment token.
+Creates a fragment. This route uses the master secret and does not use a fragment token.
 
 Body:
 
@@ -647,8 +636,7 @@ Body:
 {
   "name": "mainframe",
   "secret": "<MASTER_KEY>",
-  "key": "fragment-local-secret",
-  "quota_bytes": 322122547200
+  "key": "fragment-local-secret"
 }
 ```
 
@@ -723,32 +711,26 @@ N1 rejects the request if `confirm_fragment` does not exactly match `{fragment}`
 
 Returns system-level configured storage capacity and availability.
 
-### `GET /n1/capacity/quota`
+### `GET /n1/capacity/fragment`
 
-Returns quota usage for the authenticated fragment:
+Returns storage usage for the authenticated fragment, plus current server
+capacity totals:
 
 ```json
 {
   "fragment": "<fragment_hash>",
-  "quota_bytes": 322122547200,
+  "state": "active",
+  "committed_bytes": 104857600,
+  "reserved_bytes": 0,
+  "trash_bytes": 0,
   "used_bytes": 104857600,
-  "available_bytes": 322017689600,
-  "usage_percent": 0.0325,
-  "quota_enforced": true,
-  "quota_backend": "xfs_project"
-}
-```
-
-### `PATCH /n1/fragments/{fragment}/quota`
-
-Admin-driven quota resize.
-
-Body:
-
-```json
-{
-  "quota_bytes": 536870912000,
-  "secret": "<MASTER_KEY>"
+  "capacity_used": 1073741824,
+  "capacity_allocated": 1099511627776,
+  "capacity_available": 1098437885952,
+  "filesystem_count": 2,
+  "capacity_usage_percent": 0.0976,
+  "created_at_unix": 1778000000,
+  "updated_at_unix": 1778000001
 }
 ```
 
@@ -1370,13 +1352,9 @@ Useful query parameters:
 - `object_concurrency`
 - `status_batch`
 
-When filesystem project quota is enabled, redistribution preflights per-root fragment quota headroom before moving blob payloads. If a fragment is too close to its quota share, N1 fails fast with:
-
-```text
-fragment quota headroom insufficient for redistribution
-```
-
-That error means the operator should increase fragment quota, run GC if trash/orphans are expected, or disable strict quota only for controlled stress tests. N1 does this before migration to avoid repeated low-level `No space left on device` shard-write failures.
+Redistribution rewrites selected object versions into the current blob/EC
+topology. Upload and rewrite paths use the same disk-capacity and placement
+preflight model; if a disk is too full, N1 fails before unsafe shard writes.
 
 ## Realtime Namespace Websocket
 
@@ -1437,19 +1415,15 @@ Common mappings:
 - `409 Conflict`: existing fragment or running maintenance job
 - `413 Payload Too Large`: request exceeds configured size
 - `416 Range Not Satisfiable`: invalid range request
-- `503 Service Unavailable`: maintenance mode, saturated upload path, disk/quota provisioning issue
-- `507 Insufficient Storage`: quota/capacity limit reached
+- `503 Service Unavailable`: maintenance mode, saturated upload path, or disk provisioning issue
+- `507 Insufficient Storage`: capacity limit reached
 
 ## Troubleshooting
 
-### Fragment creation fails with quota errors
+### Fragment creation fails with disk errors
 
-Check that every fragment disk is mounted with project quota support and that N1 has permission to apply project quotas.
-
-```bash
-findmnt -no OPTIONS /mnt/disk-00
-sudo xfs_quota -x -c 'state' /mnt/disk-00
-```
+Check that every configured index and blob root exists, is mounted, and is
+writable by the N1 service user.
 
 ### Upload returns `Upload path is saturated`
 
@@ -1459,9 +1433,11 @@ The upload IO gate is protecting the server. Retry with backoff or lower client 
 
 This is expected. Empty trash retires the `.trash` namespace quickly and recreates an empty `.trash`. GC later reclaims unreferenced object metadata and blob payloads.
 
-### Redistribution fails with quota headroom insufficient
+### Redistribution fails with insufficient storage
 
-Redistribution can need temporary write headroom while it rebuilds shard placement. With filesystem project quota enabled, N1 checks that headroom before starting blob movement. Increase the fragment quota, run GC, or use a quota-disabled test profile when the goal is stress testing disk behavior instead of quota enforcement.
+Redistribution can need temporary write headroom while it rebuilds shard
+placement. Free capacity, run GC if trash/orphans are expected, or add blob
+capacity before retrying.
 
 ### Health shows degraded after disk loss
 

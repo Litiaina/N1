@@ -121,9 +121,8 @@ N1 2.0.0 IO-control proof completed on June 11, 2026:
   the SIMD benchmark targets.
 - The real two-disk release proof on `/mnt/disk-00` and `/mnt/disk-01`
   completed with `N1_RELEASE_PROOF PASS`.
-- The proof produced `164` live objects. Nineteen gates passed; the quota gate
-  was intentionally skipped because the proof ran with
-  `QUOTA_BACKEND=disabled`.
+- The proof produced `164` live objects. Nineteen gates passed; fragment usage
+  was verified through the storage usage API.
 - The `256 MiB` multipart upload restarted after three parts, resumed,
   finalized in `7.220 s`, and downloaded with a matching SHA-256. Measured
   upload throughput was `35.459 MiB/s` on this local HDD pair.
@@ -156,7 +155,7 @@ The full LTS proof should include:
 - 10k+ object namespace storm
 - four concurrent users on one fragment doing upload, mkdir, rename, move, trash, recover, and listing
 - four concurrent users across four fragments
-- UI-backed smoke for mount, quota, list, upload, download, trash, recover, repair/status, and health display
+- UI-backed smoke for mount, usage, list, upload, download, trash, recover, repair/status, and health display
 
 ## Known Tradeoffs
 

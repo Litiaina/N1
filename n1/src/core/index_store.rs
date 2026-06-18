@@ -9,8 +9,9 @@ use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_OBJECTS_DIR;
 use crate::core::fragment_identity::{
     FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_root_on as resolved_fragment_root_on,
-    list_fragment_aliases, physical_fragment_root_on, stable_fragment_id_for_root,
+    physical_fragment_root_on, stable_fragment_id_for_root,
 };
+use crate::core::linux_io;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
 use chrono::Utc;
@@ -19,8 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -46,22 +46,11 @@ pub(crate) const FRAGMENT_DIR_PREFIX: &str = PHYSICAL_FRAGMENT_PREFIX;
 const INTENTS_DIR: &str = ".intents";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
 static N1_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-const QUOTA_PROJECT_ID_FLOOR: u32 = 10_000;
-const QUOTA_PROJECT_ID_CEILING: u32 = 2_000_000_000;
-
-#[derive(Debug, Clone)]
-pub struct FragmentQuotaSpec {
-    pub fragment: String,
-    pub quota_bytes: u64,
-    pub quota_project_id: u32,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMeta {
     pub stable_fragment_id: String,
     pub state: String,
-    pub quota_bytes: u64,
-    pub quota_project_id: Option<u32>,
     pub committed_bytes: u64,
     pub reserved_bytes: u64,
     pub trash_bytes: u64,
@@ -165,6 +154,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
     Ok(rmp_serde::from_slice(bytes)?)
 }
 
+#[cfg(test)]
 fn encode_fragment_meta(meta: &FragmentMeta) -> Result<Vec<u8>, AppError> {
     Ok(rmp_serde::to_vec_named(meta)?)
 }
@@ -812,33 +802,11 @@ fn directory_entry(record: String) -> IndexListEntry {
 }
 
 fn sync_dir(path: &Path) {
-    if let Ok(dir) = OpenOptions::new().read(true).open(path) {
-        let _ = dir.sync_all();
-    }
+    let _ = linux_io::sync_dir_blocking(path);
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::InternalServerError(format!("N1 path {} has no parent", path.display()))
-    })?;
-    fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 parent dir"))?;
-    let tmp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("n1"),
-        Ulid::new()
-    ));
-    {
-        let mut file = File::create(&tmp).map_err(|e| io_err(e, "create N1 temp file"))?;
-        file.write_all(bytes)
-            .map_err(|e| io_err(e, "write N1 temp file"))?;
-        file.sync_all()
-            .map_err(|e| io_err(e, "sync N1 temp file"))?;
-    }
-    renameat(CWD, &tmp, CWD, path).map_err(|e| {
-        AppError::InternalServerError(format!("publish N1 file {}: {e}", path.display()))
-    })?;
-    sync_dir(parent);
-    Ok(())
+    linux_io::atomic_write_blocking(path, bytes).map_err(|e| io_err(e, "atomic write N1 file"))
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<bool, AppError> {
@@ -2324,14 +2292,6 @@ pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) ->
     }
 }
 
-fn default_project_id(fragment: &str) -> u32 {
-    let mut hasher = Sha256::new();
-    hasher.update(fragment.as_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let span = QUOTA_PROJECT_ID_CEILING - QUOTA_PROJECT_ID_FLOOR;
-    QUOTA_PROJECT_ID_FLOOR + (u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % span)
-}
-
 fn read_fragment_meta_from(root: &Path, fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
     let path = fragment_root_on(root, fragment).join(FRAGMENT_META_FILE);
     if !path.exists() {
@@ -2341,97 +2301,13 @@ fn read_fragment_meta_from(root: &Path, fragment: &str) -> Result<Option<Fragmen
     decode_fragment_meta(&bytes).map(Some)
 }
 
-fn write_fragment_meta(fragment: &str, meta: &FragmentMeta) -> Result<(), AppError> {
-    let bytes = encode_fragment_meta(meta)?;
-    for root in index_roots() {
-        write_atomic(
-            &fragment_root_on(&root, fragment).join(FRAGMENT_META_FILE),
-            &bytes,
-        )?;
-    }
-    Ok(())
-}
-
-pub fn fragment_quota_meta(fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
+pub fn fragment_meta(fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
     for root in index_roots() {
         if let Some(meta) = read_fragment_meta_from(&root, fragment)? {
             return Ok(Some(meta));
         }
     }
     Ok(None)
-}
-
-pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppError> {
-    ensure_fragment_dirs(fragment)?;
-    let now = Utc::now().timestamp();
-    let stable_fragment_id = stable_fragment_id_for_fragment(fragment);
-    let mut meta = fragment_quota_meta(fragment)?.unwrap_or(FragmentMeta {
-        stable_fragment_id: stable_fragment_id.clone(),
-        state: "active".to_string(),
-        quota_bytes,
-        quota_project_id: Some(default_project_id(&stable_fragment_id)),
-        committed_bytes: 0,
-        reserved_bytes: 0,
-        trash_bytes: 0,
-        created_at_unix: now,
-        updated_at_unix: now,
-        key_phc: None,
-        nt_hash_hex: None,
-        index_partition_count: crate::core::fragment_metadata::configured_index_partition_count(),
-    });
-    meta.quota_bytes = quota_bytes;
-    meta.updated_at_unix = now;
-    meta.stable_fragment_id = stable_fragment_id.clone();
-    if meta.quota_project_id.is_none() {
-        meta.quota_project_id = Some(default_project_id(&stable_fragment_id));
-    }
-    write_fragment_meta(fragment, &meta)
-}
-
-pub fn ensure_fragment_quota_project_id(fragment: &str) -> Result<u32, AppError> {
-    let stable_fragment_id = stable_fragment_id_for_fragment(fragment);
-    let project_id = fragment_quota_meta(fragment)?
-        .and_then(|meta| meta.quota_project_id)
-        .unwrap_or_else(|| default_project_id(&stable_fragment_id));
-    let quota = fragment_quota_meta(fragment)?
-        .map(|meta| meta.quota_bytes)
-        .unwrap_or(0);
-    let _ = set_fragment_quota(fragment, quota);
-    Ok(project_id)
-}
-
-pub fn active_fragment_quota_specs() -> Result<Vec<FragmentQuotaSpec>, AppError> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for root in index_roots() {
-        if !root.is_dir() {
-            continue;
-        }
-        for name in list_fragment_aliases(&root) {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            if let Some(meta) = fragment_quota_meta(&name)? {
-                if meta.state == "active" && meta.quota_bytes > 0 {
-                    out.push(FragmentQuotaSpec {
-                        fragment: name,
-                        quota_bytes: meta.quota_bytes,
-                        quota_project_id: meta
-                            .quota_project_id
-                            .unwrap_or_else(|| default_project_id(&meta.stable_fragment_id)),
-                    });
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-pub fn active_fragment_quota_bytes() -> Result<u64, AppError> {
-    Ok(active_fragment_quota_specs()?
-        .into_iter()
-        .map(|spec| spec.quota_bytes)
-        .sum())
 }
 
 pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
@@ -2882,8 +2758,6 @@ mod tests {
         let meta = FragmentMeta {
             stable_fragment_id: "01KSTABLEFRAGMENT000000000".to_string(),
             state: "active".to_string(),
-            quota_bytes: 0,
-            quota_project_id: Some(12_345),
             committed_bytes: 0,
             reserved_bytes: 0,
             trash_bytes: 0,
@@ -2904,7 +2778,6 @@ mod tests {
         let decoded = decode_fragment_meta(&encoded).expect("decode named fragment metadata");
         assert_eq!(decoded.stable_fragment_id, meta.stable_fragment_id);
         assert_eq!(decoded.state, "active");
-        assert_eq!(decoded.quota_project_id, Some(12_345));
         assert_eq!(decoded.index_partition_count, 64);
     }
 

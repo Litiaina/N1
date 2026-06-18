@@ -207,7 +207,7 @@ impl Proof {
         expected_sha: &str,
     ) -> ProofResult<Value> {
         let version_id = self.latest_version_id(object_key).await?;
-        let removed = self.remove_one_shard(&version_id)?;
+        let removed = self.remove_one_data_shard(&version_id)?;
         self.assert_download_sha256(object_key, expected_sha)
             .await?;
         self.wait_for_path(&removed, true, Duration::from_secs(30))

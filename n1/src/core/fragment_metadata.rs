@@ -1,6 +1,7 @@
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity;
 use crate::core::index_store::FragmentMeta as IndexFragmentMeta;
+use crate::core::linux_io;
 use crate::{core::constants::FRAGMENT_METADATA_FILE, enums::app_error_enum::AppError};
 
 use argon2::{
@@ -12,8 +13,6 @@ use md4::{Digest as Md4Digest, Md4};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
-use tokio::io::AsyncWriteExt;
-use ulid::Ulid;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,52 +132,8 @@ fn fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
     fragment_identity::fragment_root_on(root, fragment_hash).join(FRAGMENT_METADATA_FILE)
 }
 
-async fn sync_dir(dir: &Path) -> Result<(), AppError> {
-    let f = tokio_fs::File::open(dir)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open dir {}", dir.display())))?;
-    f.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, format!("sync dir {}", dir.display())))?;
-    Ok(())
-}
-
 async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::InternalServerError(format!("missing parent for {}", path.display()))
-    })?;
-
-    tokio_fs::create_dir_all(parent)
-        .await
-        .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
-
-    let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("file");
-
-    let tmp = parent.join(format!(".{}.tmp.{}", file_name, Ulid::new().to_string()));
-
-    let mut f = tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create tmp {}", tmp.display())))?;
-
-    f.write_all(bytes)
-        .await
-        .map_err(|e| AppError::Io(e, format!("write tmp {}", tmp.display())))?;
-
-    f.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, format!("sync tmp {}", tmp.display())))?;
-
-    drop(f);
-
-    tokio_fs::rename(&tmp, path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), path.display())))?;
-
-    sync_dir(parent).await?;
-    Ok(())
+    linux_io::atomic_write(path, bytes.to_vec()).await
 }
 
 async fn read_index_fragment_meta_if_exists(
@@ -357,8 +312,6 @@ async fn write_fragment_metadata_with_policy(
             Ok(None) => IndexFragmentMeta {
                 stable_fragment_id: meta.stable_fragment_id.clone(),
                 state: "active".to_string(),
-                quota_bytes: 0,
-                quota_project_id: None,
                 committed_bytes: 0,
                 reserved_bytes: 0,
                 trash_bytes: 0,
@@ -503,8 +456,6 @@ mod tests {
         let current = IndexFragmentMeta {
             stable_fragment_id: "01KSTABLEFRAGMENT000000000".to_string(),
             state: "active".to_string(),
-            quota_bytes: 1024,
-            quota_project_id: Some(12_345),
             committed_bytes: 0,
             reserved_bytes: 0,
             trash_bytes: 0,
@@ -547,8 +498,6 @@ mod tests {
         #[derive(Serialize)]
         struct MissingIdentity<'a> {
             state: &'a str,
-            quota_bytes: u64,
-            quota_project_id: Option<u32>,
             committed_bytes: u64,
             reserved_bytes: u64,
             trash_bytes: u64,
@@ -561,8 +510,6 @@ mod tests {
 
         let raw = rmp_serde::to_vec_named(&MissingIdentity {
             state: "active",
-            quota_bytes: 0,
-            quota_project_id: None,
             committed_bytes: 0,
             reserved_bytes: 0,
             trash_bytes: 0,

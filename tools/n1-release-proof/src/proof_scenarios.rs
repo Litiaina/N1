@@ -60,20 +60,8 @@ impl Proof {
         let permissions = self.permission_boundary_proof(&mut live_expected).await?;
         evidence.push(json!({"gate": "auth_permission_boundaries", "status": "PASS"}));
 
-        let quota = if self.quota_backend_enforced() {
-            let quota = self.quota_api_proof().await?;
-            evidence.push(json!({"gate": "quota_api_and_usage", "status": "PASS"}));
-            quota
-        } else {
-            let quota = json!({
-                "status": "SKIP",
-                "reason": "quota backend disabled for release proof stress run",
-                "quota_backend": self.args.quota_backend,
-                "quota_bytes": self.args.quota_bytes,
-            });
-            evidence.push(json!({"gate": "quota_api_and_usage", "status": "SKIP"}));
-            quota
-        };
+        let fragment_usage = self.fragment_usage_api_proof().await?;
+        evidence.push(json!({"gate": "fragment_usage_api", "status": "PASS"}));
 
         let rename_lineage = self
             .rename_version_lineage_proof(&mut live_expected)
@@ -180,6 +168,7 @@ impl Proof {
             "source_sha256": local_sha,
             "download_sha256": downloaded_sha,
             "max_part_size": self.args.max_part_size,
+            "rate_limiter_enabled": self.args.rate_limiter_enabled,
             "native_protocol": native_protocol,
             "upload": upload,
             "additional_large_multipart": additional_large,
@@ -189,7 +178,7 @@ impl Proof {
             "same_key_version_contention": version_contention,
             "multi_fragment_user_isolation": multi_fragment,
             "permissions": permissions,
-            "quota": quota,
+            "fragment_usage": fragment_usage,
             "rename_version_lineage": rename_lineage,
             "websocket": websocket,
             "crud": crud,
