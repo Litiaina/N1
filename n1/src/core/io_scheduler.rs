@@ -476,16 +476,6 @@ async fn acquire_disk_io_inner(
     context: &str,
 ) -> Result<DiskIoGuard, AppError> {
     loop {
-        let total = TOTAL_GATE
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::InternalServerError("disk scheduler closed".into()))?;
-        let class_permit = class_gate(class)
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::InternalServerError("disk scheduler class closed".into()))?;
         let fragment_permit = match fragment {
             Some(fragment) => Some(
                 fragment_gate(class, fragment)?
@@ -497,6 +487,16 @@ async fn acquire_disk_io_inner(
             ),
             None => None,
         };
+        let total = TOTAL_GATE
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::InternalServerError("disk scheduler closed".into()))?;
+        let class_permit = class_gate(class)
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::InternalServerError("disk scheduler class closed".into()))?;
 
         match register_active(
             class,
@@ -678,10 +678,12 @@ fn derive_scheduler_config(max_concurrent_io: usize, blob_roots: usize) -> DiskI
     let background = (foreground / 4).max(1).min(disk_floor.max(1)).min(8);
     let total = foreground.saturating_add(background).max(1);
     let foreground_per_fragment = match blob_roots {
-        0..=2 => 1,
-        3 | 4 => (foreground / 2).max(2).min(blob_roots),
-        _ => (foreground / 2).max(2).min(blob_roots.saturating_mul(2)),
-    };
+        0 | 1 => foreground.min(4),
+        2 => foreground.min(6),
+        3 | 4 => foreground.min(blob_roots.saturating_mul(2)),
+        _ => foreground.min(blob_roots.saturating_mul(2)).min(16),
+    }
+    .max(1);
     let background_per_fragment = (background / 2).max(1);
 
     DiskIoSchedulerConfig {
@@ -703,7 +705,7 @@ mod tests {
         assert_eq!(cfg.foreground_permits, 8);
         assert_eq!(cfg.background_permits, 2);
         assert_eq!(cfg.total_permits, 10);
-        assert_eq!(cfg.foreground_per_fragment_permits, 1);
+        assert_eq!(cfg.foreground_per_fragment_permits, 6);
         assert_eq!(cfg.background_per_fragment_permits, 1);
     }
 
@@ -713,8 +715,15 @@ mod tests {
         assert_eq!(cfg.foreground_permits, 2);
         assert_eq!(cfg.background_permits, 1);
         assert_eq!(cfg.total_permits, 3);
-        assert_eq!(cfg.foreground_per_fragment_permits, 1);
+        assert_eq!(cfg.foreground_per_fragment_permits, 2);
         assert_eq!(cfg.background_per_fragment_permits, 1);
+    }
+
+    #[test]
+    fn scheduler_config_bounds_single_fragment_without_serializing_uploads() {
+        let cfg = derive_scheduler_config(16, 1);
+        assert_eq!(cfg.foreground_permits, 16);
+        assert_eq!(cfg.foreground_per_fragment_permits, 4);
     }
 
     #[test]

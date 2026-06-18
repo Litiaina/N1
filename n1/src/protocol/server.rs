@@ -1,3 +1,4 @@
+use crate::core::io_scheduler::IoProgress;
 use crate::core::upload::{AdaptiveIoGuard, acquire_upload_io_guard_for_query};
 use crate::enums::app_error_enum::AppError;
 use crate::protocol::auth::NativeSession;
@@ -248,10 +249,12 @@ async fn execute_native_streaming_body(
         None
     };
 
+    let progress = pre_gate.as_ref().map(AdaptiveIoGuard::progress_handle);
     let (result, remaining) = {
         let mut body_reader = NativeSocketReader {
             stream,
             remaining: body_len,
+            progress,
         };
         let result = execute_native_streaming_reader(
             state,
@@ -274,7 +277,13 @@ async fn execute_native_streaming_body(
         }
     }
 
-    drop(pre_gate);
+    if result.is_ok() && remaining == 0 {
+        if let Some(guard) = pre_gate {
+            guard.complete();
+        }
+    } else {
+        drop(pre_gate);
+    }
     result
 }
 
@@ -317,6 +326,7 @@ async fn execute_native_streaming_response_body(
 struct NativeSocketReader<'a> {
     stream: &'a mut TcpStream,
     remaining: u64,
+    progress: Option<IoProgress>,
 }
 
 impl AsyncRead for NativeSocketReader<'_> {
@@ -354,6 +364,9 @@ impl AsyncRead for NativeSocketReader<'_> {
                 }
                 buf.advance(read);
                 this.remaining = this.remaining.saturating_sub(read as u64);
+                if let Some(progress) = &this.progress {
+                    progress.record(read as u64);
+                }
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),

@@ -103,11 +103,11 @@ fn adaptive_max_concurrent_io(
 ) -> usize {
     let core_cap = (cpu_cores.saturating_mul(2)).clamp(1, 64);
     let disk_cap = match blob_disks {
-        0 | 1 => 1,
-        2 => 2,
-        3 => 4,
-        4 => 6,
-        _ => blob_disks.saturating_mul(2),
+        0 | 1 => 4,
+        2 => 6,
+        3 => 8,
+        4 => 12,
+        _ => blob_disks.saturating_mul(3),
     }
     .clamp(1, 64);
     let ram_cap = match ram_gib(ram_bytes) {

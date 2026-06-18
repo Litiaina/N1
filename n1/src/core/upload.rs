@@ -140,11 +140,11 @@ pub(crate) struct AdaptiveIoGuard {
 }
 
 impl AdaptiveIoGuard {
-    fn progress_handle(&self) -> IoProgress {
+    pub(crate) fn progress_handle(&self) -> IoProgress {
         self.guard.progress_handle()
     }
 
-    fn complete(self) {
+    pub(crate) fn complete(self) {
         self.guard.complete();
     }
 }
