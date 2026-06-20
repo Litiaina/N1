@@ -53,7 +53,7 @@ pub async fn enforce_storage_limit(
     if total_storage >= allocated_storage {
         return (
             StatusCode::INSUFFICIENT_STORAGE,
-            "Your personal storage quota has been exceeded",
+            "Your personal storage capacity has been exceeded",
         )
             .into_response();
     }

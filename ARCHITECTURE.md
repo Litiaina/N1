@@ -177,7 +177,7 @@ without decoding the MessagePack body.
 Object metadata follows the object's erasure participants:
 
 ```text
-object version uses node-a, node-b, node-c
+object uses node-a, node-b, node-c
   -> node-a stores local shard(s) + identical .ncdx
   -> node-b stores local shard(s) + identical .ncdx
   -> node-c stores local shard(s) + identical .ncdx
@@ -186,6 +186,13 @@ object version uses node-a, node-b, node-c
 N2 does not replicate object metadata across every index disk or every cluster
 node. The erasure participants already define the durable object set. Metadata
 resolution queries those participants and rejects divergent immutable copies.
+
+Placement is stable by object identity, not by version ID. New versions of the
+same immutable object ID use the same bounded participant set, while each
+committed version still records its exact membership epoch, EC shape, and shard
+locators. This lets N2 resolve a namespace `@o_<object-id>` head by querying a
+bounded object holder set instead of broadcasting metadata reads to the whole
+cluster. Older or layout-drifted objects can fall back to wider discovery.
 
 If a node has several blob roots, shard placement rotates over those roots.
 `.ncdx` is written only where that node has a shard-bearing version directory.
@@ -306,7 +313,7 @@ are reclaimed by maintenance.
 client read on any node
   -> resolve logical path through fragment namespace voter
   -> obtain immutable object ID
-  -> resolve max-ULID .ncdx from shard participants
+  -> resolve max-ULID .ncdx from bounded object participants
   -> use that version's recorded placement
   -> fetch sufficient shard ranges over n2://
   -> stream directly when healthy
@@ -466,7 +473,7 @@ client -> gateway -> healthy N2 node
 ```
 
 It performs node health selection and forwards streaming requests. It is not
-namespace, object, placement, maintenance, quota, or resumability authority.
+namespace, object, placement, maintenance, capacity admission, or resumability authority.
 Multipart coordinator ownership remains a client-visible N2 rule.
 
 ## Monitoring And IO Control

@@ -12,9 +12,6 @@ use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use crate::core::quota_manager::{
-    FragmentQuotaBackend, apply_all_fragment_project_quotas, configure_fragment_quota_backend,
-};
 use crate::core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
@@ -102,11 +99,11 @@ fn adaptive_max_concurrent_io(
 ) -> usize {
     let core_cap = (cpu_cores.saturating_mul(2)).clamp(1, 64);
     let disk_cap = match blob_disks {
-        0 | 1 => 1,
-        2 => 2,
-        3 => 4,
-        4 => 6,
-        _ => blob_disks.saturating_mul(2),
+        0 | 1 => 4,
+        2 => 6,
+        3 => 8,
+        4 => 12,
+        _ => blob_disks.saturating_mul(3),
     }
     .clamp(1, 64);
     let ram_cap = match ram_gib(ram_bytes) {
@@ -773,20 +770,6 @@ pub async fn run_server() {
         cluster_runtime.membership_path.display(),
         cluster_runtime.auto_rebalance
     );
-
-    let quota_section = config.section(Some("quota_config"));
-    let fragment_quota_backend =
-        FragmentQuotaBackend::parse(quota_section.and_then(|s| s.get("fragment_quota_backend")))
-            .unwrap_or_else(|err| panic!("Invalid quota_config.fragment_quota_backend: {}", err));
-    configure_fragment_quota_backend(fragment_quota_backend)
-        .expect("Double initialization of fragment quota backend");
-    tracing::info!(
-        "Fragment usage accounting: enforcement=disabled backend_config={}",
-        fragment_quota_backend.as_str()
-    );
-    if let Err(err) = apply_all_fragment_project_quotas().await {
-        panic!("N2 startup quota validation failed: {}", err);
-    }
 
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();

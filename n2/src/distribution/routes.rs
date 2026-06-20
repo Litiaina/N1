@@ -62,8 +62,7 @@ pub struct ClusterUsageResponse {
     pub membership_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragment: Option<String>,
-    pub quota_enforced: bool,
-    pub monitoring_only: bool,
+    pub capacity_admission_enabled: bool,
     pub nodes: Vec<ClusterNodeUsage>,
     pub cluster_capacity_total_bytes: u64,
     pub cluster_capacity_used_bytes: u64,
@@ -249,8 +248,7 @@ pub async fn cluster_usage_snapshot(
     Ok(ClusterUsageResponse {
         membership_epoch: runtime.membership.epoch,
         fragment,
-        quota_enforced: false,
-        monitoring_only: true,
+        capacity_admission_enabled: true,
         nodes,
         cluster_capacity_total_bytes,
         cluster_capacity_used_bytes,

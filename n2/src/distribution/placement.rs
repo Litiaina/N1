@@ -33,13 +33,13 @@ pub struct ClusterPlacementPlan {
     pub adaptive_without_rebalance: bool,
 }
 
-fn placement_score(fragment: &str, object_key: &str, version_id: &str, node_id: &str) -> [u8; 32] {
+fn placement_score(fragment: &str, object_key: &str, node_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(b"n2-placement-v2");
+    hasher.update([0]);
     hasher.update(fragment.as_bytes());
     hasher.update([0]);
     hasher.update(object_key.as_bytes());
-    hasher.update([0]);
-    hasher.update(version_id.as_bytes());
     hasher.update([0]);
     hasher.update(node_id.as_bytes());
     hasher.finalize().into()
@@ -66,12 +66,7 @@ pub fn build_placement_plan(
 
     let mut scored = candidates
         .iter()
-        .map(|node| {
-            (
-                placement_score(fragment, object_key, version_id, &node.id),
-                node,
-            )
-        })
+        .map(|node| (placement_score(fragment, object_key, &node.id), node))
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.id.cmp(&right.1.id)));
 
@@ -137,5 +132,27 @@ mod tests {
         assert_eq!(left.placements.len(), 3);
         assert_eq!(left.placements[0].role, ClusterShardRole::Data);
         assert_eq!(left.placements[2].role, ClusterShardRole::Parity);
+    }
+
+    #[test]
+    fn placement_is_stable_across_versions_for_bounded_head_lookup() {
+        let nodes = vec![node("a"), node("b"), node("c"), node("d"), node("e")];
+        let layout = ClusterEcLayout {
+            data_shards: 2,
+            parity_shards: 1,
+        };
+        let first = build_placement_plan("frag", "obj", "01VERSIONA", 7, layout, &nodes).unwrap();
+        let second = build_placement_plan("frag", "obj", "01VERSIONB", 7, layout, &nodes).unwrap();
+        let first_nodes = first
+            .placements
+            .iter()
+            .map(|placement| placement.node_id.as_str())
+            .collect::<Vec<_>>();
+        let second_nodes = second
+            .placements
+            .iter()
+            .map(|placement| placement.node_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(first_nodes, second_nodes);
     }
 }

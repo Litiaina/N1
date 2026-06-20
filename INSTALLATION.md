@@ -215,9 +215,6 @@ fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false
 
-[quota_config]
-fragment_quota_backend=disabled
-
 [garbage_collector]
 cleanup_interval_seconds=3600
 file_ttl_seconds=3600

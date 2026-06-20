@@ -15,7 +15,6 @@ use chrono::Utc;
 use rustix::fs::{CWD, Dir, Mode, OFlags, renameat};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -42,22 +41,10 @@ pub(crate) const FRAGMENT_DIR_PREFIX: &str = PHYSICAL_FRAGMENT_PREFIX;
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
 pub(crate) const BLOB_DIR: &str = N2_BLOB_DIR;
 
-const QUOTA_PROJECT_ID_FLOOR: u32 = 10_000;
-const QUOTA_PROJECT_ID_CEILING: u32 = 2_000_000_000;
-
-#[derive(Debug, Clone)]
-pub struct FragmentQuotaSpec {
-    pub fragment: String,
-    pub quota_bytes: u64,
-    pub quota_project_id: u32,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMeta {
     pub fragment_id: String,
     pub state: String,
-    pub quota_bytes: u64,
-    pub quota_project_id: Option<u32>,
     pub committed_bytes: u64,
     pub reserved_bytes: u64,
     pub trash_bytes: u64,
@@ -215,6 +202,15 @@ fn index_roots() -> Vec<PathBuf> {
 
 fn blob_roots() -> Vec<PathBuf> {
     ObjectPathManager::new().get_blob_roots()
+}
+
+fn stable_fragment_id_for_fragment(fragment: &str) -> String {
+    for root in index_roots() {
+        if let Some(stable) = stable_fragment_id_for_root(&root, fragment) {
+            return stable;
+        }
+    }
+    fragment.to_string()
 }
 
 pub(crate) fn fragment_root_on(root: &Path, fragment: &str) -> PathBuf {
@@ -1915,49 +1911,6 @@ fn count_object_records(root: &Path, fragment: &str) -> u64 {
     count
 }
 
-fn default_project_id(fragment: &str) -> u32 {
-    let mut hasher = Sha256::new();
-    hasher.update(fragment.as_bytes());
-    let hash: [u8; 32] = hasher.finalize().into();
-    let span = QUOTA_PROJECT_ID_CEILING - QUOTA_PROJECT_ID_FLOOR;
-    QUOTA_PROJECT_ID_FLOOR + (u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % span)
-}
-
-fn stable_fragment_id_for_fragment(fragment: &str) -> String {
-    for root in index_roots() {
-        if let Some(stable) = stable_fragment_id_for_root(&root, fragment) {
-            return stable;
-        }
-    }
-    fragment.to_string()
-}
-
-pub fn fragment_quota_meta(fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
-    let _ = fragment;
-    Ok(None)
-}
-
-pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppError> {
-    let _ = (fragment, quota_bytes);
-    Ok(())
-}
-
-pub fn ensure_fragment_quota_project_id(fragment: &str) -> Result<u32, AppError> {
-    let stable_fragment_id = stable_fragment_id_for_fragment(fragment);
-    Ok(default_project_id(&stable_fragment_id))
-}
-
-pub fn active_fragment_quota_specs() -> Result<Vec<FragmentQuotaSpec>, AppError> {
-    Ok(Vec::new())
-}
-
-pub fn active_fragment_quota_bytes() -> Result<u64, AppError> {
-    Ok(active_fragment_quota_specs()?
-        .into_iter()
-        .map(|spec| spec.quota_bytes)
-        .sum())
-}
-
 pub fn open_session(
     manifest: &UploadSessionManifest,
     reservation: Option<ReservationReceipt>,
@@ -2233,8 +2186,6 @@ mod tests {
         let meta = FragmentMeta {
             fragment_id: "frag".to_string(),
             state: "active".to_string(),
-            quota_bytes: 0,
-            quota_project_id: Some(12_345),
             committed_bytes: 0,
             reserved_bytes: 0,
             trash_bytes: 0,
@@ -2255,7 +2206,6 @@ mod tests {
             rmp_serde::from_slice(&encoded).expect("decode named fragment metadata");
         assert_eq!(decoded.fragment_id, meta.fragment_id);
         assert_eq!(decoded.state, "active");
-        assert_eq!(decoded.quota_project_id, Some(12_345));
     }
 
     fn test_metadata(fragment: &str, object_key: &str, size: u64) -> ObjectMetadata {

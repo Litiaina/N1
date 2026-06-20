@@ -22,7 +22,8 @@ BIN="$ROOT_DIR/target/release/litiaina-n2"
 CERT="$ROOT_DIR/certificates/cert.pem"
 KEY="$ROOT_DIR/certificates/key.pem"
 TS="$(date +%Y%m%d-%H%M%S)"
-OUT="$ROOT_DIR/.n2-bench/capacity-expansion-proof-$TS"
+N2_PROOF_OUT_ROOT="${N2_PROOF_OUT_ROOT:-$ROOT_DIR/.n2-bench}"
+OUT="$N2_PROOF_OUT_ROOT/capacity-expansion-proof-$TS"
 LROOT="$LOCAL_HDD_ROOT/n2-capacity-expansion-$TS/node-a"
 RROOT="$REMOTE_HDD_ROOT/n2-capacity-expansion-$TS/node-b"
 CROOT="$REMOTE2_HDD_ROOT/n2-capacity-expansion-$TS/node-c"
@@ -116,9 +117,6 @@ fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false
 
-[quota_config]
-fragment_quota_backend=disabled
-
 [garbage_collector]
 cleanup_interval_seconds=3600
 file_ttl_seconds=3600
@@ -187,6 +185,8 @@ ssh_b "rm -rf '$RROOT' && mkdir -p '$RROOT/index' '$RROOT/blob' '$RROOT/fs'"
 ssh_c "rm -rf '$CROOT' && mkdir -p '$CROOT/index' '$CROOT/blob' '$CROOT/fs'"
 scp_b "$BIN" "$CERT" "$KEY" administrator@"$REMOTE_IP":"$RROOT/" >/dev/null
 scp_c "$BIN" "$CERT" "$KEY" administrator@"$REMOTE2_IP":"$CROOT/" >/dev/null
+ssh_b "chmod +x '$RROOT/litiaina-n2'"
+ssh_c "chmod +x '$CROOT/litiaina-n2'"
 write_env "$LROOT/n2.env"
 scp_b "$LROOT/n2.env" administrator@"$REMOTE_IP":"$RROOT/n2.env" >/dev/null
 scp_c "$LROOT/n2.env" administrator@"$REMOTE2_IP":"$CROOT/n2.env" >/dev/null

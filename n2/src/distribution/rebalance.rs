@@ -809,17 +809,20 @@ pub async fn run_rewrite_fragment_once(
             out.scanned = out.scanned.saturating_add(1);
             out.last_object = Some(entry.path.clone());
             out.budget = Some(budget.snapshot());
-            let meta =
-                match index::read_object_version(&req.fragment, &entry.object_id, &entry.version_id)
-                    .await
-                {
-                    Ok(meta) => meta,
-                    Err(err) => {
-                        out.failed = out.failed.saturating_add(1);
-                        out.last_error = Some(err.to_string());
-                        continue;
-                    }
-                };
+            let meta = match index::read_object_version(
+                &req.fragment,
+                &entry.object_id,
+                &entry.version_id,
+            )
+            .await
+            {
+                Ok(meta) => meta,
+                Err(err) => {
+                    out.failed = out.failed.saturating_add(1);
+                    out.last_error = Some(err.to_string());
+                    continue;
+                }
+            };
             let should_rewrite = if repair_only {
                 object_has_unreadable_shard(&meta).await
             } else if req.mismatched_only {

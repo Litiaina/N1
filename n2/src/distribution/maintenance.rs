@@ -1,16 +1,12 @@
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity::{list_fragment_aliases, stable_fragment_id_for_root};
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
-use crate::core::garbage_collector::{
-    GcJobStatus, get_gc_status, start_garbage_collector_job,
-};
+use crate::core::garbage_collector::{GcJobStatus, get_gc_status, start_garbage_collector_job};
 use crate::distribution::membership::{
     ClusterNode, active_cluster_runtime, live_active_write_nodes,
 };
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
-use crate::distribution::rebalance::{
-    ClusterRebalanceRequest, run_rewrite_fragment_once,
-};
+use crate::distribution::rebalance::{ClusterRebalanceRequest, run_rewrite_fragment_once};
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -417,9 +413,9 @@ fn begin_peer_maintenance(
     let runtime = active_cluster_runtime()?;
     let local_node_id = runtime.local_node_id.clone();
     {
-        let guard = PEER_STATUS
-            .lock()
-            .map_err(|_| AppError::InternalServerError("N2 peer maintenance lock poisoned".into()))?;
+        let guard = PEER_STATUS.lock().map_err(|_| {
+            AppError::InternalServerError("N2 peer maintenance lock poisoned".into())
+        })?;
         if guard.values().any(|status| status.running) {
             return Err(AppError::Conflict(
                 "N2 peer maintenance is already running on this node".into(),
@@ -467,15 +463,22 @@ async fn post_peer_start(
     req: &PeerDistributedMaintenanceRequest,
 ) -> Result<DistributedMaintenanceStatus, AppError> {
     let client = peer_http_client()?;
-    let url = format!("{}/n2/peer/maintenance/start", endpoint.trim_end_matches('/'));
+    let url = format!(
+        "{}/n2/peer/maintenance/start",
+        endpoint.trim_end_matches('/')
+    );
     let mut request = client.post(url).json(req);
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
     }
     let response = timeout(PEER_MAINTENANCE_TIMEOUT, request.send())
         .await
-        .map_err(|_| AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint} timed out")))?
-        .map_err(|err| AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint}: {err}")))?;
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint} timed out"))
+        })?
+        .map_err(|err| {
+            AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint}: {err}"))
+        })?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -486,7 +489,9 @@ async fn post_peer_start(
     response
         .json::<DistributedMaintenanceStatus>()
         .await
-        .map_err(|err| AppError::InternalServerError(format!("decode N2 maintenance peer response: {err}")))
+        .map_err(|err| {
+            AppError::InternalServerError(format!("decode N2 maintenance peer response: {err}"))
+        })
 }
 
 async fn get_peer_remote_status(
@@ -505,8 +510,12 @@ async fn get_peer_remote_status(
     }
     let response = timeout(PEER_MAINTENANCE_TIMEOUT, request.send())
         .await
-        .map_err(|_| AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint} status timed out")))?
-        .map_err(|err| AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint} status: {err}")))?;
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint} status timed out"))
+        })?
+        .map_err(|err| {
+            AppError::ServiceUnavailable(format!("N2 maintenance peer {endpoint} status: {err}"))
+        })?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -517,7 +526,9 @@ async fn get_peer_remote_status(
     response
         .json::<DistributedMaintenanceStatus>()
         .await
-        .map_err(|err| AppError::InternalServerError(format!("decode N2 maintenance peer status: {err}")))
+        .map_err(|err| {
+            AppError::InternalServerError(format!("decode N2 maintenance peer status: {err}"))
+        })
 }
 
 fn coordinator_status_snapshot() -> DistributedMaintenanceStatus {
@@ -527,7 +538,9 @@ fn coordinator_status_snapshot() -> DistributedMaintenanceStatus {
         .unwrap_or_default()
 }
 
-async fn resolve_request_fragments(req: &DistributedMaintenanceRequest) -> Result<Vec<String>, AppError> {
+async fn resolve_request_fragments(
+    req: &DistributedMaintenanceRequest,
+) -> Result<Vec<String>, AppError> {
     if req.fragments.is_empty() {
         let fragments = discover_local_fragments();
         if fragments.is_empty() {
@@ -682,9 +695,8 @@ async fn refresh_distributed_status() -> DistributedMaintenanceStatus {
                 }
             }
         } else {
-            peer_jobs.push(async move {
-                get_peer_remote_status(&node.endpoint, &job_id).await.ok()
-            });
+            peer_jobs
+                .push(async move { get_peer_remote_status(&node.endpoint, &job_id).await.ok() });
         }
     }
     for peer_status in join_all(peer_jobs).await.into_iter().flatten() {
@@ -724,9 +736,7 @@ pub async fn peer_distributed_maintenance_status(
     Path(job_id): Path<String>,
 ) -> Result<Json<DistributedMaintenanceStatus>, AppError> {
     authorize_peer(&headers)?;
-    get_peer_status(&job_id)
-        .map(Json)
-        .ok_or(AppError::NotFound)
+    get_peer_status(&job_id).map(Json).ok_or(AppError::NotFound)
 }
 
 pub fn build_distributed_maintenance_peer_routes() -> Router<Arc<AppState>> {

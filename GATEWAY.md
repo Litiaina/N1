@@ -3,7 +3,7 @@
 N2 Gateway is the user-facing front door for N2 clusters.
 
 It is not storage authority. It does not own namespace truth, object metadata,
-cluster placement, repair, rebalance, quota enforcement, or multipart
+cluster placement, repair, rebalance, capacity admission, or multipart
 resumability state. Its job is to route user traffic to healthy N2 nodes and
 return the selected coordinator to the client.
 
@@ -156,9 +156,6 @@ native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
 cluster_layout_mode=auto
 auto_rebalance=false
-
-[quota_config]
-fragment_quota_backend=disabled
 ```
 
 For a three-node cluster, the gateway config should point to each node:

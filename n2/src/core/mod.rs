@@ -1,5 +1,6 @@
 pub mod adaptive_concurrency;
 pub mod archive;
+pub mod capacity_manager;
 pub mod constants;
 pub mod delete;
 pub mod disk_manager;
@@ -19,7 +20,6 @@ pub mod modify;
 pub mod monitoring;
 pub mod object_parser;
 pub mod operation_gate;
-pub mod quota_manager;
 pub mod recovery;
 pub mod redistribution;
 pub mod repair_manager;

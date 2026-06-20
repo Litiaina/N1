@@ -28,9 +28,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("fixed_parity_shards", "")
         .set("auto_rebalance", "false");
 
-    conf.with_section(Some("quota_config"))
-        .set("fragment_quota_backend", "disabled");
-
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
         .set("file_ttl_seconds", "3600")

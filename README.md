@@ -192,9 +192,6 @@ auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false
-
-[quota_config]
-fragment_quota_backend=disabled
 ```
 
 For multi-node clusters, every node uses its own `node_id`, HTTP endpoint,
@@ -338,7 +335,7 @@ Distributed GC: 4 fragments scanned, failed=0
   remain release-validation work.
 - Earlier development layouts are intentionally rejected rather than migrated;
   the 1.0 line uses the documented index/blob role split.
-- Per-fragment quota is monitoring-only in N2. Enforcement belongs in a
-  business layer outside this repository.
+- N2 exposes capacity monitoring and full-disk admission only. Per-user or
+  per-fragment business limits belong outside N2.
 - S3 compatibility is not part of the N2 core. If needed, it should live as an
   adapter layer.

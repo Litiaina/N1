@@ -35,11 +35,7 @@ use crate::core::retrieve::{
     get_object as get_object_impl, get_object_metadata_direct, list_fragments,
     stream_object as stream_object_impl,
 };
-use crate::core::storage_capacity_parser::{
-    ResizeFragmentQuotaRequest, get_capacity_usage as get_capacity_usage_impl,
-    get_fragment_quota_usage as get_fragment_quota_usage_impl,
-    resize_fragment_quota as resize_fragment_quota_impl,
-};
+use crate::core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
     FinalizeUploadResult, cancel_upload_session as cancel_upload_session_impl,
@@ -363,10 +359,6 @@ async fn get_capacity_usage_scoped(claims: Claims) -> Result<impl IntoResponse, 
     get_capacity_usage_impl(claims, Path(fragment)).await
 }
 
-async fn get_fragment_quota_usage_scoped(claims: Claims) -> Result<impl IntoResponse, AppError> {
-    get_fragment_quota_usage_impl(claims).await
-}
-
 async fn run_fragment_gc(
     State(state): State<Arc<AppState>>,
     Path(fragment): Path<String>,
@@ -404,14 +396,6 @@ async fn get_fragment_health(
 ) -> Result<impl IntoResponse, AppError> {
     params.insert("fragment".to_string(), fragment);
     get_system_health(State(state), claims, Query(params)).await
-}
-
-async fn resize_fragment_quota_scoped(
-    claims: Claims,
-    Path(fragment): Path<String>,
-    AxumJson(payload): AxumJson<ResizeFragmentQuotaRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    resize_fragment_quota_impl(claims, axum::extract::Path(fragment), AxumJson(payload)).await
 }
 
 async fn list_objects_scoped(
@@ -1460,7 +1444,6 @@ pub fn build_storage_routes_unbound_with_options(
     let object_storage_routes = {
         let read_ops = Router::new()
             .route("/n2/capacity/usage", get(get_capacity_usage_scoped))
-            .route("/n2/capacity/quota", get(get_fragment_quota_usage_scoped))
             .route("/n2/fragments", get(list_fragments))
             .route("/n2/objects", get(list_objects_scoped))
             .route("/n2/objects/signed-url", post(mint_signed_read_url_scoped))
@@ -1504,10 +1487,6 @@ pub fn build_storage_routes_unbound_with_options(
         let write_ops = Router::new()
             .route("/n2/fragments/{:fragment}", delete(delete_fragment))
             .route("/n2/fragments/{:fragment}", patch(update_fragment))
-            .route(
-                "/n2/fragments/{:fragment}/quota",
-                patch(resize_fragment_quota_scoped),
-            )
             .route(
                 "/n2/trash/empty",
                 delete(empty_trash_scoped).post(empty_trash_scoped),

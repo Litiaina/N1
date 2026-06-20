@@ -306,8 +306,6 @@ async fn write_fragment_metadata_with_policy(
             Ok(None) => IndexFragmentMeta {
                 fragment_id: meta.fragment.clone(),
                 state: "active".to_string(),
-                quota_bytes: 0,
-                quota_project_id: None,
                 committed_bytes: 0,
                 reserved_bytes: 0,
                 trash_bytes: 0,
@@ -437,8 +435,6 @@ mod tests {
         let current = IndexFragmentMeta {
             fragment_id: "abc".to_string(),
             state: "active".to_string(),
-            quota_bytes: 1024,
-            quota_project_id: Some(12_345),
             committed_bytes: 0,
             reserved_bytes: 0,
             trash_bytes: 0,

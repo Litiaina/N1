@@ -31,8 +31,10 @@ BIN="${N2_PROOF_BIN:-$ROOT_DIR/target/release/litiaina-n2}"
 CERT="$ROOT_DIR/certificates/cert.pem"
 KEY="$ROOT_DIR/certificates/key.pem"
 TS="$(date +%Y%m%d-%H%M%S)"
-OUT="$ROOT_DIR/.n2-bench/n2-hardening-native-proof-$TS"
-LROOT="/tmp/n2-hardening-native-proof-$TS/node-a"
+N2_PROOF_OUT_ROOT="${N2_PROOF_OUT_ROOT:-$ROOT_DIR/.n2-bench}"
+N2_PROOF_RUN_ROOT="${N2_PROOF_RUN_ROOT:-/tmp}"
+OUT="$N2_PROOF_OUT_ROOT/n2-hardening-native-proof-$TS"
+LROOT="$N2_PROOF_RUN_ROOT/n2-hardening-native-proof-$TS/node-a"
 RROOT="/tmp/n2-hardening-native-proof-$TS/node-b"
 CROOT="/tmp/n2-hardening-native-proof-$TS/node-c"
 case "$N2_PROOF_STORAGE_LAYOUT" in
@@ -210,9 +212,6 @@ fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false
 
-[quota_config]
-fragment_quota_backend=disabled
-
 [garbage_collector]
 cleanup_interval_seconds=3600
 file_ttl_seconds=3600
@@ -353,8 +352,10 @@ if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   ssh_remote2 "rm -rf '$CROOT' '$C_INDEX_ROOT' '$C_BLOB_ROOT' '$C_FS_ROOT' && mkdir -p '$CROOT' '$C_INDEX_ROOT' '$C_BLOB_ROOT' '$C_FS_ROOT'"
 fi
 scp_remote "$BIN" "$CERT" "$KEY" administrator@"$REMOTE_IP":"$RROOT/" >/dev/null
+ssh_remote "chmod +x '$RROOT/litiaina-n2'"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   scp_remote2 "$BIN" "$CERT" "$KEY" administrator@"$REMOTE2_IP":"$CROOT/" >/dev/null
+  ssh_remote2 "chmod +x '$CROOT/litiaina-n2'"
 fi
 write_env "$LROOT/n2.env"
 scp_remote "$LROOT/n2.env" administrator@"$REMOTE_IP":"$RROOT/n2.env" >/dev/null

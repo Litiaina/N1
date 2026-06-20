@@ -1,12 +1,14 @@
-use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
-use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, ShardInfo};
-use crate::core::monitoring::system_health_snapshot;
-use crate::core::quota_manager::{
+use crate::core::capacity_manager::{
     FragmentBlobUsage, StorageRootUsage, StorageUsage, get_fragment_blob_usage,
     get_storage_root_usage, get_storage_usage,
 };
+use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
+use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, ShardInfo};
+use crate::core::monitoring::system_health_snapshot;
 use crate::core::{index, index_store};
-use crate::distribution::membership::active_cluster_runtime;
+use crate::distribution::layout::resolve_layout;
+use crate::distribution::membership::{ClusterNode, ClusterRuntime, active_cluster_runtime};
+use crate::distribution::placement::build_placement_plan;
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::{
     PeerOperation, acquire_peer_operation, record_capacity_cache_failure,
@@ -707,6 +709,111 @@ fn merge_immutable_object_record(
     }
 }
 
+fn all_readable_node_batches(
+    runtime: &ClusterRuntime,
+    object_ids: &[String],
+) -> Vec<(ClusterNode, Vec<String>)> {
+    runtime
+        .membership
+        .readable_nodes()
+        .into_iter()
+        .map(|node| (node, object_ids.to_vec()))
+        .collect()
+}
+
+fn bounded_metadata_node_batches(
+    runtime: &ClusterRuntime,
+    fragment: &str,
+    object_ids: &[String],
+) -> Vec<(ClusterNode, Vec<String>)> {
+    let readable = runtime.membership.readable_nodes();
+    if readable.is_empty() {
+        return Vec::new();
+    }
+    let readable_by_id = readable
+        .into_iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let fallback_ids = readable_by_id.keys().cloned().collect::<Vec<_>>();
+    let all_nodes = runtime.membership.nodes.clone();
+    let layout = resolve_layout(all_nodes.len(), &runtime.layout_policy).ok();
+    let mut per_node = BTreeMap::<String, Vec<String>>::new();
+
+    for object_id in object_ids {
+        let mut selected = Vec::<String>::new();
+        if let Some(layout) = layout {
+            if let Ok(plan) = build_placement_plan(
+                fragment,
+                object_id,
+                "",
+                runtime.membership.epoch,
+                layout,
+                &all_nodes,
+            ) {
+                selected.extend(plan.placements.into_iter().filter_map(|placement| {
+                    readable_by_id
+                        .contains_key(&placement.node_id)
+                        .then_some(placement.node_id)
+                }));
+            }
+        }
+        if selected.is_empty() {
+            selected.extend(fallback_ids.iter().cloned());
+        }
+        for node_id in selected {
+            per_node.entry(node_id).or_default().push(object_id.clone());
+        }
+    }
+
+    per_node
+        .into_iter()
+        .filter_map(|(node_id, ids)| {
+            readable_by_id
+                .get(&node_id)
+                .cloned()
+                .map(|node| (node, ids))
+        })
+        .collect()
+}
+
+async fn resolve_object_heads_from_batches(
+    runtime: &ClusterRuntime,
+    fragment: &str,
+    batches: Vec<(ClusterNode, Vec<String>)>,
+) -> Result<(BTreeMap<String, ObjectMetadata>, usize), AppError> {
+    let mut tasks = futures_util::stream::FuturesUnordered::new();
+    for (node, object_ids) in batches {
+        if object_ids.is_empty() {
+            continue;
+        }
+        let request = PeerObjectBatchResolveRequest {
+            fragment: fragment.to_string(),
+            object_ids,
+        };
+        let local_node_id = runtime.local_node_id.clone();
+        tasks.push(async move {
+            if node.id == local_node_id {
+                local_object_metadata_heads(&request)
+            } else {
+                post_object_batch_resolve(&node.endpoint, &request).await
+            }
+        });
+    }
+
+    let mut by_object = BTreeMap::new();
+    let mut successful_nodes = 0usize;
+    while let Some(result) = tasks.next().await {
+        let Ok(records) = result else {
+            continue;
+        };
+        successful_nodes += 1;
+        for record in records {
+            merge_immutable_object_record(&mut by_object, record)?;
+        }
+    }
+    Ok((by_object, successful_nodes))
+}
+
 pub async fn resolve_cluster_object_heads(
     fragment: &str,
     object_ids: &[String],
@@ -732,27 +839,26 @@ pub async fn resolve_cluster_object_heads(
         });
     };
 
-    let mut tasks = futures_util::stream::FuturesUnordered::new();
-    for node in runtime.membership.readable_nodes() {
-        let request = request.clone();
-        let local_node_id = runtime.local_node_id.clone();
-        tasks.push(async move {
-            if node.id == local_node_id {
-                local_object_metadata_heads(&request)
-            } else {
-                post_object_batch_resolve(&node.endpoint, &request).await
-            }
-        });
-    }
+    let bounded = bounded_metadata_node_batches(&runtime, fragment, object_ids);
+    let (mut by_object, mut successful_nodes) =
+        resolve_object_heads_from_batches(&runtime, fragment, bounded).await?;
 
-    let mut by_object = BTreeMap::new();
-    let mut successful_nodes = 0usize;
-    while let Some(result) = tasks.next().await {
-        let Ok(records) = result else {
-            continue;
+    let missing = object_ids
+        .iter()
+        .filter(|object_id| !by_object.contains_key(*object_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let fallback_ids = if successful_nodes == 0 {
+            object_ids.to_vec()
+        } else {
+            missing
         };
-        successful_nodes += 1;
-        for record in records {
+        let fallback = all_readable_node_batches(&runtime, &fallback_ids);
+        let (fallback_records, fallback_successes) =
+            resolve_object_heads_from_batches(&runtime, fragment, fallback).await?;
+        successful_nodes = successful_nodes.saturating_add(fallback_successes);
+        for record in fallback_records.into_values() {
             merge_immutable_object_record(&mut by_object, record)?;
         }
     }
@@ -764,20 +870,13 @@ pub async fn resolve_cluster_object_heads(
     Ok(by_object)
 }
 
-pub async fn resolve_cluster_object_versions(
-    fragment: &str,
-    object_id: &str,
-) -> Result<Vec<ObjectMetadata>, AppError> {
-    let request = PeerObjectResolveRequest {
-        fragment: fragment.to_string(),
-        object_id: object_id.to_string(),
-        version_id: None,
-    };
-    let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() else {
-        return local_object_metadata(&request);
-    };
+async fn resolve_object_versions_from_nodes(
+    runtime: &ClusterRuntime,
+    request: &PeerObjectResolveRequest,
+    nodes: Vec<ClusterNode>,
+) -> Result<(BTreeMap<String, ObjectMetadata>, usize), AppError> {
     let mut tasks = futures_util::stream::FuturesUnordered::new();
-    for node in runtime.membership.readable_nodes() {
+    for node in nodes {
         let request = request.clone();
         let local_node_id = runtime.local_node_id.clone();
         tasks.push(async move {
@@ -806,7 +905,7 @@ pub async fn resolve_cluster_object_versions(
                 {
                     return Err(AppError::InternalServerError(format!(
                         "divergent immutable N2 metadata for object {} version {}",
-                        object_id, record.version_id
+                        request.object_id, record.version_id
                     )));
                 }
                 Some(_) => {}
@@ -815,6 +914,38 @@ pub async fn resolve_cluster_object_versions(
                 }
             }
         }
+    }
+    Ok((by_version, successful_nodes))
+}
+
+pub async fn resolve_cluster_object_versions(
+    fragment: &str,
+    object_id: &str,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let request = PeerObjectResolveRequest {
+        fragment: fragment.to_string(),
+        object_id: object_id.to_string(),
+        version_id: None,
+    };
+    let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() else {
+        return local_object_metadata(&request);
+    };
+    let bounded_nodes = bounded_metadata_node_batches(&runtime, fragment, &[object_id.to_string()])
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect::<Vec<_>>();
+    let (mut by_version, mut successful_nodes) =
+        resolve_object_versions_from_nodes(&runtime, &request, bounded_nodes).await?;
+
+    if by_version.is_empty() {
+        let (fallback_versions, fallback_successes) = resolve_object_versions_from_nodes(
+            &runtime,
+            &request,
+            runtime.membership.readable_nodes(),
+        )
+        .await?;
+        successful_nodes = successful_nodes.saturating_add(fallback_successes);
+        by_version = fallback_versions;
     }
     if successful_nodes == 0 {
         return Err(AppError::ServiceUnavailable(

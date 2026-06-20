@@ -40,6 +40,9 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
+use crate::core::capacity_manager::{
+    ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
+};
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
@@ -49,10 +52,6 @@ use crate::core::disk_manager::{
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
 use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, acquire_disk_io};
-use crate::core::quota_manager::{
-    ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
-    fragment_quota_enforcement_enabled,
-};
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -67,7 +66,6 @@ pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 
-const UPLOAD_IO_GATE_WAIT_LOG_SECS: u64 = 30;
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
@@ -159,25 +157,7 @@ async fn acquire_upload_io_guard_with_timeout(
         return Ok(None);
     }
 
-    let started = std::time::Instant::now();
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(UPLOAD_IO_GATE_WAIT_LOG_SECS),
-            acquire_adaptive_io_guard(fragment, context),
-        )
-        .await
-        {
-            Ok(Ok(guard)) => return Ok(Some(guard)),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                warn!(
-                    "Upload IO gate still waiting after {}s ({}); preserving request instead of rejecting multipart progress",
-                    started.elapsed().as_secs(),
-                    context
-                );
-            }
-        }
-    }
+    acquire_adaptive_io_guard(fragment, context).await.map(Some)
 }
 
 pub(crate) async fn acquire_upload_io_guard_for_query(
@@ -878,9 +858,6 @@ fn choose_upload_stripe_size_for_parts(part_sizes: &[u64]) -> usize {
 }
 
 async fn preflight_upload_capacity(required_bytes: u64) -> Result<(), AppError> {
-    if fragment_quota_enforcement_enabled() {
-        return Ok(());
-    }
     ensure_capacity_available(required_bytes).await
 }
 
@@ -891,9 +868,6 @@ async fn preflight_blob_placement_capacity_for_parts(
     parity_shards: usize,
     block_size: usize,
 ) -> Result<(), AppError> {
-    if fragment_quota_enforcement_enabled() {
-        return Ok(());
-    }
     ensure_blob_placement_capacity_available_for_parts(
         start_part_index,
         part_sizes,

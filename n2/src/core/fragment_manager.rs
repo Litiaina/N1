@@ -25,9 +25,7 @@ use crate::{
             FragmentMetadata, init_fragment_metadata_strict, read_fragment_metadata,
             resolve_stable_fragment_id, rotate_fragment_key, write_fragment_metadata_strict,
         },
-        index_store::{
-            ensure_fragment_namespace_available, has_any_fragment_index, set_fragment_quota,
-        },
+        index_store::{ensure_fragment_namespace_available, has_any_fragment_index},
         sync::{
             CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
         },
@@ -214,7 +212,6 @@ pub(crate) async fn provision_fragment_local(
     if read_fragment_metadata(fragment_hash).await.is_err() {
         let _ = init_fragment_metadata_strict(stable_fragment_id, key).await?;
     }
-    set_fragment_quota(stable_fragment_id, 0)?;
     Ok(())
 }
 
@@ -244,7 +241,6 @@ pub(crate) async fn apply_fragment_control_snapshot_local(
     ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
     ensure_fragment_namespace_available(&snapshot.fragment_hash)?;
     write_fragment_metadata_strict(&snapshot.metadata).await?;
-    set_fragment_quota(stable_fragment_id, 0)?;
     Ok(())
 }
 
@@ -356,14 +352,6 @@ pub async fn create_fragment(
         )));
     }
 
-    if payload.quota_bytes.unwrap_or(0) > 0 {
-        return Err(AppError::BadRequest(
-            "N2 does not accept fragment quota during creation; use cluster usage monitoring instead"
-                .into(),
-        ));
-    }
-    let usage_target_bytes = 0;
-
     let stable_fragment_id = existing_meta
         .as_ref()
         .map(|meta| meta.fragment.clone())
@@ -388,11 +376,6 @@ pub async fn create_fragment(
             payload.name, hash
         );
     }
-    info!(
-        "N2 fragment {} usage target set to {} bytes (monitoring only)",
-        hash, usage_target_bytes
-    );
-
     Ok((
         StatusCode::CREATED,
         Json(CreateFragmentResponse {

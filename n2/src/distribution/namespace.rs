@@ -84,7 +84,6 @@ pub enum NamespaceMutationKind {
     Purge,
     EmptyTrash,
     UploadCommit,
-    QuotaEdit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1487,9 +1486,7 @@ fn validate_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<(),
             require_source("rename")?;
             require_destination("rename")?;
         }
-        NamespaceMutationKind::RecoverAll
-        | NamespaceMutationKind::EmptyTrash
-        | NamespaceMutationKind::QuotaEdit => {}
+        NamespaceMutationKind::RecoverAll | NamespaceMutationKind::EmptyTrash => {}
         NamespaceMutationKind::UploadCommit => {
             require_source("upload commit")?;
             if request.object_id.as_deref().unwrap_or_default().is_empty() {
@@ -1881,7 +1878,6 @@ async fn apply_namespace_request_core(
                 .await?;
             Ok(NamespaceApplyOutcome::Summary(summary))
         }
-        NamespaceMutationKind::QuotaEdit => Ok(NamespaceApplyOutcome::None),
         NamespaceMutationKind::UploadCommit => {
             let metadata = request.metadata.as_ref().ok_or_else(|| {
                 AppError::BadRequest("upload commit requires object metadata".into())
@@ -1970,7 +1966,6 @@ async fn namespace_request_materialized(
         NamespaceMutationKind::Purge => Ok(local_namespace_entry(&request.fragment, source, true)
             .await?
             .is_none()),
-        NamespaceMutationKind::QuotaEdit => Ok(true),
         NamespaceMutationKind::UploadCommit => {
             let Some(expected_object_id) = request.object_id.as_deref() else {
                 return Ok(false);
