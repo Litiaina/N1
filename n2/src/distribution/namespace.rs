@@ -180,8 +180,13 @@ struct NamespaceSnapshot {
 pub struct NamespaceLedgerSummary {
     pub fragment: String,
     pub partition_id: u16,
+    pub partition_count: u16,
     pub local_requests: u64,
     pub committed_log_index: u64,
+    pub snapshot_log_index: u64,
+    pub request_ledger_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub pending_prepared_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_mutation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,6 +200,39 @@ pub struct NamespaceLedgerSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_version_id: Option<String>,
     pub request_ledger_path: String,
+    pub snapshot_path: String,
+    pub partition_manifest_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NamespacePartitionManifest {
+    pub format_version: u32,
+    pub fragment: String,
+    pub partition_id: u16,
+    pub partition_count: u16,
+    pub assignment_epoch: u64,
+    pub voter_node_ids: Vec<String>,
+    pub committed_log_index: u64,
+    pub snapshot_log_index: u64,
+    pub request_ledger_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub pending_prepared_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_kind: Option<NamespaceMutationKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_destination_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_version_id: Option<String>,
+    pub updated_at_unix: i64,
+    pub request_ledger_path: String,
+    pub snapshot_path: String,
+    pub manifest_path: String,
 }
 
 static NAMESPACE_COMMIT_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -810,6 +848,239 @@ fn namespace_snapshot_path(fragment: &str, partition_id: u16) -> Result<PathBuf,
         .join(format!("{partition_id:04}.json")))
 }
 
+fn namespace_partition_manifest_path(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<PathBuf, AppError> {
+    Ok(namespace_ledger_root()?
+        .join("manifests")
+        .join(fragment)
+        .join(format!("{partition_id:04}.json")))
+}
+
+fn namespace_prepared_dir(fragment: &str, partition_id: u16) -> Result<PathBuf, AppError> {
+    Ok(namespace_ledger_root()?
+        .join("prepared")
+        .join(fragment)
+        .join(format!("{partition_id:04}")))
+}
+
+fn file_len(path: &FsPath) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn pending_prepared_count(fragment: &str, partition_id: u16) -> Result<u64, AppError> {
+    let dir = namespace_prepared_dir(fragment, partition_id)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(AppError::Io(
+                err,
+                format!("scan prepared namespace directory {}", dir.display()),
+            ));
+        }
+    };
+    let mut count = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            AppError::Io(
+                err,
+                format!("scan prepared namespace directory {}", dir.display()),
+            )
+        })?;
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("json")
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn snapshot_log_index(fragment: &str, partition_id: u16) -> Result<u64, AppError> {
+    let path = namespace_snapshot_path(fragment, partition_id)?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(AppError::Io(
+                err,
+                format!("read namespace snapshot {}", path.display()),
+            ));
+        }
+    };
+    let snapshot = serde_json::from_slice::<NamespaceSnapshot>(&bytes).map_err(|err| {
+        AppError::InternalServerError(format!(
+            "decode namespace snapshot {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(snapshot.committed_log_index)
+}
+
+fn load_namespace_partition_manifest(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<Option<NamespacePartitionManifest>, AppError> {
+    let path = namespace_partition_manifest_path(fragment, partition_id)?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(AppError::Io(
+                err,
+                format!("read namespace partition manifest {}", path.display()),
+            ));
+        }
+    };
+    let manifest = serde_json::from_slice::<NamespacePartitionManifest>(&bytes).map_err(|err| {
+        AppError::InternalServerError(format!(
+            "decode namespace partition manifest {}: {err}",
+            path.display()
+        ))
+    })?;
+    if manifest.fragment != fragment || manifest.partition_id != partition_id {
+        return Err(AppError::InternalServerError(format!(
+            "namespace partition manifest {} belongs to fragment {} partition {}",
+            path.display(),
+            manifest.fragment,
+            manifest.partition_id
+        )));
+    }
+    Ok(Some(manifest))
+}
+
+fn build_namespace_partition_manifest(
+    fragment: &str,
+    partition_id: u16,
+    assignment: Option<&NamespaceGroupAssignment>,
+) -> Result<NamespacePartitionManifest, AppError> {
+    let ledger_path = namespace_request_ledger_path(fragment, partition_id)?;
+    let snapshot_path = namespace_snapshot_path(fragment, partition_id)?;
+    let manifest_path = namespace_partition_manifest_path(fragment, partition_id)?;
+    let snapshot_bytes = file_len(&snapshot_path);
+    let persisted_manifest = load_namespace_partition_manifest(fragment, partition_id)?;
+    let requests = read_request_ledger(fragment, partition_id)?;
+    let last = requests.last();
+    let (assignment_epoch, voter_node_ids) = match assignment {
+        Some(assignment) => (
+            assignment.created_membership_epoch,
+            assignment.voter_node_ids.clone(),
+        ),
+        None => load_namespace_group(fragment, partition_id)?
+            .map(|assignment| {
+                (
+                    assignment.created_membership_epoch,
+                    assignment.voter_node_ids,
+                )
+            })
+            .unwrap_or_default(),
+    };
+    Ok(NamespacePartitionManifest {
+        format_version: 1,
+        fragment: fragment.to_string(),
+        partition_id,
+        partition_count: namespace_partition_count(),
+        assignment_epoch,
+        voter_node_ids,
+        committed_log_index: requests.len() as u64,
+        snapshot_log_index: persisted_manifest
+            .as_ref()
+            .filter(|manifest| manifest.snapshot_bytes == snapshot_bytes)
+            .map(|manifest| manifest.snapshot_log_index)
+            .map(Ok)
+            .unwrap_or_else(|| snapshot_log_index(fragment, partition_id))?,
+        request_ledger_bytes: file_len(&ledger_path),
+        snapshot_bytes,
+        pending_prepared_count: pending_prepared_count(fragment, partition_id)?,
+        last_mutation_id: last.and_then(|request| request.mutation_id.clone()),
+        last_kind: last.map(|request| request.kind.clone()),
+        last_source_path: last.and_then(|request| request.source_path.clone()),
+        last_destination_path: last.and_then(|request| request.destination_path.clone()),
+        last_object_id: last.and_then(|request| request.object_id.clone()),
+        last_version_id: last.and_then(|request| request.version_id.clone()),
+        updated_at_unix: Utc::now().timestamp(),
+        request_ledger_path: ledger_path.to_string_lossy().to_string(),
+        snapshot_path: snapshot_path.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+    })
+}
+
+fn persist_namespace_partition_manifest(
+    manifest: &NamespacePartitionManifest,
+) -> Result<(), AppError> {
+    let path = namespace_partition_manifest_path(&manifest.fragment, manifest.partition_id)?;
+    let parent = path.parent().ok_or_else(|| {
+        AppError::InternalServerError("namespace partition manifest has no parent".into())
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        AppError::Io(
+            err,
+            format!(
+                "create namespace partition manifest directory {}",
+                parent.display()
+            ),
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(|err| {
+        AppError::InternalServerError(format!("encode namespace partition manifest: {err}"))
+    })?;
+    let tmp = parent.join(format!(".{}.manifest.tmp", Ulid::new()));
+    {
+        let mut file = fs::File::create(&tmp).map_err(|err| {
+            AppError::Io(
+                err,
+                format!("create namespace partition manifest {}", tmp.display()),
+            )
+        })?;
+        file.write_all(&bytes).map_err(|err| {
+            AppError::Io(
+                err,
+                format!("write namespace partition manifest {}", tmp.display()),
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            AppError::Io(
+                err,
+                format!("sync namespace partition manifest {}", tmp.display()),
+            )
+        })?;
+    }
+    fs::rename(&tmp, &path).map_err(|err| {
+        AppError::Io(
+            err,
+            format!("publish namespace partition manifest {}", path.display()),
+        )
+    })?;
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn refresh_namespace_partition_manifest(
+    fragment: &str,
+    partition_id: u16,
+    assignment: Option<&NamespaceGroupAssignment>,
+) -> Result<NamespacePartitionManifest, AppError> {
+    let manifest = build_namespace_partition_manifest(fragment, partition_id, assignment)?;
+    persist_namespace_partition_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+pub fn namespace_local_partition_manifest(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<NamespacePartitionManifest, AppError> {
+    build_namespace_partition_manifest(fragment, partition_id, None)
+}
+
 fn remove_path_no_follow(path: &FsPath) -> Result<(), AppError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1150,6 +1421,7 @@ fn persist_namespace_snapshot(snapshot: &NamespaceSnapshot) -> Result<(), AppErr
             format!("publish namespace snapshot {}", path.display()),
         )
     })?;
+    let _ = refresh_namespace_partition_manifest(&snapshot.fragment, snapshot.partition_id, None);
     Ok(())
 }
 
@@ -1234,21 +1506,38 @@ pub fn namespace_local_ledger_summary(
     fragment: &str,
     partition_id: u16,
 ) -> Result<NamespaceLedgerSummary, AppError> {
-    let path = namespace_request_ledger_path(fragment, partition_id)?;
+    let request_ledger_path = namespace_request_ledger_path(fragment, partition_id)?;
+    let snapshot_path = namespace_snapshot_path(fragment, partition_id)?;
+    let partition_manifest_path = namespace_partition_manifest_path(fragment, partition_id)?;
     let requests = read_request_ledger(fragment, partition_id)?;
     let last = requests.last();
+    let snapshot_bytes = file_len(&snapshot_path);
+    let manifest = load_namespace_partition_manifest(fragment, partition_id)?;
+    let snapshot_log_index = manifest
+        .as_ref()
+        .filter(|manifest| manifest.snapshot_bytes == snapshot_bytes)
+        .map(|manifest| manifest.snapshot_log_index)
+        .map(Ok)
+        .unwrap_or_else(|| snapshot_log_index(fragment, partition_id))?;
     Ok(NamespaceLedgerSummary {
         fragment: fragment.to_string(),
         partition_id,
+        partition_count: namespace_partition_count(),
         local_requests: requests.len() as u64,
         committed_log_index: requests.len() as u64,
+        snapshot_log_index,
+        request_ledger_bytes: file_len(&request_ledger_path),
+        snapshot_bytes,
+        pending_prepared_count: pending_prepared_count(fragment, partition_id)?,
         last_mutation_id: last.and_then(|request| request.mutation_id.clone()),
         last_kind: last.map(|request| request.kind.clone()),
         last_source_path: last.and_then(|request| request.source_path.clone()),
         last_destination_path: last.and_then(|request| request.destination_path.clone()),
         last_object_id: last.and_then(|request| request.object_id.clone()),
         last_version_id: last.and_then(|request| request.version_id.clone()),
-        request_ledger_path: path.to_string_lossy().to_string(),
+        request_ledger_path: request_ledger_path.to_string_lossy().to_string(),
+        snapshot_path: snapshot_path.to_string_lossy().to_string(),
+        partition_manifest_path: partition_manifest_path.to_string_lossy().to_string(),
     })
 }
 
@@ -1309,6 +1598,11 @@ fn append_request_ledger(request: &PeerNamespaceApplyRequest) -> Result<(), AppE
             format!("sync N2 namespace request ledger {}", path.display()),
         )
     })?;
+    let _ = refresh_namespace_partition_manifest(
+        &request.fragment,
+        namespace_request_partition(request),
+        None,
+    );
     Ok(())
 }
 
@@ -1365,6 +1659,11 @@ fn persist_prepared_mutation(prepared: &PreparedNamespaceMutation) -> Result<(),
     if let Ok(dir) = fs::File::open(parent) {
         let _ = dir.sync_all();
     }
+    let _ = refresh_namespace_partition_manifest(
+        &prepared.request.fragment,
+        prepared.assignment.partition_id,
+        Some(&prepared.assignment),
+    );
     Ok(())
 }
 
@@ -1439,6 +1738,7 @@ fn remove_prepared_mutation(fragment: &str, partition_id: u16, mutation_id: &str
     if let Ok(path) = namespace_prepared_path(fragment, partition_id, mutation_id) {
         let _ = fs::remove_file(path);
     }
+    let _ = refresh_namespace_partition_manifest(fragment, partition_id, None);
 }
 
 fn validate_namespace_request(request: &PeerNamespaceApplyRequest) -> Result<(), AppError> {
@@ -2052,6 +2352,11 @@ fn validate_prepared_assignment(
     } else {
         persist_namespace_group(&prepared.assignment)?;
     }
+    let _ = refresh_namespace_partition_manifest(
+        &prepared.request.fragment,
+        prepared.assignment.partition_id,
+        Some(&prepared.assignment),
+    );
     Ok(())
 }
 
@@ -2484,6 +2789,17 @@ pub async fn peer_namespace_summary(
     )?))
 }
 
+pub async fn peer_namespace_partition_manifest(
+    headers: HeaderMap,
+    Path((fragment, partition_id)): Path<(String, u16)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(namespace_local_partition_manifest(
+        &fragment,
+        partition_id,
+    )?))
+}
+
 pub async fn peer_namespace_prepared(
     headers: HeaderMap,
     Path((fragment, partition_id, log_index)): Path<(String, u16, u64)>,
@@ -2647,6 +2963,10 @@ pub fn build_namespace_peer_routes() -> Router<Arc<AppState>> {
         .route(
             "/n2/peer/namespace/summary/{fragment}/{partition_id}",
             get(peer_namespace_summary),
+        )
+        .route(
+            "/n2/peer/namespace/partition/{fragment}/{partition_id}",
+            get(peer_namespace_partition_manifest),
         )
         .route(
             "/n2/peer/namespace/prepared/{fragment}/{partition_id}/{log_index}",
@@ -2845,5 +3165,103 @@ mod tests {
             Some("01KTRASH000000000000000000".to_string())
         );
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn namespace_partition_manifest_tracks_ledger_snapshot_and_prepared_state() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let base = std::env::temp_dir().join(format!("n2-namespace-manifest-{}", Ulid::new()));
+        let state = base.join("state");
+        fs::create_dir_all(&state).expect("create state root");
+        let owns_state_root = FS_STORAGE_ROOT
+            .set(state.to_string_lossy().to_string())
+            .is_ok();
+        let active_state = PathBuf::from(FS_STORAGE_ROOT.get().expect("state root"));
+        fs::create_dir_all(&active_state).expect("ensure active state root");
+
+        let fragment = format!("manifest-{}", Ulid::new());
+        let partition_id = namespace_partition_for_path(&fragment, "dir/file.bin");
+        let mut committed = request(NamespaceMutationKind::Mkdir);
+        committed.fragment = fragment.clone();
+        committed.source_path = Some("dir".into());
+        committed.mutation_id = Some("01KMANIFEST000000000000000".into());
+        write_request_ledger_atomic(&fragment, partition_id, &[committed.clone()])
+            .expect("write request ledger");
+
+        let snapshot = NamespaceSnapshot {
+            format_version: 1,
+            fragment: fragment.clone(),
+            partition_id,
+            committed_log_index: 1,
+            requests: vec![committed.clone()],
+            entries: Vec::new(),
+        };
+        persist_namespace_snapshot(&snapshot).expect("persist snapshot");
+
+        let assignment = NamespaceGroupAssignment {
+            fragment: fragment.clone(),
+            partition_id,
+            partition_count: namespace_partition_count(),
+            created_membership_epoch: 42,
+            voter_node_ids: vec!["node-a".into(), "node-b".into(), "node-c".into()],
+        };
+        let mut pending = request(NamespaceMutationKind::Trash);
+        pending.fragment = fragment.clone();
+        pending.source_path = Some("dir/file.bin".into());
+        pending.mutation_id = Some("01KPENDING0000000000000000".into());
+        let prepared = PreparedNamespaceMutation {
+            log_index: 2,
+            assignment: assignment.clone(),
+            request: pending,
+        };
+        persist_prepared_mutation(&prepared).expect("persist prepared");
+
+        let manifest =
+            refresh_namespace_partition_manifest(&fragment, partition_id, Some(&assignment))
+                .expect("refresh manifest");
+        assert_eq!(manifest.fragment, fragment);
+        assert_eq!(manifest.partition_id, partition_id);
+        assert_eq!(manifest.assignment_epoch, 42);
+        assert_eq!(
+            manifest.voter_node_ids,
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string()
+            ]
+        );
+        assert_eq!(manifest.committed_log_index, 1);
+        assert_eq!(manifest.snapshot_log_index, 1);
+        assert!(manifest.request_ledger_bytes > 0);
+        assert!(manifest.snapshot_bytes > 0);
+        assert_eq!(manifest.pending_prepared_count, 1);
+        assert_eq!(
+            manifest.last_mutation_id.as_deref(),
+            Some("01KMANIFEST000000000000000")
+        );
+        assert!(PathBuf::from(&manifest.manifest_path).exists());
+
+        let summary =
+            namespace_local_ledger_summary(&manifest.fragment, partition_id).expect("summary");
+        assert_eq!(summary.committed_log_index, manifest.committed_log_index);
+        assert_eq!(summary.snapshot_log_index, manifest.snapshot_log_index);
+        assert_eq!(
+            summary.pending_prepared_count,
+            manifest.pending_prepared_count
+        );
+        assert_eq!(summary.request_ledger_bytes, manifest.request_ledger_bytes);
+
+        remove_prepared_mutation(
+            &manifest.fragment,
+            partition_id,
+            "01KPENDING0000000000000000",
+        );
+        let manifest = refresh_namespace_partition_manifest(&manifest.fragment, partition_id, None)
+            .expect("refresh manifest after remove");
+        assert_eq!(manifest.pending_prepared_count, 0);
+
+        if owns_state_root {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 }

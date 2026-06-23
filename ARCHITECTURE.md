@@ -269,6 +269,13 @@ copy `.objects`, `.ncdx`, shards, parity, or upload payload data.
 The assignment, ledger, prepared records, and snapshots live under
 `fs_storage_path/.n2`. They are control state, not a second user namespace.
 
+Each namespace partition also maintains a small durable partition manifest. The
+manifest records the fragment, partition ID, partition count, voter assignment
+epoch, voter node IDs, committed ledger position, snapshot watermark, ledger
+size, snapshot size, pending prepared count, and the last committed mutation
+summary. This manifest is not namespace truth; it is an explicit control-plane
+checkpoint used by monitoring, repair, and future partition move/split logic.
+
 ## Multipart Ownership
 
 Multipart sessions are coordinator-owned until finalize:

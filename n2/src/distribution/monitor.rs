@@ -677,8 +677,13 @@ fn aggregate_local_namespace_ledger(fragment: &str) -> Result<NamespaceLedgerSum
     let mut aggregate = NamespaceLedgerSummary {
         fragment: fragment.to_string(),
         partition_id: 0,
+        partition_count: namespace_partition_count(),
         local_requests: 0,
         committed_log_index: 0,
+        snapshot_log_index: 0,
+        request_ledger_bytes: 0,
+        snapshot_bytes: 0,
+        pending_prepared_count: 0,
         last_mutation_id: None,
         last_kind: None,
         last_source_path: None,
@@ -686,6 +691,10 @@ fn aggregate_local_namespace_ledger(fragment: &str) -> Result<NamespaceLedgerSum
         last_object_id: None,
         last_version_id: None,
         request_ledger_path: format!(".n2/namespace-ledger/{fragment}/<partition>.requests.jsonl"),
+        snapshot_path: format!(".n2/namespace-ledger/snapshots/{fragment}/<partition>.json"),
+        partition_manifest_path: format!(
+            ".n2/namespace-ledger/manifests/{fragment}/<partition>.json"
+        ),
     };
     for partition_id in 0..namespace_partition_count() {
         let summary = namespace_local_ledger_summary(fragment, partition_id)?;
@@ -695,6 +704,18 @@ fn aggregate_local_namespace_ledger(fragment: &str) -> Result<NamespaceLedgerSum
         aggregate.committed_log_index = aggregate
             .committed_log_index
             .saturating_add(summary.committed_log_index);
+        aggregate.snapshot_log_index = aggregate
+            .snapshot_log_index
+            .saturating_add(summary.snapshot_log_index);
+        aggregate.request_ledger_bytes = aggregate
+            .request_ledger_bytes
+            .saturating_add(summary.request_ledger_bytes);
+        aggregate.snapshot_bytes = aggregate
+            .snapshot_bytes
+            .saturating_add(summary.snapshot_bytes);
+        aggregate.pending_prepared_count = aggregate
+            .pending_prepared_count
+            .saturating_add(summary.pending_prepared_count);
         if summary.last_mutation_id.is_some() {
             aggregate.partition_id = partition_id;
             aggregate.last_mutation_id = summary.last_mutation_id;

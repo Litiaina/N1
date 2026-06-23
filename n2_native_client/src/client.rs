@@ -291,6 +291,21 @@ pub fn ensure_native_ok(response: &NativeResponse) -> NativeClientResult<()> {
         .error
         .as_ref()
         .map(|err| (err.code.clone(), err.message.clone()))
+        .or_else(|| {
+            response.body.as_ref().and_then(|body| {
+                let value = rmp_serde::from_slice::<Value>(body.as_ref()).ok()?;
+                let message = value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("message").and_then(Value::as_str))
+                    .map(str::to_string)?;
+                let code = response
+                    .status
+                    .map(|status| format!("status_{status}"))
+                    .unwrap_or_else(|| "native_error".to_string());
+                Some((code, message))
+            })
+        })
         .unwrap_or_else(|| {
             (
                 "native_error".to_string(),
@@ -298,4 +313,33 @@ pub fn ensure_native_ok(response: &NativeResponse) -> NativeClientResult<()> {
             )
         });
     Err(NativeClientError::Native { code, message })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_bytes::ByteBuf;
+    use serde_json::json;
+
+    #[test]
+    fn ensure_native_ok_reports_msgpack_error_body() {
+        let response = NativeResponse {
+            id: "test".to_string(),
+            ok: false,
+            status: Some(400),
+            payload: None,
+            body: Some(ByteBuf::from(
+                rmp_serde::to_vec_named(&json!({ "error": "Fragment not found" })).unwrap(),
+            )),
+            body_len: None,
+            error: None,
+        };
+
+        let err = ensure_native_ok(&response).expect_err("response should fail");
+        assert!(matches!(
+            err,
+            NativeClientError::Native { code, message }
+                if code == "status_400" && message == "Fragment not found"
+        ));
+    }
 }

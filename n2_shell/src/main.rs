@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 
 const DEFAULT_NATIVE_URL: &str = "n2://127.0.0.1:50002";
@@ -43,7 +44,7 @@ struct Cli {
         short,
         long,
         global = true,
-        help = "Fragment name or hash used for authentication and fragment-scoped operations."
+        help = "Fragment hash or stable fragment id used for authentication and fragment-scoped operations."
     )]
     fragment: Option<String>,
 
@@ -300,6 +301,18 @@ struct UploadArgs {
     part_size: u64,
     #[arg(
         long,
+        default_value_t = 1,
+        help = "Multipart parts to upload concurrently. Use >1 only against a direct coordinator or sticky native endpoint."
+    )]
+    parallel_parts: usize,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Disable the server-side upload IO gate for this upload."
+    )]
+    no_io_gate: bool,
+    #[arg(
+        long,
         default_value_t = false,
         help = "Calculate and send CRC32 for each uploaded body/part."
     )]
@@ -426,6 +439,9 @@ async fn run() -> NativeClientResult<()> {
             let payload = parse_json(&payload)?;
             print_response(client.operation(&op, &payload, None).await?, cli.json)
         }
+        Command::Fragment { command } if is_public_fragment_command(&command) => {
+            run_fragment_command(&mut client, command, cli.json).await
+        }
         command => {
             authenticate_from_cli(&mut client, &cli).await?;
             run_authenticated_command(&mut client, &cli, command).await
@@ -441,6 +457,15 @@ fn take_profile_command(cli: &mut Cli) -> Option<ProfileCommand> {
         return Some(command);
     }
     None
+}
+
+fn is_public_fragment_command(command: &FragmentCommand) -> bool {
+    matches!(
+        command,
+        FragmentCommand::Create { .. }
+            | FragmentCommand::Check { .. }
+            | FragmentCommand::Hash { .. }
+    )
 }
 
 async fn run_authenticated_command(
@@ -538,7 +563,7 @@ async fn run_authenticated_command(
         }
         Command::EmptyTrash => print_op(client, "trash.empty", json!({}), cli.json).await,
         Command::Object { command } => run_object_command(client, command, cli.json).await,
-        Command::Upload(args) => upload_file(client, args, cli.json).await,
+        Command::Upload(args) => upload_file(client, args, cli, cli.json).await,
         Command::Download(args) => download_file(client, args).await,
         Command::Uploads { command } => run_uploads_command(client, command, cli.json).await,
         Command::Gc(args) => run_gc_command(client, args, cli.json).await,
@@ -593,6 +618,22 @@ mod tests {
             Some(ProfileCommand::Path)
         ));
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn fragment_create_check_and_hash_are_public_commands() {
+        assert!(is_public_fragment_command(&FragmentCommand::Create {
+            name: "frag".to_string(),
+            key: "key".to_string(),
+            master_key: "master".to_string(),
+        }));
+        assert!(is_public_fragment_command(&FragmentCommand::Check {
+            fragment: "frag".to_string(),
+        }));
+        assert!(is_public_fragment_command(&FragmentCommand::Hash {
+            fragment: "frag".to_string(),
+        }));
+        assert!(!is_public_fragment_command(&FragmentCommand::List));
     }
 }
 
@@ -742,7 +783,7 @@ async fn run_fragment_command(
         FragmentCommand::Hash { fragment } => {
             print_op(
                 client,
-                "fragment.hash",
+                "fragment.hash.public",
                 json!({ "fragment": fragment }),
                 json_output,
             )
@@ -1012,6 +1053,7 @@ async fn watch_job(
 async fn upload_file(
     client: &mut N2NativeClient,
     args: UploadArgs,
+    cli: &Cli,
     json_output: bool,
 ) -> NativeClientResult<()> {
     let mut file = File::open(&args.file).await?;
@@ -1033,6 +1075,7 @@ async fn upload_file(
                 &json!({
                     "object_key": args.object_key,
                     "content_type": content_type,
+                    "io_gate": !args.no_io_gate,
                     "checksum": checksum,
                 }),
                 &mut file,
@@ -1044,6 +1087,10 @@ async fn upload_file(
 
     let part_size = args.part_size.max(1024 * 1024);
     let expected_parts = size.div_ceil(part_size);
+    let parallel_parts = args
+        .parallel_parts
+        .max(1)
+        .min(expected_parts.max(1) as usize);
     let init: Value = client
         .operation_json(
             "multipart.init",
@@ -1060,34 +1107,90 @@ async fn upload_file(
     let version_id = required_response_string(&init, "version_id")?;
     let session_id = required_response_string(&init, "session_id")?;
 
-    for part_index in 0..expected_parts {
-        let start = part_index.saturating_mul(part_size);
-        let part_len = part_size.min(size.saturating_sub(start));
-        let checksum = if args.crc32 {
-            Some(crc32_range(&mut file, start, part_len).await?)
-        } else {
-            None
-        };
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-        let mut part_reader = (&mut file).take(part_len);
-        client
-            .operation_reader(
-                "multipart.put_part",
-                &json!({
-                    "version_id": version_id,
-                    "part_index": part_index,
-                    "checksum": checksum,
-                }),
-                &mut part_reader,
-                part_len,
-            )
-            .await?;
-        eprintln!(
-            "uploaded part {}/{} ({})",
-            part_index + 1,
-            expected_parts,
-            human_bytes(start.saturating_add(part_len))
-        );
+    if parallel_parts == 1 {
+        for part_index in 0..expected_parts {
+            let start = part_index.saturating_mul(part_size);
+            let part_len = part_size.min(size.saturating_sub(start));
+            let checksum = if args.crc32 {
+                Some(crc32_range(&mut file, start, part_len).await?)
+            } else {
+                None
+            };
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+            let mut part_reader = (&mut file).take(part_len);
+            client
+                .operation_reader(
+                    "multipart.put_part",
+                    &json!({
+                        "version_id": version_id,
+                        "part_index": part_index,
+                        "io_gate": !args.no_io_gate,
+                        "checksum": checksum,
+                    }),
+                    &mut part_reader,
+                    part_len,
+                )
+                .await?;
+            eprintln!(
+                "uploaded part {}/{} ({})",
+                part_index + 1,
+                expected_parts,
+                human_bytes(start.saturating_add(part_len))
+            );
+        }
+    } else {
+        let fragment = cli
+            .fragment
+            .clone()
+            .ok_or_else(|| NativeClientError::protocol("parallel upload requires --fragment"))?;
+        let secret = cli
+            .secret
+            .clone()
+            .ok_or_else(|| NativeClientError::protocol("parallel upload requires --secret"))?;
+        let native_url = cli.native_url.clone();
+        let file_path = args.file.clone();
+        let mut next_part = 0u64;
+        let mut completed_parts = 0u64;
+        let mut workers = JoinSet::new();
+
+        while next_part < expected_parts || !workers.is_empty() {
+            while next_part < expected_parts && workers.len() < parallel_parts {
+                let part_index = next_part;
+                next_part = next_part.saturating_add(1);
+                workers.spawn(upload_part_with_new_client(
+                    native_url.clone(),
+                    fragment.clone(),
+                    secret.clone(),
+                    file_path.clone(),
+                    version_id.clone(),
+                    part_index,
+                    part_size,
+                    size,
+                    args.crc32,
+                    !args.no_io_gate,
+                ));
+            }
+
+            let Some(joined) = workers.join_next().await else {
+                continue;
+            };
+            let (part_index, uploaded_bytes) = joined.map_err(|err| {
+                NativeClientError::protocol(format!("upload worker failed: {err}"))
+            })??;
+            completed_parts = completed_parts.saturating_add(1);
+            eprintln!(
+                "uploaded part {}/{} ({})",
+                part_index + 1,
+                expected_parts,
+                human_bytes(uploaded_bytes)
+            );
+        }
+
+        if completed_parts != expected_parts {
+            return Err(NativeClientError::protocol(format!(
+                "uploaded {completed_parts} parts, expected {expected_parts}"
+            )));
+        }
     }
 
     let finalized = client
@@ -1106,6 +1209,49 @@ async fn upload_file(
         )
         .await?;
     print_response(finalized, json_output)
+}
+
+async fn upload_part_with_new_client(
+    native_url: String,
+    fragment: String,
+    secret: String,
+    file_path: PathBuf,
+    version_id: String,
+    part_index: u64,
+    part_size: u64,
+    total_size: u64,
+    crc32: bool,
+    io_gate: bool,
+) -> NativeClientResult<(u64, u64)> {
+    let mut client = N2NativeClient::connect(&native_url)
+        .await?
+        .with_request_prefix(format!("n2-shell-part-{part_index}"));
+    client.auth_fragment(&fragment, &secret).await?;
+
+    let start = part_index.saturating_mul(part_size);
+    let part_len = part_size.min(total_size.saturating_sub(start));
+    let mut file = File::open(&file_path).await?;
+    let checksum = if crc32 {
+        Some(crc32_range(&mut file, start, part_len).await?)
+    } else {
+        None
+    };
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut part_reader = (&mut file).take(part_len);
+    client
+        .operation_reader(
+            "multipart.put_part",
+            &json!({
+                "version_id": version_id,
+                "part_index": part_index,
+                "io_gate": io_gate,
+                "checksum": checksum,
+            }),
+            &mut part_reader,
+            part_len,
+        )
+        .await?;
+    Ok((part_index, start.saturating_add(part_len)))
 }
 
 async fn crc32_range(file: &mut File, offset: u64, len: u64) -> NativeClientResult<String> {
