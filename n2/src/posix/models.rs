@@ -13,6 +13,8 @@ pub struct PosixEntry {
     pub path: String,
     pub kind: PosixNodeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_at_unix: Option<i64>,
@@ -41,6 +43,8 @@ pub struct PosixStatResponse {
     pub kind: PosixNodeKind,
     pub is_virtual: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_at_unix: Option<i64>,
@@ -64,6 +68,8 @@ pub struct PosixListQuery {
     pub continuation_token: Option<String>,
     #[serde(default)]
     pub trash: Option<bool>,
+    #[serde(default)]
+    pub sync: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +78,8 @@ pub struct PosixStatQuery {
     pub path: Option<String>,
     #[serde(default)]
     pub trash: Option<bool>,
+    #[serde(default)]
+    pub sync: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

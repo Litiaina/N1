@@ -59,30 +59,49 @@ pub async fn get_version_metadata(
     _requesting_fragment_context: &str,
 ) -> Result<ObjectMetadata, AppError> {
     let requested_key = object_key.trim_start_matches('/').to_string();
-    let physical_object_id = match global_namespace_runtime()
+
+    let resolved = match global_namespace_runtime()
         .resolve_any_object_id(fragment, &requested_key)
-        .await?
+        .await
     {
-        Some(object_id) => object_id,
-        None => {
-            index_store::normalize_object_id(&requested_key).map_err(|_| logical_not_found())?
+        Ok(Some(object_id)) => Some(object_id),
+        Ok(None) => index_store::normalize_object_id(&requested_key).ok(),
+        Err(err) => {
+            warn!(
+                "Namespace version lookup failed for {}/{}@{}; falling back to immutable version index: {}",
+                fragment, object_key, version_id, err
+            );
+            index_store::normalize_object_id(&requested_key).ok()
         }
     };
-    match index::read_object_version(fragment, &physical_object_id, version_id).await {
-        Ok(mut metadata) => {
+
+    if let Some(physical_object_id) = resolved {
+        match index::read_object_version(fragment, &physical_object_id, version_id).await {
+            Ok(mut metadata) => {
+                if metadata.fragment != fragment {
+                    metadata.fragment = fragment.to_string();
+                }
+                metadata.object_key = requested_key;
+                return Ok(metadata);
+            }
+            Err(AppError::NotFound) => {}
+            Err(e) => {
+                warn!(
+                    "Index version read failed for {}/{}/{}: {}",
+                    fragment, physical_object_id, version_id, e
+                );
+            }
+        }
+    }
+
+    match index::find_live_object_version_by_id(fragment, version_id).await? {
+        Some(mut metadata) => {
             if metadata.fragment != fragment {
                 metadata.fragment = fragment.to_string();
             }
             metadata.object_key = requested_key;
             Ok(metadata)
         }
-        Err(AppError::NotFound) => Err(AppError::NotFound),
-        Err(e) => {
-            warn!(
-                "Index version read failed for {}/{}/{}: {}",
-                fragment, object_key, version_id, e
-            );
-            Err(AppError::NotFound)
-        }
+        None => Err(logical_not_found()),
     }
 }

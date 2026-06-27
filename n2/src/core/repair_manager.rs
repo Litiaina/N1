@@ -11,6 +11,7 @@ use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_i
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
+use crate::distribution::download::{shard_is_remote, shard_probe_readable, shard_probe_verified};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::replica::repair_namespace_replicas;
 use crate::namespace::runtime::global_namespace_runtime;
@@ -249,7 +250,7 @@ impl RepairCheckMode {
         }
     }
 
-    fn verifies_full_integrity(self) -> bool {
+    pub(crate) fn verifies_full_integrity(self) -> bool {
         !matches!(self, Self::Availability)
     }
 }
@@ -304,6 +305,7 @@ pub(crate) fn parse_check_mode(params: &HashMap<String, String>) -> RepairCheckM
     let normalized_mode = params
         .get("mode")
         .or_else(|| params.get("check_mode"))
+        .or_else(|| params.get("check"))
         .or_else(|| params.get("execution_mode"))
         .map(|s| s.trim().to_ascii_lowercase());
 
@@ -613,6 +615,9 @@ async fn normalize_part_paths_for_repair(
 
         let abs = shard.absolute_path.clone();
         let abs_norm = strip_tmp_attempt_suffix(abs.as_str()).to_string();
+        if shard_is_remote(shard) {
+            continue;
+        }
 
         let expected = expected_shard_path(
             path_manager,
@@ -706,6 +711,24 @@ async fn inspect_object_parts(
 
         for shard in &normalized.shards {
             report.total_shards += 1;
+            if shard_is_remote(shard) {
+                let healthy = if check_mode.verifies_full_integrity() {
+                    shard_probe_verified(shard).await
+                } else {
+                    shard_probe_readable(shard).await
+                };
+                if healthy {
+                    report.healthy_shards += 1;
+                    healthy_in_part += 1;
+                } else if check_mode.verifies_full_integrity() {
+                    report.corrupt_shards += 1;
+                    bad_indexes.push(shard.shard_index);
+                } else {
+                    report.missing_shards += 1;
+                    bad_indexes.push(shard.shard_index);
+                }
+                continue;
+            }
             let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
             match fs::metadata(&shard_path).await {
                 Ok(metadata) => {
@@ -1739,6 +1762,10 @@ mod tests {
         assert_eq!(parse_check_mode(&params), RepairCheckMode::Strict);
 
         params.insert("mode".to_string(), "checksum".to_string());
+        assert_eq!(parse_check_mode(&params), RepairCheckMode::Checksum);
+
+        params.clear();
+        params.insert("check".to_string(), "checksum".to_string());
         assert_eq!(parse_check_mode(&params), RepairCheckMode::Checksum);
     }
 

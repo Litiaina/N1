@@ -972,6 +972,25 @@ pub fn read_live_version(
     Ok(None)
 }
 
+pub fn find_live_version_by_id(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<ObjectMetadata>, AppError> {
+    let version_id = version_id.trim();
+    if version_id.is_empty() {
+        return Ok(None);
+    }
+
+    for root in blob_roots() {
+        for (dir, object_id) in object_record_dirs_under_root(&root, fragment)? {
+            if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
+                return decode_metadata_file_as(&path, &object_id).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn read_current_live_head(
     fragment: &str,
     object_key: &str,

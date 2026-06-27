@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::Utc;
 use rustix::fs::{CWD, renameat};
@@ -32,9 +32,162 @@ use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
 static FINALIZE_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+static NAMESPACE_OBJECT_META_CACHE: LazyLock<StdMutex<HashMap<String, CachedNamespaceObjectMeta>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+const NAMESPACE_OBJECT_META_CACHE_TTL: Duration = Duration::from_secs(30);
+const NAMESPACE_OBJECT_META_CACHE_MAX: usize = 65_536;
+
+#[derive(Clone, Debug)]
+struct CachedNamespaceObjectMeta {
+    size_bytes: u64,
+    version_id: String,
+    content_type: String,
+    created_at_unix: i64,
+    inserted_at: Instant,
+}
 
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
+}
+
+fn namespace_object_meta_cache_key(fragment: &str, object_id: &str) -> String {
+    format!("{fragment}\0{object_id}")
+}
+
+fn cached_namespace_object_meta(
+    fragment: &str,
+    object_id: &str,
+) -> Option<CachedNamespaceObjectMeta> {
+    let key = namespace_object_meta_cache_key(fragment, object_id);
+    let mut cache = NAMESPACE_OBJECT_META_CACHE.lock().ok()?;
+    match cache.get(&key) {
+        Some(cached) if cached.inserted_at.elapsed() <= NAMESPACE_OBJECT_META_CACHE_TTL => {
+            Some(cached.clone())
+        }
+        Some(_) => {
+            cache.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn cache_namespace_object_meta(
+    fragment: &str,
+    object_id: &str,
+    metadata: CachedNamespaceObjectMeta,
+) {
+    let Ok(mut cache) = NAMESPACE_OBJECT_META_CACHE.lock() else {
+        return;
+    };
+    if cache.len() >= NAMESPACE_OBJECT_META_CACHE_MAX {
+        cache.retain(|_, cached| cached.inserted_at.elapsed() <= NAMESPACE_OBJECT_META_CACHE_TTL);
+        if cache.len() >= NAMESPACE_OBJECT_META_CACHE_MAX {
+            let remove = cache
+                .len()
+                .saturating_sub(NAMESPACE_OBJECT_META_CACHE_MAX)
+                .saturating_add(1);
+            let keys = cache.keys().take(remove).cloned().collect::<Vec<_>>();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+    }
+    cache.insert(
+        namespace_object_meta_cache_key(fragment, object_id),
+        metadata,
+    );
+}
+
+fn cached_meta_from_object_metadata(metadata: &ObjectMetadata) -> CachedNamespaceObjectMeta {
+    CachedNamespaceObjectMeta {
+        size_bytes: metadata.total_size_bytes,
+        version_id: metadata.version_id.clone(),
+        content_type: metadata.content_type.clone(),
+        created_at_unix: metadata.created_at,
+        inserted_at: Instant::now(),
+    }
+}
+
+fn cache_namespace_object_metadata(metadata: &ObjectMetadata) {
+    cache_namespace_object_meta(
+        &metadata.fragment,
+        &metadata.object_key,
+        cached_meta_from_object_metadata(metadata),
+    );
+}
+
+fn hydrate_entry_from_cached_meta(
+    entry: &mut NamespaceEntry,
+    metadata: &CachedNamespaceObjectMeta,
+) {
+    entry.size_bytes = Some(metadata.size_bytes);
+    entry.version_id = Some(metadata.version_id.clone());
+    entry.created_at_unix = metadata.created_at_unix;
+    entry.updated_at_unix = metadata.created_at_unix;
+}
+
+fn object_head_from_cached_meta(
+    fragment: &str,
+    lifecycle: LifecycleState,
+    object_id: &str,
+    metadata: CachedNamespaceObjectMeta,
+) -> ObjectHead {
+    ObjectHead {
+        fragment: fragment.to_string(),
+        object_id: object_id.to_string(),
+        current_version_id: metadata.version_id,
+        storage_object_id: object_id.to_string(),
+        content_type: metadata.content_type,
+        total_size_bytes: metadata.size_bytes,
+        lifecycle,
+        created_at_unix: metadata.created_at_unix,
+        updated_at_unix: metadata.created_at_unix,
+    }
+}
+
+async fn namespace_read_best_effort(
+    request: PeerNamespaceReadRequest,
+) -> Result<Option<PeerNamespaceReadResponse>, AppError> {
+    let remote_timeout = namespace_read_remote_timeout();
+    match tokio::time::timeout(remote_timeout, namespace_read_if_remote(request)).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(AppError::ServiceUnavailable(message))) => {
+            tracing::warn!(
+                "N2 namespace remote read quorum unavailable; falling back to local read-only namespace view: {}",
+                message
+            );
+            Ok(None)
+        }
+        Ok(Err(AppError::Timeout(message))) => {
+            tracing::warn!(
+                "N2 namespace remote read timed out; falling back to local read-only namespace view: {}",
+                message
+            );
+            Ok(None)
+        }
+        Ok(Err(err)) => Err(err),
+        Err(_) => {
+            tracing::warn!(
+                "N2 namespace remote read exceeded {:?}; falling back to local read-only namespace view",
+                remote_timeout
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn namespace_read_remote_timeout() -> Duration {
+    static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+        let millis = std::env::var("N2_NAMESPACE_READ_REMOTE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(750);
+        Duration::from_millis(millis)
+    });
+    *TIMEOUT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +265,7 @@ impl NamespaceRuntime {
         if let Some(PeerNamespaceReadResponse::ListDir {
             entries,
             continuation_token,
-        }) = namespace_read_if_remote(PeerNamespaceReadRequest {
+        }) = namespace_read_best_effort(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::ListDir,
             path: Some(path.to_string()),
@@ -126,10 +279,10 @@ impl NamespaceRuntime {
             return Ok((entries, continuation_token));
         }
         let fragment = fragment.to_string();
-        let scan_fragment = fragment.clone();
+        let scan_fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
         let after = continuation_token.map(ToOwned::to_owned);
-        let (mut entries, next) = tokio::task::spawn_blocking(move || {
+        let (entries, next) = tokio::task::spawn_blocking(move || {
             if include_trashed {
                 return list_trash_dir_page(&scan_fragment, &path, limit, after.as_deref());
             }
@@ -137,20 +290,6 @@ impl NamespaceRuntime {
         })
         .await
         .map_err(|err| AppError::InternalServerError(format!("N2 namespace worker: {err}")))??;
-        for entry in entries
-            .iter_mut()
-            .filter(|entry| entry.kind == NamespaceEntryKind::File)
-        {
-            let Some(object_id) = entry.object_id.as_deref() else {
-                continue;
-            };
-            if let Ok(metadata) = index::read_latest_object(fragment.as_str(), object_id).await {
-                entry.size_bytes = Some(metadata.total_size_bytes);
-                entry.version_id = Some(metadata.version_id);
-                entry.created_at_unix = metadata.created_at;
-                entry.updated_at_unix = metadata.created_at;
-            }
-        }
         Ok((entries, next))
     }
 
@@ -160,7 +299,7 @@ impl NamespaceRuntime {
         path: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
         if let Some(PeerNamespaceReadResponse::Entry(entry)) =
-            namespace_read_if_remote(PeerNamespaceReadRequest {
+            namespace_read_best_effort(PeerNamespaceReadRequest {
                 fragment: fragment.to_string(),
                 kind: PeerNamespaceReadKind::Entry,
                 path: Some(path.to_string()),
@@ -173,24 +312,13 @@ impl NamespaceRuntime {
         {
             return Ok(entry);
         }
-        let fragment = fragment.to_string();
-        let scan_fragment = fragment.clone();
+        let scan_fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
-        let mut entry = tokio::task::spawn_blocking(move || live_entry(&scan_fragment, &path))
+        let entry = tokio::task::spawn_blocking(move || live_entry(&scan_fragment, &path))
             .await
             .map_err(|err| {
                 AppError::InternalServerError(format!("N2 namespace worker: {err}"))
             })??;
-        if let Some(entry) = entry.as_mut()
-            && entry.kind == NamespaceEntryKind::File
-            && let Some(object_id) = entry.object_id.as_deref()
-            && let Ok(metadata) = index::read_latest_object(fragment.as_str(), object_id).await
-        {
-            entry.size_bytes = Some(metadata.total_size_bytes);
-            entry.version_id = Some(metadata.version_id);
-            entry.created_at_unix = metadata.created_at;
-            entry.updated_at_unix = metadata.created_at;
-        }
         Ok(entry)
     }
 
@@ -200,7 +328,7 @@ impl NamespaceRuntime {
         path: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
         if let Some(PeerNamespaceReadResponse::Entry(entry)) =
-            namespace_read_if_remote(PeerNamespaceReadRequest {
+            namespace_read_best_effort(PeerNamespaceReadRequest {
                 fragment: fragment.to_string(),
                 kind: PeerNamespaceReadKind::TrashedEntry,
                 path: Some(path.to_string()),
@@ -213,24 +341,13 @@ impl NamespaceRuntime {
         {
             return Ok(entry);
         }
-        let fragment = fragment.to_string();
-        let scan_fragment = fragment.clone();
+        let scan_fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
-        let mut entry = tokio::task::spawn_blocking(move || trash_entry(&scan_fragment, &path))
+        let entry = tokio::task::spawn_blocking(move || trash_entry(&scan_fragment, &path))
             .await
             .map_err(|err| {
                 AppError::InternalServerError(format!("N2 namespace worker: {err}"))
             })??;
-        if let Some(entry) = entry.as_mut()
-            && entry.kind == NamespaceEntryKind::File
-            && let Some(object_id) = entry.object_id.as_deref()
-            && let Ok(metadata) = index::read_latest_object(fragment.as_str(), object_id).await
-        {
-            entry.size_bytes = Some(metadata.total_size_bytes);
-            entry.version_id = Some(metadata.version_id);
-            entry.created_at_unix = metadata.created_at;
-            entry.updated_at_unix = metadata.created_at;
-        }
         Ok(entry)
     }
 
@@ -242,11 +359,20 @@ impl NamespaceRuntime {
         let Some(object_id) = self.resolve_live_object_id(fragment, path).await? else {
             return Ok(None);
         };
+        if let Some(metadata) = cached_namespace_object_meta(fragment, &object_id) {
+            return Ok(Some(object_head_from_cached_meta(
+                fragment,
+                LifecycleState::Live,
+                &object_id,
+                metadata,
+            )));
+        }
         let meta = match index::read_latest_object(fragment, &object_id).await {
             Ok(meta) => meta,
             Err(AppError::NotFound) => return Ok(None),
             Err(err) => return Err(err),
         };
+        cache_namespace_object_metadata(&meta);
         Ok(Some(object_head_from_meta(
             fragment,
             LifecycleState::Live,
@@ -261,7 +387,20 @@ impl NamespaceRuntime {
     ) -> Result<HashMap<String, ObjectHead>, AppError> {
         let mut out = HashMap::new();
         for object_id in object_ids {
+            if let Some(metadata) = cached_namespace_object_meta(fragment, object_id) {
+                out.insert(
+                    object_id.clone(),
+                    object_head_from_cached_meta(
+                        fragment,
+                        LifecycleState::Live,
+                        object_id,
+                        metadata,
+                    ),
+                );
+                continue;
+            }
             if let Ok(meta) = index::read_latest_object(fragment, object_id).await {
+                cache_namespace_object_metadata(&meta);
                 out.insert(
                     object_id.clone(),
                     object_head_from_meta(fragment, LifecycleState::Live, meta),
@@ -459,7 +598,7 @@ impl NamespaceRuntime {
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
         let mut snapshot = NamespaceReachabilitySnapshot::default();
-        let object_ids = match namespace_read_if_remote(PeerNamespaceReadRequest {
+        let object_ids = match namespace_read_best_effort(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::Reachability,
             path: None,
@@ -508,7 +647,7 @@ impl NamespaceRuntime {
         path: &str,
     ) -> Result<Option<String>, AppError> {
         if let Some(PeerNamespaceReadResponse::ObjectId(object_id)) =
-            namespace_read_if_remote(PeerNamespaceReadRequest {
+            namespace_read_best_effort(PeerNamespaceReadRequest {
                 fragment: fragment.to_string(),
                 kind: PeerNamespaceReadKind::ResolveLiveObject,
                 path: Some(path.to_string()),
@@ -575,7 +714,7 @@ impl NamespaceRuntime {
         fragment: &str,
         logical_path: &str,
         physical_object_id: &str,
-        _metadata: &ObjectMetadata,
+        metadata: &ObjectMetadata,
     ) -> Result<String, AppError> {
         let fragment = fragment.to_string();
         let logical_path = normalize_user_path(logical_path)?;
@@ -625,6 +764,9 @@ impl NamespaceRuntime {
             Arc::ptr_eq(existing, &lock) && Arc::strong_count(existing) <= 2
         }) {
             locks.remove(&lock_key);
+        }
+        if result.is_ok() {
+            cache_namespace_object_metadata(metadata);
         }
         result
     }
@@ -712,7 +854,7 @@ impl NamespaceRuntime {
         include_trashed: bool,
     ) -> Result<NamespaceObjectRefPage, AppError> {
         if let Some(PeerNamespaceReadResponse::ObjectRefs(page)) =
-            namespace_read_if_remote(PeerNamespaceReadRequest {
+            namespace_read_best_effort(PeerNamespaceReadRequest {
                 fragment: fragment.to_string(),
                 kind: PeerNamespaceReadKind::ObjectRefs,
                 path: None,
@@ -954,6 +1096,33 @@ fn object_head_from_meta(
     }
 }
 
+fn hydrate_entry_from_local_summary(
+    root: &Path,
+    fragment: &str,
+    entry: &mut NamespaceEntry,
+) -> Result<(), AppError> {
+    if entry.kind != NamespaceEntryKind::File {
+        return Ok(());
+    }
+    let Some(object_id) = entry.object_id.clone() else {
+        return Ok(());
+    };
+    if let Some(metadata) = cached_namespace_object_meta(fragment, &object_id) {
+        hydrate_entry_from_cached_meta(entry, &metadata);
+        return Ok(());
+    }
+    let Ok(object_dir) = live_object_dir(root, fragment, &object_id) else {
+        return Ok(());
+    };
+    if let Some(metadata) =
+        latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
+    {
+        cache_namespace_object_metadata(&metadata);
+        hydrate_entry_from_cached_meta(entry, &cached_meta_from_object_metadata(&metadata));
+    }
+    Ok(())
+}
+
 fn live_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppError> {
     if path.is_empty() {
         return Ok(Some(root_entry(fragment)));
@@ -964,7 +1133,7 @@ fn live_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppE
     for root in namespace_roots(fragment) {
         let direct = namespace_path(&root, fragment, path);
         if let Some(object_id) = read_namespace_symlink_object_id(&root, fragment, &direct)? {
-            return Ok(Some(namespace_entry(
+            let mut entry = namespace_entry(
                 fragment,
                 path.to_string(),
                 NamespaceEntryKind::File,
@@ -973,7 +1142,9 @@ fn live_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppE
                 None,
                 None,
                 None,
-            )));
+            );
+            hydrate_entry_from_local_summary(&root, fragment, &mut entry)?;
+            return Ok(Some(entry));
         }
         if direct.is_dir() && !internal_namespace_entry_name(base_name(path).as_str()) {
             return Ok(Some(namespace_entry(
@@ -1025,7 +1196,7 @@ fn list_live_dir_page(
                 if !seen.insert(display_name.clone()) {
                     continue;
                 }
-                entries.push(namespace_entry(
+                let mut entry = namespace_entry(
                     fragment,
                     child_path,
                     NamespaceEntryKind::File,
@@ -1034,7 +1205,9 @@ fn list_live_dir_page(
                     None,
                     None,
                     None,
-                ));
+                );
+                hydrate_entry_from_local_summary(&root, fragment, &mut entry)?;
+                entries.push(entry);
             } else if child.is_dir() {
                 if !seen.insert(display_name.clone()) {
                     continue;
@@ -1188,16 +1361,7 @@ fn trash_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, App
                 Some(deleted_at),
                 Some((deleted_at, deleted_at)),
             );
-            if let Ok(object_dir) = live_object_dir(&root, fragment, &object_id) {
-                if let Some(head) =
-                    latest_summary_metadata_in_object_dir(fragment, &object_id, &object_dir)?
-                {
-                    entry.size_bytes = Some(head.total_size_bytes);
-                    entry.version_id = Some(head.version_id);
-                    entry.created_at_unix = head.created_at;
-                    entry.updated_at_unix = head.created_at;
-                }
-            }
+            hydrate_entry_from_local_summary(&root, fragment, &mut entry)?;
             return Ok(Some(entry));
         }
         if meta.is_dir() {

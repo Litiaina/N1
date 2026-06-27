@@ -235,6 +235,15 @@ pub async fn read_object_version(
         .ok_or(AppError::NotFound)
 }
 
+pub async fn find_live_object_version_by_id(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<ObjectMetadata>, AppError> {
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    run_index_blocking(move || index_store::find_live_version_by_id(&fragment, &version_id)).await
+}
+
 pub async fn read_trashed_object_version(
     fragment: &str,
     object_key: &str,

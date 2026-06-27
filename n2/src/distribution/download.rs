@@ -2,12 +2,18 @@ use crate::core::disk_manager::{PartMetadata, ShardInfo};
 use crate::distribution::peer::{fetch_peer_shard_chunk, parse_peer_shard_locator};
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_read_recover;
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
-use simd_erasure_core::ReedSolomonDecoder;
+use crc32fast::Hasher;
+use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
+use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+#[derive(Default)]
+pub struct VerifiedShardCache {
+    verified: HashMap<String, Vec<u8>>,
+    rejected: HashSet<String>,
+}
 
 pub fn shard_is_remote(shard: &ShardInfo) -> bool {
     parse_peer_shard_locator(&shard.absolute_path).is_some()
@@ -76,19 +82,110 @@ pub async fn shard_probe_readable(shard: &ShardInfo) -> bool {
     read_shard_chunk(shard, 0, 1).await.is_ok()
 }
 
+fn expected_crc32(checksum: &str) -> Option<u32> {
+    let checksum = checksum.trim();
+    if checksum.len() != 8 {
+        return None;
+    }
+    u32::from_str_radix(checksum, 16).ok()
+}
+
+fn crc32_matches(bytes: &[u8], expected: u32) -> bool {
+    let mut hasher = Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize() == expected
+}
+
+fn verified_cache_key(shard: &ShardInfo) -> String {
+    format!(
+        "{}\0{}\0{}",
+        shard.absolute_path, shard.checksum, shard.size_bytes
+    )
+}
+
+async fn read_full_shard(shard: &ShardInfo) -> Result<Vec<u8>, AppError> {
+    let len = usize::try_from(shard.size_bytes).map_err(|_| {
+        AppError::InternalServerError("shard is too large to verify in memory".into())
+    })?;
+    read_shard_chunk(shard, 0, len).await
+}
+
+pub async fn shard_probe_verified(shard: &ShardInfo) -> bool {
+    let Some(expected) = expected_crc32(&shard.checksum) else {
+        return shard_probe_readable(shard).await;
+    };
+    let Ok(bytes) = read_full_shard(shard).await else {
+        return false;
+    };
+    bytes.len() as u64 == shard.size_bytes && crc32_matches(&bytes, expected)
+}
+
+pub(crate) async fn read_verified_shard_slice_cached(
+    shard: &ShardInfo,
+    offset: u64,
+    len: usize,
+    cache: &mut VerifiedShardCache,
+) -> Result<Vec<u8>, AppError> {
+    let Some(expected) = expected_crc32(&shard.checksum) else {
+        return read_shard_chunk(shard, offset, len).await;
+    };
+    let key = verified_cache_key(shard);
+    if cache.rejected.contains(&key) {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} failed checksum verification",
+            shard.file_name
+        )));
+    }
+    if !cache.verified.contains_key(&key) {
+        let bytes = read_full_shard(shard).await?;
+        if bytes.len() as u64 != shard.size_bytes || !crc32_matches(&bytes, expected) {
+            cache.rejected.insert(key.clone());
+            return Err(AppError::ServiceUnavailable(format!(
+                "cluster shard {} failed checksum verification",
+                shard.file_name
+            )));
+        }
+        cache.verified.insert(key.clone(), bytes);
+    }
+    let bytes = cache.verified.get(&key).ok_or_else(|| {
+        AppError::InternalServerError("verified shard cache lost an inserted shard".into())
+    })?;
+    let start = usize::try_from(offset)
+        .map_err(|_| AppError::BadRequest("shard read offset exceeds usize".into()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| AppError::BadRequest("shard read range overflows usize".into()))?;
+    if end > bytes.len() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} is shorter than requested range",
+            shard.file_name
+        )));
+    }
+    Ok(bytes[start..end].to_vec())
+}
+
 pub async fn read_cluster_data_chunk(
     part: &PartMetadata,
     shard_idx: usize,
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>, AppError> {
+    let mut cache = VerifiedShardCache::default();
+    read_cluster_data_chunk_cached(part, shard_idx, offset, len, &mut cache).await
+}
+
+pub async fn read_cluster_data_chunk_cached(
+    part: &PartMetadata,
+    shard_idx: usize,
+    offset: u64,
+    len: usize,
+    cache: &mut VerifiedShardCache,
+) -> Result<Vec<u8>, AppError> {
     let target = nth_data_shard(part, shard_idx).ok_or_else(|| {
         AppError::InternalServerError("cluster data shard index out of bounds".into())
     })?;
 
-    if !shard_is_remote(target)
-        && let Ok(bytes) = read_shard_chunk(target, offset, len).await
-    {
+    if let Ok(bytes) = read_verified_shard_slice_cached(target, offset, len, cache).await {
         return Ok(bytes);
     }
 
@@ -104,8 +201,6 @@ pub async fn read_cluster_data_chunk(
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, recovery_len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     let mut added = 0usize;
-    let mut reads = FuturesUnordered::new();
-
     for shard in &part.shards {
         let shard = shard.clone();
         let read_len = if shard.shard_index == target.shard_index {
@@ -113,14 +208,8 @@ pub async fn read_cluster_data_chunk(
         } else {
             recovery_len
         };
-        reads.push(async move {
-            let result = read_shard_chunk(&shard, offset, read_len).await;
-            (shard, result)
-        });
-    }
-
-    while let Some((shard, result)) = reads.next().await {
-        let Ok(chunk) = result else {
+        let Ok(chunk) = read_verified_shard_slice_cached(&shard, offset, read_len, cache).await
+        else {
             continue;
         };
         if shard.shard_index == target.shard_index {
@@ -159,6 +248,89 @@ pub async fn read_cluster_data_chunk(
     restored.truncate(len);
     record_read_recover(restored.len() as u64, missing_observed as u64);
     Ok(restored)
+}
+
+pub(crate) async fn reconstruct_cluster_shard_cached(
+    part: &PartMetadata,
+    target_shard_idx: usize,
+    block_size: usize,
+    cache: &mut VerifiedShardCache,
+) -> Result<Vec<u8>, AppError> {
+    let target = part
+        .shards
+        .iter()
+        .find(|shard| shard.shard_index == target_shard_idx)
+        .ok_or_else(|| {
+            AppError::InternalServerError("cluster repair target shard missing".into())
+        })?;
+    let total_len = usize::try_from(target.size_bytes).map_err(|_| {
+        AppError::InternalServerError("cluster repair target shard is too large".into())
+    })?;
+    if total_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let data_count = data_shards_count(part);
+    let parity_count = part.shards.len().saturating_sub(data_count);
+    if data_count == 0 || parity_count == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "cluster shard repair requires data and parity shards".into(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(total_len);
+    let mut offset = 0u64;
+    let data_nth = part
+        .shards
+        .iter()
+        .filter(|shard| !shard.is_parity)
+        .position(|shard| shard.shard_index == target_shard_idx);
+
+    while (offset as usize) < total_len {
+        let remaining = total_len - offset as usize;
+        let cur = remaining.min(block_size);
+
+        if let Some(data_idx) = data_nth {
+            let bytes = read_cluster_data_chunk_cached(part, data_idx, offset, cur, cache).await?;
+            out.extend_from_slice(&bytes);
+            offset = offset.saturating_add(cur as u64);
+            continue;
+        }
+
+        let recovery_len = if cur % 2 == 0 { cur } else { cur + 1 };
+        let mut encoder = ReedSolomonEncoder::new(data_count, parity_count, recovery_len)
+            .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {e}")))?;
+        for data_idx in 0..data_count {
+            let mut data =
+                read_cluster_data_chunk_cached(part, data_idx, offset, cur, cache).await?;
+            if data.len() < recovery_len {
+                data.resize(recovery_len, 0);
+            }
+            encoder
+                .add_original_shard(&data)
+                .map_err(|e| AppError::InternalServerError(format!("RS Add: {e}")))?;
+        }
+        let encoded = encoder
+            .encode()
+            .map_err(|e| AppError::InternalServerError(format!("RS Encode: {e}")))?;
+        let recovery_idx = target_shard_idx.saturating_sub(data_count);
+        let parity = encoded
+            .recovery(recovery_idx)
+            .ok_or_else(|| AppError::InternalServerError("missing reconstructed parity".into()))?;
+        out.extend_from_slice(&parity[..cur]);
+        offset = offset.saturating_add(cur as u64);
+    }
+
+    out.truncate(total_len);
+    if let Some(expected) = expected_crc32(&target.checksum) {
+        if !crc32_matches(&out, expected) {
+            return Err(AppError::InternalServerError(format!(
+                "reconstructed shard {} failed checksum validation",
+                target.file_name
+            )));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

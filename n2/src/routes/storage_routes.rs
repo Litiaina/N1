@@ -53,6 +53,7 @@ use crate::distribution::peer::build_peer_routes;
 use crate::distribution::rebalance::{
     metadata_matches_current_layout, rewrite_object_to_current_layout,
 };
+use crate::distribution::repair::repair_cluster_object_shards;
 use crate::distribution::routes::build_cluster_routes;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -176,6 +177,55 @@ fn looks_like_flat_storage_object_id(requested_path: &str) -> bool {
         && !normalized.contains('/')
         && normalized.len() == 64
         && normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn read_versioned_metadata_for_request(
+    fragment: &str,
+    requested_path: &str,
+    version_id: &str,
+    physical_hint: Option<&str>,
+) -> Result<(String, crate::core::disk_manager::ObjectMetadata), AppError> {
+    let requested = requested_path.trim_start_matches('/').trim().to_string();
+    let version_id = version_id.trim();
+    if requested.is_empty() || version_id.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    if let Some(physical) = physical_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| index_store::normalize_object_id(value).ok())
+    {
+        if let Ok(mut metadata) = index::read_object_version(fragment, &physical, version_id).await
+        {
+            metadata.object_key = requested;
+            return Ok((physical, metadata));
+        }
+    }
+
+    if let Ok(physical) = resolve_logical_read_key(fragment, &requested).await {
+        if let Ok(mut metadata) = index::read_object_version(fragment, &physical, version_id).await
+        {
+            metadata.object_key = requested;
+            return Ok((physical, metadata));
+        }
+    }
+
+    if let Ok(physical) = index_store::normalize_object_id(&requested) {
+        if let Ok(mut metadata) = index::read_object_version(fragment, &physical, version_id).await
+        {
+            metadata.object_key = requested;
+            return Ok((physical, metadata));
+        }
+    }
+
+    if let Some(mut metadata) = index::find_live_object_version_by_id(fragment, version_id).await? {
+        let physical = metadata.object_key.clone();
+        metadata.object_key = requested;
+        return Ok((physical, metadata));
+    }
+
+    Err(AppError::NotFound)
 }
 
 fn query_bool(params: &HashMap<String, String>, key: &str) -> bool {
@@ -346,11 +396,27 @@ async fn mint_signed_read_url_scoped(
     AxumJson(mut req): AxumJson<SignedReadUrlRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let requested = req.object_key.clone();
-    let resolved = resolve_logical_read_key(&claims.fragment, &requested).await?;
     if req.filename.is_none() {
-        req.filename = download_filename_for_logical_path(&requested, &resolved);
+        req.filename = std::path::Path::new(requested.trim_start_matches('/'))
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
     }
-    req.object_key = resolved;
+    if req
+        .version_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        req.object_key = requested;
+    } else {
+        let resolved = resolve_logical_read_key(&claims.fragment, &requested).await?;
+        if req.filename.is_none() {
+            req.filename = download_filename_for_logical_path(&requested, &resolved);
+        }
+        req.object_key = resolved;
+    }
     mint_signed_read_url(claims, AxumJson(req)).await
 }
 
@@ -491,11 +557,25 @@ async fn download_object_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     let requested = query.object_key.clone();
-    let resolved = resolve_logical_read_key(&fragment, &requested).await?;
     if query.filename.is_none() {
-        query.filename = download_filename_for_logical_path(&requested, &resolved);
+        query.filename = std::path::Path::new(requested.trim_start_matches('/'))
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
     }
-    query.object_key = resolved;
+    if query
+        .version_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        let resolved = resolve_logical_read_key(&fragment, &requested).await?;
+        if query.filename.is_none() {
+            query.filename = download_filename_for_logical_path(&requested, &resolved);
+        }
+        query.object_key = resolved;
+    }
     download_object_impl(claims, Path(fragment), Query(query), headers).await
 }
 
@@ -714,19 +794,34 @@ async fn get_object_repair_status_scoped(
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let requested_version_id = params
+        .get("version_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let metadata = if let Some(version_id) = params
         .get("version_id")
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        index::read_object_version(&fragment, &physical, version_id).await?
+        read_versioned_metadata_for_request(
+            &fragment,
+            &object_key,
+            version_id,
+            params.get("physical_object_id").map(String::as_str),
+        )
+        .await?
+        .1
     } else {
+        let physical = resolve_logical_read_key(&fragment, &object_key).await?;
         get_object_metadata_direct(&fragment, &physical).await?
     };
     let mut status = inspect_cluster_object_status(&metadata, parse_check_mode(&params)).await?;
     status.object_key = object_key.trim_start_matches('/').to_string();
+    if requested_version_id.is_some() {
+        status.version_id = metadata.version_id;
+    }
     Ok(AxumJson(status))
 }
 
@@ -756,15 +851,22 @@ async fn redistribute_object_scoped(
     }
     let fragment = claims.fragment.clone();
     let logical = object_key.trim_start_matches('/').to_string();
-    let physical = resolve_logical_read_key(&fragment, &logical).await?;
     let requested_version_id = params
         .get("version_id")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let metadata = if let Some(version_id) = requested_version_id.as_deref() {
-        index::read_object_version(&fragment, &physical, version_id).await?
+    let (physical, metadata) = if let Some(version_id) = requested_version_id.as_deref() {
+        read_versioned_metadata_for_request(
+            &fragment,
+            &logical,
+            version_id,
+            params.get("physical_object_id").map(String::as_str),
+        )
+        .await?
     } else {
-        get_object_metadata_direct(&fragment, &physical).await?
+        let physical = resolve_logical_read_key(&fragment, &logical).await?;
+        let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+        (physical, metadata)
     };
     let check_mode = parse_check_mode(&params);
     let mut before = inspect_cluster_object_status(&metadata, check_mode).await?;
@@ -834,23 +936,28 @@ async fn repair_object_scoped(
         ));
     }
     let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let requested_version_id = params
+        .get("version_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (_physical, metadata) = if let Some(version_id) = requested_version_id.as_deref() {
+        read_versioned_metadata_for_request(
+            &fragment,
+            &object_key,
+            version_id,
+            params.get("physical_object_id").map(String::as_str),
+        )
+        .await?
+    } else {
+        let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+        let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+        (physical, metadata)
+    };
     let check_mode = parse_check_mode(&params);
     let mut status = if metadata.parts.iter().any(part_has_remote_shards) {
         let status = inspect_cluster_object_status(&metadata, check_mode).await?;
-        if status.status == "healthy" {
-            status
-        } else if status.repairable {
-            rewrite_object_to_current_layout(
-                object_key.trim_start_matches('/').to_string(),
-                physical.clone(),
-                metadata.clone(),
-                false,
-            )
-            .await?;
-            let repaired_metadata = get_object_metadata_direct(&fragment, &physical).await?;
-            inspect_cluster_object_status(&repaired_metadata, check_mode).await?
+        if status.status != "healthy" && status.repairable {
+            repair_cluster_object_shards(&metadata, check_mode).await?
         } else {
             status
         }
@@ -1625,14 +1732,16 @@ pub fn build_storage_routes_unbound_with_options(
 
     let ws_routes = { Router::new().route("/ws", get(ws_handler)) };
 
-    let global_routes = Router::new()
+    let public_global_routes = Router::new()
         .route("/n2/fragments/check", get(verify_fragment_existence))
         .route("/n2/fragments/hash", get(get_fragment_hash))
-        .route("/n2/objects/signed-read", get(read_object_via_signed_url))
+        .route("/n2/objects/signed-read", get(read_object_via_signed_url));
+    let public_global_routes = layers.layer_global(public_global_routes);
+
+    let peer_routes = Router::new()
         .merge(build_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
         .merge(build_namespace_peer_routes());
-    let global_routes = layers.layer_global(global_routes);
 
     let create_fragment_route = Router::new().route("/n2/fragments", post(create_fragment));
     let create_fragment_route = layers
@@ -1656,7 +1765,8 @@ pub fn build_storage_routes_unbound_with_options(
         .merge(fragment_auth_route)
         .merge(refresh_auth_route)
         .merge(logout_auth_route)
-        .merge(global_routes)
+        .merge(public_global_routes)
+        .merge(peer_routes)
         .merge(create_fragment_route)
         .merge(ws_routes);
 

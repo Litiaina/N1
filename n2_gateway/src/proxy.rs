@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderName, Response, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, Uri, header};
 use futures_util::TryStreamExt;
 
 use crate::config::NodeConfig;
@@ -29,6 +29,9 @@ pub async fn proxy_http(
         .request(method, upstream_url)
         .body(reqwest::Body::wrap_stream(stream));
     builder = copy_request_headers(builder, &headers);
+    if let Some(host) = upstream_host_header(&headers, &uri) {
+        builder = builder.header(header::HOST, host);
+    }
 
     let upstream = builder.send().await.map_err(|err| {
         text_response(
@@ -69,11 +72,22 @@ fn copy_request_headers(
     builder
 }
 
+fn upstream_host_header(headers: &HeaderMap, uri: &Uri) -> Option<HeaderValue> {
+    if let Ok(value) = std::env::var("N2_GATEWAY_UPSTREAM_HOST_HEADER")
+        && let Ok(header) = HeaderValue::from_str(value.trim())
+    {
+        return Some(header);
+    }
+    headers.get(header::HOST).cloned().or_else(|| {
+        uri.authority()
+            .and_then(|authority| HeaderValue::from_str(authority.as_str()).ok())
+    })
+}
+
 fn should_copy_request_header(name: &HeaderName) -> bool {
     !matches!(
         *name,
-        header::HOST
-            | header::CONNECTION
+        header::CONNECTION
             | header::UPGRADE
             | header::PROXY_AUTHORIZATION
             | header::PROXY_AUTHENTICATE

@@ -29,7 +29,9 @@ async fn posix_list(
     let scan_trash = query.trash.unwrap_or(false);
     let path = query.path.unwrap_or_default();
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-    let _ = sync_namespace_from_peers(&claims.fragment).await;
+    if query.sync.unwrap_or(false) {
+        let _ = sync_namespace_from_peers(&claims.fragment).await;
+    }
     let (entries, continuation_token) = global_namespace_runtime()
         .list_dir_page(
             &claims.fragment,
@@ -49,6 +51,7 @@ async fn posix_list(
                 NamespaceEntryKind::File => PosixNodeKind::File,
                 NamespaceEntryKind::Directory => PosixNodeKind::Directory,
             },
+            object_id: entry.object_id,
             modified_at_unix: Some(entry.updated_at_unix),
             content_type: None,
             version_id: entry.version_id,
@@ -74,7 +77,9 @@ async fn posix_stat(
     }
     let path = query.path.unwrap_or_default();
     let scan_trash = query.trash.unwrap_or(false);
-    let _ = sync_namespace_from_peers(&claims.fragment).await;
+    if query.sync.unwrap_or(false) {
+        let _ = sync_namespace_from_peers(&claims.fragment).await;
+    }
     let entry = if scan_trash {
         global_namespace_runtime()
             .trashed_entry(&claims.fragment, &path)
@@ -91,14 +96,18 @@ async fn posix_stat(
     };
     let is_virtual = false;
     let (size_bytes, content_type, version_id) = if entry.kind == NamespaceEntryKind::File {
-        let head = global_namespace_runtime()
-            .head_for_path(&claims.fragment, &entry.path)
-            .await?;
-        (
-            head.as_ref().map(|value| value.total_size_bytes),
-            head.as_ref().map(|value| value.content_type.clone()),
-            head.as_ref().map(|value| value.current_version_id.clone()),
-        )
+        if entry.size_bytes.is_some() || entry.version_id.is_some() {
+            (entry.size_bytes, None, entry.version_id)
+        } else {
+            let head = global_namespace_runtime()
+                .head_for_path(&claims.fragment, &entry.path)
+                .await?;
+            (
+                head.as_ref().map(|value| value.total_size_bytes),
+                head.as_ref().map(|value| value.content_type.clone()),
+                head.as_ref().map(|value| value.current_version_id.clone()),
+            )
+        }
     } else {
         (None, None, None)
     };
@@ -108,6 +117,7 @@ async fn posix_stat(
         scan_trash,
         kind,
         is_virtual,
+        object_id: entry.object_id,
         size_bytes,
         modified_at_unix: Some(entry.updated_at_unix),
         content_type,

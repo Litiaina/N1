@@ -139,6 +139,7 @@ pub(crate) async fn download_object_chunk_from_metadata(
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
+    let mut cluster_shard_cache = crate::distribution::download::VerifiedShardCache::default();
 
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
@@ -215,11 +216,12 @@ pub(crate) async fn download_object_chunk_from_metadata(
                 );
 
                 let chunk_data = if crate::distribution::download::part_has_remote_shards(part) {
-                    crate::distribution::download::read_cluster_data_chunk(
+                    crate::distribution::download::read_cluster_data_chunk_cached(
                         part,
                         shard_index,
                         file_offset,
                         chunk_len,
+                        &mut cluster_shard_cache,
                     )
                     .await?
                 } else {
@@ -286,6 +288,7 @@ where
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
     let mut written = 0u64;
+    let mut cluster_shard_cache = crate::distribution::download::VerifiedShardCache::default();
 
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
@@ -347,11 +350,12 @@ where
                 );
 
                 let chunk_data = if crate::distribution::download::part_has_remote_shards(part) {
-                    crate::distribution::download::read_cluster_data_chunk(
+                    crate::distribution::download::read_cluster_data_chunk_cached(
                         part,
                         shard_index,
                         file_offset,
                         chunk_len,
+                        &mut cluster_shard_cache,
                     )
                     .await?
                 } else {

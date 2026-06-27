@@ -1,6 +1,8 @@
 use crate::core::disk_manager::ObjectMetadata;
 use crate::core::repair_manager::{ObjectRepairStatus, RepairCheckMode, inspect_object_status};
-use crate::distribution::download::{part_has_remote_shards, shard_probe_readable};
+use crate::distribution::download::{
+    part_has_remote_shards, shard_probe_readable, shard_probe_verified,
+};
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::rebalance::object_layout_status;
 use crate::enums::app_error_enum::AppError;
@@ -78,14 +80,22 @@ pub async fn inspect_cluster_object_status(
 
         let mut probes = FuturesUnordered::new();
         for shard in part.shards.iter().cloned() {
-            probes.push(async move { shard_probe_readable(&shard).await });
+            probes.push(async move {
+                if check_mode.verifies_full_integrity() {
+                    shard_probe_verified(&shard).await
+                } else {
+                    shard_probe_readable(&shard).await
+                }
+            });
         }
 
-        while let Some(readable) = probes.next().await {
+        while let Some(healthy) = probes.next().await {
             report.total_shards += 1;
-            if readable {
+            if healthy {
                 report.healthy_shards += 1;
                 healthy_in_part += 1;
+            } else if check_mode.verifies_full_integrity() {
+                report.corrupt_shards += 1;
             } else {
                 report.missing_shards += 1;
             }

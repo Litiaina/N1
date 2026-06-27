@@ -64,6 +64,7 @@ pub async fn list_dir(
             name: entry.name,
             path: entry.path,
             kind: posix_kind_from_namespace(entry.kind),
+            object_id: entry.object_id,
             size_bytes: entry.size_bytes,
             modified_at_unix: Some(entry.updated_at_unix),
             content_type: None,
@@ -104,6 +105,7 @@ pub async fn stat_path(
             scan_trash,
             kind: PosixNodeKind::Directory,
             is_virtual: true,
+            object_id: None,
             size_bytes: None,
             modified_at_unix: None,
             content_type: None,
@@ -113,7 +115,10 @@ pub async fn stat_path(
         }),
         Some(entry) => {
             let kind = posix_kind_from_namespace(entry.kind.clone());
-            let head = if entry.kind == NamespaceEntryKind::File {
+            let head = if entry.kind == NamespaceEntryKind::File
+                && entry.size_bytes.is_none()
+                && entry.version_id.is_none()
+            {
                 match entry.object_id.as_ref() {
                     Some(object_id) => global_namespace_runtime()
                         .object_heads(&fragment, std::slice::from_ref(object_id))
@@ -129,10 +134,15 @@ pub async fn stat_path(
                 scan_trash,
                 kind,
                 is_virtual: false,
-                size_bytes: head.as_ref().map(|value| value.total_size_bytes),
+                object_id: entry.object_id,
+                size_bytes: entry
+                    .size_bytes
+                    .or_else(|| head.as_ref().map(|value| value.total_size_bytes)),
                 modified_at_unix: Some(entry.updated_at_unix),
                 content_type: head.as_ref().map(|value| value.content_type.clone()),
-                version_id: head.as_ref().map(|value| value.current_version_id.clone()),
+                version_id: entry
+                    .version_id
+                    .or_else(|| head.as_ref().map(|value| value.current_version_id.clone())),
                 trash_entry_id: entry.trash_entry_id,
                 deleted_at_unix: entry.deleted_at_unix,
             })

@@ -31,7 +31,21 @@ use ulid::Ulid;
 
 use crate::routes::storage_routes::AppState;
 
-const NAMESPACE_PEER_APPLY_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_NAMESPACE_PEER_APPLY_TIMEOUT_SECS: u64 = 15;
+const MAX_NAMESPACE_PEER_APPLY_TIMEOUT_SECS: u64 = 300;
+
+static NAMESPACE_PEER_APPLY_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let secs = std::env::var("N2_NAMESPACE_PEER_APPLY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NAMESPACE_PEER_APPLY_TIMEOUT_SECS)
+        .clamp(1, MAX_NAMESPACE_PEER_APPLY_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+});
+
+fn namespace_peer_apply_timeout() -> Duration {
+    *NAMESPACE_PEER_APPLY_TIMEOUT
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -619,7 +633,7 @@ async fn fetch_namespace_summary(
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, request.send())
+    let response = timeout(namespace_peer_apply_timeout(), request.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!("namespace summary timed out at {endpoint}"))
@@ -659,17 +673,14 @@ async fn most_current_reachable_voter(
             candidates.push((summary.committed_log_index, node));
         }
     }
+    candidates.sort_by(|(left_pos, left_node), (right_pos, right_node)| {
+        right_pos
+            .cmp(left_pos)
+            .then_with(|| left_node.id.cmp(&right_node.id))
+    });
     candidates
         .into_iter()
-        .max_by(|(left_pos, left_node), (right_pos, right_node)| {
-            left_pos
-                .cmp(right_pos)
-                .then_with(|| {
-                    (left_node.id == runtime.local_node_id)
-                        .cmp(&(right_node.id == runtime.local_node_id))
-                })
-                .then_with(|| right_node.id.cmp(&left_node.id))
-        })
+        .next()
         .map(|(_, node)| node)
         .ok_or_else(|| {
             AppError::ServiceUnavailable(
@@ -1810,7 +1821,7 @@ async fn post_namespace_prepare(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, req.send())
+    let response = timeout(namespace_peer_apply_timeout(), req.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!("namespace prepare timed out at {endpoint}"))
@@ -1840,7 +1851,7 @@ async fn post_namespace_commit(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, req.send())
+    let response = timeout(namespace_peer_apply_timeout(), req.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!("namespace commit timed out at {endpoint}"))
@@ -1884,7 +1895,7 @@ async fn post_namespace_abort(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, req.send())
+    let response = timeout(namespace_peer_apply_timeout(), req.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!("namespace abort timed out at {endpoint}"))
@@ -1918,7 +1929,7 @@ async fn fetch_namespace_prepared(
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, request.send())
+    let response = timeout(namespace_peer_apply_timeout(), request.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!(
@@ -2826,7 +2837,7 @@ async fn fetch_peer_namespace_requests(
     if let Some(secret) = cluster_secret() {
         req = req.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(NAMESPACE_PEER_APPLY_TIMEOUT, req.send())
+    let response = timeout(namespace_peer_apply_timeout(), req.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!(

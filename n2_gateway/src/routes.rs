@@ -481,7 +481,7 @@ async fn download_object(
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
     };
-    let node = match best_node(&state).await {
+    let node = match node_for_download(&state, query.version_id.as_deref()).await {
         Ok(node) => node,
         Err(response) => return response,
     };
@@ -509,7 +509,8 @@ async fn proxy_fallback(
     State(state): State<Arc<GatewayState>>,
     request: axum::extract::Request,
 ) -> Response<Body> {
-    let node = match best_node(&state).await {
+    let path = request.uri().path().to_string();
+    let node = match node_for_proxy_path(&state, &path).await {
         Ok(node) => node,
         Err(response) => return response,
     };
@@ -520,6 +521,56 @@ async fn proxy_fallback(
             response
         }
     }
+}
+
+async fn preferred_node(
+    state: &GatewayState,
+    preferred_id: &str,
+) -> Result<NodeConfig, Response<Body>> {
+    if state.nodes.is_available(preferred_id).await {
+        if let Some(node) = state.nodes.get(preferred_id).await {
+            state.nodes.mark_route(preferred_id).await;
+            return Ok(node);
+        }
+    }
+    best_node(state).await
+}
+
+async fn node_for_download(
+    state: &GatewayState,
+    _version_id: Option<&str>,
+) -> Result<NodeConfig, Response<Body>> {
+    preferred_node(state, read_preferred_node_id().as_str()).await
+}
+
+async fn node_for_proxy_path(
+    state: &GatewayState,
+    path: &str,
+) -> Result<NodeConfig, Response<Body>> {
+    if path == "/n2/objects/signed-url"
+        || path == "/n2/objects/signed-read"
+        || path.starts_with("/n2/objects/status/")
+        || path.starts_with("/n2/objects/repair/")
+        || path.starts_with("/n2/objects/get/")
+        || path.starts_with("/n2/objects/stream/")
+        || path == "/n2/trash"
+        || path == "/n2/objects"
+        || path.starts_with("/n2/posix/")
+        || path.starts_with("/n2/objects/versions/")
+        || path.starts_with("/n2/objects/meta/")
+    {
+        return preferred_node(state, read_preferred_node_id().as_str()).await;
+    }
+
+    best_node(state).await
+}
+
+fn read_preferred_node_id() -> String {
+    std::env::var("N2_GATEWAY_READ_NODE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "node-a".to_string())
 }
 
 async fn best_node(state: &GatewayState) -> Result<NodeConfig, Response<Body>> {

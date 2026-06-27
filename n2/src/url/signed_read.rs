@@ -1,6 +1,7 @@
 use crate::core::disk_manager::{ObjectKeyQuery, ObjectPathManager};
 use crate::core::download::download_object as download_object_impl;
 use crate::core::metadata_parser::get_version_metadata;
+use crate::core::object_parser::stream_object_logic;
 use crate::core::retrieve::{get_object_metadata_direct, stream_object as stream_object_impl};
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
@@ -187,11 +188,6 @@ fn validate_signed_read_query_with_secret(
     let disposition = normalize_signed_read_disposition(query.disposition.as_deref())?;
     let version_id = normalize_optional_non_empty(query.version_id.as_deref());
     let filename = normalize_optional_non_empty(query.filename.as_deref());
-    if version_id.is_some() && disposition != "download" {
-        return Err(AppError::BadRequest(
-            "Signed version reads are only supported for download disposition".into(),
-        ));
-    }
 
     let payload = signed_read_payload(
         &query.fragment,
@@ -288,11 +284,6 @@ pub async fn mint_signed_read_url(
     let disposition = normalize_signed_read_disposition(req.disposition.as_deref())?;
     let version_id = normalize_optional_non_empty(req.version_id.as_deref());
     let filename = normalize_optional_non_empty(req.filename.as_deref());
-    if version_id.is_some() && disposition != "download" {
-        return Err(AppError::BadRequest(
-            "Signed version reads are only supported for download disposition".into(),
-        ));
-    }
 
     ensure_signed_read_target_exists(&claims.fragment, &object_key, version_id.as_deref()).await?;
 
@@ -359,8 +350,18 @@ pub async fn read_object_via_signed_url(
             Ok(response.into_response())
         }
         "stream" | "view" => {
-            let response =
-                stream_object_impl(claims, headers, Path((query.fragment, object_key))).await?;
+            let response = if let Some(version_id) = validated.version_id.as_deref() {
+                let metadata =
+                    get_version_metadata(&query.fragment, &object_key, version_id, &query.fragment)
+                        .await?;
+                stream_object_logic(headers, metadata, "inline", validated.filename)
+                    .await?
+                    .into_response()
+            } else {
+                stream_object_impl(claims, headers, Path((query.fragment, object_key)))
+                    .await?
+                    .into_response()
+            };
             Ok(response.into_response())
         }
         _ => Err(AppError::BadRequest(
@@ -454,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_version_reads_require_download_disposition() {
+    fn signed_version_reads_allow_stream_disposition() {
         let secret = b"unit-test-secret";
         let fragment = "frag";
         let object_key = "archive.tar";
@@ -499,10 +500,7 @@ mod tests {
             version_id: Some(version_id.to_string()),
             filename: None,
         };
-        assert!(matches!(
-            validate_signed_read_query_with_secret(secret, &invalid, expires - 5),
-            Err(AppError::BadRequest(_))
-        ));
+        assert!(validate_signed_read_query_with_secret(secret, &invalid, expires - 5).is_ok());
     }
 
     #[test]

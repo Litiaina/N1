@@ -273,6 +273,18 @@ impl RemoteShardWriter {
     }
 }
 
+pub async fn put_peer_shard_bytes(
+    target: PeerShardTarget,
+    bytes: &[u8],
+) -> Result<ShardInfo, AppError> {
+    let mut writer = RemoteShardWriter::spawn(target)?;
+    writer
+        .write_all(bytes)
+        .await
+        .map_err(|e| AppError::Io(e, "write repaired N2 peer shard stream".into()))?;
+    writer.finish().await
+}
+
 async fn http_put_peer_shard(
     target: &PeerShardTarget,
     reader: DuplexStream,
@@ -913,6 +925,9 @@ async fn resolve_object_versions_from_nodes(
                     by_version.insert(record.version_id.clone(), record);
                 }
             }
+        }
+        if !by_version.is_empty() {
+            return Ok((by_version, successful_nodes));
         }
     }
     Ok((by_version, successful_nodes))
