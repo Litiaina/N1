@@ -72,9 +72,9 @@ write_membership() {
   "cluster_id": "n2-capacity-$TS",
   "epoch": $epoch,
   "nodes": [
-    {"id":"node-a","endpoint":"$LOCAL_BASE","native_endpoint":"$LOCAL_NATIVE","state":"online","weight":1,"index_roots":["$LROOT/index"],"blob_roots":["$LROOT/blob"]},
-    {"id":"node-b","endpoint":"$REMOTE_BASE","native_endpoint":"$REMOTE_NATIVE","state":"online","weight":1,"index_roots":["$RROOT/index"],"blob_roots":["$RROOT/blob"]},
-    {"id":"node-c","endpoint":"$REMOTE2_BASE","native_endpoint":"$REMOTE2_NATIVE","state":"online","weight":1,"index_roots":["$CROOT/index"],"blob_roots":["$CROOT/blob"]}
+    {"id":"node-a","endpoint":"$LOCAL_BASE","native_endpoint":"$LOCAL_NATIVE","state":"online","weight":1,"storage_roots":["$LROOT/index","$LROOT/blob"]},
+    {"id":"node-b","endpoint":"$REMOTE_BASE","native_endpoint":"$REMOTE_NATIVE","state":"online","weight":1,"storage_roots":["$RROOT/index","$RROOT/blob"]},
+    {"id":"node-c","endpoint":"$REMOTE2_BASE","native_endpoint":"$REMOTE2_NATIVE","state":"online","weight":1,"storage_roots":["$CROOT/index","$CROOT/blob"]}
   ]
 }
 JSON
@@ -84,8 +84,8 @@ JSON
   "cluster_id": "n2-capacity-$TS",
   "epoch": $epoch,
   "nodes": [
-    {"id":"node-a","endpoint":"$LOCAL_BASE","native_endpoint":"$LOCAL_NATIVE","state":"online","weight":1,"index_roots":["$LROOT/index"],"blob_roots":["$LROOT/blob"]},
-    {"id":"node-b","endpoint":"$REMOTE_BASE","native_endpoint":"$REMOTE_NATIVE","state":"online","weight":1,"index_roots":["$RROOT/index"],"blob_roots":["$RROOT/blob"]}
+    {"id":"node-a","endpoint":"$LOCAL_BASE","native_endpoint":"$LOCAL_NATIVE","state":"online","weight":1,"storage_roots":["$LROOT/index","$LROOT/blob"]},
+    {"id":"node-b","endpoint":"$REMOTE_BASE","native_endpoint":"$REMOTE_NATIVE","state":"online","weight":1,"storage_roots":["$RROOT/index","$RROOT/blob"]}
   ]
 }
 JSON
@@ -103,8 +103,7 @@ cert_path=$root/cert.pem
 key_path=$root/key.pem
 
 [disk_config]
-index_store_disks=$root/index
-blob_store_disks=$root/blob
+storage_disks=$root/index,$root/blob
 fs_storage_path=$root/fs
 
 [cluster_config]

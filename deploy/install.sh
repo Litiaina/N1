@@ -31,8 +31,7 @@ NODE_HTTP_PORT="50001"
 NODE_NATIVE_PORT="50002"
 NODE_ENDPOINT="https://127.0.0.1:50001"
 NODE_NATIVE_ENDPOINT="n2://127.0.0.1:50002"
-INDEX_ROOTS="/mnt/n2/index"
-BLOB_ROOTS="/mnt/n2/blob"
+STORAGE_ROOTS="/mnt/n2/storage"
 FS_ROOT="/mnt/n2/fs"
 CLUSTER_ID="litiaina-n2-prod"
 MEMBERSHIP_EPOCH="1"
@@ -80,8 +79,7 @@ Node options:
   --native-port PORT      N2 native n2:// port. Default: 50002
   --node-endpoint URL     Public node HTTPS endpoint.
   --native-endpoint URL   Public node native endpoint.
-  --index-roots LIST      Comma-separated index roots. Default: /mnt/n2/index
-  --blob-roots LIST       Comma-separated blob roots. Default: /mnt/n2/blob
+  --storage-roots LIST    Comma-separated N2 storage devices. Default: /mnt/n2/storage
   --fs-root PATH          Namespace/runtime storage root. Default: /mnt/n2/fs
   --cluster-id ID         Membership cluster id. Default: litiaina-n2-prod
   --membership-epoch N    Initial membership epoch. Default: 1
@@ -98,8 +96,7 @@ Examples:
     --node-id node-a \
     --node-endpoint https://192.168.0.22:50001 \
     --native-endpoint n2://192.168.0.22:50002 \
-    --index-roots /mnt/DISK0/n2-index,/mnt/DISK1/n2-index \
-    --blob-roots /mnt/DISK0/n2-blob,/mnt/DISK1/n2-blob \
+    --storage-roots /mnt/DISK0/n2,/mnt/DISK1/n2 \
     --fs-root /mnt/DISK0/n2-fs \
     --enable --start
 
@@ -230,7 +227,7 @@ ensure_dirs() {
     log "creating runtime directories"
     if [[ "$MODE" == node || "$MODE" == both ]]; then
         run install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$NODE_RUNTIME_DIR" "$NODE_RUNTIME_DIR/certificates"
-        for path in $(csv_to_paths "$INDEX_ROOTS") $(csv_to_paths "$BLOB_ROOTS") "$FS_ROOT"; do
+        for path in $(csv_to_paths "$STORAGE_ROOTS") "$FS_ROOT"; do
             [[ -n "$path" ]] || continue
             run install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$path"
         done
@@ -285,8 +282,7 @@ cert_path=$NODE_RUNTIME_DIR/certificates/cert.pem
 key_path=$NODE_RUNTIME_DIR/certificates/key.pem
 
 [disk_config]
-index_store_disks=$INDEX_ROOTS
-blob_store_disks=$BLOB_ROOTS
+storage_disks=$STORAGE_ROOTS
 fs_storage_path=$FS_ROOT
 
 [cluster_config]
@@ -346,9 +342,8 @@ EOF
 
 write_membership() {
     local membership="$FS_ROOT/n2_membership.json"
-    local index_json blob_json
-    index_json="$(csv_json_array "$INDEX_ROOTS")"
-    blob_json="$(csv_json_array "$BLOB_ROOTS")"
+    local storage_json
+    storage_json="$(csv_json_array "$STORAGE_ROOTS")"
     local body
     body="$(cat <<EOF
 {
@@ -361,8 +356,7 @@ write_membership() {
       "native_endpoint": "$NODE_NATIVE_ENDPOINT",
       "state": "online",
       "weight": 1,
-      "index_roots": $index_json,
-      "blob_roots": $blob_json
+      "storage_roots": $storage_json
     }
   ]
 }
@@ -441,7 +435,7 @@ render_service() {
     local template="$1"
     local target="$2"
     local data_paths
-    data_paths="$(csv_to_paths "$INDEX_ROOTS") $(csv_to_paths "$BLOB_ROOTS") $FS_ROOT"
+    data_paths="$(csv_to_paths "$STORAGE_ROOTS") $FS_ROOT"
 
     log "rendering $(basename "$target")"
     if [[ "$DRY_RUN" == true ]]; then
@@ -531,8 +525,7 @@ parse_args() {
             --native-port) NODE_NATIVE_PORT="${2:?missing --native-port value}"; shift ;;
             --node-endpoint) NODE_ENDPOINT="${2:?missing --node-endpoint value}"; shift ;;
             --native-endpoint) NODE_NATIVE_ENDPOINT="${2:?missing --native-endpoint value}"; shift ;;
-            --index-roots) INDEX_ROOTS="${2:?missing --index-roots value}"; shift ;;
-            --blob-roots) BLOB_ROOTS="${2:?missing --blob-roots value}"; shift ;;
+            --storage-roots) STORAGE_ROOTS="${2:?missing --storage-roots value}"; shift ;;
             --fs-root) FS_ROOT="${2:?missing --fs-root value}"; shift ;;
             --cluster-id) CLUSTER_ID="${2:?missing --cluster-id value}"; shift ;;
             --membership-epoch) MEMBERSHIP_EPOCH="${2:?missing --membership-epoch value}"; shift ;;

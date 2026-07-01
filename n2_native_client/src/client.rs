@@ -5,8 +5,10 @@ use crate::url::parse_native_address;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+const NATIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub struct N2NativeClient {
     stream: TcpStream,
@@ -194,7 +196,8 @@ impl N2NativeClient {
             body_len: Some(body_len),
         };
         write_control_frame(&mut self.stream, &request).await?;
-        let copied = tokio::io::copy(reader, &mut self.stream).await?;
+        let mut buffered = BufReader::with_capacity(NATIVE_STREAM_BUFFER_BYTES, reader);
+        let copied = tokio::io::copy_buf(&mut buffered, &mut self.stream).await?;
         if copied != body_len {
             return Err(NativeClientError::protocol(format!(
                 "native request body copied {copied} bytes, expected {body_len}"
@@ -248,6 +251,18 @@ impl N2NativeClient {
         T: Serialize,
         W: AsyncWrite + Unpin,
     {
+        let response = self.begin_stream_response(op, payload).await?;
+        let bytes = self
+            .stream_response_body_to_writer(response.body_len.unwrap_or(0), writer)
+            .await?;
+        Ok((response, bytes))
+    }
+
+    pub async fn begin_stream_response<T: Serialize>(
+        &mut self,
+        op: &str,
+        payload: &T,
+    ) -> NativeClientResult<NativeResponse> {
         self.next_id = self.next_id.saturating_add(1);
         let id = format!("{}-{}", self.request_prefix, self.next_id);
         let request = NativeRequest {
@@ -262,14 +277,26 @@ impl N2NativeClient {
 
         let response = read_response(&mut self.stream).await?;
         ensure_response_id(&response, &id)?;
-        let body_len = response.body_len.unwrap_or(0);
-        let bytes = tokio::io::copy(&mut (&mut self.stream).take(body_len), writer).await?;
+        Ok(response)
+    }
+
+    pub async fn stream_response_body_to_writer<W>(
+        &mut self,
+        body_len: u64,
+        writer: &mut W,
+    ) -> NativeClientResult<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let limited = (&mut self.stream).take(body_len);
+        let mut buffered = BufReader::with_capacity(NATIVE_STREAM_BUFFER_BYTES, limited);
+        let bytes = tokio::io::copy_buf(&mut buffered, writer).await?;
         if bytes != body_len {
             return Err(NativeClientError::protocol(format!(
                 "native response streamed {bytes} bytes, expected {body_len}"
             )));
         }
-        Ok((response, bytes))
+        Ok(bytes)
     }
 }
 

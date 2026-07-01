@@ -6,7 +6,7 @@ use axum::{Json, Router};
 
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created_quorum,
-    commit_namespace_summary_quorum, sync_namespace_from_peers,
+    commit_namespace_summary_quorum,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -29,9 +29,6 @@ async fn posix_list(
     let scan_trash = query.trash.unwrap_or(false);
     let path = query.path.unwrap_or_default();
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
-    if query.sync.unwrap_or(false) {
-        let _ = sync_namespace_from_peers(&claims.fragment).await;
-    }
     let (entries, continuation_token) = global_namespace_runtime()
         .list_dir_page(
             &claims.fragment,
@@ -77,9 +74,6 @@ async fn posix_stat(
     }
     let path = query.path.unwrap_or_default();
     let scan_trash = query.trash.unwrap_or(false);
-    if query.sync.unwrap_or(false) {
-        let _ = sync_namespace_from_peers(&claims.fragment).await;
-    }
     let entry = if scan_trash {
         global_namespace_runtime()
             .trashed_entry(&claims.fragment, &path)
@@ -255,53 +249,15 @@ async fn posix_recover(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
+    let requested = req
+        .trash_entry_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(req.path);
     let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: claims.fragment.clone(),
-        source_path: Some(req.path.clone()),
-        destination_path: None,
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &claims.fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &claims.fragment,
-            summary.clone(),
-        )),
-    );
-    Ok(Json(PosixMutationResponse {
-        operation: summary.operation,
-        kind: match summary.kind {
-            NamespaceEntryKind::File => PosixNodeKind::File,
-            NamespaceEntryKind::Directory => PosixNodeKind::Directory,
-        },
-        affected: summary.affected_paths,
-        path: summary.source_path,
-        source_path: None,
-        destination_path: None,
-        created: None,
-        trash_entry_id: summary.trash_entry_id,
-        deleted_at_unix: summary.deleted_at_unix,
-    }))
-}
-
-async fn posix_purge(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Json(req): Json<PosixPathRequest>,
-) -> Result<Json<PosixMutationResponse>, AppError> {
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::Purge,
-        fragment: claims.fragment.clone(),
-        source_path: Some(req.path.clone()),
+        source_path: Some(requested.clone()),
         destination_path: None,
         object_id: None,
         version_id: None,
@@ -344,5 +300,4 @@ pub fn build_posix_write_routes() -> Router<Arc<AppState>> {
         .route("/n2/posix/move", post(posix_rename))
         .route("/n2/posix/trash", post(posix_trash))
         .route("/n2/posix/recover", post(posix_recover))
-        .route("/n2/posix/purge", post(posix_purge))
 }

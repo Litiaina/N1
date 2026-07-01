@@ -184,6 +184,7 @@ pub struct ErasureStreamWriter<W: AsyncWrite + Unpin + Send> {
     bytes_written_to_shards: usize,
     total_hasher: Option<Hasher>,
     shard_hashers: Vec<Hasher>,
+    shard_block_checksums: Vec<Vec<u32>>,
     rs_encoder: Option<ReedSolomonEncoder>,
     block_size: usize,
 }
@@ -231,6 +232,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         let shard_hashers = (0..(data_shards + parity_shards))
             .map(|_| Hasher::new())
             .collect();
+        let shard_block_checksums = vec![Vec::new(); data_shards + parity_shards];
 
         let rs_encoder = if parity_shards > 0 {
             Some(
@@ -251,6 +253,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             bytes_written_to_shards: 0,
             total_hasher,
             shard_hashers,
+            shard_block_checksums,
             rs_encoder,
             block_size,
         })
@@ -337,6 +340,14 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             for h in self.shard_hashers.iter_mut() {
                 h.update(padding_buf.as_slice());
             }
+            for checksums in self.shard_block_checksums.iter_mut() {
+                checksums.extend(
+                    padding_buf
+                        .as_slice()
+                        .chunks(self.block_size)
+                        .map(crc32fast::hash),
+                );
+            }
 
             let padding_slices = vec![padding_buf.as_slice(); self.writers.len()];
             write_slices_to_shards(&mut self.writers, &padding_slices, self.data_shards).await?;
@@ -383,6 +394,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 let start = i * block_size;
                 let end = start + block_size;
                 self.shard_hashers[i].update(&buffer_slice[start..end]);
+                self.shard_block_checksums[i].push(crc32fast::hash(&buffer_slice[start..end]));
             }
             for i in 0..self.parity_shards {
                 let slice = result.recovery(i).ok_or_else(|| {
@@ -390,6 +402,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                     AppError::InternalServerError("RS parity shard generation mismatch".into())
                 })?;
                 self.shard_hashers[self.data_shards + i].update(slice);
+                self.shard_block_checksums[self.data_shards + i].push(crc32fast::hash(slice));
             }
             let mut shard_slices = Vec::with_capacity(self.data_shards + self.parity_shards);
             for (i, writer_opt) in self.writers.iter().enumerate() {
@@ -416,6 +429,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 let start = i * block_size;
                 let end = start + block_size;
                 self.shard_hashers[i].update(&buffer_slice[start..end]);
+                self.shard_block_checksums[i].push(crc32fast::hash(&buffer_slice[start..end]));
             }
 
             let mut shard_slices = Vec::with_capacity(self.data_shards);
@@ -451,6 +465,10 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             .iter()
             .map(|h| format!("{:08x}", h.clone().finalize()))
             .collect()
+    }
+
+    pub fn get_shard_block_checksums(&self) -> Vec<Vec<u32>> {
+        self.shard_block_checksums.clone()
     }
 
     pub fn into_writers(self) -> Vec<Option<W>> {
@@ -556,4 +574,32 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErasureStreamWriter;
+
+    #[tokio::test]
+    async fn stream_writer_records_checksums_for_every_immutable_shard_block() {
+        let block_size = 4096;
+        let input = (0..block_size * 2)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let writers = vec![
+            Some(tokio::io::sink()),
+            Some(tokio::io::sink()),
+            Some(tokio::io::sink()),
+        ];
+        let mut writer = ErasureStreamWriter::new(writers, 2, 1, block_size, false, block_size)
+            .expect("create writer");
+        writer.write(&input).await.expect("write stripe");
+        writer.finalize().await.expect("finalize");
+
+        let checksums = writer.get_shard_block_checksums();
+        assert_eq!(checksums.len(), 3);
+        assert!(checksums.iter().all(|blocks| blocks.len() == 1));
+        assert_eq!(checksums[0][0], crc32fast::hash(&input[..block_size]));
+        assert_eq!(checksums[1][0], crc32fast::hash(&input[block_size..]));
+    }
 }

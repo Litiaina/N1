@@ -7,6 +7,29 @@ use tokio_util::io::StreamReader;
 
 use crate::config::NodeConfig;
 
+pub struct NativeDownload {
+    client: N2NativeClient,
+    pub status: u16,
+    pub body_len: u64,
+}
+
+pub struct NativeDownloadError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl NativeDownload {
+    pub async fn stream_to_writer<W>(mut self, writer: &mut W) -> Result<u64, String>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.client
+            .stream_response_body_to_writer(self.body_len, writer)
+            .await
+            .map_err(native_error)
+    }
+}
+
 pub async fn connect_with_bearer(
     node: &NodeConfig,
     bearer: &str,
@@ -56,28 +79,40 @@ pub async fn native_upload_body(
     Ok(decode_operation_response(response)?)
 }
 
-pub async fn native_download_to_writer<W>(
+pub async fn begin_native_download(
     node: &NodeConfig,
     bearer: &str,
     payload: Value,
-    writer: &mut W,
-) -> Result<(u16, u64), String>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut client = connect_with_bearer(node, bearer).await?;
-    let (response, bytes) = client
-        .stream_response_to_writer("object.download_stream", &payload, writer)
+) -> Result<NativeDownload, NativeDownloadError> {
+    let mut client =
+        connect_with_bearer(node, bearer)
+            .await
+            .map_err(|message| NativeDownloadError {
+                status: None,
+                message,
+            })?;
+    let response = client
+        .begin_stream_response("object.download_stream", &payload)
         .await
-        .map_err(native_error)?;
+        .map_err(|err| NativeDownloadError {
+            status: None,
+            message: native_error(err),
+        })?;
     if !response.ok {
         let message = response
             .error
             .map(|err| format!("{}: {}", err.code, err.message))
             .unwrap_or_else(|| "native download failed".to_string());
-        return Err(message);
+        return Err(NativeDownloadError {
+            status: response.status,
+            message,
+        });
     }
-    Ok((response.status.unwrap_or(200), bytes))
+    Ok(NativeDownload {
+        status: response.status.unwrap_or(200),
+        body_len: response.body_len.unwrap_or(0),
+        client,
+    })
 }
 
 pub fn msgpack_to_json(body: &[u8]) -> Result<Value, String> {

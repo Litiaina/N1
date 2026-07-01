@@ -16,7 +16,6 @@ use tokio::io::AsyncRead;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
-use crate::core::delete::delete_object_version;
 use crate::core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ObjectMetadata, UploadPartQuery,
 };
@@ -53,7 +52,7 @@ use crate::distribution::rebalance::{
     repair_status, rewrite_object_to_current_layout, start_rebalance, start_repair, stop_rebalance,
     stop_repair,
 };
-use crate::distribution::repair::repair_policy;
+use crate::distribution::repair::{repair_cluster_object_shards, repair_policy};
 use crate::distribution::resolve_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
@@ -377,17 +376,6 @@ async fn execute_native_op_inner(
                     .await?,
             )
         }
-        "namespace.purge" | "posix.purge" => {
-            let claims = claims_required(claims)?;
-            native_body(
-                posix_service::permanently_delete_path(
-                    state,
-                    claims,
-                    required_string(&payload, "path")?,
-                )
-                .await?,
-            )
-        }
         "object.list" => {
             let claims = claims_required(claims)?;
             require_read(&claims)?;
@@ -405,62 +393,6 @@ async fn execute_native_op_inner(
                     .list_objects_page(&claims.fragment, &params_from_payload(&payload), true)
                     .await?,
             )
-        }
-        "trash.empty" => {
-            let claims = claims_required(claims)?;
-            require_delete(&claims)?;
-            let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-                mutation_id: None,
-                kind: NamespaceMutationKind::EmptyTrash,
-                fragment: claims.fragment.clone(),
-                source_path: None,
-                destination_path: None,
-                object_id: None,
-                version_id: None,
-                metadata: None,
-            })
-            .await?;
-            state.emit(
-                &claims.fragment,
-                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-                    &claims.fragment,
-                    summary.clone(),
-                )),
-            );
-            native_body(json!({
-                "operation": summary.operation,
-                "affected_paths": summary.affected_paths,
-                "affected_objects": summary.affected_objects,
-                "trash_entry_id": summary.trash_entry_id,
-                "deleted_at_unix": summary.deleted_at_unix,
-            }))
-        }
-        "trash.recover_all" => {
-            let claims = claims_required(claims)?;
-            require_write(&claims)?;
-            let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-                mutation_id: None,
-                kind: NamespaceMutationKind::RecoverAll,
-                fragment: claims.fragment.clone(),
-                source_path: None,
-                destination_path: None,
-                object_id: None,
-                version_id: None,
-                metadata: None,
-            })
-            .await?;
-            state.emit(
-                &claims.fragment,
-                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-                    &claims.fragment,
-                    summary.clone(),
-                )),
-            );
-            native_body(json!({
-                "operation": summary.operation,
-                "affected_paths": summary.affected_paths,
-                "affected_objects": summary.affected_objects,
-            }))
         }
         "object.status" => {
             let claims = claims_required(claims)?;
@@ -490,16 +422,7 @@ async fn execute_native_op_inner(
                 if status.status == "healthy" {
                     status
                 } else if status.repairable {
-                    rewrite_object_to_current_layout(
-                        object_key.trim_start_matches('/').to_string(),
-                        physical.clone(),
-                        metadata.clone(),
-                        false,
-                    )
-                    .await?;
-                    let repaired_metadata =
-                        get_object_metadata_direct(&claims.fragment, &physical).await?;
-                    inspect_cluster_object_status(&repaired_metadata, check_mode).await?
+                    repair_cluster_object_shards(&metadata, check_mode).await?
                 } else {
                     status
                 }
@@ -592,11 +515,6 @@ async fn execute_native_op_inner(
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::recover_path(state, claims, path).await?)
         }
-        "object.purge" => {
-            let claims = claims_required(claims)?;
-            let path = required_string(&payload, "object_key")?;
-            native_body(posix_service::permanently_delete_path(state, claims, path).await?)
-        }
         "object.rename" => {
             let claims = claims_required(claims)?;
             require_write_modify(&claims)?;
@@ -636,24 +554,6 @@ async fn execute_native_op_inner(
                 metadata.strip_internal_layout();
             }
             native_body(versions)
-        }
-        "object.version.delete" => {
-            let claims = claims_required(claims)?;
-            require_write(&claims)?;
-            let fragment = claims.fragment.clone();
-            native_from_response(
-                delete_object_version(
-                    State(state),
-                    claims,
-                    Path((
-                        fragment,
-                        required_string(&payload, "version_id")?,
-                        required_string(&payload, "object_key")?,
-                    )),
-                )
-                .await?,
-            )
-            .await
         }
         "object.version.recover" => {
             let claims = claims_required(claims)?;
@@ -726,20 +626,6 @@ async fn execute_native_op_inner(
                     string_array_field(&payload, "object_keys")?,
                     "bulk_recover",
                     BulkNamespaceMode::Recover,
-                )
-                .await?,
-            )
-        }
-        "object.bulk_purge" | "object.bulk.purge" => {
-            let claims = claims_required(claims)?;
-            require_delete(&claims)?;
-            native_body(
-                native_bulk_namespace_operation(
-                    &state,
-                    &claims.fragment,
-                    string_array_field(&payload, "object_keys")?,
-                    "bulk_delete_permanent",
-                    BulkNamespaceMode::Purge,
                 )
                 .await?,
             )
@@ -1258,7 +1144,6 @@ fn upload_part_query_from_payload(payload: &Value) -> Result<UploadPartQuery, Ap
 enum BulkNamespaceMode {
     Trash,
     Recover,
-    Purge,
 }
 
 async fn native_bulk_namespace_operation(
@@ -1286,7 +1171,6 @@ async fn native_bulk_namespace_operation(
         let kind = match mode {
             BulkNamespaceMode::Trash => NamespaceMutationKind::Trash,
             BulkNamespaceMode::Recover => NamespaceMutationKind::Recover,
-            BulkNamespaceMode::Purge => NamespaceMutationKind::Purge,
         };
         let result = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
             mutation_id: None,
@@ -1451,14 +1335,6 @@ fn require_write(claims: &Claims) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::Forbidden("Write permission required".into()))
-    }
-}
-
-fn require_delete(claims: &Claims) -> Result<(), AppError> {
-    if claims.delete {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden("Delete permission required".into()))
     }
 }
 

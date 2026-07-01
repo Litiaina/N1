@@ -54,9 +54,9 @@ pub struct ClusterNode {
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]
-    pub index_roots: Vec<String>,
-    #[serde(default)]
-    pub blob_roots: Vec<String>,
+    pub storage_roots: Vec<String>,
+    #[serde(default = "default_joined_epoch")]
+    pub joined_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +66,10 @@ pub struct ClusterNode {
 }
 
 fn default_weight() -> u32 {
+    1
+}
+
+fn default_joined_epoch() -> u64 {
     1
 }
 
@@ -248,8 +252,7 @@ fn local_membership(
     node_id: &str,
     endpoint: &str,
     native_endpoint: &str,
-    index_roots: &[String],
-    blob_roots: &[String],
+    storage_roots: &[String],
 ) -> ClusterMembership {
     ClusterMembership {
         cluster_id: "n2-local".to_string(),
@@ -260,8 +263,8 @@ fn local_membership(
             native_endpoint: Some(native_endpoint.to_string()),
             state: Some(NodeState::Online),
             weight: 1,
-            index_roots: index_roots.to_vec(),
-            blob_roots: blob_roots.to_vec(),
+            storage_roots: storage_roots.to_vec(),
+            joined_epoch: 1,
             capacity_bytes: None,
             used_bytes: None,
             last_seen_unix: Some(Utc::now().timestamp()),
@@ -274,8 +277,7 @@ fn load_or_create_membership(
     node_id: &str,
     endpoint: &str,
     native_endpoint: &str,
-    index_roots: &[String],
-    blob_roots: &[String],
+    storage_roots: &[String],
 ) -> Result<ClusterMembership, AppError> {
     if path.exists() {
         let bytes = fs::read(path)
@@ -290,30 +292,30 @@ fn load_or_create_membership(
         if let Some(local) = membership.nodes.iter_mut().find(|node| node.id == node_id) {
             local.endpoint = endpoint.to_string();
             local.native_endpoint = Some(native_endpoint.to_string());
-            local.index_roots = index_roots.to_vec();
-            local.blob_roots = blob_roots.to_vec();
+            local.storage_roots = storage_roots.to_vec();
             local.state.get_or_insert(NodeState::Online);
             local.last_seen_unix = Some(now);
         } else {
+            let joined_epoch = membership.epoch.saturating_add(1);
             membership.nodes.push(ClusterNode {
                 id: node_id.to_string(),
                 endpoint: endpoint.to_string(),
                 native_endpoint: Some(native_endpoint.to_string()),
                 state: Some(NodeState::Online),
                 weight: 1,
-                index_roots: index_roots.to_vec(),
-                blob_roots: blob_roots.to_vec(),
+                storage_roots: storage_roots.to_vec(),
+                joined_epoch,
                 capacity_bytes: None,
                 used_bytes: None,
                 last_seen_unix: Some(now),
             });
-            membership.epoch = membership.epoch.saturating_add(1);
+            membership.epoch = joined_epoch;
         }
         write_membership(path, &membership)?;
         return Ok(membership);
     }
 
-    let membership = local_membership(node_id, endpoint, native_endpoint, index_roots, blob_roots);
+    let membership = local_membership(node_id, endpoint, native_endpoint, storage_roots);
     write_membership(path, &membership)?;
     Ok(membership)
 }
@@ -336,8 +338,7 @@ fn write_membership(path: &Path, membership: &ClusterMembership) -> Result<(), A
 pub fn init_cluster_runtime(
     config: &Ini,
     fs_storage_path: &str,
-    local_index_roots: &[String],
-    local_blob_roots: &[String],
+    local_storage_roots: &[String],
     https_endpoint: &str,
     native_endpoint: &str,
 ) -> Result<Arc<ClusterRuntime>, AppError> {
@@ -396,8 +397,7 @@ pub fn init_cluster_runtime(
         &node_id,
         node_endpoint,
         native_endpoint,
-        local_index_roots,
-        local_blob_roots,
+        local_storage_roots,
     )?;
 
     let runtime = Arc::new(ClusterRuntime {
@@ -431,8 +431,7 @@ mod tests {
             "node-a",
             "https://127.0.0.1:51001",
             "n2://127.0.0.1:51002",
-            &[root.join("idx").display().to_string()],
-            &[root.join("blob").display().to_string()],
+            &[root.join("storage").display().to_string()],
         )
         .expect("membership");
         assert_eq!(membership.nodes.len(), 1);

@@ -1,5 +1,6 @@
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::ws::{CloseFrame, Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, Method, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
@@ -9,12 +10,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_tungstenite::Connector;
+use tokio_tungstenite::tungstenite::Message as UpstreamWsMessage;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::NodeConfig;
 use crate::native::{
-    bearer_from_headers, content_length, content_type, native_download_to_writer, native_json,
+    bearer_from_headers, begin_native_download, content_length, content_type, native_json,
     native_upload_body,
 };
 use crate::node::NodeStatus;
@@ -26,6 +29,7 @@ pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/gateway/health", get(gateway_health))
         .route("/gateway/nodes", get(gateway_nodes))
+        .route("/ws", get(websocket_proxy))
         .route("/n2/auth/fragment", post(auth_fragment))
         .route("/n2/fragments", post(create_fragment))
         .route("/n2/cluster/rebalance/start", post(cluster_rebalance_start))
@@ -59,6 +63,197 @@ pub fn router(state: GatewayState) -> Router {
         .fallback(proxy_fallback)
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+async fn websocket_proxy(
+    State(state): State<Arc<GatewayState>>,
+    OriginalUri(uri): OriginalUri,
+    ws: WebSocketUpgrade,
+) -> Response<Body> {
+    let node = match best_node(&state).await {
+        Ok(node) => node,
+        Err(response) => return response,
+    };
+    let upstream_url = match websocket_upstream_url(&node.http_url, &uri) {
+        Ok(url) => url,
+        Err(message) => return text_response(StatusCode::BAD_GATEWAY, message),
+    };
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyUpstreamCertificate))
+        .with_no_client_auth();
+    let upstream = match tokio_tungstenite::connect_async_tls_with_config(
+        upstream_url,
+        None,
+        true,
+        Some(Connector::Rustls(Arc::new(tls))),
+    )
+    .await
+    {
+        Ok((socket, _)) => socket,
+        Err(error) => {
+            state.nodes.mark_failure(&node.id).await;
+            return text_response(
+                StatusCode::BAD_GATEWAY,
+                format!("gateway websocket upstream {} failed: {error}", node.id),
+            );
+        }
+    };
+
+    state.nodes.mark_route(&node.id).await;
+    ws.on_upgrade(move |client| relay_websocket(client, upstream))
+        .into_response()
+}
+
+fn websocket_upstream_url(http_url: &str, uri: &axum::http::Uri) -> Result<String, String> {
+    let base = if let Some(rest) = http_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        return Err(format!("unsupported upstream URL scheme: {http_url}"));
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/ws");
+    Ok(format!("{}{path_and_query}", base.trim_end_matches('/')))
+}
+
+async fn relay_websocket(
+    client: WebSocket,
+    upstream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut client_sink, mut client_stream) = client.split();
+    let (mut upstream_sink, mut upstream_stream) = upstream.split();
+
+    loop {
+        tokio::select! {
+            incoming = client_stream.next() => {
+                match incoming {
+                    Some(Ok(message)) => {
+                        let close = matches!(message, AxumWsMessage::Close(_));
+                        if upstream_sink.send(axum_to_upstream_message(message)).await.is_err() || close {
+                            break;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::debug!("gateway websocket client receive failed: {error}");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            incoming = upstream_stream.next() => {
+                match incoming {
+                    Some(Ok(message)) => {
+                        let Some(message) = upstream_to_axum_message(message) else {
+                            continue;
+                        };
+                        let close = matches!(message, AxumWsMessage::Close(_));
+                        if client_sink.send(message).await.is_err() || close {
+                            break;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::debug!("gateway websocket upstream receive failed: {error}");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    let _ = upstream_sink.close().await;
+    let _ = client_sink.close().await;
+}
+
+fn axum_to_upstream_message(message: AxumWsMessage) -> UpstreamWsMessage {
+    match message {
+        AxumWsMessage::Text(value) => UpstreamWsMessage::Text(value.to_string().into()),
+        AxumWsMessage::Binary(value) => UpstreamWsMessage::Binary(value),
+        AxumWsMessage::Ping(value) => UpstreamWsMessage::Ping(value),
+        AxumWsMessage::Pong(value) => UpstreamWsMessage::Pong(value),
+        AxumWsMessage::Close(frame) => UpstreamWsMessage::Close(frame.map(|frame| {
+            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            }
+        })),
+    }
+}
+
+fn upstream_to_axum_message(message: UpstreamWsMessage) -> Option<AxumWsMessage> {
+    match message {
+        UpstreamWsMessage::Text(value) => Some(AxumWsMessage::Text(value.to_string().into())),
+        UpstreamWsMessage::Binary(value) => Some(AxumWsMessage::Binary(value)),
+        UpstreamWsMessage::Ping(value) => Some(AxumWsMessage::Ping(value)),
+        UpstreamWsMessage::Pong(value) => Some(AxumWsMessage::Pong(value)),
+        UpstreamWsMessage::Close(frame) => {
+            Some(AxumWsMessage::Close(frame.map(|frame| CloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            })))
+        }
+        UpstreamWsMessage::Frame(_) => None,
+    }
+}
+
+#[derive(Debug)]
+struct AcceptAnyUpstreamCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyUpstreamCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        use rustls::SignatureScheme::*;
+        vec![
+            RSA_PKCS1_SHA1,
+            ECDSA_SHA1_Legacy,
+            RSA_PKCS1_SHA256,
+            ECDSA_NISTP256_SHA256,
+            RSA_PKCS1_SHA384,
+            ECDSA_NISTP384_SHA384,
+            RSA_PKCS1_SHA512,
+            ECDSA_NISTP521_SHA512,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            ED25519,
+            ED448,
+        ]
+    }
 }
 
 fn build_cors_layer() -> CorsLayer {
@@ -485,22 +680,37 @@ async fn download_object(
         Ok(node) => node,
         Err(response) => return response,
     };
-    let (mut writer, reader) = tokio::io::duplex(1024 * 1024);
     let payload = json!({
         "object_key": query.object_key,
         "version_id": query.version_id,
     });
+    let download = match begin_native_download(&node, &bearer, payload).await {
+        Ok(download) => download,
+        Err(err) => {
+            if let Some(status) = err.status {
+                return text_response(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    err.message,
+                );
+            }
+            return upstream_failed(&state, &node, err.message).await;
+        }
+    };
+    let response_status = StatusCode::from_u16(download.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let response_length = download.body_len;
+    let (mut writer, reader) = tokio::io::duplex(1024 * 1024);
     let failed_state = state.clone();
     let failed_node = node.clone();
     tokio::spawn(async move {
-        if let Err(err) = native_download_to_writer(&node, &bearer, payload, &mut writer).await {
+        if let Err(err) = download.stream_to_writer(&mut writer).await {
             failed_state.nodes.mark_failure(&failed_node.id).await;
             tracing::warn!("gateway native download failed: {}", err);
         }
     });
     Response::builder()
-        .status(StatusCode::OK)
+        .status(response_status)
         .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, response_length.to_string())
         .body(Body::from_stream(ReaderStream::new(reader)))
         .expect("valid download response")
 }
@@ -667,6 +877,12 @@ fn json_response(status: u16, value: Value) -> Response<Body> {
 }
 
 fn json_response_value(status: StatusCode, value: Value) -> Response<Body> {
+    if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED {
+        return Response::builder()
+            .status(status)
+            .body(Body::empty())
+            .expect("valid empty response");
+    }
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
@@ -707,7 +923,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, header};
     use http_body_util::BodyExt;
-    use n2_native_client::{NativeRequest, NativeResponse};
+    use n2_native_client::{NativeError, NativeRequest, NativeResponse};
     use serde_bytes::ByteBuf;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -759,6 +975,41 @@ mod tests {
                 }
             }
             operations.lock().await.push(request.op.clone());
+            if request.op == "object.download_stream" {
+                let object_key = request
+                    .payload
+                    .as_deref()
+                    .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                    .and_then(|payload| payload["object_key"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                if object_key == "missing" {
+                    write_native_stream_response(
+                        &mut stream,
+                        request.id,
+                        404,
+                        false,
+                        &[],
+                        Some(NativeError {
+                            code: "not_found".to_string(),
+                            message: "object not found".to_string(),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_native_stream_response(
+                        &mut stream,
+                        request.id,
+                        200,
+                        true,
+                        b"download-bytes",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                continue;
+            }
             let (status, body) = match request.op.as_str() {
                 "auth.bearer" => (200, json!({ "node": node_id, "authenticated": true })),
                 "upload.multipart.init" => (
@@ -768,7 +1019,7 @@ mod tests {
                 "upload.multipart.put_part" => (200, json!({ "stored": true })),
                 "uploads.status" => (200, json!({ "status": "open" })),
                 "upload.multipart.finalize" => (200, json!({ "finalized": true })),
-                "upload.multipart.cancel" => (200, json!({ "cancelled": true })),
+                "upload.multipart.cancel" => (204, json!({})),
                 "upload.one_shot" => (201, json!({ "version_id": "one-shot" })),
                 "ping" => (200, json!({ "status": "ok" })),
                 other => (200, json!({ "op": other, "node": node_id })),
@@ -810,6 +1061,32 @@ mod tests {
             .write_all(&(frame.len() as u32).to_be_bytes())
             .await?;
         stream.write_all(&frame).await?;
+        stream.flush().await
+    }
+
+    async fn write_native_stream_response(
+        stream: &mut TcpStream,
+        id: String,
+        status: u16,
+        ok: bool,
+        body: &[u8],
+        error: Option<NativeError>,
+    ) -> std::io::Result<()> {
+        let response = NativeResponse {
+            id,
+            ok,
+            status: Some(status),
+            payload: None,
+            body: None,
+            body_len: Some(body.len() as u64),
+            error,
+        };
+        let frame = rmp_serde::to_vec(&response).unwrap();
+        stream
+            .write_all(&(frame.len() as u32).to_be_bytes())
+            .await?;
+        stream.write_all(&frame).await?;
+        stream.write_all(body).await?;
         stream.flush().await
     }
 
@@ -883,6 +1160,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_waits_for_upstream_status_before_committing_http_response() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/n2/objects/download?object_key=present")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "download-bytes"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/n2/objects/download?object_key=missing")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "not_found: object not found"
+        );
+    }
+
+    #[tokio::test]
     async fn multipart_followups_use_client_supplied_coordinator() {
         let node_a = spawn_mock_native_node("node-a").await;
         let node_b = spawn_mock_native_node("node-b").await;
@@ -944,7 +1264,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
 
         let ops_a = node_a.operations.lock().await.clone();
         let ops_b = node_b.operations.lock().await.clone();
@@ -1059,5 +1388,43 @@ mod tests {
         assert!(ops_a.contains(&"cluster.rebalance.start".to_string()));
         assert!(ops_a.contains(&"cluster.rebalance.status".to_string()));
         assert!(!ops_b.contains(&"cluster.rebalance.status".to_string()));
+    }
+
+    #[test]
+    fn websocket_upstream_url_preserves_the_authenticated_path_and_query() {
+        let uri = "/ws?token=header.payload.signature".parse().unwrap();
+        assert_eq!(
+            websocket_upstream_url("https://10.0.0.2:53101/", &uri).unwrap(),
+            "wss://10.0.0.2:53101/ws?token=header.payload.signature"
+        );
+        assert_eq!(
+            websocket_upstream_url("http://127.0.0.1:53101", &uri).unwrap(),
+            "ws://127.0.0.1:53101/ws?token=header.payload.signature"
+        );
+    }
+
+    #[test]
+    fn websocket_message_conversion_preserves_application_frames() {
+        for message in [
+            AxumWsMessage::Text("hello".into()),
+            AxumWsMessage::Binary(bytes::Bytes::from_static(b"binary")),
+            AxumWsMessage::Ping(bytes::Bytes::from_static(b"ping")),
+            AxumWsMessage::Pong(bytes::Bytes::from_static(b"pong")),
+        ] {
+            let round_trip = upstream_to_axum_message(axum_to_upstream_message(message.clone()))
+                .expect("application frame");
+            assert_eq!(round_trip, message);
+        }
+    }
+
+    #[test]
+    fn websocket_message_conversion_preserves_close_frame() {
+        let message = AxumWsMessage::Close(Some(CloseFrame {
+            code: 1001,
+            reason: "node draining".into(),
+        }));
+        let round_trip = upstream_to_axum_message(axum_to_upstream_message(message.clone()))
+            .expect("close frame");
+        assert_eq!(round_trip, message);
     }
 }

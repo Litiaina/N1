@@ -13,14 +13,25 @@ permanent object-IO leader.
 The N2 1.0 storage model is defined by these rules:
 
 - a user path is mutable namespace, not object storage;
-- a namespace file is a direct symlink to `@o_<object-id>`;
+- namespace identity is inode-like: stable directory IDs plus independently
+  sharded directory entries;
+- a directory entry maps `(parent-directory-id, name)` to a stable child
+  directory ID or immutable object ID;
 - `@o_<object-id>` and every committed `.ncdx` version are immutable;
 - each `.ncdx` is colocated with that version's shard/parity data;
 - `.ncdx` contains immutable object and placement truth, never a logical path;
 - every shard-bearing participant stores the same named-MessagePack `.ncdx`;
 - the head version is the greatest valid ULID filename in the object directory;
 - object bytes and metadata are not cluster-consensus state;
-- namespace mutation is partitioned quorum state by fragment and path;
+- namespace mutation is partitioned quorum state by directory entry, never by
+  a complete mutable pathname;
+- namespace virtual partitions use fixed-size voter groups across distinct
+  nodes and storage devices;
+- no global namespace writer, global namespace index, union read, or
+  source-voter search exists;
+- directory rename, move, trash, and restore never rewrite descendants;
+- `.trash` is lifecycle-managed exclusively by configured TTL; there is no
+  manual purge, empty-trash operation, or recover-all mutation;
 - every version records the exact membership epoch, EC shape, and shard
   placement that wrote it;
 - adding nodes does not invalidate or automatically rewrite old objects;
@@ -48,79 +59,42 @@ All nodes can serve reads and mutations. A node that is not a namespace voter
 routes the namespace request to the current voter group for that namespace
 partition.
 
-## Disk Roles
+## Unified Storage Devices
 
-N2 supports two deliberate node layouts.
-
-### Separated Roots
-
-Fast storage holds mutable namespace and control state. Capacity storage holds
-immutable object metadata and shard data.
-
-```text
-NVMe / index root
-  -> namespace, trash, fragment control, coordinator upload state
-
-HDD / blob root
-  -> immutable .ncdx and shard/parity data
-```
-
-This is the preferred production layout when NVMe and HDD are available.
-
-### Shared Root
-
-The exact same path may be configured as both an index root and a blob root:
+N2 has one configured storage-device role. Every configured device can hold
+immutable object shards, immutable `.ncdx` records, and assigned namespace
+virtual partitions. There is no index-disk role and no index-root setting.
 
 ```ini
-index_store_disks=/mnt/n2/storage
-blob_store_disks=/mnt/n2/storage
+storage_disks=/mnt/n2/disk-00,/mnt/n2/disk-01
 ```
 
-N2 merges both roles into one physical tree. It does not create duplicate
-metadata planes. This is the minimum deployment shape and is valid for a node
-with one usable storage device.
-
-Roots are defined by configuration, not by marker files. An index root is a
-mutable namespace/control root. A blob root is an immutable object/shard root.
-If the same path is configured for both roles, the two planes intentionally
-coexist under the same stable fragment directory.
+Namespace replicas for one virtual partition must be placed on distinct nodes
+and, where topology information is available, distinct failure domains. A node
+with several devices distributes its local namespace assignments across them.
+Removing the mandatory index tier makes node expansion identical to storage
+expansion: adding a node or device contributes both object capacity and
+namespace throughput.
 
 This architecture has no in-place compatibility or migration path from earlier
 development layouts.
 
 ## Physical Layout
 
-### Namespace And Control Root
+### Unified Device Root
 
 ```text
-<index_root>/
+<storage_device>/
+  .n2/
+    cluster/
+    namespace/
+      partitions/
+
   .fragment/
     <fragment-alias-hash> -> ../@f_<stable-fragment-id>
 
   @f_<stable-fragment-id>/
     .uploads/
-    .trash/
-
-    videos/
-      movie.mp4 -> @o_<object-id>
-    reports/
-      annual.pdf -> @o_<object-id>
-```
-
-The mutable fragment alias is only an entrypoint. The stable fragment ID is
-storage truth. Renaming a fragment changes its alias, not its physical identity
-or existing object metadata. The index root does not own `.fragment.ncdx`;
-immutable fragment metadata lives in the blob plane.
-
-There is no `.namespace` wrapper. Namespace paths live directly below the
-stable fragment root, and N2 applies distributed mutation semantics around that
-namespace.
-
-### Object And Shard Root
-
-```text
-<blob_root>/
-  @f_<stable-fragment-id>/
     .fragment.ncdx
     .objects/
       ab/
@@ -135,12 +109,16 @@ namespace.
                   part_0_shard_2.parity
 ```
 
+The mutable namespace partition store and immutable object tree share the same
+configured devices but remain separate data planes. Namespace placement is
+independent of object EC placement. A device may hold an object shard without
+holding that object's directory entry, or vice versa.
+
 Object fanout is four levels. The fanout distributes object directories across
 large filesystems without changing object identity.
 
-Blob roots do not own fragment aliases. They only use stable `@f_` roots. On a
-shared root, the namespace/control entries and immutable `.objects` tree simply
-coexist under the same stable fragment root.
+The stable fragment ID is storage truth. Renaming a fragment changes namespace
+references, not immutable object metadata.
 
 ## Immutable Object Record
 
@@ -194,7 +172,7 @@ locators. This lets N2 resolve a namespace `@o_<object-id>` head by querying a
 bounded object holder set instead of broadcasting metadata reads to the whole
 cluster. Older or layout-drifted objects can fall back to wider discovery.
 
-If a node has several blob roots, shard placement rotates over those roots.
+If a node has several storage devices, shard placement rotates over those devices.
 `.ncdx` is written only where that node has a shard-bearing version directory.
 
 ## Version And Head Rules
@@ -219,62 +197,74 @@ on disk. A new upload appends a new immutable version.
 
 ## Partitioned Namespace Quorum
 
-Namespace is the mutable database of N2. It is partitioned by fragment and
-logical path, then each partition gets a stable voter group from the current
-membership epoch. This spreads namespace write pressure without dragging
-immutable object bytes or object `.ncdx` records into consensus.
-
-This is the point where N2 keeps object storage durable while preserving fast,
-POSIX-style namespace behavior. User-facing path operations mutate tiny
-namespace pointers, not object payloads. Listing a directory reads namespace
-entries. Rename, move, trash, and recover update namespace state. They do not
-scan object shards, rewrite erasure-coded payloads, or mutate immutable
-`.ncdx` records.
-
-The result is object storage with namespace ergonomics: N2 is still not an
-operating-system filesystem, but it avoids the common object-storage weakness
-where path-oriented workflows become expensive metadata scans or data-plane
-rewrites.
+Namespace is N2's only mutable data plane. It uses the same identity model as a
+POSIX filesystem instead of storing complete paths as identity:
 
 ```text
-fragment + logical path
-  -> namespace partition
-  -> stable voter assignment for that partition
-  -> prepare
-  -> quorum acceptance
-  -> commit
-  -> durable request ledger
-  -> periodic namespace snapshot
+(fragment, parent-directory-id, entry-name)
+  -> child-directory-id
+  or
+  -> immutable-object-id
 ```
 
-Files are materialized in their owning namespace partition. Directories are
-namespace structure and may be present across roots so folder rename/move stays
-fast and does not rewrite every child object.
+Directory IDs never change when a directory is renamed, moved, trashed, or
+restored. Consequently, those operations change only parent directory entries;
+they never scan or rewrite descendants.
 
-Namespace quorum covers:
+Every directory-entry key maps deterministically to one of 16 initial virtual
+namespace partitions for its directory. Each partition has a bounded voter
+group selected across distinct failure domains. The number of contacted voters
+is independent of total cluster size. A directory records the membership epoch
+that owns its partitions. Node liveness changes and later node additions cannot
+silently remap existing namespace truth.
 
-- upload publication;
-- mkdir;
-- rename and move;
-- trash and recover;
-- purge and empty trash.
+```text
+(parent-id, name)
+  -> virtual partition
+  -> bounded voter group
+  -> conditional mutation at expected generation
+  -> durable quorum result
+```
 
-Prepared mutations are durable. Recovery checks whether the requested
-filesystem state was already materialized before replaying, closing the crash
-window between filesystem mutation and ledger append.
+Disjoint entries mutate concurrently, including entries in the same logical
+directory. A transaction acquires participant partitions by virtual partition
+ID, then visits each partition's voters in deterministic order. These two
+orders avoid cross-partition deadlock and split-lock livelock without a global
+writer. Conflicting operations on one entry are serialized by its generation
+and mutation ID. Cross-directory rename is a bounded atomic operation over only
+the source and destination entry partitions. It never becomes a cluster-wide
+transaction.
 
-Namespace snapshots contain only mutable namespace and trash state. They do not
-copy `.objects`, `.ncdx`, shards, parity, or upload payload data.
+Reads resolve each path component through its directory-entry partition. A
+listing reads the partitions containing that directory's entries and performs a
+paginated merge. N2 never unions replicas of the same partition: it reads only
+an identical quorum-confirmed generation. A quorum-certified committed payload
+can replay an interrupted commit onto a stale voter; stale state is never
+accepted as namespace truth.
 
-The assignment, ledger, prepared records, and snapshots live under
-`fs_storage_path/.n2`. They are control state, not a second user namespace.
+### Trash Lifecycle
 
-Each namespace partition also maintains a small durable partition manifest. The
-manifest records the fragment, partition ID, partition count, voter assignment
-epoch, voter node IDs, committed ledger position, snapshot watermark, ledger
-size, snapshot size, pending prepared count, and the last committed mutation
-summary. This manifest is not namespace truth; it is an explicit control-plane
-checkpoint used by monitoring, repair, and future partition move/split logic.
+`.trash` is a reserved namespace directory. Delete atomically moves one
+directory entry beneath `.trash`; restore reverses that move while the entry is
+inside its retention period. A directory move carries its stable directory ID,
+so all descendants remain attached without being rewritten.
+
+There is no manual purge, empty-trash, or recover-all operation. After the
+configured TTL expires, lifecycle commits removal of the trash entry, verifies
+that no namespace reference remains, and then removes the immutable `.ncdx`
+records and EC shards. Retries are idempotent by mutation ID.
+
+### Namespace Scaling
+
+Virtual partitions can be reassigned and split without changing directory or
+object identities. Adding nodes and devices therefore increases namespace
+capacity and aggregate throughput. A large directory does not become one
+physical metadata partition because its entries are distributed by
+`(parent-directory-id, entry-name)`.
+
+Namespace recovery state contains only directory entries, generations,
+committed mutation identities, and placement epochs. It never copies or mutates
+`.objects`, `.ncdx`, shards, parity, or upload payload data.
 
 ## Multipart Ownership
 
@@ -330,11 +320,10 @@ client read on any node
 Reads never infer an old object's placement from the current cluster topology.
 The version record is authoritative.
 
-Namespace reads are partition-voter-first. If the assigned voter group returns
-an empty result for a path that may be stale, wiped, or partition-moved, N2
-falls back to other reachable readable nodes and merges the first non-empty
-answer. This fallback is only used after the owning partition read is empty;
-normal reads stay on the partition voter path.
+Namespace reads contact only the directory partition's recorded voter group.
+An identical voter quorum is required for both an entry and an empty result.
+N2 never searches non-voters, unions divergent replicas, or treats a lone
+non-empty response as truth.
 
 ## Layout Evolution
 
@@ -427,35 +416,14 @@ Health and topology age are separate facts.
 
 ## Proof Status
 
-The current 1.0.0 implementation has been proven on three hardware nodes in
-both separated-root and shared-root layouts.
-
-The hardening proof covers:
-
-- multipart resume across restart;
-- POSIX list, rename, trash, recover, and read-after-recover;
-- node-b loss during reads and writes;
-- object status and object repair;
-- deliberate single-shard deletion and parity reconstruction;
-- cluster repair;
-- distributed fragment-level repair, rebalance, and GC across live nodes;
-- targeted rebalance of an older recorded layout into the current topology;
-- forbidden old layout checks for `.cluster`, `.namespace`, `.blobs`, `.nmtd`,
-  and `.ndx`;
-- canonical `.ncdx` colocation on shard-bearing roots.
-
-Recent three-node separated-root proof:
-
-```text
-payload: 64 MiB
-multipart resume upload: 10.71 MiB/s
-local download: 72.48 MiB/s
-node-b-loss download: 116.99 MiB/s
-single-shard delete reconstruct: 70.97 MiB/s
-targeted rebalance: scanned=1 rewritten=1 failed=0
-final health: healthy, 3 readable/write nodes, 2+1 layout
-max RSS: node-a 50.35 MiB, node-b 42.92 MiB, node-c 40.78 MiB
-```
+The rewritten namespace has unit proof for immutable dentry transactions,
+generation conflicts, O(1) directory rename, trash/restore identity, strict
+quorum selection, committed-intent replay, and expansion-stable placement.
+Isolated hardware proof is recorded outside the repository under
+`/home/wlzambo/DEV-TEST`. Production readiness requires the current release
+binary to pass the complete multi-node restart, divergence, TTL, object-repair,
+and sustained-throughput matrix; historical benchmark numbers are not evidence
+for this incompatible namespace format.
 
 ## Failure Semantics
 
@@ -494,7 +462,7 @@ Multipart coordinator ownership remains a client-visible N2 rule.
 - peer IO pressure and read-on-recover counters;
 - redistribution/rebalance readiness;
 - repair, rebalance, and GC jobs;
-- namespace voter and ledger state;
+- namespace voter, partition, transaction, and placement-epoch state;
 - active upload activity.
 
 Explicit `/n2/cluster/usage` performs the more expensive disk aggregation and

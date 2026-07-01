@@ -12,8 +12,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("key_path", "");
 
     conf.with_section(Some("disk_config"))
-        .set("index_store_disks", "")
-        .set("blob_store_disks", "")
+        .set("storage_disks", "")
         .set("fs_storage_path", "");
 
     conf.with_section(Some("cluster_config"))
@@ -64,10 +63,10 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("stream_locality_bias_enabled", "true")
         .set("monitor_interval_seconds", "auto")
         .set("monitor_deep_scan_interval_seconds", "auto")
-        .set("max_part_size", "52428800")
+        .set("max_part_size", "536870912")
         .set("data_shards", "1")
         .set("parity_shards", "0")
-        .set("stripe_block_size", "262144");
+        .set("stripe_block_size", "4194304");
 
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
@@ -100,6 +99,11 @@ mod tests {
         assert_eq!(cluster.get("auto_max_data_shards"), Some("8"));
         assert_eq!(cluster.get("auto_max_parity_shards"), Some("3"));
         assert_eq!(cluster.get("membership_file"), Some("n2_membership.json"));
+        let upload = ini
+            .section(Some("upload_config"))
+            .expect("upload_config section");
+        assert_eq!(upload.get("max_part_size"), Some("536870912"));
+        assert_eq!(upload.get("stripe_block_size"), Some("4194304"));
         let _ = fs::remove_file(path);
     }
 }

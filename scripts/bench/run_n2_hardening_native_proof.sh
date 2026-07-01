@@ -20,7 +20,7 @@ REMOTE2_HDD_ROOT="${REMOTE2_HDD_ROOT:-/mnt/DISK2}"
 LOCAL_NVME_ROOT="${LOCAL_NVME_ROOT:-/home/administrator/.local/share/litiaina-n2-proof}"
 REMOTE_NVME_ROOT="${REMOTE_NVME_ROOT:-/home/administrator/.local/share/litiaina-n2-proof}"
 REMOTE2_NVME_ROOT="${REMOTE2_NVME_ROOT:-/home/administrator/.local/share/litiaina-n2-proof}"
-N2_PROOF_STORAGE_LAYOUT="${N2_PROOF_STORAGE_LAYOUT:-separated}"
+N2_PROOF_STORAGE_LAYOUT="${N2_PROOF_STORAGE_LAYOUT:-unified}"
 SOURCE_VIDEO="${SOURCE_VIDEO:-/home/administrator/Downloads/mhw.mp4}"
 PROOF_MIB="${PROOF_MIB:-256}"
 SMALL_OBJECTS="${SMALL_OBJECTS:-120}"
@@ -38,24 +38,16 @@ LROOT="$N2_PROOF_RUN_ROOT/n2-hardening-native-proof-$TS/node-a"
 RROOT="/tmp/n2-hardening-native-proof-$TS/node-b"
 CROOT="/tmp/n2-hardening-native-proof-$TS/node-c"
 case "$N2_PROOF_STORAGE_LAYOUT" in
-  separated)
-    L_INDEX_ROOT="$LOCAL_NVME_ROOT/$TS/node-a/index"
-    R_INDEX_ROOT="$REMOTE_NVME_ROOT/$TS/node-b/index"
-    C_INDEX_ROOT="$REMOTE2_NVME_ROOT/$TS/node-c/index"
-    L_BLOB_ROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a/blob"
-    R_BLOB_ROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b/blob"
-    C_BLOB_ROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c/blob"
-    ;;
-  shared)
-    L_INDEX_ROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a/storage"
-    R_INDEX_ROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b/storage"
-    C_INDEX_ROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c/storage"
-    L_BLOB_ROOT="$L_INDEX_ROOT"
-    R_BLOB_ROOT="$R_INDEX_ROOT"
-    C_BLOB_ROOT="$C_INDEX_ROOT"
+  unified)
+    L_INDEX_ROOT="$LOCAL_NVME_ROOT/$TS/node-a/device-00"
+    R_INDEX_ROOT="$REMOTE_NVME_ROOT/$TS/node-b/device-00"
+    C_INDEX_ROOT="$REMOTE2_NVME_ROOT/$TS/node-c/device-00"
+    L_BLOB_ROOT="$LOCAL_HDD_ROOT/n2-hardening-native-proof-$TS/node-a/device-01"
+    R_BLOB_ROOT="$REMOTE_HDD_ROOT/n2-hardening-native-proof-$TS/node-b/device-01"
+    C_BLOB_ROOT="$REMOTE2_HDD_ROOT/n2-hardening-native-proof-$TS/node-c/device-01"
     ;;
   *)
-    echo "N2_PROOF_STORAGE_LAYOUT must be separated or shared" >&2
+    echo "N2_PROOF_STORAGE_LAYOUT must be unified" >&2
     exit 1
     ;;
 esac
@@ -133,8 +125,7 @@ write_membership() {
       "native_endpoint": "$LOCAL_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$L_INDEX_ROOT"],
-      "blob_roots": ["$L_BLOB_ROOT"]
+      "storage_roots": ["$L_INDEX_ROOT", "$L_BLOB_ROOT"]
     },
     {
       "id": "node-b",
@@ -142,8 +133,7 @@ write_membership() {
       "native_endpoint": "$REMOTE_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$R_INDEX_ROOT"],
-      "blob_roots": ["$R_BLOB_ROOT"]
+      "storage_roots": ["$R_INDEX_ROOT", "$R_BLOB_ROOT"]
     }
   ]
 }
@@ -161,8 +151,7 @@ JSON
       "native_endpoint": "$LOCAL_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$L_INDEX_ROOT"],
-      "blob_roots": ["$L_BLOB_ROOT"]
+      "storage_roots": ["$L_INDEX_ROOT", "$L_BLOB_ROOT"]
     },
     {
       "id": "node-b",
@@ -170,8 +159,7 @@ JSON
       "native_endpoint": "$REMOTE_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$R_INDEX_ROOT"],
-      "blob_roots": ["$R_BLOB_ROOT"]
+      "storage_roots": ["$R_INDEX_ROOT", "$R_BLOB_ROOT"]
     },
     {
       "id": "node-c",
@@ -179,8 +167,7 @@ JSON
       "native_endpoint": "$REMOTE2_NATIVE",
       "state": "online",
       "weight": 1,
-      "index_roots": ["$C_INDEX_ROOT"],
-      "blob_roots": ["$C_BLOB_ROOT"]
+      "storage_roots": ["$C_INDEX_ROOT", "$C_BLOB_ROOT"]
     }
   ]
 }
@@ -198,8 +185,7 @@ cert_path=$run_root/cert.pem
 key_path=$run_root/key.pem
 
 [disk_config]
-index_store_disks=$index_root
-blob_store_disks=$blob_root
+storage_disks=$index_root,$blob_root
 fs_storage_path=$fs_root
 
 [cluster_config]
@@ -588,21 +574,6 @@ if [[ -s "$OUT/forbidden-layout-local.txt" || -s "$OUT/forbidden-layout-remote.t
   echo "forbidden old N2 layout paths found" >&2
   cat "$OUT"/forbidden-layout-*.txt >&2
   exit 1
-fi
-
-if [[ "$N2_PROOF_STORAGE_LAYOUT" == "separated" ]]; then
-  find "$L_INDEX_ROOT" \( \( -path '*/.objects/*' -name '*.ncdx' \) -o -name '*.shard' -o -name '*.parity' \) -print > "$OUT/object-data-on-index-local.txt"
-  ssh_remote "find '$R_INDEX_ROOT' \( \( -path '*/.objects/*' -name '*.ncdx' \) -o -name '*.shard' -o -name '*.parity' \) -print" > "$OUT/object-data-on-index-remote.txt"
-  if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-    ssh_remote2 "find '$C_INDEX_ROOT' \( \( -path '*/.objects/*' -name '*.ncdx' \) -o -name '*.shard' -o -name '*.parity' \) -print" > "$OUT/object-data-on-index-remote2.txt"
-  else
-    : > "$OUT/object-data-on-index-remote2.txt"
-  fi
-  if [[ -s "$OUT/object-data-on-index-local.txt" || -s "$OUT/object-data-on-index-remote.txt" || -s "$OUT/object-data-on-index-remote2.txt" ]]; then
-    echo "immutable object data leaked onto a separated namespace/index root" >&2
-    cat "$OUT"/object-data-on-index-*.txt >&2
-    exit 1
-  fi
 fi
 
 find "$L_BLOB_ROOT" -name '*.ncdx' -print > "$OUT/ncdx-local.txt"

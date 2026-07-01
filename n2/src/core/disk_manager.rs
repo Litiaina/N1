@@ -14,8 +14,7 @@ pub fn default_tar_format() -> String {
     "tar".to_string()
 }
 
-pub static INDEX_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
-pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
+pub static STORAGE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
 pub fn default_stripe_size() -> usize {
@@ -28,17 +27,10 @@ impl ObjectPathManager {
         Self
     }
 
-    pub fn get_all_index_roots(&self) -> Vec<PathBuf> {
-        let roots = INDEX_STORE_DISKS
+    pub fn get_storage_roots(&self) -> Vec<PathBuf> {
+        let roots = STORAGE_DISKS
             .get()
-            .expect("Index Store Config not initialized!");
-        roots.iter().map(PathBuf::from).collect()
-    }
-
-    pub fn get_blob_roots(&self) -> Vec<PathBuf> {
-        let roots = BLOB_STORE_DISKS
-            .get()
-            .expect("Blob Store Config not initialized!");
+            .expect("N2 storage devices are not initialized");
         roots.iter().map(PathBuf::from).collect()
     }
 
@@ -60,7 +52,7 @@ impl ObjectPathManager {
     }
 
     pub fn resolve_stable_fragment_id(&self, fragment_hash: &str) -> String {
-        let roots = INDEX_STORE_DISKS
+        let roots = STORAGE_DISKS
             .get()
             .map(|roots| roots.iter().map(PathBuf::from).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -83,7 +75,7 @@ impl ObjectPathManager {
         fragment_hash: &str,
         logical_path: &str,
     ) -> Vec<PathBuf> {
-        let roots = self.get_all_index_roots();
+        let roots = self.get_storage_roots();
         if roots.is_empty() {
             return Vec::new();
         }
@@ -94,11 +86,11 @@ impl ObjectPathManager {
     }
 
     pub fn get_all_namespace_roots(&self, _fragment_hash: &str) -> Vec<PathBuf> {
-        self.get_all_index_roots()
+        self.get_storage_roots()
     }
 
     pub fn get_session_root(&self, fragment_hash: &str, version_id: &str) -> Option<PathBuf> {
-        let roots = self.get_all_index_roots();
+        let roots = self.get_storage_roots();
         if roots.is_empty() {
             return None;
         }
@@ -204,7 +196,15 @@ pub struct ShardInfo {
     pub absolute_path: String,
     pub size_bytes: u64,
     pub checksum: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_checksums: Vec<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub checksum_block_size: usize,
     pub is_parity: bool,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

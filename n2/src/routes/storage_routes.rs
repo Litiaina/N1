@@ -4,12 +4,7 @@ use crate::core::archive::{
     download_manifest_archive as download_manifest_archive_impl,
     download_selected_archive as download_selected_archive_impl,
 };
-use crate::core::delete::{
-    BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse,
-    delete_object_version as delete_object_version_impl, get_empty_trash_status_api,
-    get_recover_all_trash_status_api, recover_object_version as recover_object_version_impl,
-    resume_persistent_trash_jobs,
-};
+use crate::core::delete::{BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse};
 use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
 };
@@ -42,12 +37,15 @@ use crate::core::upload::{
     get_upload_status as get_upload_status_impl, list_active_uploads as list_active_uploads_impl,
 };
 use crate::core::{index, index_store};
+use crate::distribution::dentry_quorum::build_dentry_quorum_routes;
+use crate::distribution::dentry_transaction::build_dentry_transaction_routes;
 use crate::distribution::download::part_has_remote_shards;
+use crate::distribution::lifecycle::build_lifecycle_peer_routes;
 use crate::distribution::maintenance::build_distributed_maintenance_peer_routes;
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, build_namespace_peer_routes,
-    commit_namespace_summary_quorum, commit_upload_quorum, sync_namespace_from_peers,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
+    commit_upload_quorum,
 };
 use crate::distribution::peer::build_peer_routes;
 use crate::distribution::rebalance::{
@@ -134,25 +132,18 @@ pub(crate) async fn resolve_logical_read_key(
     requested_path: &str,
 ) -> Result<String, AppError> {
     let requested = requested_path.trim_start_matches('/').trim();
-    for attempt in 0..=1 {
-        if let Some(entry) = global_namespace_runtime()
-            .entry(fragment, requested)
-            .await?
+    if let Some(entry) = global_namespace_runtime()
+        .entry(fragment, requested)
+        .await?
+    {
+        if entry.kind != crate::namespace::models::NamespaceEntryKind::File
+            || !entry.lifecycle.is_live()
         {
-            if entry.kind != crate::namespace::models::NamespaceEntryKind::File
-                || !entry.lifecycle.is_live()
-            {
-                return Err(logical_not_found());
-            }
-            return entry.object_id.ok_or_else(|| {
-                AppError::InternalServerError(
-                    "logical file is missing physical object id".to_string(),
-                )
-            });
+            return Err(logical_not_found());
         }
-        if attempt == 0 {
-            let _ = sync_namespace_from_peers(fragment).await;
-        }
+        return entry.object_id.ok_or_else(|| {
+            AppError::InternalServerError("logical file is missing physical object id".to_string())
+        });
     }
     index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }
@@ -472,7 +463,6 @@ async fn list_objects_scoped(
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
-    let _ = sync_namespace_from_peers(&fragment).await;
     Ok(AxumJson(
         global_namespace_runtime()
             .list_objects_page(&fragment, &params, false)
@@ -619,44 +609,6 @@ async fn download_manifest_archive_scoped(
     download_manifest_archive_impl(claims, Path(fragment), Query(query), body).await
 }
 
-async fn empty_trash_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::EmptyTrash,
-        fragment: fragment.clone(),
-        source_path: None,
-        destination_path: None,
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &fragment,
-            summary.clone(),
-        )),
-    );
-    Ok((
-        StatusCode::OK,
-        AxumJson(serde_json::json!({
-            "operation": summary.operation,
-            "affected_paths": summary.affected_paths,
-            "affected_objects": summary.affected_objects,
-            "trash_entry_id": summary.trash_entry_id,
-            "deleted_at_unix": summary.deleted_at_unix,
-        })),
-    ))
-}
-
 async fn delete_object_scoped(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -691,64 +643,6 @@ async fn delete_object_scoped(
             "deleted_at_unix": summary.deleted_at_unix,
         })),
     ))
-}
-
-async fn delete_object_version_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Path((version_id, object_key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    delete_object_version_impl(State(state), claims, Path((fragment, version_id, physical))).await
-}
-
-async fn delete_object_permanently_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Path(object_key): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::Purge,
-        fragment: fragment.clone(),
-        source_path: Some(object_key.clone()),
-        destination_path: None,
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &fragment,
-            summary.clone(),
-        )),
-    );
-    Ok((
-        StatusCode::OK,
-        AxumJson(serde_json::json!({
-            "operation": summary.operation,
-            "affected_paths": summary.affected_paths,
-            "affected_objects": summary.affected_objects,
-            "trash_entry_id": summary.trash_entry_id,
-        })),
-    ))
-}
-
-async fn recover_object_version_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Path((version_id, object_key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    recover_object_version_impl(State(state), claims, Path((fragment, version_id, physical))).await
 }
 
 async fn recover_object_scoped(
@@ -1108,113 +1002,6 @@ async fn bulk_recover_objects_scoped(
     ))
 }
 
-async fn bulk_permanent_delete_objects_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let fragment = claims.fragment.clone();
-    let requested = payload.object_keys.len();
-    let unique_keys = payload
-        .object_keys
-        .into_iter()
-        .filter(|key| !key.trim().is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if unique_keys.is_empty() {
-        return Err(AppError::BadRequest("object_keys must not be empty".into()));
-    }
-
-    let mut succeeded = 0usize;
-    let mut not_found = 0usize;
-    let mut failed = Vec::new();
-    for object_key in &unique_keys {
-        match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-            mutation_id: None,
-            kind: NamespaceMutationKind::Purge,
-            fragment: fragment.clone(),
-            source_path: Some(object_key.clone()),
-            destination_path: None,
-            object_id: None,
-            version_id: None,
-            metadata: None,
-        })
-        .await
-        {
-            Ok(_) => {
-                succeeded = succeeded.saturating_add(1);
-            }
-            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
-            Err(err) => failed.push(BulkObjectFailure {
-                object_key: object_key.clone(),
-                error: err.to_string(),
-            }),
-        }
-    }
-    if succeeded > 0 {
-        state.emit(
-            &fragment,
-            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
-                &fragment,
-                "bulk_delete_permanent",
-                succeeded,
-            )),
-        );
-    }
-    Ok((
-        StatusCode::OK,
-        AxumJson(BulkObjectOperationResponse {
-            requested,
-            unique: unique_keys.len(),
-            succeeded,
-            not_found,
-            failed,
-        }),
-    ))
-}
-
-async fn recover_all_trash_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    if !claims.write {
-        return Err(AppError::Forbidden(
-            "Write permission required to recover all".into(),
-        ));
-    }
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::RecoverAll,
-        fragment: fragment.clone(),
-        source_path: None,
-        destination_path: None,
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &fragment,
-            summary.clone(),
-        )),
-    );
-    Ok((
-        StatusCode::OK,
-        AxumJson(serde_json::json!({
-            "operation": summary.operation,
-            "affected_paths": summary.affected_paths,
-            "affected_objects": summary.affected_objects,
-        })),
-    ))
-}
-
 async fn rename_object_scoped(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -1518,22 +1305,6 @@ pub fn build_storage_routes_unbound_with_options(
 
     let app_state = Arc::new(AppState { ws_manager });
 
-    let trash_resume_state = Arc::clone(&app_state);
-    tokio::spawn(async move {
-        match resume_persistent_trash_jobs(trash_resume_state).await {
-            Ok(resumed) if resumed > 0 => {
-                tracing::info!("Resumed {} persistent trash maintenance job(s)", resumed);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to resume persistent trash maintenance jobs: {}",
-                    err
-                );
-            }
-        }
-    });
-
     let lifecycle_state = Arc::clone(&app_state);
     tokio::spawn(async move {
         run_lifecycle_manager(lifecycle_state).await;
@@ -1594,36 +1365,16 @@ pub fn build_storage_routes_unbound_with_options(
         let write_ops = Router::new()
             .route("/n2/fragments/{:fragment}", delete(delete_fragment))
             .route("/n2/fragments/{:fragment}", patch(update_fragment))
-            .route(
-                "/n2/trash/empty",
-                delete(empty_trash_scoped).post(empty_trash_scoped),
-            )
             .route("/n2/objects/rename", post(rename_object_scoped))
             .route("/n2/objects/bulk-delete", post(bulk_delete_objects_scoped))
-            .route(
-                "/n2/objects/permanent/bulk-delete",
-                post(bulk_permanent_delete_objects_scoped),
-            )
             .route(
                 "/n2/objects/redistribute/{*object_key}",
                 post(redistribute_object_scoped),
             )
             .route("/n2/objects/{*object_key}", delete(delete_object_scoped))
             .route(
-                "/n2/objects/version/{:version_id}/{*object_key}",
-                delete(delete_object_version_scoped),
-            )
-            .route(
-                "/n2/objects/permanent/{*object_key}",
-                delete(delete_object_permanently_scoped),
-            )
-            .route(
                 "/n2/objects/repair/{*object_key}",
                 post(repair_object_scoped),
-            )
-            .route(
-                "/n2/objects/recover/version/{:version_id}/{*object_key}",
-                post(recover_object_version_scoped),
             )
             .route(
                 "/n2/objects/bulk-recover",
@@ -1633,7 +1384,6 @@ pub fn build_storage_routes_unbound_with_options(
                 "/n2/objects/recover/{*object_key}",
                 post(recover_object_scoped),
             )
-            .route("/n2/trash/recover-all", post(recover_all_trash_scoped))
             .route(
                 "/n2/upload/multipart/init/{*object_key}",
                 post(initiate_object_upload_scoped),
@@ -1680,14 +1430,6 @@ pub fn build_storage_routes_unbound_with_options(
             )
             .route("/n2/maintenance/gc/stop", post(stop_garbage_collector))
             .route("/n2/maintenance/gc/status", get(get_gc_status_api))
-            .route(
-                "/n2/maintenance/trash/recover/status",
-                get(get_recover_all_trash_status_api),
-            )
-            .route(
-                "/n2/maintenance/trash/empty/status",
-                get(get_empty_trash_status_api),
-            )
             .route(
                 "/n2/maintenance/redistribution/start",
                 post(trigger_redistribution_job_api),
@@ -1741,7 +1483,9 @@ pub fn build_storage_routes_unbound_with_options(
     let peer_routes = Router::new()
         .merge(build_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
-        .merge(build_namespace_peer_routes());
+        .merge(build_lifecycle_peer_routes())
+        .merge(build_dentry_quorum_routes())
+        .merge(build_dentry_transaction_routes());
 
     let create_fragment_route = Router::new().route("/n2/fragments", post(create_fragment));
     let create_fragment_route = layers

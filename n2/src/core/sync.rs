@@ -32,7 +32,7 @@ pub struct CreateFragmentResponse {
 
 pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
 
     for root in blob_roots {
         let blob_dir = physical_fragment_root_on(&root, fragment_hash).join(N2_BLOB_DIR);
@@ -68,11 +68,11 @@ pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
 
 pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
 
     if blob_roots.is_empty() {
         return Err(AppError::ServiceUnavailable(
-            "no blob roots configured for fragment provisioning".into(),
+            "no storage devices configured for fragment provisioning".into(),
         ));
     }
 
@@ -85,13 +85,13 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
                     .await
                     .map_err(|_| {
                         AppError::ServiceUnavailable(format!(
-                            "timed out creating blob root {}",
+                            "timed out creating storage device root {}",
                             blob_dir.display()
                         ))
                     })?
                     .map_err(|e| {
                         AppError::ServiceUnavailable(format!(
-                            "failed to create blob root {}: {}",
+                            "failed to create storage device root {}: {}",
                             blob_dir.display(),
                             e
                         ))
@@ -100,14 +100,14 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
             Ok(Ok(true)) => {}
             Ok(Err(e)) => {
                 return Err(AppError::ServiceUnavailable(format!(
-                    "failed to inspect blob root {}: {}",
+                    "failed to inspect storage device root {}: {}",
                     blob_dir.display(),
                     e
                 )));
             }
             Err(_) => {
                 return Err(AppError::ServiceUnavailable(format!(
-                    "timed out inspecting blob root {}",
+                    "timed out inspecting storage device root {}",
                     blob_dir.display()
                 )));
             }
@@ -117,13 +117,13 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
             .await
             .map_err(|_| {
                 AppError::ServiceUnavailable(format!(
-                    "timed out verifying blob root {}",
+                    "timed out verifying storage device root {}",
                     blob_dir.display()
                 ))
             })?
             .map_err(|e| {
                 AppError::ServiceUnavailable(format!(
-                    "failed to verify blob root {}: {}",
+                    "failed to verify storage device root {}: {}",
                     blob_dir.display(),
                     e
                 ))
@@ -131,7 +131,7 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
 
         if !metadata.is_dir() {
             return Err(AppError::ServiceUnavailable(format!(
-                "blob root {} is not a directory",
+                "storage device root {} is not a directory",
                 blob_dir.display()
             )));
         }
@@ -142,7 +142,7 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
 
 async fn sweep_fragment_gc_files(fragment_hash: String) {
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
 
     tokio::task::spawn_blocking(move || {
         for root in blob_roots {

@@ -5,6 +5,7 @@ use crate::core::capacity_manager::{
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, ShardInfo};
 use crate::core::monitoring::system_health_snapshot;
+use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::{index, index_store};
 use crate::distribution::layout::resolve_layout;
 use crate::distribution::membership::{ClusterNode, ClusterRuntime, active_cluster_runtime};
@@ -33,7 +34,7 @@ use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::io::SeekFrom;
+use std::io::{self, ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
@@ -62,7 +63,9 @@ const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_PEER_MIN_TRANSFER_MIB_PER_SEC: u64 = 4;
+const DEFAULT_PEER_TRANSFER_IDLE_TIMEOUT_SECS: u64 = 60;
 const MAX_PEER_TRANSFER_TIMEOUT_SECS: u64 = 3600;
+const NATIVE_PEER_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn peer_http_client() -> Result<reqwest::Client, AppError> {
     Ok(PEER_HTTP_CLIENT.clone())
@@ -100,6 +103,41 @@ fn peer_transfer_timeout(bytes: u64) -> Duration {
             .saturating_add(transfer_secs)
             .clamp(20, MAX_PEER_TRANSFER_TIMEOUT_SECS),
     )
+}
+
+fn peer_transfer_idle_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("N2_PEER_TRANSFER_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PEER_TRANSFER_IDLE_TIMEOUT_SECS)
+            .clamp(5, MAX_PEER_TRANSFER_TIMEOUT_SECS),
+    )
+}
+
+async fn copy_with_idle_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; NATIVE_PEER_STREAM_BUFFER_BYTES];
+    let mut copied = 0u64;
+    loop {
+        let read = timeout(idle_timeout, reader.read(&mut buffer))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "peer stream read stalled"))??;
+        if read == 0 {
+            return Ok(copied);
+        }
+        timeout(idle_timeout, writer.write_all(&buffer[..read]))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "peer stream write stalled"))??;
+        copied = copied.saturating_add(read as u64);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -370,20 +408,17 @@ async fn native_put_peer_shard(
     .map_err(|e| {
         AppError::ServiceUnavailable(format!("write N2 native peer put control failed: {e}"))
     })?;
-    timeout(
-        peer_transfer_timeout(target.expected_len),
-        tokio::io::copy(&mut reader, &mut stream),
-    )
-    .await
-    .map_err(|_| {
-        AppError::ServiceUnavailable(format!(
-            "stream N2 native peer shard to {} timed out",
-            target.node_id
-        ))
-    })?
-    .map_err(|e| {
-        AppError::ServiceUnavailable(format!("stream N2 native peer shard failed: {e}"))
-    })?;
+    let copied = copy_with_idle_timeout(&mut reader, &mut stream, peer_transfer_idle_timeout())
+        .await
+        .map_err(|e| {
+            AppError::ServiceUnavailable(format!("stream N2 native peer shard failed: {e}"))
+        })?;
+    if copied != target.expected_len {
+        return Err(AppError::ServiceUnavailable(format!(
+            "stream N2 native peer shard to {} ended after {} bytes, expected {}",
+            target.node_id, copied, target.expected_len
+        )));
+    }
     timeout(PEER_WRITE_TIMEOUT, stream.shutdown())
         .await
         .map_err(|_| {
@@ -397,14 +432,17 @@ async fn native_put_peer_shard(
                 "shutdown N2 native peer shard stream failed: {e}"
             ))
         })?;
-    let response = timeout(PEER_READ_TIMEOUT, read_native_peer_response(&mut stream))
-        .await
-        .map_err(|_| {
-            AppError::ServiceUnavailable(format!(
-                "read N2 native peer put response from {} timed out",
-                target.node_id
-            ))
-        })??;
+    let response = timeout(
+        peer_transfer_idle_timeout(),
+        read_native_peer_response(&mut stream),
+    )
+    .await
+    .map_err(|_| {
+        AppError::ServiceUnavailable(format!(
+            "read N2 native peer put response from {} timed out",
+            target.node_id
+        ))
+    })??;
     if !response.ok {
         return Err(native_peer_response_error("put", target, &response));
     }
@@ -1595,7 +1633,7 @@ fn shard_dir(
     shard_index: usize,
 ) -> Result<std::path::PathBuf, AppError> {
     let pm = ObjectPathManager::new();
-    let roots = pm.get_blob_roots();
+    let roots = pm.get_storage_roots();
     if roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No blob storage disks configured".into(),
@@ -1628,13 +1666,8 @@ pub async fn peer_put_shard(
     let file_name = stable_name(part_index, shard_index, is_parity);
     let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
     let stable_path = dir.join(&file_name);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create peer shard {}", tmp_path.display())))?;
+    let file = create_direct_file(&tmp_path).await?;
+    let mut file = DirectWriter::new(file);
     let mut stream = body.into_data_stream();
     let mut hasher = Hasher::new();
     let mut written = 0u64;
@@ -1657,14 +1690,18 @@ pub async fn peer_put_shard(
     file.flush()
         .await
         .map_err(|e| AppError::Io(e, format!("flush peer shard {}", tmp_path.display())))?;
-    drop(file);
     if expected_len > 0 && written != expected_len {
+        drop(file);
         let _ = fs::remove_file(&tmp_path).await;
         return Err(AppError::BadRequest(format!(
             "peer shard length mismatch: got {}, expected {}",
             written, expected_len
         )));
     }
+    file.sync_data()
+        .await
+        .map_err(|e| AppError::Io(e, format!("sync peer shard {}", tmp_path.display())))?;
+    drop(file);
     if fs::try_exists(&stable_path).await.unwrap_or(false) {
         let _ = fs::remove_file(&stable_path).await;
     }
@@ -1678,12 +1715,15 @@ pub async fn peer_put_shard(
             ),
         )
     })?;
+    crate::core::upload::sync_dir(&dir).await?;
     let info = ShardInfo {
         shard_index,
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
         checksum: format!("{:08x}", hasher.finalize()),
+        block_checksums: Vec::new(),
+        checksum_block_size: 0,
         is_parity,
     };
     invalidate_local_usage_cache(Some(&fragment));
@@ -1823,24 +1863,25 @@ where
     let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
     let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
     let stable_path = dir.join(&file_name);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .await
-        .map_err(|e| {
-            AppError::Io(
-                e,
-                format!("create native peer shard {}", tmp_path.display()),
-            )
-        })?;
+    let file = create_direct_file(&tmp_path).await?;
+    let mut file = DirectWriter::new(file);
     let mut hasher = Hasher::new();
     let mut written = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
     while written < body_len {
         let wanted = ((body_len - written) as usize).min(buf.len());
-        let n = reader.read(&mut buf[..wanted]).await.map_err(|e| {
+        let n = timeout(
+            peer_transfer_idle_timeout(),
+            reader.read(&mut buf[..wanted]),
+        )
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "native peer shard body stalled while writing {}",
+                tmp_path.display()
+            ))
+        })?
+        .map_err(|e| {
             AppError::Io(
                 e,
                 format!("read native peer shard body {}", tmp_path.display()),
@@ -1858,14 +1899,18 @@ where
     file.flush()
         .await
         .map_err(|e| AppError::Io(e, format!("flush native peer shard {}", tmp_path.display())))?;
-    drop(file);
     if written != body_len || (expected_len > 0 && written != expected_len) {
+        drop(file);
         let _ = fs::remove_file(&tmp_path).await;
         return Err(AppError::BadRequest(format!(
             "native peer shard length mismatch: got {}, body_len {}, expected {}",
             written, body_len, expected_len
         )));
     }
+    file.sync_data()
+        .await
+        .map_err(|e| AppError::Io(e, format!("sync native peer shard {}", tmp_path.display())))?;
+    drop(file);
     if fs::try_exists(&stable_path).await.unwrap_or(false) {
         let _ = fs::remove_file(&stable_path).await;
     }
@@ -1879,6 +1924,7 @@ where
             ),
         )
     })?;
+    crate::core::upload::sync_dir(&dir).await?;
     invalidate_local_usage_cache(Some(&payload.fragment));
     Ok(ShardInfo {
         shard_index: payload.shard_index,
@@ -1886,6 +1932,8 @@ where
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
         checksum: format!("{:08x}", hasher.finalize()),
+        block_checksums: Vec::new(),
+        checksum_block_size: 0,
         is_parity: payload.parity,
     })
 }
@@ -2021,6 +2069,33 @@ mod tests {
         let large = peer_transfer_timeout(1024 * 1024 * 1024);
         assert!(large > small);
         assert!(small >= PEER_WRITE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn peer_copy_idle_timeout_resets_when_bytes_keep_moving() {
+        let (mut sender, mut receiver) = tokio::io::duplex(64);
+        let producer = tokio::spawn(async move {
+            for value in 0..6u8 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                sender.write_all(&[value]).await.unwrap();
+            }
+        });
+        let mut sink = tokio::io::sink();
+        let copied = copy_with_idle_timeout(&mut receiver, &mut sink, Duration::from_millis(50))
+            .await
+            .unwrap();
+        producer.await.unwrap();
+        assert_eq!(copied, 6);
+    }
+
+    #[tokio::test]
+    async fn peer_copy_idle_timeout_rejects_a_stalled_stream() {
+        let (_sender, mut receiver) = tokio::io::duplex(64);
+        let mut sink = tokio::io::sink();
+        let err = copy_with_idle_timeout(&mut receiver, &mut sink, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
     }
 
     #[test]

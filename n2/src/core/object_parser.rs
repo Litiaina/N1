@@ -276,10 +276,10 @@ pub async fn stream_object_logic(
     let content_length = end - start + 1;
 
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     if blob_roots.is_empty() {
         return Err(AppError::InternalServerError(
-            "No blob roots configured".into(),
+            "No N2 storage devices configured".into(),
         ));
     }
 
@@ -536,6 +536,8 @@ mod tests {
                 file_name: "a.shard".into(),
                 absolute_path: "/missing/root/a.shard".into(),
                 checksum: "x".into(),
+                block_checksums: Vec::new(),
+                checksum_block_size: 0,
                 size_bytes: 1,
                 shard_index: 0,
                 is_parity: false,
@@ -557,6 +559,8 @@ mod tests {
                 file_name: "a.shard".into(),
                 absolute_path: "/d1/@f_frag/.objects/ab/cd/ef/01/@o_object/ver/a.shard".into(),
                 checksum: "x".into(),
+                block_checksums: Vec::new(),
+                checksum_block_size: 0,
                 size_bytes: 1,
                 shard_index: 0,
                 is_parity: false,

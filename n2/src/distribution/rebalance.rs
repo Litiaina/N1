@@ -900,8 +900,8 @@ mod tests {
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
             weight: 1,
-            index_roots: vec![],
-            blob_roots: vec![],
+            storage_roots: vec![],
+            joined_epoch: 1,
             capacity_bytes: None,
             used_bytes: None,
             last_seen_unix: None,
@@ -983,6 +983,8 @@ mod tests {
                     absolute_path,
                     size_bytes: 1,
                     checksum: String::new(),
+                    block_checksums: Vec::new(),
+                    checksum_block_size: 0,
                     is_parity,
                 }
             })
@@ -1040,6 +1042,8 @@ mod tests {
                 absolute_path: "/local".into(),
                 size_bytes: 1,
                 checksum: String::new(),
+                block_checksums: Vec::new(),
+                checksum_block_size: 0,
                 is_parity: false,
             }],
         }];

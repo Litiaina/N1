@@ -145,8 +145,7 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-index_store_disks=/mnt/n2/index
-blob_store_disks=/mnt/n2/blob
+storage_disks=/mnt/n2/disk-00,/mnt/n2/disk-01
 fs_storage_path=/mnt/n2/fs
 
 [cluster_config]

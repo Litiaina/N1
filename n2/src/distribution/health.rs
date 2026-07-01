@@ -1,10 +1,8 @@
+use crate::distribution::dentry_group::{configured_namespace_replicas, quorum_required};
 use crate::distribution::layout::ClusterLayoutMode;
-use crate::distribution::layout::resolve_layout;
+use crate::distribution::layout::{resolve_layout, resolve_write_layout};
 use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
-};
-use crate::distribution::namespace_group::{
-    namespace_quorum_required, namespace_voter_count_for_membership,
 };
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
 use crate::enums::app_error_enum::AppError;
@@ -69,12 +67,24 @@ pub fn cluster_health_snapshot_with_live_nodes(
     readable: Vec<ClusterNode>,
 ) -> Result<ClusterHealthSnapshot, AppError> {
     let configured_active = runtime.membership.active_write_nodes();
-    let layout =
-        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
-    let data_plane_readable = readable.len() >= layout.data_shards;
-    let data_plane_writable = active.len() >= layout.total_shards();
-    let namespace_voters = namespace_voter_count_for_membership(runtime.membership.nodes.len());
-    let namespace_quorum_required = namespace_quorum_required(namespace_voters);
+    let configured_layout = resolve_layout(configured_active.len(), &runtime.layout_policy)
+        .map_err(AppError::BadRequest)?;
+    let layout = resolve_write_layout(
+        active.len(),
+        configured_active.len(),
+        &runtime.layout_policy,
+    )
+    .map_err(AppError::BadRequest)?;
+    let data_plane_readable = readable.len() >= configured_layout.data_shards;
+    let data_plane_writable = active.len() >= layout.total_shards()
+        && (configured_layout.parity_shards == 0 || layout.parity_shards > 0);
+    let namespace_voters = runtime
+        .membership
+        .nodes
+        .len()
+        .max(1)
+        .min(configured_namespace_replicas());
+    let namespace_quorum_required = quorum_required(namespace_voters);
     let estimated_namespace_reachable_voters = readable.len().min(namespace_voters);
     let namespace_quorum_writable =
         estimated_namespace_reachable_voters >= namespace_quorum_required;
@@ -130,8 +140,12 @@ pub fn cluster_health_snapshot_with_live_nodes(
     if missing_writable > 0 {
         if namespace_quorum_writable {
             notes.push(format!(
-                "{} configured writable node(s) are currently unreachable; namespace quorum is still writable and new objects use the live data layout, while older objects keep their recorded layout",
-                missing_writable
+                "{} configured writable node(s) are currently unreachable; namespace quorum remains writable and new objects use immutable {}+{} layouts instead of configured {}+{} layouts",
+                missing_writable,
+                layout.data_shards,
+                layout.parity_shards,
+                configured_layout.data_shards,
+                configured_layout.parity_shards
             ));
         } else {
             notes.push(format!(
@@ -174,7 +188,8 @@ pub fn cluster_health_snapshot_with_live_nodes(
         namespace_quorum_required,
         namespace_quorum_writable,
         effective_client_writable,
-        adaptive_layout: matches!(runtime.layout_policy.mode, ClusterLayoutMode::Auto),
+        adaptive_layout: matches!(runtime.layout_policy.mode, ClusterLayoutMode::Auto)
+            || layout != configured_layout,
         manual_rebalance_available: active.len() > 1,
         layout_drift_is_health_failure: false,
         automatic_rebalance: runtime.auto_rebalance,
@@ -241,8 +256,8 @@ mod tests {
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(state),
             weight: 1,
-            index_roots: vec![],
-            blob_roots: vec![],
+            storage_roots: vec![],
+            joined_epoch: 1,
             capacity_bytes: None,
             used_bytes: None,
             last_seen_unix: None,
@@ -305,6 +320,33 @@ mod tests {
     }
 
     #[test]
+    fn fixed_two_plus_one_reports_redundant_one_plus_one_write_layout() {
+        let mut runtime = runtime(vec![
+            node("a", NodeState::Online),
+            node("b", NodeState::Online),
+            node("c", NodeState::Online),
+        ]);
+        runtime.layout_policy = ClusterLayoutPolicy {
+            mode: ClusterLayoutMode::Fixed,
+            fixed_data_shards: Some(2),
+            fixed_parity_shards: Some(1),
+            ..ClusterLayoutPolicy::default()
+        };
+        let live = runtime.membership.nodes[..2].to_vec();
+
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
+
+        assert_eq!(snap.state, ClusterHealthState::Degraded);
+        assert_eq!(snap.data_shards, 1);
+        assert_eq!(snap.parity_shards, 1);
+        assert!(snap.data_plane_readable);
+        assert!(snap.data_plane_writable);
+        assert!(snap.namespace_quorum_writable);
+        assert!(snap.effective_client_writable);
+        assert!(snap.adaptive_layout);
+    }
+
+    #[test]
     fn health_reports_namespace_quorum_blocking_writes() {
         let runtime = runtime(vec![
             node("a", NodeState::Online),
@@ -314,7 +356,7 @@ mod tests {
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
         assert_eq!(snap.state, ClusterHealthState::Degraded);
         assert!(snap.data_plane_readable);
-        assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_writable);
         assert!(!snap.namespace_quorum_writable);
         assert!(!snap.effective_client_writable);
         assert!(snap.nodes.iter().all(|node| !node.accepts_writes));

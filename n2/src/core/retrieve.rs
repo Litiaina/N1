@@ -163,7 +163,7 @@ pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppErro
     }
 
     let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
+    let index_roots = path_manager.get_storage_roots();
 
     let fragments = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
         let mut fragment_hashes = HashSet::new();

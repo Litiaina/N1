@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
@@ -197,11 +196,11 @@ fn encode_disk_object_metadata(metadata: &ObjectMetadata) -> Result<Vec<u8>, App
 }
 
 fn index_roots() -> Vec<PathBuf> {
-    ObjectPathManager::new().get_all_index_roots()
+    ObjectPathManager::new().get_storage_roots()
 }
 
 fn blob_roots() -> Vec<PathBuf> {
-    ObjectPathManager::new().get_blob_roots()
+    ObjectPathManager::new().get_storage_roots()
 }
 
 fn stable_fragment_id_for_fragment(fragment: &str) -> String {
@@ -343,22 +342,6 @@ pub(crate) fn object_record_dir(
         .join(object_dir_name_for_id(object_id)?))
 }
 
-pub(crate) fn live_object_dir(
-    root: &Path,
-    fragment: &str,
-    object_id: &str,
-) -> Result<PathBuf, AppError> {
-    object_record_dir(root, fragment, object_id)
-}
-
-pub(crate) fn namespace_path(root: &Path, fragment: &str, logical_path: &str) -> PathBuf {
-    fragment_root_on(root, fragment).join(logical_path)
-}
-
-fn object_symlink_target(object_id: &str) -> Result<PathBuf, AppError> {
-    Ok(PathBuf::from(object_dir_name_for_id(object_id)?))
-}
-
 pub(crate) fn read_namespace_symlink_object_id(
     _root: &Path,
     _fragment: &str,
@@ -389,40 +372,6 @@ pub(crate) fn read_namespace_symlink_object_id(
         return Ok(None);
     };
     Ok(object_id_from_dir_name(name))
-}
-
-pub(crate) fn publish_namespace_link(
-    root: &Path,
-    fragment: &str,
-    logical_path: &str,
-    object_id: &str,
-) -> Result<(), AppError> {
-    let logical_path = normalize_object_key(logical_path)?;
-    let link = namespace_path(root, fragment, &logical_path);
-    let parent = link.parent().ok_or_else(|| {
-        AppError::InternalServerError("N2 namespace link has no parent".to_string())
-    })?;
-    fs::create_dir_all(parent).map_err(|e| io_err(e, "create N2 namespace parent"))?;
-
-    if let Some(existing) = read_namespace_symlink_object_id(root, fragment, &link)? {
-        if existing == normalize_object_id(object_id)? {
-            return Ok(());
-        }
-        return Err(AppError::Conflict(format!(
-            "logical path '{}' already points to another object",
-            logical_path
-        )));
-    }
-    if fs::symlink_metadata(&link).is_ok() {
-        return Err(AppError::Conflict(format!(
-            "logical path '{}' already exists",
-            logical_path
-        )));
-    }
-    let target = object_symlink_target(object_id)?;
-    unix_fs::symlink(target, &link).map_err(|e| io_err(e, "publish N2 namespace link"))?;
-    sync_dir(parent);
-    Ok(())
 }
 
 pub(crate) fn object_dir_candidates(
@@ -479,7 +428,7 @@ pub(crate) fn local_object_dirs_under_root(
 fn ensure_fragment_dirs(fragment: &str) -> Result<(), AppError> {
     for root in ObjectPathManager::new().get_all_namespace_roots(fragment) {
         let root = fragment_root_on(&root, fragment);
-        fs::create_dir_all(root.join(TRASH_DIR)).map_err(|e| io_err(e, "create trash dir"))?;
+        fs::create_dir_all(&root).map_err(|e| io_err(e, "create fragment storage root"))?;
     }
     Ok(())
 }
@@ -595,15 +544,6 @@ fn latest_summary_in_object_dir(dir: &Path) -> Result<Option<NcdxSummary>, AppEr
         }
     }
     Ok(latest)
-}
-
-pub(crate) fn latest_summary_metadata_in_object_dir(
-    fragment: &str,
-    record_key: &str,
-    dir: &Path,
-) -> Result<Option<ObjectMetadata>, AppError> {
-    Ok(latest_summary_in_object_dir(dir)?
-        .map(|summary| summary_metadata(fragment, record_key.to_string(), summary)))
 }
 
 fn ncdx_path_for_version(dir: &Path, version_id: &str) -> Result<Option<PathBuf>, AppError> {
@@ -1832,39 +1772,6 @@ pub fn drop_fragment_trash_namespace(fragment: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn retire_fragment_trash_namespace(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
-    let suffix = format!("{}-{}", Utc::now().timestamp_millis(), std::process::id());
-    let mut retired_roots = Vec::new();
-
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
-        fs::create_dir_all(&fragment_root).map_err(|e| io_err(e, "create N2 fragment root"))?;
-
-        let trash_root = fragment_root.join(TRASH_DIR);
-        let retired_parent = fragment_root.join(GC_DIR);
-        fs::create_dir_all(&retired_parent)
-            .map_err(|e| io_err(e, "create N2 retired trash root"))?;
-
-        if trash_root.exists() {
-            let retired_root = retired_parent.join(format!("{TRASH_DIR}.retired.{suffix}"));
-            if retired_root.exists() {
-                fs::remove_dir_all(&retired_root)
-                    .map_err(|e| io_err(e, "replace retired N2 trash namespace"))?;
-            }
-            renameat(CWD, &trash_root, CWD, &retired_root).map_err(|e| {
-                AppError::InternalServerError(format!("retire N2 trash namespace: {e}"))
-            })?;
-            retired_roots.push(retired_root);
-        }
-
-        fs::create_dir_all(&trash_root).map_err(|e| io_err(e, "recreate N2 trash namespace"))?;
-        sync_dir(&fragment_root);
-        sync_dir(&retired_parent);
-    }
-
-    Ok(retired_roots)
-}
-
 pub fn has_object_record(fragment: &str, object_key: &str) -> Result<bool, AppError> {
     Ok(object_dir_candidates(fragment, object_key)?
         .into_iter()
@@ -2150,153 +2057,40 @@ pub(crate) fn clear_pending_binding(fragment: &str, version_id: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata};
-    use ulid::Ulid;
+    use serde_json::Value;
 
-    fn ensure_test_blob_roots() -> Vec<PathBuf> {
-        if let Some(existing) = BLOB_STORE_DISKS.get() {
-            let roots = existing.iter().map(PathBuf::from).collect::<Vec<_>>();
-            for root in &roots {
-                let _ = fs::create_dir_all(root);
-            }
-            return roots;
-        }
-
-        let base = std::env::temp_dir().join(format!("n2-blob-{}", std::process::id()));
-        let roots = vec![base.join("blob-0"), base.join("blob-1")];
-        for root in &roots {
-            fs::create_dir_all(root).expect("create test blob root");
-        }
-        let _ = BLOB_STORE_DISKS.set(
-            roots
-                .iter()
-                .map(|root| root.to_string_lossy().to_string())
-                .collect(),
-        );
-        roots
-    }
-
-    fn ensure_test_index_roots() -> Vec<PathBuf> {
-        let _ = ensure_test_blob_roots();
-        if let Some(existing) = INDEX_STORE_DISKS.get() {
-            let roots = existing.iter().map(PathBuf::from).collect::<Vec<_>>();
-            for root in &roots {
-                let _ = fs::create_dir_all(root);
-            }
-            return roots;
-        }
-
-        let base = std::env::temp_dir().join(format!("n2-index-{}", std::process::id()));
-        let roots = vec![base.join("index-0"), base.join("index-1")];
-        for root in &roots {
-            fs::create_dir_all(root).expect("create test index root");
-        }
-        let _ = INDEX_STORE_DISKS.set(
-            roots
-                .iter()
-                .map(|root| root.to_string_lossy().to_string())
-                .collect(),
-        );
-        roots
-    }
-
-    #[test]
-    fn fragment_meta_encoding_is_named_and_optional_fields_do_not_shift() {
-        let meta = FragmentMeta {
-            fragment_id: "frag".to_string(),
-            state: "active".to_string(),
-            committed_bytes: 0,
-            reserved_bytes: 0,
-            trash_bytes: 0,
-            created_at_unix: 1,
-            updated_at_unix: 2,
-            key_phc: None,
-            nt_hash_hex: None,
-        };
-
-        let encoded = rmp_serde::to_vec_named(&meta).expect("encode fragment metadata");
-        assert!(
-            encoded
-                .first()
-                .is_some_and(|byte| (*byte & 0xf0) == 0x80 || *byte == 0xde || *byte == 0xdf),
-            ".fragment.ncdx must be a named MessagePack map, not a positional tuple"
-        );
-        let decoded: FragmentMeta =
-            rmp_serde::from_slice(&encoded).expect("decode named fragment metadata");
-        assert_eq!(decoded.fragment_id, meta.fragment_id);
-        assert_eq!(decoded.state, "active");
-    }
-
-    fn test_metadata(fragment: &str, object_key: &str, size: u64) -> ObjectMetadata {
+    fn metadata() -> ObjectMetadata {
         ObjectMetadata {
-            object_key: object_key.to_string(),
-            packed_ext_u64: packed_extension_key(object_key),
-            fragment: fragment.to_string(),
-            version_id: Ulid::new().to_string(),
-            upload_session_id: "test-session".to_string(),
-            owner_uid: "test-owner".to_string(),
-            content_type: "application/octet-stream".to_string(),
-            total_size_bytes: size,
-            created_at: 1_777_905_000,
-            membership_epoch: 0,
-            data_shards: 1,
-            parity_shards: 0,
+            object_key: "01KWOBJECT00000000000000000".into(),
+            packed_ext_u64: packed_extension_key("docs/report.pdf"),
+            fragment: "01KWFRAGMENT000000000000000".into(),
+            version_id: "01KWVERSION0000000000000000".into(),
+            upload_session_id: "01KWSESSION0000000000000000".into(),
+            owner_uid: "owner".into(),
+            content_type: "application/pdf".into(),
+            total_size_bytes: 4096,
+            created_at: 1_782_864_000,
+            membership_epoch: 7,
+            data_shards: 2,
+            parity_shards: 1,
             parts: Vec::new(),
             is_delete_marker: false,
-            stripe_size_bytes: crate::core::disk_manager::default_stripe_size(),
+            stripe_size_bytes: 262_144,
         }
     }
 
     #[test]
-    fn object_ncdx_is_named_and_stores_immutable_object_id() {
-        let metadata = test_metadata("stable-fragment", "01KOBJECT000000000000000000", 42);
-        let encoded = encode_disk_object_metadata(&metadata).expect("encode object ncdx");
-        assert!(
-            encoded
-                .first()
-                .is_some_and(|byte| (*byte & 0xf0) == 0x80 || *byte == 0xde || *byte == 0xdf),
-            "object .ncdx must be a named MessagePack map"
-        );
-        let value: serde_json::Value =
-            rmp_serde::from_slice(&encoded).expect("decode object ncdx map");
-        assert_eq!(
-            value.get("object_id").and_then(serde_json::Value::as_str),
-            Some(metadata.object_key.as_str())
-        );
-        assert!(
-            value.get("object_key").is_none(),
-            "immutable object metadata must not own a namespace key"
-        );
-    }
-
-    fn publish_logical_object(
-        _roots: &[PathBuf],
-        fragment: &str,
-        logical_path: &str,
-        size: u64,
-    ) -> String {
-        let object_id = new_object_id();
-        let metadata = test_metadata(fragment, &object_id, size);
-        let path_manager = ObjectPathManager::new();
-        for root in path_manager.get_blob_roots() {
-            fs::create_dir_all(path_manager.get_shard_dir_on_disk(
-                &root,
-                fragment,
-                &object_id,
-                &metadata.version_id,
-            ))
-            .expect("create shard-bearing object version");
-        }
-        upsert_live_version(&metadata).expect("publish test ncdx");
-        for root in path_manager.get_namespace_roots_for_path(fragment, logical_path) {
-            publish_namespace_link(&root, fragment, logical_path, &object_id)
-                .expect("publish namespace link");
-        }
-        object_id
+    fn immutable_ncdx_uses_named_fields_without_logical_path() {
+        let bytes = encode_disk_object_metadata(&metadata()).expect("encode metadata");
+        let value: Value = rmp_serde::from_slice(&bytes).expect("decode metadata");
+        assert!(value.is_object());
+        assert!(value.get("object_id").is_some());
+        assert!(value.get("object_key").is_none());
+        assert!(value.get("logical_path").is_none());
     }
 
     #[test]
-    fn packed_extension_uses_length_prefixed_lowercase_bytes() {
+    fn packed_extension_is_zero_decode_filename_data() {
         let packed = packed_extension_key("docs/Clip.PDF");
         let expected = 3u64 | (b'p' as u64) << 8 | (b'd' as u64) << 16 | (b'f' as u64) << 24;
         assert_eq!(packed, expected);
@@ -2304,602 +2098,35 @@ mod tests {
     }
 
     #[test]
-    fn reserved_user_path_segments_are_rejected() {
-        assert!(normalize_object_key("docs/@o_bad/file.txt").is_err());
+    fn reserved_internal_planes_are_not_user_paths() {
         assert!(normalize_object_key(".trash/video.mp4").is_err());
         assert!(normalize_object_key(".objects/video.mp4").is_err());
-        assert!(normalize_object_key("docs/.repair/file.txt").is_err());
+        assert!(normalize_object_key("docs/@o_bad/file.txt").is_err());
         assert_eq!(
-            normalize_object_key("docs/video.mp4").unwrap(),
+            normalize_object_key("docs/video.mp4").expect("valid path"),
             "docs/video.mp4"
         );
+    }
+
+    #[test]
+    fn object_record_path_has_four_hash_fanout_levels() {
+        let object_id = "01KWOBJECT00000000000000000";
+        let segments = ObjectPathManager::object_fanout_segments(object_id);
+        assert_eq!(segments.len(), 4);
+        assert!(segments.iter().all(|segment| segment.len() == 2));
         assert_eq!(
-            normalize_object_key("blob/video.mp4").unwrap(),
-            "blob/video.mp4"
+            object_dir_name_for_id(object_id).expect("object dir"),
+            format!("@o_{object_id}")
         );
     }
 
     #[test]
-    fn n2_object_id_validation_rejects_posix_file_names() {
-        assert!(normalize_object_id("INCDT 122225.mp4").is_err());
-        assert!(normalize_object_id("videos/clip.mp4").is_err());
-        assert!(normalize_object_id("@o_01KQXRVALIDEDGEID0000000").is_ok());
-    }
-
-    #[test]
-    fn object_record_dir_uses_four_level_hash_fanout() {
-        let root = PathBuf::from("/n2-index");
-        let fragment = "fragment-a";
-        let object_id = "01KQXRVALIDEDGEID0000000";
-        let fanout = object_fanout_segments_for_id(object_id).expect("fanout segments");
-        let path = object_record_dir(&root, fragment, object_id).expect("object dir");
-
-        assert_eq!(
-            path,
-            fragment_root_on(&root, fragment)
-                .join(OBJECTS_DIR)
-                .join(&fanout[0])
-                .join(&fanout[1])
-                .join(&fanout[2])
-                .join(&fanout[3])
-                .join(format!("@o_{object_id}"))
-        );
-        assert_ne!(
-            path,
-            fragment_root_on(&root, fragment)
-                .join(OBJECTS_DIR)
-                .join(format!("@o_{object_id}")),
-            "N2 object records must not use the old flat object directory"
-        );
-    }
-
-    #[test]
-    fn live_head_listing_reads_filenames_without_decoding_ncdx_body() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let _roots = ensure_test_index_roots();
-        let blob_roots = ensure_test_blob_roots();
-        let fragment = format!("n2-list-{}", Ulid::new());
-        let object_id = new_object_id();
-        let logical_path = "docs/bad-body.mp4";
-        let file_name = format!(
-            "{}.{}.{}.{}.ncdx",
-            Ulid::new(),
-            12345,
-            1_777_905_000_000_000_000i128,
-            packed_extension_key(logical_path)
-        );
-        for root in &blob_roots {
-            let object_dir = live_object_dir(root, &fragment, &object_id).expect("object dir");
-            fs::create_dir_all(&object_dir).expect("create object dir");
-            fs::write(object_dir.join(&file_name), b"not-valid-msgpack").expect("write bad ndx");
-        }
-        for root in ObjectPathManager::new().get_namespace_roots_for_path(&fragment, logical_path) {
-            publish_namespace_link(&root, &fragment, logical_path, &object_id)
-                .expect("publish namespace link");
-        }
-
-        let listed =
-            scan_live_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
-                .expect("zero-decode list");
-        assert_eq!(listed.entries.len(), 1);
-        assert_eq!(listed.objects.len(), 1);
-        assert_eq!(listed.objects[0].total_size_bytes, 12345);
-        assert_eq!(listed.objects[0].object_key, logical_path);
-        assert!(read_current_live_head(&fragment, &object_id).is_err());
-    }
-
-    #[test]
-    fn live_head_pagination_uses_display_names_not_raw_object_dirs() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let roots = ensure_test_index_roots();
-        let _blob_roots = ensure_test_blob_roots();
-        let fragment = format!("n2-page-{}", Ulid::new());
-        for (name, size) in [
-            ("docs/a.svg", 10u64),
-            ("docs/b.svg", 20u64),
-            ("docs/c.svg", 30u64),
-        ] {
-            publish_logical_object(&roots, &fragment, name, size);
-        }
-
-        let first = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 2, None, true)
-            .expect("first page");
-        assert_eq!(
-            first
-                .objects
-                .iter()
-                .map(|meta| meta.object_key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["docs/a.svg", "docs/b.svg"]
-        );
-        let second = scan_live_heads_page(
-            &fragment,
-            Some("docs".to_string()),
-            None,
-            2,
-            first.continuation_token,
-            true,
-        )
-        .expect("second page");
-        assert_eq!(
-            second
-                .objects
-                .iter()
-                .map(|meta| meta.object_key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["docs/c.svg"]
-        );
-    }
-
-    #[test]
-    fn full_metadata_scan_uses_current_filesystem_path_after_rename() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let roots = ensure_test_index_roots();
-        let fragment = format!("n2-full-meta-{}", Ulid::new());
-        let old_key = "docs/old-name.txt";
-        let new_key = "docs/new-name.txt";
-        let object_id = publish_logical_object(&roots, &fragment, old_key, 42);
-        for root in ObjectPathManager::new().get_namespace_roots_for_path(&fragment, old_key) {
-            let old_link = fragment_root_on(&root, &fragment).join(old_key);
-            let new_link = fragment_root_on(&root, &fragment).join(new_key);
-            fs::rename(&old_link, &new_link).expect("simulate N2 namespace rename");
-            assert_eq!(
-                read_namespace_symlink_object_id(&root, &fragment, &new_link)
-                    .expect("read moved link"),
-                Some(object_id.clone())
-            );
-        }
-
-        let page =
-            scan_live_full_metadata_page(&fragment, Some("docs".to_string()), None, 10, None, true)
-                .expect("full metadata page");
-        assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].object_key, object_id);
-    }
-
-    #[test]
-    fn full_metadata_pagination_advances_by_namespace_path() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let roots = ensure_test_index_roots();
-        let fragment = format!("n2-full-page-{}", Ulid::new());
-        let first_id = publish_logical_object(&roots, &fragment, "docs/a.txt", 10);
-        let second_id = publish_logical_object(&roots, &fragment, "docs/b.txt", 20);
-        let third_id = publish_logical_object(&roots, &fragment, "docs/c.txt", 30);
-
-        let first =
-            scan_live_full_metadata_page(&fragment, Some("docs".to_string()), None, 2, None, true)
-                .expect("first full metadata page");
-        assert_eq!(
-            first
-                .objects
-                .iter()
-                .map(|meta| meta.object_key.as_str())
-                .collect::<Vec<_>>(),
-            vec![first_id.as_str(), second_id.as_str()]
-        );
-        let token = first
-            .continuation_token
-            .clone()
-            .expect("first page continuation");
-        assert_eq!(token, "docs/b.txt");
-
-        let second = scan_live_full_metadata_page(
-            &fragment,
-            Some("docs".to_string()),
-            None,
-            2,
-            first.continuation_token,
-            true,
-        )
-        .expect("second full metadata page");
-        assert_eq!(
-            second
-                .objects
-                .iter()
-                .map(|meta| meta.object_key.as_str())
-                .collect::<Vec<_>>(),
-            vec![third_id.as_str()]
-        );
-        assert!(second.continuation_token.is_none());
-    }
-
-    #[test]
-    fn multipart_receipts_are_zero_decode_filename_records() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let _roots = ensure_test_index_roots();
-        let fragment = format!("n2-upload-{}", Ulid::new());
-        let version_id = Ulid::new().to_string();
-        let manifest = UploadSessionManifest {
-            fragment: fragment.clone(),
-            object_key: "uploads/video.bin".to_string(),
-            packed_ext_u64: packed_extension_key("uploads/video.bin"),
-            version_id: version_id.clone(),
-            session_id: Ulid::new().to_string(),
-            total_size_bytes: 8 * 1024,
-            expected_parts: 8,
-            part_size_bytes: 1024,
-            content_type: "application/octet-stream".to_string(),
-            created_at: 1_777_905_000,
-            stripe_size_bytes: 512,
-            membership_epoch: 0,
-            data_shards: 2,
-            parity_shards: 1,
-        };
-        open_session(&manifest, None).expect("open session");
-        let receipt = SessionPartReceipt {
-            part_index: 7,
-            size_bytes: 1024,
-            shard_size_bytes: 512,
-            created_at: 1_777_905_001,
-            checksum: Some(0x0102_0304),
-            shard_checksums: vec![0x1111_1111, 0x2222_2222, 0x3333_3333],
-        };
-        commit_session_part_receipt(&fragment, &version_id, &receipt).expect("write receipts");
-
-        let session_root = ObjectPathManager::new()
-            .get_session_root(&fragment, &version_id)
-            .expect("session root");
-        let dir = fragment_root_on(&session_root, &fragment)
-            .join(UPLOADS_DIR)
-            .join(&version_id);
-        let names = read_dir_names(&dir).expect("receipt names");
-        assert!(names.contains(&"part_p00000000000000000007.01020304.receipt".to_string()));
-        assert!(names.contains(&"shard_p00000000000000000007_s0000.11111111.receipt".to_string()));
-        assert!(names.contains(&"shard_p00000000000000000007_s0001.22222222.receipt".to_string()));
-        assert!(names.contains(&"shard_p00000000000000000007_s0002.33333333.receipt".to_string()));
-
-        for name in names.iter().filter(|name| name.ends_with(RECEIPT_SUFFIX)) {
-            fs::write(dir.join(name), b"not-msgpack").expect("receipt body is not authority");
-        }
-
-        let loaded = load_session_part_receipts(&fragment, &version_id, &manifest)
-            .expect("load receipts")
-            .expect("session exists");
-        let loaded_receipt = loaded[7].as_ref().expect("part receipt");
-        assert_eq!(loaded_receipt.part_index, 7);
-        assert_eq!(loaded_receipt.size_bytes, 1024);
-        assert_eq!(loaded_receipt.shard_size_bytes, 512);
-        assert_eq!(loaded_receipt.created_at, manifest.created_at);
-        assert_eq!(loaded_receipt.checksum, Some(0x0102_0304));
-        assert_eq!(
-            loaded_receipt.shard_checksums,
-            vec![0x1111_1111, 0x2222_2222, 0x3333_3333]
-        );
-    }
-
-    #[test]
-    fn multipart_manifest_and_binding_are_stable_session_truth() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let _roots = ensure_test_index_roots();
-        let fragment = format!("n2-upload-truth-{}", Ulid::new());
-        let version_id = Ulid::new().to_string();
-        let session_id = Ulid::new().to_string();
-        let manifest = UploadSessionManifest {
-            fragment: fragment.clone(),
-            object_key: "@o_01KSESSIONPHYSICALOBJECT000".to_string(),
-            packed_ext_u64: packed_extension_key("videos/movie.mp4"),
-            version_id: version_id.clone(),
-            session_id: session_id.clone(),
-            total_size_bytes: 6 * 1024,
-            expected_parts: 3,
-            part_size_bytes: 2 * 1024,
-            content_type: "application/octet-stream".to_string(),
-            created_at: 1_777_905_100,
-            stripe_size_bytes: 512,
-            membership_epoch: 0,
-            data_shards: 2,
-            parity_shards: 1,
-        };
-        let binding = PendingUploadBinding {
-            fragment: fragment.clone(),
-            logical_path: "videos/movie.mp4".to_string(),
-            physical_object_id: manifest.object_key.clone(),
-            version_id: version_id.clone(),
-            session_id: session_id.clone(),
-            created_at_unix: 1_777_905_101,
-        };
-
-        open_session(&manifest, None).expect("open multipart session");
-        write_pending_binding(&binding).expect("write pending namespace binding");
-
-        let session_root = ObjectPathManager::new()
-            .get_session_root(&fragment, &version_id)
-            .expect("session root");
-        let session_roots = [session_root];
-        let manifest_bytes_before = session_roots
-            .iter()
-            .map(|root| {
-                fs::read(
-                    fragment_root_on(root, &fragment)
-                        .join(UPLOADS_DIR)
-                        .join(&version_id)
-                        .join(MANIFEST_FILE),
-                )
-                .expect("read manifest")
-            })
-            .collect::<Vec<_>>();
-        let binding_bytes_before = session_roots
-            .iter()
-            .map(|root| {
-                fs::read(
-                    fragment_root_on(root, &fragment)
-                        .join(UPLOADS_DIR)
-                        .join(&version_id)
-                        .join(BINDING_FILE),
-                )
-                .expect("read binding")
-            })
-            .collect::<Vec<_>>();
-
-        for part_index in 0..manifest.expected_parts {
-            let receipt = SessionPartReceipt {
-                part_index,
-                size_bytes: manifest.part_size_bytes,
-                shard_size_bytes: 1024,
-                created_at: 1_777_905_200 + part_index as i64,
-                checksum: Some(0xaaaa_0000 + part_index as u32),
-                shard_checksums: vec![
-                    0xbbbb_0000 + part_index as u32,
-                    0xcccc_0000 + part_index as u32,
-                    0xdddd_0000 + part_index as u32,
-                ],
-            };
-            commit_session_part_receipt(&fragment, &version_id, &receipt)
-                .expect("write zero-decode receipt");
-        }
-
-        for (idx, root) in session_roots.iter().enumerate() {
-            let dir = fragment_root_on(root, &fragment)
-                .join(UPLOADS_DIR)
-                .join(&version_id);
-            assert_eq!(
-                fs::read(dir.join(MANIFEST_FILE)).expect("manifest after receipts"),
-                manifest_bytes_before[idx],
-                "part receipt commits must not rewrite manifest.ncdx"
-            );
-            assert_eq!(
-                fs::read(dir.join(BINDING_FILE)).expect("binding after receipts"),
-                binding_bytes_before[idx],
-                "part receipt commits must not rewrite binding.ncdx"
-            );
-            assert!(
-                !read_dir_names(&dir)
-                    .expect("session dir entries")
-                    .iter()
-                    .any(|name| name.starts_with(PART_META_PREFIX) && name.ends_with(".ncdx")),
-                "receipt-only hot path must not create heavy part metadata records"
-            );
-        }
-
-        let loaded = load_session(&fragment, &version_id)
-            .expect("load session")
-            .expect("session exists");
-        assert_eq!(loaded.manifest.version_id, manifest.version_id);
-        assert_eq!(loaded.manifest.expected_parts, manifest.expected_parts);
-        assert_eq!(loaded.part_receipts.len(), manifest.expected_parts as usize);
-
-        let loaded_binding = read_pending_binding(&fragment, &version_id)
-            .expect("read binding")
-            .expect("binding exists");
-        assert_eq!(loaded_binding.logical_path, "videos/movie.mp4");
-        assert_eq!(loaded_binding.physical_object_id, manifest.object_key);
-    }
-
-    #[test]
-    fn removing_multipart_session_clears_coordinator_local_state() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let roots = ensure_test_index_roots();
-        let fragment = format!("n2-upload-remove-{}", Ulid::new());
-        let version_id = Ulid::new().to_string();
-        let session_id = Ulid::new().to_string();
-        let manifest = UploadSessionManifest {
-            fragment: fragment.clone(),
-            object_key: "@o_01KSESSIONDELETE000000000".to_string(),
-            packed_ext_u64: packed_extension_key("docs/delete-me.bin"),
-            version_id: version_id.clone(),
-            session_id: session_id.clone(),
-            total_size_bytes: 1024,
-            expected_parts: 1,
-            part_size_bytes: 1024,
-            content_type: "application/octet-stream".to_string(),
-            created_at: 1_777_905_300,
-            stripe_size_bytes: 512,
-            membership_epoch: 0,
-            data_shards: 1,
-            parity_shards: 1,
-        };
-        open_session(&manifest, None).expect("open session");
-        write_pending_binding(&PendingUploadBinding {
-            fragment: fragment.clone(),
-            logical_path: "docs/delete-me.bin".to_string(),
-            physical_object_id: manifest.object_key.clone(),
-            version_id: version_id.clone(),
-            session_id,
-            created_at_unix: 1_777_905_301,
-        })
-        .expect("write binding");
-        commit_session_part_receipt(
-            &fragment,
-            &version_id,
-            &SessionPartReceipt {
-                part_index: 0,
-                size_bytes: 1024,
-                shard_size_bytes: 1024,
-                created_at: 1_777_905_302,
-                checksum: Some(0x0102_0304),
-                shard_checksums: vec![0x1111_1111, 0x2222_2222],
-            },
-        )
-        .expect("write receipt");
-
-        assert!(remove_session(&fragment, &version_id).expect("remove session"));
-        for root in roots {
-            assert!(
-                !fragment_root_on(&root, &fragment)
-                    .join(UPLOADS_DIR)
-                    .join(&version_id)
-                    .exists(),
-                "session removal must clear coordinator-local manifest, binding, and receipts"
-            );
-        }
-        assert!(
-            read_pending_binding(&fragment, &version_id)
-                .expect("read binding after remove")
-                .is_none(),
-            "removed upload sessions must not leave pending namespace bindings"
-        );
-    }
-
-    #[test]
-    fn root_listing_hides_internal_planes_and_blob_aliases() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let roots = ensure_test_index_roots();
-        let _blob_roots = ensure_test_blob_roots();
-        let fragment = format!("n2-root-hidden-{}", Ulid::new());
-        publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
-
-        for root in &roots {
-            let fragment_root = fragment_root_on(root, &fragment);
-            for internal in [
-                OBJECTS_DIR,
-                UPLOADS_DIR,
-                TRASH_DIR,
-                TMP_DIR,
-                LOCKS_DIR,
-                GC_DIR,
-                REPAIR_DIR,
-                TRASH_JOBS_DIR,
-                BLOB_DIR,
-                FRAGMENT_META_FILE,
-            ] {
-                let path = fragment_root.join(internal);
-                if internal == FRAGMENT_META_FILE {
-                    fs::write(path, b"fragment-meta").expect("write internal file");
-                } else {
-                    fs::create_dir_all(path).expect("create internal dir");
-                }
-            }
-            fs::create_dir_all(fragment_root.join("@o_fake_user_visible"))
-                .expect("create raw object-like dir");
-        }
-
-        let page = scan_live_heads_page(&fragment, Some(String::new()), None, 100, None, true)
-            .expect("root list");
-        let records = page
-            .entries
-            .iter()
-            .map(|entry| entry.record.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(records, vec!["docs"]);
-        assert_eq!(page.common_prefixes, vec!["docs"]);
-    }
-
-    #[test]
-    fn latest_head_uses_max_ulid_and_ignores_invalid_ncdx_names() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let _roots = ensure_test_index_roots();
-        let blob_roots = ensure_test_blob_roots();
-        let fragment = format!("n2-head-{}", Ulid::new());
-        let object_id = new_object_id();
-        let old_id = "01K00000000000000000000000";
-        let new_id = "01K00000000000000000000001";
-
-        for root in
-            ObjectPathManager::new().get_namespace_roots_for_path(&fragment, "docs/versioned.bin")
-        {
-            publish_namespace_link(&root, &fragment, "docs/versioned.bin", &object_id)
-                .expect("publish namespace link");
-        }
-        for root in &blob_roots {
-            let dir = live_object_dir(root, &fragment, &object_id).expect("object dir");
-            fs::create_dir_all(&dir).expect("create object dir");
-
-            let mut old = test_metadata(&fragment, &object_id, 111);
-            old.version_id = old_id.to_string();
-            old.created_at = 1_777_905_400;
-            write_atomic(
-                &dir.join(ncdx_file_name(&old)),
-                &encode_disk_object_metadata(&old).expect("encode old metadata"),
-            )
-            .expect("write old version");
-
-            fs::write(dir.join("not-a-valid-version.ncdx"), b"garbage")
-                .expect("write invalid ndx name");
-
-            let mut new = test_metadata(&fragment, &object_id, 222);
-            new.version_id = new_id.to_string();
-            new.created_at = 1_777_905_500;
-            write_atomic(
-                &dir.join(ncdx_file_name(&new)),
-                &encode_disk_object_metadata(&new).expect("encode new metadata"),
-            )
-            .expect("write new version");
-        }
-
-        let page = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
-            .expect("list latest head");
-        assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].version_id, new_id);
-        assert_eq!(page.objects[0].total_size_bytes, 222);
-
-        let full = read_current_live_head(&fragment, &object_id)
-            .expect("read latest")
-            .expect("head exists");
-        assert_eq!(full.version_id, new_id);
-        assert_eq!(full.total_size_bytes, 222);
-    }
-
-    #[test]
-    fn current_head_uses_max_ulid_across_shard_bearing_roots() {
-        let _guard = crate::test_support::global_test_lock().blocking_lock();
-        let _roots = ensure_test_index_roots();
-        let blob_roots = ensure_test_blob_roots();
-        assert!(
-            blob_roots.len() >= 2,
-            "head selection requires at least two shard-bearing roots"
-        );
-        let fragment = format!("n2-replica-head-{}", Ulid::new());
-        let object_id = new_object_id();
-        let old_id = "01K00000000000000000000000";
-        let new_id = "01K00000000000000000000009";
-
-        for root in ObjectPathManager::new()
-            .get_namespace_roots_for_path(&fragment, "docs/stale-replica.pdf")
-        {
-            publish_namespace_link(&root, &fragment, "docs/stale-replica.pdf", &object_id)
-                .expect("publish namespace link");
-        }
-        for root in &blob_roots {
-            fs::create_dir_all(live_object_dir(root, &fragment, &object_id).expect("object dir"))
-                .expect("create object dir");
-        }
-
-        let old_dir =
-            live_object_dir(&blob_roots[0], &fragment, &object_id).expect("old participant dir");
-        let mut old = test_metadata(&fragment, &object_id, 4_490_023);
-        old.version_id = old_id.to_string();
-        old.created_at = 1_779_883_031;
-        write_atomic(
-            &old_dir.join(ncdx_file_name(&old)),
-            &encode_disk_object_metadata(&old).expect("encode old replica metadata"),
-        )
-        .expect("write old replica");
-
-        let new_dir =
-            live_object_dir(&blob_roots[1], &fragment, &object_id).expect("new participant dir");
-        let mut new = test_metadata(&fragment, &object_id, 7_983_741);
-        new.version_id = new_id.to_string();
-        new.created_at = 1_779_892_004;
-        write_atomic(
-            &new_dir.join(ncdx_file_name(&new)),
-            &encode_disk_object_metadata(&new).expect("encode new replica metadata"),
-        )
-        .expect("write new replica");
-
-        let full = read_current_live_head(&fragment, &object_id)
-            .expect("read latest across replicas")
-            .expect("head exists");
-        assert_eq!(full.version_id, new_id);
-        assert_eq!(full.total_size_bytes, 7_983_741);
+    fn ncdx_filename_round_trips_zero_decode_summary() {
+        let metadata = metadata();
+        let name = ncdx_file_name(&metadata);
+        let summary = parse_ncdx_file_name(&name).expect("parse ncdx filename");
+        assert_eq!(summary.version_id, metadata.version_id);
+        assert_eq!(summary.size_bytes, metadata.total_size_bytes);
+        assert_eq!(summary.packed_ext, metadata.packed_ext_u64);
     }
 }

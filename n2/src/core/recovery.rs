@@ -56,7 +56,7 @@ static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 });
 
 static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
-    LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
+    LazyLock::new(|| ObjectPathManager::new().get_storage_roots());
 
 struct RepairInflightGuard {
     path: PathBuf,
@@ -661,7 +661,7 @@ pub async fn repair_entire_shard(
     if let Some(root) = owning_blob_root_for_path(&final_path) {
         if !fs::try_exists(root).await.unwrap_or(false) {
             info!(
-                "Skipping background repair for shard {} because blob root {} is unavailable",
+                "Skipping background repair for shard {} because storage device {} is unavailable",
                 target_shard_idx,
                 root.display()
             );
@@ -915,9 +915,7 @@ pub async fn repair_entire_shard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::disk_manager::{
-        BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, PartMetadata, ShardInfo,
-    };
+    use crate::core::disk_manager::{FS_STORAGE_ROOT, PartMetadata, STORAGE_DISKS, ShardInfo};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -943,15 +941,13 @@ mod tests {
         for root in index_roots.iter().chain(blob_roots.iter()) {
             fs::create_dir_all(root).await.expect("create suite root");
         }
-        if INDEX_STORE_DISKS.get().is_none() {
-            INDEX_STORE_DISKS
+        if STORAGE_DISKS.get().is_none() {
+            STORAGE_DISKS
                 .set(index_roots)
                 .expect("set suite index roots");
         }
-        if BLOB_STORE_DISKS.get().is_none() {
-            BLOB_STORE_DISKS
-                .set(blob_roots)
-                .expect("set suite blob roots");
+        if STORAGE_DISKS.get().is_none() {
+            STORAGE_DISKS.set(blob_roots).expect("set suite blob roots");
         }
         if FS_STORAGE_ROOT.get().is_none() {
             FS_STORAGE_ROOT
@@ -992,6 +988,8 @@ mod tests {
                         .to_string(),
                     size_bytes: 262_144,
                     checksum: checksum.clone(),
+                    block_checksums: Vec::new(),
+                    checksum_block_size: 0,
                     is_parity: false,
                 },
                 ShardInfo {
@@ -1000,6 +998,8 @@ mod tests {
                     absolute_path: parity_path.to_string_lossy().to_string(),
                     size_bytes: 262_144,
                     checksum,
+                    block_checksums: Vec::new(),
+                    checksum_block_size: 0,
                     is_parity: true,
                 },
             ],
@@ -1031,6 +1031,8 @@ mod tests {
                             .to_string(),
                         size_bytes: 262_144,
                         checksum: crc32_hex(&shard_bytes),
+                        block_checksums: Vec::new(),
+                        checksum_block_size: 0,
                         is_parity: false,
                     },
                     ShardInfo {
@@ -1039,6 +1041,8 @@ mod tests {
                         absolute_path: parity_path.to_string_lossy().to_string(),
                         size_bytes: 262_144,
                         checksum: crc32_hex(&shard_bytes),
+                        block_checksums: Vec::new(),
+                        checksum_block_size: 0,
                         is_parity: true,
                     },
                 ],

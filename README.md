@@ -48,6 +48,8 @@ N2-native operators, peers, tools, and future internal systems.
   cluster placement, namespace coordination, repair, and rebalance design.
 - [GATEWAY.md](GATEWAY.md): gateway deployment, route-only behavior, and
   client-owned multipart coordinator tracking.
+- [BENCHMARK.md](BENCHMARK.md): measured three-node throughput, hardware,
+  degraded operation, failure tests, and reproduction guidance.
 
 ## Core Model
 
@@ -177,8 +179,7 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-index_store_disks=/mnt/n2/index
-blob_store_disks=/mnt/n2/blob
+storage_disks=/mnt/n2/storage
 fs_storage_path=/mnt/n2/fs
 
 [cluster_config]

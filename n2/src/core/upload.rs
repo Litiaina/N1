@@ -946,7 +946,7 @@ fn shard_specs_for_part(
     manifest: &UploadSessionManifest,
     part_index: u64,
 ) -> Result<Vec<(usize, bool, PathBuf, String)>, AppError> {
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     if blob_roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No blob storage disks configured".into(),
@@ -1009,19 +1009,22 @@ async fn ensure_version_shard_dirs(
     path_manager: &ObjectPathManager,
     manifest: &UploadSessionManifest,
 ) -> Result<(), AppError> {
-    let create_futs = path_manager.get_blob_roots().into_iter().map(|disk_root| {
-        let shard_dir = path_manager.get_shard_dir_on_disk(
-            &disk_root,
-            &manifest.fragment,
-            &manifest.object_key,
-            &manifest.version_id,
-        );
-        async move {
-            tokio_fs::create_dir_all(&shard_dir)
-                .await
-                .map_err(|e| AppError::Io(e, format!("mkdir shard dir {}", shard_dir.display())))
-        }
-    });
+    let create_futs = path_manager
+        .get_storage_roots()
+        .into_iter()
+        .map(|disk_root| {
+            let shard_dir = path_manager.get_shard_dir_on_disk(
+                &disk_root,
+                &manifest.fragment,
+                &manifest.object_key,
+                &manifest.version_id,
+            );
+            async move {
+                tokio_fs::create_dir_all(&shard_dir).await.map_err(|e| {
+                    AppError::Io(e, format!("mkdir shard dir {}", shard_dir.display()))
+                })
+            }
+        });
 
     for result in join_all(create_futs).await {
         result?;
@@ -1105,6 +1108,8 @@ async fn reconstruct_part_meta_from_disk(
             absolute_path: stable_path.to_string_lossy().to_string(),
             size_bytes: expected_shard_len,
             checksum,
+            block_checksums: Vec::new(),
+            checksum_block_size: 0,
             is_parity,
         });
     }
@@ -1160,6 +1165,8 @@ async fn reconstruct_part_meta_from_receipt(
             absolute_path: stable_path.to_string_lossy().to_string(),
             size_bytes: shard_size_bytes,
             checksum: format_crc32_u32(*checksum),
+            block_checksums: Vec::new(),
+            checksum_block_size: 0,
             is_parity,
         });
     }
@@ -1287,7 +1294,7 @@ where
     )
     .await?;
 
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     let num_disks = blob_roots.len();
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
@@ -1496,6 +1503,8 @@ where
                 absolute_path: stable_paths[i].to_string_lossy().to_string(),
                 size_bytes: final_shard_len,
                 checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+                block_checksums: Vec::new(),
+                checksum_block_size: 0,
                 is_parity: i >= data_shards,
             });
         }
@@ -1568,7 +1577,7 @@ where
     )
     .await?;
 
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     let num_disks = blob_roots.len();
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
@@ -1757,6 +1766,8 @@ where
                 absolute_path: stable_paths[i].to_string_lossy().to_string(),
                 size_bytes: final_shard_len,
                 checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+                block_checksums: Vec::new(),
+                checksum_block_size: 0,
                 is_parity: i >= data_shards,
             });
         }
@@ -1796,7 +1807,7 @@ async fn cleanup_blob_version_dirs_for_version(
     version_id: &str,
 ) {
     let mut dirs = Vec::new();
-    for root in path_manager.get_blob_roots() {
+    for root in path_manager.get_storage_roots() {
         let objects = crate::core::fragment_identity::fragment_root_on(&root, fragment)
             .join(crate::core::constants::N2_BLOB_DIR);
         for entry in WalkDir::new(objects)
@@ -1910,7 +1921,7 @@ async fn cleanup_blob_tmp_attempt_files_for_version(
     version_id: &str,
 ) {
     let mut dirs = Vec::new();
-    for root in path_manager.get_blob_roots() {
+    for root in path_manager.get_storage_roots() {
         let objects = crate::core::fragment_identity::fragment_root_on(&root, fragment)
             .join(crate::core::constants::N2_BLOB_DIR);
         for entry in WalkDir::new(objects)
@@ -3037,7 +3048,7 @@ pub async fn finalize_object_upload_direct(
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
     }
 
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     let required_data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
     let mut found_data_roots = 0usize;
 

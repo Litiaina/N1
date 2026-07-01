@@ -82,7 +82,7 @@ fn stable_fragment_id_from_index(fragment: &str) -> Option<String> {
         return Some(stable.to_string());
     }
     let pm = ObjectPathManager::new();
-    for root in pm.get_all_index_roots() {
+    for root in pm.get_storage_roots() {
         if let Some(stable) = fragment_identity::stable_fragment_id_for_root(&root, fragment) {
             return Some(stable);
         }
@@ -92,7 +92,7 @@ fn stable_fragment_id_from_index(fragment: &str) -> Option<String> {
 
 fn fragment_metadata_roots() -> Vec<PathBuf> {
     let pm = ObjectPathManager::new();
-    let mut roots = pm.get_blob_roots();
+    let mut roots = pm.get_storage_roots();
     roots.sort();
     roots.dedup();
     roots
@@ -293,7 +293,7 @@ async fn write_fragment_metadata_with_policy(
     require_all_roots: bool,
 ) -> Result<(), AppError> {
     let pm = ObjectPathManager::new();
-    let roots = pm.get_blob_roots();
+    let roots = pm.get_storage_roots();
 
     let mut any_ok = false;
     let mut failed_paths = Vec::new();
@@ -347,14 +347,14 @@ async fn write_fragment_metadata_with_policy(
 
     if require_all_roots && !failed_paths.is_empty() {
         return Err(AppError::ServiceUnavailable(format!(
-            "failed to write fragment metadata to all index roots: {}",
+            "failed to write fragment metadata to all selected storage devices: {}",
             failed_paths.join("; ")
         )));
     }
 
     if !any_ok {
         return Err(AppError::InternalServerError(
-            "failed to write fragment metadata to any index root".into(),
+            "failed to write fragment metadata to any storage device".into(),
         ));
     }
 

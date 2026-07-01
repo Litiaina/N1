@@ -178,7 +178,7 @@ static PEER_STATUS: LazyLock<Mutex<HashMap<String, DistributedMaintenanceStatus>
 pub fn discover_local_fragments() -> Vec<String> {
     let path_manager = ObjectPathManager::new();
     let mut fragments = BTreeSet::new();
-    for root in path_manager.get_all_index_roots() {
+    for root in path_manager.get_storage_roots() {
         for alias in list_fragment_aliases(&root) {
             if let Some(stable) = stable_fragment_id_for_root(&root, &alias) {
                 fragments.insert(stable);
@@ -763,8 +763,8 @@ mod tests {
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
             weight: 1,
-            index_roots: Vec::new(),
-            blob_roots: Vec::new(),
+            storage_roots: Vec::new(),
+            joined_epoch: 1,
             capacity_bytes: None,
             used_bytes: None,
             last_seen_unix: None,

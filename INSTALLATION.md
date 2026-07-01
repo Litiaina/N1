@@ -59,34 +59,18 @@ Shared roots use the same mounted path for both roles:
 /mnt/n2/control
 ```
 
-The shared layout is the minimum valid N2 deployment. It does not duplicate
-object metadata: namespace entries and `.objects` coexist under the same stable
-fragment root.
+Every configured storage device can hold immutable object data and assigned
+namespace partitions. N2 has no index-disk role and does not migrate earlier
+development layouts in place.
 
-Roots are selected by configuration. Index roots hold mutable namespace/control
-state; blob roots hold immutable fragment metadata, object `.ncdx` records, and
-shard/parity payloads. There is no automatic migration from earlier development
-layouts.
+`fs_storage_path` holds process-local membership, upload coordination, and job
+state. Namespace truth lives under `.n2/namespace` on `storage_disks`.
 
-`fs_storage_path` holds membership, namespace-group assignments, namespace
-ledgers/snapshots, and maintenance state. Put it on durable low-latency storage
-when available.
-
-### Separated Disk Configuration
+### Storage Configuration
 
 ```ini
 [disk_config]
-index_store_disks=/mnt/nvme/n2-index
-blob_store_disks=/mnt/hdd/n2-objects
-fs_storage_path=/mnt/nvme/n2-control
-```
-
-### Shared Disk Configuration
-
-```ini
-[disk_config]
-index_store_disks=/mnt/n2/storage
-blob_store_disks=/mnt/n2/storage
+storage_disks=/mnt/n2/storage
 fs_storage_path=/mnt/n2/control
 ```
 
@@ -199,8 +183,7 @@ cert_path=/var/lib/litiaina/n2/certificates/cert.pem
 key_path=/var/lib/litiaina/n2/certificates/key.pem
 
 [disk_config]
-index_store_disks=/mnt/n2/index
-blob_store_disks=/mnt/n2/blob
+storage_disks=/mnt/n2/storage
 fs_storage_path=/mnt/n2/fs
 
 [cluster_config]
@@ -251,10 +234,10 @@ stream_readahead_bytes=auto
 stream_locality_bias_enabled=true
 monitor_interval_seconds=auto
 monitor_deep_scan_interval_seconds=auto
-max_part_size=52428800
+max_part_size=536870912
 data_shards=1
 parity_shards=0
-stripe_block_size=262144
+stripe_block_size=4194304
 ```
 
 Create the same `n2_membership.json` on every node under `fs_storage_path`:
@@ -270,8 +253,7 @@ Create the same `n2_membership.json` on every node under `fs_storage_path`:
       "native_endpoint": "n2://192.168.0.22:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     },
     {
       "id": "node-b",
@@ -279,8 +261,7 @@ Create the same `n2_membership.json` on every node under `fs_storage_path`:
       "native_endpoint": "n2://192.168.0.13:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     },
     {
       "id": "node-c",
@@ -288,8 +269,7 @@ Create the same `n2_membership.json` on every node under `fs_storage_path`:
       "native_endpoint": "n2://192.168.0.18:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     }
   ]
 }

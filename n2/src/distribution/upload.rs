@@ -5,14 +5,16 @@ use crate::core::disk_manager::{
 };
 use crate::core::ec::ErasureStreamWriter;
 use crate::core::index;
+use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
+use crate::distribution::dentry_group::{configured_namespace_replicas, quorum_required};
 use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
     publish_cluster_object_metadata,
 };
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
-use crate::distribution::resolve_layout;
+use crate::distribution::{ClusterEcLayout, resolve_layout, resolve_write_layout};
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_io_latency;
 use crate::structs::auth_structs::Claims;
@@ -58,7 +60,7 @@ enum ClusterShardWriter {
 }
 
 struct LocalShardWriter {
-    file: fs::File,
+    file: DirectWriter,
     tmp_path: PathBuf,
     stable_path: PathBuf,
     file_name: String,
@@ -93,12 +95,20 @@ impl AsyncWrite for LocalShardWriter {
 }
 
 impl LocalShardWriter {
-    async fn finish(mut self, checksum: String) -> Result<ShardInfo, AppError> {
+    async fn finish(
+        mut self,
+        checksum: String,
+        block_checksums: Vec<u32>,
+        checksum_block_size: usize,
+    ) -> Result<ShardInfo, AppError> {
         self.file.flush().await.map_err(|e| {
             AppError::Io(
                 e,
                 format!("flush cluster shard {}", self.tmp_path.display()),
             )
+        })?;
+        self.file.sync_data().await.map_err(|e| {
+            AppError::Io(e, format!("sync cluster shard {}", self.tmp_path.display()))
         })?;
         drop(self.file);
         if fs::try_exists(&self.stable_path).await.unwrap_or(false) {
@@ -116,6 +126,10 @@ impl LocalShardWriter {
                     ),
                 )
             })?;
+        crate::core::upload::sync_dir(self.stable_path.parent().ok_or_else(|| {
+            AppError::InternalServerError("cluster shard path has no parent".into())
+        })?)
+        .await?;
         invalidate_local_usage_cache(Some(&self.locator.fragment));
         Ok(ShardInfo {
             shard_index: self.shard_index,
@@ -123,9 +137,87 @@ impl LocalShardWriter {
             absolute_path: encode_peer_shard_locator(&self.locator),
             size_bytes: self.expected_len,
             checksum,
+            block_checksums,
+            checksum_block_size,
             is_parity: self.is_parity,
         })
     }
+}
+
+fn configured_layout(
+    runtime: &crate::distribution::membership::ClusterRuntime,
+) -> Result<ClusterEcLayout, AppError> {
+    resolve_layout(
+        runtime.membership.active_write_nodes().len(),
+        &runtime.layout_policy,
+    )
+    .map_err(AppError::BadRequest)
+}
+
+fn validate_write_admission(
+    runtime: &crate::distribution::membership::ClusterRuntime,
+    active_nodes: usize,
+    write_layout: ClusterEcLayout,
+) -> Result<(), AppError> {
+    let voter_count = runtime
+        .membership
+        .nodes
+        .len()
+        .max(1)
+        .min(configured_namespace_replicas());
+    let required_voters = quorum_required(voter_count);
+    let reachable_voter_estimate = active_nodes.min(voter_count);
+    if reachable_voter_estimate < required_voters {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 namespace quorum is unavailable: {} reachable voter(s), {} required",
+            reachable_voter_estimate, required_voters
+        )));
+    }
+
+    let configured = configured_layout(runtime)?;
+    if configured.parity_shards > 0 && write_layout.parity_shards == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "N2 durable writes require at least two writable nodes for a redundant object layout"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pinned_upload_layout(
+    layout: ClusterEcLayout,
+    active_nodes: usize,
+) -> Result<(), AppError> {
+    if layout.data_shards == 0 || layout.total_shards() > active_nodes {
+        return Err(AppError::ServiceUnavailable(format!(
+            "upload session layout {}+{} requires {} writable node(s), but only {} are reachable",
+            layout.data_shards,
+            layout.parity_shards,
+            layout.total_shards(),
+            active_nodes
+        )));
+    }
+    Ok(())
+}
+
+async fn current_write_context() -> Result<
+    (
+        std::sync::Arc<crate::distribution::membership::ClusterRuntime>,
+        Vec<crate::distribution::membership::ClusterNode>,
+        ClusterEcLayout,
+    ),
+    AppError,
+> {
+    let runtime = active_cluster_runtime()?;
+    let active = live_active_write_nodes(&runtime).await;
+    let layout = resolve_write_layout(
+        active.len(),
+        runtime.membership.active_write_nodes().len(),
+        &runtime.layout_policy,
+    )
+    .map_err(AppError::ServiceUnavailable)?;
+    validate_write_admission(&runtime, active.len(), layout)?;
+    Ok((runtime, active, layout))
 }
 
 impl AsyncWrite for ClusterShardWriter {
@@ -162,9 +254,18 @@ impl AsyncWrite for ClusterShardWriter {
 }
 
 impl ClusterShardWriter {
-    async fn finish(self, checksum: String) -> Result<ShardInfo, AppError> {
+    async fn finish(
+        self,
+        checksum: String,
+        block_checksums: Vec<u32>,
+        checksum_block_size: usize,
+    ) -> Result<ShardInfo, AppError> {
         match self {
-            Self::Local(writer) => writer.finish(checksum).await,
+            Self::Local(writer) => {
+                writer
+                    .finish(checksum, block_checksums, checksum_block_size)
+                    .await
+            }
             Self::Remote(writer) => {
                 let mut info = writer.finish().await?;
                 if !info.checksum.eq_ignore_ascii_case(&checksum) {
@@ -174,6 +275,8 @@ impl ClusterShardWriter {
                     )));
                 }
                 info.checksum = checksum;
+                info.block_checksums = block_checksums;
+                info.checksum_block_size = checksum_block_size;
                 Ok(info)
             }
         }
@@ -239,7 +342,7 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
 
 async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter, AppError> {
     let pm = ObjectPathManager::new();
-    let roots = pm.get_blob_roots();
+    let roots = pm.get_storage_roots();
     if roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No blob storage disks configured".into(),
@@ -258,15 +361,9 @@ async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter
     let file_name = stable_name(target.part_index, target.shard_index, target.is_parity);
     let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
     let stable_path = dir.join(&file_name);
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create cluster shard {}", tmp_path.display())))?;
+    let file = create_direct_file(&tmp_path).await?;
     Ok(ClusterShardWriter::Local(LocalShardWriter {
-        file,
+        file: DirectWriter::new(file),
         tmp_path,
         stable_path,
         file_name,
@@ -321,6 +418,7 @@ pub async fn write_cluster_part_from_stream<S>(
     content_length: u64,
     data_shards: usize,
     parity_shards: usize,
+    membership_epoch: u64,
     block_size: usize,
     body_stream: S,
     expected_checksum: Option<&str>,
@@ -329,19 +427,23 @@ where
     S: Stream<Item = Result<Bytes, AppError>>,
 {
     let runtime = active_cluster_runtime()?;
-    let active = live_active_write_nodes(&runtime).await;
-    let layout =
-        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
-    if layout.data_shards != data_shards || layout.parity_shards != parity_shards {
+    if runtime.membership.epoch != membership_epoch {
         return Err(AppError::Conflict(
-            "cluster layout changed during upload session; restart the multipart upload".into(),
+            "cluster membership changed during upload session; restart the multipart upload".into(),
         ));
     }
+    let active = live_active_write_nodes(&runtime).await;
+    let layout = ClusterEcLayout {
+        data_shards,
+        parity_shards,
+    };
+    validate_pinned_upload_layout(layout, active.len())?;
+    validate_write_admission(&runtime, active.len(), layout)?;
     let placement = build_placement_plan(
         fragment,
         object_key,
         version_id,
-        runtime.membership.epoch,
+        membership_epoch,
         layout,
         &active,
     )?;
@@ -387,6 +489,7 @@ where
         }
     }
     let shard_checksums = stream_writer.get_shard_checksums();
+    let shard_block_checksums = stream_writer.get_shard_block_checksums();
     let total_checksum = stream_writer.get_total_checksum();
     let writers = stream_writer.into_writers();
     let mut shards = Vec::with_capacity(writers.len());
@@ -396,13 +499,17 @@ where
         })?;
         shards.push(
             writer
-                .finish(shard_checksums.get(idx).cloned().unwrap_or_default())
+                .finish(
+                    shard_checksums.get(idx).cloned().unwrap_or_default(),
+                    shard_block_checksums.get(idx).cloned().unwrap_or_default(),
+                    block_size,
+                )
                 .await?,
         );
     }
     shards.sort_by_key(|shard| shard.shard_index);
     Ok(DistributedPartWrite {
-        membership_epoch: runtime.membership.epoch,
+        membership_epoch,
         data_shards: layout.data_shards as u16,
         parity_shards: layout.parity_shards as u16,
         part: PartMetadata {
@@ -448,10 +555,7 @@ pub async fn initiate_cluster_upload(
             "expected_parts does not match total_size_bytes and part_size_bytes".into(),
         ));
     }
-    let runtime = active_cluster_runtime()?;
-    let active = live_active_write_nodes(&runtime).await;
-    let layout =
-        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let (runtime, _active, layout) = current_write_context().await?;
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(params.total_size_bytes);
@@ -522,6 +626,7 @@ where
         content_length,
         usize::from(state.manifest.data_shards),
         usize::from(state.manifest.parity_shards),
+        state.manifest.membership_epoch,
         state.manifest.stripe_size_bytes,
         body_stream,
         query.checksum.as_deref(),
@@ -559,10 +664,7 @@ where
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
     validate_cluster_one_shot_size(content_length)?;
-    let runtime = active_cluster_runtime()?;
-    let active = live_active_write_nodes(&runtime).await;
-    let layout =
-        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let (runtime, _active, layout) = current_write_context().await?;
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(content_length);
@@ -575,6 +677,7 @@ where
         content_length,
         layout.data_shards,
         layout.parity_shards,
+        runtime.membership.epoch,
         stripe_size,
         body_stream,
         query.checksum.as_deref(),
@@ -693,6 +796,11 @@ impl EmptyFallback for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
+    use crate::distribution::membership::{
+        ClusterMembership, ClusterNode, ClusterRuntime, NodeState,
+    };
+    use std::path::PathBuf;
 
     fn manifest(
         total_size_bytes: u64,
@@ -739,5 +847,79 @@ mod tests {
     fn cluster_one_shot_rejects_large_objects() {
         assert!(validate_cluster_one_shot_size(CLUSTER_ONE_SHOT_MAX_BYTES).is_ok());
         assert!(validate_cluster_one_shot_size(CLUSTER_ONE_SHOT_MAX_BYTES + 1).is_err());
+    }
+
+    fn fixed_runtime() -> ClusterRuntime {
+        ClusterRuntime {
+            local_node_id: "a".into(),
+            membership_path: PathBuf::from("membership.json"),
+            layout_policy: ClusterLayoutPolicy {
+                mode: ClusterLayoutMode::Fixed,
+                fixed_data_shards: Some(2),
+                fixed_parity_shards: Some(1),
+                ..ClusterLayoutPolicy::default()
+            },
+            membership: ClusterMembership {
+                cluster_id: "test".into(),
+                epoch: 7,
+                nodes: ["a", "b", "c"]
+                    .into_iter()
+                    .map(|id| ClusterNode {
+                        id: id.into(),
+                        endpoint: format!("https://{id}:50001"),
+                        native_endpoint: Some(format!("n2://{id}:50002")),
+                        state: Some(NodeState::Online),
+                        weight: 1,
+                        storage_roots: Vec::new(),
+                        joined_epoch: 1,
+                        capacity_bytes: None,
+                        used_bytes: None,
+                        last_seen_unix: None,
+                    })
+                    .collect(),
+            },
+            auto_rebalance: false,
+        }
+    }
+
+    #[test]
+    fn fixed_cluster_admits_redundant_one_plus_one_writes_with_two_nodes() {
+        let runtime = fixed_runtime();
+        let layout = resolve_write_layout(2, 3, &runtime.layout_policy).unwrap();
+
+        assert_eq!(layout.data_shards, 1);
+        assert_eq!(layout.parity_shards, 1);
+        assert!(validate_write_admission(&runtime, 2, layout).is_ok());
+    }
+
+    #[test]
+    fn fixed_cluster_rejects_non_redundant_writes_with_one_node() {
+        let runtime = fixed_runtime();
+        let layout = resolve_write_layout(1, 3, &runtime.layout_policy).unwrap();
+
+        assert_eq!(layout.data_shards, 1);
+        assert_eq!(layout.parity_shards, 0);
+        assert!(validate_write_admission(&runtime, 1, layout).is_err());
+    }
+
+    #[test]
+    fn pinned_one_plus_one_session_survives_node_return() {
+        let layout = ClusterEcLayout {
+            data_shards: 1,
+            parity_shards: 1,
+        };
+
+        assert!(validate_pinned_upload_layout(layout, 2).is_ok());
+        assert!(validate_pinned_upload_layout(layout, 3).is_ok());
+    }
+
+    #[test]
+    fn pinned_two_plus_one_session_stops_after_node_loss() {
+        let layout = ClusterEcLayout {
+            data_shards: 2,
+            parity_shards: 1,
+        };
+
+        assert!(validate_pinned_upload_layout(layout, 2).is_err());
     }
 }

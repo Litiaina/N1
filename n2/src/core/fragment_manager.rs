@@ -25,7 +25,6 @@ use crate::{
             FragmentMetadata, init_fragment_metadata_strict, read_fragment_metadata,
             resolve_stable_fragment_id, rotate_fragment_key, write_fragment_metadata_strict,
         },
-        index_store::{ensure_fragment_namespace_available, has_any_fragment_index},
         sync::{
             CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
         },
@@ -105,72 +104,17 @@ pub fn is_fragment_hash(name: &str) -> bool {
         .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
 }
 
-async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppError> {
+async fn prepare_fragment_storage_roots_strict(stable_fragment_id: &str) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_namespace_roots(fragment);
+    let storage_roots = path_manager.get_storage_roots();
 
-    if index_roots.is_empty() {
+    if storage_roots.is_empty() {
         return Err(AppError::ServiceUnavailable(
-            "no index roots configured for fragment provisioning".into(),
+            "no storage devices configured for fragment provisioning".into(),
         ));
     }
 
-    for root in index_roots {
-        let index_dir = fragment_root_on(&root, fragment);
-        timeout(FRAGMENT_CREATE_IO_TIMEOUT, fs::create_dir_all(&index_dir))
-            .await
-            .map_err(|_| {
-                AppError::ServiceUnavailable(format!(
-                    "timed out preparing index root {}",
-                    index_dir.display()
-                ))
-            })?
-            .map_err(|e| {
-                AppError::ServiceUnavailable(format!(
-                    "failed to prepare index root {}: {}",
-                    index_dir.display(),
-                    e
-                ))
-            })?;
-
-        let metadata = timeout(FRAGMENT_CREATE_IO_TIMEOUT, fs::metadata(&index_dir))
-            .await
-            .map_err(|_| {
-                AppError::ServiceUnavailable(format!(
-                    "timed out verifying index root {}",
-                    index_dir.display()
-                ))
-            })?
-            .map_err(|e| {
-                AppError::ServiceUnavailable(format!(
-                    "failed to verify index root {}: {}",
-                    index_dir.display(),
-                    e
-                ))
-            })?;
-
-        if !metadata.is_dir() {
-            return Err(AppError::ServiceUnavailable(format!(
-                "index root {} is not a directory",
-                index_dir.display()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-async fn prepare_fragment_blob_roots_strict(stable_fragment_id: &str) -> Result<(), AppError> {
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
-
-    if blob_roots.is_empty() {
-        return Err(AppError::ServiceUnavailable(
-            "no blob roots configured for fragment provisioning".into(),
-        ));
-    }
-
-    for root in blob_roots {
+    for root in storage_roots {
         let fragment_root = physical_fragment_root_on(&root, stable_fragment_id);
         timeout(
             FRAGMENT_CREATE_IO_TIMEOUT,
@@ -179,13 +123,13 @@ async fn prepare_fragment_blob_roots_strict(stable_fragment_id: &str) -> Result<
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!(
-                "timed out preparing blob fragment root {}",
+                "timed out preparing storage fragment root {}",
                 fragment_root.display()
             ))
         })?
         .map_err(|e| {
             AppError::ServiceUnavailable(format!(
-                "failed to prepare blob fragment root {}: {}",
+                "failed to prepare storage fragment root {}: {}",
                 fragment_root.display(),
                 e
             ))
@@ -201,14 +145,12 @@ pub(crate) async fn provision_fragment_local(
     key: &str,
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let mut identity_roots = path_manager.get_all_index_roots();
+    let mut identity_roots = path_manager.get_storage_roots();
     identity_roots.sort();
     identity_roots.dedup();
     ensure_fragment_identity_on_roots(&identity_roots, fragment_hash, stable_fragment_id).await?;
-    prepare_fragment_index_roots_strict(fragment_hash).await?;
-    prepare_fragment_blob_roots_strict(stable_fragment_id).await?;
+    prepare_fragment_storage_roots_strict(stable_fragment_id).await?;
     ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
-    ensure_fragment_namespace_available(fragment_hash)?;
     if read_fragment_metadata(fragment_hash).await.is_err() {
         let _ = init_fragment_metadata_strict(stable_fragment_id, key).await?;
     }
@@ -231,15 +173,13 @@ pub(crate) async fn apply_fragment_control_snapshot_local(
     }
 
     let path_manager = ObjectPathManager::new();
-    let mut identity_roots = path_manager.get_all_index_roots();
+    let mut identity_roots = path_manager.get_storage_roots();
     identity_roots.sort();
     identity_roots.dedup();
     ensure_fragment_identity_on_roots(&identity_roots, &snapshot.fragment_hash, stable_fragment_id)
         .await?;
-    prepare_fragment_index_roots_strict(&snapshot.fragment_hash).await?;
-    prepare_fragment_blob_roots_strict(stable_fragment_id).await?;
+    prepare_fragment_storage_roots_strict(stable_fragment_id).await?;
     ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
-    ensure_fragment_namespace_available(&snapshot.fragment_hash)?;
     write_fragment_metadata_strict(&snapshot.metadata).await?;
     Ok(())
 }
@@ -248,7 +188,7 @@ pub(crate) async fn local_fragment_control_snapshot()
 -> Result<Vec<FragmentControlSnapshot>, AppError> {
     let path_manager = ObjectPathManager::new();
     let mut aliases = std::collections::BTreeSet::new();
-    for root in path_manager.get_all_index_roots() {
+    for root in path_manager.get_storage_roots() {
         aliases.extend(crate::core::fragment_identity::list_fragment_aliases(&root));
     }
 
@@ -268,7 +208,7 @@ pub(crate) async fn rename_fragment_alias_local(
     stable_fragment_id: &str,
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let mut roots = path_manager.get_all_index_roots();
+    let mut roots = path_manager.get_storage_roots();
     roots.sort();
     roots.dedup();
     ensure_fragment_identity_on_roots(&roots, new_hash, stable_fragment_id).await?;
@@ -296,7 +236,7 @@ pub(crate) async fn rotate_fragment_key_local(
 pub(crate) fn delete_fragment_local(stable_fragment_id: &str) -> Result<(), AppError> {
     global_namespace_runtime().evict_fragment(stable_fragment_id);
     let path_manager = ObjectPathManager::new();
-    let mut roots = path_manager.get_all_index_roots();
+    let mut roots = path_manager.get_storage_roots();
     roots.sort();
     roots.dedup();
     for root in roots {
@@ -311,7 +251,7 @@ pub(crate) fn delete_fragment_local(stable_fragment_id: &str) -> Result<(), AppE
         }
         remove_fragment_aliases_for_stable_id(&root, stable_fragment_id);
     }
-    for root in path_manager.get_blob_roots() {
+    for root in path_manager.get_storage_roots() {
         let fragment_path = physical_fragment_root_on(&root, stable_fragment_id);
         if fragment_path.exists() {
             std::fs::remove_dir_all(&fragment_path).map_err(|err| {
@@ -343,19 +283,14 @@ pub async fn create_fragment(
     global_namespace_runtime().evict_fragment(&hash);
 
     let existing_meta = read_fragment_metadata(&hash).await.ok();
-    let metadata_exists = existing_meta.is_some();
-    let index_exists = has_any_fragment_index(&hash)?;
-    if metadata_exists && index_exists {
+    if existing_meta.is_some() {
         return Err(AppError::Conflict(format!(
             "Fragment already exists: {}",
             hash
         )));
     }
 
-    let stable_fragment_id = existing_meta
-        .as_ref()
-        .map(|meta| meta.fragment.clone())
-        .unwrap_or_else(new_stable_fragment_id);
+    let stable_fragment_id = new_stable_fragment_id();
     crate::distribution::peer::replicate_fragment_control(
         crate::distribution::peer::PeerFragmentControlRequest::Provision {
             fragment_hash: hash.clone(),
@@ -365,17 +300,10 @@ pub async fn create_fragment(
     )
     .await?;
 
-    if metadata_exists || index_exists {
-        info!(
-            "Recovered partial fragment '{}' with hash: {}",
-            payload.name, hash
-        );
-    } else {
-        info!(
-            "Created new fragment '{}' with hash: {}",
-            payload.name, hash
-        );
-    }
+    info!(
+        "Created new fragment '{}' with hash: {}",
+        payload.name, hash
+    );
     Ok((
         StatusCode::CREATED,
         Json(CreateFragmentResponse {

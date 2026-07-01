@@ -1,7 +1,5 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, PARITY_SUFFIX, SHARD_SUFFIX};
-use crate::core::disk_manager::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
-};
+use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, STORAGE_DISKS};
 use crate::core::fragment_identity::{
     list_fragment_aliases, physical_fragment_root_on, stable_fragment_id_for_root,
 };
@@ -668,7 +666,7 @@ async fn inspect_object_parts(
     check_mode: RepairCheckMode,
 ) -> Result<(ObjectRepairStatus, Vec<PartMetadata>, Vec<Vec<usize>>), AppError> {
     let path_manager = ObjectPathManager::new();
-    let blob_roots = reachable_dir_roots(path_manager.get_blob_roots()).await;
+    let blob_roots = reachable_dir_roots(path_manager.get_storage_roots()).await;
     let mut report = ObjectRepairStatus {
         object_key: meta.object_key.clone(),
         version_id: meta.version_id.clone(),
@@ -1355,51 +1353,42 @@ pub async fn run_repair_job_with_options(
     }
 
     let path_manager = ObjectPathManager::new();
-    let _index_roots_config = INDEX_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError(
-            "Index Store Config not initialized".into(),
-        ))?;
+    let _storage_config = STORAGE_DISKS.get().ok_or(AppError::InternalServerError(
+        "N2 storage devices are not initialized".into(),
+    ))?;
 
-    let index_roots: Vec<PathBuf> = reachable_dir_roots(path_manager.get_all_index_roots()).await;
-    let blob_roots = Arc::new(reachable_dir_roots(path_manager.get_blob_roots()).await);
-    let num_disks = blob_roots.len();
-    if index_roots.is_empty() {
+    let storage_roots = Arc::new(reachable_dir_roots(path_manager.get_storage_roots()).await);
+    let num_disks = storage_roots.len();
+    if storage_roots.is_empty() {
         return Err(AppError::InternalServerError(
-            "No reachable index roots".into(),
+            "No reachable N2 storage devices".into(),
         ));
     }
-    if num_disks == 0 {
-        return Err(AppError::InternalServerError(
-            "No reachable blob disks".into(),
-        ));
-    }
-    let cfg = normalize_repair_cfg_for_layout(cfg, num_disks, index_roots.len());
+    let cfg = normalize_repair_cfg_for_layout(cfg, num_disks, num_disks);
     info!(
-        "Repair runtime caps after layout normalization: mode={:?} meta_conc={} repair_conc={} batch={} blob_disks={} index_roots={}",
+        "Repair runtime caps after layout normalization: mode={:?} meta_conc={} repair_conc={} batch={} storage_devices={}",
         cfg.check_mode,
         cfg.meta_concurrency,
         cfg.shard_repair_concurrency,
         cfg.meta_batch_size,
-        num_disks,
-        index_roots.len()
+        num_disks
     );
 
     let shard_repair_sem = Arc::new(Semaphore::new(cfg.shard_repair_concurrency));
     let fragments = match cfg.target_fragment.as_ref() {
         Some(fragment) => vec![fragment.clone()],
-        None => list_all_fragments(&index_roots, &blob_roots).await,
+        None => list_all_fragments(&storage_roots, &storage_roots).await,
     };
 
     info!(
-        "Starting Storage Repair Job (scope={}, fragments={}, index_roots={}). mode={:?}, dry_run={}",
+        "Starting Storage Repair Job (scope={}, fragments={}, storage_devices={}). mode={:?}, dry_run={}",
         if cfg.target_fragment.is_some() {
             "single-fragment"
         } else {
             "all-fragments"
         },
         fragments.len(),
-        index_roots.len(),
+        storage_roots.len(),
         cfg.check_mode,
         cfg.dry_run
     );
@@ -1423,7 +1412,7 @@ pub async fn run_repair_job_with_options(
         }
 
         let (fmiss, fdiv, fcorrupt) =
-            repair_fragment_metadata_replicas(&blob_roots, &fragment_hash, cfg.dry_run).await?;
+            repair_fragment_metadata_replicas(&storage_roots, &fragment_hash, cfg.dry_run).await?;
 
         {
             let mut status = REPAIR_STATUS.write().await;
@@ -1436,12 +1425,12 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Synchronizing N2 namespace log {}", fragment_hash);
+            status.phase = format!("Verifying N2 namespace quorum {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
         let namespace_report =
-            repair_namespace_replicas(&fragment_hash, &index_roots, cfg.dry_run).await?;
+            repair_namespace_replicas(&fragment_hash, &storage_roots, cfg.dry_run).await?;
 
         {
             let mut status = REPAIR_STATUS.write().await;
@@ -1512,7 +1501,7 @@ pub async fn run_repair_job_with_options(
 
                 let d = apply_meta_batch(
                     &page.objects,
-                    blob_roots.clone(),
+                    storage_roots.clone(),
                     num_disks,
                     cfg.clone(),
                     shard_repair_sem.clone(),

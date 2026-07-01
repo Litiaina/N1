@@ -8,6 +8,8 @@ use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
+use crate::distribution::dentry_service::DistributedNamespace;
+use crate::distribution::lifecycle::purge_object_from_holders;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
@@ -540,8 +542,8 @@ async fn perform_gc_scan(
     let _maintenance_gate =
         acquire_maintenance_mode(options.execution_mode.maintenance_access_mode());
     let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-    let blob_roots = path_manager.get_blob_roots();
+    let index_roots = path_manager.get_storage_roots();
+    let blob_roots = path_manager.get_storage_roots();
 
     let mut fragments = collect_gc_fragments(&index_roots, &blob_roots)
         .into_iter()
@@ -681,6 +683,112 @@ async fn process_fragment_gc(
 
     let now = SystemTime::now();
     let now_unix = Utc::now().timestamp();
+    let distributed_trash = match DistributedNamespace::list_trash(fragment).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(
+                "GC: failed to read quorum namespace trash for fragment {}: {}",
+                fragment, err
+            );
+            return stats;
+        }
+    };
+    let reference_counts = match DistributedNamespace::object_reference_counts(fragment).await {
+        Ok(counts) => counts,
+        Err(err) => {
+            warn!(
+                "GC: failed to count quorum namespace references for fragment {}: {}",
+                fragment, err
+            );
+            return stats;
+        }
+    };
+    for entry in distributed_trash {
+        if should_stop_gc() {
+            return stats;
+        }
+        let Some(trash) = entry.trash.as_ref() else {
+            warn!(
+                "GC: refusing malformed trash dentry {} without lifecycle context",
+                entry.key.name
+            );
+            continue;
+        };
+        let age = trash_deleted_age(trash.deleted_at_unix, now_unix);
+        if age < retention {
+            continue;
+        }
+        let subtree_counts =
+            match DistributedNamespace::collect_target_reference_counts(fragment, &entry.target)
+                .await
+            {
+                Ok(counts) => counts,
+                Err(err) => {
+                    warn!(
+                        "GC: failed to inspect expired trash subtree {}/{}: {}",
+                        fragment, entry.key.name, err
+                    );
+                    continue;
+                }
+            };
+        let lifecycle_id = format!("gc-{}-{}", entry.key.name, now_unix);
+        let mut reclaim = Vec::new();
+        let mut inspect_failed = false;
+        for (object_id, subtree_references) in &subtree_counts {
+            if reference_counts.get(object_id).copied().unwrap_or(0) > *subtree_references {
+                continue;
+            }
+            let versions =
+                match index::list_live_object_versions_metadata(fragment, object_id).await {
+                    Ok(versions) => versions,
+                    Err(AppError::NotFound) => Vec::new(),
+                    Err(err) => {
+                        warn!(
+                            "GC: failed to resolve immutable object {}/{} before TTL purge: {}",
+                            fragment, object_id, err
+                        );
+                        inspect_failed = true;
+                        break;
+                    }
+                };
+            let refund = versions
+                .iter()
+                .map(|metadata| metadata.total_size_bytes)
+                .sum::<u64>();
+            reclaim.push((object_id.clone(), refund, versions.len() as u64));
+        }
+        if inspect_failed {
+            continue;
+        }
+        if let Err(err) = DistributedNamespace::purge_expired_tree(
+            fragment,
+            &entry.key.name,
+            retention.as_secs(),
+            now_unix,
+            &lifecycle_id,
+        )
+        .await
+        {
+            warn!(
+                "GC: namespace expiry for trash {}/{} requires retry; immutable data was preserved: {}",
+                fragment, entry.key.name, err
+            );
+            continue;
+        }
+        for (object_id, refund, versions) in reclaim {
+            match purge_object_from_holders(fragment, &object_id, &lifecycle_id).await {
+                Ok(()) => {
+                    stats.refund_bytes = stats.refund_bytes.saturating_add(refund);
+                    stats.trash_versions_expired =
+                        stats.trash_versions_expired.saturating_add(versions);
+                }
+                Err(err) => warn!(
+                    "GC: expired object {}/{} is namespace-unreachable but physical reclamation requires retry: {}",
+                    fragment, object_id, err
+                ),
+            }
+        }
+    }
     let physical_live_objects = match index::list_fragment_live_objects(fragment).await {
         Ok(objects) => objects,
         Err(err) => {
@@ -758,8 +866,20 @@ async fn process_fragment_gc(
     }
 
     let mut namespace_absent_gc_candidates = BTreeSet::<String>::new();
-    if namespace_snapshot.is_none() {
+    if let Some(snapshot) = &namespace_snapshot {
         namespace_absent_gc_candidates.extend(purged_object_ids.iter().cloned());
+        let orphan_grace = i64::try_from(file_ttl.as_secs()).unwrap_or(i64::MAX);
+        for metadata in &physical_live_objects {
+            if snapshot
+                .referenced_object_ids
+                .contains(&metadata.object_key)
+            {
+                continue;
+            }
+            if now_unix.saturating_sub(metadata.created_at) >= orphan_grace {
+                namespace_absent_gc_candidates.insert(metadata.object_key.clone());
+            }
+        }
     }
 
     match index::list_fragment_trash_catalog(fragment).await {
@@ -782,7 +902,7 @@ async fn process_fragment_gc(
                         }
                     };
                 let age = trash_deleted_age(entry.deleted_at, now_unix);
-                let should_expire = is_manual_run || age > retention;
+                let should_expire = age >= retention;
                 for meta in versions {
                     if should_expire {
                         expired_versions

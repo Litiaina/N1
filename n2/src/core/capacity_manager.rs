@@ -84,9 +84,9 @@ fn unique_capacity_probe_paths() -> Vec<PathBuf> {
     let mut seen = HashSet::new();
 
     for path in pm
-        .get_blob_roots()
+        .get_storage_roots()
         .into_iter()
-        .chain(pm.get_all_index_roots())
+        .chain(pm.get_storage_roots())
     {
         if seen.insert(path.clone()) {
             out.push(path);
@@ -123,7 +123,7 @@ fn sum_file_tree_bytes(path: &Path) -> Result<u64, AppError> {
 
 async fn compute_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage, AppError> {
     let fragment = fragment.to_string();
-    let roots = ObjectPathManager::new().get_blob_roots();
+    let roots = ObjectPathManager::new().get_storage_roots();
     tokio::task::spawn_blocking(move || {
         let mut usage = FragmentBlobUsage::default();
         let mut seen_roots = HashSet::<PathBuf>::new();
@@ -238,12 +238,12 @@ pub async fn get_storage_root_usage() -> Result<Vec<StorageRootUsage>, AppError>
     let pm = ObjectPathManager::new();
     let mut roots = Vec::<(PathBuf, String)>::new();
     roots.extend(
-        pm.get_all_index_roots()
+        pm.get_storage_roots()
             .into_iter()
             .map(|path| (path, "index".to_string())),
     );
     roots.extend(
-        pm.get_blob_roots()
+        pm.get_storage_roots()
             .into_iter()
             .map(|path| (path, "blob".to_string())),
     );
@@ -291,7 +291,7 @@ pub async fn ensure_blob_placement_capacity_available_for_parts(
     parity_shards: usize,
     block_size: usize,
 ) -> Result<(), AppError> {
-    let roots = ObjectPathManager::new().get_blob_roots();
+    let roots = ObjectPathManager::new().get_storage_roots();
     if roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No blob storage disks configured".into(),
@@ -305,7 +305,7 @@ pub async fn ensure_blob_placement_capacity_available_for_parts(
     let total_shards = data_shards.saturating_add(parity_shards);
     if roots.len() < total_shards {
         return Err(AppError::ServiceUnavailable(format!(
-            "Configured blob roots ({}) cannot satisfy target layout {}D+{}P requiring {} distinct roots",
+            "Configured storage devices ({}) cannot satisfy target layout {}D+{}P requiring {} distinct devices",
             roots.len(),
             data_shards,
             parity_shards,

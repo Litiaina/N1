@@ -1,6 +1,5 @@
 use crate::core::constants::N2_BLOB_DIR;
-use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
-use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectPathManager};
+use crate::core::disk_manager::{ObjectPathManager, STORAGE_DISKS};
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, physical_fragment_root_on, stable_fragment_id_for_root,
 };
@@ -158,16 +157,14 @@ pub struct ObjectRecordRuntimeStats {
 
 #[derive(Serialize, Clone, Default)]
 pub struct StoragePlaneStats {
-    pub index_roots_total: u64,
-    pub index_roots_online: u64,
-    pub blob_devices_total: u64,
-    pub blob_devices_online: u64,
+    pub storage_devices_total: u64,
+    pub storage_devices_online: u64,
     pub raw_total_bytes: u64,
     pub raw_used_bytes: u64,
     pub raw_available_bytes: u64,
-    pub heterogeneous_blob_capacity: bool,
+    pub heterogeneous_storage_capacity: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub blob_capacity_imbalance_ratio: Option<f64>,
+    pub storage_capacity_imbalance_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement_limiter_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,18 +185,6 @@ pub struct MaintenanceRuntimeStats {
     pub pending_redistribution_intents: u64,
     pub failed_redistribution_intents: u64,
     pub fragments_with_pending_redistribution: u64,
-    pub trash_recover_running: bool,
-    pub trash_recover_phase: String,
-    pub trash_recover_fragment: String,
-    pub trash_recover_total_objects: u64,
-    pub trash_recover_processed_objects: u64,
-    pub trash_empty_running: bool,
-    pub trash_empty_phase: String,
-    pub trash_empty_fragment: String,
-    pub trash_empty_total_objects: u64,
-    pub trash_empty_processed_objects: u64,
-    pub trash_empty_total_roots: u64,
-    pub trash_empty_processed_roots: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_redistribution_intent_age_seconds: Option<u64>,
 }
@@ -227,9 +212,9 @@ struct CachedRedistributionIntentDebt {
     snapshot: RedistributionIntentDebtSnapshot,
 }
 
-struct BlobPlacementRisk {
-    heterogeneous_blob_capacity: bool,
-    blob_capacity_imbalance_ratio: Option<f64>,
+struct StoragePlacementRisk {
+    heterogeneous_storage_capacity: bool,
+    storage_capacity_imbalance_ratio: Option<f64>,
     placement_limiter_path: Option<String>,
     placement_limiter_available_bytes: Option<u64>,
     placement_limiter_usage_percent: Option<f64>,
@@ -706,43 +691,30 @@ async fn collect_system_health(
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
     let gc_status = get_gc_status().await;
-    let trash_recover_status = get_recover_all_trash_status().await;
-    let trash_empty_status = get_empty_trash_status().await;
 
-    let index_disks_config = INDEX_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError("Index config missing".into()))?;
-
-    let blob_disks_config = BLOB_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError("Blob config missing".into()))?;
+    let storage_disks_config = STORAGE_DISKS.get().ok_or(AppError::InternalServerError(
+        "Storage config missing".into(),
+    ))?;
 
     let mut check_futures = Vec::new();
 
-    for disk in index_disks_config {
-        check_futures.push(check_disk_accessibility(disk.clone(), "index".to_string()));
-    }
-    for disk in blob_disks_config {
-        check_futures.push(check_disk_accessibility(disk.clone(), "blob".to_string()));
+    for disk in storage_disks_config {
+        check_futures.push(check_disk_accessibility(
+            disk.clone(),
+            "storage".to_string(),
+        ));
     }
 
     let disk_results = join_all(check_futures).await;
 
-    let mut online_index_count = 0;
-    let mut online_blob_count = 0;
-    let mut active_index_roots = Vec::new();
-    let mut active_blob_roots = Vec::new();
+    let mut online_storage_count = 0;
+    let mut active_storage_roots = Vec::new();
     let mut disk_statuses = Vec::new();
 
     for stat in disk_results {
         if stat.status == "online" || stat.status == "slow" {
-            if stat.role == "index" {
-                online_index_count += 1;
-                active_index_roots.push(PathBuf::from(&stat.path));
-            } else {
-                online_blob_count += 1;
-                active_blob_roots.push(PathBuf::from(&stat.path));
-            }
+            online_storage_count += 1;
+            active_storage_roots.push(PathBuf::from(&stat.path));
         }
         disk_statuses.push(stat);
     }
@@ -757,10 +729,10 @@ async fn collect_system_health(
     let mut scan_performed = false;
     let mut scan_busy = false;
 
-    if deep_scan && !active_blob_roots.is_empty() {
+    if deep_scan && !active_storage_roots.is_empty() {
         if let Ok(_permit) = DEEP_SCAN_SEMAPHORE.try_acquire() {
             scan_performed = true;
-            let roots_clone = active_blob_roots.clone();
+            let roots_clone = active_storage_roots.clone();
             let target_fragment_for_scan = target_fragment.clone();
             let (tx, rx) = oneshot::channel();
 
@@ -801,7 +773,7 @@ async fn collect_system_health(
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
 
-            for (i, root) in active_blob_roots.iter().enumerate() {
+            for (i, root) in active_storage_roots.iter().enumerate() {
                 if let Some(count) = object_record_counts.get(i) {
                     object_record_map.insert(root.to_string_lossy().to_string(), *count);
                 }
@@ -823,37 +795,34 @@ async fn collect_system_health(
         "records-scanned".to_string()
     };
 
-    let total_index = index_disks_config.len();
-    let total_blob = blob_disks_config.len();
+    let total_storage = storage_disks_config.len();
     let uploads =
-        collect_upload_runtime_stats(&active_index_roots, target_fragment.as_deref()).await?;
+        collect_upload_runtime_stats(&active_storage_roots, target_fragment.as_deref()).await?;
     let namespace_runtime = global_namespace_runtime().runtime_stats();
     let redistribution_debt = load_redistribution_intent_debt(
-        &active_index_roots,
+        &active_storage_roots,
         force_refresh || deep_scan,
         target_fragment.clone(),
     )
     .await;
     let fragment_redundancy_debt = detect_fragment_redundancy_debt(
-        &active_index_roots,
-        &active_blob_roots,
+        &active_storage_roots,
+        &active_storage_roots,
         deep_scan,
         target_fragment.as_deref(),
     )
     .await?;
     let namespace_replica_debt = detect_namespace_replica_debt(
-        &active_index_roots,
-        &active_blob_roots,
+        &active_storage_roots,
+        &active_storage_roots,
         deep_scan,
         target_fragment.as_deref(),
     )
     .await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
-        total_index as u64,
-        online_index_count as u64,
-        total_blob as u64,
-        online_blob_count as u64,
+        total_storage as u64,
+        online_storage_count as u64,
     );
     let placement_limiter_low = storage
         .placement_limiter_available_bytes
@@ -871,30 +840,17 @@ async fn collect_system_health(
             )
         });
 
-    let (status, mut summary) = if online_index_count == 0 {
+    let (status, mut summary) = if online_storage_count == 0 {
         (
             "critical",
-            "ALL Metadata (Index) disks are offline. System cannot function.".to_string(),
+            "All configured storage devices are offline. System cannot function.".to_string(),
         )
-    } else if online_blob_count == 0 {
-        (
-            "critical",
-            "ALL Data (Blob) disks are offline. Data is inaccessible.".to_string(),
-        )
-    } else if online_index_count < total_index {
+    } else if online_storage_count < total_storage {
         (
             "degraded",
             format!(
-                "Running on {}/{} index roots. Partition redundancy reduced.",
-                online_index_count, total_index
-            ),
-        )
-    } else if online_blob_count < total_blob {
-        (
-            "degraded",
-            format!(
-                "Running on {}/{} data disks. Performance/capacity reduced.",
-                online_blob_count, total_blob
+                "Running on {}/{} storage devices. Redundancy and capacity are reduced.",
+                online_storage_count, total_storage
             ),
         )
     } else if !fragment_redundancy_debt
@@ -932,7 +888,7 @@ async fn collect_system_health(
         (
             "degraded",
             placement_limiter_summary.clone().unwrap_or_else(|| {
-                "Blob placement is capacity-limited; uploads may fail before aggregate capacity is exhausted.".to_string()
+                "Storage placement is capacity-limited; uploads may fail before aggregate capacity is exhausted.".to_string()
             }),
         )
     } else {
@@ -951,12 +907,12 @@ async fn collect_system_health(
                     .join(", ")
             ));
         }
-        if storage.heterogeneous_blob_capacity {
-            if let Some(ratio) = storage.blob_capacity_imbalance_ratio {
+        if storage.heterogeneous_storage_capacity {
+            if let Some(ratio) = storage.storage_capacity_imbalance_ratio {
                 let note = if let Some(limit) = placement_limiter_summary.as_ref() {
-                    format!(" Blob disks are size-imbalanced ({ratio:.2}x). {limit}")
+                    format!(" Storage devices are size-imbalanced ({ratio:.2}x). {limit}")
                 } else {
-                    format!(" Blob disks are size-imbalanced ({ratio:.2}x).")
+                    format!(" Storage devices are size-imbalanced ({ratio:.2}x).")
                 };
                 summary.push_str(&note);
             }
@@ -982,18 +938,6 @@ async fn collect_system_health(
             failed_redistribution_intents: redistribution_debt.failed_intents,
             fragments_with_pending_redistribution: redistribution_debt
                 .fragments_with_pending_intents,
-            trash_recover_running: trash_recover_status.is_running,
-            trash_recover_phase: trash_recover_status.phase.clone(),
-            trash_recover_fragment: trash_recover_status.fragment.clone(),
-            trash_recover_total_objects: trash_recover_status.total_objects,
-            trash_recover_processed_objects: trash_recover_status.processed_objects,
-            trash_empty_running: trash_empty_status.is_running,
-            trash_empty_phase: trash_empty_status.phase.clone(),
-            trash_empty_fragment: trash_empty_status.fragment.clone(),
-            trash_empty_total_objects: trash_empty_status.total_objects,
-            trash_empty_processed_objects: trash_empty_status.processed_objects,
-            trash_empty_total_roots: trash_empty_status.total_trash_roots,
-            trash_empty_processed_roots: trash_empty_status.processed_trash_roots,
             oldest_pending_redistribution_intent_age_seconds: redistribution_debt
                 .oldest_pending_intent_age_seconds,
         })
@@ -1001,7 +945,7 @@ async fn collect_system_health(
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
         object_record_status: object_record_health.clone(),
-        namespace_healthy: online_index_count == total_index,
+        namespace_healthy: online_storage_count == total_storage,
         sampled_at: Some(Utc::now().timestamp()),
         summary: Some(summary.clone()),
     };
@@ -1027,7 +971,7 @@ async fn collect_system_health(
         io_control: io_control_snapshot(),
         object_record_runtime: ObjectRecordRuntimeStats {
             scanned_object_records: total_object_records,
-            shard_roots_online: online_blob_count as u64,
+            shard_roots_online: online_storage_count as u64,
         },
         namespace_runtime,
         storage,
@@ -1043,18 +987,6 @@ async fn collect_system_health(
             failed_redistribution_intents: redistribution_debt.failed_intents,
             fragments_with_pending_redistribution: redistribution_debt
                 .fragments_with_pending_intents,
-            trash_recover_running: trash_recover_status.is_running,
-            trash_recover_phase: trash_recover_status.phase,
-            trash_recover_fragment: trash_recover_status.fragment,
-            trash_recover_total_objects: trash_recover_status.total_objects,
-            trash_recover_processed_objects: trash_recover_status.processed_objects,
-            trash_empty_running: trash_empty_status.is_running,
-            trash_empty_phase: trash_empty_status.phase,
-            trash_empty_fragment: trash_empty_status.fragment,
-            trash_empty_total_objects: trash_empty_status.total_objects,
-            trash_empty_processed_objects: trash_empty_status.processed_objects,
-            trash_empty_total_roots: trash_empty_status.total_trash_roots,
-            trash_empty_processed_roots: trash_empty_status.processed_trash_roots,
             oldest_pending_redistribution_intent_age_seconds: redistribution_debt
                 .oldest_pending_intent_age_seconds,
         },
@@ -1228,75 +1160,72 @@ fn maintenance_access_mode_label(mode: MaintenanceAccessMode) -> &'static str {
 
 fn collect_storage_plane_stats(
     disk_statuses: &[DiskStatus],
-    index_roots_total: u64,
-    index_roots_online: u64,
-    blob_devices_total: u64,
-    blob_devices_online: u64,
+    storage_devices_total: u64,
+    storage_devices_online: u64,
 ) -> StoragePlaneStats {
     let mut raw_total_bytes = 0u64;
     let mut raw_used_bytes = 0u64;
     let mut raw_available_bytes = 0u64;
 
-    for disk in disk_statuses.iter().filter(|disk| disk.role == "blob") {
+    for disk in disk_statuses.iter().filter(|disk| disk.role == "storage") {
         raw_total_bytes = raw_total_bytes.saturating_add(disk.total_bytes.unwrap_or(0));
         raw_used_bytes = raw_used_bytes.saturating_add(disk.used_bytes.unwrap_or(0));
         raw_available_bytes = raw_available_bytes.saturating_add(disk.available_bytes.unwrap_or(0));
     }
 
-    let blob_risk = analyze_blob_placement_risk(disk_statuses);
+    let blob_risk = analyze_storage_placement_risk(disk_statuses);
 
     StoragePlaneStats {
-        index_roots_total,
-        index_roots_online,
-        blob_devices_total,
-        blob_devices_online,
+        storage_devices_total,
+        storage_devices_online,
         raw_total_bytes,
         raw_used_bytes,
         raw_available_bytes,
-        heterogeneous_blob_capacity: blob_risk.heterogeneous_blob_capacity,
-        blob_capacity_imbalance_ratio: blob_risk.blob_capacity_imbalance_ratio,
+        heterogeneous_storage_capacity: blob_risk.heterogeneous_storage_capacity,
+        storage_capacity_imbalance_ratio: blob_risk.storage_capacity_imbalance_ratio,
         placement_limiter_path: blob_risk.placement_limiter_path,
         placement_limiter_available_bytes: blob_risk.placement_limiter_available_bytes,
         placement_limiter_usage_percent: blob_risk.placement_limiter_usage_percent,
     }
 }
 
-fn analyze_blob_placement_risk(disk_statuses: &[DiskStatus]) -> BlobPlacementRisk {
-    let blob_disks: Vec<&DiskStatus> = disk_statuses
+fn analyze_storage_placement_risk(disk_statuses: &[DiskStatus]) -> StoragePlacementRisk {
+    let storage_disks: Vec<&DiskStatus> = disk_statuses
         .iter()
-        .filter(|disk| disk.role == "blob" && disk.total_bytes.unwrap_or(0) > 0)
+        .filter(|disk| disk.role == "storage" && disk.total_bytes.unwrap_or(0) > 0)
         .collect();
 
-    if blob_disks.is_empty() {
-        return BlobPlacementRisk {
-            heterogeneous_blob_capacity: false,
-            blob_capacity_imbalance_ratio: None,
+    if storage_disks.is_empty() {
+        return StoragePlacementRisk {
+            heterogeneous_storage_capacity: false,
+            storage_capacity_imbalance_ratio: None,
             placement_limiter_path: None,
             placement_limiter_available_bytes: None,
             placement_limiter_usage_percent: None,
         };
     }
 
-    let smallest_total = blob_disks
+    let smallest_total = storage_disks
         .iter()
         .filter_map(|disk| disk.total_bytes)
         .min()
         .unwrap_or(0);
-    let largest_total = blob_disks
+    let largest_total = storage_disks
         .iter()
         .filter_map(|disk| disk.total_bytes)
         .max()
         .unwrap_or(0);
-    let blob_capacity_imbalance_ratio = if smallest_total > 0 && largest_total >= smallest_total {
+    let storage_capacity_imbalance_ratio = if smallest_total > 0 && largest_total >= smallest_total
+    {
         Some(largest_total as f64 / smallest_total as f64)
     } else {
         None
     };
-    let heterogeneous_blob_capacity = blob_capacity_imbalance_ratio
+    let heterogeneous_storage_capacity = storage_capacity_imbalance_ratio
         .map(|ratio| ratio >= 1.5)
         .unwrap_or(false);
 
-    let limiter = blob_disks
+    let limiter = storage_disks
         .iter()
         .filter_map(|disk| {
             disk.available_bytes
@@ -1304,9 +1233,9 @@ fn analyze_blob_placement_risk(disk_statuses: &[DiskStatus]) -> BlobPlacementRis
         })
         .min_by_key(|(available, _, _)| *available);
 
-    BlobPlacementRisk {
-        heterogeneous_blob_capacity,
-        blob_capacity_imbalance_ratio,
+    StoragePlacementRisk {
+        heterogeneous_storage_capacity,
+        storage_capacity_imbalance_ratio,
         placement_limiter_path: limiter.as_ref().map(|(_, path, _)| path.clone()),
         placement_limiter_available_bytes: limiter.as_ref().map(|(available, _, _)| *available),
         placement_limiter_usage_percent: limiter.and_then(|(_, _, usage)| usage),

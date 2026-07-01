@@ -3,6 +3,7 @@ use crate::distribution::peer::{fetch_peer_shard_chunk, parse_peer_shard_locator
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_read_recover;
 use crc32fast::Hasher;
+use futures_util::future::join_all;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -96,6 +97,212 @@ fn crc32_matches(bytes: &[u8], expected: u32) -> bool {
     hasher.finalize() == expected
 }
 
+pub fn part_has_block_checksums(part: &PartMetadata, block_size: usize) -> bool {
+    block_size > 0
+        && part.shards.iter().all(|shard| {
+            shard.checksum_block_size == block_size
+                && shard.block_checksums.len()
+                    >= usize::try_from(shard.size_bytes.div_ceil(block_size as u64))
+                        .unwrap_or(usize::MAX)
+        })
+}
+
+async fn read_verified_shard_block(
+    shard: &ShardInfo,
+    offset: u64,
+    block_size: usize,
+) -> Result<Vec<u8>, AppError> {
+    if shard.checksum_block_size != block_size || block_size == 0 || offset % block_size as u64 != 0
+    {
+        return Err(AppError::InternalServerError(format!(
+            "cluster shard {} has invalid block checksum geometry",
+            shard.file_name
+        )));
+    }
+    let block_index = usize::try_from(offset / block_size as u64)
+        .map_err(|_| AppError::BadRequest("shard block index exceeds usize".into()))?;
+    let expected = shard
+        .block_checksums
+        .get(block_index)
+        .copied()
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(format!(
+                "cluster shard {} is missing block checksum {}",
+                shard.file_name, block_index
+            ))
+        })?;
+    let remaining = shard.size_bytes.saturating_sub(offset);
+    let length = remaining.min(block_size as u64) as usize;
+    if length == 0 {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} is shorter than block {}",
+            shard.file_name, block_index
+        )));
+    }
+    let bytes = read_shard_chunk(shard, offset, length).await?;
+    if !crc32_matches(&bytes, expected) {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} block {} failed checksum verification",
+            shard.file_name, block_index
+        )));
+    }
+    Ok(bytes)
+}
+
+async fn read_verified_shard_range(
+    shard: &ShardInfo,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, AppError> {
+    let block_size = shard.checksum_block_size;
+    if block_size == 0 || shard.block_checksums.is_empty() || len == 0 {
+        return Err(AppError::InternalServerError(format!(
+            "cluster shard {} has no range-verification geometry",
+            shard.file_name
+        )));
+    }
+    let request_end = offset
+        .checked_add(len as u64)
+        .ok_or_else(|| AppError::BadRequest("shard read range overflows u64".into()))?;
+    if request_end > shard.size_bytes {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} is shorter than requested range",
+            shard.file_name
+        )));
+    }
+    let block_size_u64 = block_size as u64;
+    let first_block = offset / block_size_u64;
+    let last_block = request_end.saturating_sub(1) / block_size_u64;
+    let read_start = first_block * block_size_u64;
+    let read_end = shard
+        .size_bytes
+        .min(last_block.saturating_add(1).saturating_mul(block_size_u64));
+    let read_len = usize::try_from(read_end.saturating_sub(read_start))
+        .map_err(|_| AppError::BadRequest("verified shard range exceeds usize".into()))?;
+    let bytes = read_shard_chunk(shard, read_start, read_len).await?;
+
+    for block_index in first_block..=last_block {
+        let expected =
+            shard
+                .block_checksums
+                .get(usize::try_from(block_index).map_err(|_| {
+                    AppError::BadRequest("shard checksum index exceeds usize".into())
+                })?)
+                .copied()
+                .ok_or_else(|| {
+                    AppError::ServiceUnavailable(format!(
+                        "cluster shard {} is missing block checksum {}",
+                        shard.file_name, block_index
+                    ))
+                })?;
+        let block_start = block_index * block_size_u64;
+        let block_end = shard.size_bytes.min(block_start + block_size_u64);
+        let relative_start = usize::try_from(block_start - read_start)
+            .map_err(|_| AppError::BadRequest("verified block offset exceeds usize".into()))?;
+        let relative_end = relative_start
+            + usize::try_from(block_end - block_start)
+                .map_err(|_| AppError::BadRequest("verified block length exceeds usize".into()))?;
+        if relative_end > bytes.len()
+            || !crc32_matches(&bytes[relative_start..relative_end], expected)
+        {
+            return Err(AppError::ServiceUnavailable(format!(
+                "cluster shard {} block {} failed checksum verification",
+                shard.file_name, block_index
+            )));
+        }
+    }
+
+    let slice_start = usize::try_from(offset - read_start)
+        .map_err(|_| AppError::BadRequest("shard slice offset exceeds usize".into()))?;
+    let slice_end = slice_start + len;
+    Ok(bytes[slice_start..slice_end].to_vec())
+}
+
+pub async fn read_verified_cluster_data_stripe(
+    part: &PartMetadata,
+    offset: u64,
+    block_size: usize,
+) -> Result<Vec<u8>, AppError> {
+    if !part_has_block_checksums(part, block_size) {
+        return Err(AppError::InternalServerError(
+            "cluster part does not contain complete block checksums".into(),
+        ));
+    }
+    let data_count = data_shards_count(part);
+    let parity_count = part.shards.len().saturating_sub(data_count);
+    if data_count == 0 {
+        return Err(AppError::InternalServerError(
+            "cluster part has no data shards".into(),
+        ));
+    }
+
+    let reads = part.shards.iter().cloned().map(|shard| async move {
+        let result = read_verified_shard_block(&shard, offset, block_size).await;
+        (shard, result)
+    });
+    let results = join_all(reads).await;
+    let mut data = vec![None; data_count];
+    let mut readable = 0usize;
+    for (shard, result) in &results {
+        if !shard.is_parity && shard.shard_index < data_count {
+            if let Ok(bytes) = result {
+                data[shard.shard_index] = Some(bytes.clone());
+                readable += 1;
+            }
+        }
+    }
+    if readable == data_count {
+        return Ok(data.into_iter().flatten().flatten().collect());
+    }
+    if parity_count == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "cluster data block unavailable and no parity is available".into(),
+        ));
+    }
+
+    let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, block_size)
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let mut added = 0usize;
+    for (shard, result) in results {
+        let Ok(bytes) = result else {
+            continue;
+        };
+        let added_result = if shard.is_parity {
+            decoder.add_recovery_shard(shard.shard_index.saturating_sub(data_count), bytes)
+        } else {
+            decoder.add_original_shard(shard.shard_index, bytes)
+        };
+        if added_result.is_ok() {
+            added += 1;
+        }
+    }
+    if added < data_count {
+        return Err(AppError::ServiceUnavailable(format!(
+            "insufficient verified cluster blocks; need {}, found {}",
+            data_count, added
+        )));
+    }
+    let decoded = decoder
+        .decode()
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    for (index, bytes) in decoded.restored_original_iter() {
+        if index < data.len() {
+            data[index] = Some(bytes.to_vec());
+        }
+    }
+    if data.iter().any(Option::is_none) {
+        return Err(AppError::InternalServerError(
+            "cluster block reconstruction did not restore every data block".into(),
+        ));
+    }
+    let restored = data.into_iter().flatten().flatten().collect::<Vec<_>>();
+    record_read_recover(
+        restored.len() as u64,
+        part.shards.len().saturating_sub(added) as u64,
+    );
+    Ok(restored)
+}
+
 fn verified_cache_key(shard: &ShardInfo) -> String {
     format!(
         "{}\0{}\0{}",
@@ -120,12 +327,47 @@ pub async fn shard_probe_verified(shard: &ShardInfo) -> bool {
     bytes.len() as u64 == shard.size_bytes && crc32_matches(&bytes, expected)
 }
 
+pub async fn prefetch_verified_data_shards(part: &PartMetadata, cache: &mut VerifiedShardCache) {
+    let pending = part
+        .shards
+        .iter()
+        .filter(|shard| !shard.is_parity)
+        .filter_map(|shard| {
+            let expected = expected_crc32(&shard.checksum)?;
+            let key = verified_cache_key(shard);
+            if cache.verified.contains_key(&key) || cache.rejected.contains(&key) {
+                return None;
+            }
+            let shard = shard.clone();
+            Some(async move {
+                let bytes = read_full_shard(&shard).await;
+                (key, shard, expected, bytes)
+            })
+        });
+
+    for (key, shard, expected, result) in join_all(pending).await {
+        match result {
+            Ok(bytes)
+                if bytes.len() as u64 == shard.size_bytes && crc32_matches(&bytes, expected) =>
+            {
+                cache.verified.insert(key, bytes);
+            }
+            Ok(_) | Err(_) => {
+                cache.rejected.insert(key);
+            }
+        }
+    }
+}
+
 pub(crate) async fn read_verified_shard_slice_cached(
     shard: &ShardInfo,
     offset: u64,
     len: usize,
     cache: &mut VerifiedShardCache,
 ) -> Result<Vec<u8>, AppError> {
+    if shard.checksum_block_size > 0 && !shard.block_checksums.is_empty() {
+        return read_verified_shard_range(shard, offset, len).await;
+    }
     let Some(expected) = expected_crc32(&shard.checksum) else {
         return read_shard_chunk(shard, offset, len).await;
     };
@@ -341,6 +583,42 @@ mod tests {
     use ulid::Ulid;
 
     #[tokio::test]
+    async fn verified_range_reads_only_checksum_blocks_covering_the_slice() {
+        let root = std::env::temp_dir().join(format!("n2-range-read-{}", Ulid::new()));
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let data = (0..65_537usize)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let block_size = 4096usize;
+        let block_checksums = data
+            .chunks(block_size)
+            .map(crc32fast::hash)
+            .collect::<Vec<_>>();
+        let path = root.join("data.shard");
+        tokio::fs::write(&path, &data).await.expect("write shard");
+        let shard = ShardInfo {
+            shard_index: 0,
+            file_name: "data.shard".into(),
+            absolute_path: path.to_string_lossy().to_string(),
+            size_bytes: data.len() as u64,
+            checksum: "00000000".into(),
+            block_checksums,
+            checksum_block_size: block_size,
+            is_parity: false,
+        };
+
+        let mut cache = VerifiedShardCache::default();
+        let offset = 123u64;
+        let len = 20_000usize;
+        let actual = read_verified_shard_slice_cached(&shard, offset, len, &mut cache)
+            .await
+            .expect("verified range");
+        assert_eq!(actual, data[offset as usize..offset as usize + len]);
+        assert!(cache.verified.is_empty());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn cluster_read_reconstructs_missing_data_from_parity() {
         let root = std::env::temp_dir().join(format!("n2-cluster-read-{}", Ulid::new()));
         tokio::fs::create_dir_all(&root).await.expect("create root");
@@ -369,6 +647,8 @@ mod tests {
                         .to_string(),
                     size_bytes: data.len() as u64,
                     checksum: String::new(),
+                    block_checksums: Vec::new(),
+                    checksum_block_size: 0,
                     is_parity: false,
                 },
                 ShardInfo {
@@ -377,6 +657,8 @@ mod tests {
                     absolute_path: parity_path.to_string_lossy().to_string(),
                     size_bytes: data.len() as u64,
                     checksum: String::new(),
+                    block_checksums: Vec::new(),
+                    checksum_block_size: 0,
                     is_parity: true,
                 },
             ],
@@ -386,6 +668,105 @@ mod tests {
             .await
             .expect("reconstruct");
         assert_eq!(restored, data);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn prefetch_verifies_data_shards_concurrently_and_rejects_corruption() {
+        let root = std::env::temp_dir().join(format!("n2-cluster-prefetch-{}", Ulid::new()));
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let expected = [
+            b"data-000".to_vec(),
+            b"data-111".to_vec(),
+            b"data-222".to_vec(),
+        ];
+        let mut shards = Vec::new();
+
+        for (index, bytes) in expected.iter().enumerate() {
+            let path = root.join(format!("part_0_shard_{index}.shard"));
+            let stored = if index == 2 {
+                b"corrupt!".as_slice()
+            } else {
+                bytes.as_slice()
+            };
+            tokio::fs::write(&path, stored).await.expect("write shard");
+            shards.push(ShardInfo {
+                shard_index: index,
+                file_name: format!("part_0_shard_{index}.shard"),
+                absolute_path: path.to_string_lossy().to_string(),
+                size_bytes: bytes.len() as u64,
+                checksum: format!("{:08x}", crc32fast::hash(bytes)),
+                block_checksums: Vec::new(),
+                checksum_block_size: 0,
+                is_parity: false,
+            });
+        }
+
+        let part = PartMetadata {
+            part_index: 0,
+            size_bytes: expected.iter().map(Vec::len).sum::<usize>() as u64,
+            created_at: 0,
+            shards,
+            checksum: None,
+        };
+        let mut cache = VerifiedShardCache::default();
+        prefetch_verified_data_shards(&part, &mut cache).await;
+
+        assert_eq!(cache.verified.len(), 2);
+        assert_eq!(cache.rejected.len(), 1);
+        for (index, bytes) in expected.iter().enumerate().take(2) {
+            let restored = read_cluster_data_chunk_cached(&part, index, 0, bytes.len(), &mut cache)
+                .await
+                .expect("read prefetched shard");
+            assert_eq!(&restored, bytes);
+        }
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn verified_cluster_stripe_reconstructs_a_corrupt_data_block() {
+        let root = std::env::temp_dir().join(format!("n2-block-recover-{}", Ulid::new()));
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let blocks = [b"data".to_vec(), b"more".to_vec()];
+        let mut encoder = ReedSolomonEncoder::new(2, 1, 4).expect("encoder");
+        for block in &blocks {
+            encoder.add_original_shard(block).expect("add data");
+        }
+        let encoded = encoder.encode().expect("encode");
+        let parity = encoded.recovery(0).expect("parity").to_vec();
+        drop(encoded);
+        let stored = [b"data".to_vec(), b"FAIL".to_vec(), parity.clone()];
+        let expected = [blocks[0].clone(), blocks[1].clone(), parity];
+        let mut shards = Vec::new();
+        for index in 0..3 {
+            let path = root.join(format!("part_0_shard_{index}"));
+            tokio::fs::write(&path, &stored[index])
+                .await
+                .expect("write block");
+            shards.push(ShardInfo {
+                shard_index: index,
+                file_name: format!("part_0_shard_{index}"),
+                absolute_path: path.to_string_lossy().to_string(),
+                size_bytes: 4,
+                checksum: format!("{:08x}", crc32fast::hash(&expected[index])),
+                block_checksums: vec![crc32fast::hash(&expected[index])],
+                checksum_block_size: 4,
+                is_parity: index == 2,
+            });
+        }
+        let part = PartMetadata {
+            part_index: 0,
+            size_bytes: 8,
+            created_at: 0,
+            shards,
+            checksum: None,
+        };
+
+        let restored = read_verified_cluster_data_stripe(&part, 0, 4)
+            .await
+            .expect("reconstruct corrupt block");
+        assert_eq!(restored, b"datamore");
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

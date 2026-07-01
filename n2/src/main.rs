@@ -3,7 +3,7 @@ pub use n2::*;
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
-use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::core::disk_manager::{FS_STORAGE_ROOT, STORAGE_DISKS};
 use crate::core::io_scheduler::{DiskIoSchedulerConfig, configure_disk_io_scheduler};
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
@@ -560,26 +560,15 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     })?;
     probe_directory_writable(&refresh_store_root, "N2 refresh session store")?;
 
-    let index_store_str = disk_section
-        .and_then(|s| s.get("index_store_disks"))
-        .ok_or_else(|| "Missing index_store_disks in [disk_config]".to_string())?;
-    for root in index_store_str
+    let storage_disks = disk_section
+        .and_then(|s| s.get("storage_disks"))
+        .ok_or_else(|| "Missing storage_disks in [disk_config]".to_string())?;
+    for root in storage_disks
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        ensure_existing_writable_dir(Path::new(root), "N2 index_store_disks entry")?;
-    }
-
-    let blob_store_str = disk_section
-        .and_then(|s| s.get("blob_store_disks"))
-        .ok_or_else(|| "Missing blob_store_disks in [disk_config]".to_string())?;
-    for root in blob_store_str
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        ensure_existing_writable_dir(Path::new(root), "N2 blob_store_disks entry")?;
+        ensure_existing_writable_dir(Path::new(root), "N2 storage_disks entry")?;
     }
 
     Ok(())
@@ -705,48 +694,32 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let index_store_str = disk_section
-        .and_then(|s| s.get("index_store_disks"))
-        .expect("Missing index_store_disks in [disk_config]");
+    let storage_disks = disk_section
+        .and_then(|s| s.get("storage_disks"))
+        .expect("Missing storage_disks in [disk_config]");
 
-    let index_disks: Vec<String> = index_store_str
+    let storage_disks: Vec<String> = storage_disks
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    let index_disks = normalize_fs_backed_disk_paths("index_store_disks", index_disks);
-
-    INDEX_STORE_DISKS
-        .set(index_disks)
-        .expect("Double initialization of INDEX_STORE_DISKS!");
-
-    let blob_store_str = disk_section
-        .and_then(|s| s.get("blob_store_disks"))
-        .expect("Missing blob_store_disks in [disk_config]");
-
-    let blob_disks: Vec<String> = blob_store_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let blob_disks = normalize_fs_backed_disk_paths("blob_store_disks", blob_disks);
-    let blob_disk_count = blob_disks.len();
-    let blob_device_count = detect_unique_storage_devices(&blob_disks);
-    let effective_blob_disks_for_auto = blob_device_count.min(blob_disk_count).max(1);
-    if blob_device_count < blob_disk_count {
+    let storage_disks = normalize_fs_backed_disk_paths("storage_disks", storage_disks);
+    let storage_disk_count = storage_disks.len();
+    let storage_device_count = detect_unique_storage_devices(&storage_disks);
+    let effective_blob_disks_for_auto = storage_device_count.min(storage_disk_count).max(1);
+    if storage_device_count < storage_disk_count {
         tracing::warn!(
-            "blob_store_disks has {} configured path(s) but only {} unique physical device(s); auto tuning will use {} effective disk(s)",
-            blob_disk_count,
-            blob_device_count,
+            "storage_disks has {} configured path(s) but only {} unique physical device(s); auto tuning will use {} effective disk(s)",
+            storage_disk_count,
+            storage_device_count,
             effective_blob_disks_for_auto
         );
     }
 
-    BLOB_STORE_DISKS
-        .set(blob_disks)
-        .expect("Double initialization of BLOB_STORE_DISKS!");
+    STORAGE_DISKS
+        .set(storage_disks)
+        .expect("Double initialization of STORAGE_DISKS!");
     tracing::info!(
         "Storage mode: N2 distributed object storage with colocated immutable object metadata and shard payloads"
     );
@@ -756,8 +729,7 @@ pub async fn run_server() {
     let cluster_runtime = init_cluster_runtime(
         &config,
         fs_storage_path,
-        INDEX_STORE_DISKS.get().expect("index roots initialized"),
-        BLOB_STORE_DISKS.get().expect("blob roots initialized"),
+        STORAGE_DISKS.get().expect("storage devices initialized"),
         &https_endpoint,
         &native_endpoint,
     )
@@ -890,11 +862,11 @@ pub async fn run_server() {
     let upload_io_gate_enabled = configured_upload_io_gate_enabled;
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), disk_scheduler={{total:{}, foreground:{}, background:{}, fg_fragment:{}, bg_fragment:{}}}, writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, storage_paths={}, storage_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), disk_scheduler={{total:{}, foreground:{}, background:{}, fg_fragment:{}, bg_fragment:{}}}, writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
         cpu_cores,
         detected_ram_gib,
-        blob_disk_count,
-        blob_device_count,
+        storage_disk_count,
+        storage_device_count,
         effective_blob_disks_for_auto,
         data_shards_value,
         parity_shards_value,

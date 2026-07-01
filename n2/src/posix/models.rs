@@ -68,8 +68,6 @@ pub struct PosixListQuery {
     pub continuation_token: Option<String>,
     #[serde(default)]
     pub trash: Option<bool>,
-    #[serde(default)]
-    pub sync: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,8 +76,6 @@ pub struct PosixStatQuery {
     pub path: Option<String>,
     #[serde(default)]
     pub trash: Option<bool>,
-    #[serde(default)]
-    pub sync: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

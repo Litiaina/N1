@@ -517,7 +517,7 @@ fn map_refresh_error(error: RefreshStoreError) -> AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+    use crate::core::disk_manager::STORAGE_DISKS;
     use crate::core::fragment_identity::ensure_fragment_identity_on_roots;
     use crate::middleware::refresh_store::clear_refresh_store_for_tests;
     use crate::test_support::global_test_lock;
@@ -547,13 +547,13 @@ mod tests {
             std::env::temp_dir().join(format!("n2-auth-blob-tests-{}", std::process::id()));
         std::fs::create_dir_all(&index_root).expect("create auth index root");
         std::fs::create_dir_all(&blob_root).expect("create auth blob root");
-        if INDEX_STORE_DISKS.get().is_none() {
-            INDEX_STORE_DISKS
+        if STORAGE_DISKS.get().is_none() {
+            STORAGE_DISKS
                 .set(vec![index_root.to_string_lossy().to_string()])
                 .expect("set auth index roots");
         }
-        if BLOB_STORE_DISKS.get().is_none() {
-            BLOB_STORE_DISKS
+        if STORAGE_DISKS.get().is_none() {
+            STORAGE_DISKS
                 .set(vec![blob_root.to_string_lossy().to_string()])
                 .expect("set auth blob roots");
         }
@@ -561,7 +561,7 @@ mod tests {
 
     async fn ensure_auth_test_fragment(fragment: &str) {
         let mut roots = Vec::new();
-        if let Some(index_roots) = INDEX_STORE_DISKS.get() {
+        if let Some(index_roots) = STORAGE_DISKS.get() {
             roots.extend(index_roots.iter().map(std::path::PathBuf::from));
         }
         ensure_fragment_identity_on_roots(&roots, fragment, fragment)

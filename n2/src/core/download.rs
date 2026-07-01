@@ -1,5 +1,5 @@
 use crate::core::disk_manager::{
-    ChunkQuery, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, ShardInfo,
+    ChunkQuery, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
 };
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::metadata_parser::{get_metadata, get_version_metadata};
@@ -137,10 +137,9 @@ pub(crate) async fn download_object_chunk_from_metadata(
     let mut checksum_header: Option<String> = None;
     let mut file_cache: HashMap<String, File> = HashMap::new();
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     let num_disks = blob_roots.len();
     let mut cluster_shard_cache = crate::distribution::download::VerifiedShardCache::default();
-
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
             "No blob storage configured".into(),
@@ -253,6 +252,66 @@ pub(crate) async fn download_object_chunk_from_metadata(
     Ok((result_buffer, checksum_header))
 }
 
+async fn stream_verified_cluster_part<W>(
+    part: &PartMetadata,
+    part_size: u64,
+    block_size: usize,
+    writer: &mut W,
+) -> Result<u64, AppError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let data_shards = part.shards.iter().filter(|shard| !shard.is_parity).count();
+    if data_shards == 0 {
+        return Err(AppError::InternalServerError(
+            "cluster part has no data shards".into(),
+        ));
+    }
+    let stripe_width = block_size.saturating_mul(data_shards);
+    if stripe_width == 0 {
+        return Err(AppError::InternalServerError(
+            "cluster stripe width is zero".into(),
+        ));
+    }
+    let stripe_count = part_size.div_ceil(stripe_width as u64);
+    let mut current =
+        crate::distribution::download::read_verified_cluster_data_stripe(part, 0, block_size)
+            .await?;
+    let mut written = 0u64;
+
+    for stripe_index in 0..stripe_count {
+        let next = if stripe_index + 1 < stripe_count {
+            let next_part = part.clone();
+            let next_offset = (stripe_index + 1).saturating_mul(block_size as u64);
+            Some(tokio::spawn(async move {
+                crate::distribution::download::read_verified_cluster_data_stripe(
+                    &next_part,
+                    next_offset,
+                    block_size,
+                )
+                .await
+            }))
+        } else {
+            None
+        };
+
+        let remaining = part_size.saturating_sub(written);
+        let write_len = remaining.min(current.len() as u64) as usize;
+        writer
+            .write_all(&current[..write_len])
+            .await
+            .map_err(|err| AppError::Io(err, "verified cluster stream write".into()))?;
+        written = written.saturating_add(write_len as u64);
+
+        if let Some(next) = next {
+            current = next.await.map_err(|err| {
+                AppError::InternalServerError(format!("verified cluster stripe task failed: {err}"))
+            })??;
+        }
+    }
+    Ok(written)
+}
+
 pub(crate) async fn stream_object_range_to_writer<W>(
     metadata: ObjectMetadata,
     offset: u64,
@@ -285,10 +344,9 @@ where
     let mut current_global_pos = 0u64;
     let mut file_cache: HashMap<String, File> = HashMap::new();
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     let num_disks = blob_roots.len();
     let mut written = 0u64;
-    let mut cluster_shard_cache = crate::distribution::download::VerifiedShardCache::default();
 
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
@@ -316,7 +374,37 @@ where
                 ));
             }
 
+            if part_rel_start == 0
+                && part_rel_end == part_len
+                && crate::distribution::download::part_has_remote_shards(part)
+                && crate::distribution::download::part_has_block_checksums(part, stripe_block_size)
+            {
+                let part_written =
+                    stream_verified_cluster_part(part, part_len, stripe_block_size, writer).await?;
+                if part_written != part_len {
+                    return Err(AppError::ServiceUnavailable(format!(
+                        "verified cluster stream produced {} bytes, expected {}",
+                        part_written, part_len
+                    )));
+                }
+                written = written.saturating_add(part_written);
+                bytes_to_read = 0;
+            }
+
             let part_arc = Arc::new(part.clone());
+            let mut cluster_shard_cache =
+                crate::distribution::download::VerifiedShardCache::default();
+            let full_stripe_bytes = stripe_block_size.saturating_mul(data_shards_count as usize);
+            if crate::distribution::download::part_has_remote_shards(part)
+                && bytes_to_read > 0
+                && bytes_to_read >= full_stripe_bytes
+            {
+                crate::distribution::download::prefetch_verified_data_shards(
+                    part,
+                    &mut cluster_shard_cache,
+                )
+                .await;
+            }
 
             while bytes_to_read > 0 {
                 let (shard_index, file_offset, chunk_len) = if data_shards_count == 1 {

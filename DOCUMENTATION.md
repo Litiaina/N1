@@ -215,8 +215,7 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-index_store_disks=/mnt/n2/index
-blob_store_disks=/mnt/n2/blob
+storage_disks=/mnt/n2/storage
 fs_storage_path=/mnt/n2/fs
 
 [cluster_config]
@@ -267,19 +266,19 @@ stream_readahead_bytes=auto
 stream_locality_bias_enabled=true
 monitor_interval_seconds=auto
 monitor_deep_scan_interval_seconds=auto
-max_part_size=52428800
+max_part_size=536870912
 data_shards=1
 parity_shards=0
-stripe_block_size=262144
+stripe_block_size=4194304
 ```
 
 Notes:
 
-- `index_store_disks` and `blob_store_disks` are comma-separated paths.
-- `index_store_disks` holds mutable namespace and fragment control state.
-- `blob_store_disks` holds immutable `.ncdx` records beside shard/parity data.
-- `fs_storage_path` stores runtime control state such as membership, stable
-  namespace voter assignments, ledgers, snapshots, and jobs.
+- `storage_disks` is a comma-separated list of unified storage-device paths.
+- Every storage device can hold immutable `.ncdx`/shard data and assigned
+  namespace virtual partitions under `.n2/namespace`.
+- `fs_storage_path` stores process-local membership, upload coordination, and
+  maintenance job state. It is not namespace truth.
 - `membership_file` is relative to `fs_storage_path` unless absolute.
 - `cluster_layout_mode=auto` is recommended for normal N2 deployments.
 - `auto_max_data_shards` and `auto_max_parity_shards` bound each object's
@@ -290,33 +289,19 @@ Notes:
 - N2 uses cluster capacity monitoring and physical free-space admission.
   Per-fragment business limits belong above N2 when needed.
 
-### Storage Layout Modes
+### Unified Storage Layout
 
-Separated mode is preferred when a node has NVMe and HDD:
-
-```ini
-[disk_config]
-index_store_disks=/mnt/nvme/n2-index
-blob_store_disks=/mnt/hdd/n2-objects
-fs_storage_path=/mnt/nvme/n2-control
-```
-
-The index root contains namespace symlinks, trash, fragment control, and
-coordinator-local upload state. It does not contain committed object `.ncdx`,
-shards, or parity.
-
-Shared mode is the minimum valid deployment and uses one storage path for both
-roles:
+Configure every device that should participate in object and namespace
+placement:
 
 ```ini
 [disk_config]
-index_store_disks=/mnt/n2/storage
-blob_store_disks=/mnt/n2/storage
+storage_disks=/mnt/n2/storage
 fs_storage_path=/mnt/n2/control
 ```
 
-Shared mode does not create a duplicate object plane. Namespace and immutable
-`.objects` data coexist under the same `@f_<stable-fragment-id>` root.
+There is no separate index tier. Namespace virtual partitions are distributed
+across these devices independently from object EC placement.
 
 Each committed version is stored as:
 
@@ -353,8 +338,7 @@ membership file should contain every node:
       "native_endpoint": "n2://192.168.0.22:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     },
     {
       "id": "node-b",
@@ -362,8 +346,7 @@ membership file should contain every node:
       "native_endpoint": "n2://192.168.0.13:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     },
     {
       "id": "node-c",
@@ -371,8 +354,7 @@ membership file should contain every node:
       "native_endpoint": "n2://192.168.0.18:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     }
   ]
 }
@@ -453,8 +435,7 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-index_store_disks=/mnt/n2/index
-blob_store_disks=/mnt/n2/blob
+storage_disks=/mnt/n2/storage
 fs_storage_path=/mnt/n2/fs
 
 [cluster_config]
@@ -488,8 +469,7 @@ absolute `membership_file` path.
       "native_endpoint": "n2://192.168.0.22:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     },
     {
       "id": "node-b",
@@ -497,8 +477,7 @@ absolute `membership_file` path.
       "native_endpoint": "n2://192.168.0.13:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     },
     {
       "id": "node-c",
@@ -506,8 +485,7 @@ absolute `membership_file` path.
       "native_endpoint": "n2://192.168.0.18:50002",
       "state": "online",
       "weight": 1,
-      "index_roots": ["/mnt/n2/index"],
-      "blob_roots": ["/mnt/n2/blob"]
+      "storage_roots": ["/mnt/n2/storage"]
     }
   ]
 }
@@ -659,7 +637,8 @@ Fields:
 - `read`: allow list, read, status, health.
 - `write`: allow upload, mkdir, trash, recover.
 - `modify`: allow rename, repair, rebalance, maintenance mutations.
-- `delete`: allow permanent delete, purge, fragment delete.
+- `delete`: allow soft delete and fragment administration. Object reclamation
+  remains TTL lifecycle-only.
 - `expires_in`: optional access-token TTL in seconds, capped by env config.
 
 Response:
@@ -1558,7 +1537,7 @@ Response sections:
 - `overview`: cluster state, epoch, local node, writable/readable nodes, and
   current `data + parity` layout.
 - `nodes`: configured node list with reachability, HTTP/native endpoints,
-  index/blob roots, local health status, upload counters, storage plane, disk
+  unified storage devices, local health status, upload counters, storage plane, disk
   status, and maintenance state.
 - `topology`: current layout policy, current shard counts, object-level erasure
   layout flag, old-layout validity, and manual redistribution policy.
@@ -2203,9 +2182,9 @@ each node, object status/repair, trash/recover, namespace stress, small-object
 scale, cancel, canonical disk-layout checks, byte-identical `.ncdx` participant
 copies, native placement locator checks, read-on-recover after deleting a
 shard, node-loss read/list/rename behavior, targeted rebalance of a real
-old-layout object, final cluster health, and RSS summaries. Separated mode also
-proves that committed object metadata and shards never land on index roots.
-Shared mode proves that one exact path can safely carry both roles. The harness
+old-layout object, final cluster health, and RSS summaries. Unified-device mode
+proves that each configured device can hold assigned namespace partitions and
+immutable object material without a separate index role. The harness
 only kills unrelated N2 processes when `N2_PROOF_ALLOW_PKILL=1` is explicitly
 set.
 
@@ -2217,7 +2196,7 @@ For 1.0.0 readiness, prove at minimum:
 - multipart upload through each node with coordinator stickiness;
 - download from every node after finalize;
 - object status from every node;
-- namespace list, mkdir, rename, trash, recover, purge;
+- namespace list, mkdir, rename, trash, TTL expiry, and restore-before-expiry;
 - cluster health, layout, usage;
 - cluster repair plan/status;
 - cluster rebalance plan/status;

@@ -13,7 +13,7 @@ use tracing::{error, info};
 
 async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError> {
     let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = path_manager.get_storage_roots();
     let stable_fragment = path_manager.resolve_stable_fragment_id(fragment);
     let now = SystemTime::now();
     let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);

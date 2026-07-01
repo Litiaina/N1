@@ -1,8 +1,18 @@
+use axum::Json;
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
+use serde::Serialize;
 use std::io;
 
-use crate::handlers::error_handlers;
+#[derive(Serialize)]
+struct ErrorResponseBody {
+    error: &'static str,
+    message: String,
+}
+
+fn error_response(status: StatusCode, error: &'static str, message: String) -> Response {
+    (status, Json(ErrorResponseBody { error, message })).into_response()
+}
 
 #[derive(Debug)]
 pub enum AppError {
@@ -65,52 +75,60 @@ impl std::error::Error for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
-            AppError::NotFound => {
-                (StatusCode::NOT_FOUND, Html(error_handlers::NOT_FOUND_HTML)).into_response()
-            }
+            AppError::NotFound => error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Resource not found".into(),
+            ),
             AppError::Io(e, context) => {
                 tracing::error!("IO error during '{}': {}", context, e);
                 let message = format!("IO operation failed: {}", context);
-                (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "io_error", message)
             }
             AppError::Timeout(context) => {
                 tracing::error!("Timeout during '{}'", context);
                 let message = format!("Operation timed out: {}", context);
-                (StatusCode::REQUEST_TIMEOUT, message).into_response()
+                error_response(StatusCode::REQUEST_TIMEOUT, "timeout", message)
             }
             AppError::ServiceUnavailable(msg) => {
                 tracing::warn!("Service unavailable: {}", msg);
-                (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg)
             }
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response(),
+            AppError::BadRequest(msg) => {
+                error_response(StatusCode::BAD_REQUEST, "bad_request", msg)
+            }
+            AppError::Conflict(msg) => error_response(StatusCode::CONFLICT, "conflict", msg),
+            AppError::PayloadTooLarge(msg) => {
+                error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", msg)
+            }
             AppError::Multipart(msg) => {
                 tracing::error!("Multipart error: {}", msg);
-                (StatusCode::BAD_REQUEST, msg).into_response()
+                error_response(StatusCode::BAD_REQUEST, "multipart_error", msg)
             }
-            AppError::Unauthorized => {
-                (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()).into_response()
-            }
-            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
-            AppError::RangeNotSatisfiable => (
+            AppError::Unauthorized => error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Unauthorized".into(),
+            ),
+            AppError::Forbidden(msg) => error_response(StatusCode::FORBIDDEN, "forbidden", msg),
+            AppError::RangeNotSatisfiable => error_response(
                 StatusCode::RANGE_NOT_SATISFIABLE,
-                "Range Not Satisfiable".to_string(),
-            )
-                .into_response(),
+                "range_not_satisfiable",
+                "Range not satisfiable".into(),
+            ),
             AppError::InternalServerError(msg) => {
                 tracing::error!("Internal Server Error: {}", msg);
-                (
+                error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "An internal server error occurred.".to_string(),
+                    "internal_server_error",
+                    "An internal server error occurred".into(),
                 )
-                    .into_response()
             }
-            AppError::InsufficientStorage => (
+            AppError::InsufficientStorage => error_response(
                 StatusCode::INSUFFICIENT_STORAGE,
-                "Insufficient storage capacity.".to_string(),
-            )
-                .into_response(),
+                "insufficient_storage",
+                "Insufficient storage capacity".into(),
+            ),
         }
     }
 }
@@ -125,5 +143,25 @@ mod tests {
     fn service_unavailable_maps_to_503() {
         let response = AppError::ServiceUnavailable("busy".to_string()).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn not_found_is_a_structured_json_error() {
+        let response = AppError::NotFound.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("error body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({"error":"not_found","message":"Resource not found"})
+        );
     }
 }
