@@ -2,7 +2,7 @@ use crate::core::disk_manager::{ObjectKeyQuery, ObjectPathManager};
 use crate::core::download::download_object as download_object_impl;
 use crate::core::metadata_parser::get_version_metadata;
 use crate::core::object_parser::stream_object_logic;
-use crate::core::retrieve::{get_object_metadata_direct, stream_object as stream_object_impl};
+use crate::core::retrieve::get_object_metadata_direct;
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
 use axum::Json as AxumJson;
@@ -350,18 +350,15 @@ pub async fn read_object_via_signed_url(
             Ok(response.into_response())
         }
         "stream" | "view" => {
-            let response = if let Some(version_id) = validated.version_id.as_deref() {
-                let metadata =
-                    get_version_metadata(&query.fragment, &object_key, version_id, &query.fragment)
-                        .await?;
-                stream_object_logic(headers, metadata, "inline", validated.filename)
+            let metadata = if let Some(version_id) = validated.version_id.as_deref() {
+                get_version_metadata(&query.fragment, &object_key, version_id, &query.fragment)
                     .await?
-                    .into_response()
             } else {
-                stream_object_impl(claims, headers, Path((query.fragment, object_key)))
-                    .await?
-                    .into_response()
+                get_object_metadata_direct(&query.fragment, &object_key).await?
             };
+            let response = stream_object_logic(headers, metadata, "inline", validated.filename)
+                .await?
+                .into_response();
             Ok(response.into_response())
         }
         _ => Err(AppError::BadRequest(

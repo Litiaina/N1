@@ -5,15 +5,52 @@ use crate::io_control::record_read_recover;
 use crc32fast::Hasher;
 use futures_util::future::join_all;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-#[derive(Default)]
 pub struct VerifiedShardCache {
     verified: HashMap<String, Vec<u8>>,
     rejected: HashSet<String>,
+    verified_blocks: HashMap<String, Vec<u8>>,
+    block_order: VecDeque<String>,
+    max_verified_blocks: usize,
+}
+
+impl Default for VerifiedShardCache {
+    fn default() -> Self {
+        Self {
+            verified: HashMap::new(),
+            rejected: HashSet::new(),
+            verified_blocks: HashMap::new(),
+            block_order: VecDeque::new(),
+            max_verified_blocks: 16,
+        }
+    }
+}
+
+impl VerifiedShardCache {
+    pub fn clear(&mut self) {
+        self.verified.clear();
+        self.rejected.clear();
+        self.verified_blocks.clear();
+        self.block_order.clear();
+    }
+
+    fn insert_verified_block(&mut self, key: String, bytes: Vec<u8>) {
+        if self.verified_blocks.contains_key(&key) {
+            return;
+        }
+        while self.verified_blocks.len() >= self.max_verified_blocks {
+            let Some(oldest) = self.block_order.pop_front() else {
+                break;
+            };
+            self.verified_blocks.remove(&oldest);
+        }
+        self.block_order.push_back(key.clone());
+        self.verified_blocks.insert(key, bytes);
+    }
 }
 
 pub fn shard_is_remote(shard: &ShardInfo) -> bool {
@@ -149,10 +186,11 @@ async fn read_verified_shard_block(
     Ok(bytes)
 }
 
-async fn read_verified_shard_range(
+async fn read_verified_shard_range_cached(
     shard: &ShardInfo,
     offset: u64,
     len: usize,
+    cache: &mut VerifiedShardCache,
 ) -> Result<Vec<u8>, AppError> {
     let block_size = shard.checksum_block_size;
     if block_size == 0 || shard.block_checksums.is_empty() || len == 0 {
@@ -173,49 +211,41 @@ async fn read_verified_shard_range(
     let block_size_u64 = block_size as u64;
     let first_block = offset / block_size_u64;
     let last_block = request_end.saturating_sub(1) / block_size_u64;
-    let read_start = first_block * block_size_u64;
-    let read_end = shard
-        .size_bytes
-        .min(last_block.saturating_add(1).saturating_mul(block_size_u64));
-    let read_len = usize::try_from(read_end.saturating_sub(read_start))
-        .map_err(|_| AppError::BadRequest("verified shard range exceeds usize".into()))?;
-    let bytes = read_shard_chunk(shard, read_start, read_len).await?;
-
+    let mut output = Vec::with_capacity(len);
     for block_index in first_block..=last_block {
-        let expected =
-            shard
-                .block_checksums
-                .get(usize::try_from(block_index).map_err(|_| {
-                    AppError::BadRequest("shard checksum index exceeds usize".into())
-                })?)
-                .copied()
-                .ok_or_else(|| {
-                    AppError::ServiceUnavailable(format!(
-                        "cluster shard {} is missing block checksum {}",
-                        shard.file_name, block_index
-                    ))
-                })?;
         let block_start = block_index * block_size_u64;
-        let block_end = shard.size_bytes.min(block_start + block_size_u64);
-        let relative_start = usize::try_from(block_start - read_start)
-            .map_err(|_| AppError::BadRequest("verified block offset exceeds usize".into()))?;
-        let relative_end = relative_start
-            + usize::try_from(block_end - block_start)
-                .map_err(|_| AppError::BadRequest("verified block length exceeds usize".into()))?;
-        if relative_end > bytes.len()
-            || !crc32_matches(&bytes[relative_start..relative_end], expected)
-        {
+        let cache_key = format!("{}\0{}", verified_cache_key(shard), block_index);
+        if !cache.verified_blocks.contains_key(&cache_key) {
+            let bytes = read_verified_shard_block(shard, block_start, block_size).await?;
+            cache.insert_verified_block(cache_key.clone(), bytes);
+        }
+        let bytes = cache.verified_blocks.get(&cache_key).ok_or_else(|| {
+            AppError::InternalServerError("verified shard block cache lost an entry".into())
+        })?;
+        let slice_start = offset.max(block_start).saturating_sub(block_start);
+        let block_end = block_start.saturating_add(bytes.len() as u64);
+        let slice_end = request_end.min(block_end).saturating_sub(block_start);
+        let slice_start = usize::try_from(slice_start)
+            .map_err(|_| AppError::BadRequest("verified block slice exceeds usize".into()))?;
+        let slice_end = usize::try_from(slice_end)
+            .map_err(|_| AppError::BadRequest("verified block slice exceeds usize".into()))?;
+        if slice_start > slice_end || slice_end > bytes.len() {
             return Err(AppError::ServiceUnavailable(format!(
-                "cluster shard {} block {} failed checksum verification",
+                "cluster shard {} block {} is shorter than requested range",
                 shard.file_name, block_index
             )));
         }
+        output.extend_from_slice(&bytes[slice_start..slice_end]);
     }
-
-    let slice_start = usize::try_from(offset - read_start)
-        .map_err(|_| AppError::BadRequest("shard slice offset exceeds usize".into()))?;
-    let slice_end = slice_start + len;
-    Ok(bytes[slice_start..slice_end].to_vec())
+    if output.len() != len {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} returned {} verified bytes, expected {}",
+            shard.file_name,
+            output.len(),
+            len
+        )));
+    }
+    Ok(output)
 }
 
 pub async fn read_verified_cluster_data_stripe(
@@ -241,6 +271,9 @@ pub async fn read_verified_cluster_data_stripe(
         (shard, result)
     });
     let results = join_all(reads).await;
+    if results.iter().any(|(_, result)| result.is_err()) {
+        crate::distribution::repair::schedule_cluster_part_read_repair(part.clone());
+    }
     let mut data = vec![None; data_count];
     let mut readable = 0usize;
     for (shard, result) in &results {
@@ -366,7 +399,7 @@ pub(crate) async fn read_verified_shard_slice_cached(
     cache: &mut VerifiedShardCache,
 ) -> Result<Vec<u8>, AppError> {
     if shard.checksum_block_size > 0 && !shard.block_checksums.is_empty() {
-        return read_verified_shard_range(shard, offset, len).await;
+        return read_verified_shard_range_cached(shard, offset, len, cache).await;
     }
     let Some(expected) = expected_crc32(&shard.checksum) else {
         return read_shard_chunk(shard, offset, len).await;
@@ -489,6 +522,7 @@ pub async fn read_cluster_data_chunk_cached(
     let mut restored = restored;
     restored.truncate(len);
     record_read_recover(restored.len() as u64, missing_observed as u64);
+    crate::distribution::repair::schedule_cluster_part_read_repair(part.clone());
     Ok(restored)
 }
 
@@ -615,6 +649,21 @@ mod tests {
             .expect("verified range");
         assert_eq!(actual, data[offset as usize..offset as usize + len]);
         assert!(cache.verified.is_empty());
+        assert!(!cache.verified_blocks.is_empty());
+
+        tokio::fs::remove_file(&path)
+            .await
+            .expect("remove backing shard after cache fill");
+        let cached_offset = 512u64;
+        let cached_len = 1024usize;
+        let cached =
+            read_verified_shard_slice_cached(&shard, cached_offset, cached_len, &mut cache)
+                .await
+                .expect("second range is served from verified block cache");
+        assert_eq!(
+            cached,
+            data[cached_offset as usize..cached_offset as usize + cached_len]
+        );
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

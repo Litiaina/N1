@@ -167,6 +167,7 @@ fn shard_dir_with_locality_hint<'a>(
 async fn read_chunk_with_retries(
     file_cache: &mut HashMap<String, File>,
     recovery_file_cache: &mut HashMap<String, File>,
+    cluster_shard_cache: &mut crate::distribution::download::VerifiedShardCache,
     shard_dir: &PathBuf,
     part: Arc<PartMetadata>,
     shard_index: usize,
@@ -175,11 +176,12 @@ async fn read_chunk_with_retries(
     stripe_size: usize,
 ) -> Result<Vec<u8>, AppError> {
     if crate::distribution::download::part_has_remote_shards(part.as_ref()) {
-        return crate::distribution::download::read_cluster_data_chunk(
+        return crate::distribution::download::read_cluster_data_chunk_cached(
             part.as_ref(),
             shard_index,
             file_offset,
             to_read,
+            cluster_shard_cache,
         )
         .await;
     }
@@ -290,6 +292,7 @@ pub async fn stream_object_logic(
         shard_dirs: Vec<PathBuf>,
         file_cache: HashMap<String, File>,
         recovery_file_cache: HashMap<String, File>,
+        cluster_shard_cache: crate::distribution::download::VerifiedShardCache,
         current_part_idx: usize,
         current_part_offset: u64,
         stripe_size: usize,
@@ -328,6 +331,7 @@ pub async fn stream_object_logic(
         shard_dirs,
         file_cache: HashMap::new(),
         recovery_file_cache: HashMap::new(),
+        cluster_shard_cache: crate::distribution::download::VerifiedShardCache::default(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
         stripe_size: stripe_size_bytes,
@@ -348,6 +352,7 @@ pub async fn stream_object_logic(
                 state.current_part_offset = part_end_global;
                 state.file_cache.clear();
                 state.recovery_file_cache.clear();
+                state.cluster_shard_cache.clear();
                 continue;
             }
 
@@ -451,6 +456,7 @@ pub async fn stream_object_logic(
                 let data_result = read_chunk_with_retries(
                     &mut state.file_cache,
                     &mut state.recovery_file_cache,
+                    &mut state.cluster_shard_cache,
                     shard_dir,
                     Arc::clone(part),
                     shard_index,

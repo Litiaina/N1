@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     tracing::info!("╔════════════════════════════════════════════════╗");
-    tracing::info!("║         L I T I A I N A  N 2  G A T E        ║");
+    tracing::info!("║         L I T I A I N A  N 2  G A T E          ║");
     tracing::info!("╚════════════════════════════════════════════════╝");
 
     let config = GatewayConfig::load().map_err(std::io::Error::other)?;
