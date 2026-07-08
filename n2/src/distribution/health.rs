@@ -1,6 +1,8 @@
-use crate::distribution::dentry_group::{configured_namespace_replicas, quorum_required};
+use crate::distribution::dentry_group::{
+    configured_namespace_replicas, guaranteed_reachable_voters, quorum_required,
+};
 use crate::distribution::layout::ClusterLayoutMode;
-use crate::distribution::layout::{resolve_layout, resolve_write_layout};
+use crate::distribution::layout::{resolve_configured_layout, resolve_write_layout};
 use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
 };
@@ -67,15 +69,16 @@ pub fn cluster_health_snapshot_with_live_nodes(
     readable: Vec<ClusterNode>,
 ) -> Result<ClusterHealthSnapshot, AppError> {
     let configured_active = runtime.membership.active_write_nodes();
-    let configured_layout = resolve_layout(configured_active.len(), &runtime.layout_policy)
-        .map_err(AppError::BadRequest)?;
+    let configured_layout =
+        resolve_configured_layout(configured_active.len(), &runtime.layout_policy)
+            .map_err(AppError::BadRequest)?;
     let layout = resolve_write_layout(
         active.len(),
         configured_active.len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::BadRequest)?;
-    let data_plane_readable = readable.len() >= configured_layout.data_shards;
+    let data_plane_readable = readable.len() >= layout.data_shards;
     let data_plane_writable = active.len() >= layout.total_shards()
         && (configured_layout.parity_shards == 0 || layout.parity_shards > 0);
     let namespace_voters = runtime
@@ -85,7 +88,11 @@ pub fn cluster_health_snapshot_with_live_nodes(
         .max(1)
         .min(configured_namespace_replicas());
     let namespace_quorum_required = quorum_required(namespace_voters);
-    let estimated_namespace_reachable_voters = readable.len().min(namespace_voters);
+    let estimated_namespace_reachable_voters = guaranteed_reachable_voters(
+        runtime.membership.nodes.len(),
+        readable.len(),
+        namespace_voters,
+    );
     let namespace_quorum_writable =
         estimated_namespace_reachable_voters >= namespace_quorum_required;
     let effective_client_writable = data_plane_writable && namespace_quorum_writable;
@@ -342,6 +349,32 @@ mod tests {
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
         assert!(snap.namespace_quorum_writable);
+        assert!(snap.effective_client_writable);
+        assert!(snap.adaptive_layout);
+    }
+
+    #[test]
+    fn fixed_layout_accepts_an_explicitly_contracted_membership() {
+        let mut runtime = runtime(vec![
+            node("a", NodeState::Offline),
+            node("b", NodeState::Online),
+            node("c", NodeState::Online),
+            node("d", NodeState::Online),
+        ]);
+        runtime.layout_policy = ClusterLayoutPolicy {
+            mode: ClusterLayoutMode::Fixed,
+            fixed_data_shards: Some(3),
+            fixed_parity_shards: Some(1),
+            ..ClusterLayoutPolicy::default()
+        };
+        let live = runtime.membership.active_write_nodes();
+
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
+
+        assert_eq!(snap.data_shards, 2);
+        assert_eq!(snap.parity_shards, 1);
+        assert!(snap.data_plane_readable);
+        assert!(snap.data_plane_writable);
         assert!(snap.effective_client_writable);
         assert!(snap.adaptive_layout);
     }

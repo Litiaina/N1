@@ -15,8 +15,8 @@ pub mod status;
 pub mod upload;
 
 pub use layout::{
-    ClusterEcLayout, ClusterLayoutMode, ClusterLayoutPolicy, derive_auto_layout, resolve_layout,
-    resolve_write_layout,
+    ClusterEcLayout, ClusterLayoutMode, ClusterLayoutPolicy, derive_auto_layout,
+    resolve_configured_layout, resolve_layout, resolve_write_layout,
 };
 pub use membership::{
     ClusterMembership, ClusterNode, ClusterRuntime, NodeState, active_cluster_runtime,

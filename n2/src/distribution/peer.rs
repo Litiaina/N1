@@ -964,9 +964,6 @@ async fn resolve_object_versions_from_nodes(
                 }
             }
         }
-        if !by_version.is_empty() {
-            return Ok((by_version, successful_nodes));
-        }
     }
     Ok((by_version, successful_nodes))
 }
@@ -1013,10 +1010,56 @@ pub async fn resolve_cluster_object_version(
     object_id: &str,
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    Ok(resolve_cluster_object_versions(fragment, object_id)
-        .await?
+    let request = PeerObjectResolveRequest {
+        fragment: fragment.to_string(),
+        object_id: object_id.to_string(),
+        version_id: Some(version_id.to_string()),
+    };
+    let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() else {
+        return Ok(local_object_metadata(&request)?.into_iter().next());
+    };
+
+    let bounded_nodes = bounded_metadata_node_batches(&runtime, fragment, &[object_id.to_string()])
         .into_iter()
-        .find(|metadata| metadata.version_id == version_id))
+        .map(|(node, _)| node)
+        .collect::<Vec<_>>();
+    let (mut by_version, mut successful_nodes) =
+        resolve_object_versions_from_nodes(&runtime, &request, bounded_nodes).await?;
+
+    if !by_version.contains_key(version_id) {
+        let (fallback_versions, fallback_successes) = resolve_object_versions_from_nodes(
+            &runtime,
+            &request,
+            runtime.membership.readable_nodes(),
+        )
+        .await?;
+        successful_nodes = successful_nodes.saturating_add(fallback_successes);
+        for record in fallback_versions.into_values() {
+            match by_version.get(&record.version_id) {
+                Some(existing)
+                    if existing.membership_epoch != record.membership_epoch
+                        || existing.data_shards != record.data_shards
+                        || existing.parity_shards != record.parity_shards
+                        || existing.total_size_bytes != record.total_size_bytes =>
+                {
+                    return Err(AppError::InternalServerError(format!(
+                        "divergent immutable N2 metadata for object {} version {}",
+                        object_id, record.version_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    by_version.insert(record.version_id.clone(), record);
+                }
+            }
+        }
+    }
+    if successful_nodes == 0 {
+        return Err(AppError::ServiceUnavailable(
+            "no N2 metadata-bearing node was reachable".into(),
+        ));
+    }
+    Ok(by_version.remove(version_id))
 }
 
 pub async fn peer_resolve_object_metadata(

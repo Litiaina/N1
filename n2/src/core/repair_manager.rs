@@ -9,7 +9,11 @@ use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_i
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
-use crate::distribution::download::{shard_is_remote, shard_probe_readable, shard_probe_verified};
+use crate::distribution::download::{
+    part_has_remote_shards, shard_is_remote, shard_probe_readable, shard_probe_verified,
+};
+use crate::distribution::repair::repair_cluster_object_shards;
+use crate::distribution::status::inspect_cluster_object_status;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::replica::repair_namespace_replicas;
 use crate::namespace::runtime::global_namespace_runtime;
@@ -42,6 +46,7 @@ pub struct RepairJobStatus {
 
     pub total_scanned: u64,
     pub total_repaired: u64,
+    pub total_failed: u64,
     pub corrupt_found: u64,
 
     pub missing_meta_repaired: u64,
@@ -282,6 +287,7 @@ impl Default for RepairRunOptions {
 struct BatchDelta {
     scanned: u64,
     repaired_shards: u64,
+    failed_repairs: u64,
     corrupt_found: u64,
     missing_meta_repaired: u64,
     divergent_meta_repaired: u64,
@@ -1188,15 +1194,33 @@ async fn process_object_repair(
     num_disks: usize,
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
-) -> Result<(usize, usize, Option<String>), AppError> {
+) -> Result<(usize, usize, usize, Option<String>), AppError> {
     if meta.parts.is_empty() || num_disks == 0 {
-        return Ok((0, 0, None));
+        return Ok((0, 0, 0, None));
+    }
+
+    if meta.parts.iter().any(part_has_remote_shards) {
+        let before = inspect_cluster_object_status(&meta, cfg.check_mode).await?;
+        if cfg.dry_run || before.status == "healthy" || !before.repairable {
+            let failed = usize::from(!cfg.dry_run && before.status != "healthy");
+            return Ok((0, before.corrupt_shards as usize, failed, None));
+        }
+        let after = repair_cluster_object_shards(&meta, cfg.check_mode).await?;
+        let last_repaired =
+            (after.repaired_shards > 0).then(|| format!("{}/{}", meta.fragment, meta.object_key));
+        return Ok((
+            after.repaired_shards as usize,
+            before.corrupt_shards as usize,
+            after.failed_repairs as usize,
+            last_repaired,
+        ));
     }
 
     let path_manager = ObjectPathManager::new();
     let meta_arc = Arc::new(meta);
 
     let mut repaired_total = 0usize;
+    let mut failed_total = 0usize;
     let mut corrupt_found = 0usize;
     let mut last_repaired: Option<String> = None;
 
@@ -1219,6 +1243,25 @@ async fn process_object_repair(
         let mut missing_shards: Vec<usize> = Vec::new();
 
         for shard in &part_arc.shards {
+            if shard_is_remote(shard) {
+                let healthy = if cfg.check_mode.verifies_full_integrity() {
+                    shard_probe_verified(shard).await
+                } else {
+                    shard_probe_readable(shard).await
+                };
+                if !healthy {
+                    if cfg.check_mode.verifies_full_integrity() {
+                        corrupt_found += 1;
+                        warn!(
+                            "Remote shard failed integrity probe: {}",
+                            shard.absolute_path
+                        );
+                    }
+                    missing_shards.push(shard.shard_index);
+                }
+                continue;
+            }
+
             let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
             let mut healthy = false;
 
@@ -1276,13 +1319,14 @@ async fn process_object_repair(
                     last_repaired = Some(format!("{}/{}", meta_arc.fragment, meta_arc.object_key));
                 }
                 Err(e) => {
+                    failed_total += 1;
                     warn!("Shard repair failed (disk might be offline): {}", e);
                 }
             }
         }
     }
 
-    Ok((repaired_total, corrupt_found, last_repaired))
+    Ok((repaired_total, corrupt_found, failed_total, last_repaired))
 }
 
 #[cfg(test)]
@@ -1338,6 +1382,7 @@ pub async fn run_repair_job_with_options(
         );
         status.total_scanned = 0;
         status.total_repaired = 0;
+        status.total_failed = 0;
         status.corrupt_found = 0;
         status.missing_meta_repaired = 0;
         status.divergent_meta_repaired = 0;
@@ -1529,6 +1574,8 @@ pub async fn run_repair_job_with_options(
         status.fast_mode = opts.fast_mode;
         status.phase = if should_stop() {
             "Stopped by User".to_string()
+        } else if status.total_failed > 0 {
+            "Completed with errors".to_string()
         } else {
             "Completed".to_string()
         };
@@ -1536,9 +1583,10 @@ pub async fn run_repair_job_with_options(
         ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
 
         info!(
-            "Repair Job Ended. Scanned: {}, Repaired: {}, Corrupt: {}, MissingMeta: {}, DivergentMeta: {}",
+            "Repair Job Ended. Scanned: {}, Repaired: {}, Failed: {}, Corrupt: {}, MissingMeta: {}, DivergentMeta: {}",
             status.total_scanned,
             status.total_repaired,
+            status.total_failed,
             status.corrupt_found,
             status.missing_meta_repaired,
             status.divergent_meta_repaired
@@ -1604,6 +1652,7 @@ async fn apply_meta_batch(
 
         batch_agg.scanned += delta.scanned;
         batch_agg.repaired_shards += delta.repaired_shards;
+        batch_agg.failed_repairs += delta.failed_repairs;
         batch_agg.corrupt_found += delta.corrupt_found;
         batch_agg.missing_meta_repaired += delta.missing_meta_repaired;
         batch_agg.divergent_meta_repaired += delta.divergent_meta_repaired;
@@ -1616,6 +1665,7 @@ async fn apply_meta_batch(
 
         pending_update.scanned += delta.scanned;
         pending_update.repaired_shards += delta.repaired_shards;
+        pending_update.failed_repairs += delta.failed_repairs;
         pending_update.corrupt_found += delta.corrupt_found;
         pending_update.missing_meta_repaired += delta.missing_meta_repaired;
         pending_update.divergent_meta_repaired += delta.divergent_meta_repaired;
@@ -1635,6 +1685,7 @@ async fn apply_meta_batch(
         }
 
         let significant_change = delta.repaired_shards > 0
+            || delta.failed_repairs > 0
             || delta.missing_meta_repaired > 0
             || delta.divergent_meta_repaired > 0
             || delta.corrupt_found > 0;
@@ -1648,6 +1699,7 @@ async fn apply_meta_batch(
             status.total_repaired += pending_update.repaired_shards
                 + pending_update.missing_meta_repaired
                 + pending_update.divergent_meta_repaired;
+            status.total_failed += pending_update.failed_repairs;
             status.corrupt_found += pending_update.corrupt_found;
             status.missing_meta_repaired += pending_update.missing_meta_repaired;
             status.divergent_meta_repaired += pending_update.divergent_meta_repaired;
@@ -1678,6 +1730,7 @@ async fn apply_meta_batch(
         status.total_repaired += pending_update.repaired_shards
             + pending_update.missing_meta_repaired
             + pending_update.divergent_meta_repaired;
+        status.total_failed += pending_update.failed_repairs;
         status.corrupt_found += pending_update.corrupt_found;
         status.missing_meta_repaired += pending_update.missing_meta_repaired;
         status.divergent_meta_repaired += pending_update.divergent_meta_repaired;
@@ -1719,10 +1772,11 @@ async fn process_one_metadata(
         return Ok(delta);
     }
 
-    let (repaired, corrupt, last_rep) =
+    let (repaired, corrupt, failed, last_rep) =
         process_object_repair(meta, &blob_roots, num_disks, cfg, shard_repair_sem).await?;
 
     delta.repaired_shards += repaired as u64;
+    delta.failed_repairs += failed as u64;
     delta.corrupt_found += corrupt as u64;
     delta.last_repaired = last_rep;
 

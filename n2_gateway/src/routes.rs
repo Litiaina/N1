@@ -720,17 +720,51 @@ async fn proxy_fallback(
     request: axum::extract::Request,
 ) -> Response<Body> {
     let path = request.uri().path().to_string();
-    let node = match node_for_proxy_path(&state, &path).await {
+    let retry_template = replay_safe_proxy_template(&request);
+    let mut node = match node_for_proxy_path(&state, &path).await {
         Ok(node) => node,
         Err(response) => return response,
     };
-    match proxy_http(&state, node.clone(), request).await {
-        Ok(response) => response,
-        Err(response) => {
-            state.nodes.mark_failure(&node.id).await;
-            response
+    let mut request = request;
+    loop {
+        match proxy_http(&state, node.clone(), request).await {
+            Ok(response) => return response,
+            Err(response) => {
+                state.nodes.mark_failure(&node.id).await;
+                let Some(template) = retry_template.as_ref() else {
+                    return response;
+                };
+                node = match best_node(&state).await {
+                    Ok(node) => node,
+                    Err(_) => return response,
+                };
+                request = replay_safe_proxy_request(template);
+            }
         }
     }
+}
+
+#[derive(Clone)]
+struct ReplaySafeProxyTemplate {
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+}
+
+fn replay_safe_proxy_template(request: &axum::extract::Request) -> Option<ReplaySafeProxyTemplate> {
+    matches!(*request.method(), Method::GET | Method::HEAD).then(|| ReplaySafeProxyTemplate {
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        headers: request.headers().clone(),
+    })
+}
+
+fn replay_safe_proxy_request(template: &ReplaySafeProxyTemplate) -> axum::extract::Request {
+    let mut request = axum::extract::Request::new(Body::empty());
+    *request.method_mut() = template.method.clone();
+    *request.uri_mut() = template.uri.clone();
+    *request.headers_mut() = template.headers.clone();
+    request
 }
 
 async fn preferred_node(
@@ -1388,6 +1422,44 @@ mod tests {
         assert!(ops_a.contains(&"cluster.rebalance.start".to_string()));
         assert!(ops_a.contains(&"cluster.rebalance.status".to_string()));
         assert!(!ops_b.contains(&"cluster.rebalance.status".to_string()));
+    }
+
+    #[tokio::test]
+    async fn proxy_retry_replays_only_safe_empty_body_requests() {
+        for method in [Method::GET, Method::HEAD] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("/n2/objects/stream/video.mp4?version=latest")
+                .header(header::AUTHORIZATION, "Bearer token")
+                .body(Body::empty())
+                .unwrap();
+            let template = replay_safe_proxy_template(&request).expect("safe request template");
+            let replay = replay_safe_proxy_request(&template);
+            assert_eq!(replay.method(), method);
+            assert_eq!(replay.uri(), request.uri());
+            assert_eq!(
+                replay.headers().get(header::AUTHORIZATION),
+                request.headers().get(header::AUTHORIZATION)
+            );
+            assert!(
+                replay
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        }
+
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/n2/objects")
+                .body(Body::from("mutation"))
+                .unwrap();
+            assert!(replay_safe_proxy_template(&request).is_none());
+        }
     }
 
     #[test]

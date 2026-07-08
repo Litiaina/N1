@@ -24,6 +24,14 @@ pub fn quorum_required(voters: usize) -> usize {
     (voters / 2).saturating_add(1).max(1)
 }
 
+pub fn guaranteed_reachable_voters(
+    total_nodes: usize,
+    reachable_nodes: usize,
+    voters: usize,
+) -> usize {
+    voters.saturating_sub(total_nodes.saturating_sub(reachable_nodes))
+}
+
 pub fn assignment_for_partition(
     runtime: &ClusterRuntime,
     virtual_partition: u64,
@@ -165,6 +173,13 @@ mod tests {
         let first = assignment_for_partition(&runtime, 1).expect("assignment");
         let second = assignment_for_partition(&runtime, 2).expect("assignment");
         assert_ne!(first.voter_node_ids, second.voter_node_ids);
+    }
+
+    #[test]
+    fn reachable_voter_bound_is_conservative_across_partition_assignments() {
+        assert_eq!(guaranteed_reachable_voters(4, 3, 3), 2);
+        assert_eq!(guaranteed_reachable_voters(4, 2, 3), 1);
+        assert_eq!(guaranteed_reachable_voters(3, 2, 3), 2);
     }
 
     #[test]

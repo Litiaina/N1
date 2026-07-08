@@ -7,14 +7,16 @@ use crate::core::ec::ErasureStreamWriter;
 use crate::core::index;
 use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
-use crate::distribution::dentry_group::{configured_namespace_replicas, quorum_required};
+use crate::distribution::dentry_group::{
+    configured_namespace_replicas, guaranteed_reachable_voters, quorum_required,
+};
 use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
     publish_cluster_object_metadata,
 };
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
-use crate::distribution::{ClusterEcLayout, resolve_layout, resolve_write_layout};
+use crate::distribution::{ClusterEcLayout, resolve_configured_layout, resolve_write_layout};
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_io_latency;
 use crate::structs::auth_structs::Claims;
@@ -147,7 +149,7 @@ impl LocalShardWriter {
 fn configured_layout(
     runtime: &crate::distribution::membership::ClusterRuntime,
 ) -> Result<ClusterEcLayout, AppError> {
-    resolve_layout(
+    resolve_configured_layout(
         runtime.membership.active_write_nodes().len(),
         &runtime.layout_policy,
     )
@@ -166,7 +168,8 @@ fn validate_write_admission(
         .max(1)
         .min(configured_namespace_replicas());
     let required_voters = quorum_required(voter_count);
-    let reachable_voter_estimate = active_nodes.min(voter_count);
+    let reachable_voter_estimate =
+        guaranteed_reachable_voters(runtime.membership.nodes.len(), active_nodes, voter_count);
     if reachable_voter_estimate < required_voters {
         return Err(AppError::ServiceUnavailable(format!(
             "N2 namespace quorum is unavailable: {} reachable voter(s), {} required",
@@ -900,6 +903,29 @@ mod tests {
         assert_eq!(layout.data_shards, 1);
         assert_eq!(layout.parity_shards, 0);
         assert!(validate_write_admission(&runtime, 1, layout).is_err());
+    }
+
+    #[test]
+    fn four_node_namespace_rejects_two_arbitrary_survivors_without_voter_migration() {
+        let mut runtime = fixed_runtime();
+        runtime.layout_policy.fixed_data_shards = Some(3);
+        runtime.membership.nodes.push(ClusterNode {
+            id: "d".into(),
+            endpoint: "https://d:50001".into(),
+            native_endpoint: Some("n2://d:50002".into()),
+            state: Some(NodeState::Online),
+            weight: 1,
+            storage_roots: Vec::new(),
+            joined_epoch: 1,
+            capacity_bytes: None,
+            used_bytes: None,
+            last_seen_unix: None,
+        });
+        let layout = resolve_write_layout(2, 4, &runtime.layout_policy).unwrap();
+
+        assert_eq!(layout.data_shards, 1);
+        assert_eq!(layout.parity_shards, 1);
+        assert!(validate_write_admission(&runtime, 2, layout).is_err());
     }
 
     #[test]

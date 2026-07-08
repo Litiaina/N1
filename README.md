@@ -19,6 +19,11 @@ namespace, and maintenance operations on any healthy node, places immutable
 object shards across the cluster, and keeps namespace mutation as the
 coordination boundary.
 
+N2 `1.0.0` locks the architecture as a high-performance object storage engine
+with first-class filesystem-like namespace semantics. Blob shards and `.ncdx`
+object metadata are immutable. Directory names, paths, rename, move, trash,
+and recover live in a native partitioned namespace quorum.
+
 N2 deliberately keeps POSIX-style namespace operations fast without becoming a
 filesystem. Directory listing, rename, move, trash, and recover operate on a
 small partitioned namespace quorum of logical pointers, while object bytes and
@@ -77,11 +82,11 @@ The result is simple operational behavior:
 - distributed maintenance assigns fragments across reachable nodes for
   fragment-level GC, repair, and targeted rebalance.
 
-N2 supports separated and shared disk roles. With separated roots, fast index
-storage holds mutable namespace/control state while capacity storage holds
-colocated `.ncdx` and shard/parity data. With a shared root, the exact same path
-is configured for both roles and N2 maintains one canonical tree without a
-second metadata plane.
+N2 uses unified storage devices. Every configured `storage_disks` path can hold
+immutable object shards, immutable `.ncdx` records, and assigned namespace
+virtual partitions. `fs_storage_path` is process-local control state for
+membership, upload coordination, and maintenance jobs; it is not namespace
+truth and not an index tier.
 
 ## Coordination Model
 
@@ -92,7 +97,7 @@ N2 is bidirectional at the node level. Any healthy node can coordinate:
 - one-shot upload;
 - multipart upload initiation;
 - object read/download/status;
-- namespace list/mkdir/rename/trash/recover/purge;
+- namespace list/mkdir/rename/trash/recover;
 - cluster health, usage, repair, and rebalance flows.
 
 Multipart sessions are intentionally coordinator-owned until finalize. The node
@@ -180,7 +185,7 @@ key_path=./certificates/key.pem
 
 [disk_config]
 storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/fs
+fs_storage_path=/mnt/n2/control
 
 [cluster_config]
 node_id=node-a
@@ -302,40 +307,38 @@ The proof harnesses are intended for multi-node correctness checks and write
 ignored local output under `.n2-bench/`. The hardening harness does not kill
 existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
 
-Latest three-node proof summary:
+N2 1.0.0 real-node proof summary:
 
 ```text
-N2 package tests: 111 passed
-Workspace tests: N2, gateway, shell, native client, and SIMD core passed
-Separated hardening proof: passed
-Shared-root hardening proof: passed
-Capacity expansion proof: passed
-Live gateway smoke: one-shot SHA matched, cluster health healthy
+N2 package tests: 116 passed
+Gateway package tests: 16 passed
+Four-node hardware proof: passed
+Final topology: epoch 5, 4 writable/readable nodes, 3+1 layout
+Distributed rebalance: scanned=24, rewritten=4, skipped=20, failed=0
+Distributed repair: scanned=25, skipped=25, failed=0
+Namespace hardening: mkdir race, rename race, collision, trash/recover passed
+Final monitor: all fragments healthy, current layout, zero missing shards
 ```
 
-The separated proof covered node-b loss, read-on-recover, single-shard delete
-reconstruction, object repair, cluster repair, targeted rebalance, POSIX
-mutation, trash/recover, and old-layout rejection checks.
-
-Latest distributed maintenance proof:
-
-```text
-Node C unreachable: 192.168.0.18 returned Destination Host Unreachable
-Live workers: node-a, node-b
-Distributed rebalance: 4 fragments, scanned=7, skipped=7, failed=0
-Distributed repair dry-run: 4 fragments, scanned=7, rewritten=7, failed=0
-Distributed GC: 4 fragments scanned, failed=0
-```
+Evidence is stored outside the repository under
+`/home/wlzambo/DEV-TEST/n2-maintenance-proof-20260708`.
 
 ## Operational Boundaries
 
 - N2 `1.0.0` means the product shape and architecture are finalized enough for
   the 1.0 line.
 - It is not an LTS statement yet.
-- Long soak, clusters larger than three nodes, and wider UI viewport proof
+- Long soak, clusters larger than four nodes, and wider UI viewport proof
   remain release-validation work.
 - Earlier development layouts are intentionally rejected rather than migrated;
-  the 1.0 line uses the documented index/blob role split.
+  the 1.0 line uses the documented unified-device namespace/object layout.
+- A three-node cluster is the production minimum for namespace write
+  availability. Two-node deployments are development or constrained-lab
+  deployments because a 2-of-2 namespace cannot keep accepting writes after one
+  node loss.
+- A four-node 3+1 object layout tolerates one node loss. Testing two-node-loss
+  object reads on four nodes requires a 2+2 layout, and two-node-loss namespace
+  writes require voter migration/reassignment.
 - N2 exposes capacity monitoring and full-disk admission only. Per-user or
   per-fragment business limits belong outside N2.
 - S3 compatibility is not part of the N2 core. If needed, it should live as an

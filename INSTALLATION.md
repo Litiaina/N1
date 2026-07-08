@@ -41,22 +41,12 @@ Recommended production paths:
 /var/lib/litiaina/n2-gateway/certificates/
 ```
 
-Use real mounted storage paths. N2 supports two production layouts.
-
-Separated roots place mutable namespace/control IO on fast storage and
-immutable object/shard IO on capacity storage:
+Use real mounted storage paths. N2 1.0.0 uses unified storage devices:
 
 ```text
-/mnt/nvme/n2-index
-/mnt/hdd/n2-objects
+/mnt/hdd0/n2-storage
+/mnt/hdd1/n2-storage
 /mnt/nvme/n2-control
-```
-
-Shared roots use the same mounted path for both roles:
-
-```text
-/mnt/n2/storage
-/mnt/n2/control
 ```
 
 Every configured storage device can hold immutable object data and assigned
@@ -98,9 +88,8 @@ Preview a node install without changing the machine:
   --node-id node-a \
   --node-endpoint https://192.168.0.22:50001 \
   --native-endpoint n2://192.168.0.22:50002 \
-  --index-roots /mnt/DISK0/n2-index,/mnt/DISK1/n2-index \
-  --blob-roots /mnt/DISK0/n2-blob,/mnt/DISK1/n2-blob \
-  --fs-root /mnt/DISK0/n2-fs
+  --storage-roots /mnt/DISK0/n2-storage,/mnt/DISK1/n2-storage \
+  --fs-root /mnt/DISK0/n2-control
 ```
 
 Install an N2 node:
@@ -110,9 +99,8 @@ sudo ./deploy/install.sh --node --build --copy-certs \
   --node-id node-a \
   --node-endpoint https://192.168.0.22:50001 \
   --native-endpoint n2://192.168.0.22:50002 \
-  --index-roots /mnt/DISK0/n2-index,/mnt/DISK1/n2-index \
-  --blob-roots /mnt/DISK0/n2-blob,/mnt/DISK1/n2-blob \
-  --fs-root /mnt/DISK0/n2-fs \
+  --storage-roots /mnt/DISK0/n2-storage,/mnt/DISK1/n2-storage \
+  --fs-root /mnt/DISK0/n2-control \
   --enable --start
 ```
 
@@ -153,7 +141,7 @@ Create runtime directories:
 ```bash
 sudo mkdir -p /etc/litiaina/n2
 sudo mkdir -p /var/lib/litiaina/n2/certificates
-sudo mkdir -p /mnt/n2/index /mnt/n2/blob /mnt/n2/fs
+sudo mkdir -p /mnt/n2/storage /mnt/n2/control
 ```
 
 Create `/etc/litiaina/n2/n2.env` on each node:
@@ -184,7 +172,7 @@ key_path=/var/lib/litiaina/n2/certificates/key.pem
 
 [disk_config]
 storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/fs
+fs_storage_path=/mnt/n2/control
 
 [cluster_config]
 node_id=node-a
@@ -292,7 +280,7 @@ placeholders:
 @N2_ENV_FILE@        /etc/litiaina/n2/n2.env
 @N2_BIN@             /usr/local/bin/litiaina-n2
 @N2_LOG_FILTER@      n2=info,tower_http=info
-@N2_DATA_PATHS@      writable data roots, space separated
+@N2_DATA_PATHS@      writable storage/control roots, space separated
 ```
 
 Example replacement values:
@@ -305,7 +293,7 @@ Example replacement values:
 @N2_ENV_FILE@=/etc/litiaina/n2/n2.env
 @N2_BIN@=/usr/local/bin/litiaina-n2
 @N2_LOG_FILTER@=n2=info,tower_http=info
-@N2_DATA_PATHS@=/mnt/n2/index /mnt/n2/blob /mnt/n2/fs
+@N2_DATA_PATHS@=/mnt/n2/storage /mnt/n2/control
 ```
 
 Install and start:

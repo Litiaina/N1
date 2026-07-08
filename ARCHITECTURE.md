@@ -8,6 +8,34 @@ layout, node placement, peer transport, repair, redistribution, rebalance, and
 cluster health. Every healthy node can receive client operations; there is no
 permanent object-IO leader.
 
+## N2 1.0.0 Verdict
+
+N2 `1.0.0` locks the storage architecture as a native distributed object
+storage engine with filesystem-like namespace semantics. The architecture is
+not a database-backed file manager and not an S3 clone. It is three storage
+planes with strict ownership:
+
+```text
+immutable blob shards      actual erasure-coded object bytes
+immutable .ncdx records    zero-decode object/version/shard truth
+mutable namespace          path, directory, trash, rename, and recover truth
+```
+
+Only namespace mutates for ordinary user-visible filesystem operations. Blob
+payloads and `.ncdx` records are immutable after commit. This is the N2 design
+line for 1.0.0 and later 1.x hardening work.
+
+N2 is scalable because object IO is bounded by object-level erasure sets while
+namespace IO is partitioned by stable directory-entry identity and replicated
+through bounded voter groups. Adding nodes and devices adds object capacity,
+repair bandwidth, and namespace partition capacity without introducing a
+central database, global namespace writer, or cluster-wide mutable object head.
+
+The current production minimum is three storage nodes. Three nodes allow the
+namespace to use a safe 2-of-3 quorum and the object plane to use a 2+1 layout.
+Two-node deployments are valid for development or constrained labs, but a
+2-of-2 namespace cannot keep accepting writes after either node is lost.
+
 ## Architectural Invariants
 
 The N2 1.0 storage model is defined by these rules:
@@ -416,14 +444,25 @@ Health and topology age are separate facts.
 
 ## Proof Status
 
-The rewritten namespace has unit proof for immutable dentry transactions,
-generation conflicts, O(1) directory rename, trash/restore identity, strict
-quorum selection, committed-intent replay, and expansion-stable placement.
-Isolated hardware proof is recorded outside the repository under
-`/home/wlzambo/DEV-TEST`. Production readiness requires the current release
-binary to pass the complete multi-node restart, divergence, TTL, object-repair,
-and sustained-throughput matrix; historical benchmark numbers are not evidence
-for this incompatible namespace format.
+The 1.0.0 architecture has both unit proof and live-node proof.
+
+Unit proof covers immutable dentry transactions, generation conflicts, O(1)
+directory rename, trash/restore identity, strict quorum selection,
+committed-intent replay, expansion-stable namespace placement, adaptive object
+layout, conservative namespace health, cluster-aware fragment repair, and
+gateway replay safety.
+
+The July 8, 2026 four-node hardware proof is recorded outside the repository
+under `/home/wlzambo/DEV-TEST/n2-maintenance-proof-20260708`. The tested build
+passed object repair, fragment repair, global distributed repair, fragment and
+global redistribution, 4->3->4 topology movement, namespace race hardening,
+trash/recover, final SHA-256 content verification, and per-fragment monitoring.
+
+One important boundary remains intentionally enforced: a four-node cluster
+reduced to two arbitrary survivors can read objects that still have enough
+recorded shards, but it must not accept new namespace mutations until namespace
+voter migration/reassignment exists. The current health and upload admission
+report that state conservatively instead of pretending it is writable.
 
 ## Failure Semantics
 

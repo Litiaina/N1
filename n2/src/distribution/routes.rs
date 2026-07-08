@@ -15,7 +15,7 @@ use crate::distribution::rebalance::{
     start_repair, stop_rebalance, stop_repair,
 };
 use crate::distribution::repair::repair_policy;
-use crate::distribution::{resolve_layout, resolve_write_layout};
+use crate::distribution::{resolve_configured_layout, resolve_write_layout};
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
 use axum::extract::{Query, State};
@@ -93,8 +93,8 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
     let runtime = active_cluster_runtime()?;
     let active = live_active_write_nodes(&runtime).await;
     let configured_nodes = runtime.membership.active_write_nodes().len();
-    let configured_layout =
-        resolve_layout(configured_nodes, &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let configured_layout = resolve_configured_layout(configured_nodes, &runtime.layout_policy)
+        .map_err(AppError::BadRequest)?;
     let layout = resolve_write_layout(active.len(), configured_nodes, &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
     Ok(Json(serde_json::json!({

@@ -1,10 +1,66 @@
 # Litiaina N2 Performance and Resilience Benchmark
 
 This report publishes measured N2 results with explicit software-format and
-topology boundaries. The current section covers the incompatible dentry-quorum
-namespace rewrite. Older multi-node results are retained as historical engine
-and hardware evidence only; their legacy namespace results do not qualify the
-current format.
+topology boundaries. The current release evidence is the four-node N2 1.0.0
+maintenance proof. Older multi-node results are retained as historical engine
+and hardware evidence only; their retired namespace results do not qualify the
+current 1.0.0 format.
+
+## N2 1.0.0 Four-Node Proof
+
+Evidence directory:
+`/home/wlzambo/DEV-TEST/n2-maintenance-proof-20260708`.
+
+| Field | Value |
+| --- | --- |
+| Test date | 2026-07-08 |
+| Deployment | Four physical storage nodes; coordinator/client/gateway local |
+| Final topology | Epoch 5, 4 readable/write nodes |
+| Final erasure layout | 3 data + 1 parity |
+| Gateway | `https://127.0.0.1:57912` |
+| N2 binary hash | `c7830b9fe3d06f8f70d44c6bce2448b82930e7cbc6cc698331b4c025c34eb742` |
+| Gateway binary hash | `e5660692273d396f93e3aff789916738263c7644e60dbae3d78114a536459d4c` |
+| Qualification | Real-node repair, redistribution, namespace, topology, and monitoring proof |
+
+### Correctness and maintenance
+
+| Test | Result |
+| --- | --- |
+| N2 library tests | 116 passed; 0 failed |
+| Gateway tests | 16 passed; 0 failed |
+| Object repair | Missing data shard and missing parity shard repaired byte-exactly |
+| Fragment repair | Cluster-aware fragment repair restored missing shard; failed=0 |
+| Distributed repair | Scanned 25, skipped 25 healthy, failed 0 |
+| Fragment redistribution | Forced alpha redistribution rewrote 7 objects; SHA verified |
+| Distributed rebalance | Final run scanned 24, rewritten 4, skipped 20, failed 0 |
+| 4 -> 3 -> 4 topology | Passed; 3-node mode wrote successfully, 4-node restored to 3+1 |
+| 4 -> 2 degraded behavior | Existing repairable video read SHA matched; writes rejected by namespace quorum |
+| Namespace mkdir race | 1 success, 23 conflicts, exactly one final directory |
+| Namespace rename race | Exactly one destination won; no duplicate source/destination |
+| Namespace collision | Conflict returned; source and destination both preserved |
+| Trash/recover | Trash 200, live stat after trash 404, recover 200, live stat after recover 200 |
+| Final monitor | All fragments healthy, current layout, zero missing shards |
+
+### Final content verification
+
+| Object | SHA-256 |
+| --- | --- |
+| `corpus/video-proof.mp4` | `8713f5d526baf2524074013ed2a362bddc78d9b831ad720f8260d49d8c4a0fa5` |
+| `corpus/large-128m.bin` | `82f6c69ea1c4cb23fd570422f626ff6b1bebcb65a396419922844ce851baef0f` |
+| `topology/three-live.bin` | `30278e9f36956d7ada519f5167793a65595fc0a8a7b377f14343cc9360464798` |
+
+### Known boundary
+
+A four-node 3+1 object layout is designed for one-node object-loss tolerance.
+Testing two-node-loss object readability on four nodes requires 2+2. Also,
+namespace writes under two arbitrary survivors require voter
+migration/reassignment. Current N2 correctly rejects that write state instead
+of accepting unsafe split-brain mutations.
+
+## Earlier Two-Node Dentry-Quorum Rewrite
+
+Evidence directory:
+`/home/wlzambo/DEV-TEST/n2-namespace-rewrite-2node`.
 
 | Field | Value |
 | --- | --- |
@@ -17,11 +73,6 @@ current format.
 
 All storage rates use binary mebibytes per second (`MiB/s`). Network link rates
 use decimal megabits per second (`Mb/s`).
-
-## Current Dentry-Quorum Rewrite
-
-Evidence directory:
-`/home/wlzambo/DEV-TEST/n2-namespace-rewrite-2node`.
 
 ### Correctness and lifecycle
 

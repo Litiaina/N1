@@ -6,7 +6,7 @@ use crate::core::download::download_object_chunk_from_metadata;
 use crate::core::index;
 use crate::core::repair_manager::ObjectLayoutStatus;
 use crate::distribution::download::shard_probe_readable;
-use crate::distribution::layout::resolve_layout;
+use crate::distribution::layout::resolve_write_layout;
 use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
 use crate::distribution::namespace::commit_upload_quorum;
 use crate::distribution::peer::parse_peer_shard_locator;
@@ -112,8 +112,12 @@ static REPAIR_STATUS: LazyLock<Mutex<ClusterRewriteJobStatus>> =
 
 pub fn plan_rebalance(runtime: &ClusterRuntime) -> Result<ClusterRebalancePlan, AppError> {
     let active_nodes = runtime.membership.active_write_nodes();
-    let layout =
-        resolve_layout(active_nodes.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let layout = resolve_write_layout(
+        active_nodes.len(),
+        active_nodes.len(),
+        &runtime.layout_policy,
+    )
+    .map_err(AppError::BadRequest)?;
     Ok(ClusterRebalancePlan {
         membership_epoch: runtime.membership.epoch,
         active_nodes: active_nodes.len(),
@@ -304,8 +308,8 @@ pub fn object_layout_status(
     runtime: &ClusterRuntime,
 ) -> Result<ObjectLayoutStatus, AppError> {
     let active = runtime.membership.active_write_nodes();
-    let layout =
-        resolve_layout(active.len(), &runtime.layout_policy).map_err(AppError::BadRequest)?;
+    let layout = resolve_write_layout(active.len(), active.len(), &runtime.layout_policy)
+        .map_err(AppError::BadRequest)?;
     let recorded_total_shards = meta
         .parts
         .first()
@@ -944,7 +948,8 @@ mod tests {
 
     fn meta_matching_runtime(runtime: &ClusterRuntime) -> ObjectMetadata {
         let active = runtime.membership.active_write_nodes();
-        let layout = resolve_layout(active.len(), &runtime.layout_policy).unwrap();
+        let layout =
+            resolve_write_layout(active.len(), active.len(), &runtime.layout_policy).unwrap();
         let plan = build_placement_plan(
             "frag",
             "obj",

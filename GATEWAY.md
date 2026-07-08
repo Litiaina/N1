@@ -146,7 +146,7 @@ key_path=./certificates/key.pem
 
 [disk_config]
 storage_disks=/mnt/n2/disk-00,/mnt/n2/disk-01
-fs_storage_path=/mnt/n2/fs
+fs_storage_path=/mnt/n2/control
 
 [cluster_config]
 node_id=node-a
@@ -156,6 +156,11 @@ membership_file=n2_membership.json
 cluster_layout_mode=auto
 auto_rebalance=false
 ```
+
+`storage_disks` are unified N2 storage devices: they can hold immutable object
+shards, immutable `.ncdx` records, and assigned namespace partitions.
+`fs_storage_path` is local control state for membership, upload coordination,
+and jobs; it is not a gateway database and not a namespace/index tier.
 
 For a three-node cluster, the gateway config should point to each node:
 

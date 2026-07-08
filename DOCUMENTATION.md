@@ -12,11 +12,16 @@ For production service setup, systemd templates, and validation order, see
 
 N2 `1.0.0` is the architecture-final line for the distributed object storage
 system. That means the core shape is set: `/n2/...` HTTP API, `n2://` native
-protocol, distributed object placement, namespace coordination, cluster
-monitoring, repair, rebalance, and N2 console/shell flows.
+protocol, immutable blob and `.ncdx` records, native partitioned namespace
+coordination, cluster monitoring, repair, rebalance, and N2 console/shell
+flows.
 
-This is not an LTS claim yet. Long soak, larger cluster proof, node-loss
-re-add proof, and wider UI viewport proof remain validation work.
+The July 8, 2026 four-node proof passed object repair, fragment repair, global
+repair, redistribution, 4->3->4 topology movement, namespace race hardening,
+trash/recover, content SHA verification, and final per-fragment monitoring.
+This is the 1.0.0 architecture lock, not an LTS claim. Long soak, larger
+cluster proof, namespace voter migration, and wider UI viewport proof remain
+validation and hardening work.
 
 ## What N2 Is
 
@@ -216,7 +221,7 @@ key_path=./certificates/key.pem
 
 [disk_config]
 storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/fs
+fs_storage_path=/mnt/n2/control
 
 [cluster_config]
 node_id=node-a
@@ -317,10 +322,12 @@ The logical path exists only as a namespace symlink to `@o_<object-id>`.
 `.ncdx` stores immutable object identity and recorded cluster placement, not the
 logical path. The maximum valid ULID filename is the head version.
 
-Roots are role-defined by configuration. Index roots hold mutable namespace and
-control state. Blob roots hold immutable fragment metadata, object `.ncdx`
-records, and shard/parity payloads. Older development layouts are not an
-in-place migration target for this release.
+Every configured `storage_disks` root can hold immutable object shards,
+immutable `.ncdx` records, fragment metadata, and assigned namespace virtual
+partitions. `fs_storage_path` is process-local control state for membership,
+upload coordination, and maintenance jobs; it is not namespace truth and not an
+index tier. Older development layouts are not an in-place migration target for
+this release.
 
 ## Membership File
 
@@ -393,7 +400,7 @@ The gateway is routing authority only. N2 nodes remain the storage authority.
 On each N2 node:
 
 ```bash
-mkdir -p /mnt/n2/index /mnt/n2/blob /mnt/n2/fs
+mkdir -p /mnt/n2/storage /mnt/n2/control
 ```
 
 Install the same N2 build on every node:
@@ -408,7 +415,7 @@ Each node must have:
 - a unique `node_id`;
 - reachable HTTPS API port;
 - reachable native `n2://` port;
-- local index/blob/runtime roots;
+- local storage/control roots;
 - the same membership file content and epoch.
 
 Example per-node identity:
@@ -436,7 +443,7 @@ key_path=./certificates/key.pem
 
 [disk_config]
 storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/fs
+fs_storage_path=/mnt/n2/control
 
 [cluster_config]
 node_id=node-a
@@ -1191,21 +1198,13 @@ Content-Type: application/json
 }
 ```
 
-### Purge
+### Trash Lifecycle
 
-```http
-POST /n2/posix/purge
-Authorization: Bearer <token>
-Content-Type: application/json
-```
-
-```json
-{
-  "path": "archive/mhw.mp4"
-}
-```
-
-Purge removes the namespace trash entry. Payload reclamation is handled by GC.
+N2 1.0.0 does not expose manual namespace purge or empty-trash semantics.
+Trash is lifecycle-managed. Delete moves the namespace entry into reserved
+trash state, recover moves it back while the retention period is valid, and GC
+reclaims immutable object material only after the configured TTL proves no live
+or trash namespace reference remains.
 
 ## Object Mutation API
 
@@ -1299,20 +1298,11 @@ Response:
 }
 ```
 
-### Empty Trash
+### Trash Lifecycle Boundary
 
-```http
-DELETE /n2/trash/empty
-POST /n2/trash/empty
-Authorization: Bearer <token>
-```
-
-### Recover All Trash
-
-```http
-POST /n2/trash/recover-all
-Authorization: Bearer <token>
-```
+N2 1.0.0 intentionally has no empty-trash or recover-all namespace mutation.
+Recover explicit entries before their retention period expires. Expired trash
+is removed by lifecycle/GC after namespace reachability checks.
 
 ## Object Health And Repair
 
@@ -1934,7 +1924,6 @@ namespace.mkdir
 namespace.rename
 namespace.trash
 namespace.recover
-namespace.purge
 object.list
 object.meta
 object.versions
@@ -1943,7 +1932,6 @@ object.repair
 object.redistribute
 object.delete
 object.recover
-object.purge
 upload.one_shot
 multipart.init
 multipart.put_part
@@ -2200,6 +2188,8 @@ For 1.0.0 readiness, prove at minimum:
 - cluster health, layout, usage;
 - cluster repair plan/status;
 - cluster rebalance plan/status;
+- distributed fragment/global repair and rebalance across real nodes;
+- namespace race hardening for mkdir, rename, collision, trash, and recover;
 - Shell ping, auth, health, membership, layout, list, usage, upload, download,
   object status/repair, cluster repair, cluster rebalance, dashboard, profile,
   and job watch flows.

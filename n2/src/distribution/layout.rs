@@ -131,6 +131,29 @@ pub fn resolve_layout(
     Ok(layout)
 }
 
+pub fn resolve_configured_layout(
+    configured_nodes: usize,
+    policy: &ClusterLayoutPolicy,
+) -> Result<ClusterEcLayout, String> {
+    match policy.mode {
+        ClusterLayoutMode::Auto => resolve_layout(configured_nodes, policy),
+        ClusterLayoutMode::Fixed => {
+            let layout = ClusterEcLayout {
+                data_shards: policy
+                    .fixed_data_shards
+                    .ok_or_else(|| "fixed cluster layout requires data shards".to_string())?,
+                parity_shards: policy
+                    .fixed_parity_shards
+                    .ok_or_else(|| "fixed cluster layout requires parity shards".to_string())?,
+            };
+            if layout.data_shards == 0 {
+                return Err("cluster data shards must be greater than zero".to_string());
+            }
+            Ok(layout)
+        }
+    }
+}
+
 pub fn resolve_write_layout(
     available_nodes: usize,
     configured_nodes: usize,
@@ -140,7 +163,8 @@ pub fn resolve_write_layout(
         return Err("cluster has no writable nodes".to_string());
     }
 
-    let configured_layout = resolve_layout(configured_nodes.max(available_nodes), policy)?;
+    let configured_layout =
+        resolve_configured_layout(configured_nodes.max(available_nodes), policy)?;
     if available_nodes >= configured_layout.total_shards() {
         return Ok(configured_layout);
     }
@@ -258,6 +282,21 @@ mod tests {
             ClusterEcLayout {
                 data_shards: 1,
                 parity_shards: 0,
+            }
+        );
+
+        assert_eq!(
+            resolve_configured_layout(2, &policy).unwrap(),
+            ClusterEcLayout {
+                data_shards: 2,
+                parity_shards: 1,
+            }
+        );
+        assert_eq!(
+            resolve_write_layout(2, 2, &policy).unwrap(),
+            ClusterEcLayout {
+                data_shards: 1,
+                parity_shards: 1,
             }
         );
     }
