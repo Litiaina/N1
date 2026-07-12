@@ -4,12 +4,7 @@ use crate::core::archive::{
     download_manifest_archive as download_manifest_archive_impl,
     download_selected_archive as download_selected_archive_impl,
 };
-use crate::core::delete::{
-    BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse,
-    delete_object_version as delete_object_version_impl, get_empty_trash_status_api,
-    get_recover_all_trash_status_api, recover_object_version as recover_object_version_impl,
-    resume_persistent_trash_jobs,
-};
+use crate::core::delete::{BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse};
 use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
 };
@@ -526,34 +521,6 @@ async fn download_manifest_archive_scoped(
     download_manifest_archive_impl(claims, Path(fragment), Query(query), body).await
 }
 
-async fn empty_trash_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let summary = global_namespace_runtime().empty_trash(&fragment).await?;
-    state.emit(
-        &fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &fragment,
-            summary.clone(),
-        )),
-    );
-    Ok((
-        StatusCode::OK,
-        AxumJson(serde_json::json!({
-            "operation": summary.operation,
-            "affected_paths": summary.affected_paths,
-            "affected_objects": summary.affected_objects,
-            "trash_entry_id": summary.trash_entry_id,
-            "deleted_at_unix": summary.deleted_at_unix,
-        })),
-    ))
-}
-
 async fn delete_object_scoped(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -580,56 +547,6 @@ async fn delete_object_scoped(
             "deleted_at_unix": summary.deleted_at_unix,
         })),
     ))
-}
-
-async fn delete_object_version_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Path((version_id, object_key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    delete_object_version_impl(State(state), claims, Path((fragment, version_id, physical))).await
-}
-
-async fn delete_object_permanently_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Path(object_key): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let summary = global_namespace_runtime()
-        .purge_trash_path(&fragment, &object_key)
-        .await?;
-    state.emit(
-        &fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &fragment,
-            summary.clone(),
-        )),
-    );
-    Ok((
-        StatusCode::OK,
-        AxumJson(serde_json::json!({
-            "operation": summary.operation,
-            "affected_paths": summary.affected_paths,
-            "affected_objects": summary.affected_objects,
-            "trash_entry_id": summary.trash_entry_id,
-        })),
-    ))
-}
-
-async fn recover_object_version_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Path((version_id, object_key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    recover_object_version_impl(State(state), claims, Path((fragment, version_id, physical))).await
 }
 
 async fn recover_object_scoped(
@@ -796,65 +713,6 @@ async fn bulk_recover_objects_scoped(
             StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
                 &fragment,
                 "bulk_recover",
-                succeeded,
-            )),
-        );
-    }
-    Ok((
-        StatusCode::OK,
-        AxumJson(BulkObjectOperationResponse {
-            requested,
-            unique: unique_keys.len(),
-            succeeded,
-            not_found,
-            failed,
-        }),
-    ))
-}
-
-async fn bulk_permanent_delete_objects_scoped(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let fragment = claims.fragment.clone();
-    let requested = payload.object_keys.len();
-    let unique_keys = payload
-        .object_keys
-        .into_iter()
-        .filter(|key| !key.trim().is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if unique_keys.is_empty() {
-        return Err(AppError::BadRequest("object_keys must not be empty".into()));
-    }
-
-    let mut succeeded = 0usize;
-    let mut not_found = 0usize;
-    let mut failed = Vec::new();
-    for object_key in &unique_keys {
-        match global_namespace_runtime()
-            .purge_trash_path(&fragment, object_key)
-            .await
-        {
-            Ok(_) => succeeded = succeeded.saturating_add(1),
-            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
-            Err(err) => failed.push(BulkObjectFailure {
-                object_key: object_key.clone(),
-                error: err.to_string(),
-            }),
-        }
-    }
-    if succeeded > 0 {
-        state.emit(
-            &fragment,
-            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
-                &fragment,
-                "bulk_delete_permanent",
                 succeeded,
             )),
         );
@@ -1194,22 +1052,6 @@ pub fn build_storage_routes_unbound_with_options(
 
     let app_state = Arc::new(AppState { ws_manager });
 
-    let trash_resume_state = Arc::clone(&app_state);
-    tokio::spawn(async move {
-        match resume_persistent_trash_jobs(trash_resume_state).await {
-            Ok(resumed) if resumed > 0 => {
-                tracing::info!("Resumed {} persistent trash maintenance job(s)", resumed);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to resume persistent trash maintenance jobs: {}",
-                    err
-                );
-            }
-        }
-    });
-
     let lifecycle_state = Arc::clone(&app_state);
     tokio::spawn(async move {
         run_lifecycle_manager(lifecycle_state).await;
@@ -1273,30 +1115,27 @@ pub fn build_storage_routes_unbound_with_options(
             .route("/n1/fragments/{:fragment}", patch(update_fragment))
             .route(
                 "/n1/trash/empty",
-                delete(empty_trash_scoped).post(empty_trash_scoped),
+                delete(removed_manual_reclamation_route).post(removed_manual_reclamation_route),
             )
-            .route("/n1/objects/rename", post(rename_object_scoped))
-            .route("/n1/objects/bulk-delete", post(bulk_delete_objects_scoped))
+            .route("/n1/posix/purge", post(removed_manual_reclamation_route))
             .route(
                 "/n1/objects/permanent/bulk-delete",
-                post(bulk_permanent_delete_objects_scoped),
+                post(removed_manual_reclamation_route),
             )
-            .route("/n1/objects/{*object_key}", delete(delete_object_scoped))
             .route(
                 "/n1/objects/version/{:version_id}/{*object_key}",
-                delete(delete_object_version_scoped),
+                delete(removed_manual_reclamation_route),
             )
             .route(
                 "/n1/objects/permanent/{*object_key}",
-                delete(delete_object_permanently_scoped),
+                delete(removed_manual_reclamation_route),
             )
+            .route("/n1/objects/rename", post(rename_object_scoped))
+            .route("/n1/objects/bulk-delete", post(bulk_delete_objects_scoped))
+            .route("/n1/objects/{*object_key}", delete(delete_object_scoped))
             .route(
                 "/n1/objects/repair/{*object_key}",
                 post(repair_object_scoped),
-            )
-            .route(
-                "/n1/objects/recover/version/{:version_id}/{*object_key}",
-                post(recover_object_version_scoped),
             )
             .route(
                 "/n1/objects/bulk-recover",
@@ -1353,14 +1192,6 @@ pub fn build_storage_routes_unbound_with_options(
             )
             .route("/n1/maintenance/gc/stop", post(stop_garbage_collector))
             .route("/n1/maintenance/gc/status", get(get_gc_status_api))
-            .route(
-                "/n1/maintenance/trash/recover/status",
-                get(get_recover_all_trash_status_api),
-            )
-            .route(
-                "/n1/maintenance/trash/empty/status",
-                get(get_empty_trash_status_api),
-            )
             .route(
                 "/n1/maintenance/redistribution/start",
                 post(trigger_redistribution_job_api),
@@ -1460,9 +1291,17 @@ async fn ping() -> &'static str {
     "pong"
 }
 
+async fn removed_manual_reclamation_route() -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        "N1 3.0 removed manual trash purge and version deletion; configured TTL lifecycle owns reclamation",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     #[test]
     fn object_redistribution_route_places_catch_all_last() {
@@ -1470,5 +1309,40 @@ mod tests {
             "/n1/maintenance/objects/redistribution/start/{*object_key}",
             post(trigger_object_redistribution_job),
         );
+    }
+
+    #[tokio::test]
+    async fn n1_3_removed_destructive_routes_fail_closed() {
+        let (router, state) = build_storage_routes_unbound();
+        let router = router.with_state(state);
+        for (method, uri) in [
+            (Method::DELETE, "/n1/trash/empty"),
+            (Method::POST, "/n1/trash/empty"),
+            (Method::POST, "/n1/posix/purge"),
+            (Method::DELETE, "/n1/objects/permanent/clinical/a.bin"),
+            (Method::DELETE, "/n1/objects/version/v1/clinical/a.bin"),
+            (Method::POST, "/n1/objects/permanent/bulk-delete"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("removed route request"),
+                )
+                .await
+                .expect("removed route response");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "authentication must remain ahead of retired route {uri}"
+            );
+        }
+
+        let authenticated_handler_response =
+            removed_manual_reclamation_route().await.into_response();
+        assert_eq!(authenticated_handler_response.status(), StatusCode::GONE);
     }
 }

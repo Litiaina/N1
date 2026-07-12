@@ -1,6 +1,6 @@
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity;
-use crate::core::index_store::FragmentMeta as IndexFragmentMeta;
+use crate::core::index_store::{FragmentMeta as IndexFragmentMeta, N1_ENGINE_FORMAT_VERSION};
 use crate::core::linux_io;
 use crate::{core::constants::FRAGMENT_METADATA_FILE, enums::app_error_enum::AppError};
 
@@ -29,6 +29,7 @@ static FRAGMENT_INDEX_PARTITION_COUNT_CACHE: LazyLock<Mutex<HashMap<String, u16>
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMetadata {
+    pub engine_format_version: u16,
     pub stable_fragment_id: String,
     pub key_phc: String,
     #[serde(default)]
@@ -85,12 +86,21 @@ fn unix_to_rfc3339(seconds: i64) -> String {
 }
 
 fn decode_index_fragment_meta(raw: &[u8]) -> Result<IndexFragmentMeta, AppError> {
-    rmp_serde::from_slice::<IndexFragmentMeta>(raw)
-        .map_err(|e| AppError::InternalServerError(format!("decode N1 fragment metadata: {}", e)))
+    let meta = rmp_serde::from_slice::<IndexFragmentMeta>(raw).map_err(|e| {
+        AppError::InternalServerError(format!("decode N1 fragment metadata: {}", e))
+    })?;
+    if meta.engine_format_version != N1_ENGINE_FORMAT_VERSION {
+        return Err(AppError::Conflict(format!(
+            "fragment uses N1 engine format {}, but this binary requires format {}; N1 3.0 does not open or migrate earlier engine formats",
+            meta.engine_format_version, N1_ENGINE_FORMAT_VERSION
+        )));
+    }
+    Ok(meta)
 }
 
 fn fragment_metadata_from_index(meta: IndexFragmentMeta) -> FragmentMetadata {
     FragmentMetadata {
+        engine_format_version: meta.engine_format_version,
         stable_fragment_id: meta.stable_fragment_id,
         key_phc: meta.key_phc.unwrap_or_default(),
         nt_hash_hex: meta.nt_hash_hex,
@@ -184,6 +194,7 @@ pub async fn init_fragment_metadata(
     }
 
     let meta = FragmentMetadata {
+        engine_format_version: N1_ENGINE_FORMAT_VERSION,
         stable_fragment_id: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
         nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
@@ -205,6 +216,7 @@ pub async fn init_fragment_metadata_strict(
     }
 
     let meta = FragmentMetadata {
+        engine_format_version: N1_ENGINE_FORMAT_VERSION,
         stable_fragment_id: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
         nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
@@ -310,6 +322,7 @@ async fn write_fragment_metadata_with_policy(
         let mut edge = match read_index_fragment_meta_if_exists(&p).await {
             Ok(Some(existing)) => existing,
             Ok(None) => IndexFragmentMeta {
+                engine_format_version: N1_ENGINE_FORMAT_VERSION,
                 stable_fragment_id: meta.stable_fragment_id.clone(),
                 state: "active".to_string(),
                 committed_bytes: 0,
@@ -389,6 +402,7 @@ pub async fn rotate_fragment_key(fragment_hash: &str, new_key: &str) -> Result<(
     let mut meta = match read_fragment_metadata(fragment_hash).await {
         Ok(m) => m,
         Err(_) => FragmentMetadata {
+            engine_format_version: N1_ENGINE_FORMAT_VERSION,
             stable_fragment_id: fragment_hash.to_string(),
             key_phc: String::new(),
             nt_hash_hex: None,
@@ -454,6 +468,7 @@ mod tests {
     #[test]
     fn decode_fragment_metadata_accepts_n1_fragment_ndx_shape() {
         let current = IndexFragmentMeta {
+            engine_format_version: N1_ENGINE_FORMAT_VERSION,
             stable_fragment_id: "01KSTABLEFRAGMENT000000000".to_string(),
             state: "active".to_string(),
             committed_bytes: 0,
@@ -473,6 +488,7 @@ mod tests {
         );
         let decoded = decode_fragment_metadata(&raw).expect("decode current");
         assert_eq!(decoded.stable_fragment_id, current.stable_fragment_id);
+        assert_eq!(decoded.engine_format_version, N1_ENGINE_FORMAT_VERSION);
         assert_eq!(decoded.key_phc, current.key_phc.unwrap());
         assert_eq!(decoded.nt_hash_hex, current.nt_hash_hex);
         assert_eq!(decoded.index_partition_count, 64);
@@ -497,6 +513,7 @@ mod tests {
     fn decode_fragment_metadata_rejects_missing_stable_identity() {
         #[derive(Serialize)]
         struct MissingIdentity<'a> {
+            engine_format_version: u16,
             state: &'a str,
             committed_bytes: u64,
             reserved_bytes: u64,
@@ -509,6 +526,7 @@ mod tests {
         }
 
         let raw = rmp_serde::to_vec_named(&MissingIdentity {
+            engine_format_version: N1_ENGINE_FORMAT_VERSION,
             state: "active",
             committed_bytes: 0,
             reserved_bytes: 0,

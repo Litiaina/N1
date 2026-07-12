@@ -15,7 +15,7 @@ use crate::core::linux_io;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
 use chrono::Utc;
-use rustix::fs::{CWD, Dir, Mode, OFlags, renameat};
+use rustix::fs::{CWD, Dir, Mode, OFlags};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,11 +30,14 @@ use ulid::Ulid;
 pub(crate) const OBJECTS_DIR: &str = N1_OBJECTS_DIR;
 pub(crate) const UPLOADS_DIR: &str = ".uploads";
 pub(crate) const TRASH_DIR: &str = ".trash";
+pub(crate) const TRASH_ENTRIES_DIR: &str = ".entries";
+pub(crate) const TRASH_RECORDS_DIR: &str = ".records";
 pub(crate) const TMP_DIR: &str = ".tmp";
 pub(crate) const LOCKS_DIR: &str = ".locks";
 pub(crate) const GC_DIR: &str = ".gc";
 pub(crate) const REPAIR_DIR: &str = ".repair";
 const FRAGMENT_META_FILE: &str = ".fragment.ndx";
+pub(crate) const N1_ENGINE_FORMAT_VERSION: u16 = 3;
 const MANIFEST_FILE: &str = "manifest.ndx";
 const BINDING_FILE: &str = "binding.ndx";
 const SHARD_RECEIPT_PREFIX: &str = "shard_p";
@@ -49,6 +52,7 @@ static N1_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMeta {
+    pub engine_format_version: u16,
     pub stable_fragment_id: String,
     pub state: String,
     pub committed_bytes: u64,
@@ -79,7 +83,7 @@ pub(crate) enum TrashKind {
     Directory,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TrashRecord {
     pub trash_entry_id: String,
     pub original_path: String,
@@ -88,6 +92,16 @@ pub(crate) struct TrashRecord {
     pub object_keys: Vec<String>,
     pub version_ids: Vec<String>,
     pub deleted_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TrashReclaimReceipt {
+    pub operation_id: String,
+    pub fragment: String,
+    pub trash_entry_id: String,
+    pub object_ids: Vec<String>,
+    pub version_ids: Vec<String>,
+    pub prepared_at_unix: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +174,14 @@ fn encode_fragment_meta(meta: &FragmentMeta) -> Result<Vec<u8>, AppError> {
 }
 
 fn decode_fragment_meta(bytes: &[u8]) -> Result<FragmentMeta, AppError> {
-    Ok(rmp_serde::from_slice(bytes)?)
+    let meta = rmp_serde::from_slice::<FragmentMeta>(bytes)?;
+    if meta.engine_format_version != N1_ENGINE_FORMAT_VERSION {
+        return Err(AppError::Conflict(format!(
+            "fragment uses N1 engine format {}, but this binary requires format {}; N1 3.0 does not open or migrate earlier engine formats",
+            meta.engine_format_version, N1_ENGINE_FORMAT_VERSION
+        )));
+    }
+    Ok(meta)
 }
 
 fn index_roots() -> Vec<PathBuf> {
@@ -1392,68 +1413,223 @@ pub fn list_trash_versions(
     Ok(out)
 }
 
-pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
+fn trash_record_file(root: &Path, fragment: &str, trash_entry_id: &str) -> PathBuf {
+    fragment_root_on(root, fragment)
+        .join(TRASH_DIR)
+        .join(TRASH_RECORDS_DIR)
+        .join(format!("{trash_entry_id}.ndx"))
+}
+
+fn trash_reclaim_receipt_file(root: &Path, fragment: &str, operation_id: &str) -> PathBuf {
+    fragment_root_on(root, fragment)
+        .join(GC_DIR)
+        .join("trash-lifecycle")
+        .join(format!("{operation_id}.ndx"))
+}
+
+pub(crate) fn write_trash_record_for_fragment(
+    fragment: &str,
+    record: &TrashRecord,
+) -> Result<(), AppError> {
+    let bytes = encode(record)?;
+    let mut written = Vec::<PathBuf>::new();
+    for root in index_roots() {
+        let path = trash_record_file(&root, fragment, &record.trash_entry_id);
+        if let Err(err) = write_atomic(&path, &bytes) {
+            for written_path in written {
+                let _ = remove_file_if_exists(&written_path);
+                if let Some(parent) = written_path.parent() {
+                    sync_dir(parent);
+                }
+            }
+            return Err(err);
+        }
+        written.push(path);
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_trash_record(fragment: &str, trash_entry_id: &str) -> Result<(), AppError> {
+    for root in index_roots() {
+        let path = trash_record_file(&root, fragment, trash_entry_id);
+        if remove_file_if_exists(&path)? {
+            if let Some(parent) = path.parent() {
+                sync_dir(parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_trash_payload(fragment: &str, record: &TrashRecord) -> Result<(), AppError> {
+    for root in index_roots() {
+        let payload = fragment_root_on(&root, fragment)
+            .join(TRASH_DIR)
+            .join(&record.source_relative_path);
+        let meta = match fs::symlink_metadata(&payload) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_err(err, "inspect N1 expired trash payload")),
+        };
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(&payload).map_err(|e| io_err(e, "remove N1 expired trash file"))?;
+        } else if meta.is_dir() {
+            fs::remove_dir_all(&payload)
+                .map_err(|e| io_err(e, "remove N1 expired trash directory"))?;
+        }
+        if let Some(parent) = payload.parent() {
+            sync_dir(parent);
+        }
+    }
+    remove_trash_record(fragment, &record.trash_entry_id)
+}
+
+pub(crate) fn write_trash_reclaim_receipt(receipt: &TrashReclaimReceipt) -> Result<(), AppError> {
+    let bytes = encode(receipt)?;
+    for root in index_roots() {
+        write_atomic(
+            &trash_reclaim_receipt_file(&root, &receipt.fragment, &receipt.operation_id),
+            &bytes,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn list_trash_reclaim_receipts(
+    fragment: &str,
+) -> Result<Vec<TrashReclaimReceipt>, AppError> {
+    let mut receipts = BTreeMap::<String, TrashReclaimReceipt>::new();
+    for root in index_roots() {
+        let dir = fragment_root_on(&root, fragment)
+            .join(GC_DIR)
+            .join("trash-lifecycle");
+        if !dir.is_dir() {
+            continue;
+        }
+        for name in read_dir_names(&dir)? {
+            if !name.ends_with(".ndx") {
+                continue;
+            }
+            let path = dir.join(name);
+            let receipt: TrashReclaimReceipt =
+                decode(&fs::read(&path).map_err(|e| io_err(e, "read N1 trash reclaim receipt"))?)?;
+            match receipts.entry(receipt.operation_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(receipt);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &receipt => {
+                    return Err(AppError::Conflict(format!(
+                        "divergent N1 trash reclaim receipt replica for operation {}",
+                        receipt.operation_id
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    Ok(receipts.into_values().collect())
+}
+
+pub(crate) fn remove_trash_reclaim_receipt(
+    fragment: &str,
+    operation_id: &str,
+) -> Result<(), AppError> {
+    for root in index_roots() {
+        let path = trash_reclaim_receipt_file(&root, fragment, operation_id);
+        if remove_file_if_exists(&path)? {
+            if let Some(parent) = path.parent() {
+                sync_dir(parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn stored_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
+    let mut records = BTreeMap::<String, TrashRecord>::new();
+    for root in existing_fragment_roots(fragment) {
+        let dir = root.join(TRASH_DIR).join(TRASH_RECORDS_DIR);
+        if !dir.is_dir() {
+            continue;
+        }
+        for name in read_dir_names(&dir)? {
+            if !name.ends_with(".ndx") {
+                continue;
+            }
+            let path = dir.join(name);
+            let record: TrashRecord =
+                decode(&fs::read(&path).map_err(|e| io_err(e, "read N1 trash lifecycle record"))?)?;
+            match records.entry(record.trash_entry_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &record => {
+                    return Err(AppError::Conflict(format!(
+                        "divergent N1 trash lifecycle record replica for entry {}",
+                        record.trash_entry_id
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    Ok(records.into_values().collect())
+}
+
+pub(crate) fn hydrate_trash_record(
+    fragment: &str,
+    mut record: TrashRecord,
+) -> Result<TrashRecord, AppError> {
+    let mut object_ids = BTreeSet::new();
+    let mut version_ids = BTreeSet::new();
     for fragment_root in existing_fragment_roots(fragment) {
         let index_root = fragment_root
             .parent()
             .unwrap_or(&fragment_root)
             .to_path_buf();
-        let trash_root = fragment_root.join(TRASH_DIR);
-        let mut stack = vec![(trash_root.clone(), String::new())];
-        while let Some((dir, rel)) = stack.pop() {
-            if !dir.is_dir() {
-                continue;
-            }
-            for name in read_dir_names(&dir)? {
-                if internal_namespace_entry_name(&name) && name != OBJECTS_DIR {
-                    continue;
-                }
-                let child = dir.join(&name);
-                let child_rel = if rel.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel}/{name}")
-                };
-                if let Some(object_id) =
-                    read_namespace_symlink_object_id(&index_root, fragment, &child)?
-                {
-                    let mut object_keys = BTreeSet::new();
-                    let mut version_ids = BTreeSet::new();
-                    let mut deleted_at = Utc::now().timestamp();
-                    let Some(object_dir) = object_dir_candidates(fragment, &object_id)?
-                        .into_iter()
-                        .find(|dir| dir.is_dir())
-                    else {
-                        continue;
-                    };
-                    for ndx_name in read_dir_names(&object_dir)? {
-                        if parse_ndx_file_name(&ndx_name).is_none() {
-                            continue;
-                        }
-                        let meta = decode_metadata_file(&object_dir.join(&ndx_name))?;
-                        deleted_at = meta.created_at;
-                        object_keys.insert(object_id.clone());
+        let payload = fragment_root
+            .join(TRASH_DIR)
+            .join(&record.source_relative_path);
+        if fs::symlink_metadata(&payload).is_err() {
+            continue;
+        }
+        let mut stack = vec![payload];
+        while let Some(current) = stack.pop() {
+            if let Some(object_id) =
+                read_namespace_symlink_object_id(&index_root, fragment, &current)?
+            {
+                if object_ids.insert(object_id.clone()) {
+                    for meta in list_live_versions(fragment, &object_id)? {
                         version_ids.insert(meta.version_id);
                     }
-                    if seen.insert(child_rel.clone()) {
-                        out.push(TrashRecord {
-                            trash_entry_id: child_rel.clone(),
-                            original_path: child_rel.clone(),
-                            source_relative_path: child_rel,
-                            kind: TrashKind::File,
-                            object_keys: object_keys.into_iter().collect(),
-                            version_ids: version_ids.into_iter().collect(),
-                            deleted_at_unix: deleted_at,
-                        });
-                    }
-                } else if child.is_dir() {
-                    stack.push((child, child_rel));
                 }
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(&current) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            for name in read_dir_names(&current)? {
+                if internal_namespace_entry_name(&name) {
+                    continue;
+                }
+                stack.push(current.join(name));
             }
         }
+        break;
     }
+    record.object_keys = object_ids.into_iter().collect();
+    record.version_ids = version_ids.into_iter().collect();
+    Ok(record)
+}
+
+pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
+    let mut out = stored_trash_records(fragment)?
+        .into_iter()
+        .map(|record| hydrate_trash_record(fragment, record))
+        .collect::<Result<Vec<_>, _>>()?;
     out.sort_by(|a, b| a.source_relative_path.cmp(&b.source_relative_path));
     Ok(out)
 }
@@ -1705,18 +1881,30 @@ pub(crate) fn delete_unreferenced_object_index(
     Ok(removed)
 }
 
-pub(crate) fn cleanup_unreferenced_object_indexes(fragment: &str) -> Result<usize, AppError> {
+pub(crate) fn delete_unreferenced_object_indexes_batch(
+    fragment: &str,
+    candidates: &[String],
+) -> Result<Vec<String>, AppError> {
     let referenced = referenced_object_ids(fragment)?;
-    let mut removed = 0usize;
-    let mut seen = HashSet::new();
-    for root in blob_roots() {
-        for (_, object_id) in local_object_dirs_under_root(&root, fragment)? {
-            if referenced.contains(&object_id) || !seen.insert(object_id.clone()) {
+    let mut removed = Vec::new();
+    for object_id in candidates.iter().collect::<BTreeSet<_>>() {
+        let object_id = normalize_object_id(object_id)?;
+        if referenced.contains(&object_id) {
+            continue;
+        }
+        let mut object_removed = false;
+        for dir in object_dir_candidates(fragment, &object_id)? {
+            if !dir.exists() {
                 continue;
             }
-            if delete_unreferenced_object_index(fragment, &object_id)? {
-                removed += 1;
+            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "reclaim N1 expired trash object"))?;
+            object_removed = true;
+            if let Some(parent) = dir.parent() {
+                sync_dir(parent);
             }
+        }
+        if object_removed {
+            removed.push(object_id);
         }
     }
     Ok(removed)
@@ -1859,36 +2047,6 @@ pub fn restore_objects_from_trash_manifest_batch(
     Ok(out)
 }
 
-pub fn delete_all_trash_versions_for_key(
-    fragment: &str,
-    object_key: &str,
-) -> Result<Option<Vec<String>>, AppError> {
-    let records = scan_trash_records(fragment)?;
-    let object_ids = records
-        .iter()
-        .find(|record| {
-            record.original_path == object_key
-                || record.object_keys.iter().any(|id| id == object_key)
-        })
-        .map(|record| record.object_keys.clone())
-        .unwrap_or_else(|| vec![object_key.to_string()]);
-    let mut ids = Vec::new();
-    for object_id in &object_ids {
-        for meta in list_trash_versions(fragment, object_id)? {
-            if !ids.contains(&meta.version_id) {
-                ids.push(meta.version_id);
-            }
-        }
-    }
-    if ids.is_empty() {
-        return Ok(None);
-    }
-    for object_id in object_ids {
-        delete_unreferenced_object_index(fragment, &object_id)?;
-    }
-    Ok(Some(ids))
-}
-
 pub fn delete_object_fast(
     fragment: &str,
     object_id: &str,
@@ -1908,140 +2066,6 @@ pub fn delete_object_fast(
     }
     delete_unreferenced_object_index(fragment, object_id)?;
     Ok((!ids.is_empty()).then_some(ids))
-}
-
-pub fn delete_live_version(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-) -> Result<bool, AppError> {
-    let mut removed = false;
-    for dir in object_dir_candidates(fragment, object_key)? {
-        if let Some(path) = ndx_path_for_version(&dir, version_id)? {
-            removed |= remove_file_if_exists(&path)?;
-        }
-        let payload_dir = dir.join(version_id);
-        if payload_dir.is_dir() {
-            fs::remove_dir_all(&payload_dir)
-                .map_err(|e| io_err(e, "delete N1 object version payload"))?;
-            removed = true;
-        }
-        if dir.is_dir()
-            && fs::read_dir(&dir)
-                .map_err(|e| io_err(e, "inspect N1 object dir after version delete"))?
-                .next()
-                .is_none()
-        {
-            fs::remove_dir(&dir).map_err(|e| io_err(e, "remove empty N1 object dir"))?;
-        }
-    }
-    Ok(removed)
-}
-
-pub fn delete_trash_version(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-) -> Result<bool, AppError> {
-    let mut removed = false;
-    for dir in object_dir_candidates(fragment, object_key)? {
-        if let Some(path) = ndx_path_for_version(&dir, version_id)? {
-            removed |= remove_file_if_exists(&path)?;
-        }
-        let payload_dir = dir.join(version_id);
-        if payload_dir.is_dir() {
-            fs::remove_dir_all(&payload_dir)
-                .map_err(|e| io_err(e, "delete N1 trashed object version payload"))?;
-            removed = true;
-        }
-        if dir.is_dir()
-            && fs::read_dir(&dir)
-                .map_err(|e| io_err(e, "inspect N1 object dir after trash delete"))?
-                .next()
-                .is_none()
-        {
-            fs::remove_dir(&dir).map_err(|e| io_err(e, "remove empty N1 object dir"))?;
-        }
-    }
-    Ok(removed)
-}
-
-pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<(), AppError> {
-    if let Some(key) = object_key {
-        let _ = delete_unreferenced_object_index(fragment, key)?;
-        return Ok(());
-    }
-    for root in index_roots() {
-        let path = fragment_root_on(&root, fragment).join(TRASH_DIR);
-        if path.exists() {
-            fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear N1 trash object dir"))?;
-        }
-        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate N1 trash object dir"))?;
-    }
-    let _ = cleanup_unreferenced_object_indexes(fragment)?;
-    Ok(())
-}
-
-pub fn drop_fragment_trash_namespace(fragment: &str) -> Result<(), AppError> {
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
-        let path = fragment_root.join(TRASH_DIR);
-        if path.exists() {
-            fs::remove_dir_all(&path).map_err(|e| io_err(e, "drop N1 trash namespace"))?;
-        }
-        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate N1 trash namespace"))?;
-        sync_dir(&fragment_root);
-    }
-    Ok(())
-}
-
-pub(crate) fn retire_fragment_trash_namespace(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
-    let suffix = format!("{}-{}", Utc::now().timestamp_millis(), std::process::id());
-    let mut retired_roots = Vec::new();
-
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
-        fs::create_dir_all(&fragment_root).map_err(|e| io_err(e, "create N1 fragment root"))?;
-
-        let trash_root = fragment_root.join(TRASH_DIR);
-        let retired_parent = fragment_root.join(GC_DIR);
-        fs::create_dir_all(&retired_parent)
-            .map_err(|e| io_err(e, "create N1 retired trash root"))?;
-
-        if trash_root.exists() {
-            let retired_root = retired_parent.join(format!("{TRASH_DIR}.retired.{suffix}"));
-            if retired_root.exists() {
-                fs::remove_dir_all(&retired_root)
-                    .map_err(|e| io_err(e, "replace retired N1 trash namespace"))?;
-            }
-            renameat(CWD, &trash_root, CWD, &retired_root).map_err(|e| {
-                AppError::InternalServerError(format!("retire N1 trash namespace: {e}"))
-            })?;
-            retired_roots.push(retired_root);
-        }
-
-        fs::create_dir_all(&trash_root).map_err(|e| io_err(e, "recreate N1 trash namespace"))?;
-        sync_dir(&fragment_root);
-        sync_dir(&retired_parent);
-    }
-
-    Ok(retired_roots)
-}
-
-pub fn clear_fragment_trash_for_partitions(
-    fragment: &str,
-    _touched_partitions: &BTreeSet<u16>,
-) -> Result<usize, AppError> {
-    clear_fragment_trash(fragment, None)?;
-    Ok(1)
-}
-
-pub fn clear_fragment_trash_partition(
-    fragment: &str,
-    _partition_id: u16,
-) -> Result<usize, AppError> {
-    clear_fragment_trash(fragment, None)?;
-    Ok(1)
 }
 
 pub fn object_partition_id(_fragment: &str, object_key: &str) -> Result<u16, AppError> {
@@ -2756,6 +2780,7 @@ mod tests {
     #[test]
     fn fragment_meta_encoding_is_named_and_requires_stable_identity() {
         let meta = FragmentMeta {
+            engine_format_version: N1_ENGINE_FORMAT_VERSION,
             stable_fragment_id: "01KSTABLEFRAGMENT000000000".to_string(),
             state: "active".to_string(),
             committed_bytes: 0,
@@ -2777,8 +2802,81 @@ mod tests {
         );
         let decoded = decode_fragment_meta(&encoded).expect("decode named fragment metadata");
         assert_eq!(decoded.stable_fragment_id, meta.stable_fragment_id);
+        assert_eq!(decoded.engine_format_version, N1_ENGINE_FORMAT_VERSION);
         assert_eq!(decoded.state, "active");
         assert_eq!(decoded.index_partition_count, 64);
+    }
+
+    #[test]
+    fn fragment_meta_rejects_pre_n1_3_engine_format() {
+        #[derive(Serialize)]
+        struct PreviousEngineMeta<'a> {
+            engine_format_version: u16,
+            stable_fragment_id: &'a str,
+            state: &'a str,
+            committed_bytes: u64,
+            reserved_bytes: u64,
+            trash_bytes: u64,
+            created_at_unix: i64,
+            updated_at_unix: i64,
+            key_phc: Option<&'a str>,
+            nt_hash_hex: Option<&'a str>,
+            index_partition_count: u16,
+        }
+
+        let raw = rmp_serde::to_vec_named(&PreviousEngineMeta {
+            engine_format_version: 2,
+            stable_fragment_id: "01KPREVIOUSENGINE000000000",
+            state: "active",
+            committed_bytes: 0,
+            reserved_bytes: 0,
+            trash_bytes: 0,
+            created_at_unix: 1,
+            updated_at_unix: 2,
+            key_phc: None,
+            nt_hash_hex: None,
+            index_partition_count: 64,
+        })
+        .expect("encode previous engine metadata");
+
+        let err = decode_fragment_meta(&raw).expect_err("N1 2 engine must fail closed");
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[test]
+    fn fragment_meta_rejects_missing_engine_format() {
+        #[derive(Serialize)]
+        struct UnversionedMeta<'a> {
+            stable_fragment_id: &'a str,
+            state: &'a str,
+            committed_bytes: u64,
+            reserved_bytes: u64,
+            trash_bytes: u64,
+            created_at_unix: i64,
+            updated_at_unix: i64,
+            key_phc: Option<&'a str>,
+            nt_hash_hex: Option<&'a str>,
+            index_partition_count: u16,
+        }
+
+        let raw = rmp_serde::to_vec_named(&UnversionedMeta {
+            stable_fragment_id: "01KUNVERSIONED00000000000",
+            state: "active",
+            committed_bytes: 0,
+            reserved_bytes: 0,
+            trash_bytes: 0,
+            created_at_unix: 1,
+            updated_at_unix: 2,
+            key_phc: None,
+            nt_hash_hex: None,
+            index_partition_count: 64,
+        })
+        .expect("encode unversioned metadata");
+
+        assert!(
+            decode_fragment_meta(&raw).is_err(),
+            "unversioned pre-N1 3 metadata must fail closed"
+        );
     }
 
     fn test_metadata(fragment: &str, object_key: &str, size: u64) -> ObjectMetadata {

@@ -39,6 +39,8 @@ struct Args {
     colocated_roots: bool,
     #[arg(long, default_value_t = 10_800)]
     job_timeout_seconds: u64,
+    #[arg(long, default_value_t = 60)]
+    trash_retention_seconds: u64,
     #[arg(long, default_value_t = 2)]
     large_copies: usize,
     #[arg(long, default_value_t = 10_000)]

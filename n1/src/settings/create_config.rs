@@ -22,7 +22,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
         .set("file_ttl_seconds", "3600")
-        .set("retention_seconds", "2592000");
+        .set("trash_retention_seconds", "2592000");
 
     conf.with_section(Some("set_limits"))
         .set("max_file_size", "5368709120");
@@ -101,6 +101,11 @@ mod tests {
         let io_control = ini.section(Some("io_control")).expect("io_control section");
         assert_eq!(io_control.get("foreground_wait_timeout_ms"), Some("30000"));
         assert_eq!(io_control.get("stall_threshold_ms"), Some("20000"));
+        let gc = ini
+            .section(Some("garbage_collector"))
+            .expect("garbage_collector section");
+        assert_eq!(gc.get("trash_retention_seconds"), Some("2592000"));
+        assert!(gc.get("retention_seconds").is_none());
 
         let _ = fs::remove_file(path);
     }

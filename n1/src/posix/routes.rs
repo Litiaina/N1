@@ -250,49 +250,6 @@ async fn posix_recover(
     }))
 }
 
-async fn posix_purge(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Json(req): Json<PosixPathRequest>,
-) -> Result<Json<PosixMutationResponse>, AppError> {
-    if !claims.delete {
-        return Err(AppError::Forbidden("Delete permission required".into()));
-    }
-    let summary = match req.trash_entry_id.as_deref().map(str::trim) {
-        Some(trash_entry_id) if !trash_entry_id.is_empty() => {
-            global_namespace_runtime()
-                .purge_trash_entry_id(&claims.fragment, trash_entry_id)
-                .await?
-        }
-        _ => {
-            global_namespace_runtime()
-                .purge_trash_path(&claims.fragment, &req.path)
-                .await?
-        }
-    };
-    state.emit(
-        &claims.fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &claims.fragment,
-            summary.clone(),
-        )),
-    );
-    Ok(Json(PosixMutationResponse {
-        operation: summary.operation,
-        kind: match summary.kind {
-            NamespaceEntryKind::File => PosixNodeKind::File,
-            NamespaceEntryKind::Directory => PosixNodeKind::Directory,
-        },
-        affected: summary.affected_paths,
-        path: summary.source_path,
-        source_path: None,
-        destination_path: None,
-        created: None,
-        trash_entry_id: summary.trash_entry_id,
-        deleted_at_unix: summary.deleted_at_unix,
-    }))
-}
-
 pub fn build_posix_read_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/n1/posix/list", get(posix_list))
@@ -306,5 +263,4 @@ pub fn build_posix_write_routes() -> Router<Arc<AppState>> {
         .route("/n1/posix/move", post(posix_rename))
         .route("/n1/posix/trash", post(posix_trash))
         .route("/n1/posix/recover", post(posix_recover))
-        .route("/n1/posix/purge", post(posix_purge))
 }

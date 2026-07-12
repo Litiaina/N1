@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 2.0.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 3.0.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -12,7 +12,7 @@ For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). For release 
 - **Namespace:** The user-facing tree of folders and files. This is what `/n1/posix/*` and the UI show.
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
-- **Trash:** Soft delete moves namespace entries into `.trash`. Trash listing reads `.trash`. Recover moves paths back to live namespace. Hard delete and empty trash remove `.trash` paths first; GC later reclaims blob bytes that no remaining namespace metadata references.
+- **Trash:** Soft delete moves namespace entries into `.trash` under unique lifecycle ids. Recover moves retained paths back to the live namespace. Configured TTL expiry removes namespace references and directly reclaims only safely unreferenced immutable objects.
 - **Repair:** Rebuilds missing namespace/control replicas, immutable object metadata placements, and shard/parity payload when enough data remains.
 - **Redistribution:** Explicitly rewrites selected object versions into the current blob/EC topology. Existing objects remain valid under their recorded topology until redistributed.
 
@@ -121,6 +121,11 @@ index_store_disks=/mnt/disk-00,/mnt/disk-01
 blob_store_disks=/mnt/disk-00,/mnt/disk-01
 fs_storage_path=/home/administrator/Server Deploy Test/fs-disk
 
+[garbage_collector]
+cleanup_interval_seconds=3600
+file_ttl_seconds=3600
+trash_retention_seconds=2592000
+
 [upload_config]
 data_shards=1
 parity_shards=1
@@ -154,7 +159,7 @@ the placement-limiting disk are both considered before writes proceed.
 
 ### Fragment Identity Layout
 
-N1 2.0.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
+N1 3.0.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
 
 ```text
 <index_root>/
@@ -182,7 +187,7 @@ The `.fragment/<fragment_hash>` symlink is the mount/auth alias. The `@f_<stable
 
 Object `.ndx` metadata is stored only on blob roots that carry a shard or parity file for that version. The metadata and EC payload therefore share one durability topology. Index-only roots do not carry object metadata capacity.
 
-N1 2.0.0 does not read or migrate N1 1.x disk layouts.
+N1 3.0.0 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh N1 3.0 fragments; an incompatible fragment fails closed.
 
 ## Quick Start
 
@@ -297,17 +302,18 @@ Fragment tokens carry independent permissions:
 - HTTPS is the universal API face for consumers and broad compatibility. `n1://` is the native N1 protocol face for N1 Console, N1 Shell, NS, N2, and heavy internal clients.
 - Large files should use multipart upload. One-shot upload is intended for smaller objects.
 - `version_id` is the persistent upload/object-version id. Multipart part upload and status use `version_id`; finalize also requires the `session_id` returned by init.
-- Empty trash and hard delete remove namespace references first. Blob bytes are reclaimed after GC proves no live or trash metadata references them.
+- Delete is always a soft delete. Trash remains recoverable until `trash_retention_seconds` expires; there is no manual empty-trash or hard-delete API.
+- Normal trash reclamation scans only `.trash`, removes expired namespace entries, verifies reference safety, and directly reclaims the exact unreferenced object ids.
 - Object status/repair is object-scoped. A repair or scrub for one object does not lock the whole fragment.
 - When an operation returns `503 Service Unavailable`, retry later. This can mean maintenance is running, object maintenance gates are saturated, or disk provisioning prevents safe progress.
 
 ## Native N1 Protocol
 
-N1 2.0.0 includes the native N1 protocol:
+N1 3.0.0 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
-protocol: n1/0.4
+protocol: n1/0.5
 ```
 
 HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 Shell, NS, N2, and trusted services that need lower latency than HTTPS for namespace, control-plane, and data-plane calls.
@@ -316,7 +322,8 @@ The native protocol does not create another storage engine, another namespace, a
 
 Rust clients should use the workspace `n1_native_client` crate instead of reimplementing frames. The crate owns native URL parsing, MessagePack frame IO, fragment authentication, typed operation calls, raw upload bodies, and raw streaming response reads.
 
-`n1/0.4` supports the native data plane:
+`n1/0.5` supports the native data plane. It removes manual purge, empty-trash,
+and version-delete operations as part of the N1 3.0 lifecycle contract:
 
 - `upload.one_shot`
 - `multipart.init`
@@ -332,11 +339,8 @@ Rust clients should use the workspace `n1_native_client` crate instead of reimpl
 - `object.rename`
 - `object.delete`
 - `object.recover`
-- `object.purge`
-- `object.version.recover`
 - `object.bulk_delete`
 - `object.bulk_recover`
-- `object.bulk_purge`
 - `object.download_chunk`
 - `object.download`
 - `object.download_stream`
@@ -437,7 +441,6 @@ Namespace/POSIX:
 - `namespace.rename`
 - `namespace.trash`
 - `namespace.recover`
-- `namespace.purge`
 
 Object:
 
@@ -446,12 +449,10 @@ Object:
 - `object.repair`
 - `object.delete`
 - `object.recover`
-- `object.purge`
 
 Trash:
 
 - `trash.list`
-- `trash.empty`
 - `trash.recover_all`
 
 Multipart:
@@ -507,7 +508,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 2.0.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.0.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -840,16 +841,6 @@ Body:
 { "path": "archive/clip.mp4" }
 ```
 
-### `POST /n1/posix/purge`
-
-Hard deletes a trash path by removing it from `.trash`. GC reclaims blob bytes later after no live or trash namespace path references the object metadata.
-
-Body:
-
-```json
-{ "path": "archive/clip.mp4" }
-```
-
 ## Object API
 
 These routes accept namespace paths. N1 resolves them to stable object identities internally.
@@ -950,21 +941,9 @@ Public signed read endpoint. The signed URL generator returns the full URL.
 
 Soft deletes a file or folder.
 
-### `DELETE /n1/objects/permanent/{object_key}`
-
-Hard deletes a trash path.
-
 ### `POST /n1/objects/recover/{object_key}`
 
 Recovers a trash path.
-
-### `DELETE /n1/objects/version/{version_id}/{object_key}`
-
-Deletes one object version.
-
-### `POST /n1/objects/recover/version/{version_id}/{object_key}`
-
-Recovers one object version when available.
 
 ### `POST /n1/objects/rename`
 
@@ -988,14 +967,6 @@ Body:
 ```
 
 ### `POST /n1/objects/bulk-recover`
-
-Body:
-
-```json
-{ "object_keys": ["a.txt", "b.txt"] }
-```
-
-### `POST /n1/objects/permanent/bulk-delete`
 
 Body:
 
@@ -1172,17 +1143,18 @@ Query parameters:
 
 ## Trash And Recovery
 
-Soft delete moves a file or folder into `.trash`. Live listing no longer shows it. Trash listing is derived from the `.trash` namespace itself: a deleted file is listed as that file, and a deleted folder is listed as that folder, without a separate trash metadata plane.
+Soft delete moves a file or folder into the internal `.trash` namespace and assigns a unique `trash_entry_id`. Live listing no longer shows it. The lifecycle record stores its original path, deletion time, kind, and internal payload location. Multiple deleted generations of the same path can coexist and be recovered independently by id.
 
-Hard delete removes trash namespace entries. Bytes are returned after GC determines no live or trash namespace path references the blob versions.
+Recovery is allowed only while the configured `trash_retention_seconds` has not expired. Folder soft delete remains a directory rename; N1 does not scan descendants until that retained folder reaches expiry.
 
-N1 2.0.0 keeps trash state single-sourced in the namespace. There is no separate persisted trash metadata plane. This avoids split-brain behavior where secondary delete-state metadata says one thing while the namespace says another.
+The background lifecycle scans `.trash`, not the full blob plane. For an expired entry it writes a durable reclamation receipt, removes the namespace reference, verifies that each candidate object id has no live or remaining trash reference, directly reclaims safe immutable object directories, and then clears the receipt. Interrupted work is retried from the receipt.
 
-Empty trash:
+N1 3.0.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
 
-```bash
-curl -k -X DELETE "$BASE/n1/trash/empty" "${AUTH[@]}"
-```
+Legacy HTTP clients receive `410 Gone` from the retired destructive routes.
+This explicit tombstone prevents a former `/objects/permanent/...` URL from
+falling through to the ordinary object-key catch-all. Removed native operation
+names fail as unsupported requests.
 
 Recover all trash:
 
@@ -1190,12 +1162,7 @@ Recover all trash:
 curl -k -X POST "$BASE/n1/trash/recover-all" "${AUTH[@]}"
 ```
 
-Status routes:
-
-```http
-GET /n1/maintenance/trash/empty/status
-GET /n1/maintenance/trash/recover/status
-```
+Lifecycle state is reported in the system health `maintenance` object through `trash_lifecycle_running`, `trash_lifecycle_phase`, `trash_retention_seconds`, and `trash_versions_expired`.
 
 ## Health, Repair, GC, And Redistribution
 
@@ -1394,13 +1361,9 @@ Common operations:
 - `rename`
 - `trash`
 - `recover`
-- `purge_trash`
-- `empty_trash`
 - `recover_all`
-- `delete_version`
 - `bulk_delete`
 - `bulk_recover`
-- `bulk_delete_permanent`
 
 ## Error Handling
 
@@ -1429,9 +1392,9 @@ writable by the N1 service user.
 
 The upload IO gate is protecting the server. Retry with backoff or lower client concurrency. On slow mixed disks, this is a backpressure signal, not a data-loss event.
 
-### Empty trash does not immediately free bytes
+### Deleted data has not been reclaimed yet
 
-This is expected. Empty trash retires the `.trash` namespace quickly and recreates an empty `.trash`. GC later reclaims unreferenced object metadata and blob payloads.
+This is expected while the configured `trash_retention_seconds` has not elapsed. N1 deliberately preserves the entry for recovery. After expiry, the targeted lifecycle scan removes the `.trash` entry and directly reclaims object data only when no other namespace reference remains. Manual GC does not shorten this window.
 
 ### Redistribution fails with insufficient storage
 

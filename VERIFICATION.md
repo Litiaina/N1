@@ -12,7 +12,7 @@ Before an LTS release, N1 should pass:
 - download hash match
 - range/view streaming
 - CRUD and POSIX namespace operations
-- trash/recover/hard-delete/GC lifecycle
+- unique-id trash, pre-TTL recover, TTL expiry, targeted reclamation, and removed purge surfaces
 - recover-on-read after one disk is wiped
 - repair after simulated disk loss or reformat
 - redistribution `2 roots -> 1 root -> 2 roots`
@@ -150,8 +150,8 @@ The full LTS proof should include:
 - range/view streaming checks
 - disk wipe, disk removal/re-add, repair, and health refresh
 - redistribution after disk topology changes
-- GC after hard delete and orphaned upload cancellation
-- trash/recover with path-based namespace truth and no second trash metadata plane
+- targeted TTL reclamation plus explicit orphan GC after upload cancellation
+- trash/recover by unique trash entry id with lifecycle context stored inside `.trash`
 - 10k+ object namespace storm
 - four concurrent users on one fragment doing upload, mkdir, rename, move, trash, recover, and listing
 - four concurrent users across four fragments

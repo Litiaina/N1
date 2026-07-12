@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-pub const N1_NATIVE_PROTOCOL_VERSION: &str = "n1/0.4";
+pub const N1_NATIVE_PROTOCOL_VERSION: &str = "n1/0.5";
 pub const MAX_NATIVE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_NATIVE_BODY_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_NATIVE_FULL_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;

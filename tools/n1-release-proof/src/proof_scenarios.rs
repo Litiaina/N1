@@ -168,6 +168,7 @@ impl Proof {
             "source_sha256": local_sha,
             "download_sha256": downloaded_sha,
             "max_part_size": self.args.max_part_size,
+            "trash_retention_seconds": self.args.trash_retention_seconds,
             "rate_limiter_enabled": self.args.rate_limiter_enabled,
             "native_protocol": native_protocol,
             "upload": upload,

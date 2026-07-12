@@ -84,7 +84,7 @@ impl Proof {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.get("protocol").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_default();
-        if protocol != "n1/0.4" {
+        if protocol != "n1/0.5" {
             return Err(format!("native ping returned unexpected protocol '{protocol}'").into());
         }
 
@@ -386,7 +386,7 @@ impl Proof {
         )
         .await?;
         ensure_native_status(&recover_upload, 201, "native version recover upload")?;
-        let recover_version_id = native_json_body(&recover_upload)?
+        let _recover_version_id = native_json_body(&recover_upload)?
             .get("version_id")
             .and_then(Value::as_str)
             .ok_or("native version recover upload missing version_id")?
@@ -407,16 +407,13 @@ impl Proof {
             &native_round_trip(
                 &mut stream,
                 "native-version-recover",
-                "object.version.recover",
-                json!({
-                    "object_key": recover_version_key,
-                    "version_id": recover_version_id,
-                }),
+                "object.recover",
+                json!({"object_key": recover_version_key}),
                 None,
             )
             .await?,
             200,
-            "native version recover",
+            "native retained object recover",
         )?;
         self.assert_download_sha256(&recover_version_key, &recover_sha)
             .await?;
@@ -478,18 +475,28 @@ impl Proof {
             200,
             "native bulk delete before purge",
         )?;
-        ensure_native_status(
-            &native_round_trip(
+        let rejected_bulk_purge = native_round_trip(
                 &mut stream,
                 "native-bulk-purge",
                 "object.bulk_purge",
-                json!({"object_keys": [bulk_a, bulk_b]}),
+                json!({"object_keys": [bulk_a.clone(), bulk_b.clone()]}),
+                None,
+            )
+            .await?;
+        ensure_native_rejected(&rejected_bulk_purge, "removed native bulk purge")?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-bulk-recover-after-rejected-purge",
+                "object.bulk_recover",
+                json!({"object_keys": [bulk_a.clone(), bulk_b.clone()]}),
                 None,
             )
             .await?,
             200,
-            "native bulk purge",
+            "native bulk recover after rejected purge",
         )?;
+        live_object_keys.extend([bulk_a, bulk_b]);
 
         let cancel_key = format!("{}native-protocol/cancel-me.bin", self.args.prefix);
         let cancel_init = native_round_trip(
@@ -648,17 +655,26 @@ impl Proof {
             200,
             "native trash before purge",
         )?;
-        ensure_native_status(
-            &native_round_trip(
+        let rejected_namespace_purge = native_round_trip(
                 &mut stream,
                 "native-purge",
                 "namespace.purge",
                 json!({"path": renamed_dir}),
                 None,
             )
+            .await?;
+        ensure_native_rejected(&rejected_namespace_purge, "removed native namespace purge")?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-recover-after-rejected-purge",
+                "namespace.recover",
+                json!({"path": renamed_dir}),
+                None,
+            )
             .await?,
             200,
-            "native purge",
+            "native recover after rejected purge",
         )?;
 
         ensure_native_status(
@@ -797,7 +813,7 @@ impl Proof {
                 "namespace.rename",
                 "namespace.trash",
                 "namespace.recover",
-                "namespace.purge",
+                "namespace.purge (rejected by N1 3.0)",
                 "upload.one_shot",
                 "multipart.init",
                 "multipart.put_part",
@@ -813,10 +829,9 @@ impl Proof {
                 "object.status",
                 "object.repair",
                 "object.rename",
-                "object.version.recover",
                 "object.bulk_delete",
                 "object.bulk_recover",
-                "object.bulk_purge",
+                "object.bulk_purge (rejected by N1 3.0)",
                 "fragment.usage",
                 "capacity.usage",
                 "maintenance.gc.status",
@@ -1028,6 +1043,51 @@ fn ensure_native_status(
             String::from_utf8_lossy(response.body.as_ref().map(|body| body.as_slice()).unwrap_or_default())
         )
         .into())
+    }
+}
+
+fn ensure_native_rejected(response: &NativeProofResponse, label: &str) -> ProofResult<()> {
+    // Unknown/retired native operations are protocol errors, not HTTP
+    // responses, and therefore legitimately carry no numeric HTTP status.
+    if !response.ok && response.error.is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} unexpectedly remained available: status={:?} ok={} error={}",
+            response.status,
+            response.ok,
+            native_error_string(response)
+        )
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod native_rejection_tests {
+    use super::*;
+
+    fn response(ok: bool, status: Option<u16>, error: Option<Value>) -> NativeProofResponse {
+        NativeProofResponse {
+            id: "test".to_string(),
+            ok,
+            status,
+            payload: None,
+            body: None,
+            body_len: None,
+            error,
+        }
+    }
+
+    #[test]
+    fn unknown_operation_without_http_status_is_rejected() {
+        let rejected = response(false, None, Some(json!({"code": "unknown_op"})));
+        ensure_native_rejected(&rejected, "retired op").expect("must accept protocol rejection");
+    }
+
+    #[test]
+    fn successful_operation_is_not_a_rejection() {
+        let accepted = response(true, Some(200), None);
+        assert!(ensure_native_rejected(&accepted, "retired op").is_err());
     }
 }
 

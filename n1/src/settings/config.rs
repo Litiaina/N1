@@ -6,7 +6,7 @@ use crate::settings::constants::CONFIG_FILE;
 pub struct GarbageCollectorConfig {
     pub cleanup_interval_seconds: u64,
     pub file_ttl_seconds: u64,
-    pub retention_seconds: u64,
+    pub trash_retention_seconds: u64,
 }
 
 pub struct Config {
@@ -33,17 +33,17 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         .parse()
         .expect("'file_ttl_seconds' must be a valid positive integer.");
 
-    let retention_seconds: u64 = gc_section
-        .get("retention_seconds")
-        .expect("Missing 'retention_seconds' in [garbage_collector] section")
+    let trash_retention_seconds: u64 = gc_section
+        .get("trash_retention_seconds")
+        .expect("Missing 'trash_retention_seconds' in [garbage_collector] section")
         .parse()
-        .expect("'retention_seconds' must be a valid positive integer.");
+        .expect("'trash_retention_seconds' must be a valid non-negative integer.");
 
     Config {
         garbage_collector: GarbageCollectorConfig {
             cleanup_interval_seconds,
             file_ttl_seconds,
-            retention_seconds,
+            trash_retention_seconds,
         },
     }
 });

@@ -44,6 +44,12 @@ impl Proof {
         if self.args.multi_fragment_files_per_user == 0 {
             return Err("multi_fragment_files_per_user must be at least 1".into());
         }
+        if self.args.trash_retention_seconds < 5 {
+            return Err(
+                "trash_retention_seconds must be at least 5 for deterministic recovery proofs"
+                    .into(),
+            );
+        }
         for root in &roots {
             if !root.is_dir() {
                 return Err(format!("disk root does not exist: {}", root.display()).into());
@@ -167,7 +173,7 @@ max_loaded_dbs=auto
 [garbage_collector]
 cleanup_interval_seconds=86400
 file_ttl_seconds=30
-retention_seconds=2592000
+trash_retention_seconds={}
 
 [set_limits]
 max_file_size=1099511627776
@@ -212,6 +218,7 @@ stripe_block_size=262144
             index_roots,
             blob_roots,
             self.args.out_dir.join("fs").display(),
+            self.args.trash_retention_seconds,
             self.args.rate_limiter_enabled,
             self.args.max_part_size,
             self.data_shards,

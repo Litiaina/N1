@@ -592,18 +592,6 @@ pub async fn restore_objects_from_trash_manifest_batch(
     .await
 }
 
-pub async fn delete_all_trash_versions_for_key(
-    fragment: &str,
-    object_key: &str,
-) -> Result<Option<Vec<String>>, AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    run_index_blocking(move || {
-        index_store::delete_all_trash_versions_for_key(&fragment, &object_key)
-    })
-    .await
-}
-
 pub async fn delete_object_fast(
     fragment: &str,
     object_key: &str,
@@ -628,71 +616,4 @@ pub async fn ensure_object_owner_partition_available(
         index_store::ensure_object_owner_partition_available(&fragment, &object_key)
     })
     .await
-}
-
-pub async fn delete_object_version(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    let version_id = version_id.to_string();
-    run_index_blocking(move || {
-        if index_store::delete_live_version(&fragment, &object_key, &version_id)? {
-            Ok(())
-        } else {
-            Err(AppError::NotFound)
-        }
-    })
-    .await
-}
-
-pub async fn delete_trashed_object_version(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    let version_id = version_id.to_string();
-    run_index_blocking(move || {
-        if index_store::delete_trash_version(&fragment, &object_key, &version_id)? {
-            Ok(())
-        } else {
-            Err(AppError::NotFound)
-        }
-    })
-    .await
-}
-
-pub async fn clear_fragment_trash_in_partitions(
-    fragment: &str,
-    object_key: Option<&str>,
-) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.map(ToOwned::to_owned);
-    run_index_blocking(move || index_store::clear_fragment_trash(&fragment, object_key.as_deref()))
-        .await
-}
-
-pub async fn clear_fragment_trash_for_partitions(
-    fragment: &str,
-    touched_partitions: &std::collections::BTreeSet<u16>,
-) -> Result<usize, AppError> {
-    let fragment = fragment.to_string();
-    let touched_partitions = touched_partitions.clone();
-    run_index_blocking(move || {
-        index_store::clear_fragment_trash_for_partitions(&fragment, &touched_partitions)
-    })
-    .await
-}
-
-pub async fn clear_fragment_trash_partition(
-    fragment: &str,
-    partition_id: u16,
-) -> Result<usize, AppError> {
-    let fragment = fragment.to_string();
-    run_index_blocking(move || index_store::clear_fragment_trash_partition(&fragment, partition_id))
-        .await
 }

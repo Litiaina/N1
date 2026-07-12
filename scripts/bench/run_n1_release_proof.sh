@@ -27,6 +27,7 @@ CHAOS_SECONDS="${CHAOS_SECONDS:-0}"
 CHAOS_CYCLES="${CHAOS_CYCLES:-0}"
 CHAOS_STORM_OBJECTS="${CHAOS_STORM_OBJECTS:-1000}"
 JOB_TIMEOUT_SECONDS="${JOB_TIMEOUT_SECONDS:-10800}"
+TRASH_RETENTION_SECONDS="${TRASH_RETENTION_SECONDS:-60}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 PROOF_ROOT="${PROOF_ROOT:-/tmp/litiaina-n1-release-proof}"
 OUT_DIR="${OUT_DIR:-$PROOF_ROOT/n1-release-proof-${STAMP}}"
@@ -69,6 +70,7 @@ args=(
   --multi-fragment-users "$MULTI_FRAGMENT_USERS" \
   --multi-fragment-files-per-user "$MULTI_FRAGMENT_FILES_PER_USER" \
   --job-timeout-seconds "$JOB_TIMEOUT_SECONDS" \
+  --trash-retention-seconds "$TRASH_RETENTION_SECONDS" \
   --chaos-seconds "$CHAOS_SECONDS" \
   --chaos-cycles "$CHAOS_CYCLES" \
   --chaos-storm-objects "$CHAOS_STORM_OBJECTS"

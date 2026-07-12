@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::core::delete::delete_object_version;
 use crate::core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ObjectMetadata, UploadPartQuery,
 };
@@ -352,17 +351,6 @@ async fn execute_native_op_inner(
                     .await?,
             )
         }
-        "namespace.purge" | "posix.purge" => {
-            let claims = claims_required(claims)?;
-            native_body(
-                posix_service::permanently_delete_path(
-                    state,
-                    claims,
-                    required_string(&payload, "path")?,
-                )
-                .await?,
-            )
-        }
         "object.list" => {
             let claims = claims_required(claims)?;
             require_read(&claims)?;
@@ -380,27 +368,6 @@ async fn execute_native_op_inner(
                     .list_objects_page(&claims.fragment, &params_from_payload(&payload), true)
                     .await?,
             )
-        }
-        "trash.empty" => {
-            let claims = claims_required(claims)?;
-            require_delete(&claims)?;
-            let summary = global_namespace_runtime()
-                .empty_trash(&claims.fragment)
-                .await?;
-            state.emit(
-                &claims.fragment,
-                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-                    &claims.fragment,
-                    summary.clone(),
-                )),
-            );
-            native_body(json!({
-                "operation": summary.operation,
-                "affected_paths": summary.affected_paths,
-                "affected_objects": summary.affected_objects,
-                "trash_entry_id": summary.trash_entry_id,
-                "deleted_at_unix": summary.deleted_at_unix,
-            }))
         }
         "trash.recover_all" => {
             let claims = claims_required(claims)?;
@@ -451,11 +418,6 @@ async fn execute_native_op_inner(
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::recover_path(state, claims, path).await?)
         }
-        "object.purge" => {
-            let claims = claims_required(claims)?;
-            let path = required_string(&payload, "object_key")?;
-            native_body(posix_service::permanently_delete_path(state, claims, path).await?)
-        }
         "object.rename" => {
             let claims = claims_required(claims)?;
             require_write_modify(&claims)?;
@@ -497,63 +459,6 @@ async fn execute_native_op_inner(
             }
             native_body(versions)
         }
-        "object.version.delete" => {
-            let claims = claims_required(claims)?;
-            require_write(&claims)?;
-            let fragment = claims.fragment.clone();
-            native_from_response(
-                delete_object_version(
-                    State(state),
-                    claims,
-                    Path((
-                        fragment,
-                        required_string(&payload, "version_id")?,
-                        required_string(&payload, "object_key")?,
-                    )),
-                )
-                .await?,
-            )
-            .await
-        }
-        "object.version.recover" => {
-            let claims = claims_required(claims)?;
-            require_write(&claims)?;
-            let fragment = claims.fragment.clone();
-            let version_id = required_string(&payload, "version_id")?;
-            let logical = required_string(&payload, "object_key")?;
-            let physical = resolve_any_logical_object_id(&fragment, &logical).await?;
-            let version_exists =
-                match index::read_object_version(&fragment, &physical, &version_id).await {
-                    Ok(_) => true,
-                    Err(AppError::NotFound) => {
-                        index::read_trashed_object_version(&fragment, &physical, &version_id)
-                            .await
-                            .is_ok()
-                    }
-                    Err(err) => return Err(err),
-                };
-            if !version_exists {
-                return Err(AppError::NotFound);
-            }
-            let summary = global_namespace_runtime()
-                .recover(&fragment, &logical)
-                .await?;
-            state.emit(
-                &fragment,
-                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-                    &fragment,
-                    summary.clone(),
-                )),
-            );
-            native_body(json!({
-                "operation": summary.operation,
-                "object_key": logical,
-                "physical_object_id": physical,
-                "version_id": version_id,
-                "affected_paths": summary.affected_paths,
-                "affected_objects": summary.affected_objects,
-            }))
-        }
         "object.bulk_delete" | "object.bulk.delete" => {
             let claims = claims_required(claims)?;
             require_write(&claims)?;
@@ -578,20 +483,6 @@ async fn execute_native_op_inner(
                     string_array_field(&payload, "object_keys")?,
                     "bulk_recover",
                     BulkNamespaceMode::Recover,
-                )
-                .await?,
-            )
-        }
-        "object.bulk_purge" | "object.bulk.purge" => {
-            let claims = claims_required(claims)?;
-            require_delete(&claims)?;
-            native_body(
-                native_bulk_namespace_operation(
-                    &state,
-                    &claims.fragment,
-                    string_array_field(&payload, "object_keys")?,
-                    "bulk_delete_permanent",
-                    BulkNamespaceMode::Purge,
                 )
                 .await?,
             )
@@ -1010,7 +901,6 @@ fn upload_part_query_from_payload(payload: &Value) -> Result<UploadPartQuery, Ap
 enum BulkNamespaceMode {
     Trash,
     Recover,
-    Purge,
 }
 
 async fn native_bulk_namespace_operation(
@@ -1042,11 +932,6 @@ async fn native_bulk_namespace_operation(
             BulkNamespaceMode::Recover => {
                 global_namespace_runtime()
                     .recover(fragment, object_key)
-                    .await
-            }
-            BulkNamespaceMode::Purge => {
-                global_namespace_runtime()
-                    .purge_trash_path(fragment, object_key)
                     .await
             }
         };
@@ -1205,14 +1090,6 @@ fn require_write(claims: &Claims) -> Result<(), AppError> {
     }
 }
 
-fn require_delete(claims: &Claims) -> Result<(), AppError> {
-    if claims.delete {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden("Delete permission required".into()))
-    }
-}
-
 fn require_write_modify(claims: &Claims) -> Result<(), AppError> {
     if claims.write && claims.modify {
         Ok(())
@@ -1248,20 +1125,6 @@ async fn resolve_logical_read_key(
         return entry.object_id.ok_or_else(|| {
             AppError::InternalServerError("logical file is missing physical object id".to_string())
         });
-    }
-    crate::core::index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
-}
-
-async fn resolve_any_logical_object_id(
-    fragment: &str,
-    requested_path: &str,
-) -> Result<String, AppError> {
-    let requested = requested_path.trim_start_matches('/').trim();
-    if let Some(object_id) = global_namespace_runtime()
-        .resolve_any_object_id(fragment, requested)
-        .await?
-    {
-        return Ok(object_id);
     }
     crate::core::index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }

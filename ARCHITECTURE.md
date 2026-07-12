@@ -1,11 +1,12 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 2.0.0 storage contract. It is the reference for
+This document defines the N1 3.0.0 storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 2.0.0 intentionally uses a new on-disk layout. It does not read or migrate
-N1 1.x disk layouts.
+N1 3.0.0 is a new engine format that preserves N1's immutable-object and
+namespace-mutation architecture while introducing the TTL trash lifecycle.
+It does not open, adopt, or migrate any earlier N1 engine format.
 
 ## Core Rule
 
@@ -45,8 +46,10 @@ receipts, trash, and the user namespace:
         part_p00000000000000000000.<crc32>.receipt
         shard_p00000000000000000000_s0000.<crc32>.receipt
     .trash/
-      docs/
-        video.mp4 -> @o_<object-id>
+      .entries/
+        <trash-entry-id> -> @o_<object-id>
+      .records/
+        <trash-entry-id>.ndx
 
     docs/
       video.mp4 -> @o_<object-id>
@@ -148,6 +151,17 @@ Namespace operations are therefore lightweight:
 - recover moves entries from `.trash` back to the live namespace
 
 These operations do not rewrite object metadata or EC payload.
+
+Each soft delete receives a unique trash entry id. The lifecycle record stores
+the original path, deletion timestamp, entry kind, and internal payload
+location. This permits multiple retained generations of the same logical path
+without overwriting an older recoverable deletion. Folder soft delete remains
+a constant-sized directory rename; descendants are inspected only if the
+folder reaches lifecycle expiry.
+
+There is no manual empty-trash or hard-delete operation in N1 3.0.0. Recovery
+is allowed until the configured trash retention deadline. Once that deadline
+is reached, lifecycle owns the entry and recovery fails closed.
 
 Reserved internal names are rejected in user paths:
 
@@ -301,20 +315,28 @@ Object repair uses the immutable `.ndx` and surviving shards to restore:
 
 Recover-on-read uses the same recorded object topology and repair primitives.
 
-## Garbage Collection
+## Trash Lifecycle And Garbage Collection
 
-The namespace is reachability truth.
+The namespace is reachability truth. Normal deletion reclamation is a targeted
+trash lifecycle operation, not a full object-plane scan:
 
-GC:
+1. scan lifecycle records under each fragment's `.trash`
+2. retain entries younger than `trash_retention_seconds`
+3. collect exact object ids only for an expired file or subtree
+4. persist a crash-replayable reclamation receipt under `.gc/trash-lifecycle`
+5. remove the expired namespace entry and its lifecycle record
+6. verify candidate object ids are absent from both live and remaining trash namespace
+7. directly reclaim only those unreferenced immutable object directories
+8. remove the receipt after reclamation completes
 
-1. scans live and trash namespace links
-2. builds the reachable object-id set
-3. scans blob-root `.objects`
-4. protects reachable versions and active uploads
-5. reclaims headless object metadata and payload after retention rules allow it
+An interrupted expiry retries from the durable receipt and never needs to
+rediscover headless blobs through a global scan. Earlier-engine trash entries
+are not adopted: N1 3.0 requires freshly initialized format-3 fragments and
+fails closed when an earlier or unversioned fragment marker is encountered.
 
-Soft delete does not rewrite object truth. Empty trash retires namespace
-references; GC performs physical reclamation later.
+Full GC remains an explicit operator maintenance tool for orphan detection,
+abandoned upload state, and scrub work. A manual GC run cannot bypass trash
+retention or permanently delete a still-recoverable entry.
 
 Redistribution may temporarily stage old payload as `.gc` files with
 compatibility symlinks. Those entries are object-plane retirement state, not
@@ -378,7 +400,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 2.0.0 is correct only while all of these remain true:
+N1 3.0.0 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -392,3 +414,9 @@ N1 2.0.0 is correct only while all of these remain true:
 10. Fragment rename never rewrites object metadata or payload.
 11. GC derives reachability from live and trash namespace state.
 12. Upload and download remain streaming and memory-bounded.
+13. Delete is always a namespace soft delete with a unique trash entry id.
+14. Recovery is permitted only before the configured trash TTL expires.
+15. No public HTTP, native, POSIX, shell, or console operation can empty or purge trash early.
+16. Normal TTL reclamation scans `.trash`, not the complete immutable object plane.
+17. Namespace removal precedes physical reclamation, and a candidate object is deleted only when no live or trash reference remains.
+18. Interrupted TTL reclamation is replayable from a durable receipt.

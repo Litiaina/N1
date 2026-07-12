@@ -1,5 +1,5 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX};
-use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
+use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectPathManager};
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
@@ -194,33 +194,99 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     };
     let cleanup_interval = Duration::from_secs(interval_secs);
 
+    let _ = state;
     loop {
-        sleep(cleanup_interval).await;
-
         if GC_RUNNING.swap(true, Ordering::SeqCst) {
+            sleep(cleanup_interval).await;
             continue;
         }
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
-        if let Err(err) =
-            run_gc_scan_offthread(state.clone(), false, None, GcRunOptions::default()).await
-        {
-            error!("Lifecycle Manager Scan failed: {}", err);
+        let path_manager = ObjectPathManager::new();
+        let index_roots = path_manager.get_all_index_roots();
+        let mut fragments = collect_gc_fragments(&index_roots)
+            .into_iter()
+            .collect::<Vec<_>>();
+        fragments.sort();
+        let started = std::time::Instant::now();
+        with_gc_status_write(|st| {
+            *st = GcJobStatus {
+                is_running: true,
+                phase: "Scanning trash lifecycle namespace".to_string(),
+                is_manual_run: false,
+                total_fragments: fragments.len() as u64,
+                start_timestamp: Utc::now().timestamp(),
+                ..Default::default()
+            };
+        });
+
+        for fragment in fragments {
+            if should_stop_gc() {
+                break;
+            }
             with_gc_status_write(|st| {
-                st.total_errors += 1;
-                st.last_error = Some(err.to_string());
-                st.phase = "Failed".to_string();
+                st.current_fragment = fragment.clone();
+                st.phase = format!("Scanning .trash for fragment {fragment}");
             });
+            match index_store::fragment_meta(&fragment) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    with_gc_status_write(|st| {
+                        st.total_errors = st.total_errors.saturating_add(1);
+                        st.last_error =
+                            Some(format!("fragment {fragment} has no N1 3 engine metadata"));
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    with_gc_status_write(|st| {
+                        st.total_errors = st.total_errors.saturating_add(1);
+                        st.last_error = Some(format!(
+                            "fragment {fragment} failed the N1 3 engine-format gate: {err}"
+                        ));
+                    });
+                    continue;
+                }
+            }
+            match global_namespace_runtime()
+                .sweep_expired_trash(
+                    &fragment,
+                    CONFIG.garbage_collector.trash_retention_seconds,
+                    Utc::now().timestamp(),
+                )
+                .await
+            {
+                Ok(summary) => with_gc_status_write(|st| {
+                    st.total_fragments_scanned = st.total_fragments_scanned.saturating_add(1);
+                    st.total_trash_versions_expired = st
+                        .total_trash_versions_expired
+                        .saturating_add(summary.expired_versions);
+                    st.duration_seconds = started.elapsed().as_secs();
+                }),
+                Err(err) => {
+                    error!("Trash lifecycle scan failed for {}: {}", fragment, err);
+                    with_gc_status_write(|st| {
+                        st.total_errors = st.total_errors.saturating_add(1);
+                        st.last_error = Some(err.to_string());
+                    });
+                }
+            }
         }
 
         with_gc_status_write(|st| {
             st.is_running = false;
-            if st.phase != "Failed" && st.phase != "Stopped by User" {
-                st.phase = "Completed".to_string();
-            }
+            st.phase = if should_stop_gc() {
+                "Stopped by User".to_string()
+            } else if st.total_errors > 0 {
+                "Completed with errors".to_string()
+            } else {
+                "Trash lifecycle completed".to_string()
+            };
+            st.duration_seconds = started.elapsed().as_secs();
         });
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
         GC_RUNNING.store(false, Ordering::SeqCst);
+        sleep(cleanup_interval).await;
     }
 }
 
@@ -358,10 +424,6 @@ pub async fn stop_garbage_collector(
     });
 
     (StatusCode::OK, "Stop signal sent to GC.")
-}
-
-fn trash_deleted_age(deleted_at: i64, now_unix: i64) -> Duration {
-    Duration::from_secs(now_unix.saturating_sub(deleted_at.max(0)).max(0) as u64)
 }
 
 #[cfg(unix)]
@@ -567,7 +629,7 @@ async fn perform_gc_scan(
         st.start_timestamp = Utc::now().timestamp();
     });
 
-    let retention_duration = Duration::from_secs(CONFIG.garbage_collector.retention_seconds);
+    let retention_duration = Duration::from_secs(CONFIG.garbage_collector.trash_retention_seconds);
 
     let file_ttl = options.file_ttl(is_manual_run);
 
@@ -649,11 +711,42 @@ async fn process_fragment_gc(
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
     let mut live_versions = HashSet::<String>::new();
-    let mut trash_versions = HashSet::<String>::new();
-    let mut expired_versions: HashMap<String, ObjectMetadata> = HashMap::new();
+
+    match index_store::fragment_meta(fragment) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            warn!(
+                "GC: preserving fragment {} because N1 3 engine metadata is missing",
+                fragment
+            );
+            return stats;
+        }
+        Err(err) => {
+            warn!(
+                "GC: preserving fragment {} because the N1 3 engine-format gate failed: {}",
+                fragment, err
+            );
+            return stats;
+        }
+    }
 
     let now = SystemTime::now();
     let now_unix = Utc::now().timestamp();
+    match global_namespace_runtime()
+        .sweep_expired_trash(fragment, retention.as_secs(), now_unix)
+        .await
+    {
+        Ok(summary) => {
+            stats.trash_versions_expired = summary.expired_versions;
+        }
+        Err(err) => {
+            warn!(
+                "GC: targeted trash lifecycle failed for fragment {}; preserving immutable data: {}",
+                fragment, err
+            );
+            return stats;
+        }
+    }
     let physical_live_objects = match index::list_fragment_live_objects(fragment).await {
         Ok(objects) => objects,
         Err(err) => {
@@ -756,17 +849,10 @@ async fn process_fragment_gc(
                             continue;
                         }
                     };
-                let age = trash_deleted_age(entry.deleted_at, now_unix);
-                let should_expire = is_manual_run || age > retention;
-                for meta in versions {
-                    if should_expire {
-                        expired_versions
-                            .entry(meta.version_id.clone())
-                            .or_insert(meta.clone());
-                    } else {
-                        trash_versions.insert(meta.version_id);
-                    }
-                }
+                // Trash is reclaimed only by the targeted TTL lifecycle above.
+                // Reading the records here verifies they remain decodable; a
+                // manual GC run must never bypass the recovery window.
+                let _ = versions;
             }
         }
         Err(err) => {
@@ -872,7 +958,6 @@ async fn process_fragment_gc(
             .sum::<u64>();
         for version in &version_metas {
             live_versions.remove(&version.version_id);
-            trash_versions.remove(&version.version_id);
         }
 
         match index::delete_object_fast(fragment, &object_id).await {
@@ -889,33 +974,7 @@ async fn process_fragment_gc(
         }
     }
 
-    expired_versions.retain(|version_id, meta| {
-        if live_versions.contains(version_id) {
-            warn!(
-                "GC: preserving expired trash version {}/{}@{} because it is still protected as live",
-                fragment, meta.object_key, version_id
-            );
-            false
-        } else {
-            true
-        }
-    });
     stats.live_versions_seen = live_versions.len() as u64;
-
-    let expired_trash_refund: u64 = expired_versions
-        .values()
-        .map(|meta| meta.total_size_bytes)
-        .sum();
-    stats.refund_bytes += expired_trash_refund;
-    stats.trash_versions_expired += expired_versions.len() as u64;
-
-    for (ver, meta) in &expired_versions {
-        io_progress.heartbeat();
-        if should_stop_gc() {
-            return stats;
-        }
-        let _ = index::delete_trashed_object_version(fragment, &meta.object_key, ver).await;
-    }
     let now_ts = Utc::now().timestamp();
     let ttl_secs = CONFIG.garbage_collector.file_ttl_seconds as i64;
     let mut active_session_versions = HashSet::<String>::new();

@@ -300,38 +300,3 @@ pub async fn recover_path(
         deleted_at_unix: summary.deleted_at_unix,
     })
 }
-
-pub async fn permanently_delete_path(
-    state: Arc<AppState>,
-    claims: Claims,
-    path: String,
-) -> Result<PosixMutationResponse, AppError> {
-    let path = normalize_posix_path(Some(path.as_str()))?;
-    if path.is_empty() {
-        return Err(AppError::BadRequest(
-            "root path cannot be permanently deleted".to_string(),
-        ));
-    }
-    let fragment = claims.fragment.clone();
-    let summary = global_namespace_runtime()
-        .purge_trash_path(&fragment, &path)
-        .await?;
-    state.emit(
-        &fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &fragment,
-            summary.clone(),
-        )),
-    );
-    Ok(PosixMutationResponse {
-        operation: summary.operation,
-        kind: posix_kind_from_namespace(summary.kind),
-        affected: summary.affected_paths,
-        path: Some(path),
-        source_path: None,
-        destination_path: None,
-        created: None,
-        trash_entry_id: summary.trash_entry_id,
-        deleted_at_unix: summary.deleted_at_unix,
-    })
-}

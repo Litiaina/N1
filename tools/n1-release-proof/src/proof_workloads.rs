@@ -703,25 +703,26 @@ impl Proof {
             .await?;
         final_keys.push(recover_child.clone());
 
-        let purge_dir = format!("{base}/purge-dir");
-        let purge_child = format!("{purge_dir}/payload.bin");
-        self.posix_post_with_token(token, "/n1/posix/mkdir", json!({"path": &purge_dir}))
+        let retained_dir = format!("{base}/retained-dir");
+        let retained_child = format!("{retained_dir}/payload.bin");
+        self.posix_post_with_token(token, "/n1/posix/mkdir", json!({"path": &retained_dir}))
             .await?;
         self.upload_bytes_with_token(
             token,
-            &purge_child,
-            deterministic_payload(32 * 1024, purge_child.as_bytes()),
+            &retained_child,
+            deterministic_payload(32 * 1024, retained_child.as_bytes()),
             "application/octet-stream",
         )
         .await?;
-        self.posix_post_with_token(token, "/n1/posix/trash", json!({"path": &purge_dir}))
+        self.posix_post_with_token(token, "/n1/posix/trash", json!({"path": &retained_dir}))
             .await?;
         self.posix_post_with_token(
             token,
-            "/n1/posix/purge",
-            json!({"path": purge_dir}),
+            "/n1/posix/recover",
+            json!({"path": retained_dir}),
         )
         .await?;
+        final_keys.push(retained_child.clone());
 
         Ok(ActorReport {
             final_keys,
@@ -731,7 +732,7 @@ impl Proof {
                 "renamed_files": files,
                 "folder_renamed_children": 16,
                 "trash_recover_child": recover_child,
-                "purged_folder": purge_dir,
+                "ttl_retained_and_recovered_folder": retained_dir,
                 "verified_samples": samples,
                 "elapsed_s": round3(start.elapsed().as_secs_f64()),
             }),

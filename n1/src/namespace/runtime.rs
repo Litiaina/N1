@@ -2,7 +2,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::UNIX_EPOCH;
 
 use chrono::Utc;
 use rustix::fs::{CWD, renameat};
@@ -10,10 +9,10 @@ use serde::Serialize;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
 use crate::core::index_store::{
-    self, PendingUploadBinding, TRASH_DIR, TrashKind, TrashRecord, fragment_root_on,
-    internal_namespace_entry_name, namespace_path, new_object_id, publish_namespace_link,
-    read_dir_names, read_namespace_symlink_object_id, reject_reserved_user_path,
-    scan_trash_records, write_pending_binding,
+    self, PendingUploadBinding, TRASH_DIR, TRASH_ENTRIES_DIR, TrashKind, TrashRecord,
+    fragment_root_on, internal_namespace_entry_name, namespace_path, new_object_id,
+    publish_namespace_link, read_dir_names, read_namespace_symlink_object_id,
+    reject_reserved_user_path, scan_trash_records, write_pending_binding,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -21,10 +20,23 @@ use crate::namespace::models::{
     NamespaceReachabilitySnapshot, ObjectHead,
 };
 use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, parent_path};
+#[cfg(not(test))]
+use crate::settings::config::CONFIG;
+use ulid::Ulid;
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
 static FINALIZE_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+#[cfg(not(test))]
+fn configured_trash_retention_seconds() -> u64 {
+    CONFIG.garbage_collector.trash_retention_seconds
+}
+
+#[cfg(test)]
+fn configured_trash_retention_seconds() -> u64 {
+    30 * 24 * 60 * 60
+}
 
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
@@ -63,6 +75,14 @@ pub struct NamespaceRuntimeStats {
     pub largest_namespace_nodes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub largest_namespace_fragment: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TrashLifecycleSweepSummary {
+    pub expired_entries: u64,
+    pub expired_versions: u64,
+    pub reclaimed_objects: u64,
+    pub pending_receipts_replayed: u64,
 }
 
 pub struct NamespaceRuntime;
@@ -271,38 +291,31 @@ impl NamespaceRuntime {
         .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
     }
 
-    pub async fn purge_trash_path(
+    pub async fn sweep_expired_trash(
         &self,
         fragment: &str,
-        path: &str,
-    ) -> Result<NamespaceMutationSummary, AppError> {
+        retention_seconds: u64,
+        now_unix: i64,
+    ) -> Result<TrashLifecycleSweepSummary, AppError> {
         let fragment = fragment.to_string();
-        let path = normalize_user_path(path)?;
-        tokio::task::spawn_blocking(move || purge_trash(&fragment, &path, None))
-            .await
-            .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
-    }
-
-    pub async fn purge_trash_entry_id(
-        &self,
-        fragment: &str,
-        trash_entry_id: &str,
-    ) -> Result<NamespaceMutationSummary, AppError> {
-        let fragment = fragment.to_string();
-        let trash_entry_id = trash_entry_id.to_string();
-        tokio::task::spawn_blocking(move || purge_trash(&fragment, "", Some(&trash_entry_id)))
-            .await
-            .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
+        tokio::task::spawn_blocking(move || {
+            sweep_expired_trash_sync(&fragment, retention_seconds, now_unix)
+        })
+        .await
+        .map_err(|err| AppError::InternalServerError(format!("N1 lifecycle worker: {err}")))?
     }
 
     pub async fn recover_all(&self, fragment: &str) -> Result<NamespaceMutationSummary, AppError> {
         let fragment_name = fragment.to_string();
         let (affected_paths, affected_objects) = tokio::task::spawn_blocking(move || {
-            let paths = trash_child_paths(&fragment_name, "")?;
+            let trash_entry_ids = index_store::stored_trash_records(&fragment_name)?
+                .into_iter()
+                .map(|record| record.trash_entry_id)
+                .collect::<Vec<_>>();
             let mut affected_paths = 0usize;
             let mut affected_objects = 0usize;
-            for path in paths {
-                let summary = recover_trash_path(&fragment_name, &path, None)?;
+            for trash_entry_id in trash_entry_ids {
+                let summary = recover_trash_path(&fragment_name, "", Some(&trash_entry_id))?;
                 affected_paths += summary.affected_paths;
                 affected_objects += summary.affected_objects;
             }
@@ -319,41 +332,6 @@ impl NamespaceRuntime {
             destination_path: None,
             trash_entry_id: None,
             deleted_at_unix: None,
-        })
-    }
-
-    pub async fn empty_trash(&self, fragment: &str) -> Result<NamespaceMutationSummary, AppError> {
-        let fragment = fragment.to_string();
-        tokio::task::spawn_blocking(move || {
-            let retired_roots = index_store::retire_fragment_trash_namespace(&fragment)?;
-            if !retired_roots.is_empty() {
-                std::thread::Builder::new()
-                    .name("n1-trash-purge".to_string())
-                    .spawn(move || {
-                        for retired_root in retired_roots {
-                            let _ = fs::remove_dir_all(retired_root);
-                        }
-                    })
-                    .map_err(|e| {
-                        AppError::InternalServerError(format!(
-                            "spawn N1 retired trash purge worker: {e}"
-                        ))
-                    })?;
-            }
-            Ok::<_, AppError>(())
-        })
-        .await
-        .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))??;
-
-        Ok(NamespaceMutationSummary {
-            operation: "empty_trash".to_string(),
-            kind: NamespaceEntryKind::Directory,
-            affected_paths: 1,
-            affected_objects: 0,
-            source_path: None,
-            destination_path: None,
-            trash_entry_id: None,
-            deleted_at_unix: Some(Utc::now().timestamp()),
         })
     }
 
@@ -886,88 +864,40 @@ fn list_trash_dir_page(
     after: Option<&str>,
 ) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
     let mut entries = Vec::new();
-    for child_path in trash_child_paths(fragment, path)? {
-        let Some(entry) = trash_entry(fragment, &child_path)? else {
+    for record in index_store::stored_trash_records(fragment)? {
+        if !path.is_empty()
+            && record.original_path != path
+            && !record.original_path.starts_with(&format!("{path}/"))
+        {
+            continue;
+        }
+        let Some(entry) = trash_entry_from_record(fragment, &record)? else {
             continue;
         };
-        if after.is_some_and(|cursor| entry.path.as_str() <= cursor) {
+        let cursor_key = format!("{}\u{001f}{}", entry.path, record.trash_entry_id);
+        if after.is_some_and(|cursor| cursor_key.as_str() <= cursor) {
             continue;
         }
         entries.push(entry);
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.trash_entry_id.cmp(&b.trash_entry_id))
+    });
     let next = if entries.len() > limit {
         entries.truncate(limit);
-        entries.last().map(|entry| entry.path.clone())
+        entries.last().map(|entry| {
+            format!(
+                "{}\u{001f}{}",
+                entry.path,
+                entry.trash_entry_id.clone().unwrap_or_default()
+            )
+        })
     } else {
         None
     };
     Ok((entries, next))
-}
-
-fn metadata_mtime_secs(path: &Path) -> i64 {
-    fs::symlink_metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_else(|| Utc::now().timestamp())
-}
-
-fn trash_child_paths(fragment: &str, path: &str) -> Result<Vec<String>, AppError> {
-    let mut seen = BTreeSet::new();
-    collect_visible_trash_paths(fragment, path, &mut seen)?;
-    Ok(seen.into_iter().collect())
-}
-
-fn direct_trash_child_paths(fragment: &str, path: &str) -> Result<Vec<String>, AppError> {
-    let mut seen = BTreeSet::new();
-    for root in index_roots() {
-        let dir = fragment_root_on(&root, fragment).join(TRASH_DIR).join(path);
-        if !dir.is_dir() {
-            continue;
-        }
-        for name in read_dir_names(&dir)? {
-            if internal_namespace_entry_name(&name) {
-                continue;
-            }
-            let child_path = if path.is_empty() {
-                name
-            } else {
-                format!("{path}/{name}")
-            };
-            seen.insert(child_path);
-        }
-    }
-    Ok(seen.into_iter().collect())
-}
-
-fn trash_path_is_dir(fragment: &str, path: &str) -> Result<bool, AppError> {
-    for root in index_roots() {
-        let trash_path = fragment_root_on(&root, fragment).join(TRASH_DIR).join(path);
-        match fs::symlink_metadata(&trash_path) {
-            Ok(meta) => return Ok(meta.is_dir()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(io_err(err, "inspect N1 trash path type")),
-        }
-    }
-    Ok(false)
-}
-
-fn collect_visible_trash_paths(
-    fragment: &str,
-    path: &str,
-    out: &mut BTreeSet<String>,
-) -> Result<(), AppError> {
-    for child_path in direct_trash_child_paths(fragment, path)? {
-        if trash_path_is_dir(fragment, &child_path)? && live_entry(fragment, &child_path)?.is_some()
-        {
-            collect_visible_trash_paths(fragment, &child_path, out)?;
-        } else {
-            out.insert(child_path);
-        }
-    }
-    Ok(())
 }
 
 fn trash_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppError> {
@@ -983,62 +913,43 @@ fn trash_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, App
             Some((0, 0)),
         )));
     }
-    if internal_namespace_entry_name(base_name(path).as_str()) {
-        return Ok(None);
+    let record = select_trash_record(fragment, path, Some(path))
+        .or_else(|_| select_trash_record(fragment, path, None));
+    match record {
+        Ok(record) => trash_entry_from_record(fragment, &record),
+        Err(AppError::NotFound) => Ok(None),
+        Err(err) => Err(err),
     }
-    for root in index_roots() {
-        let trash_path = fragment_root_on(&root, fragment).join(TRASH_DIR).join(path);
-        let meta = match fs::symlink_metadata(&trash_path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(io_err(err, "inspect N1 trash namespace entry")),
-        };
-        let deleted_at = metadata_mtime_secs(&trash_path);
-        if let Some(object_id) = read_namespace_symlink_object_id(&root, fragment, &trash_path)? {
-            let mut entry = namespace_entry(
-                fragment,
-                path.to_string(),
-                NamespaceEntryKind::File,
-                Some(object_id.clone()),
-                LifecycleState::trashed(deleted_at),
-                None,
-                Some(deleted_at),
-                Some((deleted_at, deleted_at)),
-            );
-            if let Some(head) = index_store::read_current_live_head(fragment, &object_id)? {
-                entry.size_bytes = Some(head.total_size_bytes);
-                entry.version_id = Some(head.version_id);
-                entry.created_at_unix = head.created_at;
-                entry.updated_at_unix = head.created_at;
-            }
-            return Ok(Some(entry));
-        }
-        if meta.is_dir() {
-            return Ok(Some(namespace_entry(
-                fragment,
-                path.to_string(),
-                NamespaceEntryKind::Directory,
-                None,
-                LifecycleState::trashed(deleted_at),
-                None,
-                Some(deleted_at),
-                Some((deleted_at, deleted_at)),
-            )));
-        }
-        if meta.is_file() {
-            return Ok(Some(namespace_entry(
-                fragment,
-                path.to_string(),
-                NamespaceEntryKind::File,
-                None,
-                LifecycleState::trashed(deleted_at),
-                None,
-                Some(deleted_at),
-                Some((deleted_at, deleted_at)),
-            )));
-        }
+}
+
+fn trash_entry_from_record(
+    fragment: &str,
+    record: &TrashRecord,
+) -> Result<Option<NamespaceEntry>, AppError> {
+    let object_id = record.object_keys.first().cloned();
+    let mut entry = namespace_entry(
+        fragment,
+        record.original_path.clone(),
+        if record.kind == TrashKind::File {
+            NamespaceEntryKind::File
+        } else {
+            NamespaceEntryKind::Directory
+        },
+        object_id.clone(),
+        LifecycleState::trashed(record.deleted_at_unix),
+        Some(record.trash_entry_id.clone()),
+        Some(record.deleted_at_unix),
+        Some((record.deleted_at_unix, record.deleted_at_unix)),
+    );
+    if let Some(object_id) = object_id
+        && let Some(head) = index_store::read_current_live_head(fragment, &object_id)?
+    {
+        entry.size_bytes = Some(head.total_size_bytes);
+        entry.version_id = Some(head.version_id);
+        entry.created_at_unix = head.created_at;
+        entry.updated_at_unix = head.created_at;
     }
-    Ok(None)
+    Ok(Some(entry))
 }
 
 fn resolve_live_object_id_sync(fragment: &str, path: &str) -> Result<Option<String>, AppError> {
@@ -1118,26 +1029,69 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
         return Err(AppError::NotFound);
     };
     let deleted_at = Utc::now().timestamp();
-    let source_relative = path.to_string();
+    let trash_entry_id = Ulid::new().to_string();
+    let source_relative = format!("{TRASH_ENTRIES_DIR}/{trash_entry_id}");
     let affected_objects = usize::from(entry.kind == NamespaceEntryKind::File);
+    let mut object_keys = Vec::new();
+    let mut version_ids = Vec::new();
+    if let Some(object_id) = entry.object_id.clone() {
+        version_ids.extend(
+            index_store::list_live_versions(fragment, &object_id)?
+                .into_iter()
+                .map(|metadata| metadata.version_id),
+        );
+        object_keys.push(object_id);
+    }
+    let record = TrashRecord {
+        trash_entry_id: trash_entry_id.clone(),
+        original_path: path.to_string(),
+        source_relative_path: source_relative.clone(),
+        kind: if entry.kind == NamespaceEntryKind::File {
+            TrashKind::File
+        } else {
+            TrashKind::Directory
+        },
+        object_keys,
+        version_ids,
+        deleted_at_unix: deleted_at,
+    };
+    let mut placements = Vec::new();
     for root in index_roots() {
         let fragment_root = fragment_root_on(&root, fragment);
-        let src = fragment_root.join(&source_relative);
+        let src = fragment_root.join(path);
         if !path_exists_no_follow(&src) {
             continue;
         }
         let dst = fragment_root.join(TRASH_DIR).join(&source_relative);
         if path_exists_no_follow(&dst) {
             return Err(AppError::Conflict(format!(
-                "trash path '{}' already exists; hard delete or recover it first",
-                source_relative
+                "trash entry '{}' already exists",
+                trash_entry_id
             )));
         }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err(e, "create trash destination"))?;
         }
-        renameat(CWD, &src, CWD, &dst)
-            .map_err(|e| AppError::InternalServerError(format!("N1 namespace trash: {e}")))?;
+        placements.push((src, dst));
+    }
+    if placements.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    index_store::write_trash_record_for_fragment(fragment, &record)?;
+    let mut moved = Vec::new();
+    for (src, dst) in &placements {
+        if let Err(err) = renameat(CWD, src, CWD, dst) {
+            for (rollback_src, rollback_dst) in moved.into_iter().rev() {
+                let _ = renameat(CWD, rollback_dst, CWD, rollback_src);
+            }
+            let _ = index_store::remove_trash_record(fragment, &trash_entry_id);
+            return Err(AppError::InternalServerError(format!(
+                "N1 namespace trash {} -> {}: {err}",
+                src.display(),
+                dst.display()
+            )));
+        }
+        moved.push((src.clone(), dst.clone()));
     }
     Ok(NamespaceMutationSummary {
         operation: "trash".to_string(),
@@ -1146,43 +1100,70 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
         affected_objects,
         source_path: Some(path.to_string()),
         destination_path: None,
-        trash_entry_id: None,
+        trash_entry_id: Some(trash_entry_id),
         deleted_at_unix: Some(deleted_at),
     })
 }
 
-fn collect_trash_object_refs_under(
+fn replay_trash_reclaim_receipt(
     fragment: &str,
-    root: &Path,
-    dir: &Path,
-) -> Result<(Vec<String>, Vec<String>), AppError> {
-    let mut object_keys = BTreeSet::new();
-    let mut version_ids = BTreeSet::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        if !current.is_dir() {
+    receipt: &index_store::TrashReclaimReceipt,
+) -> Result<u64, AppError> {
+    if let Some(record) = index_store::stored_trash_records(fragment)?
+        .into_iter()
+        .find(|record| record.trash_entry_id == receipt.trash_entry_id)
+    {
+        index_store::remove_trash_payload(fragment, &record)?;
+    }
+    let reclaimed =
+        index_store::delete_unreferenced_object_indexes_batch(fragment, &receipt.object_ids)?;
+    index_store::remove_trash_reclaim_receipt(fragment, &receipt.operation_id)?;
+    Ok(reclaimed.len() as u64)
+}
+
+fn sweep_expired_trash_sync(
+    fragment: &str,
+    retention_seconds: u64,
+    now_unix: i64,
+) -> Result<TrashLifecycleSweepSummary, AppError> {
+    let mut summary = TrashLifecycleSweepSummary::default();
+
+    for receipt in index_store::list_trash_reclaim_receipts(fragment)? {
+        summary.reclaimed_objects = summary
+            .reclaimed_objects
+            .saturating_add(replay_trash_reclaim_receipt(fragment, &receipt)?);
+        summary.pending_receipts_replayed = summary.pending_receipts_replayed.saturating_add(1);
+    }
+
+    let retention = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
+    for record in index_store::stored_trash_records(fragment)? {
+        let expires_at = record.deleted_at_unix.saturating_add(retention);
+        if now_unix < expires_at {
             continue;
         }
-        for name in read_dir_names(&current)? {
-            if internal_namespace_entry_name(&name) {
-                continue;
-            }
-            let child = current.join(&name);
-            if let Some(object_id) = read_namespace_symlink_object_id(root, fragment, &child)? {
-                if object_keys.insert(object_id.clone()) {
-                    for meta in index_store::list_live_versions(fragment, &object_id)? {
-                        version_ids.insert(meta.version_id);
-                    }
-                }
-            } else if child.is_dir() {
-                stack.push(child);
-            }
-        }
+        let record = index_store::hydrate_trash_record(fragment, record)?;
+        let operation_id = format!("ttl-{}-{}", record.trash_entry_id, Ulid::new());
+        let receipt = index_store::TrashReclaimReceipt {
+            operation_id,
+            fragment: fragment.to_string(),
+            trash_entry_id: record.trash_entry_id.clone(),
+            object_ids: record.object_keys.clone(),
+            version_ids: record.version_ids.clone(),
+            prepared_at_unix: now_unix,
+        };
+        index_store::write_trash_reclaim_receipt(&receipt)?;
+        index_store::remove_trash_payload(fragment, &record)?;
+        summary.reclaimed_objects = summary.reclaimed_objects.saturating_add(
+            index_store::delete_unreferenced_object_indexes_batch(fragment, &receipt.object_ids)?
+                .len() as u64,
+        );
+        index_store::remove_trash_reclaim_receipt(fragment, &receipt.operation_id)?;
+        summary.expired_entries = summary.expired_entries.saturating_add(1);
+        summary.expired_versions = summary
+            .expired_versions
+            .saturating_add(receipt.version_ids.len() as u64);
     }
-    Ok((
-        object_keys.into_iter().collect(),
-        version_ids.into_iter().collect(),
-    ))
+    Ok(summary)
 }
 
 fn select_trash_record(
@@ -1196,57 +1177,15 @@ fn select_trash_record(
     if target.is_empty() {
         return Err(AppError::NotFound);
     }
-    for root in index_roots() {
-        let trash_path = fragment_root_on(&root, fragment)
-            .join(TRASH_DIR)
-            .join(target);
-        let meta = match fs::symlink_metadata(&trash_path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(io_err(err, "inspect N1 trash target")),
-        };
-        let deleted_at = metadata_mtime_secs(&trash_path);
-        if let Some(object_id) = read_namespace_symlink_object_id(&root, fragment, &trash_path)? {
-            let version_ids = index_store::list_live_versions(fragment, &object_id)?
-                .into_iter()
-                .map(|meta| meta.version_id)
-                .collect();
-            return Ok(TrashRecord {
-                trash_entry_id: target.to_string(),
-                original_path: target.to_string(),
-                source_relative_path: target.to_string(),
-                kind: TrashKind::File,
-                object_keys: vec![object_id],
-                version_ids,
-                deleted_at_unix: deleted_at,
-            });
-        }
-        if meta.is_dir() {
-            let (object_keys, version_ids) =
-                collect_trash_object_refs_under(fragment, &root, &trash_path)?;
-            return Ok(TrashRecord {
-                trash_entry_id: target.to_string(),
-                original_path: target.to_string(),
-                source_relative_path: target.to_string(),
-                kind: TrashKind::Directory,
-                object_keys,
-                version_ids,
-                deleted_at_unix: deleted_at,
-            });
-        }
-        if meta.is_file() {
-            return Ok(TrashRecord {
-                trash_entry_id: target.to_string(),
-                original_path: target.to_string(),
-                source_relative_path: target.to_string(),
-                kind: TrashKind::File,
-                object_keys: Vec::new(),
-                version_ids: Vec::new(),
-                deleted_at_unix: deleted_at,
-            });
-        }
-    }
-    Err(AppError::NotFound)
+    index_store::stored_trash_records(fragment)?
+        .into_iter()
+        .filter(|record| record.trash_entry_id == target || record.original_path == target)
+        .max_by(|left, right| {
+            left.deleted_at_unix
+                .cmp(&right.deleted_at_unix)
+                .then_with(|| left.trash_entry_id.cmp(&right.trash_entry_id))
+        })
+        .ok_or(AppError::NotFound)
 }
 
 fn recover_trash_path(
@@ -1255,6 +1194,15 @@ fn recover_trash_path(
     trash_entry_id: Option<&str>,
 ) -> Result<NamespaceMutationSummary, AppError> {
     let record = select_trash_record(fragment, path, trash_entry_id)?;
+    let expires_at = record
+        .deleted_at_unix
+        .saturating_add(i64::try_from(configured_trash_retention_seconds()).unwrap_or(i64::MAX));
+    if Utc::now().timestamp() >= expires_at {
+        return Err(AppError::Conflict(
+            "trash retention expired; lifecycle owns permanent reclamation".to_string(),
+        ));
+    }
+    let mut placements = Vec::new();
     for root in index_roots() {
         let fragment_root = fragment_root_on(&root, fragment);
         let src = fragment_root
@@ -1263,7 +1211,7 @@ fn recover_trash_path(
         if !path_exists_no_follow(&src) {
             continue;
         }
-        let dst = fragment_root.join(&record.source_relative_path);
+        let dst = fragment_root.join(&record.original_path);
         if path_exists_no_follow(&dst) {
             return Err(AppError::Conflict(format!(
                 "recover destination '{}' already exists",
@@ -1273,10 +1221,24 @@ fn recover_trash_path(
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err(e, "create recover destination"))?;
         }
-        renameat(CWD, &src, CWD, &dst)
-            .map_err(|e| AppError::InternalServerError(format!("N1 namespace recover: {e}")))?;
-        prune_empty_trash_parents(&fragment_root.join(TRASH_DIR), &record.source_relative_path);
+        placements.push((src, dst, fragment_root.join(TRASH_DIR)));
     }
+    let mut moved = Vec::new();
+    for (src, dst, _) in &placements {
+        if let Err(err) = renameat(CWD, src, CWD, dst) {
+            for (rollback_src, rollback_dst) in moved.into_iter().rev() {
+                let _ = renameat(CWD, rollback_dst, CWD, rollback_src);
+            }
+            return Err(AppError::InternalServerError(format!(
+                "N1 namespace recover: {err}"
+            )));
+        }
+        moved.push((src.clone(), dst.clone()));
+    }
+    for (_, _, trash_root) in &placements {
+        prune_empty_trash_parents(trash_root, &record.source_relative_path);
+    }
+    index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
     Ok(NamespaceMutationSummary {
         operation: "recover".to_string(),
         kind: if record.kind == TrashKind::File {
@@ -1288,55 +1250,19 @@ fn recover_trash_path(
         affected_objects: record.object_keys.len(),
         source_path: Some(record.original_path.clone()),
         destination_path: Some(record.original_path),
-        trash_entry_id: None,
-        deleted_at_unix: Some(record.deleted_at_unix),
-    })
-}
-
-fn purge_trash(
-    fragment: &str,
-    path: &str,
-    trash_entry_id: Option<&str>,
-) -> Result<NamespaceMutationSummary, AppError> {
-    let record = select_trash_record(fragment, path, trash_entry_id)?;
-    for root in index_roots() {
-        let trash_root = fragment_root_on(&root, fragment)
-            .join(TRASH_DIR)
-            .join(&record.source_relative_path);
-        if path_exists_no_follow(&trash_root) {
-            let meta = fs::symlink_metadata(&trash_root)
-                .map_err(|e| io_err(e, "inspect N1 trash target"))?;
-            if meta.file_type().is_symlink() || meta.is_file() {
-                fs::remove_file(&trash_root).map_err(|e| io_err(e, "purge N1 trash file"))?;
-            } else {
-                fs::remove_dir_all(&trash_root).map_err(|e| io_err(e, "purge N1 trash"))?;
-            }
-            prune_empty_trash_parents(
-                &fragment_root_on(&root, fragment).join(TRASH_DIR),
-                &record.source_relative_path,
-            );
-        }
-    }
-    Ok(NamespaceMutationSummary {
-        operation: "purge_trash".to_string(),
-        kind: if record.kind == TrashKind::File {
-            NamespaceEntryKind::File
-        } else {
-            NamespaceEntryKind::Directory
-        },
-        affected_paths: 1,
-        affected_objects: record.object_keys.len(),
-        source_path: Some(record.original_path),
-        destination_path: None,
-        trash_entry_id: None,
+        trash_entry_id: Some(record.trash_entry_id),
         deleted_at_unix: Some(record.deleted_at_unix),
     })
 }
 
 fn prune_empty_trash_parents(trash_root: &Path, source_relative_path: &str) {
+    // `.entries` is a structural lifecycle directory shared by concurrent
+    // trash and recovery operations. Removing it while another trash move is
+    // between preflight and rename can invalidate that move's destination.
+    let entries_root = trash_root.join(TRASH_ENTRIES_DIR);
     let mut current = trash_root.join(source_relative_path);
     current.pop();
-    while current != trash_root {
+    while current != trash_root && current != entries_root {
         match fs::remove_dir(&current) {
             Ok(()) => {
                 if !current.pop() {
@@ -1365,6 +1291,26 @@ mod tests {
     };
     use crate::core::index_store;
     use ulid::Ulid;
+
+    #[test]
+    fn trash_parent_pruning_preserves_shared_entries_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "n1-trash-prune-{}-{}",
+            std::process::id(),
+            Ulid::new()
+        ));
+        let trash_root = base.join(TRASH_DIR);
+        let entries_root = trash_root.join(TRASH_ENTRIES_DIR);
+        std::fs::create_dir_all(&entries_root).expect("create trash entries directory");
+
+        prune_empty_trash_parents(&trash_root, ".entries/01KTESTENTRY");
+
+        assert!(
+            entries_root.is_dir(),
+            "concurrent trash moves require the shared .entries directory to remain stable"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     fn ensure_test_index_roots() -> Vec<PathBuf> {
         let base = std::env::temp_dir().join("n1-index-tests");
@@ -1589,7 +1535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn n1_soft_delete_and_purge_retire_namespace_before_gc_reclaims_index() {
+    async fn n1_soft_delete_ttl_reclaims_only_after_namespace_expiry() {
         let _guard = crate::test_support::global_test_lock().lock().await;
         let roots = ensure_test_index_roots();
         let blob_roots = ObjectPathManager::new().get_blob_roots();
@@ -1602,6 +1548,7 @@ mod tests {
             .expect("soft delete");
         assert_eq!(summary.operation, "trash");
         assert_eq!(summary.affected_objects, 1);
+        let trash_entry_id = summary.trash_entry_id.clone().expect("trash entry id");
 
         for root in &roots {
             assert!(!path_exists_no_follow(
@@ -1610,7 +1557,8 @@ mod tests {
             assert!(path_exists_no_follow(
                 &fragment_root_on(root, &fragment)
                     .join(TRASH_DIR)
-                    .join("video/my-video.mp4")
+                    .join(TRASH_ENTRIES_DIR)
+                    .join(&trash_entry_id)
             ));
             assert!(
                 !fragment_root_on(root, &fragment)
@@ -1624,18 +1572,31 @@ mod tests {
                 .unwrap_or(false)
         }));
 
-        global_namespace_runtime()
-            .purge_trash_path(&fragment, "video/my-video.mp4")
-            .await
-            .expect("hard delete single trash item");
+        let before_expiry = sweep_expired_trash_sync(
+            &fragment,
+            60,
+            summary.deleted_at_unix.expect("deleted timestamp") + 59,
+        )
+        .expect("pre-expiry lifecycle sweep");
+        assert_eq!(before_expiry.expired_entries, 0);
+
+        let expired = sweep_expired_trash_sync(
+            &fragment,
+            60,
+            summary.deleted_at_unix.expect("deleted timestamp") + 60,
+        )
+        .expect("expiry lifecycle sweep");
+        assert_eq!(expired.expired_entries, 1);
+        assert_eq!(expired.reclaimed_objects, 1);
         for root in &roots {
             assert!(!path_exists_no_follow(
                 &fragment_root_on(root, &fragment)
                     .join(TRASH_DIR)
-                    .join("video/my-video.mp4")
+                    .join(TRASH_ENTRIES_DIR)
+                    .join(&trash_entry_id)
             ));
         }
-        assert!(blob_roots.iter().any(|root| {
+        assert!(!blob_roots.iter().any(|root| {
             index_store::live_object_dir(root, &fragment, &object_id)
                 .map(|path| path.exists())
                 .unwrap_or(false)
@@ -1646,6 +1607,99 @@ mod tests {
                 .contains(&object_id),
             "purged trash item must leave object index headless for GC"
         );
+    }
+
+    #[tokio::test]
+    async fn n1_trash_ids_allow_repeated_delete_of_the_same_logical_path() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-trash-repeat-{}", Ulid::new());
+        let path = "clinical/report.bin";
+        let first_object = publish_logical_object(&roots, &fragment, path, 11);
+        let first = global_namespace_runtime()
+            .trash(&fragment, path)
+            .await
+            .expect("trash first object");
+
+        let second_object = publish_logical_object(&roots, &fragment, path, 22);
+        let second = global_namespace_runtime()
+            .trash(&fragment, path)
+            .await
+            .expect("trash replacement object");
+        assert_ne!(first_object, second_object);
+        assert_ne!(first.trash_entry_id, second.trash_entry_id);
+
+        let (entries, _) = global_namespace_runtime()
+            .list_dir_page(&fragment, "", true, 10, None)
+            .await
+            .expect("list trash");
+        assert_eq!(
+            entries.iter().filter(|entry| entry.path == path).count(),
+            2,
+            "both retained generations must remain independently recoverable"
+        );
+
+        global_namespace_runtime()
+            .recover_trash_entry_id(
+                &fragment,
+                second.trash_entry_id.as_deref().expect("second trash id"),
+            )
+            .await
+            .expect("recover latest generation");
+        assert_eq!(
+            global_namespace_runtime()
+                .resolve_live_object_id(&fragment, path)
+                .await
+                .expect("resolve recovered path"),
+            Some(second_object)
+        );
+        assert!(matches!(
+            global_namespace_runtime()
+                .recover_trash_entry_id(
+                    &fragment,
+                    first.trash_entry_id.as_deref().expect("first trash id"),
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn n1_ttl_reclaim_preserves_an_object_still_referenced_live() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let blob_roots = ObjectPathManager::new().get_blob_roots();
+        let fragment = format!("n1-trash-shared-{}", Ulid::new());
+        let object_id = publish_logical_object(&roots, &fragment, "records/a.bin", 33);
+        for root in &roots {
+            publish_namespace_link(root, &fragment, "records/b.bin", &object_id)
+                .expect("publish second live reference");
+        }
+
+        let deleted = global_namespace_runtime()
+            .trash(&fragment, "records/a.bin")
+            .await
+            .expect("trash one reference");
+        let expired = sweep_expired_trash_sync(
+            &fragment,
+            1,
+            deleted.deleted_at_unix.expect("deleted timestamp") + 1,
+        )
+        .expect("lifecycle sweep");
+        assert_eq!(expired.expired_entries, 1);
+        assert_eq!(expired.reclaimed_objects, 0);
+        assert_eq!(
+            global_namespace_runtime()
+                .resolve_live_object_id(&fragment, "records/b.bin")
+                .await
+                .expect("resolve retained reference"),
+            Some(object_id.clone())
+        );
+        assert!(blob_roots.iter().any(|root| {
+            index_store::live_object_dir(root, &fragment, &object_id)
+                .map(|path| path.is_dir())
+                .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]

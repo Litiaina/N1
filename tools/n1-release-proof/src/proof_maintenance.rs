@@ -56,17 +56,20 @@ impl Proof {
             .await?;
         self.posix_post("/n1/posix/trash", json!({"path": delete_me}))
             .await?;
-        self.posix_post("/n1/posix/purge", json!({"path": delete_me}))
-            .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(
+            self.args.trash_retention_seconds.saturating_add(1),
+        ))
+        .await;
         self.run_gc_and_wait().await?;
         if self.blob_version_exists(&version_id) {
-            return Err(format!("GC did not reclaim purged version {version_id}").into());
+            return Err(format!("TTL lifecycle did not reclaim expired version {version_id}").into());
         }
         Ok(json!({
             "elapsed_s": round3(start.elapsed().as_secs_f64()),
             "renamed_file": new_file,
             "recovered_folder_child": moved_child,
-            "gc_reclaimed_version": version_id,
+            "ttl_reclaimed_version": version_id,
+            "trash_retention_seconds": self.args.trash_retention_seconds,
         }))
     }
 
