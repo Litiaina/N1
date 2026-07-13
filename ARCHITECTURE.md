@@ -1,10 +1,10 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.0.0 storage contract. It is the reference for
+This document defines the N1 3.0.1 storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.0.0 is a new engine format that preserves N1's immutable-object and
+N1 3.0.1 uses the N1 3 engine format and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
@@ -159,7 +159,7 @@ without overwriting an older recoverable deletion. Folder soft delete remains
 a constant-sized directory rename; descendants are inspected only if the
 folder reaches lifecycle expiry.
 
-There is no manual empty-trash or hard-delete operation in N1 3.0.0. Recovery
+There is no manual empty-trash or hard-delete operation in N1 3.0.1. Recovery
 is allowed until the configured trash retention deadline. Once that deadline
 is reached, lifecycle owns the entry and recovery fails closed.
 
@@ -305,6 +305,22 @@ Namespace/control repair restores index replicas:
 - live namespace
 - trash namespace
 
+Each accepted namespace mutation first advances a small, durable generation
+record on every participating index replica. The generation is namespace-plane
+authority metadata, not an object head and not part of immutable object state.
+It lets `2 -> 1 -> 2` redistribution distinguish the continuously active
+replica from a returning stale replica even when their link counts happen to
+match or the stale replica contains more pre-deletion links. Generation reads
+and writes are constant-size; namespace mutation does not hash or scan the
+namespace.
+
+Redistribution selects the highest generation as authoritative and copies only
+the namespace/control plane. Replicas at the same generation must have the
+same deterministic content digest; disagreement at the same generation fails
+closed. Normal mutations are rejected while configured replicas expose
+different generations, so no new write can erase the authority history before
+redistribution reconciles it.
+
 It must never copy, delete, merge, or rewrite blob-plane `.objects`.
 
 Object repair uses the immutable `.ndx` and surviving shards to restore:
@@ -400,7 +416,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.0.0 is correct only while all of these remain true:
+N1 3.0.1 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -420,3 +436,16 @@ N1 3.0.0 is correct only while all of these remain true:
 16. Normal TTL reclamation scans `.trash`, not the complete immutable object plane.
 17. Namespace removal precedes physical reclamation, and a candidate object is deleted only when no live or trash reference remains.
 18. Interrupted TTL reclamation is replayable from a durable receipt.
+19. Mutating operations for one fragment are serialized across rename, trash, recovery, finalize, mkdir, and TTL sweep boundaries.
+20. Recovery never removes a lifecycle record unless at least one retained payload placement was moved back into the live namespace.
+21. Multi-root namespace publication and rename preflight all roots and roll back publications completed by a failed operation.
+22. Every namespace mutation rejects a symlink or non-directory in its parent chain; a logical path cannot escape its physical fragment root.
+23. Namespace rename durability includes syncing both source and destination parent directories after forward and rollback renames.
+24. Recursive continuation tokens filter object entries but never prune a directory whose descendants may sort after the token.
+25. Path-based trash lookup and recovery select the same newest generation by deletion time and trash entry id.
+26. Replica health compares deterministic namespace/control content in addition to record counts. Replicas with the same authority generation but different content fail closed instead of being destructively auto-repaired.
+27. Every accepted namespace mutation advances a constant-size durable generation record on all participating index replicas before changing namespace content.
+28. Redistribution selects a higher namespace generation over link counts or filesystem timestamps, including when the newer replica contains fewer links because of deletion or TTL expiry.
+29. Configured replicas with different namespace generations reject new namespace mutations until redistribution reconciles them.
+30. Namespace generations are excluded from content hashing, and generation maintenance never scans the namespace on the mutation path.
+31. Namespace redistribution and repair share the per-fragment mutation boundary; they cannot copy a replica concurrently with rename, trash, recovery, finalize, mkdir, or TTL sweep.

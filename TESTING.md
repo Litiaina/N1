@@ -107,9 +107,9 @@ SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_rele
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
-## N1 3.0.0 Release Requirement
+## N1 3.0.1 Release Requirement
 
-N1 3.0.0 must retain every N1 2.0 storage invariant and additionally prove:
+N1 3.0.1 must retain every N1 2.0 storage invariant and additionally prove:
 
 - delete is soft-only across HTTP, POSIX, native protocol, shell, and console
 - each deletion receives a unique trash entry id
@@ -125,6 +125,13 @@ N1 3.0.0 must retain every N1 2.0 storage invariant and additionally prove:
 Evidence for the current release belongs under `/home/wlzambo/DEV-TEST` and
 must record the exact binary hash, configuration, disk topology, commands,
 results, and any unproven boundaries.
+
+Recover-on-read fault injection must remove a data shard (`.shard`) that the
+read path actually consumes. Removing parity (`.parity`) exercises explicit
+object or fragment repair instead; a healthy read is not required to scan for
+or recreate unused parity. The proof runner keeps these two fault classes
+separate so a parity-repair expectation cannot masquerade as recover-on-read
+evidence.
 
 ## Historical N1 2.0.0 Evidence
 
@@ -155,6 +162,10 @@ Focused N1 2.0.0 evidence from June 11, 2026:
 - Object-level redistribution passed a real `1 + 0 -> 1 + 1` topology change:
   one object scanned, one mismatch found, one migration completed, zero errors,
   followed by physical `.ndx + payload` verification on both blob roots.
+- N1 3.0.1 redistribution tests must prove that a higher durable namespace
+  generation wins after `2 -> 1 -> 2`, including equal-count replacement and
+  newer deletion cases, while same-generation content disagreement and writes
+  attempted before reconciliation still fail closed.
 - Server RSS peaked at about `155 MiB` in the larger colocated matrix and about
   `123 MiB` in the split-root matrix.
 - Log scans reported no warning, error, panic, critical, degraded, or failed

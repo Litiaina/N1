@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 3.0.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.0.1 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -159,7 +159,7 @@ the placement-limiting disk are both considered before writes proceed.
 
 ### Fragment Identity Layout
 
-N1 3.0.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
+N1 3.0.1 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
 
 ```text
 <index_root>/
@@ -187,7 +187,7 @@ The `.fragment/<fragment_hash>` symlink is the mount/auth alias. The `@f_<stable
 
 Object `.ndx` metadata is stored only on blob roots that carry a shard or parity file for that version. The metadata and EC payload therefore share one durability topology. Index-only roots do not carry object metadata capacity.
 
-N1 3.0.0 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh N1 3.0 fragments; an incompatible fragment fails closed.
+N1 3.0.1 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh N1 3.0 fragments; an incompatible fragment fails closed.
 
 ## Quick Start
 
@@ -309,7 +309,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 3.0.0 includes the native N1 protocol:
+N1 3.0.1 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -508,7 +508,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.0.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.0.1 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -1149,7 +1149,7 @@ Recovery is allowed only while the configured `trash_retention_seconds` has not 
 
 The background lifecycle scans `.trash`, not the full blob plane. For an expired entry it writes a durable reclamation receipt, removes the namespace reference, verifies that each candidate object id has no live or remaining trash reference, directly reclaims safe immutable object directories, and then clears the receipt. Interrupted work is retried from the receipt.
 
-N1 3.0.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
+N1 3.0.1 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
 
 Legacy HTTP clients receive `410 Gone` from the retired destructive routes.
 This explicit tombstone prevents a former `/objects/permanent/...` URL from
@@ -1322,6 +1322,16 @@ Useful query parameters:
 Redistribution rewrites selected object versions into the current blob/EC
 topology. Upload and rewrite paths use the same disk-capacity and placement
 preflight model; if a disk is too full, N1 fails before unsafe shard writes.
+
+Namespace redistribution also reconciles returning index replicas. Every
+accepted namespace mutation advances a constant-size durable generation on
+the participating index roots. After a `2 -> 1 -> 2` topology cycle, the
+higher generation identifies the continuously active namespace even when link
+counts match or the returning replica contains more stale links. Run
+redistribution before resuming namespace writes after re-adding an index root;
+N1 rejects namespace mutations while configured replicas expose different
+generations. If replicas have the same generation but different content,
+automatic repair fails closed and requires operator investigation.
 
 ## Realtime Namespace Websocket
 

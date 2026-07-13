@@ -46,7 +46,7 @@ impl Proof {
             rss_samples.push(self.rss_sample(&format!("chaos_{cycle_idx:03}_after_large")));
 
             let version_id = self.latest_version_id(&large_key).await?;
-            let removed = self.remove_one_shard(&version_id)?;
+            let removed = self.remove_recover_on_read_target(&version_id)?;
             self.assert_download_sha256(&large_key, large_sha).await?;
             self.wait_for_path(&removed, true, Duration::from_secs(60))
                 .await?;
@@ -574,14 +574,7 @@ impl Proof {
                 fs::read_dir(&version_dir)?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
-                    .filter(|path| {
-                        path.is_file()
-                            && path
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .is_some_and(|ext| matches!(ext, "shard" | "parity"))
-                            && keep(path)
-                    }),
+                    .filter(|path| path.is_file() && is_erasure_shard_path(path) && keep(path)),
             );
         }
         shard_files.sort();
@@ -598,11 +591,13 @@ impl Proof {
     }
 
     fn remove_one_data_shard(&self, version_id: &str) -> ProofResult<PathBuf> {
-        self.remove_one_shard_matching(version_id, |path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext == "shard")
-        })
+        self.remove_one_shard_matching(version_id, is_data_shard_path)
+    }
+
+    fn remove_recover_on_read_target(&self, version_id: &str) -> ProofResult<PathBuf> {
+        // A healthy read consumes data shards only. Removing parity here would
+        // exercise explicit object/fragment repair, not recover-on-read.
+        self.remove_one_data_shard(version_id)
     }
 
     async fn wait_for_path(
@@ -890,5 +885,37 @@ impl Proof {
             let _ = fs::remove_dir_all(parent);
         }
         Ok(())
+    }
+}
+
+fn is_erasure_shard_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "shard" | "parity"))
+}
+
+fn is_data_shard_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == "shard")
+}
+
+#[cfg(test)]
+mod proof_job_tests {
+    use super::{is_data_shard_path, is_erasure_shard_path};
+    use std::path::Path;
+
+    #[test]
+    fn recover_on_read_fault_targets_data_and_never_parity() {
+        let data = Path::new("part_0_shard_0.shard");
+        let parity = Path::new("part_0_shard_1.parity");
+        let metadata = Path::new("version.ndx");
+
+        assert!(is_erasure_shard_path(data));
+        assert!(is_erasure_shard_path(parity));
+        assert!(!is_erasure_shard_path(metadata));
+        assert!(is_data_shard_path(data));
+        assert!(!is_data_shard_path(parity));
+        assert!(!is_data_shard_path(metadata));
     }
 }

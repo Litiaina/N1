@@ -9,10 +9,7 @@ use crate::core::ec::ErasureStreamWriter;
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
-use crate::core::fragment_metadata::{
-    fragment_index_partition_count, read_fragment_metadata, resolve_stable_fragment_id,
-    write_fragment_metadata,
-};
+use crate::core::fragment_metadata::{fragment_index_partition_count, resolve_stable_fragment_id};
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
@@ -1239,12 +1236,6 @@ async fn reachable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-async fn replicate_fragment_metadata_best_effort(fragment_hash: &str) {
-    if let Ok(meta) = read_fragment_metadata(fragment_hash).await {
-        let _ = write_fragment_metadata(&meta).await;
-    }
-}
-
 async fn durable_atomic_write_bytes_with_mode(
     path: &Path,
     bytes: &[u8],
@@ -1713,7 +1704,6 @@ pub async fn run_redistribution_job_with_options(
             continue;
         }
 
-        replicate_fragment_metadata_best_effort(&fragment_hash).await;
         if !dry_run {
             if let Err(err) = replay_pending_intents_for_fragment(
                 &fragment_hash,

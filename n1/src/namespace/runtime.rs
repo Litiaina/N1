@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
@@ -27,6 +28,19 @@ use ulid::Ulid;
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
 static FINALIZE_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+const NAMESPACE_MUTATION_LOCK_STRIPES: usize = 257;
+static NAMESPACE_MUTATION_LOCKS: LazyLock<Vec<Arc<tokio::sync::Mutex<()>>>> = LazyLock::new(|| {
+    (0..NAMESPACE_MUTATION_LOCK_STRIPES)
+        .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+        .collect()
+});
+
+pub(crate) async fn namespace_mutation_guard(fragment: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let mut hasher = DefaultHasher::new();
+    fragment.hash(&mut hasher);
+    let stripe = (hasher.finish() as usize) % NAMESPACE_MUTATION_LOCKS.len();
+    NAMESPACE_MUTATION_LOCKS[stripe].clone().lock_owned().await
+}
 
 #[cfg(not(test))]
 fn configured_trash_retention_seconds() -> u64 {
@@ -200,17 +214,22 @@ impl NamespaceRuntime {
         if path.is_empty() {
             return Ok(false);
         }
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         tokio::task::spawn_blocking(move || {
             if live_entry(&fragment, &path)?.is_some() {
                 return Ok(false);
             }
-            let mut created = false;
-            for root in index_roots() {
-                let dir = fragment_root_on(&root, &fragment).join(&path);
-                if !dir.exists() {
-                    created = true;
-                }
-                fs::create_dir_all(&dir).map_err(|e| io_err(e, "create N1 namespace dir"))?;
+            let roots = index_roots();
+            let created = roots
+                .iter()
+                .any(|root| !fragment_root_on(root, &fragment).join(&path).exists());
+            if created {
+                index_store::advance_namespace_generation(&fragment)?;
+            }
+            for root in roots {
+                let fragment_root = fragment_root_on(&root, &fragment);
+                let dir = fragment_root.join(&path);
+                index_store::ensure_namespace_directory(&fragment_root, &dir)?;
             }
             Ok(created)
         })
@@ -235,6 +254,7 @@ impl NamespaceRuntime {
                 "destination cannot be inside the source subtree".to_string(),
             ));
         }
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         tokio::task::spawn_blocking(move || rename_live_path(&fragment, &source, &destination))
             .await
             .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
@@ -247,6 +267,7 @@ impl NamespaceRuntime {
     ) -> Result<NamespaceMutationSummary, AppError> {
         let fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         tokio::task::spawn_blocking(move || trash_live_path(&fragment, &path))
             .await
             .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
@@ -259,6 +280,7 @@ impl NamespaceRuntime {
     ) -> Result<NamespaceMutationSummary, AppError> {
         let fragment = fragment.to_string();
         let path = normalize_user_path(path)?;
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         tokio::task::spawn_blocking(move || recover_trash_path(&fragment, &path, None))
             .await
             .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
@@ -284,6 +306,7 @@ impl NamespaceRuntime {
     ) -> Result<NamespaceMutationSummary, AppError> {
         let fragment = fragment.to_string();
         let trash_entry_id = trash_entry_id.to_string();
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         tokio::task::spawn_blocking(move || {
             recover_trash_path(&fragment, "", Some(&trash_entry_id))
         })
@@ -298,6 +321,7 @@ impl NamespaceRuntime {
         now_unix: i64,
     ) -> Result<TrashLifecycleSweepSummary, AppError> {
         let fragment = fragment.to_string();
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         tokio::task::spawn_blocking(move || {
             sweep_expired_trash_sync(&fragment, retention_seconds, now_unix)
         })
@@ -307,6 +331,7 @@ impl NamespaceRuntime {
 
     pub async fn recover_all(&self, fragment: &str) -> Result<NamespaceMutationSummary, AppError> {
         let fragment_name = fragment.to_string();
+        let _mutation_guard = namespace_mutation_guard(&fragment_name).await;
         let (affected_paths, affected_objects) = tokio::task::spawn_blocking(move || {
             let trash_entry_ids = index_store::stored_trash_records(&fragment_name)?
                 .into_iter()
@@ -393,12 +418,15 @@ impl NamespaceRuntime {
             return Ok(Some(id));
         }
         let normalized = normalize_user_path(path)?;
-        for record in scan_trash_records(fragment)? {
-            if record.original_path == normalized {
-                return Ok(record.object_keys.first().cloned());
-            }
-        }
-        Ok(None)
+        Ok(scan_trash_records(fragment)?
+            .into_iter()
+            .filter(|record| record.original_path == normalized)
+            .max_by(|left, right| {
+                left.deleted_at_unix
+                    .cmp(&right.deleted_at_unix)
+                    .then_with(|| left.trash_entry_id.cmp(&right.trash_entry_id))
+            })
+            .and_then(|record| record.object_keys.first().cloned()))
     }
 
     pub async fn select_object_id_for_write(
@@ -437,6 +465,7 @@ impl NamespaceRuntime {
         let logical_path = normalize_user_path(logical_path)?;
         let physical_object_id = physical_object_id.to_string();
         let metadata = metadata.clone();
+        let _mutation_guard = namespace_mutation_guard(&fragment).await;
         let lock_key = format!("{fragment}\0{logical_path}");
         let lock = {
             let mut locks = FINALIZE_LOCKS.lock().await;
@@ -461,13 +490,56 @@ impl NamespaceRuntime {
                 None => physical_object_id.clone(),
             };
 
+            let mut namespace_placements = Vec::new();
+            for root in index_roots() {
+                let fragment_root = fragment_root_on(&root, &fragment);
+                let link = namespace_path(&root, &fragment, &logical_path);
+                index_store::ensure_namespace_parent(&fragment_root, &link)?;
+                let existing = read_namespace_symlink_object_id(&root, &fragment, &link)?;
+                match existing {
+                    Some(existing) if existing == final_object_id => {
+                        namespace_placements.push((root, link, true));
+                    }
+                    Some(_) => {
+                        return Err(AppError::Conflict(format!(
+                            "logical path '{}' already points to another object",
+                            logical_path
+                        )));
+                    }
+                    None if path_exists_no_follow(&link) => {
+                        return Err(AppError::Conflict(format!(
+                            "logical path '{}' already exists",
+                            logical_path
+                        )));
+                    }
+                    None => namespace_placements.push((root, link, false)),
+                }
+            }
+
+            index_store::advance_namespace_generation(&fragment)?;
+
             if final_object_id != physical_object_id {
                 let _ =
                     index_store::rebind_unpublished_object_version(&metadata, &final_object_id)?;
             }
 
-            for root in index_roots() {
-                publish_namespace_link(&root, &fragment, &logical_path, &final_object_id)?;
+            let mut published: Vec<PathBuf> = Vec::new();
+            for (root, link, already_present) in namespace_placements {
+                if already_present {
+                    continue;
+                }
+                if let Err(err) =
+                    publish_namespace_link(&root, &fragment, &logical_path, &final_object_id)
+                {
+                    for published_link in published.into_iter().rev() {
+                        let _ = fs::remove_file(&published_link);
+                        if let Some(parent) = published_link.parent() {
+                            index_store::sync_dir(parent);
+                        }
+                    }
+                    return Err(err);
+                }
+                published.push(link);
             }
             Ok(final_object_id)
         })
@@ -592,15 +664,15 @@ impl NamespaceRuntime {
                         } else {
                             format!("{rel}/{name}")
                         };
-                        if after
-                            .as_ref()
-                            .is_some_and(|cursor| child_rel.as_str() <= cursor.as_str())
-                        {
-                            continue;
-                        }
                         if let Some(object_id) =
                             read_namespace_symlink_object_id(&root, &fragment, &child)?
                         {
+                            if after
+                                .as_ref()
+                                .is_some_and(|cursor| child_rel.as_str() <= cursor.as_str())
+                            {
+                                continue;
+                            }
                             if !seen.insert(child_rel.clone()) {
                                 continue;
                             }
@@ -639,10 +711,6 @@ impl NamespaceRuntime {
 
 fn index_roots() -> Vec<PathBuf> {
     crate::core::disk_manager::ObjectPathManager::new().get_all_index_roots()
-}
-
-fn io_err(err: std::io::Error, context: &str) -> AppError {
-    AppError::Io(err, context.to_string())
 }
 
 fn path_exists_no_follow(path: &Path) -> bool {
@@ -967,6 +1035,14 @@ fn rename_live_path(
     source: &str,
     destination: &str,
 ) -> Result<NamespaceMutationSummary, AppError> {
+    let roots = index_roots();
+    for root in &roots {
+        let fragment_root = fragment_root_on(root, fragment);
+        let source_path = fragment_root.join(source);
+        if path_exists_no_follow(&source_path) {
+            index_store::validate_namespace_parent(&fragment_root, &source_path)?;
+        }
+    }
     if live_entry(fragment, destination)?.is_some() {
         return Err(AppError::Conflict(format!(
             "destination path '{}' already exists",
@@ -976,10 +1052,10 @@ fn rename_live_path(
     let Some(entry) = live_entry(fragment, source)? else {
         return Err(AppError::NotFound);
     };
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
+    for root in &roots {
+        let fragment_root = fragment_root_on(root, fragment);
         let destination_path = if entry.kind == NamespaceEntryKind::File {
-            namespace_path(&root, fragment, destination)
+            namespace_path(root, fragment, destination)
         } else {
             fragment_root.join(destination)
         };
@@ -990,10 +1066,11 @@ fn rename_live_path(
             )));
         }
     }
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
+    let mut placements = Vec::new();
+    for root in &roots {
+        let fragment_root = fragment_root_on(root, fragment);
         let source_path = if entry.kind == NamespaceEntryKind::File {
-            namespace_path(&root, fragment, source)
+            namespace_path(root, fragment, source)
         } else {
             fragment_root.join(source)
         };
@@ -1001,16 +1078,37 @@ fn rename_live_path(
             continue;
         }
         let destination_path = if entry.kind == NamespaceEntryKind::File {
-            namespace_path(&root, fragment, destination)
+            namespace_path(root, fragment, destination)
         } else {
             fragment_root.join(destination)
         };
-        if let Some(parent) = destination_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| io_err(e, "create rename destination parent"))?;
+        index_store::ensure_namespace_parent(&fragment_root, &destination_path)?;
+        placements.push((source_path, destination_path));
+    }
+    index_store::advance_namespace_generation(fragment)?;
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (source_path, destination_path) in &placements {
+        #[cfg(test)]
+        if test_fail_rename_after(moved.len()) {
+            for (rollback_source, rollback_destination) in moved.into_iter().rev() {
+                let _ = renameat(CWD, &rollback_destination, CWD, &rollback_source);
+                sync_rename_parents(&rollback_destination, &rollback_source);
+            }
+            return Err(AppError::InternalServerError(
+                "N1 namespace rename: injected replica failure".to_string(),
+            ));
         }
-        renameat(CWD, &source_path, CWD, &destination_path)
-            .map_err(|e| AppError::InternalServerError(format!("N1 namespace rename: {e}")))?;
+        if let Err(err) = renameat(CWD, source_path, CWD, destination_path) {
+            for (rollback_source, rollback_destination) in moved.into_iter().rev() {
+                let _ = renameat(CWD, &rollback_destination, CWD, &rollback_source);
+                sync_rename_parents(&rollback_destination, &rollback_source);
+            }
+            return Err(AppError::InternalServerError(format!(
+                "N1 namespace rename: {err}"
+            )));
+        }
+        sync_rename_parents(source_path, destination_path);
+        moved.push((source_path.clone(), destination_path.clone()));
     }
     Ok(NamespaceMutationSummary {
         operation: "rename".to_string(),
@@ -1069,20 +1167,21 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
                 trash_entry_id
             )));
         }
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(e, "create trash destination"))?;
-        }
+        index_store::validate_namespace_parent(&fragment_root, &src)?;
+        index_store::ensure_namespace_parent(&fragment_root, &dst)?;
         placements.push((src, dst));
     }
     if placements.is_empty() {
         return Err(AppError::NotFound);
     }
+    index_store::advance_namespace_generation(fragment)?;
     index_store::write_trash_record_for_fragment(fragment, &record)?;
-    let mut moved = Vec::new();
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (src, dst) in &placements {
         if let Err(err) = renameat(CWD, src, CWD, dst) {
             for (rollback_src, rollback_dst) in moved.into_iter().rev() {
-                let _ = renameat(CWD, rollback_dst, CWD, rollback_src);
+                let _ = renameat(CWD, &rollback_dst, CWD, &rollback_src);
+                sync_rename_parents(&rollback_dst, &rollback_src);
             }
             let _ = index_store::remove_trash_record(fragment, &trash_entry_id);
             return Err(AppError::InternalServerError(format!(
@@ -1091,6 +1190,7 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
                 dst.display()
             )));
         }
+        sync_rename_parents(src, dst);
         moved.push((src.clone(), dst.clone()));
     }
     Ok(NamespaceMutationSummary {
@@ -1127,20 +1227,25 @@ fn sweep_expired_trash_sync(
     now_unix: i64,
 ) -> Result<TrashLifecycleSweepSummary, AppError> {
     let mut summary = TrashLifecycleSweepSummary::default();
+    let receipts = index_store::list_trash_reclaim_receipts(fragment)?;
+    let retention = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
+    let expired_records = index_store::stored_trash_records(fragment)?
+        .into_iter()
+        .filter(|record| now_unix >= record.deleted_at_unix.saturating_add(retention))
+        .collect::<Vec<_>>();
+    if receipts.is_empty() && expired_records.is_empty() {
+        return Ok(summary);
+    }
+    index_store::advance_namespace_generation(fragment)?;
 
-    for receipt in index_store::list_trash_reclaim_receipts(fragment)? {
+    for receipt in receipts {
         summary.reclaimed_objects = summary
             .reclaimed_objects
             .saturating_add(replay_trash_reclaim_receipt(fragment, &receipt)?);
         summary.pending_receipts_replayed = summary.pending_receipts_replayed.saturating_add(1);
     }
 
-    let retention = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
-    for record in index_store::stored_trash_records(fragment)? {
-        let expires_at = record.deleted_at_unix.saturating_add(retention);
-        if now_unix < expires_at {
-            continue;
-        }
+    for record in expired_records {
         let record = index_store::hydrate_trash_record(fragment, record)?;
         let operation_id = format!("ttl-{}-{}", record.trash_entry_id, Ulid::new());
         let receipt = index_store::TrashReclaimReceipt {
@@ -1218,21 +1323,29 @@ fn recover_trash_path(
                 record.original_path
             )));
         }
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(e, "create recover destination"))?;
-        }
+        index_store::validate_namespace_parent(&fragment_root, &src)?;
+        index_store::ensure_namespace_parent(&fragment_root, &dst)?;
         placements.push((src, dst, fragment_root.join(TRASH_DIR)));
     }
-    let mut moved = Vec::new();
+    if placements.is_empty() {
+        return Err(AppError::InternalServerError(format!(
+            "N1 namespace invariant: trash record '{}' has no recoverable payload placement",
+            record.trash_entry_id
+        )));
+    }
+    index_store::advance_namespace_generation(fragment)?;
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (src, dst, _) in &placements {
         if let Err(err) = renameat(CWD, src, CWD, dst) {
             for (rollback_src, rollback_dst) in moved.into_iter().rev() {
-                let _ = renameat(CWD, rollback_dst, CWD, rollback_src);
+                let _ = renameat(CWD, &rollback_dst, CWD, &rollback_src);
+                sync_rename_parents(&rollback_dst, &rollback_src);
             }
             return Err(AppError::InternalServerError(format!(
                 "N1 namespace recover: {err}"
             )));
         }
+        sync_rename_parents(src, dst);
         moved.push((src.clone(), dst.clone()));
     }
     for (_, _, trash_root) in &placements {
@@ -1253,6 +1366,26 @@ fn recover_trash_path(
         trash_entry_id: Some(record.trash_entry_id),
         deleted_at_unix: Some(record.deleted_at_unix),
     })
+}
+
+fn sync_rename_parents(source: &Path, destination: &Path) {
+    if let Some(parent) = source.parent() {
+        index_store::sync_dir(parent);
+    }
+    if let Some(parent) = destination.parent()
+        && source.parent() != Some(parent)
+    {
+        index_store::sync_dir(parent);
+    }
+}
+
+#[cfg(test)]
+static TEST_RENAME_FAIL_AFTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+fn test_fail_rename_after(completed_placements: usize) -> bool {
+    TEST_RENAME_FAIL_AFTER.load(std::sync::atomic::Ordering::SeqCst) == completed_placements
 }
 
 fn prune_empty_trash_parents(trash_root: &Path, source_relative_path: &str) {
@@ -1454,6 +1587,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn n1_namespace_mutations_advance_the_replicated_authority_generation() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-namespace-generation-{}", Ulid::new());
+        for root in &roots {
+            std::fs::create_dir_all(fragment_root_on(root, &fragment))
+                .expect("create generation test fragment root");
+        }
+
+        global_namespace_runtime()
+            .mkdir(&fragment, "clinical")
+            .await
+            .expect("mkdir advances generation");
+        for root in &roots {
+            assert_eq!(
+                index_store::namespace_generation_on_root(root, &fragment)
+                    .expect("read mkdir generation"),
+                Some(1)
+            );
+        }
+
+        publish_logical_object(&roots, &fragment, "clinical/report.bin", 123);
+        global_namespace_runtime()
+            .rename(&fragment, "clinical/report.bin", "clinical/renamed.bin")
+            .await
+            .expect("rename advances generation");
+        global_namespace_runtime()
+            .trash(&fragment, "clinical/renamed.bin")
+            .await
+            .expect("trash advances generation");
+        global_namespace_runtime()
+            .recover(&fragment, "clinical/renamed.bin")
+            .await
+            .expect("recover advances generation");
+
+        for root in &roots {
+            assert_eq!(
+                index_store::namespace_generation_on_root(root, &fragment)
+                    .expect("read final mutation generation"),
+                Some(4)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn n1_namespace_mutation_is_blocked_until_stale_generation_is_reconciled() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-stale-generation-write-gate-{}", Ulid::new());
+        let object_id = publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
+        index_store::set_namespace_generation_on_root(&roots[0], &fragment, 8)
+            .expect("set active generation");
+        index_store::set_namespace_generation_on_root(&roots[1], &fragment, 7)
+            .expect("set stale generation");
+
+        assert!(matches!(
+            global_namespace_runtime()
+                .rename(&fragment, "docs/report.bin", "docs/renamed.bin")
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        for root in &roots {
+            assert_eq!(
+                read_namespace_symlink_object_id(
+                    root,
+                    &fragment,
+                    &fragment_root_on(root, &fragment).join("docs/report.bin")
+                )
+                .expect("read source after gated mutation"),
+                Some(object_id.clone())
+            );
+            assert!(
+                !path_exists_no_follow(&fragment_root_on(root, &fragment).join("docs/renamed.bin")),
+                "a mutation must not start while replica authority generations disagree"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn n1_concurrent_finalize_keeps_same_path_version_lineage() {
         let _guard = crate::test_support::global_test_lock().lock().await;
         let _roots = ensure_test_index_roots();
@@ -1498,6 +1711,41 @@ mod tests {
                 .expect("read stale provisional object")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn n1_finalize_preflights_every_replica_before_namespace_publication() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-finalize-preflight-{}", Ulid::new());
+        let object_id = new_object_id();
+        let metadata = test_metadata(&fragment, &object_id, 99);
+        index_store::upsert_live_version(&metadata).expect("publish provisional object metadata");
+        let outside = std::env::temp_dir().join(format!("n1-finalize-outside-{}", Ulid::new()));
+        std::fs::create_dir_all(&outside).expect("create finalize outside directory");
+        for root in &roots {
+            std::fs::create_dir_all(fragment_root_on(root, &fragment))
+                .expect("create finalize fragment root");
+        }
+        std::os::unix::fs::symlink(
+            &outside,
+            fragment_root_on(&roots[1], &fragment).join("docs"),
+        )
+        .expect("inject later-root parent symlink");
+
+        assert!(matches!(
+            global_namespace_runtime()
+                .finalize_logical_upload(&fragment, "docs/item.bin", &object_id, &metadata)
+                .await,
+            Err(AppError::InternalServerError(_))
+        ));
+        assert!(
+            !path_exists_no_follow(&fragment_root_on(&roots[0], &fragment).join("docs/item.bin")),
+            "failed finalize preflight must not publish a partial namespace replica"
+        );
+        assert!(!outside.join("item.bin").exists());
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[tokio::test]
@@ -1795,5 +2043,198 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "videos");
         assert_eq!(entries[0].kind, NamespaceEntryKind::Directory);
+    }
+
+    #[tokio::test]
+    async fn n1_recursive_reference_pagination_never_skips_cursor_directory_descendants() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-recursive-page-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "a/first.bin", 1);
+        publish_logical_object(&roots, &fragment, "a/z-last.bin", 2);
+        publish_logical_object(&roots, &fragment, "b.bin", 3);
+
+        let first = global_namespace_runtime()
+            .list_live_object_refs_page(&fragment, None, None, 1)
+            .await
+            .expect("first recursive reference page");
+        assert_eq!(first.entries[0].path, "a/first.bin");
+        let second = global_namespace_runtime()
+            .list_live_object_refs_page(&fragment, None, first.continuation_token.as_deref(), 10)
+            .await
+            .expect("second recursive reference page");
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a/z-last.bin", "b.bin"]
+        );
+    }
+
+    #[tokio::test]
+    async fn n1_resolve_any_selects_the_same_latest_trash_generation_as_recovery() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-resolve-trash-generation-{}", Ulid::new());
+        let path = "clinical/report.bin";
+        let first_object = publish_logical_object(&roots, &fragment, path, 11);
+        global_namespace_runtime()
+            .trash(&fragment, path)
+            .await
+            .expect("trash first generation");
+        let second_object = publish_logical_object(&roots, &fragment, path, 22);
+        global_namespace_runtime()
+            .trash(&fragment, path)
+            .await
+            .expect("trash second generation");
+        assert_ne!(first_object, second_object);
+
+        assert_eq!(
+            global_namespace_runtime()
+                .resolve_any_object_id(&fragment, path)
+                .await
+                .expect("resolve latest trashed generation"),
+            Some(second_object)
+        );
+    }
+
+    #[tokio::test]
+    async fn n1_recover_fails_closed_when_record_has_no_payload_placement() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-recover-headless-record-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "records/report.bin", 44);
+        let deleted = global_namespace_runtime()
+            .trash(&fragment, "records/report.bin")
+            .await
+            .expect("trash object");
+        let trash_entry_id = deleted.trash_entry_id.expect("trash entry id");
+        let record = index_store::stored_trash_records(&fragment)
+            .expect("trash records")
+            .into_iter()
+            .find(|record| record.trash_entry_id == trash_entry_id)
+            .expect("matching trash record");
+        for root in &roots {
+            let payload = fragment_root_on(root, &fragment)
+                .join(TRASH_DIR)
+                .join(&record.source_relative_path);
+            if path_exists_no_follow(&payload) {
+                std::fs::remove_file(payload).expect("remove test trash payload");
+            }
+        }
+
+        assert!(matches!(
+            global_namespace_runtime()
+                .recover_trash_entry_id(&fragment, &trash_entry_id)
+                .await,
+            Err(AppError::InternalServerError(_))
+        ));
+        assert!(
+            index_store::stored_trash_records(&fragment)
+                .expect("trash record retained after fail-closed recovery")
+                .iter()
+                .any(|record| record.trash_entry_id == trash_entry_id),
+            "recovery must never delete lifecycle metadata when no payload was moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn n1_live_rename_rolls_back_every_replica_after_later_root_failure() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-rename-rollback-{}", Ulid::new());
+        let object_id = publish_logical_object(&roots, &fragment, "before/item.bin", 55);
+
+        TEST_RENAME_FAIL_AFTER.store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = global_namespace_runtime()
+            .rename(&fragment, "before/item.bin", "after/item.bin")
+            .await;
+        TEST_RENAME_FAIL_AFTER.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(result, Err(AppError::InternalServerError(_))));
+        for root in &roots {
+            assert_eq!(
+                read_namespace_symlink_object_id(
+                    root,
+                    &fragment,
+                    &fragment_root_on(root, &fragment).join("before/item.bin")
+                )
+                .expect("read rolled-back source"),
+                Some(object_id.clone())
+            );
+            assert!(!path_exists_no_follow(
+                &fragment_root_on(root, &fragment).join("after/item.bin")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn n1_namespace_mutations_reject_parent_symlink_escape() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-parent-symlink-{}", Ulid::new());
+        let outside = std::env::temp_dir().join(format!("n1-outside-{}", Ulid::new()));
+        std::fs::create_dir_all(&outside).expect("create outside test directory");
+        for root in &roots {
+            let fragment_root = fragment_root_on(root, &fragment);
+            std::fs::create_dir_all(&fragment_root).expect("create fragment root");
+            std::os::unix::fs::symlink(&outside, fragment_root.join("clinical"))
+                .expect("inject corrupt namespace parent symlink");
+        }
+
+        assert!(matches!(
+            global_namespace_runtime()
+                .mkdir(&fragment, "clinical/new-folder")
+                .await,
+            Err(AppError::InternalServerError(_))
+        ));
+        assert!(
+            !outside.join("new-folder").exists(),
+            "namespace mutation must not create data outside its physical fragment root"
+        );
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[tokio::test]
+    async fn n1_recover_and_ttl_sweep_are_serialized_per_fragment() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        for iteration in 0..32u64 {
+            let fragment = format!("n1-recover-sweep-race-{iteration}-{}", Ulid::new());
+            let path = "race/item.bin";
+            publish_logical_object(&roots, &fragment, path, iteration + 1);
+            global_namespace_runtime()
+                .trash(&fragment, path)
+                .await
+                .expect("trash race object");
+
+            let (recover, sweep) = tokio::join!(
+                global_namespace_runtime().recover(&fragment, path),
+                global_namespace_runtime().sweep_expired_trash(
+                    &fragment,
+                    0,
+                    Utc::now().timestamp()
+                )
+            );
+            let live = global_namespace_runtime()
+                .resolve_live_object_id(&fragment, path)
+                .await
+                .expect("resolve race result")
+                .is_some();
+            let records = index_store::stored_trash_records(&fragment).expect("race records");
+            assert!(
+                records.is_empty(),
+                "race must leave no orphan lifecycle record"
+            );
+            match (recover, sweep, live) {
+                (Ok(_), Ok(summary), true) => assert_eq!(summary.expired_entries, 0),
+                (Err(AppError::NotFound), Ok(summary), false) => {
+                    assert_eq!(summary.expired_entries, 1)
+                }
+                outcome => panic!("invalid recover/sweep outcome: {outcome:?}"),
+            }
+        }
     }
 }

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
+use std::io::Read;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -37,6 +38,7 @@ pub(crate) const LOCKS_DIR: &str = ".locks";
 pub(crate) const GC_DIR: &str = ".gc";
 pub(crate) const REPAIR_DIR: &str = ".repair";
 const FRAGMENT_META_FILE: &str = ".fragment.ndx";
+const NAMESPACE_GENERATION_FILE: &str = ".namespace-generation.ndx";
 pub(crate) const N1_ENGINE_FORMAT_VERSION: u16 = 3;
 const MANIFEST_FILE: &str = "manifest.ndx";
 const BINDING_FILE: &str = "binding.ndx";
@@ -119,6 +121,19 @@ struct ReplicaScore {
     object_records: u64,
     namespace_links: u64,
     upload_records: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicaState {
+    score: ReplicaScore,
+    content_digest: [u8; 32],
+    namespace_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NamespaceGenerationRecord {
+    engine_format_version: u16,
+    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +255,7 @@ fn reserved_user_segment(segment: &str) -> bool {
         || segment.starts_with(REPAIR_DIR)
         || segment.starts_with(INTENTS_DIR)
         || segment.starts_with(TRASH_JOBS_DIR)
+        || segment.starts_with(NAMESPACE_GENERATION_FILE)
 }
 
 pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
@@ -258,6 +274,7 @@ pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
                 | INTENTS_DIR
                 | TRASH_JOBS_DIR
                 | FRAGMENT_META_FILE
+                | NAMESPACE_GENERATION_FILE
         )
 }
 
@@ -356,6 +373,116 @@ pub(crate) fn namespace_path(root: &Path, fragment: &str, logical_path: &str) ->
     fragment_root_on(root, fragment).join(logical_path)
 }
 
+fn validate_namespace_component(path: &Path) -> Result<bool, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(AppError::InternalServerError(format!(
+                "N1 namespace invariant: parent component {} is a symlink",
+                path.display()
+            )))
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(AppError::InternalServerError(format!(
+            "N1 namespace invariant: parent component {} is not a directory",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(io_err(err, "inspect N1 namespace parent")),
+    }
+}
+
+pub(crate) fn validate_namespace_parent(
+    fragment_root: &Path,
+    target: &Path,
+) -> Result<(), AppError> {
+    let parent = target.parent().ok_or_else(|| {
+        AppError::InternalServerError("N1 namespace target has no parent".to_string())
+    })?;
+    let relative = parent.strip_prefix(fragment_root).map_err(|_| {
+        AppError::InternalServerError(format!(
+            "N1 namespace invariant: {} escapes fragment root {}",
+            target.display(),
+            fragment_root.display()
+        ))
+    })?;
+    if !validate_namespace_component(fragment_root)? {
+        return Err(AppError::InternalServerError(format!(
+            "N1 namespace invariant: fragment root {} is missing",
+            fragment_root.display()
+        )));
+    }
+    let mut current = fragment_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(AppError::InternalServerError(format!(
+                "N1 namespace invariant: invalid parent component in {}",
+                target.display()
+            )));
+        };
+        current.push(segment);
+        if !validate_namespace_component(&current)? {
+            return Err(AppError::InternalServerError(format!(
+                "N1 namespace invariant: parent component {} is missing",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_namespace_directory(
+    fragment_root: &Path,
+    directory: &Path,
+) -> Result<(), AppError> {
+    let relative = directory.strip_prefix(fragment_root).map_err(|_| {
+        AppError::InternalServerError(format!(
+            "N1 namespace invariant: {} escapes fragment root {}",
+            directory.display(),
+            fragment_root.display()
+        ))
+    })?;
+    if !validate_namespace_component(fragment_root)? {
+        fs::create_dir(fragment_root).map_err(|e| io_err(e, "create N1 fragment root"))?;
+        if let Some(parent) = fragment_root.parent() {
+            sync_dir(parent);
+        }
+    }
+    let mut current = fragment_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(AppError::InternalServerError(format!(
+                "N1 namespace invariant: invalid directory component in {}",
+                directory.display()
+            )));
+        };
+        let parent = current.clone();
+        current.push(segment);
+        if validate_namespace_component(&current)? {
+            continue;
+        }
+        match fs::create_dir(&current) {
+            Ok(()) => sync_dir(&parent),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !validate_namespace_component(&current)? {
+                    return Err(AppError::InternalServerError(format!(
+                        "N1 namespace invariant: failed to create directory {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(err) => return Err(io_err(err, "create N1 namespace directory")),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_namespace_parent(fragment_root: &Path, target: &Path) -> Result<(), AppError> {
+    let parent = target.parent().ok_or_else(|| {
+        AppError::InternalServerError("N1 namespace target has no parent".to_string())
+    })?;
+    ensure_namespace_directory(fragment_root, parent)
+}
+
 fn object_symlink_target(object_id: &str) -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(object_dir_name_for_id(object_id)?))
 }
@@ -400,10 +527,11 @@ pub(crate) fn publish_namespace_link(
 ) -> Result<(), AppError> {
     let logical_path = normalize_object_key(logical_path)?;
     let link = namespace_path(root, fragment, &logical_path);
+    let fragment_root = fragment_root_on(root, fragment);
+    ensure_namespace_parent(&fragment_root, &link)?;
     let parent = link.parent().ok_or_else(|| {
         AppError::InternalServerError("N1 namespace link has no parent".to_string())
     })?;
-    fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 namespace parent"))?;
 
     if let Some(existing) = read_namespace_symlink_object_id(root, fragment, &link)? {
         if existing == normalize_object_id(object_id)? {
@@ -822,7 +950,7 @@ fn directory_entry(record: String) -> IndexListEntry {
     }
 }
 
-fn sync_dir(path: &Path) {
+pub(crate) fn sync_dir(path: &Path) {
     let _ = linux_io::sync_dir_blocking(path);
 }
 
@@ -2178,6 +2306,91 @@ fn count_namespace_links(root: &Path, fragment: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn namespace_generation_path(fragment_root: &Path) -> PathBuf {
+    fragment_root.join(NAMESPACE_GENERATION_FILE)
+}
+
+fn read_namespace_generation_from_fragment_root(
+    fragment_root: &Path,
+) -> Result<Option<u64>, AppError> {
+    let path = namespace_generation_path(fragment_root);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io_err(err, "read N1 namespace generation")),
+    };
+    let record: NamespaceGenerationRecord = decode(&bytes)?;
+    if record.engine_format_version != N1_ENGINE_FORMAT_VERSION {
+        return Err(AppError::InternalServerError(format!(
+            "N1 namespace generation at {} uses engine format {}, expected {}",
+            path.display(),
+            record.engine_format_version,
+            N1_ENGINE_FORMAT_VERSION
+        )));
+    }
+    Ok(Some(record.generation))
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_generation_on_root(
+    root: &Path,
+    fragment: &str,
+) -> Result<Option<u64>, AppError> {
+    read_namespace_generation_from_fragment_root(&fragment_root_on(root, fragment))
+}
+
+#[cfg(test)]
+pub(crate) fn set_namespace_generation_on_root(
+    root: &Path,
+    fragment: &str,
+    generation: u64,
+) -> Result<(), AppError> {
+    write_namespace_generation_to_fragment_root(&fragment_root_on(root, fragment), generation)
+}
+
+fn write_namespace_generation_to_fragment_root(
+    fragment_root: &Path,
+    generation: u64,
+) -> Result<(), AppError> {
+    write_atomic(
+        &namespace_generation_path(fragment_root),
+        &encode(&NamespaceGenerationRecord {
+            engine_format_version: N1_ENGINE_FORMAT_VERSION,
+            generation,
+        })?,
+    )
+}
+
+pub(crate) fn advance_namespace_generation(fragment: &str) -> Result<u64, AppError> {
+    let roots = existing_fragment_roots(fragment);
+    if roots.is_empty() {
+        return Err(AppError::InternalServerError(format!(
+            "N1 namespace generation cannot advance: fragment '{fragment}' has no index replica"
+        )));
+    }
+    let mut observed_generation = None::<Option<u64>>;
+    let mut current = 0u64;
+    for fragment_root in &roots {
+        let generation = read_namespace_generation_from_fragment_root(fragment_root)?;
+        if observed_generation.is_some_and(|observed| observed != generation) {
+            return Err(AppError::Conflict(format!(
+                "N1 namespace replicas for fragment '{fragment}' have different authority generations; run namespace redistribution before accepting another mutation"
+            )));
+        }
+        observed_generation = Some(generation);
+        current = current.max(generation.unwrap_or_default());
+    }
+    let next = current.checked_add(1).ok_or_else(|| {
+        AppError::InternalServerError(format!(
+            "N1 namespace generation overflow for fragment '{fragment}'"
+        ))
+    })?;
+    for fragment_root in roots {
+        write_namespace_generation_to_fragment_root(&fragment_root, next)?;
+    }
+    Ok(next)
+}
+
 fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
     ReplicaScore {
         meta_present: u64::from(
@@ -2189,6 +2402,86 @@ fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
         namespace_links: count_namespace_links(root, fragment),
         upload_records: count_upload_records(root, fragment),
     }
+}
+
+fn hash_replica_tree(
+    hasher: &mut Sha256,
+    fragment_root: &Path,
+    directory: &Path,
+) -> Result<(), AppError> {
+    let mut names = read_dir_names(directory)?;
+    names.sort_unstable();
+    for name in names {
+        if directory == fragment_root
+            && matches!(
+                name.as_str(),
+                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | REPAIR_DIR | NAMESPACE_GENERATION_FILE
+            )
+        {
+            continue;
+        }
+        let path = directory.join(&name);
+        let relative = path.strip_prefix(fragment_root).map_err(|_| {
+            AppError::InternalServerError(format!(
+                "N1 replica manifest path {} escapes {}",
+                path.display(),
+                fragment_root.display()
+            ))
+        })?;
+        let relative = relative.to_string_lossy();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|e| io_err(e, "inspect N1 replica manifest entry"))?;
+        if metadata.file_type().is_symlink() {
+            let target =
+                fs::read_link(&path).map_err(|e| io_err(e, "read N1 replica manifest symlink"))?;
+            hasher.update(b"L\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(target.as_os_str().as_encoded_bytes());
+            hasher.update(b"\0");
+        } else if metadata.is_dir() {
+            hasher.update(b"D\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            hash_replica_tree(hasher, fragment_root, &path)?;
+        } else if metadata.is_file() {
+            hasher.update(b"F\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            let mut file =
+                File::open(&path).map_err(|e| io_err(e, "open N1 replica manifest file"))?;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|e| io_err(e, "read N1 replica manifest file"))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            hasher.update(b"\0");
+        } else {
+            return Err(AppError::InternalServerError(format!(
+                "N1 replica manifest contains unsupported entry {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn replica_state(root: &Path, fragment: &str) -> Result<ReplicaState, AppError> {
+    let fragment_root = fragment_root_on(root, fragment);
+    let mut hasher = Sha256::new();
+    if fragment_root.is_dir() {
+        hash_replica_tree(&mut hasher, &fragment_root, &fragment_root)?;
+    }
+    Ok(ReplicaState {
+        score: replica_score(root, fragment),
+        content_digest: hasher.finalize().into(),
+        namespace_generation: read_namespace_generation_from_fragment_root(&fragment_root)?,
+    })
 }
 
 fn replica_index_records(score: &ReplicaScore) -> u64 {
@@ -2233,34 +2526,47 @@ fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
     latest
 }
 
-fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaScore)> {
-    let mut best: Option<(PathBuf, ReplicaScore, u128)> = None;
+fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaState)> {
+    let mut best: Option<(PathBuf, ReplicaState, u128)> = None;
     for root in index_roots() {
         let fragment_root = fragment_root_on(&root, fragment);
         if !fragment_root.exists() {
             continue;
         }
-        let score = replica_score(&root, fragment);
+        let Ok(state) = replica_state(&root, fragment) else {
+            continue;
+        };
         let modified = latest_index_plane_mtime_nanos(&fragment_root);
         let take = match best.as_ref() {
             None => true,
-            Some((_, current_score, current_modified)) => {
-                let records = replica_index_records(&score);
-                let current_records = replica_index_records(current_score);
-                if records > current_records {
-                    true
-                } else if records < current_records {
-                    false
-                } else {
-                    // Maintenance and redistribution can touch stale replicas after a
-                    // one-disk write. Use mtime only when the N1 index content matches.
-                    modified > *current_modified
-                        || (modified == *current_modified && score > *current_score)
+            Some((_, current_state, current_modified)) => {
+                match (
+                    state.namespace_generation,
+                    current_state.namespace_generation,
+                ) {
+                    (Some(candidate), Some(current)) if candidate != current => candidate > current,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    _ => {
+                        let records = replica_index_records(&state.score);
+                        let current_records = replica_index_records(&current_state.score);
+                        if records > current_records {
+                            true
+                        } else if records < current_records {
+                            false
+                        } else {
+                            // Maintenance and redistribution can touch stale replicas after a
+                            // one-disk write. Use mtime only when the N1 index content matches.
+                            modified > *current_modified
+                                || (modified == *current_modified
+                                    && state.score > current_state.score)
+                        }
+                    }
                 }
             }
         };
         if take {
-            best = Some((root, score, modified));
+            best = Some((root, state, modified));
         }
     }
     best.map(|(root, score, _)| (fragment_root_on(&root, fragment), score))
@@ -2271,7 +2577,8 @@ pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) ->
     let mut present_replicas = 0u64;
     let mut missing_replicas = 0u64;
     let mut divergent_replicas = 0u64;
-    let Some((source_fragment_root, canonical_score)) = choose_replica_source(fragment) else {
+    let mut corrupt_replicas = 0u64;
+    let Some((source_fragment_root, canonical_state)) = choose_replica_source(fragment) else {
         return ReplicaInspection {
             expected_replicas,
             present_replicas: 0,
@@ -2292,12 +2599,26 @@ pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) ->
             continue;
         }
         present_replicas += 1;
-        let score = replica_score(root, fragment);
-        if score == canonical_score {
+        let state = match replica_state(root, fragment) {
+            Ok(state) => state,
+            Err(_) => {
+                corrupt_replicas += 1;
+                continue;
+            }
+        };
+        if state == canonical_state {
             valid_replicas += 1;
             continue;
         }
-        if score < canonical_score {
+        let stale_generation = match (
+            state.namespace_generation,
+            canonical_state.namespace_generation,
+        ) {
+            (Some(replica), Some(canonical)) => replica < canonical,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if stale_generation || state.score < canonical_state.score {
             missing_replicas += 1;
         } else {
             divergent_replicas += 1;
@@ -2310,8 +2631,8 @@ pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) ->
         valid_replicas,
         missing_replicas,
         divergent_replicas,
-        corrupt_replicas: 0,
-        healthy: missing_replicas == 0 && divergent_replicas == 0,
+        corrupt_replicas,
+        healthy: missing_replicas == 0 && divergent_replicas == 0 && corrupt_replicas == 0,
         canonical_path: Some(source_fragment_root.display().to_string()),
     }
 }
@@ -2338,17 +2659,18 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
     let _guard = N1_FS_LOCK
         .lock()
         .map_err(|_| AppError::InternalServerError("N1 index sync lock poisoned".to_string()))?;
-    let Some((source, _source_score)) = choose_replica_source(fragment) else {
+    let Some((source, source_state)) = choose_replica_source(fragment) else {
         return Ok(());
     };
+    ensure_replica_source_unambiguous(fragment, &source_state)?;
     let source_root = source.parent().unwrap_or(&source).to_path_buf();
-    let source_score = replica_score(&source_root, fragment);
+    let source_state = replica_state(&source_root, fragment)?;
     for dst in fragment_roots(fragment) {
         if dst == source {
             continue;
         }
         let dst_root = dst.parent().unwrap_or(&dst).to_path_buf();
-        if dst.exists() && replica_score(&dst_root, fragment) == source_score {
+        if dst.exists() && replica_state(&dst_root, fragment)? == source_state {
             continue;
         }
         clear_index_plane(&dst)?;
@@ -2369,15 +2691,20 @@ pub fn repair_fragment_all_partition_replicas(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let Some((source, mut source_score)) = choose_replica_source(fragment) else {
+    let _guard = N1_FS_LOCK
+        .lock()
+        .map_err(|_| AppError::InternalServerError("N1 index repair lock poisoned".to_string()))?;
+    let Some((source, mut source_state)) = choose_replica_source(fragment) else {
         return Ok((0, 0, 0));
     };
     if !dry_run {
+        ensure_replica_source_unambiguous(fragment, &source_state)?;
         let source_root = source.parent().unwrap_or(&source).to_path_buf();
-        source_score = replica_score(&source_root, fragment);
+        source_state = replica_state(&source_root, fragment)?;
     }
     let mut missing = 0;
     let mut divergent = 0;
+    let mut corrupt = 0;
     for dst in fragment_roots(fragment) {
         if dst == source {
             continue;
@@ -2386,11 +2713,21 @@ pub fn repair_fragment_all_partition_replicas(
             missing += 1;
         } else {
             let dst_root = dst.parent().unwrap_or(&dst).to_path_buf();
-            let dst_score = replica_score(&dst_root, fragment);
-            if dst_score == source_score {
+            let dst_state = match replica_state(&dst_root, fragment) {
+                Ok(state) => state,
+                Err(_) => {
+                    corrupt += 1;
+                    if !dry_run {
+                        clear_index_plane(&dst)?;
+                        copy_dir_contents(&source, &dst)?;
+                    }
+                    continue;
+                }
+            };
+            if dst_state == source_state {
                 continue;
             }
-            if dst_score < source_score {
+            if dst_state.score < source_state.score {
                 missing += 1;
             } else {
                 divergent += 1;
@@ -2404,7 +2741,35 @@ pub fn repair_fragment_all_partition_replicas(
     if !dry_run {
         let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
     }
-    Ok((missing, divergent, 0))
+    Ok((missing, divergent, corrupt))
+}
+
+fn ensure_replica_source_unambiguous(
+    fragment: &str,
+    source_state: &ReplicaState,
+) -> Result<(), AppError> {
+    for root in index_roots() {
+        let fragment_root = fragment_root_on(&root, fragment);
+        if !fragment_root.exists() {
+            continue;
+        }
+        let Ok(state) = replica_state(&root, fragment) else {
+            continue;
+        };
+        let same_known_generation = source_state.namespace_generation.is_some()
+            && state.namespace_generation == source_state.namespace_generation;
+        let equally_complete_legacy = source_state.namespace_generation.is_none()
+            && state.namespace_generation.is_none()
+            && state.score == source_state.score;
+        if state.content_digest != source_state.content_digest
+            && (same_known_generation || equally_complete_legacy)
+        {
+            return Err(AppError::Conflict(format!(
+                "N1 namespace replicas for fragment '{fragment}' have the same authority generation but different content; refusing destructive automatic repair"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn same_root(left: &Path, right: &Path) -> bool {
@@ -2418,7 +2783,7 @@ pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<us
     let Some((_source, source_score)) = choose_replica_source(fragment) else {
         return Ok(0);
     };
-    if source_score.meta_present == 0 && replica_index_records(&source_score) == 0 {
+    if source_score.score.meta_present == 0 && replica_index_records(&source_score.score) == 0 {
         return Ok(0);
     }
 
@@ -3030,6 +3395,167 @@ mod tests {
                 "2.0 index roots must never receive an object metadata plane"
             );
         }
+    }
+
+    #[test]
+    fn replica_inspection_detects_equal_count_different_namespace_content() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-replica-content-divergence-{}", Ulid::new());
+        let original_object = publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
+        let divergent_object = new_object_id();
+        upsert_live_version(&test_metadata(&fragment, &divergent_object, 456))
+            .expect("publish divergent object metadata");
+
+        let divergent_link = fragment_root_on(&roots[1], &fragment).join("docs/report.bin");
+        fs::remove_file(&divergent_link).expect("remove one replica link");
+        unix_fs::symlink(
+            object_symlink_target(&divergent_object).expect("divergent link target"),
+            &divergent_link,
+        )
+        .expect("inject equal-count divergent namespace link");
+
+        assert_ne!(original_object, divergent_object);
+        let inspection = inspect_fragment_partition_replicas(&fragment, &roots);
+        assert!(!inspection.healthy);
+        assert_eq!(inspection.missing_replicas, 0);
+        assert_eq!(inspection.divergent_replicas, 1);
+        assert!(matches!(
+            repair_fragment_all_partition_replicas(&fragment, false),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            read_namespace_symlink_object_id(&roots[1], &fragment, &divergent_link)
+                .expect("read divergent link after refused repair"),
+            Some(divergent_object),
+            "automatic repair must fail closed when two equally complete replicas disagree"
+        );
+    }
+
+    #[test]
+    fn replica_content_digest_is_independent_of_directory_iteration_order() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-replica-manifest-order-{}", Ulid::new());
+        let first_object = new_object_id();
+        let second_object = new_object_id();
+        let first_root = fragment_root_on(&roots[0], &fragment);
+        let second_root = fragment_root_on(&roots[1], &fragment);
+
+        fs::create_dir_all(first_root.join("alpha")).expect("create first alpha");
+        fs::create_dir_all(first_root.join("beta")).expect("create first beta");
+        fs::create_dir_all(second_root.join("beta")).expect("create second beta first");
+        fs::create_dir_all(second_root.join("alpha")).expect("create second alpha last");
+        unix_fs::symlink(
+            object_symlink_target(&first_object).expect("first target"),
+            first_root.join("alpha/a.bin"),
+        )
+        .expect("publish first-root alpha");
+        unix_fs::symlink(
+            object_symlink_target(&second_object).expect("second target"),
+            first_root.join("beta/b.bin"),
+        )
+        .expect("publish first-root beta");
+        unix_fs::symlink(
+            object_symlink_target(&second_object).expect("second target"),
+            second_root.join("beta/b.bin"),
+        )
+        .expect("publish second-root beta");
+        unix_fs::symlink(
+            object_symlink_target(&first_object).expect("first target"),
+            second_root.join("alpha/a.bin"),
+        )
+        .expect("publish second-root alpha");
+
+        let inspection = inspect_fragment_partition_replicas(&fragment, &roots);
+        assert!(inspection.healthy);
+        assert_eq!(inspection.valid_replicas, 2);
+        assert_eq!(inspection.divergent_replicas, 0);
+    }
+
+    #[test]
+    fn redistribution_reconciles_equal_count_stale_replica_from_higher_generation() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-redistribution-generation-{}", Ulid::new());
+        let original_object = publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
+        let replacement_object = new_object_id();
+        upsert_live_version(&test_metadata(&fragment, &replacement_object, 456))
+            .expect("publish replacement object metadata");
+        for root in &roots {
+            write_namespace_generation_to_fragment_root(&fragment_root_on(root, &fragment), 41)
+                .expect("write shared namespace generation");
+        }
+
+        let authoritative_link = fragment_root_on(&roots[0], &fragment).join("docs/report.bin");
+        fs::remove_file(&authoritative_link).expect("remove prior authoritative link");
+        unix_fs::symlink(
+            object_symlink_target(&replacement_object).expect("replacement target"),
+            &authoritative_link,
+        )
+        .expect("publish one-disk replacement");
+        write_namespace_generation_to_fragment_root(&fragment_root_on(&roots[0], &fragment), 42)
+            .expect("advance active one-disk generation");
+
+        let before = inspect_fragment_partition_replicas(&fragment, &roots);
+        assert!(!before.healthy);
+        assert_eq!(
+            before.canonical_path,
+            Some(fragment_root_on(&roots[0], &fragment).display().to_string())
+        );
+        sync_fragment_partition_replicas(&fragment)
+            .expect("reconcile returning stale namespace replica");
+
+        for root in &roots {
+            let link = fragment_root_on(root, &fragment).join("docs/report.bin");
+            assert_eq!(
+                read_namespace_symlink_object_id(root, &fragment, &link)
+                    .expect("read reconciled link"),
+                Some(replacement_object.clone())
+            );
+            assert_eq!(
+                read_namespace_generation_from_fragment_root(&fragment_root_on(root, &fragment))
+                    .expect("read reconciled generation"),
+                Some(42)
+            );
+        }
+        assert_ne!(original_object, replacement_object);
+        assert!(inspect_fragment_partition_replicas(&fragment, &roots).healthy);
+    }
+
+    #[test]
+    fn redistribution_generation_outranks_stale_replica_with_more_links() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("n1-redistribution-delete-generation-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "docs/expired.bin", 123);
+        for root in &roots {
+            write_namespace_generation_to_fragment_root(&fragment_root_on(root, &fragment), 51)
+                .expect("write shared generation before one-disk delete");
+        }
+
+        fs::remove_file(fragment_root_on(&roots[0], &fragment).join("docs/expired.bin"))
+            .expect("delete on continuously active replica");
+        write_namespace_generation_to_fragment_root(&fragment_root_on(&roots[0], &fragment), 52)
+            .expect("advance generation after one-disk delete");
+
+        let (source, state) = choose_replica_source(&fragment).expect("authoritative source");
+        assert_eq!(source, fragment_root_on(&roots[0], &fragment));
+        assert_eq!(state.namespace_generation, Some(52));
+        sync_fragment_partition_replicas(&fragment)
+            .expect("higher generation must override richer stale replica");
+        for root in &roots {
+            assert!(
+                fs::symlink_metadata(fragment_root_on(root, &fragment).join("docs/expired.bin"))
+                    .is_err(),
+                "a stale retained link must not resurrect a newer namespace deletion"
+            );
+        }
+        assert!(inspect_fragment_partition_replicas(&fragment, &roots).healthy);
     }
 
     #[test]

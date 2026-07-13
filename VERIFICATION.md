@@ -139,6 +139,96 @@ N1 2.0.0 IO-control proof completed on June 11, 2026:
 - The final log scan passed with `bad_lines: []`.
 - Evidence: `/tmp/n1-2.0-io-control-proof/summary.json`.
 
+## N1 3.0.1 Namespace Edge-Case Confidence Matrix
+
+N1 3.0.1 is a hardening release on engine format 3. It does not redesign the
+immutable object plane, stable object identities, EC placement, or O(1)
+namespace rename. The patch closes mutation-boundary edge cases identified
+after the N1 3.0.0 lifecycle release.
+
+| Edge case | Locked invariant | Regression proof | Status |
+| --- | --- | --- | --- |
+| Recovery record exists but every trash payload placement is missing | Recovery fails closed and retains lifecycle metadata; it never reports a successful headless recovery | `n1_recover_fails_closed_when_record_has_no_payload_placement` | PASS |
+| Recovery races TTL ownership and physical reclamation | All namespace/lifecycle mutations for one fragment use the same bounded per-fragment lock stripe | `n1_recover_and_ttl_sweep_are_serialized_per_fragment` runs 32 adversarial races and accepts only the two complete serial outcomes | PASS |
+| A later index root fails during live rename | Earlier root renames are rolled back and both parent directories are synced | `n1_live_rename_rolls_back_every_replica_after_later_root_failure` | PASS |
+| Finalize encounters an invalid later-root namespace parent | Every root is preflighted before publishing the first new namespace link; newly published links are rolled back on runtime failure | `n1_finalize_preflights_every_replica_before_namespace_publication` | PASS |
+| Recursive pagination token sorts after a parent directory but before one of its descendants | Continuation filtering never prunes directory traversal | `n1_recursive_reference_pagination_never_skips_cursor_directory_descendants` | PASS |
+| Repeated deletes create multiple retained generations at one path | Any-object resolution and recovery both select max `(deleted_at_unix, trash_entry_id)` | `n1_resolve_any_selects_the_same_latest_trash_generation_as_recovery` | PASS |
+| Corrupt namespace parent is a symlink outside the fragment root | Mutation parent chains accept directories only and reject symlinks/non-directories before creation or rename | `n1_namespace_mutations_reject_parent_symlink_escape` | PASS |
+| Two replicas have equal link counts but different paths, kinds, targets, or control bytes | Replica inspection hashes deterministic namespace/control content; destructive repair refuses an equally complete disagreement | `replica_inspection_detects_equal_count_different_namespace_content` | PASS |
+| Identical replicas expose directory entries in different filesystem iteration order | Every directory level is sorted before content hashing, so the digest depends only on namespace/control content | `replica_content_digest_is_independent_of_directory_iteration_order` | PASS |
+| A `2 -> 1 -> 2` cycle returns a stale replica with the same link count but different targets | The continuously active replica has a higher durable namespace generation and is copied to the returning replica | `redistribution_reconciles_equal_count_stale_replica_from_higher_generation` | PASS |
+| A returning stale replica has more links because the active replica deleted or expired an entry | Higher generation outranks record count, preventing stale-link resurrection | `redistribution_generation_outranks_stale_replica_with_more_links` | PASS |
+| A normal mutation arrives before stale replicas are reconciled | Different generations reject the mutation before any namespace path changes | `n1_namespace_mutation_is_blocked_until_stale_generation_is_reconciled` | PASS |
+| Namespace authority tracking accidentally scans the namespace or mutates object state | Mutations update one constant-size internal generation record per participating index root; the record is excluded from the content digest and `.objects` remains untouched | `n1_namespace_mutations_advance_the_replicated_authority_generation` | PASS |
+| Existing 3.0 lifecycle, lineage, folder move, trash generation, POSIX pagination, and shared-reference behavior regress | All pre-existing namespace runtime tests remain green beside the new adversarial cases | `cargo test -p n1 namespace::runtime::tests -- --test-threads=1` | PASS: 19/19 |
+
+Focused verification commands:
+
+```bash
+cargo check -p n1 --tests
+cargo test -p n1 namespace::runtime::tests -- --test-threads=1
+cargo test -p n1 equal_count_different_namespace_content -- --nocapture
+cargo test -p n1 replica_content_digest -- --nocapture
+cargo test -p n1 redistribution_reconciles_equal_count_stale_replica -- --nocapture
+cargo test -p n1 redistribution_generation_outranks_stale_replica -- --nocapture
+cargo test -p n1 n1_namespace_mutation_is_blocked_until_stale_generation_is_reconciled -- --nocapture
+```
+
+On July 13, 2026, the warning-denied N1 gate passed all `116` N1 tests, and
+the warning-denied workspace library/binary/integration gate also passed (`7`
+N1 Shell integration tests, `107` SIMD unit tests, and `5` SIMD integration
+tests; long SIMD stress cases remained explicitly ignored as configured).
+
+The first real HDD+SSD preflight at
+`/home/wlzambo/DEV-TEST/n1-3.0.1-namespace-extreme/extreme-20260712-200250`
+correctly failed on an order-dependent replica digest. The digest was fixed to
+sort every directory level, and the failure became the dedicated
+`replica_content_digest_is_independent_of_directory_iteration_order`
+regression test. The next detached proof was launched as
+`n1-301-namespace-extreme-201043.service`, with evidence under
+`/home/wlzambo/DEV-TEST/n1-3.0.1-namespace-extreme/extreme-20260712-201043`.
+That run correctly failed during `2 -> 1 -> 2` redistribution because equal
+record counts no longer concealed different namespace contents, while no
+durable authority existed to identify the continuously active replica. The
+resulting patch adds the replicated namespace generation and the three
+redistribution/write-gate regressions above. This failed run remains evidence;
+it is not counted as release PASS.
+
+The generation-authority patch was frozen into the N1 3.0.1 release binary and
+a fresh detached HDD+SSD `1 + 1` proof ran on July 13, 2026 as
+`n1-301-generation-proof-112852.service`, with evidence under
+`/home/wlzambo/DEV-TEST/n1-3.0.1-namespace-extreme/extreme-20260713-112852`.
+The run reached the chaos cycle after the earlier release gates succeeded,
+including `2 -> 1 -> 2` redistribution and a repair scan of `15,095` objects
+with zero corrupt objects, missing metadata, or divergent metadata. The run
+then failed because the chaos harness removed an unused parity shard and
+incorrectly expected an otherwise healthy read to recreate it. N1 correctly
+read the intact data shard. This is retained as failed harness evidence, not a
+release PASS. The harness now uses the same data-shard-only fault selector as
+the dedicated recover-on-read proof, with a regression that rejects parity as
+a recover-on-read target.
+
+The corrected harness then passed a fresh compact full release matrix on the
+real HDD `/mnt/DISK001` and SSD
+`/home/wlzambo/SERVER-TEST/disk-00`, with evidence under
+`/home/wlzambo/DEV-TEST/n1-3.0.1-harness-fix/focused-20260713-184522`.
+All `21` release gates passed with `1 + 1` EC, a real `64 MiB` multipart
+object, restart persistence, native protocol, concurrent workloads, POSIX
+CRUD/trash/recover/GC, corrected recover-on-read, explicit parity repair,
+disk-format repair, `2 -> 1 -> 2` redistribution, and a completed chaos cycle.
+The corrected chaos path physically restored the deleted data shard before
+continuing through trash/recover, disk-wipe repair, GC, and final health. The
+final inspection found `103` live namespace links on each root and `103`
+unique objects; the log scan passed with zero bad lines. This fresh complete
+matrix closes the harness defect, while the preceding run remains the
+independent `15,095`-object scale evidence rather than being relabeled PASS.
+
+The final release gate also requires the warning-denied workspace suite and an
+unattended real HDD+SSD `1 + 1` EC proof. Its command, PID, logs, and final
+summary belong under `/home/wlzambo/DEV-TEST`; a running background proof is
+not recorded as PASS until its summary and log scan complete successfully.
+
 ## Extended LTS Proof Matrix
 
 The full LTS proof should include:
