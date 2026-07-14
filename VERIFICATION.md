@@ -189,15 +189,17 @@ The ordinary workspace matrix also passed: proof runner `3/3`, N1 Shell
 integration `7/7`, SIMD unit `107` passed with `6` intentional ignores, SIMD
 integration `5` passed with `2` intentional ignores, and documentation tests
 `4/4`. All workspace targets, including benchmark targets, compiled.
-The earlier real HDD+SSD evidence below remains valid baseline evidence for
-the unchanged immutable-object, EC, namespace, CRUD, POSIX, recovery, repair,
-and redistribution primitives; it is not relabeled as a dedicated autonomous-
-healing topology proof.
+The real HDD+SSD evidence below remains valid for the immutable-object, EC,
+namespace, CRUD, POSIX, recovery, repair, and redistribution primitives carried
+into N1 3.1.0. The historical evidence-directory names retain the package label
+used by each run; the dedicated `--auto-healing-proof` section separately
+records direct failure-injection proof of the autonomous controller.
 
-### Reset 3.0.0 Fast Real-Disk Smoke
+### N1 3.1.0 Fast Real-Disk Smoke
 
-On July 14, 2026, a fresh debug binary ran a bounded native/CRUD smoke on the
-real XFS HDD `/mnt/DISK001` and ext4 NVMe root containing
+On July 14, 2026, the autonomous-maintenance implementation carried into N1
+3.1.0 ran a bounded native/CRUD smoke on the real XFS HDD `/mnt/DISK001` and
+ext4 NVMe root containing
 `/home/wlzambo/SERVER-TEST/disk-00`, using colocated index/blob roots and
 `1 + 1` EC. The controller enrolled two root identities on two distinct Linux
 devices, validated the topology, and automatically left startup read-only
@@ -216,10 +218,11 @@ the durable topology registry remain in the evidence directory. Scheduled
 auto scans were disabled for this short smoke to avoid turning it into a soak;
 their scheduling/fail-safe behavior is covered by the fast regression matrix.
 
-### Reset 3.0.0 Autonomous-Healing Real-Disk Proof
+### N1 3.1.0 Autonomous-Healing Real-Disk Proof
 
-On July 14, 2026, the bounded `--auto-healing-proof` release gate passed on
-the real XFS HDD `/mnt/DISK001` and the ext4 NVMe device containing
+On July 14, 2026, the bounded `--auto-healing-proof` release gate passed for
+the autonomous-healing implementation carried into N1 3.1.0 on the real XFS
+HDD `/mnt/DISK001` and the ext4 NVMe device containing
 `/home/wlzambo/SERVER-TEST/disk-00`. The roots were colocated index/blob
 roots on two distinct Linux devices with minimum `1 + 1` EC. This was a short
 failure-injection proof, not a soak.
@@ -255,7 +258,7 @@ the logs contain no panic. Reproducible evidence is stored at:
 The reusable command path is `n1-release-proof --auto-healing-proof`; every
 state wait is bounded to 30 seconds.
 
-## Pre-Reset 3.0.1 Namespace Edge-Case Evidence
+## N1 3.1.0 Namespace Edge-Case Evidence
 
 The unreleased N1 3.0.1 work was hardening on engine format 3. It did not redesign the
 immutable object plane, stable object identities, EC placement, or O(1)
@@ -313,7 +316,7 @@ resulting patch adds the replicated namespace generation and the three
 redistribution/write-gate regressions above. This failed run remains evidence;
 it is not counted as release PASS.
 
-The generation-authority patch was frozen into the pre-reset N1 3.0.1 candidate binary and
+The generation-authority patch was frozen into the unreleased N1 3.0.1 candidate binary and
 a fresh detached HDD+SSD `1 + 1` proof ran on July 13, 2026 as
 `n1-301-generation-proof-112852.service`, with evidence under
 `/home/wlzambo/DEV-TEST/n1-3.0.1-namespace-extreme/extreme-20260713-112852`.
