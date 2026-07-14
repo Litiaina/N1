@@ -888,6 +888,58 @@ fn decode_metadata_file_as(path: &Path, object_key: &str) -> Result<ObjectMetada
     Ok(meta)
 }
 
+fn read_authoritative_object_metadata(
+    paths: Vec<PathBuf>,
+    object_key: &str,
+) -> Result<Option<ObjectMetadata>, AppError> {
+    let mut selected: Option<(u64, Vec<u8>, ObjectMetadata)> = None;
+    let mut first_error: Option<AppError> = None;
+
+    for path in paths {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                first_error.get_or_insert_with(|| io_err(error, "read N1 object metadata"));
+                continue;
+            }
+        };
+        let mut metadata = match decode::<ObjectMetadata>(&bytes) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        metadata.object_key = object_key.to_string();
+
+        match selected.as_ref() {
+            None => selected = Some((metadata.placement_generation, bytes, metadata)),
+            Some((generation, selected_bytes, _))
+                if metadata.placement_generation > *generation =>
+            {
+                selected = Some((metadata.placement_generation, bytes, metadata));
+            }
+            Some((generation, selected_bytes, _))
+                if metadata.placement_generation == *generation && bytes != *selected_bytes =>
+            {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "N1 object metadata has same-generation divergent placement for object {} generation {}",
+                    object_key, generation
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    match selected {
+        Some((_, _, metadata)) => Ok(Some(metadata)),
+        None => match first_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        },
+    }
+}
+
 fn record_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()
@@ -922,6 +974,7 @@ fn summary_metadata(fragment: &str, object_key: String, summary: NdxSummary) -> 
         created_at: (summary.unix_nanos / 1_000_000_000i128) as i64,
         data_shards: 0,
         parity_shards: 0,
+        placement_generation: 0,
         parts: Vec::new(),
         is_delete_marker: false,
         stripe_size_bytes: super::disk_manager::default_stripe_size(),
@@ -1196,6 +1249,12 @@ pub fn rebind_unpublished_object_version(
     }
 
     let mut rebound = metadata.clone();
+    rebound.placement_generation =
+        rebound.placement_generation.checked_add(1).ok_or_else(|| {
+            AppError::InternalServerError(
+                "object placement generation exhausted during rebind".into(),
+            )
+        })?;
     rebound.object_key = destination_object_id.clone();
     for part in &mut rebound.parts {
         for shard in &mut part.shards {
@@ -1259,12 +1318,13 @@ pub fn read_live_version(
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
     let object_key = normalize_object_key(object_key)?;
+    let mut paths = Vec::new();
     for dir in object_dir_candidates(fragment, &object_key)? {
         if let Some(path) = ndx_path_for_version(&dir, version_id)? {
-            return decode_metadata_file_as(&path, &object_key).map(Some);
+            paths.push(path);
         }
     }
-    Ok(None)
+    read_authoritative_object_metadata(paths, &object_key)
 }
 
 pub fn read_current_live_head(
@@ -1284,9 +1344,10 @@ pub fn read_current_live_head(
             latest = Some((dir, summary));
         }
     }
-    latest
-        .map(|(dir, summary)| decode_metadata_file_as(&dir.join(summary.file_name), &object_key))
-        .transpose()
+    match latest {
+        Some((_, summary)) => read_live_version(fragment, &object_key, &summary.version_id),
+        None => Ok(None),
+    }
 }
 
 pub fn list_live_versions(
@@ -1294,12 +1355,21 @@ pub fn list_live_versions(
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
     let object_key = normalize_object_key(object_key)?;
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    let mut by_version = BTreeMap::<String, Vec<PathBuf>>::new();
     for path in all_live_version_paths(fragment, &object_key)? {
-        let meta = decode_metadata_file_as(&path, &object_key)?;
-        if seen.insert(meta.version_id.clone()) {
-            out.push(meta);
+        if let Some(version) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_ndx_file_name)
+            .map(|summary| summary.version_id)
+        {
+            by_version.entry(version).or_default().push(path);
+        }
+    }
+    let mut out = Vec::with_capacity(by_version.len());
+    for paths in by_version.into_values() {
+        if let Some(metadata) = read_authoritative_object_metadata(paths, &object_key)? {
+            out.push(metadata);
         }
     }
     out.sort_by(|a, b| a.version_id.cmp(&b.version_id));
@@ -1500,12 +1570,13 @@ pub fn read_trash_version(
     object_id: &str,
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
+    let mut paths = Vec::new();
     for dir in object_dir_candidates(fragment, object_id)? {
         if let Some(path) = ndx_path_for_version(&dir, version_id)? {
-            return decode_metadata_file(&path).map(Some);
+            paths.push(path);
         }
     }
-    Ok(None)
+    read_authoritative_object_metadata(paths, object_id)
 }
 
 pub fn read_latest_trash(
@@ -1868,6 +1939,7 @@ fn scan_trash_page(
                 created_at: record.deleted_at_unix,
                 data_shards: 0,
                 parity_shards: 0,
+                placement_generation: 0,
                 parts: Vec::new(),
                 is_delete_marker: false,
                 stripe_size_bytes: super::disk_manager::default_stripe_size(),
@@ -3267,6 +3339,7 @@ mod tests {
             created_at: 1_777_905_000,
             data_shards: 1,
             parity_shards: 0,
+            placement_generation: 0,
             parts: vec![PartMetadata {
                 part_index: 0,
                 size_bytes: size,
@@ -3939,6 +4012,11 @@ mod tests {
             stripe_size_bytes: 512,
             data_shards: 2,
             parity_shards: 1,
+            placement_roots: vec![
+                "/blob/0".to_string(),
+                "/blob/1".to_string(),
+                "/blob/2".to_string(),
+            ],
         };
         open_session(&manifest, None).expect("open session");
         let receipt = SessionPartReceipt {
@@ -3999,6 +4077,11 @@ mod tests {
             stripe_size_bytes: 512,
             data_shards: 2,
             parity_shards: 1,
+            placement_roots: vec![
+                "/blob/0".to_string(),
+                "/blob/1".to_string(),
+                "/blob/2".to_string(),
+            ],
         };
         let binding = PendingUploadBinding {
             fragment: fragment.clone(),
@@ -4111,6 +4194,7 @@ mod tests {
             stripe_size_bytes: 512,
             data_shards: 1,
             parity_shards: 1,
+            placement_roots: vec!["/blob/0".to_string(), "/blob/1".to_string()],
         };
         open_session(&manifest, None).expect("open session");
         write_pending_binding(&PendingUploadBinding {
@@ -4207,6 +4291,16 @@ mod tests {
         let old_id = "01K00000000000000000000000";
         let new_id = "01K00000000000000000000001";
 
+        let mut old = test_metadata(&fragment, &object_id, 111);
+        old.version_id = old_id.to_string();
+        old.created_at = 1_777_905_400;
+        let old_bytes = encode(&old).expect("encode old metadata");
+
+        let mut new = test_metadata(&fragment, &object_id, 222);
+        new.version_id = new_id.to_string();
+        new.created_at = 1_777_905_500;
+        let new_bytes = encode(&new).expect("encode new metadata");
+
         for root in &index_roots {
             publish_namespace_link(root, &fragment, "docs/versioned.bin", &object_id)
                 .expect("publish namespace link");
@@ -4215,26 +4309,12 @@ mod tests {
             let dir = live_object_dir(root, &fragment, &object_id).expect("object dir");
             fs::create_dir_all(&dir).expect("create object dir");
 
-            let mut old = test_metadata(&fragment, &object_id, 111);
-            old.version_id = old_id.to_string();
-            old.created_at = 1_777_905_400;
-            write_atomic(
-                &dir.join(ndx_file_name(&old)),
-                &encode(&old).expect("encode old metadata"),
-            )
-            .expect("write old version");
+            write_atomic(&dir.join(ndx_file_name(&old)), &old_bytes).expect("write old version");
 
             fs::write(dir.join("not-a-valid-version.ndx"), b"garbage")
                 .expect("write invalid ndx name");
 
-            let mut new = test_metadata(&fragment, &object_id, 222);
-            new.version_id = new_id.to_string();
-            new.created_at = 1_777_905_500;
-            write_atomic(
-                &dir.join(ndx_file_name(&new)),
-                &encode(&new).expect("encode new metadata"),
-            )
-            .expect("write new version");
+            write_atomic(&dir.join(ndx_file_name(&new)), &new_bytes).expect("write new version");
         }
 
         let page = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
@@ -4298,6 +4378,60 @@ mod tests {
             .expect("head exists");
         assert_eq!(full.version_id, new_id);
         assert_eq!(full.total_size_bytes, 7_983_741);
+    }
+
+    #[test]
+    fn object_metadata_uses_highest_placement_generation_and_rejects_ties() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let _ = ensure_test_index_roots();
+        let blob_roots = ensure_test_blob_roots();
+        assert!(blob_roots.len() >= 2);
+        let fragment = format!("n1-placement-generation-{}", Ulid::new());
+        let object_id = new_object_id();
+        let version_id = Ulid::new().to_string();
+
+        let mut older = test_metadata(&fragment, &object_id, 111);
+        older.version_id = version_id.clone();
+        older.placement_generation = 4;
+        let mut newer = older.clone();
+        newer.total_size_bytes = 222;
+        newer.placement_generation = 5;
+
+        let older_dir =
+            live_object_dir(&blob_roots[0], &fragment, &object_id).expect("older object dir");
+        let newer_dir =
+            live_object_dir(&blob_roots[1], &fragment, &object_id).expect("newer object dir");
+        fs::create_dir_all(&older_dir).expect("create older metadata dir");
+        fs::create_dir_all(&newer_dir).expect("create newer metadata dir");
+        write_atomic(
+            &older_dir.join(ndx_file_name(&older)),
+            &encode(&older).expect("encode older placement"),
+        )
+        .expect("write older placement");
+        write_atomic(
+            &newer_dir.join(ndx_file_name(&newer)),
+            &encode(&newer).expect("encode newer placement"),
+        )
+        .expect("write newer placement");
+
+        let selected = read_live_version(&fragment, &object_id, &version_id)
+            .expect("select authoritative placement")
+            .expect("metadata exists");
+        assert_eq!(selected.placement_generation, 5);
+        assert_eq!(selected.total_size_bytes, 222);
+
+        newer.placement_generation = 4;
+        write_atomic(
+            &newer_dir.join(ndx_file_name(&newer)),
+            &encode(&newer).expect("encode divergent placement"),
+        )
+        .expect("write divergent placement");
+        let error = read_live_version(&fragment, &object_id, &version_id)
+            .expect_err("same generation divergence must fail closed");
+        assert!(error.to_string().contains("same-generation divergent"));
+
+        let _ = fs::remove_dir_all(fragment_root_on(&blob_roots[0], &fragment));
+        let _ = fs::remove_dir_all(fragment_root_on(&blob_roots[1], &fragment));
     }
 
     #[test]

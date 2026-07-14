@@ -4,6 +4,7 @@ use crate::core::archive::{
     download_manifest_archive as download_manifest_archive_impl,
     download_selected_archive as download_selected_archive_impl,
 };
+use crate::core::auto_healing::run_auto_healing_controller;
 use crate::core::delete::{BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse};
 use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
@@ -1060,6 +1061,11 @@ pub fn build_storage_routes_unbound_with_options(
     let monitoring_state = Arc::clone(&app_state);
     tokio::spawn(async move {
         run_system_monitor(monitoring_state).await;
+    });
+
+    let auto_healing_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        run_auto_healing_controller(auto_healing_state).await;
     });
 
     tokio::spawn(async move {

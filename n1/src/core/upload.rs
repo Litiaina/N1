@@ -42,6 +42,8 @@ use crate::core::index;
 use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, IoProgress, acquire_disk_io};
 use crate::core::linux_io;
 pub use crate::core::linux_io::sync_dir;
+use crate::core::operation_gate::ensure_user_mutations_allowed;
+use crate::core::root_identity::configured_root_identity_is_current;
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -228,11 +230,14 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 #[cfg(test)]
 mod tests {
     use super::{
-        UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode,
+        UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode, UploadSessionManifest,
         acquire_upload_io_guard_with_timeout, choose_upload_stripe_size_for_len_with_ceiling,
-        parse_upload_durability_mode, target_stripe_size_for_metadata,
+        parse_upload_durability_mode, shard_specs_for_part, target_stripe_size_for_metadata,
     };
-    use crate::core::disk_manager::{ObjectMetadata, PartMetadata, UploadPartQuery};
+    use crate::core::disk_manager::{
+        INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, UploadPartQuery,
+    };
+    use std::path::Path;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -329,6 +334,7 @@ mod tests {
             created_at: 1,
             data_shards: 1,
             parity_shards: 1,
+            placement_generation: 0,
             parts: vec![
                 PartMetadata {
                     part_index: 0,
@@ -351,6 +357,44 @@ mod tests {
 
         assert_eq!(target_stripe_size_for_metadata(&metadata, 262_144), 4096);
     }
+
+    #[test]
+    fn multipart_parts_keep_one_fixed_object_ec_set() {
+        let _ = INDEX_STORE_DISKS.set(vec!["/tmp/n1-upload-test-index".to_string()]);
+        let roots = ["/tmp/n1-fixed-root-a", "/tmp/n1-fixed-root-b"];
+        let manifest = UploadSessionManifest {
+            fragment: "01KFRAGMENT".to_string(),
+            object_key: "01KOBJECT".to_string(),
+            version_id: "01KVERSION".to_string(),
+            session_id: "01KSESSION".to_string(),
+            total_size_bytes: 8192,
+            expected_parts: 2,
+            part_size_bytes: 4096,
+            content_type: "application/octet-stream".to_string(),
+            created_at: 1,
+            stripe_size_bytes: 4096,
+            data_shards: 1,
+            parity_shards: 1,
+            placement_roots: roots.iter().map(|root| (*root).to_string()).collect(),
+        };
+        let path_manager = ObjectPathManager::new();
+        let first = shard_specs_for_part(&path_manager, &manifest, 0).expect("first part");
+        let second = shard_specs_for_part(&path_manager, &manifest, 1).expect("second part");
+
+        for shard_index in 0..2 {
+            assert!(
+                first[shard_index]
+                    .2
+                    .starts_with(Path::new(roots[shard_index]))
+            );
+            assert!(
+                second[shard_index]
+                    .2
+                    .starts_with(Path::new(roots[shard_index]))
+            );
+            assert_eq!(first[shard_index].0, second[shard_index].0);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +411,7 @@ pub struct UploadSessionManifest {
     pub stripe_size_bytes: usize,
     pub data_shards: u16,
     pub parity_shards: u16,
+    pub placement_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,6 +712,7 @@ async fn preflight_upload_capacity(required_bytes: u64) -> Result<(), AppError> 
 }
 
 async fn preflight_blob_placement_capacity_for_parts(
+    placement_roots: &[PathBuf],
     start_part_index: u64,
     part_sizes: &[u64],
     data_shards: usize,
@@ -674,6 +720,7 @@ async fn preflight_blob_placement_capacity_for_parts(
     block_size: usize,
 ) -> Result<(), AppError> {
     ensure_blob_placement_capacity_available_for_parts(
+        placement_roots,
         start_part_index,
         part_sizes,
         data_shards,
@@ -681,6 +728,18 @@ async fn preflight_blob_placement_capacity_for_parts(
         block_size,
     )
     .await
+}
+
+fn ensure_registered_placement_roots(placement_roots: &[PathBuf]) -> Result<(), AppError> {
+    for root in placement_roots {
+        if !configured_root_identity_is_current(root) {
+            return Err(AppError::ServiceUnavailable(format!(
+                "N1 refused the write because blob root '{}' does not match its registered disk identity.",
+                root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn stable_shard_name(part_index: u64, shard_index: usize, data_shards: usize) -> String {
@@ -751,22 +810,21 @@ fn shard_specs_for_part(
     manifest: &UploadSessionManifest,
     part_index: u64,
 ) -> Result<Vec<(usize, bool, PathBuf, String)>, AppError> {
-    let blob_roots = path_manager.get_blob_roots();
-    if blob_roots.is_empty() {
-        return Err(AppError::InternalServerError(
-            "No blob storage disks configured".into(),
-        ));
-    }
-
     let data_shards = manifest_data_shards(manifest);
     let total_shards = manifest_total_shards(manifest);
+    if manifest.placement_roots.len() != total_shards {
+        return Err(AppError::InternalServerError(format!(
+            "upload manifest EC placement has {} roots but {} shards",
+            manifest.placement_roots.len(),
+            total_shards
+        )));
+    }
     let mut out = Vec::with_capacity(total_shards);
 
     for shard_index in 0..total_shards {
-        let disk_idx = (part_index as usize + shard_index) % blob_roots.len();
-        let disk_root = &blob_roots[disk_idx];
+        let disk_root = PathBuf::from(&manifest.placement_roots[shard_index]);
         let shard_dir = path_manager.get_shard_dir_on_disk(
-            disk_root,
+            &disk_root,
             &manifest.fragment,
             &manifest.object_key,
             &manifest.version_id,
@@ -1016,6 +1074,7 @@ async fn write_part_blob_to_disk(
     data_shards: usize,
     parity_shards: usize,
     block_size: usize,
+    recorded_placement_roots: Option<&[String]>,
     body: Body,
     expected_checksum: Option<&str>,
     strict_durability: bool,
@@ -1039,6 +1098,7 @@ async fn write_part_blob_to_disk(
         data_shards,
         parity_shards,
         block_size,
+        recorded_placement_roots,
         body_stream,
         expected_checksum,
         strict_durability,
@@ -1057,6 +1117,7 @@ async fn write_part_blob_to_disk_from_stream<S>(
     data_shards: usize,
     parity_shards: usize,
     block_size: usize,
+    recorded_placement_roots: Option<&[String]>,
     mut body_stream: S,
     expected_checksum: Option<&str>,
     strict_durability: bool,
@@ -1085,7 +1146,25 @@ where
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * block_size as u64;
 
+    let blob_roots = match recorded_placement_roots {
+        Some(roots) => roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        None => path_manager.select_blob_roots_for_object(
+            fragment,
+            object_key,
+            version_id,
+            total_shards,
+        )?,
+    };
+    if blob_roots.len() != total_shards {
+        return Err(AppError::InternalServerError(format!(
+            "object EC placement has {} roots but requires {}",
+            blob_roots.len(),
+            total_shards
+        )));
+    }
+    ensure_registered_placement_roots(&blob_roots)?;
     preflight_blob_placement_capacity_for_parts(
+        &blob_roots,
         part_index,
         &[content_length],
         data_shards,
@@ -1093,14 +1172,6 @@ where
         block_size,
     )
     .await?;
-
-    let blob_roots = path_manager.get_blob_roots();
-    let num_disks = blob_roots.len();
-    if num_disks == 0 {
-        return Err(AppError::InternalServerError(
-            "No blob storage disks configured".into(),
-        ));
-    }
 
     let use_buffered_small_write =
         !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
@@ -1120,8 +1191,7 @@ where
 
         let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
-        let disk_idx = (part_index as usize + i) % num_disks;
-        let target_disk = &blob_roots[disk_idx];
+        let target_disk = &blob_roots[i];
         let shard_dir =
             path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
 
@@ -1189,11 +1259,11 @@ where
         stable_names.push(stable_name);
     }
 
-    if successful_opens < data_shards {
+    if successful_opens < total_shards {
         cleanup_files_best_effort(&tmp_paths).await;
-        return Err(AppError::InternalServerError(format!(
-            "Insufficient healthy disks for write quorum. Need {}, got {}.",
-            data_shards, successful_opens
+        return Err(AppError::ServiceUnavailable(format!(
+            "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
+            data_shards, parity_shards, total_shards, successful_opens
         )));
     }
 
@@ -1249,6 +1319,13 @@ where
         let shard_checksums = stream_writer.get_shard_checksums();
         let total_checksum = stream_writer.get_total_checksum();
         let writers = stream_writer.into_writers();
+
+        if writers.iter().any(Option::is_none) {
+            return Err(AppError::ServiceUnavailable(format!(
+                "N1 refused an under-protected write because the {}D+{}P shard set did not complete",
+                data_shards, parity_shards
+            )));
+        }
 
         if strict_durability {
             let sync_futs = writers.into_iter().filter_map(|w_opt| {
@@ -1342,6 +1419,7 @@ async fn write_part_blob_to_disk_from_reader<R>(
     data_shards: usize,
     parity_shards: usize,
     block_size: usize,
+    recorded_placement_roots: Option<&[String]>,
     reader: &mut R,
     expected_checksum: Option<&str>,
     strict_durability: bool,
@@ -1370,7 +1448,25 @@ where
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * block_size as u64;
 
+    let blob_roots = match recorded_placement_roots {
+        Some(roots) => roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        None => path_manager.select_blob_roots_for_object(
+            fragment,
+            object_key,
+            version_id,
+            total_shards,
+        )?,
+    };
+    if blob_roots.len() != total_shards {
+        return Err(AppError::InternalServerError(format!(
+            "object EC placement has {} roots but requires {}",
+            blob_roots.len(),
+            total_shards
+        )));
+    }
+    ensure_registered_placement_roots(&blob_roots)?;
     preflight_blob_placement_capacity_for_parts(
+        &blob_roots,
         part_index,
         &[content_length],
         data_shards,
@@ -1378,14 +1474,6 @@ where
         block_size,
     )
     .await?;
-
-    let blob_roots = path_manager.get_blob_roots();
-    let num_disks = blob_roots.len();
-    if num_disks == 0 {
-        return Err(AppError::InternalServerError(
-            "No blob storage disks configured".into(),
-        ));
-    }
 
     let use_buffered_small_write =
         !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
@@ -1405,8 +1493,7 @@ where
 
         let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
-        let disk_idx = (part_index as usize + i) % num_disks;
-        let target_disk = &blob_roots[disk_idx];
+        let target_disk = &blob_roots[i];
         let shard_dir =
             path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
 
@@ -1474,11 +1561,11 @@ where
         stable_names.push(stable_name);
     }
 
-    if successful_opens < data_shards {
+    if successful_opens < total_shards {
         cleanup_files_best_effort(&tmp_paths).await;
-        return Err(AppError::InternalServerError(format!(
-            "Insufficient healthy disks for write quorum. Need {}, got {}.",
-            data_shards, successful_opens
+        return Err(AppError::ServiceUnavailable(format!(
+            "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
+            data_shards, parity_shards, total_shards, successful_opens
         )));
     }
 
@@ -1515,6 +1602,13 @@ where
         let shard_checksums = stream_writer.get_shard_checksums();
         let total_checksum = stream_writer.get_total_checksum();
         let writers = stream_writer.into_writers();
+
+        if writers.iter().any(Option::is_none) {
+            return Err(AppError::ServiceUnavailable(format!(
+                "N1 refused an under-protected write because the {}D+{}P shard set did not complete",
+                data_shards, parity_shards
+            )));
+        }
 
         if strict_durability {
             let sync_futs = writers.into_iter().filter_map(|w_opt| {
@@ -1750,6 +1844,7 @@ pub async fn initiate_object_upload_direct(
     object_key: String,
     params: InitiateUploadParams,
 ) -> Result<InitiateUploadResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -1814,9 +1909,32 @@ pub async fn initiate_object_upload_direct(
         stripe_size_bytes: stripe_size,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
+        placement_roots: ObjectPathManager::new()
+            .select_blob_roots_for_object(
+                &fragment,
+                &object_key,
+                &version_id,
+                configured_data_shards().saturating_add(configured_parity_shards()),
+            )?
+            .into_iter()
+            .map(|root| root.to_string_lossy().to_string())
+            .collect(),
     };
 
+    ensure_registered_placement_roots(
+        &manifest
+            .placement_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    )?;
+
     preflight_blob_placement_capacity_for_parts(
+        &manifest
+            .placement_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
         0,
         &planned_sizes,
         manifest_data_shards(&manifest),
@@ -2049,6 +2167,7 @@ pub async fn object_upload_part(
         manifest_data_shards(&manifest),
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
+        Some(&manifest.placement_roots),
         body,
         expected_checksum,
         strict_durability,
@@ -2155,6 +2274,7 @@ pub async fn object_upload_part_stream_direct<S>(
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
 {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2244,6 +2364,7 @@ where
         manifest_data_shards(&manifest),
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
+        Some(&manifest.placement_roots),
         body_stream,
         expected_checksum,
         strict_durability,
@@ -2300,6 +2421,7 @@ pub async fn object_upload_part_reader_direct<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2389,6 +2511,7 @@ where
         manifest_data_shards(&manifest),
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
+        Some(&manifest.placement_roots),
         reader,
         expected_checksum,
         strict_durability,
@@ -2494,6 +2617,7 @@ async fn upload_object_one_shot_inner(
         configured_data_shards(),
         configured_parity_shards(),
         stripe_size,
+        None,
         body,
         expected_checksum,
         strict_durability,
@@ -2525,6 +2649,7 @@ async fn upload_object_one_shot_inner(
         created_at,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
+        placement_generation: 0,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2632,6 +2757,7 @@ pub async fn upload_object_one_shot_stream_direct<S>(
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
 {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2680,6 +2806,7 @@ where
         configured_data_shards(),
         configured_parity_shards(),
         stripe_size,
+        None,
         body_stream,
         expected_checksum,
         strict_durability,
@@ -2711,6 +2838,7 @@ where
         created_at,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
+        placement_generation: 0,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2749,6 +2877,7 @@ pub async fn upload_object_one_shot_reader_direct<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2797,6 +2926,7 @@ where
         configured_data_shards(),
         configured_parity_shards(),
         stripe_size,
+        None,
         reader,
         expected_checksum,
         strict_durability,
@@ -2828,6 +2958,7 @@ where
         created_at,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
+        placement_generation: 0,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -2894,6 +3025,7 @@ pub async fn finalize_object_upload_direct(
     object_key: String,
     params: InitiateUploadParams,
 ) -> Result<FinalizeUploadResult, AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2980,6 +3112,14 @@ pub async fn finalize_object_upload_direct(
                 resolved = read_part_meta_any(&fragment, &version_id, i).await;
             }
 
+            if resolved.is_some() && !part_exists_on_disk(&path_manager, m, i).await? {
+                warn!(
+                    "Finalization deferred for {}/{} part {} because its complete recorded EC shard set is not present",
+                    fragment, version_id, i
+                );
+                resolved = None;
+            }
+
             if let Some(pm) = resolved {
                 present.insert(i);
                 parts.push(pm);
@@ -3049,6 +3189,7 @@ pub async fn finalize_object_upload_direct(
             .as_ref()
             .map(manifest_parity_shards)
             .unwrap_or_else(configured_parity_shards) as u16,
+        placement_generation: 0,
         parts,
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
@@ -3076,6 +3217,7 @@ pub async fn cancel_upload_session_direct(
     version_id: String,
     object_key_hint: String,
 ) -> Result<(), AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }

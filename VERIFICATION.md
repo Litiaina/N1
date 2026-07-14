@@ -2,6 +2,11 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
+The current package line is N1 `3.1.0` on the development channel, using
+engine format `3`. Stable product status has not been declared for this engine
+line. Dated `3.0.0` and `3.0.1` evidence names below remain unchanged because
+they identify the exact candidate binaries and runs that produced them.
+
 ## Required Release Gates
 
 Before an LTS release, N1 should pass:
@@ -15,6 +20,10 @@ Before an LTS release, N1 should pass:
 - unique-id trash, pre-TTL recover, TTL expiry, targeted reclamation, and removed purge surfaces
 - recover-on-read after one disk is wiped
 - repair after simulated disk loss or reformat
+- autonomous repair after recoverable data- and parity-shard loss
+- automatic read-only entry/recovery for missing and identity-mismatched roots
+- healer-fault read-only persistence until an unresolved repair succeeds
+- old and new per-object EC layouts remain valid across an EC configuration change
 - redistribution `2 roots -> 1 root -> 2 roots`
 - high object-count upload storm
 - concurrent users on one fragment
@@ -139,12 +148,121 @@ N1 2.0.0 IO-control proof completed on June 11, 2026:
 - The final log scan passed with `bad_lines: []`.
 - Evidence: `/tmp/n1-2.0-io-control-proof/summary.json`.
 
-## N1 3.0.1 Namespace Edge-Case Confidence Matrix
+## N1 3.1.0 Development-Engine Autonomous-Maintenance Confidence Matrix
 
-N1 3.0.1 is a hardening release on engine format 3. It does not redesign the
+N1 3.1.0 intentionally has no metadata or upload-manifest compatibility
+with an earlier engine. The package, native client, and shell versions are
+aligned at `3.1.0`. This development line incorporates the earlier 3.0.x
+namespace/lifecycle hardening and adds object-owned EC topology plus autonomous
+repair. Historical proof names retain the version used when each run completed.
+
+| Edge case | Locked invariant | Regression proof | Status |
+| --- | --- | --- | --- |
+| A disk mount disappears but its underlying directory remains writable | The path must still contain the enrolled `.n1-root-id`; a known path is never rebound automatically | `missing_or_replaced_root_never_rebinds_automatically` | PASS |
+| A new configured disk is added | Its identity is enrolled without changing any existing root identity or object metadata | `new_root_enrollment_preserves_existing_root_identity` | PASS |
+| An operator intentionally replaces a disk at the same path | Removing the path from configuration decommissions the old identity; re-adding it enrolls the replacement without registry editing | `explicit_config_removal_allows_controlled_disk_replacement` | PASS |
+| Blob paths alias fewer physical devices than `D + P` | New writes remain read-only until enough distinct registered devices exist | `insufficient_or_non_distinct_roots_fail_closed` | PASS |
+| More disks are added while EC remains `4 + 2` | Current EC width remains static and the expanded pool is write-safe | `expanded_topology_stays_write_safe_without_changing_ec_width` | PASS |
+| Multipart contains multiple parts | Every part maps shard index `i` to the same fixed object root `i` | `multipart_parts_keep_one_fixed_object_ec_set` | PASS |
+| Added roots expand placement choices | Deterministic per-object rendezvous placement remains bounded and spreads new versions across the larger pool | `object_ec_set_selection_is_deterministic_and_bounded`, `different_object_versions_spread_across_expanded_pool` | PASS |
+| New upload loses any shard writer | The version is rejected before metadata/namespace publication; N1 never commits an under-protected new EC set | upload writer and finalize invariant suite | PASS |
+| Repair relocates a shard and stale metadata returns | The relocated metadata has a higher placement generation; lower generations cannot win | `object_metadata_uses_highest_placement_generation_and_rejects_ties` | PASS |
+| Equal placement generations disagree | Object metadata selection fails closed rather than guessing authority | `object_metadata_uses_highest_placement_generation_and_rejects_ties` | PASS |
+| Scheduled repair cannot find a distinct replacement or cannot complete IO | The scan records unresolved debt and finishes failed, causing the autonomous controller to retain read-only mode | `unresolved_automatic_repair_debt_fails_the_scan` | PASS |
+| Topology or healer read-only is enforced through HTTP and direct/native paths | Mutations receive `503 Service Unavailable`; reads remain available unless explicitly quiesced | `persistent_safety_read_only_returns_service_unavailable`, operation-gate suite | PASS |
+| Disk/EC configuration changes but recorded objects remain healthy | Health treats the recorded object layout as authoritative and reports current-layout mismatch only as optional redistribution opportunity | monitoring and object-layout unit suite | PASS |
+
+Fast, non-soak verification commands for this implementation:
+
+```bash
+cargo fmt --all -- --check
+cargo check -p n1 --all-targets
+cargo test -p n1 --lib -- --test-threads=1
+cargo test -p n1 --bin litiaina-n1 -- --test-threads=1
+cargo check --workspace --all-targets
+cargo test --workspace
+```
+
+The fast N1 library gate passed all `129` tests on July 14, 2026. No soak or
+long-running proof was started, per the implementation-stage test boundary.
+The ordinary workspace matrix also passed: proof runner `3/3`, N1 Shell
+integration `7/7`, SIMD unit `107` passed with `6` intentional ignores, SIMD
+integration `5` passed with `2` intentional ignores, and documentation tests
+`4/4`. All workspace targets, including benchmark targets, compiled.
+The earlier real HDD+SSD evidence below remains valid baseline evidence for
+the unchanged immutable-object, EC, namespace, CRUD, POSIX, recovery, repair,
+and redistribution primitives; it is not relabeled as a dedicated autonomous-
+healing topology proof.
+
+### Reset 3.0.0 Fast Real-Disk Smoke
+
+On July 14, 2026, a fresh debug binary ran a bounded native/CRUD smoke on the
+real XFS HDD `/mnt/DISK001` and ext4 NVMe root containing
+`/home/wlzambo/SERVER-TEST/disk-00`, using colocated index/blob roots and
+`1 + 1` EC. The controller enrolled two root identities on two distinct Linux
+devices, validated the topology, and automatically left startup read-only
+mode. The harness then passed HTTP upload/download plus native authentication,
+one-shot upload, multipart, namespace/POSIX movement, trash/recovery, bulk
+operations, capacity/usage, object status/repair, and maintenance control
+surfaces. The repair check scanned `7` objects with `0` failed repairs,
+corruption, missing metadata, or divergence; EC telemetry reported `errors=0`.
+The completed summary is:
+
+`/home/wlzambo/DEV-TEST/n1-3.0.0-fast-smoke-20260714-222903/summary.json`
+
+The server log contains no panic, fatal, failed, or nonzero error record. Test
+storage roots were removed by the harness; configuration, log, summary, and
+the durable topology registry remain in the evidence directory. Scheduled
+auto scans were disabled for this short smoke to avoid turning it into a soak;
+their scheduling/fail-safe behavior is covered by the fast regression matrix.
+
+### Reset 3.0.0 Autonomous-Healing Real-Disk Proof
+
+On July 14, 2026, the bounded `--auto-healing-proof` release gate passed on
+the real XFS HDD `/mnt/DISK001` and the ext4 NVMe device containing
+`/home/wlzambo/SERVER-TEST/disk-00`. The roots were colocated index/blob
+roots on two distinct Linux devices with minimum `1 + 1` EC. This was a short
+failure-injection proof, not a soak.
+
+The gate proved all of the following against a running N1 process:
+
+- deleting a data shard preserved a correct download and recover-on-read
+  recreated the exact recorded shard path;
+- deleting a parity shard was detected and repaired by the scheduled
+  availability scan;
+- removing one registered root changed health to degraded/read-only, kept
+  reads available from the remaining `1 + 1` shard, and rejected a mutation
+  with `503 Service Unavailable`;
+- restoring the authoritative root returned the engine to availability after
+  the configured stability interval without operator-triggered repair;
+- replacing that path with an empty directory did not rebind it: the disk
+  matrix reported a registered-root identity mismatch and N1 stayed
+  read-only until the original root returned;
+- removing every shard forced the autonomous scan to `scan_failed` and kept
+  N1 read-only; restoring one reconstructable shard allowed the retry to
+  rebuild the other shard, clear the healer fault, and return to availability;
+- changing new-write EC from `1 + 1` to `1 + 0` preserved the old object's two
+  recorded roots through an autonomous scan, while the new object used one
+  root. No redistribution was requested or required.
+
+Final health was `healthy`, the controller phase was `idle`, and maintenance
+access was `availability`. The harness removed its temporary storage roots.
+Expected fail-safe errors appear while damage is intentionally unrecoverable;
+the logs contain no panic. Reproducible evidence is stored at:
+
+`/home/wlzambo/DEV-TEST/n1-3.0.0-auto-healing-fast-20260714/summary.json`
+
+The reusable command path is `n1-release-proof --auto-healing-proof`; every
+state wait is bounded to 30 seconds.
+
+## Pre-Reset 3.0.1 Namespace Edge-Case Evidence
+
+The unreleased N1 3.0.1 work was hardening on engine format 3. It did not redesign the
 immutable object plane, stable object identities, EC placement, or O(1)
 namespace rename. The patch closes mutation-boundary edge cases identified
-after the N1 3.0.0 lifecycle release.
+after the initial N1 3.0 lifecycle implementation. All of these patches are
+incorporated into the current 3.1.0 development engine; historical evidence
+paths retain their original names.
 
 | Edge case | Locked invariant | Regression proof | Status |
 | --- | --- | --- | --- |
@@ -195,7 +313,7 @@ resulting patch adds the replicated namespace generation and the three
 redistribution/write-gate regressions above. This failed run remains evidence;
 it is not counted as release PASS.
 
-The generation-authority patch was frozen into the N1 3.0.1 release binary and
+The generation-authority patch was frozen into the pre-reset N1 3.0.1 candidate binary and
 a fresh detached HDD+SSD `1 + 1` proof ran on July 13, 2026 as
 `n1-301-generation-proof-112852.service`, with evidence under
 `/home/wlzambo/DEV-TEST/n1-3.0.1-namespace-extreme/extreme-20260713-112852`.
@@ -224,7 +342,7 @@ unique objects; the log scan passed with zero bad lines. This fresh complete
 matrix closes the harness defect, while the preceding run remains the
 independent `15,095`-object scale evidence rather than being relabeled PASS.
 
-The final release gate also requires the warning-denied workspace suite and an
+That historical candidate gate also required the warning-denied workspace suite and an
 unattended real HDD+SSD `1 + 1` EC proof. Its command, PID, logs, and final
 summary belong under `/home/wlzambo/DEV-TEST`; a running background proof is
 not recorded as PASS until its summary and log scan complete successfully.

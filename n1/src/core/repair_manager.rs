@@ -13,6 +13,7 @@ use crate::core::linux_io;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
+use crate::core::root_identity::configured_root_identity_is_current;
 use crate::core::upload::{
     DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, target_stripe_size_for_metadata,
 };
@@ -49,6 +50,7 @@ pub struct RepairJobStatus {
     pub total_scanned: u64,
     pub total_repaired: u64,
     pub corrupt_found: u64,
+    pub failed_repairs: u64,
 
     pub missing_meta_repaired: u64,
     pub divergent_meta_repaired: u64,
@@ -99,6 +101,15 @@ static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
     LazyLock::new(|| Arc::new(RwLock::new(RepairJobStatus::default())));
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+static REPAIR_RUNNING: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+
+struct RepairRunningGuard;
+
+impl Drop for RepairRunningGuard {
+    fn drop(&mut self) {
+        REPAIR_RUNNING.store(false, Ordering::Release);
+    }
+}
 static OBJECT_STATUS_GATE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(64)));
 static OBJECT_REPAIR_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
@@ -243,7 +254,7 @@ pub enum RepairCheckMode {
 }
 
 impl RepairCheckMode {
-    fn maintenance_access_mode(self) -> MaintenanceAccessMode {
+    pub(crate) fn maintenance_access_mode(self) -> MaintenanceAccessMode {
         match self {
             Self::Availability => MaintenanceAccessMode::Availability,
             Self::Checksum | Self::Strict => MaintenanceAccessMode::ReadOnly,
@@ -270,6 +281,7 @@ pub struct RepairRunConfig {
 pub struct RepairRunOptions {
     pub fast_mode: bool,
     pub access_mode: MaintenanceAccessMode,
+    pub replay_pending_redistribution: bool,
 }
 
 impl Default for RepairRunOptions {
@@ -277,6 +289,7 @@ impl Default for RepairRunOptions {
         Self {
             fast_mode: false,
             access_mode: MaintenanceAccessMode::Availability,
+            replay_pending_redistribution: true,
         }
     }
 }
@@ -288,8 +301,30 @@ struct BatchDelta {
     corrupt_found: u64,
     missing_meta_repaired: u64,
     divergent_meta_repaired: u64,
+    failed_repairs: u64,
     last_repaired: Option<String>,
     last_disagreement: Option<String>,
+    last_failure: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum MetadataCatalog {
+    Live,
+    Trash,
+}
+
+fn ensure_no_unresolved_repairs(
+    unresolved_repairs: u64,
+    last_failure: Option<&str>,
+) -> Result<(), AppError> {
+    if unresolved_repairs == 0 {
+        return Ok(());
+    }
+    Err(AppError::ServiceUnavailable(format!(
+        "N1 repair scan completed with {} unresolved shard or metadata repair(s): {}",
+        unresolved_repairs,
+        last_failure.unwrap_or("repair could not complete")
+    )))
 }
 
 #[inline]
@@ -576,85 +611,13 @@ fn stable_shard_file_name(part_index: u64, shard_index: usize, is_parity: bool) 
     )
 }
 
-fn expected_shard_path(
-    path_manager: &ObjectPathManager,
-    blob_roots: &[PathBuf],
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    part_index: u64,
-    shard_index: usize,
-    is_parity: bool,
-) -> Option<PathBuf> {
-    let num_disks = blob_roots.len();
-    if num_disks == 0 {
-        return None;
-    }
-    let disk_idx = (part_index as usize + shard_index) % num_disks;
-    if disk_idx >= blob_roots.len() {
-        return None;
-    }
-    let disk_root = &blob_roots[disk_idx];
-    let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment, object_key, version_id);
-    let name = stable_shard_file_name(part_index, shard_index, is_parity);
-    Some(shard_dir.join(name))
-}
-
-async fn normalize_part_paths_for_repair(
-    path_manager: &ObjectPathManager,
-    blob_roots: &[PathBuf],
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    mut part: PartMetadata,
-) -> PartMetadata {
+async fn normalize_part_paths_for_repair(mut part: PartMetadata) -> PartMetadata {
     for shard in part.shards.iter_mut() {
         let stable_name =
             stable_shard_file_name(part.part_index, shard.shard_index, shard.is_parity);
         shard.file_name = stable_name;
 
-        let abs = shard.absolute_path.clone();
-        let abs_norm = strip_tmp_attempt_suffix(abs.as_str()).to_string();
-
-        let expected = expected_shard_path(
-            path_manager,
-            blob_roots,
-            fragment,
-            object_key,
-            version_id,
-            part.part_index,
-            shard.shard_index,
-            shard.is_parity,
-        );
-
-        let mut chosen: Option<PathBuf> = None;
-
-        if !abs_norm.is_empty() {
-            let p = PathBuf::from(&abs_norm);
-            if fs::try_exists(&p).await.unwrap_or(false) {
-                chosen = Some(p);
-            }
-        }
-
-        if chosen.is_none() {
-            if let Some(exp) = expected.as_ref() {
-                if fs::try_exists(exp).await.unwrap_or(false) {
-                    chosen = Some(exp.clone());
-                }
-            }
-        }
-
-        if chosen.is_none() {
-            if let Some(exp) = expected {
-                chosen = Some(exp);
-            } else if !abs_norm.is_empty() {
-                chosen = Some(PathBuf::from(abs_norm));
-            }
-        }
-
-        if let Some(p) = chosen {
-            shard.absolute_path = p.to_string_lossy().to_string();
-        }
+        shard.absolute_path = strip_tmp_attempt_suffix(&shard.absolute_path).to_string();
     }
 
     part
@@ -665,7 +628,7 @@ async fn inspect_object_parts(
     check_mode: RepairCheckMode,
 ) -> Result<(ObjectRepairStatus, Vec<PartMetadata>, Vec<Vec<usize>>), AppError> {
     let path_manager = ObjectPathManager::new();
-    let blob_roots = reachable_dir_roots(path_manager.get_blob_roots()).await;
+    let active_blob_roots = path_manager.get_blob_roots();
     let layout = object_layout_status(meta, &path_manager);
     let mut report = ObjectRepairStatus {
         object_key: meta.object_key.clone(),
@@ -689,15 +652,7 @@ async fn inspect_object_parts(
     let mut any_lost = false;
 
     for part in &meta.parts {
-        let normalized = normalize_part_paths_for_repair(
-            &path_manager,
-            &blob_roots,
-            &meta.fragment,
-            &meta.object_key,
-            &meta.version_id,
-            part.clone(),
-        )
-        .await;
+        let normalized = normalize_part_paths_for_repair(part.clone()).await;
         let data_shards = normalized
             .shards
             .iter()
@@ -710,6 +665,14 @@ async fn inspect_object_parts(
         for shard in &normalized.shards {
             report.total_shards += 1;
             let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
+            if !active_blob_roots
+                .iter()
+                .any(|root| shard_path.starts_with(root))
+            {
+                report.missing_shards += 1;
+                bad_indexes.push(shard.shard_index);
+                continue;
+            }
             match fs::metadata(&shard_path).await {
                 Ok(metadata) => {
                     if metadata.len() != shard.size_bytes {
@@ -802,24 +765,27 @@ fn object_layout_status(
         mismatch_reasons.push("stripe_size".to_string());
     }
 
-    let placement_matches_current = !blob_roots.is_empty()
-        && meta.parts.iter().all(|part| {
+    let current_placement = path_manager
+        .select_blob_roots_for_object(
+            &meta.fragment,
+            &meta.object_key,
+            &meta.version_id,
+            current_total,
+        )
+        .ok();
+    let placement_matches_current = current_placement.as_ref().is_some_and(|roots| {
+        meta.parts.iter().all(|part| {
             part.shards.iter().all(|shard| {
-                if shard.shard_index >= current_total {
+                let Some(root) = roots.get(shard.shard_index) else {
                     return false;
-                }
-                let root_index = (part.part_index as usize + shard.shard_index) % blob_roots.len();
+                };
                 let expected = path_manager
-                    .get_shard_dir_on_disk(
-                        &blob_roots[root_index],
-                        &meta.fragment,
-                        &meta.object_key,
-                        &meta.version_id,
-                    )
+                    .get_shard_dir_on_disk(root, &meta.fragment, &meta.object_key, &meta.version_id)
                     .join(&shard.file_name);
                 Path::new(&shard.absolute_path) == expected
             })
-        });
+        })
+    });
     if !placement_matches_current {
         mismatch_reasons.push("placement".to_string());
     }
@@ -1017,6 +983,7 @@ pub async fn trigger_repair_job_api(
     let run_opts = RepairRunOptions {
         fast_mode,
         access_mode,
+        replay_pending_redistribution: true,
     };
 
     let ws_manager = Arc::new(state.ws_manager.clone());
@@ -1266,43 +1233,71 @@ async fn repair_fragment_index_db(
 
 async fn process_object_repair(
     meta: ObjectMetadata,
-    blob_roots: &Vec<PathBuf>,
-    num_disks: usize,
+    writable_blob_roots: &[PathBuf],
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
-) -> Result<(usize, usize, Option<String>), AppError> {
-    if meta.parts.is_empty() || num_disks == 0 {
-        return Ok((0, 0, None));
+    catalog: MetadataCatalog,
+) -> Result<(usize, usize, usize, usize, Option<String>, Option<String>), AppError> {
+    if meta.parts.is_empty() || writable_blob_roots.is_empty() {
+        return Ok((0, 0, 0, 0, None, None));
     }
 
     let path_manager = ObjectPathManager::new();
-    let meta_arc = Arc::new(meta);
+    let _object_guard =
+        index::acquire_object_operation_lock(&meta.fragment, &meta.object_key).await?;
+    let mut metadata = match catalog {
+        MetadataCatalog::Live => {
+            match index::read_object_version(&meta.fragment, &meta.object_key, &meta.version_id)
+                .await
+            {
+                Ok(current) => current,
+                Err(AppError::NotFound) => return Ok((0, 0, 0, 0, None, None)),
+                Err(error) => return Err(error),
+            }
+        }
+        MetadataCatalog::Trash => {
+            match index::read_trashed_object_version(
+                &meta.fragment,
+                &meta.object_key,
+                &meta.version_id,
+            )
+            .await
+            {
+                Ok(current) => current,
+                Err(AppError::NotFound) => return Ok((0, 0, 0, 0, None, None)),
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    let configured_blob_roots = path_manager.get_blob_roots();
 
     let mut repaired_total = 0usize;
     let mut corrupt_found = 0usize;
     let mut last_repaired: Option<String> = None;
+    let mut failed_repairs = 0usize;
+    let mut last_failure: Option<String> = None;
+    let mut placement_changed = false;
 
-    for part in &meta_arc.parts {
+    for part_index in 0..metadata.parts.len() {
         if should_stop() {
             break;
         }
 
-        let part_fixed = normalize_part_paths_for_repair(
-            &path_manager,
-            blob_roots,
-            &meta_arc.fragment,
-            &meta_arc.object_key,
-            &meta_arc.version_id,
-            part.clone(),
-        )
-        .await;
-
-        let part_arc = Arc::new(part_fixed);
+        let mut part_fixed =
+            normalize_part_paths_for_repair(metadata.parts[part_index].clone()).await;
         let mut missing_shards: Vec<usize> = Vec::new();
 
-        for shard in &part_arc.shards {
+        for shard in &part_fixed.shards {
             let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
             let mut healthy = false;
+
+            if !configured_blob_roots
+                .iter()
+                .any(|root| shard_path.starts_with(root))
+            {
+                missing_shards.push(shard.shard_index);
+                continue;
+            }
 
             match fs::metadata(&shard_path).await {
                 Ok(m) => {
@@ -1336,39 +1331,165 @@ async fn process_object_repair(
             continue;
         }
 
-        let mut repairs = stream::iter(missing_shards.into_iter())
-            .map(|missing_idx| {
-                let part_for_task = part_arc.clone();
-                let sem = shard_repair_sem.clone();
-                let stripe = meta_arc.stripe_size_bytes;
+        for missing_idx in missing_shards {
+            let Some(shard_position) = part_fixed
+                .shards
+                .iter()
+                .position(|shard| shard.shard_index == missing_idx)
+            else {
+                continue;
+            };
+            let original_path = PathBuf::from(&part_fixed.shards[shard_position].absolute_path);
+            let original_root = configured_blob_roots
+                .iter()
+                .filter(|root| original_path.starts_with(root))
+                .max_by_key(|root| root.components().count());
+            let original_root_is_writable = original_root
+                .is_some_and(|root| writable_blob_roots.iter().any(|active| active == root));
 
-                async move {
-                    let _permit = sem.acquire().await.map_err(|_| {
-                        AppError::InternalServerError("Repair semaphore closed".into())
-                    })?;
-                    repair_entire_shard(part_for_task, missing_idx, stripe).await
-                }
-            })
-            .buffer_unordered(cfg.shard_repair_concurrency);
+            if !original_root_is_writable {
+                let occupied_roots = part_fixed
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.shard_index != missing_idx)
+                    .filter_map(|shard| {
+                        let path = Path::new(&shard.absolute_path);
+                        configured_blob_roots
+                            .iter()
+                            .filter(|root| path.starts_with(root))
+                            .max_by_key(|root| root.components().count())
+                            .cloned()
+                    })
+                    .collect::<HashSet<_>>();
+                #[cfg(unix)]
+                let occupied_devices = {
+                    use std::os::unix::fs::MetadataExt;
+                    occupied_roots
+                        .iter()
+                        .filter_map(|root| std::fs::metadata(root).ok().map(|meta| meta.dev()))
+                        .collect::<HashSet<_>>()
+                };
+                let ranked_roots = path_manager.rank_blob_roots_for_object(
+                    &metadata.fragment,
+                    &metadata.object_key,
+                    &metadata.version_id,
+                );
+                let replacement = ranked_roots.into_iter().find(|candidate| {
+                    let eligible = writable_blob_roots.iter().any(|active| active == candidate)
+                        && !occupied_roots.contains(candidate);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        eligible
+                            && std::fs::metadata(candidate)
+                                .ok()
+                                .is_some_and(|meta| !occupied_devices.contains(&meta.dev()))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        eligible
+                    }
+                });
+                let Some(replacement) = replacement else {
+                    let message = format!(
+                        "Deferred repair for {}/{} shard {}: no distinct writable replacement root",
+                        metadata.fragment, metadata.object_key, missing_idx
+                    );
+                    warn!("{message}");
+                    failed_repairs += 1;
+                    last_failure = Some(message);
+                    continue;
+                };
+                let replacement_path = path_manager
+                    .get_shard_dir_on_disk(
+                        &replacement,
+                        &metadata.fragment,
+                        &metadata.object_key,
+                        &metadata.version_id,
+                    )
+                    .join(&part_fixed.shards[shard_position].file_name);
+                part_fixed.shards[shard_position].absolute_path =
+                    replacement_path.to_string_lossy().to_string();
+            }
 
-        while let Some(r) = repairs.next().await {
-            match r {
+            let _permit = shard_repair_sem
+                .acquire()
+                .await
+                .map_err(|_| AppError::InternalServerError("Repair semaphore closed".into()))?;
+            match repair_entire_shard(
+                Arc::new(part_fixed.clone()),
+                missing_idx,
+                metadata.stripe_size_bytes,
+            )
+            .await
+            {
                 Ok(_) => {
                     repaired_total += 1;
-                    last_repaired = Some(format!("{}/{}", meta_arc.fragment, meta_arc.object_key));
+                    placement_changed |=
+                        Path::new(&part_fixed.shards[shard_position].absolute_path)
+                            != original_path;
+                    metadata.parts[part_index] = part_fixed.clone();
+                    last_repaired = Some(format!("{}/{}", metadata.fragment, metadata.object_key));
                 }
                 Err(e) => {
-                    warn!("Shard repair failed (disk might be offline): {}", e);
+                    part_fixed.shards[shard_position].absolute_path =
+                        original_path.to_string_lossy().to_string();
+                    let message = format!(
+                        "Shard repair failed for {}/{} shard {}: {}",
+                        metadata.fragment, metadata.object_key, missing_idx, e
+                    );
+                    warn!("{message}");
+                    failed_repairs += 1;
+                    last_failure = Some(message);
                 }
             }
         }
     }
 
-    if !cfg.dry_run {
-        index::upsert_object_version(meta_arc.as_ref()).await?;
-    }
+    let metadata_needs_repair = if placement_changed {
+        true
+    } else {
+        let metadata_for_check = metadata.clone();
+        !tokio::task::spawn_blocking(move || {
+            index_store::object_metadata_placements_healthy(&metadata_for_check)
+        })
+        .await
+        .map_err(|error| {
+            AppError::InternalServerError(format!("object metadata health worker failed: {error}"))
+        })??
+    };
 
-    Ok((repaired_total, corrupt_found, last_repaired))
+    if placement_changed {
+        metadata.placement_generation =
+            metadata
+                .placement_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "object placement generation exhausted during repair".into(),
+                    )
+                })?;
+    }
+    let metadata_repaired = if metadata_needs_repair {
+        match catalog {
+            MetadataCatalog::Live => index::upsert_object_version(&metadata).await?,
+            MetadataCatalog::Trash => {
+                index::publish_trashed_object_version_for_maintenance(&metadata).await?
+            }
+        }
+        1
+    } else {
+        0
+    };
+
+    Ok((
+        repaired_total,
+        corrupt_found,
+        metadata_repaired,
+        failed_repairs,
+        last_repaired,
+        last_failure,
+    ))
 }
 
 #[cfg(test)]
@@ -1379,11 +1500,38 @@ pub async fn run_repair_job(
     let run_opts = RepairRunOptions {
         fast_mode: false,
         access_mode: cfg.check_mode.maintenance_access_mode(),
+        replay_pending_redistribution: true,
     };
     run_repair_job_with_options(cfg, run_opts, ws_manager).await
 }
 
 pub async fn run_repair_job_with_options(
+    cfg: RepairRunConfig,
+    opts: RepairRunOptions,
+    ws_manager: Arc<WsConnectionManager>,
+) -> Result<(), AppError> {
+    if REPAIR_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(AppError::Conflict(
+            "A repair job is already running.".into(),
+        ));
+    }
+    let _running_guard = RepairRunningGuard;
+
+    let result = run_repair_job_inner(cfg, opts, ws_manager.clone()).await;
+    if let Err(error) = &result {
+        let mut status = REPAIR_STATUS.write().await;
+        status.is_running = false;
+        status.phase = "Failed".to_string();
+        status.last_error = Some(error.to_string());
+        ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+    }
+    result
+}
+
+async fn run_repair_job_inner(
     cfg: RepairRunConfig,
     opts: RepairRunOptions,
     ws_manager: Arc<WsConnectionManager>,
@@ -1425,6 +1573,7 @@ pub async fn run_repair_job_with_options(
         status.total_scanned = 0;
         status.total_repaired = 0;
         status.corrupt_found = 0;
+        status.failed_repairs = 0;
         status.missing_meta_repaired = 0;
         status.divergent_meta_repaired = 0;
         status.last_disagreement = None;
@@ -1445,8 +1594,18 @@ pub async fn run_repair_job_with_options(
             "Index Store Config not initialized".into(),
         ))?;
 
-    let index_roots: Vec<PathBuf> = reachable_dir_roots(path_manager.get_all_index_roots()).await;
-    let blob_roots = Arc::new(reachable_dir_roots(path_manager.get_blob_roots()).await);
+    let index_roots: Vec<PathBuf> = reachable_dir_roots(path_manager.get_all_index_roots())
+        .await
+        .into_iter()
+        .filter(|root| configured_root_identity_is_current(root))
+        .collect();
+    let blob_roots: Arc<Vec<PathBuf>> = Arc::new(
+        reachable_dir_roots(path_manager.get_blob_roots())
+            .await
+            .into_iter()
+            .filter(|root| configured_root_identity_is_current(root))
+            .collect(),
+    );
     let num_disks = blob_roots.len();
     if index_roots.is_empty() {
         return Err(AppError::InternalServerError(
@@ -1487,6 +1646,9 @@ pub async fn run_repair_job_with_options(
         cfg.check_mode,
         cfg.dry_run
     );
+
+    let mut unresolved_repairs = 0u64;
+    let mut last_unresolved_failure: Option<String> = None;
 
     for fragment_hash in fragments {
         if should_stop() {
@@ -1575,7 +1737,7 @@ pub async fn run_repair_job_with_options(
             global_namespace_runtime().evict_fragment(&fragment_hash);
         }
 
-        if !cfg.dry_run {
+        if !cfg.dry_run && opts.replay_pending_redistribution {
             if let Err(err) = replay_pending_intents_for_fragment_now(&fragment_hash, true).await {
                 warn!(
                     "Failed replaying pending redistribution intents for fragment {} during repair: {}",
@@ -1620,14 +1782,22 @@ pub async fn run_repair_job_with_options(
                 let d = apply_meta_batch(
                     &page.objects,
                     blob_roots.clone(),
-                    num_disks,
                     cfg.clone(),
                     shard_repair_sem.clone(),
                     batch_pacing,
                     ws_manager.clone(),
                     start_time,
+                    if is_trash {
+                        MetadataCatalog::Trash
+                    } else {
+                        MetadataCatalog::Live
+                    },
                 )
                 .await?;
+                unresolved_repairs += d.failed_repairs;
+                if d.last_failure.is_some() {
+                    last_unresolved_failure = d.last_failure.clone();
+                }
                 io_guard.heartbeat();
 
                 let _fragment_touched = d.repaired_shards > 0
@@ -1642,6 +1812,8 @@ pub async fn run_repair_job_with_options(
         }
     }
 
+    ensure_no_unresolved_repairs(unresolved_repairs, last_unresolved_failure.as_deref())?;
+
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = false;
@@ -1655,10 +1827,11 @@ pub async fn run_repair_job_with_options(
         ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
 
         info!(
-            "Repair Job Ended. Scanned: {}, Repaired: {}, Corrupt: {}, MissingMeta: {}, DivergentMeta: {}",
+            "Repair Job Ended. Scanned: {}, Repaired: {}, Corrupt: {}, Failed: {}, MissingMeta: {}, DivergentMeta: {}",
             status.total_scanned,
             status.total_repaired,
             status.corrupt_found,
+            status.failed_repairs,
             status.missing_meta_repaired,
             status.divergent_meta_repaired
         );
@@ -1671,12 +1844,12 @@ pub async fn run_repair_job_with_options(
 async fn apply_meta_batch(
     batch: &[ObjectMetadata],
     blob_roots: Arc<Vec<PathBuf>>,
-    num_disks: usize,
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
     batch_pacing: Option<Duration>,
     ws_manager: Arc<WsConnectionManager>,
     start_time: Instant,
+    catalog: MetadataCatalog,
 ) -> Result<BatchDelta, AppError> {
     if batch.is_empty() {
         return Ok(BatchDelta::default());
@@ -1703,7 +1876,7 @@ async fn apply_meta_batch(
                 let cfg = cfg.clone();
 
                 async move {
-                    process_one_metadata(meta, blob_roots, num_disks, cfg, shard_repair_sem).await
+                    process_one_metadata(meta, blob_roots, cfg, shard_repair_sem, catalog).await
                 }
             })
             .buffer_unordered(cfg.meta_concurrency);
@@ -1717,7 +1890,12 @@ async fn apply_meta_batch(
         let delta = match res {
             Ok(d) => d,
             Err(e) => {
-                warn!("Meta batch item failed (non-fatal): {}", e);
+                let message = format!("Object maintenance failed: {e}");
+                warn!("{message}");
+                batch_agg.failed_repairs += 1;
+                batch_agg.last_failure = Some(message.clone());
+                pending_update.failed_repairs += 1;
+                pending_update.last_failure = Some(message);
                 continue;
             }
         };
@@ -1727,11 +1905,15 @@ async fn apply_meta_batch(
         batch_agg.corrupt_found += delta.corrupt_found;
         batch_agg.missing_meta_repaired += delta.missing_meta_repaired;
         batch_agg.divergent_meta_repaired += delta.divergent_meta_repaired;
+        batch_agg.failed_repairs += delta.failed_repairs;
         if delta.last_repaired.is_some() {
             batch_agg.last_repaired = delta.last_repaired.clone();
         }
         if delta.last_disagreement.is_some() {
             batch_agg.last_disagreement = delta.last_disagreement.clone();
+        }
+        if delta.last_failure.is_some() {
+            batch_agg.last_failure = delta.last_failure.clone();
         }
 
         pending_update.scanned += delta.scanned;
@@ -1739,11 +1921,15 @@ async fn apply_meta_batch(
         pending_update.corrupt_found += delta.corrupt_found;
         pending_update.missing_meta_repaired += delta.missing_meta_repaired;
         pending_update.divergent_meta_repaired += delta.divergent_meta_repaired;
+        pending_update.failed_repairs += delta.failed_repairs;
         if delta.last_repaired.is_some() {
             pending_update.last_repaired = delta.last_repaired.clone();
         }
         if delta.last_disagreement.is_some() {
             pending_update.last_disagreement = delta.last_disagreement.clone();
+        }
+        if delta.last_failure.is_some() {
+            pending_update.last_failure = delta.last_failure.clone();
         }
 
         if let Some(delay) = batch_pacing {
@@ -1757,7 +1943,8 @@ async fn apply_meta_batch(
         let significant_change = delta.repaired_shards > 0
             || delta.missing_meta_repaired > 0
             || delta.divergent_meta_repaired > 0
-            || delta.corrupt_found > 0;
+            || delta.corrupt_found > 0
+            || delta.failed_repairs > 0;
 
         if significant_change
             || pending_update.scanned >= 10
@@ -1771,12 +1958,16 @@ async fn apply_meta_batch(
             status.corrupt_found += pending_update.corrupt_found;
             status.missing_meta_repaired += pending_update.missing_meta_repaired;
             status.divergent_meta_repaired += pending_update.divergent_meta_repaired;
+            status.failed_repairs += pending_update.failed_repairs;
 
             if let Some(s) = &pending_update.last_repaired {
                 status.last_repaired = Some(s.clone());
             }
             if let Some(s) = &pending_update.last_disagreement {
                 status.last_disagreement = Some(s.clone());
+            }
+            if let Some(s) = &pending_update.last_failure {
+                status.last_error = Some(s.clone());
             }
 
             let elapsed = start_time.elapsed().as_secs_f64();
@@ -1792,7 +1983,7 @@ async fn apply_meta_batch(
         }
     }
 
-    if pending_update.scanned > 0 {
+    if pending_update.scanned > 0 || pending_update.failed_repairs > 0 {
         let mut status = REPAIR_STATUS.write().await;
         status.total_scanned += pending_update.scanned;
         status.total_repaired += pending_update.repaired_shards
@@ -1801,12 +1992,16 @@ async fn apply_meta_batch(
         status.corrupt_found += pending_update.corrupt_found;
         status.missing_meta_repaired += pending_update.missing_meta_repaired;
         status.divergent_meta_repaired += pending_update.divergent_meta_repaired;
+        status.failed_repairs += pending_update.failed_repairs;
 
         if let Some(s) = &pending_update.last_repaired {
             status.last_repaired = Some(s.clone());
         }
         if let Some(s) = &pending_update.last_disagreement {
             status.last_disagreement = Some(s.clone());
+        }
+        if let Some(s) = &pending_update.last_failure {
+            status.last_error = Some(s.clone());
         }
 
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -1824,9 +2019,9 @@ async fn apply_meta_batch(
 async fn process_one_metadata(
     meta: ObjectMetadata,
     blob_roots: Arc<Vec<PathBuf>>,
-    num_disks: usize,
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
+    catalog: MetadataCatalog,
 ) -> Result<BatchDelta, AppError> {
     let mut delta = BatchDelta::default();
     if should_stop() {
@@ -1839,19 +2034,25 @@ async fn process_one_metadata(
         return Ok(delta);
     }
 
-    let (repaired, corrupt, last_rep) =
-        process_object_repair(meta, &blob_roots, num_disks, cfg, shard_repair_sem).await?;
+    let (repaired, corrupt, metadata_repaired, failed_repairs, last_rep, last_failure) =
+        process_object_repair(meta, &blob_roots, cfg, shard_repair_sem, catalog).await?;
 
     delta.repaired_shards += repaired as u64;
     delta.corrupt_found += corrupt as u64;
+    delta.missing_meta_repaired += metadata_repaired as u64;
+    delta.failed_repairs += failed_repairs as u64;
     delta.last_repaired = last_rep;
+    delta.last_failure = last_failure;
 
     Ok(delta)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RepairCheckMode, list_all_fragments, parse_check_mode, reachable_dir_roots};
+    use super::{
+        RepairCheckMode, ensure_no_unresolved_repairs, list_all_fragments, parse_check_mode,
+        reachable_dir_roots,
+    };
     use crate::core::constants::FRAGMENT_METADATA_FILE;
     use crate::core::fragment_identity::{
         fragment_alias_dir, physical_fragment_dir_name, physical_fragment_root_on,
@@ -1872,6 +2073,16 @@ mod tests {
 
         params.insert("mode".to_string(), "checksum".to_string());
         assert_eq!(parse_check_mode(&params), RepairCheckMode::Checksum);
+    }
+
+    #[test]
+    fn unresolved_automatic_repair_debt_fails_the_scan() {
+        assert!(ensure_no_unresolved_repairs(0, None).is_ok());
+        let error = ensure_no_unresolved_repairs(2, Some("no distinct replacement"))
+            .expect_err("unresolved repairs must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("2 unresolved"));
+        assert!(message.contains("no distinct replacement"));
     }
 
     #[test]

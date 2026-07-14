@@ -6,6 +6,7 @@ pub use n1::*;
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
+use crate::core::auto_healing::arm_topology_safety_gate;
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::core::fragment_metadata::set_configured_index_partition_count;
 use crate::core::io_scheduler::{DiskIoSchedulerConfig, configure_disk_io_scheduler};
@@ -16,6 +17,7 @@ use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
+use crate::core::root_identity::initialize_configured_root_identities;
 use crate::core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
@@ -959,6 +961,14 @@ pub async fn run_server() {
     PARITY_SHARDS_ATOMIC
         .set(AtomicUsize::new(parity_shards_value))
         .expect("Double initialization of PARITY_SHARDS!");
+
+    arm_topology_safety_gate();
+    if let Err(error) = initialize_configured_root_identities() {
+        tracing::error!(
+            "N1 root identity initialization failed; writes remain read-only: {}",
+            error
+        );
+    }
 
     STRIPE_SIZE_ATOMIC
         .set(AtomicUsize::new(stripe_block_size_value))

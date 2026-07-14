@@ -1,3 +1,4 @@
+use crate::core::auto_healing::{AutoHealingStatus, get_auto_healing_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
@@ -14,6 +15,9 @@ use crate::core::redistribution::{
 };
 use crate::core::redistribution::{RedistributionScope, check_needs_redistribution};
 use crate::core::repair_manager::get_repair_status;
+use crate::core::root_identity::{
+    configured_root_identity_is_current, root_identity_enforcement_initialized,
+};
 use crate::core::system::{SystemMetrics, get_system_metrics};
 use crate::core::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC};
 use crate::enums::app_error_enum::AppError;
@@ -199,6 +203,9 @@ pub struct MaintenanceRuntimeStats {
     pub trash_lifecycle_phase: String,
     pub trash_retention_seconds: u64,
     pub trash_versions_expired: u64,
+    pub auto_healing: AutoHealingStatus,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sampled_recorded_layout_fragments: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_redistribution_intent_age_seconds: Option<u64>,
 }
@@ -238,6 +245,13 @@ struct BlobPlacementRisk {
 struct FragmentRedundancyDebt {
     pending_gc_blob_fragments: Vec<String>,
     sampled_degraded_fragments: Vec<String>,
+    sampled_recorded_layout_fragments: Vec<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SampledObjectDebt {
+    actual_redundancy_debt: bool,
+    recorded_layout: bool,
 }
 
 fn should_count_index_record(path: &Path) -> bool {
@@ -325,6 +339,21 @@ mod tests {
 
 async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus {
     let path = PathBuf::from(&path_str);
+    if root_identity_enforcement_initialized() && !configured_root_identity_is_current(&path) {
+        return DiskStatus {
+            path: path_str,
+            role,
+            status: "offline".to_string(),
+            total_bytes: None,
+            used_bytes: None,
+            available_bytes: None,
+            usage_percent: None,
+            latency_ms: None,
+            error: Some(
+                "Configured path does not match its registered N1 root identity".to_string(),
+            ),
+        };
+    }
     let capacity = disk_capacity_snapshot(&path);
 
     let (status, latency_ms, error) = if path.exists() {
@@ -498,10 +527,11 @@ async fn fragment_has_sampled_redundancy_debt(
     target_stripe_size: usize,
     active_blob_roots: &[PathBuf],
     active_index_roots: &[PathBuf],
-) -> Result<bool, AppError> {
+) -> Result<SampledObjectDebt, AppError> {
     let page_limit = if deep_scan { 128 } else { 32 };
     let mut live_token = None;
     let mut checked = 0usize;
+    let mut sampled = SampledObjectDebt::default();
 
     loop {
         let page = index::scan_fragment_live_metadata_page(
@@ -521,7 +551,10 @@ async fn fragment_has_sampled_redundancy_debt(
             for part in &meta.parts {
                 for shard in &part.shards {
                     if !fs::try_exists(&shard.absolute_path).await.unwrap_or(false) {
-                        return Ok(true);
+                        return Ok(SampledObjectDebt {
+                            actual_redundancy_debt: true,
+                            recorded_layout: false,
+                        });
                     }
                 }
             }
@@ -540,12 +573,12 @@ async fn fragment_has_sampled_redundancy_debt(
             .await;
 
             if needs.payload || needs.metadata {
-                return Ok(true);
+                sampled.recorded_layout = true;
             }
 
             checked += 1;
             if !deep_scan && checked >= page_limit {
-                return Ok(false);
+                return Ok(sampled);
             }
         }
 
@@ -555,7 +588,7 @@ async fn fragment_has_sampled_redundancy_debt(
         }
     }
 
-    Ok(false)
+    Ok(sampled)
 }
 
 async fn detect_fragment_redundancy_debt(
@@ -602,7 +635,7 @@ async fn detect_fragment_redundancy_debt(
             continue;
         }
 
-        if fragment_has_sampled_redundancy_debt(
+        let sampled = fragment_has_sampled_redundancy_debt(
             &fragment,
             deep_scan,
             target_data,
@@ -611,9 +644,11 @@ async fn detect_fragment_redundancy_debt(
             active_blob_roots,
             active_index_roots,
         )
-        .await?
-        {
+        .await?;
+        if sampled.actual_redundancy_debt {
             debt.sampled_degraded_fragments.push(fragment);
+        } else if sampled.recorded_layout {
+            debt.sampled_recorded_layout_fragments.push(fragment);
         }
     }
 
@@ -738,6 +773,7 @@ async fn collect_system_health(
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
     let gc_status = get_gc_status().await;
+    let auto_healing_status = get_auto_healing_status().await;
 
     let index_disks_config = INDEX_STORE_DISKS
         .get()
@@ -907,20 +943,22 @@ async fn collect_system_health(
             "critical",
             "ALL Data (Blob) disks are offline. Data is inaccessible.".to_string(),
         )
+    } else if !auto_healing_status.write_safe || auto_healing_status.read_only_reason.is_some() {
+        (
+            "degraded",
+            auto_healing_status
+                .read_only_reason
+                .clone()
+                .unwrap_or_else(|| {
+                    "N1 topology has not yet been validated as write-safe.".to_string()
+                }),
+        )
     } else if online_index_count < total_index {
         (
             "degraded",
             format!(
                 "Running on {}/{} index roots. Partition redundancy reduced.",
                 online_index_count, total_index
-            ),
-        )
-    } else if online_blob_count < total_blob {
-        (
-            "degraded",
-            format!(
-                "Running on {}/{} data disks. Performance/capacity reduced.",
-                online_blob_count, total_blob
             ),
         )
     } else if !fragment_redundancy_debt
@@ -930,7 +968,7 @@ async fn collect_system_health(
         (
             "degraded",
             format!(
-                "Fragments have missing or out-of-layout shard copies and need repair/redistribution: {}.",
+                "Fragments contain objects with genuinely missing recorded shard copies and need repair: {}.",
                 fragment_redundancy_debt
                     .sampled_degraded_fragments
                     .join(", ")
@@ -956,7 +994,7 @@ async fn collect_system_health(
         )
     } else if placement_limiter_low {
         (
-            "degraded",
+            "warning",
             placement_limiter_summary.clone().unwrap_or_else(|| {
                 "Blob placement is capacity-limited; uploads may fail before aggregate capacity is exhausted.".to_string()
             }),
@@ -966,6 +1004,23 @@ async fn collect_system_health(
     };
 
     if status == "healthy" {
+        if online_blob_count < total_blob {
+            summary.push_str(&format!(
+                " {}/{} configured blob roots are currently writable; object health remains based on recorded shard sets.",
+                online_blob_count, total_blob
+            ));
+        }
+        if !fragment_redundancy_debt
+            .sampled_recorded_layout_fragments
+            .is_empty()
+        {
+            summary.push_str(&format!(
+                " Healthy objects use recorded layouts in fragment(s): {}; redistribution is optional.",
+                fragment_redundancy_debt
+                    .sampled_recorded_layout_fragments
+                    .join(", ")
+            ));
+        }
         if !fragment_redundancy_debt
             .pending_gc_blob_fragments
             .is_empty()
@@ -1012,6 +1067,10 @@ async fn collect_system_health(
             trash_lifecycle_phase: gc_status.phase.clone(),
             trash_retention_seconds: CONFIG.garbage_collector.trash_retention_seconds,
             trash_versions_expired: gc_status.total_trash_versions_expired,
+            auto_healing: auto_healing_status.clone(),
+            sampled_recorded_layout_fragments: fragment_redundancy_debt
+                .sampled_recorded_layout_fragments
+                .clone(),
             oldest_pending_redistribution_intent_age_seconds: redistribution_debt
                 .oldest_pending_intent_age_seconds,
         })
@@ -1066,6 +1125,9 @@ async fn collect_system_health(
             trash_lifecycle_phase: gc_status.phase,
             trash_retention_seconds: CONFIG.garbage_collector.trash_retention_seconds,
             trash_versions_expired: gc_status.total_trash_versions_expired,
+            auto_healing: auto_healing_status,
+            sampled_recorded_layout_fragments: fragment_redundancy_debt
+                .sampled_recorded_layout_fragments,
             oldest_pending_redistribution_intent_age_seconds: redistribution_debt
                 .oldest_pending_intent_age_seconds,
         },

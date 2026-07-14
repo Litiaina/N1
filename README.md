@@ -19,8 +19,20 @@ truth on one machine: fragments, namespace entries, immutable object versions,
 payload placement, health checks, repair, and garbage collection.
 
 This repository is the N1 product boundary. N2, Registry, NS, and other
-Litiaina services should treat N1 as a stable storage system and integrate
+Litiaina services should treat N1 as a storage-system boundary and integrate
 through its supported APIs or through the native client crate.
+
+## Development Status
+
+- **Current engine/package version:** `3.1.0`
+- **Release channel:** development
+- **Storage engine format:** `3`
+- **Stable release for this engine line:** not yet declared
+
+The engine/package version identifies the actively evolving implementation; it
+does not itself declare production stability. Engine-format compatibility is a
+separate contract: N1 3.1.0 uses engine format 3 and fails closed on older or
+unversioned storage roots rather than adopting or migrating them.
 
 ## What Is Included
 

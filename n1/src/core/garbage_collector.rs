@@ -7,6 +7,7 @@ use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, IoProgress, acquire_disk_io};
+use crate::core::operation_gate::safety_read_only_reason;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
@@ -196,6 +197,10 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
 
     let _ = state;
     loop {
+        if safety_read_only_reason().is_some() {
+            sleep(cleanup_interval).await;
+            continue;
+        }
         if GC_RUNNING.swap(true, Ordering::SeqCst) {
             sleep(cleanup_interval).await;
             continue;
@@ -332,6 +337,9 @@ pub async fn run_garbage_collector(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if let Some(reason) = safety_read_only_reason() {
+        return (StatusCode::SERVICE_UNAVAILABLE, reason);
+    }
     let target_fragment = match parse_gc_target_fragment(&params) {
         Some(fragment) => match resolve_stable_fragment_id(&fragment).await {
             Ok(stable) => Some(stable),

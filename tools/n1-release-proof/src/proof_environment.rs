@@ -148,6 +148,11 @@ impl Proof {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(",");
+        let auto_healing_enabled = self.args.auto_healing_proof;
+        let topology_recovery_stability_seconds = if auto_healing_enabled { 2 } else { 0 };
+        let initial_scan_delay_seconds = if auto_healing_enabled { 2 } else { 60 };
+        let availability_scan_interval_seconds = if auto_healing_enabled { 2 } else { 3600 };
+        let checksum_scrub_interval_seconds = if auto_healing_enabled { 5 } else { 604800 };
         let config = format!(
             r#"[server]
 host=127.0.0.1
@@ -174,6 +179,17 @@ max_loaded_dbs=auto
 cleanup_interval_seconds=86400
 file_ttl_seconds=30
 trash_retention_seconds={}
+
+[auto_healing]
+enabled={}
+topology_check_interval_seconds=1
+topology_recovery_stability_seconds={}
+initial_scan_delay_seconds={}
+availability_scan_interval_seconds={}
+checksum_scrub_interval_seconds={}
+object_scan_concurrency=1
+shard_repair_concurrency=1
+metadata_batch_size=128
 
 [set_limits]
 max_file_size=1099511627776
@@ -219,6 +235,11 @@ stripe_block_size=262144
             blob_roots,
             self.args.out_dir.join("fs").display(),
             self.args.trash_retention_seconds,
+            auto_healing_enabled,
+            topology_recovery_stability_seconds,
+            initial_scan_delay_seconds,
+            availability_scan_interval_seconds,
+            checksum_scrub_interval_seconds,
             self.args.rate_limiter_enabled,
             self.args.max_part_size,
             self.data_shards,

@@ -1,13 +1,18 @@
+use crate::enums::app_error_enum::AppError;
 use axum::body::Body;
 use axum::http::Method;
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, RwLock};
 
 static READ_ONLY_FAST_MODE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 static QUIESCED_MAINTENANCE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
+static TOPOLOGY_READ_ONLY_REASON: LazyLock<RwLock<Option<String>>> =
+    LazyLock::new(|| RwLock::new(None));
+static AUTO_HEALING_FAULT_REASON: LazyLock<RwLock<Option<String>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaintenanceAccessMode {
@@ -67,11 +72,58 @@ pub fn acquire_read_only_fast_mode(enable: bool) -> ReadOnlyFastModeGuard {
 pub fn current_maintenance_access_mode() -> MaintenanceAccessMode {
     if QUIESCED_MAINTENANCE_REFCOUNT.load(Ordering::Acquire) > 0 {
         MaintenanceAccessMode::Quiesced
-    } else if READ_ONLY_FAST_MODE_REFCOUNT.load(Ordering::Acquire) > 0 {
+    } else if READ_ONLY_FAST_MODE_REFCOUNT.load(Ordering::Acquire) > 0
+        || safety_read_only_reason().is_some()
+    {
         MaintenanceAccessMode::ReadOnly
     } else {
         MaintenanceAccessMode::Availability
     }
+}
+
+pub fn set_safety_read_only(reason: Option<String>) {
+    let mut current = TOPOLOGY_READ_ONLY_REASON
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *current = reason;
+}
+
+pub fn set_auto_healing_fault(reason: Option<String>) {
+    let mut current = AUTO_HEALING_FAULT_REASON
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *current = reason;
+}
+
+pub fn safety_read_only_reason() -> Option<String> {
+    let auto_healing = AUTO_HEALING_FAULT_REASON
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    auto_healing.or_else(|| {
+        TOPOLOGY_READ_ONLY_REASON
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    })
+}
+
+pub fn topology_read_only_reason() -> Option<String> {
+    TOPOLOGY_READ_ONLY_REASON
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+pub fn ensure_user_mutations_allowed() -> Result<(), AppError> {
+    if current_maintenance_access_mode() >= MaintenanceAccessMode::ReadOnly {
+        return Err(AppError::ServiceUnavailable(
+            safety_read_only_reason().unwrap_or_else(|| {
+                "N1 is read-only while strict maintenance is active.".to_string()
+            }),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -98,11 +150,14 @@ pub async fn enforce_read_only_fast_mode_on_mutations(req: Request<Body>, next: 
 
     match mode {
         MaintenanceAccessMode::Availability => next.run(req).await,
-        MaintenanceAccessMode::ReadOnly => (
-            axum::http::StatusCode::FORBIDDEN,
-            "Write/modify/delete operations are temporarily disabled: strict maintenance mode is active.",
-        )
-            .into_response(),
+        MaintenanceAccessMode::ReadOnly => match safety_read_only_reason() {
+            Some(reason) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
+            None => (
+                axum::http::StatusCode::FORBIDDEN,
+                "Write/modify/delete operations are temporarily disabled: strict maintenance mode is active.",
+            )
+                .into_response(),
+        },
         MaintenanceAccessMode::Quiesced => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Write/modify/delete operations are temporarily disabled: scrub mode is active.",
@@ -133,6 +188,7 @@ mod tests {
         MaintenanceAccessMode, acquire_maintenance_mode, acquire_read_only_fast_mode,
         current_maintenance_access_mode, enforce_quiesced_mode_on_reads,
         enforce_read_only_fast_mode_on_mutations, is_read_only_fast_mode_active,
+        safety_read_only_reason, set_safety_read_only,
     };
     use axum::Router;
     use axum::body::Body;
@@ -186,6 +242,32 @@ mod tests {
         assert!(!is_read_only_fast_mode_active());
     }
 
+    #[test]
+    fn persistent_safety_gate_is_independent_of_temporary_guards() {
+        let _test_lock = acquire_test_lock();
+        set_safety_read_only(Some("topology cannot satisfy 4D+2P".to_string()));
+        assert_eq!(
+            current_maintenance_access_mode(),
+            MaintenanceAccessMode::ReadOnly
+        );
+        assert_eq!(
+            safety_read_only_reason().as_deref(),
+            Some("topology cannot satisfy 4D+2P")
+        );
+
+        let temporary = acquire_read_only_fast_mode(true);
+        set_safety_read_only(None);
+        assert_eq!(
+            current_maintenance_access_mode(),
+            MaintenanceAccessMode::ReadOnly
+        );
+        drop(temporary);
+        assert_eq!(
+            current_maintenance_access_mode(),
+            MaintenanceAccessMode::Availability
+        );
+    }
+
     #[tokio::test]
     async fn middleware_blocks_mutations_but_allows_reads() {
         let _test_lock = acquire_test_lock();
@@ -222,6 +304,29 @@ mod tests {
         assert_eq!(read_resp.status(), StatusCode::OK);
 
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn persistent_safety_read_only_returns_service_unavailable() {
+        let _test_lock = acquire_test_lock();
+        let app = Router::new()
+            .route("/write", post(|| async { "ok" }))
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
+
+        set_safety_read_only(Some("registered topology is unsafe".to_string()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/write")
+                    .body(Body::empty())
+                    .expect("build write request"),
+            )
+            .await
+            .expect("write request");
+        set_safety_read_only(None);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

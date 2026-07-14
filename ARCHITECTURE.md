@@ -1,12 +1,17 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.0.1 storage contract. It is the reference for
+This document defines the N1 3.1.0 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.0.1 uses the N1 3 engine format and preserves N1's immutable-object and
-namespace-mutation architecture while introducing the TTL trash lifecycle.
+N1 3.1.0 uses engine format 3 and preserves N1's immutable-object and
+namespace-mutation architecture while introducing the TTL trash lifecycle,
+per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
+
+Version `3.1.0` identifies the current development package line; it does not
+declare stable-release status. Engine format `3` is the independent on-disk
+compatibility boundary defined by this document.
 
 ## Core Rule
 
@@ -20,7 +25,7 @@ blob roots  = immutable object metadata and EC payload
 The namespace points to stable object identities. It never points to a shard,
 parity file, version path, or mutable head record.
 
-Each committed object version stores its immutable `.ndx` record beside its
+Each committed object version stores its authoritative `.ndx` record beside its
 shard or parity payload on every shard-bearing blob root. Object metadata
 durability therefore follows the recorded EC placement instead of consuming
 the index plane.
@@ -34,6 +39,7 @@ receipts, trash, and the user namespace:
 
 ```text
 <index_root>/
+  .n1-root-id
   .fragment/
     <fragment-alias-hash> -> ../@f_<stable-fragment-id>
 
@@ -63,6 +69,7 @@ A blob root stores immutable object records and their EC payload:
 
 ```text
 <blob_root>/
+  .n1-root-id
   @f_<stable-fragment-id>/
     .objects/
       ab/
@@ -159,7 +166,7 @@ without overwriting an older recoverable deletion. Folder soft delete remains
 a constant-sized directory rename; descendants are inspected only if the
 folder reaches lifecycle expiry.
 
-There is no manual empty-trash or hard-delete operation in N1 3.0.1. Recovery
+There is no manual empty-trash or hard-delete operation in N1 3.1.0. Recovery
 is allowed until the configured trash retention deadline. Once that deadline
 is reached, lifecycle owns the entry and recovery fails closed.
 
@@ -196,7 +203,7 @@ Each committed version has:
   <shard-or-parity-files>
 ```
 
-The `.ndx` body stores immutable object metadata:
+The `.ndx` body stores object-version truth:
 
 - object key at commit time
 - stable fragment identity
@@ -205,9 +212,16 @@ The `.ndx` body stores immutable object metadata:
 - logical size and timestamps
 - recorded data/parity shard counts
 - recorded stripe size
+- placement generation
 - parts
 - absolute shard/parity paths
 - checksums and shard roles
+
+The object id, version id, logical bytes, checksum truth, ownership, and
+content semantics are immutable. Repair or explicit redistribution may replace
+only the physical topology projection (recorded shard paths and placement
+generation) after equivalent shard bytes are durable. That maintenance update
+does not create a content version or mutate the namespace.
 
 There is no mutable head pointer. The head is the greatest valid version ULID
 found across the object's healthy blob placements.
@@ -265,6 +279,12 @@ N1 records EC topology per object version. For `3 + 1`, each part has three
 data shards and one parity shard placed across four selected blob roots. Each
 of those roots also stores the same immutable `.ndx` for that version.
 
+The selected roots form one fixed object EC set: every part maps shard index
+`i` to the same object root `i`. Selection uses deterministic rendezvous
+ranking over all currently healthy registered blob roots, so adding disks
+expands placement choices for new object versions without moving old ones.
+N1 refuses an upload unless every `D + P` shard target opens successfully.
+
 This provides:
 
 - metadata survival with surviving shard placements
@@ -276,6 +296,15 @@ Absolute shard paths remain recorded because they are direct storage truth on
 one machine. Stable fragment ids ensure fragment rename cannot invalidate
 those paths.
 
+Each configured storage root has a persistent `.n1-root-id`. The expected
+path-to-identity registry is atomically stored under
+`<fs_storage_path>/.n1/topology-roots.json`. A known configured path is never
+rebound to a new identity automatically. Explicitly removing a path from the
+configuration decommissions its registry entry; re-adding it on a later start
+is the controlled enrollment boundary for a replacement disk. This prevents an unmounted disk's underlying
+directory, or a replacement disk at the same path, from being mistaken for
+the recorded failure domain.
+
 ## Topology Changes
 
 Changing configured disks or EC values does not rewrite existing objects.
@@ -284,6 +313,13 @@ Changing configured disks or EC values does not rewrite existing objects.
 - new objects use the current configured topology
 - health compares each version against its recorded layout
 - redistribution is explicit
+
+Adding a disk is not degradation and does not create redistribution debt.
+Changing `D + P` is prospective: it changes new object versions only. An old
+version remains healthy while its own recorded shard set is healthy. A disk
+loss may cause automatic repair to relocate one missing shard to a healthy,
+distinct configured root; that changes only the affected object's placement
+metadata and increments its placement generation.
 
 Object-level redistribution rewrites one selected version into the current
 topology. Fragment redistribution scans that fragment and rewrites only
@@ -331,6 +367,33 @@ Object repair uses the immutable `.ndx` and surviving shards to restore:
 
 Recover-on-read uses the same recorded object topology and repair primitives.
 
+N1 runs a lightweight topology controller and two configurable repair cycles:
+
+- availability scans verify recorded shard existence and size
+- checksum scrubs verify immutable payload integrity
+
+Fragments are scanned serially. Object concurrency is bounded and defaults to
+one; shards for one object are examined and repaired one at a time. A repaired
+shard is first made durable, then the higher placement generation is published
+to every new shard-bearing root. Readers select the highest generation and
+fail closed if equal generations disagree.
+
+Recover-on-read serves successfully reconstructed data first and schedules an
+in-place background repair. If the recorded root is unavailable, relocation is
+left to the scheduled healer because only that path may atomically update the
+object's placement generation.
+
+The controller keeps mutations read-only until the configured EC width can be
+satisfied by distinct writable, correctly identified devices and at least one
+writable index root. A stable healthy interval clears topology read-only mode
+automatically. An unresolved automatic repair keeps N1 read-only and remains
+visible in repair and health status; it is never converted into a false
+successful scan.
+
+Autonomous repair does not invoke redistribution. Redistribution remains an
+explicit operator request for intentionally rewriting otherwise valid objects
+into the current EC or placement policy.
+
 ## Trash Lifecycle And Garbage Collection
 
 The namespace is reachability truth. Normal deletion reclamation is a targeted
@@ -347,7 +410,7 @@ trash lifecycle operation, not a full object-plane scan:
 
 An interrupted expiry retries from the durable receipt and never needs to
 rediscover headless blobs through a global scan. Earlier-engine trash entries
-are not adopted: N1 3.0 requires freshly initialized format-3 fragments and
+are not adopted: N1 3.1.0 requires freshly initialized format-3 fragments and
 fails closed when an earlier or unversioned fragment marker is encountered.
 
 Full GC remains an explicit operator maintenance tool for orphan detection,
@@ -416,7 +479,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.0.1 is correct only while all of these remain true:
+N1 3.1.0 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -449,3 +512,13 @@ N1 3.0.1 is correct only while all of these remain true:
 29. Configured replicas with different namespace generations reject new namespace mutations until redistribution reconciles them.
 30. Namespace generations are excluded from content hashing, and generation maintenance never scans the namespace on the mutation path.
 31. Namespace redistribution and repair share the per-fragment mutation boundary; they cannot copy a replica concurrently with rename, trash, recovery, finalize, mkdir, or TTL sweep.
+32. Each object version carries its own fixed EC set; configuration changes are prospective and never invalidate a healthy recorded layout.
+33. Adding a blob root neither marks old objects degraded nor triggers implicit redistribution.
+34. New uploads require all `D + P` targets on distinct, registered physical devices; N1 never commits an under-protected new version.
+35. A configured path is writable only when its on-disk root identity matches the durable local topology registry; it is never rebound while it remains configured, and configuration removal is the explicit decommission boundary.
+36. Repair scans fragments serially, bound object concurrency, and process an object's missing shards one at a time.
+37. A repair relocation publishes a higher placement generation only after the reconstructed shard is durable; stale lower-generation metadata cannot override it.
+38. Equal placement generations with different immutable metadata fail closed.
+39. Automatic availability and checksum scans report unresolved repair debt as failure and keep user mutations read-only until a successful retry.
+40. Recover-on-read may repair a recorded live root in the background, but only the scheduled healer may relocate a shard and change placement metadata.
+41. Automatic healing never performs or requires redistribution of a healthy recorded object layout.

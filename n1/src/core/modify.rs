@@ -7,6 +7,7 @@ use tracing::info;
 use crate::core::disk_manager::{ObjectPathManager, RenameObjectRequest};
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
+use crate::core::operation_gate::ensure_user_mutations_allowed;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
@@ -44,6 +45,7 @@ pub async fn rename_object(
     claims: Claims,
     AxumJson(mut payload): AxumJson<RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }

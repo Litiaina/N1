@@ -24,6 +24,17 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("file_ttl_seconds", "3600")
         .set("trash_retention_seconds", "2592000");
 
+    conf.with_section(Some("auto_healing"))
+        .set("enabled", "true")
+        .set("topology_check_interval_seconds", "30")
+        .set("topology_recovery_stability_seconds", "10")
+        .set("initial_scan_delay_seconds", "60")
+        .set("availability_scan_interval_seconds", "3600")
+        .set("checksum_scrub_interval_seconds", "604800")
+        .set("object_scan_concurrency", "1")
+        .set("shard_repair_concurrency", "1")
+        .set("metadata_batch_size", "128");
+
     conf.with_section(Some("set_limits"))
         .set("max_file_size", "5368709120");
 
@@ -106,6 +117,18 @@ mod tests {
             .expect("garbage_collector section");
         assert_eq!(gc.get("trash_retention_seconds"), Some("2592000"));
         assert!(gc.get("retention_seconds").is_none());
+        let auto_healing = ini
+            .section(Some("auto_healing"))
+            .expect("auto_healing section");
+        assert_eq!(auto_healing.get("enabled"), Some("true"));
+        assert_eq!(
+            auto_healing.get("availability_scan_interval_seconds"),
+            Some("3600")
+        );
+        assert_eq!(
+            auto_healing.get("checksum_scrub_interval_seconds"),
+            Some("604800")
+        );
 
         let _ = fs::remove_file(path);
     }

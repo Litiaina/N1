@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::core::operation_gate::ensure_user_mutations_allowed;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
 use crate::namespace::runtime::global_namespace_runtime;
@@ -142,6 +143,7 @@ pub async fn mkdir_path(
     claims: Claims,
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -182,6 +184,7 @@ pub async fn rename_path(
     source_path: String,
     destination_path: String,
 ) -> Result<PosixMutationResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
@@ -240,6 +243,7 @@ pub async fn trash_path(
     claims: Claims,
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     let path = normalize_posix_path(Some(path.as_str()))?;
     if path.is_empty() {
         return Err(AppError::BadRequest(
@@ -273,6 +277,7 @@ pub async fn recover_path(
     claims: Claims,
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     let path = normalize_posix_path(Some(path.as_str()))?;
     if path.is_empty() {
         return Err(AppError::BadRequest(

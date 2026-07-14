@@ -1,8 +1,12 @@
 use crate::core::fragment_identity;
+use crate::core::root_identity::{
+    configured_root_identity_is_current, root_identity_enforcement_initialized,
+};
 use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -34,14 +38,100 @@ impl ObjectPathManager {
         let roots = INDEX_STORE_DISKS
             .get()
             .expect("Index Store Config not initialized!");
-        roots.iter().map(PathBuf::from).collect()
+        roots
+            .iter()
+            .map(PathBuf::from)
+            .filter(|root| {
+                !root_identity_enforcement_initialized()
+                    || configured_root_identity_is_current(root)
+            })
+            .collect()
     }
 
     pub fn get_blob_roots(&self) -> Vec<PathBuf> {
         let roots = BLOB_STORE_DISKS
             .get()
             .expect("Blob Store Config not initialized!");
-        roots.iter().map(PathBuf::from).collect()
+        roots
+            .iter()
+            .map(PathBuf::from)
+            .filter(|root| {
+                !root_identity_enforcement_initialized()
+                    || configured_root_identity_is_current(root)
+            })
+            .collect()
+    }
+
+    pub fn select_blob_roots_for_object(
+        &self,
+        fragment: &str,
+        object_key: &str,
+        version_id: &str,
+        shard_count: usize,
+    ) -> Result<Vec<PathBuf>, AppError> {
+        if shard_count == 0 {
+            return Err(AppError::InternalServerError(
+                "object EC set must contain at least one shard".into(),
+            ));
+        }
+
+        let roots = self.get_blob_roots();
+        if roots.len() < shard_count {
+            return Err(AppError::ServiceUnavailable(format!(
+                "Configured blob roots ({}) cannot satisfy this object's {}-shard EC set",
+                roots.len(),
+                shard_count
+            )));
+        }
+
+        let ranked = self.rank_blob_roots_for_object(fragment, object_key, version_id);
+        let mut selected = Vec::with_capacity(shard_count);
+        let mut failure_domains = HashSet::new();
+        for root in ranked {
+            let failure_domain = blob_root_failure_domain(&root);
+            if failure_domains.insert(failure_domain) {
+                selected.push(root);
+                if selected.len() == shard_count {
+                    break;
+                }
+            }
+        }
+        if selected.len() != shard_count {
+            return Err(AppError::ServiceUnavailable(format!(
+                "Configured blob roots do not provide {} distinct failure domains required by this object's EC set",
+                shard_count
+            )));
+        }
+        Ok(selected)
+    }
+
+    pub fn rank_blob_roots_for_object(
+        &self,
+        fragment: &str,
+        object_key: &str,
+        version_id: &str,
+    ) -> Vec<PathBuf> {
+        let mut ranked: Vec<([u8; 32], PathBuf)> = self
+            .get_blob_roots()
+            .into_iter()
+            .map(|root| {
+                let root_label = root.to_string_lossy();
+                (
+                    Self::route_hash(&[
+                        "object-ec-set",
+                        fragment,
+                        object_key,
+                        version_id,
+                        root_label.as_ref(),
+                    ]),
+                    root,
+                )
+            })
+            .collect();
+        ranked.sort_by(|(score_a, root_a), (score_b, root_b)| {
+            score_b.cmp(score_a).then_with(|| root_a.cmp(root_b))
+        });
+        ranked.into_iter().map(|(_, root)| root).collect()
     }
 
     fn route_hash(parts: &[&str]) -> [u8; 32] {
@@ -178,6 +268,91 @@ impl ObjectPathManager {
     }
 }
 
+#[cfg(unix)]
+fn blob_root_failure_domain(root: &PathBuf) -> String {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(root)
+        .map(|metadata| format!("dev:{}", metadata.dev()))
+        .unwrap_or_else(|_| format!("path:{}", root.display()))
+}
+
+#[cfg(not(unix))]
+fn blob_root_failure_domain(root: &PathBuf) -> String {
+    format!("path:{}", root.display())
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    fn rank(
+        roots: &[PathBuf],
+        fragment: &str,
+        object_key: &str,
+        version_id: &str,
+        count: usize,
+    ) -> Vec<PathBuf> {
+        let mut ranked: Vec<([u8; 32], PathBuf)> = roots
+            .iter()
+            .cloned()
+            .map(|root| {
+                let mut hasher = Sha256::new();
+                for part in [
+                    "object-ec-set",
+                    fragment,
+                    object_key,
+                    version_id,
+                    root.to_string_lossy().as_ref(),
+                ] {
+                    hasher.update(part.as_bytes());
+                    hasher.update([0u8]);
+                }
+                (hasher.finalize().into(), root)
+            })
+            .collect();
+        ranked.sort_by(|(score_a, root_a), (score_b, root_b)| {
+            score_b.cmp(score_a).then_with(|| root_a.cmp(root_b))
+        });
+        ranked
+            .into_iter()
+            .take(count)
+            .map(|(_, root)| root)
+            .collect()
+    }
+
+    #[test]
+    fn object_ec_set_selection_is_deterministic_and_bounded() {
+        let roots = (0..8)
+            .map(|idx| PathBuf::from(format!("/disk-{idx}")))
+            .collect::<Vec<_>>();
+        let first = rank(&roots, "fragment", "object", "version", 6);
+        let second = rank(&roots, "fragment", "object", "version", 6);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 6);
+        let unique = first.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), 6);
+    }
+
+    #[test]
+    fn different_object_versions_spread_across_expanded_pool() {
+        let roots = (0..8)
+            .map(|idx| PathBuf::from(format!("/disk-{idx}")))
+            .collect::<Vec<_>>();
+        let mut used = std::collections::HashSet::new();
+        for version in 0..64 {
+            used.extend(rank(
+                &roots,
+                "fragment",
+                "object",
+                &format!("version-{version}"),
+                6,
+            ));
+        }
+        assert_eq!(used.len(), roots.len());
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IndexListEntry {
     pub record: String,
@@ -243,6 +418,7 @@ pub struct ObjectMetadata {
     pub created_at: i64,
     pub data_shards: u16,
     pub parity_shards: u16,
+    pub placement_generation: u64,
     pub parts: Vec<PartMetadata>,
     #[serde(default)]
     pub is_delete_marker: bool,
@@ -294,6 +470,7 @@ impl From<ObjectSummary> for ObjectMetadata {
             created_at: summary.created_at,
             data_shards: summary.data_shards,
             parity_shards: summary.parity_shards,
+            placement_generation: 0,
             parts: Vec::new(),
             is_delete_marker: summary.is_delete_marker,
             stripe_size_bytes: summary.stripe_size_bytes,

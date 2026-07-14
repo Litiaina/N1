@@ -14,8 +14,10 @@ use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::linux_io;
+use crate::core::operation_gate::ensure_user_mutations_allowed;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::read_or_recover_chunk;
+use crate::core::root_identity::configured_root_identity_is_current;
 use crate::core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir, target_stripe_size_for_metadata,
@@ -617,6 +619,7 @@ pub async fn trigger_redistribution_job_api(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     if !claims.write || !claims.modify || !claims.delete {
         return Err(AppError::Forbidden(
             "Write, Modify and Delete permissions required".into(),
@@ -1192,12 +1195,12 @@ pub async fn replay_pending_intents_for_fragment_now(
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let live_index = reachable_roots(&index_cfg).await;
+    let live_index = reachable_roots(&index_cfg, true).await;
     if live_index.is_empty() {
         return Ok(());
     }
 
-    let live_blob = reachable_roots(&ObjectPathManager::new().get_blob_roots()).await;
+    let live_blob = reachable_roots(&ObjectPathManager::new().get_blob_roots(), true).await;
     let target_data_shards = DATA_SHARDS_ATOMIC
         .get()
         .map(|value| value.load(Ordering::Relaxed))
@@ -1224,11 +1227,11 @@ pub async fn replay_pending_intents_for_fragment_now(
     .await
 }
 
-async fn reachable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+async fn reachable_roots(roots: &[PathBuf], require_identity: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for r in roots {
         if let Ok(meta) = tokio_fs::metadata(r).await {
-            if meta.is_dir() {
+            if meta.is_dir() && (!require_identity || configured_root_identity_is_current(r)) {
                 out.push(r.clone());
             }
         }
@@ -1383,8 +1386,8 @@ struct LiveLayout {
 
 impl LiveLayout {
     async fn new(blob_cfg: Vec<PathBuf>, index_cfg: Vec<PathBuf>) -> Self {
-        let live_blob = Arc::new(reachable_roots(&blob_cfg).await);
-        let live_index = Arc::new(reachable_roots(&index_cfg).await);
+        let live_blob = Arc::new(reachable_roots(&blob_cfg, true).await);
+        let live_index = Arc::new(reachable_roots(&index_cfg, true).await);
         Self {
             blob_cfg,
             index_cfg,
@@ -1398,8 +1401,8 @@ impl LiveLayout {
         if self.last_refresh.elapsed() < Duration::from_secs(2) {
             return;
         }
-        self.live_blob = Arc::new(reachable_roots(&self.blob_cfg).await);
-        self.live_index = Arc::new(reachable_roots(&self.index_cfg).await);
+        self.live_blob = Arc::new(reachable_roots(&self.blob_cfg, true).await);
+        self.live_index = Arc::new(reachable_roots(&self.index_cfg, true).await);
         self.last_refresh = Instant::now();
     }
 }
@@ -2677,6 +2680,11 @@ async fn redistribute_object_streaming(
         return Ok(());
     }
 
+    meta.placement_generation = meta.placement_generation.checked_add(1).ok_or_else(|| {
+        AppError::InternalServerError(
+            "object placement generation exhausted during redistribution".into(),
+        )
+    })?;
     write_redistributed_metadata(meta, is_trash).await?;
 
     for old in old_shards_for_gc {
@@ -2893,7 +2901,7 @@ mod tests {
         fs::create_dir_all(&base).expect("create base");
         fs::write(&blocked_root, b"down").expect("create blocker file");
 
-        let live = reachable_roots(&[live_root.clone(), blocked_root.clone()]).await;
+        let live = reachable_roots(&[live_root.clone(), blocked_root.clone()], false).await;
         assert_eq!(live, vec![live_root]);
 
         let _ = fs::remove_dir_all(base);

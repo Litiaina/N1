@@ -1,5 +1,6 @@
 pub mod adaptive_concurrency;
 pub mod archive;
+pub mod auto_healing;
 pub mod capacity_manager;
 pub mod constants;
 pub mod delete;
@@ -25,6 +26,7 @@ pub mod recovery;
 pub mod redistribution;
 pub mod repair_manager;
 pub mod retrieve;
+pub mod root_identity;
 pub mod storage_capacity_parser;
 pub mod sync;
 pub mod system;

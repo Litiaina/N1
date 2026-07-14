@@ -107,9 +107,9 @@ SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_rele
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
-## N1 3.0.1 Release Requirement
+## N1 3.1.0 Development Release Requirement
 
-N1 3.0.1 must retain every N1 2.0 storage invariant and additionally prove:
+N1 3.1.0 must retain every N1 2.0 storage invariant and additionally prove:
 
 - delete is soft-only across HTTP, POSIX, native protocol, shell, and console
 - each deletion receives a unique trash entry id
@@ -120,7 +120,7 @@ N1 3.0.1 must retain every N1 2.0 storage invariant and additionally prove:
 - expiry writes a replayable receipt before removing namespace reachability
 - exact object ids are reclaimed directly only after live/trash reference verification
 - folder delete remains a directory rename and descendant inspection is deferred until expiry
-- N1 2.x and unversioned fragment metadata fail closed; N1 3.0 performs no compatibility adoption or migration
+- N1 2.x and unversioned fragment metadata fail closed; N1 3.1.0 performs no compatibility adoption or migration
 
 Evidence for the current release belongs under `/home/wlzambo/DEV-TEST` and
 must record the exact binary hash, configuration, disk topology, commands,
@@ -162,7 +162,7 @@ Focused N1 2.0.0 evidence from June 11, 2026:
 - Object-level redistribution passed a real `1 + 0 -> 1 + 1` topology change:
   one object scanned, one mismatch found, one migration completed, zero errors,
   followed by physical `.ndx + payload` verification on both blob roots.
-- N1 3.0.1 redistribution tests must prove that a higher durable namespace
+- N1 3.1.0 redistribution tests must prove that a higher durable namespace
   generation wins after `2 -> 1 -> 2`, including equal-count replacement and
   newer deletion cases, while same-generation content disagreement and writes
   attempted before reconciliation still fail closed.

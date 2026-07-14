@@ -1,6 +1,9 @@
 use crate::core::constants::{GC_SUFFIX, N1_OBJECTS_DIR};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::linux_io;
+use crate::core::root_identity::{
+    configured_root_identity_is_current, root_identity_enforcement_initialized,
+};
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
@@ -52,6 +55,10 @@ static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
     LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
+
+fn blob_root_identity_current(root: &Path) -> bool {
+    !root_identity_enforcement_initialized() || configured_root_identity_is_current(root)
+}
 
 struct RepairInflightGuard {
     path: PathBuf,
@@ -181,16 +188,12 @@ fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
 async fn should_schedule_background_repair(shard: &ShardInfo) -> bool {
     let stable = strip_tmp_attempt_suffix(&shard.absolute_path);
     let path = Path::new(stable);
-    if let Some(parent) = path.parent() {
-        if fs::try_exists(parent).await.unwrap_or(false) {
-            return true;
-        }
-    }
-    if let Some(root) = owning_blob_root_for_path(path) {
-        return fs::try_exists(root).await.unwrap_or(false);
-    }
-
-    false
+    let Some(root) = owning_blob_root_for_path(path) else {
+        // The scheduled healer owns relocation because only it can atomically
+        // update the object's recorded placement metadata.
+        return false;
+    };
+    blob_root_identity_current(root) && fs::try_exists(root).await.unwrap_or(false)
 }
 
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
@@ -317,7 +320,10 @@ async fn get_or_open_shard_ha(
         );
 
         if let Some(hint) = parse_version_dir_hint(vdir) {
-            for root in BLOB_ROOTS.iter() {
+            for root in BLOB_ROOTS
+                .iter()
+                .filter(|root| blob_root_identity_current(root.as_path()))
+            {
                 let dir = shard_dir_on_root(root.as_path(), &hint);
                 candidates.push(
                     dir.join(&shard_info.file_name)
@@ -329,7 +335,10 @@ async fn get_or_open_shard_ha(
     }
 
     if let Some(hint) = extract_shard_path_hint(&shard_info.absolute_path) {
-        for root in BLOB_ROOTS.iter() {
+        for root in BLOB_ROOTS
+            .iter()
+            .filter(|root| blob_root_identity_current(root.as_path()))
+        {
             let dir = shard_dir_on_root(root.as_path(), &hint);
             candidates.push(
                 dir.join(&shard_info.file_name)
@@ -387,7 +396,10 @@ async fn get_or_open_shard_fast(
         );
 
         if let Some(hint) = parse_version_dir_hint(vdir) {
-            for root in BLOB_ROOTS.iter() {
+            for root in BLOB_ROOTS
+                .iter()
+                .filter(|root| blob_root_identity_current(root.as_path()))
+            {
                 let dir = shard_dir_on_root(root.as_path(), &hint);
                 candidates.push(
                     dir.join(&shard_info.file_name)
@@ -399,7 +411,10 @@ async fn get_or_open_shard_fast(
     }
 
     if let Some(hint) = extract_shard_path_hint(&shard_info.absolute_path) {
-        for root in BLOB_ROOTS.iter() {
+        for root in BLOB_ROOTS
+            .iter()
+            .filter(|root| blob_root_identity_current(root.as_path()))
+        {
             let dir = shard_dir_on_root(root.as_path(), &hint);
             candidates.push(
                 dir.join(&shard_info.file_name)
@@ -628,13 +643,12 @@ pub async fn repair_entire_shard(
         .to_path_buf();
 
     if let Some(root) = owning_blob_root_for_path(&final_path) {
-        if !fs::try_exists(root).await.unwrap_or(false) {
-            info!(
-                "Skipping background repair for shard {} because blob root {} is unavailable",
+        if !blob_root_identity_current(root) || !fs::try_exists(root).await.unwrap_or(false) {
+            return Err(AppError::ServiceUnavailable(format!(
+                "Deferred shard {} repair because recorded blob root {} is unavailable",
                 target_shard_idx,
                 root.display()
-            );
-            return Ok(());
+            )));
         }
     }
 

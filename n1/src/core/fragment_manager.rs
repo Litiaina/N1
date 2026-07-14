@@ -25,6 +25,7 @@ use crate::{
             rotate_fragment_key,
         },
         index_store::{ensure_fragment_owner_partition_available_strict, has_any_fragment_index},
+        operation_gate::ensure_user_mutations_allowed,
         sync::{
             CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
         },
@@ -156,6 +157,7 @@ async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppEr
 pub async fn create_fragment(
     Json(payload): Json<CreateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     if payload.secret != *MASTER_KEY {
         return Err(AppError::Unauthorized);
     }
@@ -221,6 +223,7 @@ pub async fn update_fragment(
     Path(fragment_hash): Path<String>,
     Json(payload): Json<UpdateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     let is_admin = payload
         .secret
         .as_ref()
@@ -325,6 +328,7 @@ pub async fn delete_fragment(
     Path(fragment): Path<String>,
     Json(payload): Json<DeleteFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    ensure_user_mutations_allowed()?;
     let stable_fragment_id = resolve_stable_fragment_id(&fragment).await?;
     validate_delete_fragment_request(
         &claims,

@@ -27,6 +27,7 @@ use crate::core::garbage_collector::{
 use crate::core::index;
 use crate::core::metadata_parser::get_version_metadata;
 use crate::core::monitoring::system_health_snapshot;
+use crate::core::operation_gate::ensure_user_mutations_allowed;
 use crate::core::redistribution::{
     get_redist_status, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
@@ -68,6 +69,44 @@ pub struct NativeDownloadPlan {
     pub body_len: u64,
     metadata: ObjectMetadata,
     offset: u64,
+}
+
+fn native_operation_requires_write_safe_topology(op: &str) -> bool {
+    matches!(
+        op,
+        "namespace.mkdir"
+            | "posix.mkdir"
+            | "namespace.rename"
+            | "posix.rename"
+            | "posix.move"
+            | "namespace.trash"
+            | "posix.trash"
+            | "namespace.recover"
+            | "posix.recover"
+            | "trash.recover_all"
+            | "object.delete"
+            | "object.recover"
+            | "object.rename"
+            | "object.bulk_delete"
+            | "object.bulk.delete"
+            | "object.bulk_recover"
+            | "object.bulk.recover"
+            | "upload.one_shot"
+            | "object.upload.one_shot"
+            | "multipart.init"
+            | "upload.multipart.init"
+            | "multipart.put_part"
+            | "upload.multipart.put_part"
+            | "multipart.finalize"
+            | "upload.multipart.finalize"
+            | "multipart.cancel"
+            | "upload.multipart.cancel"
+            | "maintenance.gc.start"
+            | "maintenance.redistribution.start"
+            | "fragment.create"
+            | "fragment.update"
+            | "fragment.delete"
+    )
 }
 
 pub async fn execute_native_op(
@@ -288,6 +327,9 @@ async fn execute_native_op_inner(
     payload: Value,
     _body: Option<Vec<u8>>,
 ) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError> {
+    if native_operation_requires_write_safe_topology(op) {
+        ensure_user_mutations_allowed()?;
+    }
     let claims = match op {
         "fragment.create" | "fragment.hash.public" | "fragment.check" => None,
         _ => Some(require_claims(session)?),

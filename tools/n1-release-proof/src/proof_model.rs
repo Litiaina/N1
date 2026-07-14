@@ -79,6 +79,8 @@ struct Args {
     upload_benchmark: bool,
     #[arg(long, default_value_t = false)]
     multipart_resume_proof: bool,
+    #[arg(long, default_value_t = false)]
+    auto_healing_proof: bool,
     #[arg(long, default_value_t = 1_000)]
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]

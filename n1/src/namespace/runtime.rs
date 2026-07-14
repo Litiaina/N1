@@ -1507,6 +1507,7 @@ mod tests {
             created_at: Utc::now().timestamp(),
             data_shards: 1,
             parity_shards: 0,
+            placement_generation: 0,
             parts: vec![PartMetadata {
                 part_index: 0,
                 size_bytes: size,

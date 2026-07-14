@@ -148,7 +148,7 @@ fn final_shard_len_for_part(part_size_bytes: u64, data_shards: usize, block_size
 
 fn placement_required_bytes_by_root(
     root_count: usize,
-    start_part_index: u64,
+    _start_part_index: u64,
     part_sizes: &[u64],
     data_shards: usize,
     parity_shards: usize,
@@ -160,11 +160,10 @@ fn placement_required_bytes_by_root(
     }
 
     let total_shards = data_shards.saturating_add(parity_shards);
-    for (offset, part_size_bytes) in part_sizes.iter().copied().enumerate() {
-        let part_index = start_part_index.saturating_add(offset as u64);
+    for part_size_bytes in part_sizes.iter().copied() {
         let shard_len = final_shard_len_for_part(part_size_bytes, data_shards, block_size);
         for shard_index in 0..total_shards {
-            let root_idx = (part_index as usize + shard_index) % root_count;
+            let root_idx = shard_index % root_count;
             required[root_idx] = required[root_idx].saturating_add(shard_len);
         }
     }
@@ -234,13 +233,14 @@ pub async fn ensure_capacity_available(required_bytes: u64) -> Result<(), AppErr
 }
 
 pub async fn ensure_blob_placement_capacity_available_for_parts(
+    placement_roots: &[PathBuf],
     start_part_index: u64,
     part_sizes: &[u64],
     data_shards: usize,
     parity_shards: usize,
     block_size: usize,
 ) -> Result<(), AppError> {
-    let roots = ObjectPathManager::new().get_blob_roots();
+    let roots = placement_roots.to_vec();
     if roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No blob storage disks configured".into(),
@@ -272,9 +272,10 @@ pub async fn ensure_blob_placement_capacity_available_for_parts(
     );
     let required_roots: Vec<(PathBuf, u64)> = roots
         .into_iter()
-        .zip(required_by_root.into_iter())
+        .zip(required_by_root)
         .filter(|(_, required)| *required > 0)
         .collect();
+    let required_root_count = required_roots.len();
 
     tokio::task::spawn_blocking(move || {
         let mut seen_devices = HashSet::<u64>::new();
@@ -307,6 +308,14 @@ pub async fn ensure_blob_placement_capacity_available_for_parts(
                 .saturating_add(required_bytes);
         }
 
+        if seen_devices.len() != required_root_count {
+            return Err(AppError::ServiceUnavailable(format!(
+                "Object EC placement requires {} distinct devices, but selected roots resolve to {}",
+                required_root_count,
+                seen_devices.len()
+            )));
+        }
+
         for (device_id, required_bytes) in device_required {
             let Some((path, _total_bytes, available_bytes)) = device_availability.get(&device_id)
             else {
@@ -335,7 +344,7 @@ mod tests {
     use super::placement_required_bytes_by_root;
 
     #[test]
-    fn placement_requirements_shift_with_part_index() {
+    fn fixed_object_ec_set_does_not_shift_with_part_index() {
         let req0 = placement_required_bytes_by_root(3, 0, &[4096], 2, 1, 4096);
         let req1 = placement_required_bytes_by_root(3, 1, &[4096], 2, 1, 4096);
         assert_eq!(req0, vec![4096, 4096, 4096]);

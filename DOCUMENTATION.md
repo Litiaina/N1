@@ -1,10 +1,23 @@
 # N1 Documentation
 
-N1 3.0.1 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.1.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
 For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). For release validation notes, see [VERIFICATION.md](VERIFICATION.md).
+
+## Version And Release Status
+
+N1 `3.1.0` is the current development engine/package version. It is on the
+development release channel and is not a declaration that this engine line has
+reached its stable product milestone. Storage compatibility is tracked
+separately as engine format `3`; package updates within this development line
+must continue to honor the format-3 architecture unless an explicitly new
+engine format is introduced.
+
+Historical verification directories retain the version of the binary that
+produced them. A `3.0.0` or `3.0.1` evidence path is therefore not renamed when
+the current package version advances to `3.1.0`.
 
 ## Core Concepts
 
@@ -105,6 +118,8 @@ sudo scripts/install-n1-systemd.sh \
 ## Configuration
 
 N1 reads `n1_config.ini` and `n1.env` from the server working directory.
+N1 3.1.0 does not accept an older configuration contract: the complete
+`[auto_healing]` section below is required, and malformed values fail startup.
 
 Minimal two-disk configuration where both disks house index and blob roles:
 
@@ -125,6 +140,17 @@ fs_storage_path=/home/administrator/Server Deploy Test/fs-disk
 cleanup_interval_seconds=3600
 file_ttl_seconds=3600
 trash_retention_seconds=2592000
+
+[auto_healing]
+enabled=true
+topology_check_interval_seconds=30
+topology_recovery_stability_seconds=10
+initial_scan_delay_seconds=60
+availability_scan_interval_seconds=3600
+checksum_scrub_interval_seconds=604800
+object_scan_concurrency=1
+shard_repair_concurrency=1
+metadata_batch_size=128
 
 [upload_config]
 data_shards=1
@@ -157,9 +183,22 @@ N1 is Linux-only and works with normal mounted disks. It uses `statvfs`-based
 capacity checks plus per-placement upload preflight so aggregate capacity and
 the placement-limiting disk are both considered before writes proceed.
 
+On first N1 3.1.0 startup, every configured index/blob root receives a persistent
+`.n1-root-id`, and N1 atomically records the expected identities under
+`<fs_storage_path>/.n1/topology-roots.json`. Mount all production disks before
+the first startup. Once a path is enrolled, N1 never silently adopts a missing
+mount's underlying directory or a replacement disk at the same path. A root
+identity mismatch is reported as offline and keeps unsafe mutations read-only.
+
+To replace a disk at the same configured path, stop N1, remove that path from
+`index_store_disks`/`blob_store_disks`, and start N1 once so the path is
+explicitly decommissioned. Stop N1 again, mount the replacement, restore the
+path in the configuration, and start N1 to enroll its new identity. Never
+delete or edit the topology registry while N1 is running.
+
 ### Fragment Identity Layout
 
-N1 3.0.1 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
+N1 3.1.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
 
 ```text
 <index_root>/
@@ -187,7 +226,7 @@ The `.fragment/<fragment_hash>` symlink is the mount/auth alias. The `@f_<stable
 
 Object `.ndx` metadata is stored only on blob roots that carry a shard or parity file for that version. The metadata and EC payload therefore share one durability topology. Index-only roots do not carry object metadata capacity.
 
-N1 3.0.1 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh N1 3.0 fragments; an incompatible fragment fails closed.
+N1 3.1.0 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh engine-format-3 fragments; an incompatible fragment fails closed.
 
 ## Quick Start
 
@@ -309,7 +348,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 3.0.1 includes the native N1 protocol:
+N1 3.1.0 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -323,7 +362,7 @@ The native protocol does not create another storage engine, another namespace, a
 Rust clients should use the workspace `n1_native_client` crate instead of reimplementing frames. The crate owns native URL parsing, MessagePack frame IO, fragment authentication, typed operation calls, raw upload bodies, and raw streaming response reads.
 
 `n1/0.5` supports the native data plane. It removes manual purge, empty-trash,
-and version-delete operations as part of the N1 3.0 lifecycle contract:
+and version-delete operations as part of the N1 3.1.0 lifecycle contract:
 
 - `upload.one_shot`
 - `multipart.init`
@@ -508,7 +547,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.0.1 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.1.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -1149,7 +1188,7 @@ Recovery is allowed only while the configured `trash_retention_seconds` has not 
 
 The background lifecycle scans `.trash`, not the full blob plane. For an expired entry it writes a durable reclamation receipt, removes the namespace reference, verifies that each candidate object id has no live or remaining trash reference, directly reclaims safe immutable object directories, and then clears the receipt. Interrupted work is retried from the receipt.
 
-N1 3.0.1 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
+N1 3.1.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
 
 Legacy HTTP clients receive `410 Gone` from the retired destructive routes.
 This explicit tombstone prevents a former `/objects/permanent/...` URL from
@@ -1226,6 +1265,18 @@ Fragment health:
 GET /n1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
 ```
 
+The system health `maintenance.auto_healing` object reports the current
+controller phase, registered/writable roots, distinct writable devices, EC
+width, read-only reason, last topology check, last availability scan, last
+checksum scrub, and last error.
+
+N1 starts read-only, validates the registered storage identities and writable
+failure domains, and enables mutations only after the topology has remained
+safe for `topology_recovery_stability_seconds`. The current configured `D + P`
+must fit on distinct healthy devices. Extra configured disks may be offline
+without degrading healthy recorded objects as long as the current EC width can
+still be satisfied.
+
 ### Object Status And Repair
 
 Object status:
@@ -1268,6 +1319,23 @@ Modes:
 Object status and repair are bounded by global and per-fragment gates. If too many checks or repairs are already running, N1 returns `503 Service Unavailable` with a retry-shortly message. Repair and scrub also take an object-scoped lock so two repair/scrub tasks cannot mutate the same object at the same time.
 
 ### Fragment Or Global Repair
+
+The auto-healing controller normally owns routine global maintenance. Its
+availability cycle checks recorded paths and sizes; its checksum cycle verifies
+payload checksums. Fragments are processed serially, while
+`object_scan_concurrency` bounds objects inside the current fragment and
+`shard_repair_concurrency` bounds repair IO. The conservative defaults are one
+object and one shard repair at a time.
+
+When a recorded shard root is gone but enough data and another distinct healthy
+root exist, the healer reconstructs the shard on that replacement root and
+atomically publishes a higher object placement generation. Stale metadata at a
+lower generation cannot win. If any object cannot be repaired, the scan is
+reported as failed and N1 keeps user mutations read-only until a later scan
+completes without unresolved repair debt.
+
+Manual repair remains available for diagnosis or an immediate operator-driven
+cycle:
 
 ```http
 POST /n1/maintenance/fragments/{fragment}/repair/start?mode=strict
@@ -1322,6 +1390,12 @@ Useful query parameters:
 Redistribution rewrites selected object versions into the current blob/EC
 topology. Upload and rewrite paths use the same disk-capacity and placement
 preflight model; if a disk is too full, N1 fails before unsafe shard writes.
+
+Redistribution is never triggered by disk addition or auto-healing. Each object
+version remains governed by its recorded `D + P`, stripe size, and root set.
+Changing the configured EC width affects new versions only. Added disks enter
+the deterministic placement pool for new objects and as eligible repair
+targets; healthy existing objects are neither degraded nor rewritten.
 
 Namespace redistribution also reconciles returning index replicas. Every
 accepted namespace mutation advances a constant-size durable generation on
@@ -1396,7 +1470,9 @@ Common mappings:
 ### Fragment creation fails with disk errors
 
 Check that every configured index and blob root exists, is mounted, and is
-writable by the N1 service user.
+writable by the N1 service user. Also inspect `maintenance.auto_healing` for a
+root-identity mismatch. N1 deliberately does not overwrite an enrolled
+identity when a disk is replaced or a mount is absent.
 
 ### Upload returns `Upload path is saturated`
 
@@ -1414,7 +1490,8 @@ capacity before retrying.
 
 ### Health shows degraded after disk loss
 
-Run fragment repair first, then refresh health:
+Wait for the configured automatic availability cycle or start an immediate
+manual repair, then refresh health:
 
 ```bash
 curl -k -X POST "$BASE/n1/maintenance/fragments/$FRAGMENT/repair/start?mode=strict" "${AUTH[@]}"
