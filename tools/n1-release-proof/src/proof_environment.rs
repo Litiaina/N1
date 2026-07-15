@@ -292,7 +292,7 @@ stripe_block_size=262144
             }
             if let Ok(response) = self
                 .client
-                .get(format!("{}/n1/ping", self.base_url))
+                .get(format!("{}/noa/v1/ping", self.base_url))
                 .send()
                 .await
             {
@@ -328,7 +328,7 @@ stripe_block_size=262144
         });
         let response = self
             .client
-            .post(format!("{}/n1/fragments", self.base_url))
+            .post(format!("{}/noa/v1/fragments", self.base_url))
             .json(&body)
             .send()
             .await?;
@@ -358,7 +358,7 @@ stripe_block_size=262144
         });
         let response = self
             .client
-            .post(format!("{}/n1/auth/fragment", self.base_url))
+            .post(format!("{}/noa/v1/auth/fragment", self.base_url))
             .json(&body)
             .send()
             .await?;
@@ -386,7 +386,7 @@ stripe_block_size=262144
     ) -> ProofResult<String> {
         let response = self
             .client
-            .post(format!("{}/n1/auth/fragment", self.base_url))
+            .post(format!("{}/noa/v1/auth/fragment", self.base_url))
             .json(&json!({
                 "fragment": fragment,
                 "secret": key,

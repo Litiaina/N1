@@ -48,7 +48,7 @@ pub async fn run_native(cli: Cli) -> Result<(), DynError> {
             let response = client
                 .mapped_request(
                     Method::POST,
-                    "/n1/fragments",
+                    "/noa/v1/fragments",
                     Some(serde_json::to_value(CreateFragmentRequest {
                         name: args.name.clone(),
                         key: args.key.clone(),
@@ -145,7 +145,7 @@ async fn resolve_n1_auth_fragment_native(
     let response: FragmentHashLookupResponse = client
         .mapped_json(
             Method::GET,
-            "/n1/fragments/hash",
+            "/noa/v1/fragments/hash",
             Some(serde_json::to_value(FragmentHashLookupRequest {
                 fragment: fragment_hint.to_string(),
             })?),
@@ -183,7 +183,7 @@ async fn handle_native_authenticated_command(
             handle_native_fragment_command(client, cli, command).await
         }
         Commands::Health { watch, deep_scan } => {
-            let path = format!("/n1/maintenance/health?deep_scan={deep_scan}");
+            let path = format!("/noa/v1/maintenance/health?deep_scan={deep_scan}");
             if *watch {
                 native_watch_json::<HealthResponse, _, _>(
                     client,
@@ -205,7 +205,7 @@ async fn handle_native_authenticated_command(
                     .mapped_json(
                         Method::GET,
                         &format!(
-                            "/n1/posix/list?path={}&limit={}",
+                            "/noa/v1/posix/list?path={}&limit={}",
                             encode_query(path),
                             (*limit).clamp(1, 1000)
                         ),
@@ -218,7 +218,7 @@ async fn handle_native_authenticated_command(
                 let value: Value = client
                     .mapped_json(
                         Method::GET,
-                        &format!("/n1/posix/stat?path={}", encode_query(path)),
+                        &format!("/noa/v1/posix/stat?path={}", encode_query(path)),
                         None,
                     )
                     .await?;
@@ -248,7 +248,7 @@ async fn handle_native_authenticated_command(
                     .mapped_json(
                         Method::GET,
                         &format!(
-                            "/n1/objects/status/{}?mode={}",
+                            "/noa/v1/objects/status/{}?mode={}",
                             encode_path(object_key),
                             encode_query(mode)
                         ),
@@ -262,7 +262,7 @@ async fn handle_native_authenticated_command(
                     .mapped_json(
                         Method::POST,
                         &format!(
-                            "/n1/objects/repair/{}?mode={}",
+                            "/noa/v1/objects/repair/{}?mode={}",
                             encode_path(object_key),
                             encode_query(mode)
                         ),
@@ -277,7 +277,7 @@ async fn handle_native_authenticated_command(
                 let uploads: ListUploadsResponse = client
                     .mapped_json(
                         Method::GET,
-                        &format!("/n1/upload/multipart?limit={limit}&offset={offset}"),
+                        &format!("/noa/v1/upload/multipart?limit={limit}&offset={offset}"),
                         None,
                     )
                     .await?;
@@ -287,7 +287,7 @@ async fn handle_native_authenticated_command(
                 let status: UploadStatusResponse = client
                     .mapped_json(
                         Method::GET,
-                        &format!("/n1/upload/multipart/{}", encode_path(version_id)),
+                        &format!("/noa/v1/upload/multipart/{}", encode_path(version_id)),
                         None,
                     )
                     .await?;
@@ -302,12 +302,12 @@ async fn handle_native_authenticated_command(
                     selected_gc_mode(args)?,
                     args.fast_mode,
                 );
-                let path = path_with_query("/n1/maintenance/gc/start", &query);
+                let path = path_with_query("/noa/v1/maintenance/gc/start", &query);
                 let response = client.mapped_request(Method::POST, &path, None).await?;
                 print_native_response(response)?;
                 native_watch_json::<GcJobStatus, _, _>(
                     client,
-                    "/n1/maintenance/gc/status",
+                    "/noa/v1/maintenance/gc/status",
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -317,19 +317,19 @@ async fn handle_native_authenticated_command(
             }
             DirectAction::Status => {
                 let status: GcJobStatus = client
-                    .mapped_json(Method::GET, "/n1/maintenance/gc/status", None)
+                    .mapped_json(Method::GET, "/noa/v1/maintenance/gc/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
             }
             DirectAction::Stop => print_native_response(
                 client
-                    .mapped_request(Method::POST, "/n1/maintenance/gc/stop", None)
+                    .mapped_request(Method::POST, "/noa/v1/maintenance/gc/stop", None)
                     .await?,
             ),
             DirectAction::Watch => {
                 native_watch_json::<GcJobStatus, _, _>(
                     client,
-                    "/n1/maintenance/gc/status",
+                    "/noa/v1/maintenance/gc/status",
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -351,11 +351,11 @@ async fn handle_native_authenticated_command(
                     args.repair_concurrency,
                     args.batch,
                 );
-                let path = path_with_query("/n1/maintenance/repair/start", &query);
+                let path = path_with_query("/noa/v1/maintenance/repair/start", &query);
                 print_native_response(client.mapped_request(Method::POST, &path, None).await?)?;
                 native_watch_json::<RepairJobStatus, _, _>(
                     client,
-                    "/n1/maintenance/repair/status",
+                    "/noa/v1/maintenance/repair/status",
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -365,19 +365,19 @@ async fn handle_native_authenticated_command(
             }
             DirectAction::Status => {
                 let status: RepairJobStatus = client
-                    .mapped_json(Method::GET, "/n1/maintenance/repair/status", None)
+                    .mapped_json(Method::GET, "/noa/v1/maintenance/repair/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
             }
             DirectAction::Stop => print_native_response(
                 client
-                    .mapped_request(Method::POST, "/n1/maintenance/repair/stop", None)
+                    .mapped_request(Method::POST, "/noa/v1/maintenance/repair/stop", None)
                     .await?,
             ),
             DirectAction::Watch => {
                 native_watch_json::<RepairJobStatus, _, _>(
                     client,
-                    "/n1/maintenance/repair/status",
+                    "/noa/v1/maintenance/repair/status",
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -400,11 +400,11 @@ async fn handle_native_authenticated_command(
                     args.object_concurrency,
                     args.status_batch,
                 );
-                let path = path_with_query("/n1/maintenance/redistribution/start", &query);
+                let path = path_with_query("/noa/v1/maintenance/redistribution/start", &query);
                 print_native_response(client.mapped_request(Method::POST, &path, None).await?)?;
                 native_watch_json::<RedistributionJobStatus, _, _>(
                     client,
-                    "/n1/maintenance/redistribution/status",
+                    "/noa/v1/maintenance/redistribution/status",
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -414,19 +414,27 @@ async fn handle_native_authenticated_command(
             }
             DirectAction::Status => {
                 let status: RedistributionJobStatus = client
-                    .mapped_json(Method::GET, "/n1/maintenance/redistribution/status", None)
+                    .mapped_json(
+                        Method::GET,
+                        "/noa/v1/maintenance/redistribution/status",
+                        None,
+                    )
                     .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
             }
             DirectAction::Stop => print_native_response(
                 client
-                    .mapped_request(Method::POST, "/n1/maintenance/redistribution/stop", None)
+                    .mapped_request(
+                        Method::POST,
+                        "/noa/v1/maintenance/redistribution/stop",
+                        None,
+                    )
                     .await?,
             ),
             DirectAction::Watch => {
                 native_watch_json::<RedistributionJobStatus, _, _>(
                     client,
-                    "/n1/maintenance/redistribution/status",
+                    "/noa/v1/maintenance/redistribution/status",
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -447,7 +455,7 @@ async fn handle_native_fragment_command(
         FragmentCommands::Create(_) => unreachable!("fragment create is handled before auth"),
         FragmentCommands::List => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/fragments", None)
+                .mapped_json(Method::GET, "/noa/v1/fragments", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
@@ -461,7 +469,7 @@ async fn handle_native_fragment_command(
             let value: Value = client
                 .mapped_json(
                     Method::GET,
-                    "/n1/fragments/hash",
+                    "/noa/v1/fragments/hash",
                     Some(serde_json::to_value(FragmentHashLookupRequest {
                         fragment: fragment.to_string(),
                     })?),
@@ -471,7 +479,7 @@ async fn handle_native_fragment_command(
         }
         FragmentCommands::Usage => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/capacity/fragment", None)
+                .mapped_json(Method::GET, "/noa/v1/capacity/fragment", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
@@ -515,25 +523,25 @@ async fn handle_shell_line(
     match parts.as_slice() {
         ["health"] => {
             let health: HealthResponse = client
-                .mapped_json(Method::GET, "/n1/maintenance/health", None)
+                .mapped_json(Method::GET, "/noa/v1/maintenance/health", None)
                 .await?;
             print_output(cli.json, &health, &format_health(&health))
         }
         ["usage"] => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/capacity/fragment", None)
+                .mapped_json(Method::GET, "/noa/v1/capacity/fragment", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
         ["fragments"] => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/fragments", None)
+                .mapped_json(Method::GET, "/noa/v1/fragments", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
         ["list"] => {
             let value: Value = client
-                .mapped_json(Method::GET, "/n1/posix/list?path=&limit=200", None)
+                .mapped_json(Method::GET, "/noa/v1/posix/list?path=&limit=200", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
@@ -541,7 +549,7 @@ async fn handle_shell_line(
             let value: Value = client
                 .mapped_json(
                     Method::GET,
-                    &format!("/n1/posix/list?path={}&limit=200", encode_query(path)),
+                    &format!("/noa/v1/posix/list?path={}&limit=200", encode_query(path)),
                     None,
                 )
                 .await?;
@@ -551,7 +559,7 @@ async fn handle_shell_line(
             let value: Value = client
                 .mapped_json(
                     Method::GET,
-                    &format!("/n1/posix/stat?path={}", encode_query(path)),
+                    &format!("/noa/v1/posix/stat?path={}", encode_query(path)),
                     None,
                 )
                 .await?;
@@ -559,7 +567,11 @@ async fn handle_shell_line(
         }
         ["uploads"] => {
             let uploads: ListUploadsResponse = client
-                .mapped_json(Method::GET, "/n1/upload/multipart?limit=50&offset=0", None)
+                .mapped_json(
+                    Method::GET,
+                    "/noa/v1/upload/multipart?limit=50&offset=0",
+                    None,
+                )
                 .await?;
             print_output(cli.json, &uploads, &format_upload_list(&uploads))
         }
@@ -567,7 +579,7 @@ async fn handle_shell_line(
             let status: UploadStatusResponse = client
                 .mapped_json(
                     Method::GET,
-                    &format!("/n1/upload/multipart/{}", encode_path(version_id)),
+                    &format!("/noa/v1/upload/multipart/{}", encode_path(version_id)),
                     None,
                 )
                 .await?;
@@ -575,35 +587,43 @@ async fn handle_shell_line(
         }
         ["gc"] | ["gc", "status"] => {
             let status: GcJobStatus = client
-                .mapped_json(Method::GET, "/n1/maintenance/gc/status", None)
+                .mapped_json(Method::GET, "/noa/v1/maintenance/gc/status", None)
                 .await?;
             print_output(cli.json, &status, &format_gc_status(&status))
         }
         ["gc", "start"] => print_native_response(
             client
-                .mapped_request(Method::POST, "/n1/maintenance/gc/start", None)
+                .mapped_request(Method::POST, "/noa/v1/maintenance/gc/start", None)
                 .await?,
         ),
         ["repair"] | ["repair", "status"] => {
             let status: RepairJobStatus = client
-                .mapped_json(Method::GET, "/n1/maintenance/repair/status", None)
+                .mapped_json(Method::GET, "/noa/v1/maintenance/repair/status", None)
                 .await?;
             print_output(cli.json, &status, &format_repair_status(&status))
         }
         ["repair", "start"] => print_native_response(
             client
-                .mapped_request(Method::POST, "/n1/maintenance/repair/start", None)
+                .mapped_request(Method::POST, "/noa/v1/maintenance/repair/start", None)
                 .await?,
         ),
         ["redistribute"] | ["redistribute", "status"] => {
             let status: RedistributionJobStatus = client
-                .mapped_json(Method::GET, "/n1/maintenance/redistribution/status", None)
+                .mapped_json(
+                    Method::GET,
+                    "/noa/v1/maintenance/redistribution/status",
+                    None,
+                )
                 .await?;
             print_output(cli.json, &status, &format_redistribution_status(&status))
         }
         ["redistribute", "start"] => print_native_response(
             client
-                .mapped_request(Method::POST, "/n1/maintenance/redistribution/start", None)
+                .mapped_request(
+                    Method::POST,
+                    "/noa/v1/maintenance/redistribution/start",
+                    None,
+                )
                 .await?,
         ),
         ["object", "status", object_key] => {
@@ -611,7 +631,7 @@ async fn handle_shell_line(
                 .mapped_json(
                     Method::GET,
                     &format!(
-                        "/n1/objects/status/{}?mode=availability",
+                        "/noa/v1/objects/status/{}?mode=availability",
                         encode_path(object_key)
                     ),
                     None,
@@ -635,7 +655,10 @@ async fn handle_shell_line(
             let value: Value = client
                 .mapped_json(
                     Method::POST,
-                    &format!("/n1/objects/repair/{}?mode=strict", encode_path(object_key)),
+                    &format!(
+                        "/noa/v1/objects/repair/{}?mode=strict",
+                        encode_path(object_key)
+                    ),
                     None,
                 )
                 .await?;
@@ -803,46 +826,54 @@ fn native_op_from_mapped_call(
 
     let method_for_error = method.clone();
     let op = match (method, path.as_str()) {
-        (Method::POST, "/n1/fragments") => {
+        (Method::POST, "/noa/v1/fragments") => {
             merge_json(&mut payload);
             "fragment.create"
         }
-        (Method::GET, "/n1/fragments") => "fragment.list",
-        (Method::GET, "/n1/fragments/hash") => {
+        (Method::GET, "/noa/v1/fragments") => "fragment.list",
+        (Method::GET, "/noa/v1/fragments/hash") => {
             merge_json(&mut payload);
             "fragment.hash.public"
         }
-        (Method::GET, "/n1/capacity/fragment") => "fragment.usage",
-        (Method::GET, "/n1/maintenance/health") => "maintenance.health",
-        (Method::GET, "/n1/posix/list") => "namespace.list",
-        (Method::GET, "/n1/posix/stat") => "namespace.stat",
-        (Method::GET, "/n1/upload/multipart") => "uploads.list",
-        (Method::POST, "/n1/maintenance/gc/start") => "maintenance.gc.start",
-        (Method::GET, "/n1/maintenance/gc/status") => "maintenance.gc.status",
-        (Method::POST, "/n1/maintenance/gc/stop") => "maintenance.gc.stop",
-        (Method::POST, "/n1/maintenance/repair/start") => "maintenance.repair.start",
-        (Method::GET, "/n1/maintenance/repair/status") => "maintenance.repair.status",
-        (Method::POST, "/n1/maintenance/repair/stop") => "maintenance.repair.stop",
-        (Method::POST, "/n1/maintenance/redistribution/start") => {
+        (Method::GET, "/noa/v1/capacity/fragment") => "fragment.usage",
+        (Method::GET, "/noa/v1/maintenance/health") => "maintenance.health",
+        (Method::GET, "/noa/v1/posix/list") => "namespace.list",
+        (Method::GET, "/noa/v1/posix/stat") => "namespace.stat",
+        (Method::GET, "/noa/v1/upload/multipart") => "uploads.list",
+        (Method::POST, "/noa/v1/maintenance/gc/start") => "maintenance.gc.start",
+        (Method::GET, "/noa/v1/maintenance/gc/status") => "maintenance.gc.status",
+        (Method::POST, "/noa/v1/maintenance/gc/stop") => "maintenance.gc.stop",
+        (Method::POST, "/noa/v1/maintenance/repair/start") => "maintenance.repair.start",
+        (Method::GET, "/noa/v1/maintenance/repair/status") => "maintenance.repair.status",
+        (Method::POST, "/noa/v1/maintenance/repair/stop") => "maintenance.repair.stop",
+        (Method::POST, "/noa/v1/maintenance/redistribution/start") => {
             "maintenance.redistribution.start"
         }
-        (Method::GET, "/n1/maintenance/redistribution/status") => {
+        (Method::GET, "/noa/v1/maintenance/redistribution/status") => {
             "maintenance.redistribution.status"
         }
-        (Method::POST, "/n1/maintenance/redistribution/stop") => "maintenance.redistribution.stop",
-        (Method::GET, path) if path.starts_with("/n1/upload/multipart/") => {
-            payload["version_id"] =
-                Value::String(path.trim_start_matches("/n1/upload/multipart/").to_string());
+        (Method::POST, "/noa/v1/maintenance/redistribution/stop") => {
+            "maintenance.redistribution.stop"
+        }
+        (Method::GET, path) if path.starts_with("/noa/v1/upload/multipart/") => {
+            payload["version_id"] = Value::String(
+                path.trim_start_matches("/noa/v1/upload/multipart/")
+                    .to_string(),
+            );
             "uploads.status"
         }
-        (Method::GET, path) if path.starts_with("/n1/objects/status/") => {
-            payload["object_key"] =
-                Value::String(path.trim_start_matches("/n1/objects/status/").to_string());
+        (Method::GET, path) if path.starts_with("/noa/v1/objects/status/") => {
+            payload["object_key"] = Value::String(
+                path.trim_start_matches("/noa/v1/objects/status/")
+                    .to_string(),
+            );
             "object.status"
         }
-        (Method::POST, path) if path.starts_with("/n1/objects/repair/") => {
-            payload["object_key"] =
-                Value::String(path.trim_start_matches("/n1/objects/repair/").to_string());
+        (Method::POST, path) if path.starts_with("/noa/v1/objects/repair/") => {
+            payload["object_key"] = Value::String(
+                path.trim_start_matches("/noa/v1/objects/repair/")
+                    .to_string(),
+            );
             "object.repair"
         }
         _ => {
@@ -857,7 +888,7 @@ fn native_op_from_mapped_call(
 }
 
 fn split_mapped_path(path: &str) -> Result<(String, Value), DynError> {
-    let normalized = if path.starts_with("/n1/") {
+    let normalized = if path.starts_with("/noa/v1/") {
         path.to_string()
     } else {
         let url = Url::parse(path)?;

@@ -7,7 +7,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/maintenance/health?deep_scan={deep_scan}&refresh={refresh}",
+                "{}/noa/v1/maintenance/health?deep_scan={deep_scan}&refresh={refresh}",
                 self.base_url
             ))
             .bearer_auth(&self.token)
@@ -59,7 +59,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/maintenance/fragments/{}/repair/start?mode={mode}&fast_mode=false&meta_concurrency=1&repair_concurrency=1&batch=32",
+                "{}/noa/v1/maintenance/fragments/{}/repair/start?mode={mode}&fast_mode=false&meta_concurrency=1&repair_concurrency=1&batch=32",
                 self.base_url, self.fragment
             ))
             .bearer_auth(&self.token)
@@ -104,7 +104,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/one-shot/{}",
+                "{}/noa/v1/upload/one-shot/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -122,7 +122,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/download?object_key={}",
+                "{}/noa/v1/objects/download?object_key={}",
                 self.base_url,
                 encode_query_value(object_key)
             ))
@@ -153,7 +153,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/init/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -176,7 +176,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/n1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
                     self.base_url, init.version_id, index
                 ))
                 .bearer_auth(&self.token)
@@ -196,7 +196,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,
@@ -234,7 +234,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/init/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -255,7 +255,7 @@ impl Proof {
         let first = self
             .client
             .put(format!(
-                "{}/n1/upload/multipart/{}/0?durability=batched",
+                "{}/noa/v1/upload/multipart/{}/0?durability=batched",
                 self.base_url, init.version_id
             ))
             .bearer_auth(&self.token)
@@ -296,7 +296,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/n1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
                     self.base_url, init.version_id, index
                 ))
                 .bearer_auth(&self.token)
@@ -316,7 +316,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,
@@ -419,7 +419,7 @@ impl Proof {
             .into());
         }
         let availability_result = self
-            .wait_job("/n1/maintenance/repair/status", "availability repair")
+            .wait_job("/noa/v1/maintenance/repair/status", "availability repair")
             .await?;
         self.wait_for_path(&removed, true, Duration::from_secs(30))
             .await?;
@@ -461,7 +461,7 @@ impl Proof {
             .into());
         }
         let checksum_result = self
-            .wait_job("/n1/maintenance/repair/status", "checksum repair")
+            .wait_job("/noa/v1/maintenance/repair/status", "checksum repair")
             .await?;
         let checksum_final = self.maintenance_health_snapshot(true, true).await?;
         Self::assert_maintenance_access(
@@ -490,7 +490,7 @@ impl Proof {
             .into());
         }
         let strict_result = self
-            .wait_job("/n1/maintenance/repair/status", "strict repair")
+            .wait_job("/noa/v1/maintenance/repair/status", "strict repair")
             .await?;
         let strict_final = self.maintenance_health_snapshot(true, true).await?;
         Self::assert_maintenance_access(&strict_final, "availability", "strict completion")?;
@@ -523,7 +523,7 @@ impl Proof {
             .into());
         }
         let scrub_result = self
-            .wait_job("/n1/maintenance/repair/status", "scrub repair")
+            .wait_job("/noa/v1/maintenance/repair/status", "scrub repair")
             .await?;
         let scrub_final = self.maintenance_health_snapshot(true, true).await?;
         Self::assert_maintenance_access(&scrub_final, "availability", "scrub completion")?;

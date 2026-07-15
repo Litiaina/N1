@@ -57,15 +57,15 @@ impl Proof {
             let trash_child = format!("{trash_root}/payload.txt");
             let payload = deterministic_payload(128 * 1024, trash_child.as_bytes());
             let trash_sha = sha256_bytes(&payload);
-            self.posix_post("/n1/posix/mkdir", json!({"path": trash_root}))
+            self.posix_post("/noa/v1/posix/mkdir", json!({"path": trash_root}))
                 .await?;
             self.upload_bytes(&trash_child, payload, "text/plain")
                 .await?;
             expected.insert(trash_child.clone());
-            self.posix_post("/n1/posix/trash", json!({"path": trash_root}))
+            self.posix_post("/noa/v1/posix/trash", json!({"path": trash_root}))
                 .await?;
             expected.remove(&trash_child);
-            self.posix_post("/n1/posix/recover", json!({"path": trash_root}))
+            self.posix_post("/noa/v1/posix/recover", json!({"path": trash_root}))
                 .await?;
             self.assert_download_sha256(&trash_child, &trash_sha)
                 .await?;
@@ -120,7 +120,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/status/{}?mode={}",
+                "{}/noa/v1/objects/status/{}?mode={}",
                 self.base_url,
                 encode_path(object_key),
                 mode
@@ -147,7 +147,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/status/{}?mode={}",
+                "{}/noa/v1/objects/status/{}?mode={}",
                 self.base_url,
                 encode_path(object_key),
                 mode
@@ -168,7 +168,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/objects/repair/{}?mode={}",
+                "{}/noa/v1/objects/repair/{}?mode={}",
                 self.base_url,
                 encode_path(object_key),
                 mode
@@ -198,7 +198,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/maintenance/health?deep_scan=true",
+                "{}/noa/v1/maintenance/health?deep_scan=true",
                 self.base_url
             ))
             .bearer_auth(&self.token)
@@ -225,7 +225,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/maintenance/fragments/{}/gc/start?mode=scrub&fast_mode=true",
+                "{}/noa/v1/maintenance/fragments/{}/gc/start?mode=scrub&fast_mode=true",
                 self.base_url, self.fragment
             ))
             .bearer_auth(&self.token)
@@ -239,12 +239,12 @@ impl Proof {
             )
             .into());
         }
-        self.wait_job("/n1/maintenance/gc/status", "GC").await
+        self.wait_job("/noa/v1/maintenance/gc/status", "GC").await
     }
 
     async fn run_repair_and_wait(&self) -> ProofResult<Value> {
         self.start_repair_job().await?;
-        self.wait_job("/n1/maintenance/repair/status", "repair")
+        self.wait_job("/noa/v1/maintenance/repair/status", "repair")
             .await
     }
 
@@ -252,7 +252,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/maintenance/fragments/{}/repair/start?mode=scrub&fast_mode=true&meta_concurrency=4&repair_concurrency=2&batch=128",
+                "{}/noa/v1/maintenance/fragments/{}/repair/start?mode=scrub&fast_mode=true&meta_concurrency=4&repair_concurrency=2&batch=128",
                 self.base_url, self.fragment
             ))
             .bearer_auth(&self.token)
@@ -278,7 +278,7 @@ impl Proof {
         while Instant::now() < deadline {
             let response = self
                 .client
-                .get(format!("{}/n1/maintenance/repair/status", self.base_url))
+                .get(format!("{}/noa/v1/maintenance/repair/status", self.base_url))
                 .bearer_auth(&self.token)
                 .send()
                 .await?;
@@ -305,7 +305,7 @@ impl Proof {
 
     async fn run_redistribution_and_wait(&self) -> ProofResult<Value> {
         self.start_redistribution_job().await?;
-        self.wait_job("/n1/maintenance/redistribution/status", "redistribution")
+        self.wait_job("/noa/v1/maintenance/redistribution/status", "redistribution")
             .await
     }
 
@@ -316,7 +316,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/maintenance/objects/redistribution/start/{}?mode=scrub&fast_mode=true&durability=batched",
+                "{}/noa/v1/maintenance/objects/redistribution/start/{}?mode=scrub&fast_mode=true&durability=batched",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -331,7 +331,7 @@ impl Proof {
             )
             .into());
         }
-        self.wait_job("/n1/maintenance/redistribution/status", "object redistribution")
+        self.wait_job("/noa/v1/maintenance/redistribution/status", "object redistribution")
             .await
     }
 
@@ -339,7 +339,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/maintenance/fragments/{}/redistribution/start?mode=scrub&fast_mode=true&durability=batched&object_concurrency=8&status_batch=512",
+                "{}/noa/v1/maintenance/fragments/{}/redistribution/start?mode=scrub&fast_mode=true&durability=batched&object_concurrency=8&status_batch=512",
                 self.base_url, self.fragment
             ))
             .bearer_auth(&self.token)
@@ -363,7 +363,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/maintenance/redistribution/status",
+                "{}/noa/v1/maintenance/redistribution/status",
                 self.base_url
             ))
             .bearer_auth(&self.token)
@@ -424,7 +424,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/versions/{}",
+                "{}/noa/v1/objects/versions/{}",
                 self.base_url,
                 encode_path(object_key)
             ))

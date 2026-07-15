@@ -103,7 +103,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/init/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -153,7 +153,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,
@@ -221,7 +221,7 @@ impl Proof {
                     let started = Instant::now();
                     let response = client
                         .put(format!(
-                            "{base_url}/n1/upload/multipart/{version_id}/{idx}?durability=batched"
+                            "{base_url}/noa/v1/upload/multipart/{version_id}/{idx}?durability=batched"
                         ))
                         .bearer_auth(token)
                         .header("content-type", "application/octet-stream")

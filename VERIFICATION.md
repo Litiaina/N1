@@ -2,10 +2,10 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.1.1` on the development channel, using
+The current package line is N1 `3.2.0` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
-line. Dated `3.0.0` and `3.0.1` evidence names below remain unchanged because
-they identify the exact candidate binaries and runs that produced them.
+line. Dated evidence names below remain unchanged because they identify the
+exact candidate binaries and runs that produced them.
 
 ## Required Release Gates
 
@@ -147,6 +147,70 @@ N1 2.0.0 IO-control proof completed on June 11, 2026:
   after redistribution and clean health was `47996 KiB`.
 - The final log scan passed with `bad_lines: []`.
 - Evidence: `/tmp/n1-2.0-io-control-proof/summary.json`.
+
+## N1 3.2.0 NOA v1 API Stabilization
+
+N1 3.2.0 preserves engine format 3 and the complete N1 3.1.1 storage behavior.
+Its intentional contract change is limited to the universal HTTPS and WebSocket
+surface: the existing route structure is now the Litiaina Node Object API (NOA)
+v1 under `/noa/v1`. N1 does not retain `/n1/...` aliases, because doing so would
+create a second permanent public contract. The native `n1://` wire protocol is
+unchanged and remains N1-specific.
+
+The N1 Shell, release-proof client, signed-read URL generator, documentation,
+and N1 Console are migrated to the canonical NOA paths. Space and Space UI are
+intentionally not modified in this release task. Because no engine, metadata,
+namespace, EC, lifecycle, or healing implementation changed, the 3.1.1 engine
+evidence below remains the storage-behavior baseline. N1 3.2.0 still requires
+focused route, client, and build verification; those bounded gates are recorded
+next.
+
+The bounded API-stabilization verification completed on July 15, 2026:
+
+- NOA route identity and retained lifecycle guards passed `2/2`; the canonical
+  `/noa/v1/ping` route resolves successfully and the former `/n1/ping` route is
+  absent from the isolated public route graph.
+- Signed-read URL generation passed its focused encoding regression and emits
+  `/noa/v1/objects/signed-read`.
+- N1 Shell HTTP/native mapping integration passed `7/7` against NOA paths.
+- `cargo check --workspace --all-targets` passed, including the migrated release
+  proof client.
+- Freshly linked N1 and N1 Shell binaries both report package version `3.2.0`;
+  the intentionally separate native wire protocol remains `n1/0.5`.
+- N1 Console `npm run check` passed with zero errors and warnings, the production
+  build passed, and the responsive Playwright matrix completed with `36` passed,
+  `4` intentionally skipped, and `0` failed.
+
+The optimized real-process NOA gate also passed on July 15, 2026. The final
+physical-topology run used the production-class test server at `192.168.0.12`
+without modifying either deployed N1 service:
+
+- Binary SHA-256:
+  `06318b048db17dcc48d32ef272435f2b1a0a59d890d0b752d5b9d9d10f5e6832`.
+- Four distinct physical XFS HDDs were used at `/mnt/DISK0` through
+  `/mnt/DISK3`, backed by `/dev/sda1` through `/dev/sdd1`. The proof configured
+  `3 + 1` EC with colocated roots, so all four disks were both index and blob
+  roots.
+- Canonical NOA ping/auth, upload, list/stat, full download hash, range read,
+  object status, realtime WebSocket, file/folder rename, trash/recover, TTL
+  reclamation, GC status, repair status, redistribution status, deep health,
+  process restart, and post-restart persistence all passed.
+- The former `/n1/ping` returned `404` both before and after restart.
+- Final inspection found `4` live namespace links and exactly `4` matching
+  metadata/payload versions on each of the four physical roots. All roots had
+  distinct Linux device identities. The expired test version was reclaimed and
+  the GC reported zero errors.
+- Both server log scans completed with `bad_lines: []`; the temporary process,
+  ports, and proof roots were removed. Both pre-existing production N1
+  processes retained their PIDs and remained active throughout the run.
+- Evidence:
+  `/home/wlzambo/DEV-TEST/n1-3.2.0-noa-v1-four-disk-proof-20260715-154322/REPORT.md`
+  and `summary.json` in the same directory.
+
+No long-running, fault-injection, throughput, or soak proof was rerun for this
+API-only change. The bounded `3 + 1` gate is real four-HDD API, layout,
+lifecycle, health, and restart evidence. It does not replace the autonomous
+healing and storage-engine fault-injection evidence recorded below.
 
 ## N1 3.1.1 Development-Engine Autonomous-Maintenance Confidence Matrix
 

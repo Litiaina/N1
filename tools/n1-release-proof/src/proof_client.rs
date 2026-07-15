@@ -2,7 +2,7 @@ impl Proof {
     async fn create_named_fragment(&self, name: &str, key: &str) -> ProofResult<String> {
         let response = self
             .client
-            .post(format!("{}/n1/fragments", self.base_url))
+            .post(format!("{}/noa/v1/fragments", self.base_url))
             .json(&json!({
                 "name": name,
                 "secret": self.args.master_key,
@@ -24,7 +24,7 @@ impl Proof {
     async fn auth_fragment(&self, fragment: &str, key: &str) -> ProofResult<String> {
         let response = self
             .client
-            .post(format!("{}/n1/auth/fragment", self.base_url))
+            .post(format!("{}/noa/v1/auth/fragment", self.base_url))
             .json(&json!({
                 "fragment": fragment,
                 "secret": key,
@@ -66,7 +66,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/n1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
                     self.base_url, version_id, part_idx
                 ))
                 .bearer_auth(&self.token)
@@ -112,7 +112,7 @@ impl Proof {
             }
 
             let mut url = format!(
-                "{}/n1/posix/list?path={}&limit=1000",
+                "{}/noa/v1/posix/list?path={}&limit=1000",
                 self.base_url,
                 encode_query_value(parent)
             );
@@ -175,7 +175,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/download?object_key={}",
+                "{}/noa/v1/objects/download?object_key={}",
                 self.base_url,
                 encode_query_value(object_key)
             ))
@@ -206,7 +206,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/download?object_key={}",
+                "{}/noa/v1/objects/download?object_key={}",
                 self.base_url,
                 encode_query_value(object_key)
             ))
@@ -229,7 +229,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/download?object_key={}",
+                "{}/noa/v1/objects/download?object_key={}",
                 self.base_url,
                 encode_query_value(object_key)
             ))
@@ -295,7 +295,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/one-shot/{}",
+                "{}/noa/v1/upload/one-shot/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -358,7 +358,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/posix/stat?path={}&trash={}",
+                "{}/noa/v1/posix/stat?path={}&trash={}",
                 self.base_url,
                 encode_query_value(object_key),
                 trash

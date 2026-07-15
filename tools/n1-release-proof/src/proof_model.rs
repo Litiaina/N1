@@ -74,6 +74,8 @@ struct Args {
     #[arg(long, default_value_t = false)]
     native_protocol_proof: bool,
     #[arg(long, default_value_t = false)]
+    noa_api_proof: bool,
+    #[arg(long, default_value_t = false)]
     native_transport_benchmark: bool,
     #[arg(long, default_value_t = false)]
     upload_benchmark: bool,

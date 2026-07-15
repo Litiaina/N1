@@ -1,15 +1,15 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.1.1 development-engine storage contract. It is the reference for
+This document defines the N1 3.2.0 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.1.1 uses engine format 3 and preserves N1's immutable-object and
+N1 3.2.0 uses engine format 3 and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle,
 per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
-Version `3.1.1` identifies the current development package line; it does not
+Version `3.2.0` identifies the current development package line; it does not
 declare stable-release status. Engine format `3` is the independent on-disk
 compatibility boundary defined by this document.
 
@@ -166,7 +166,7 @@ without overwriting an older recoverable deletion. Folder soft delete remains
 a constant-sized directory rename; descendants are inspected only if the
 folder reaches lifecycle expiry.
 
-There is no manual empty-trash or hard-delete operation in N1 3.1.1. Recovery
+There is no manual empty-trash or hard-delete operation in N1 3.2.0. Recovery
 is allowed until the configured trash retention deadline. Once that deadline
 is reached, lifecycle owns the entry and recovery fails closed.
 
@@ -418,7 +418,7 @@ trash lifecycle operation, not a full object-plane scan:
 
 An interrupted expiry retries from the durable receipt and never needs to
 rediscover headless blobs through a global scan. Earlier-engine trash entries
-are not adopted: N1 3.1.1 requires freshly initialized format-3 fragments and
+are not adopted: N1 3.2.0 requires freshly initialized format-3 fragments and
 fails closed when an earlier or unversioned fragment marker is encountered.
 
 Full GC remains an explicit operator maintenance tool for orphan detection,
@@ -466,11 +466,16 @@ for EC.
 
 N1 exposes:
 
-- `/n1/...` over HTTPS for universal clients
+- NOA v1 at `/noa/v1/...` over HTTPS for universal clients
 - `n1://` for N1-owned low-level tools and trusted services
 
 Both call the same N1 core. The native protocol does not bridge through Axum
 and does not own separate storage semantics.
+
+NOA is an external transport contract only. N1 3.2.0 changes the HTTPS and
+WebSocket namespace from the former engine-branded paths to `/noa/v1` without
+changing storage metadata, namespace authority, lifecycle, EC placement, or
+maintenance behavior. The complete route contract is defined in `NOA.md`.
 
 Native data operations use a small MessagePack control frame followed by raw
 body bytes. Upload bodies stream into the same bounded upload core, and
@@ -487,7 +492,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.1.1 is correct only while all of these remain true:
+N1 3.2.0 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.

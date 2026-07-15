@@ -78,9 +78,9 @@ impl Proof {
 
         let base = format!("{}trash-maintenance-directory", self.args.prefix);
         let nested = format!("{base}/nested");
-        self.posix_post("/n1/posix/mkdir", json!({"path": &base}))
+        self.posix_post("/noa/v1/posix/mkdir", json!({"path": &base}))
             .await?;
-        self.posix_post("/n1/posix/mkdir", json!({"path": &nested}))
+        self.posix_post("/noa/v1/posix/mkdir", json!({"path": &nested}))
             .await?;
 
         let direct_key = format!("{}trash-maintenance-direct.bin", self.args.prefix);
@@ -102,9 +102,9 @@ impl Proof {
             directory_objects.push((key, sha, version));
         }
 
-        self.posix_post("/n1/posix/trash", json!({"path": &direct_key}))
+        self.posix_post("/noa/v1/posix/trash", json!({"path": &direct_key}))
             .await?;
-        self.posix_post("/n1/posix/trash", json!({"path": &base}))
+        self.posix_post("/noa/v1/posix/trash", json!({"path": &base}))
             .await?;
 
         let removed_direct = self.remove_one_shard_matching(&direct_version, |path| {
@@ -150,9 +150,9 @@ impl Proof {
             )
             .await?;
 
-        self.posix_post("/n1/posix/recover", json!({"path": &direct_key}))
+        self.posix_post("/noa/v1/posix/recover", json!({"path": &direct_key}))
             .await?;
-        self.posix_post("/n1/posix/recover", json!({"path": &base}))
+        self.posix_post("/noa/v1/posix/recover", json!({"path": &base}))
             .await?;
         self.assert_download_sha256(&direct_key, &direct_sha).await?;
         for (key, sha, _) in &directory_objects {
@@ -198,7 +198,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/maintenance/health?refresh=true",
+                "{}/noa/v1/maintenance/health?refresh=true",
                 self.base_url
             ))
             .bearer_auth(&self.token)
@@ -272,7 +272,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/one-shot/{}",
+                "{}/noa/v1/upload/one-shot/{}",
                 self.base_url,
                 encode_path(object_key)
             ))

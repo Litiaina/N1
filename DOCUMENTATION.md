@@ -1,14 +1,16 @@
 # N1 Documentation
 
-N1 3.1.1 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.2.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
-For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). For release validation notes, see [VERIFICATION.md](VERIFICATION.md).
+For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). The canonical
+HTTPS/WebSocket transport contract is [NOA v1](NOA.md). For release validation
+notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Version And Release Status
 
-N1 `3.1.1` is the current development engine/package version. It is on the
+N1 `3.2.0` is the current development engine/package version. It is on the
 development release channel and is not a declaration that this engine line has
 reached its stable product milestone. Storage compatibility is tracked
 separately as engine format `3`; package updates within this development line
@@ -17,12 +19,12 @@ engine format is introduced.
 
 Historical verification directories retain the version of the binary that
 produced them. A `3.0.0` or `3.0.1` evidence path is therefore not renamed when
-the current package version advances to `3.1.1`.
+the current package version advances to `3.2.0`.
 
 ## Core Concepts
 
 - **Fragment:** An authenticated namespace and object-placement scope. Clients mount/authenticate a fragment before using the API. The public fragment hash is a mutable namespace alias; N1 stores data under an immutable `@f_<stable_fragment_id>` physical fragment root.
-- **Namespace:** The user-facing tree of folders and files. This is what `/n1/posix/*` and the UI show.
+- **Namespace:** The user-facing tree of folders and files. This is what `/noa/v1/posix/*` and the UI show.
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
 - **Trash:** Soft delete moves namespace entries into `.trash` under unique lifecycle ids. Recover moves retained paths back to the live namespace. Configured TTL expiry removes namespace references and directly reclaims only safely unreferenced immutable objects.
@@ -118,7 +120,7 @@ sudo scripts/install-n1-systemd.sh \
 ## Configuration
 
 N1 reads `n1_config.ini` and `n1.env` from the server working directory.
-N1 3.1.1 does not accept an older configuration contract: the complete
+N1 3.2.0 does not accept an older configuration contract: the complete
 `[auto_healing]` section below is required, and malformed values fail startup.
 
 Minimal two-disk configuration where both disks house index and blob roles:
@@ -183,7 +185,7 @@ N1 is Linux-only and works with normal mounted disks. It uses `statvfs`-based
 capacity checks plus per-placement upload preflight so aggregate capacity and
 the placement-limiting disk are both considered before writes proceed.
 
-On first N1 3.1.1 startup, every configured index/blob root receives a persistent
+On first N1 3.2.0 startup, every configured index/blob root receives a persistent
 `.n1-root-id`, and N1 atomically records the expected identities under
 `<fs_storage_path>/.n1/topology-roots.json`. Mount all production disks before
 the first startup. Once a path is enrolled, N1 never silently adopts a missing
@@ -198,7 +200,7 @@ delete or edit the topology registry while N1 is running.
 
 ### Fragment Identity Layout
 
-N1 3.1.1 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
+N1 3.2.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
 
 ```text
 <index_root>/
@@ -226,7 +228,7 @@ The `.fragment/<fragment_hash>` symlink is the mount/auth alias. The `@f_<stable
 
 Object `.ndx` metadata is stored only on blob roots that carry a shard or parity file for that version. The metadata and EC payload therefore share one durability topology. Index-only roots do not carry object metadata capacity.
 
-N1 3.1.1 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh engine-format-3 fragments; an incompatible fragment fails closed.
+N1 3.2.0 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh engine-format-3 fragments; an incompatible fragment fails closed.
 
 ## Quick Start
 
@@ -240,13 +242,13 @@ MASTER='<MASTER_KEY>'
 Check server health:
 
 ```bash
-curl -k "$BASE/n1/ping"
+curl -k "$BASE/noa/v1/ping"
 ```
 
 Create a fragment:
 
 ```bash
-curl -k "$BASE/n1/fragments" \
+curl -k "$BASE/noa/v1/fragments" \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "mainframe",
@@ -258,7 +260,7 @@ curl -k "$BASE/n1/fragments" \
 Authenticate the fragment:
 
 ```bash
-curl -k "$BASE/n1/auth/fragment" \
+curl -k "$BASE/noa/v1/auth/fragment" \
   -H 'Content-Type: application/json' \
   -d '{
     "fragment": "<FRAGMENT_HASH>",
@@ -280,7 +282,7 @@ AUTH=(-H "Authorization: Bearer $TOKEN")
 Create a folder:
 
 ```bash
-curl -k "$BASE/n1/posix/mkdir" "${AUTH[@]}" \
+curl -k "$BASE/noa/v1/posix/mkdir" "${AUTH[@]}" \
   -H 'Content-Type: application/json' \
   -d '{"path":"videos"}'
 ```
@@ -288,7 +290,7 @@ curl -k "$BASE/n1/posix/mkdir" "${AUTH[@]}" \
 Upload a small file with one-shot upload:
 
 ```bash
-curl -k "$BASE/n1/upload/one-shot/videos/clip.mp4" "${AUTH[@]}" \
+curl -k "$BASE/noa/v1/upload/one-shot/videos/clip.mp4" "${AUTH[@]}" \
   -H 'Content-Type: video/mp4' \
   --data-binary @clip.mp4
 ```
@@ -296,13 +298,13 @@ curl -k "$BASE/n1/upload/one-shot/videos/clip.mp4" "${AUTH[@]}" \
 List files:
 
 ```bash
-curl -k "$BASE/n1/posix/list?path=videos&limit=200" "${AUTH[@]}"
+curl -k "$BASE/noa/v1/posix/list?path=videos&limit=200" "${AUTH[@]}"
 ```
 
 Download a file:
 
 ```bash
-curl -k "$BASE/n1/objects/download?object_key=videos/clip.mp4" \
+curl -k "$BASE/noa/v1/objects/download?object_key=videos/clip.mp4" \
   "${AUTH[@]}" \
   -o clip.mp4
 ```
@@ -310,11 +312,11 @@ curl -k "$BASE/n1/objects/download?object_key=videos/clip.mp4" \
 Soft delete and recover:
 
 ```bash
-curl -k "$BASE/n1/posix/trash" "${AUTH[@]}" \
+curl -k "$BASE/noa/v1/posix/trash" "${AUTH[@]}" \
   -H 'Content-Type: application/json' \
   -d '{"path":"videos/clip.mp4"}'
 
-curl -k "$BASE/n1/posix/recover" "${AUTH[@]}" \
+curl -k "$BASE/noa/v1/posix/recover" "${AUTH[@]}" \
   -H 'Content-Type: application/json' \
   -d '{"path":"videos/clip.mp4"}'
 ```
@@ -336,6 +338,9 @@ Fragment tokens carry independent permissions:
 
 ## API Conventions
 
+- The universal HTTPS/WebSocket surface is the Litiaina Node Object API (NOA)
+  v1 under `/noa/v1`. N1 3.2.0 preserves the preceding request, response, and
+  storage semantics while replacing the engine-branded route namespace.
 - `object_key`, `path`, `source_path`, and `destination_path` are namespace paths such as `videos/clip.mp4`. URL-encode spaces and special characters when they appear in a path or query string.
 - Request bodies are JSON unless the route says the body is raw bytes.
 - HTTPS is the universal API face for consumers and broad compatibility. `n1://` is the native N1 protocol face for N1 Console, N1 Shell, NS, N2, and heavy internal clients.
@@ -348,7 +353,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 3.1.1 includes the native N1 protocol:
+N1 3.2.0 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -362,7 +367,7 @@ The native protocol does not create another storage engine, another namespace, a
 Rust clients should use the workspace `n1_native_client` crate instead of reimplementing frames. The crate owns native URL parsing, MessagePack frame IO, fragment authentication, typed operation calls, raw upload bodies, and raw streaming response reads.
 
 `n1/0.5` supports the native data plane. It removes manual purge, empty-trash,
-and version-delete operations as part of the N1 3.1.1 lifecycle contract:
+and version-delete operations as part of the N1 3.2.0 lifecycle contract:
 
 - `upload.one_shot`
 - `multipart.init`
@@ -547,7 +552,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.1.1 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.2.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -620,7 +625,7 @@ For LTS release proof, native should remain in the Rust release proof matrix for
 - multipart control paths
 - benchmark regression detection
 
-### `POST /n1/auth/fragment`
+### `POST /noa/v1/auth/fragment`
 
 Body:
 
@@ -648,7 +653,7 @@ Response:
 }
 ```
 
-### `POST /n1/auth/refresh`
+### `POST /noa/v1/auth/refresh`
 
 Body:
 
@@ -656,7 +661,7 @@ Body:
 { "refresh_token": "<refresh-token>" }
 ```
 
-### `POST /n1/auth/logout`
+### `POST /noa/v1/auth/logout`
 
 Body:
 
@@ -666,7 +671,7 @@ Body:
 
 ## Fragment API
 
-### `POST /n1/fragments`
+### `POST /noa/v1/fragments`
 
 Creates a fragment. This route uses the master secret and does not use a fragment token.
 
@@ -689,11 +694,11 @@ Response:
 }
 ```
 
-### `GET /n1/fragments`
+### `GET /noa/v1/fragments`
 
 Lists fragments visible to the authenticated caller.
 
-### `GET /n1/fragments/check`
+### `GET /noa/v1/fragments/check`
 
 Checks whether a fragment hash exists.
 
@@ -703,7 +708,7 @@ Body:
 { "fragment": "<fragment_hash>" }
 ```
 
-### `GET /n1/fragments/hash`
+### `GET /noa/v1/fragments/hash`
 
 Returns the fragment hash for a fragment name when that fragment exists.
 
@@ -713,7 +718,7 @@ Body:
 { "fragment": "mainframe" }
 ```
 
-### `PATCH /n1/fragments/{fragment}`
+### `PATCH /noa/v1/fragments/{fragment}`
 
 Updates fragment name or fragment key.
 
@@ -727,7 +732,7 @@ Body:
 }
 ```
 
-### `DELETE /n1/fragments/{fragment}`
+### `DELETE /noa/v1/fragments/{fragment}`
 
 Deletes a fragment. Requires all of the following:
 
@@ -747,11 +752,11 @@ Body:
 
 N1 rejects the request if `confirm_fragment` does not exactly match `{fragment}`.
 
-### `GET /n1/capacity/usage`
+### `GET /noa/v1/capacity/usage`
 
 Returns system-level configured storage capacity and availability.
 
-### `GET /n1/capacity/fragment`
+### `GET /noa/v1/capacity/fragment`
 
 Returns storage usage for the authenticated fragment, plus current server
 capacity totals:
@@ -774,11 +779,11 @@ capacity totals:
 }
 ```
 
-### `POST /n1/maintenance/fragment/init`
+### `POST /noa/v1/maintenance/fragment/init`
 
 Initializes the storage structure for the authenticated fragment. This is normally handled during fragment creation, but the route is useful after manual disk preparation.
 
-### `POST /n1/maintenance/fragment/cleanup`
+### `POST /noa/v1/maintenance/fragment/cleanup`
 
 Cleans stale fragment metadata and old orphaned blob directories for the authenticated fragment.
 
@@ -797,7 +802,7 @@ Response:
 
 These routes operate on the user-facing namespace.
 
-### `GET /n1/posix/list`
+### `GET /noa/v1/posix/list`
 
 Query parameters:
 
@@ -809,7 +814,7 @@ Query parameters:
 Example:
 
 ```bash
-curl -k "$BASE/n1/posix/list?path=videos&limit=200" "${AUTH[@]}"
+curl -k "$BASE/noa/v1/posix/list?path=videos&limit=200" "${AUTH[@]}"
 ```
 
 Response:
@@ -832,14 +837,14 @@ Response:
 }
 ```
 
-### `GET /n1/posix/stat`
+### `GET /noa/v1/posix/stat`
 
 Query parameters:
 
 - `path`
 - `trash=true` for trash lookup
 
-### `POST /n1/posix/mkdir`
+### `POST /noa/v1/posix/mkdir`
 
 Body:
 
@@ -847,9 +852,9 @@ Body:
 { "path": "videos/2026" }
 ```
 
-### `POST /n1/posix/rename`
+### `POST /noa/v1/posix/rename`
 
-Also available as `POST /n1/posix/move`.
+Also available as `POST /noa/v1/posix/move`.
 
 Body:
 
@@ -860,7 +865,7 @@ Body:
 }
 ```
 
-### `POST /n1/posix/trash`
+### `POST /noa/v1/posix/trash`
 
 Soft deletes a file or folder.
 
@@ -870,7 +875,7 @@ Body:
 { "path": "archive/clip.mp4" }
 ```
 
-### `POST /n1/posix/recover`
+### `POST /noa/v1/posix/recover`
 
 Recovers a trash path by moving it from `.trash` back to the live namespace. Clients should send the `path` returned by trash listing.
 
@@ -884,7 +889,7 @@ Body:
 
 These routes accept namespace paths. N1 resolves them to stable object identities internally.
 
-### `GET /n1/objects`
+### `GET /noa/v1/objects`
 
 Lists live objects. Query parameters:
 
@@ -896,30 +901,30 @@ Lists live objects. Query parameters:
 Example:
 
 ```bash
-curl -k "$BASE/n1/objects?prefix=videos/&limit=200" "${AUTH[@]}"
+curl -k "$BASE/noa/v1/objects?prefix=videos/&limit=200" "${AUTH[@]}"
 ```
 
-### `GET /n1/trash`
+### `GET /noa/v1/trash`
 
 Lists trash entries. Supports the same paging style as object listing.
 
-### `GET /n1/objects/meta/{object_key}`
+### `GET /noa/v1/objects/meta/{object_key}`
 
 Returns public object metadata for the latest version.
 
-### `GET /n1/objects/versions/{object_key}`
+### `GET /noa/v1/objects/versions/{object_key}`
 
 Returns committed versions for a file path, newest first by version ULID. Internal shard layout is stripped from the public response.
 
-### `GET /n1/objects/get/{object_key}`
+### `GET /noa/v1/objects/get/{object_key}`
 
 Returns the object payload response.
 
-### `GET /n1/objects/stream/{object_key}`
+### `GET /noa/v1/objects/stream/{object_key}`
 
 Streams an object. Supports HTTP `Range`.
 
-### `GET /n1/objects/download`
+### `GET /noa/v1/objects/download`
 
 Query parameters:
 
@@ -930,12 +935,12 @@ Query parameters:
 Example:
 
 ```bash
-curl -k "$BASE/n1/objects/download?object_key=videos/clip.mp4" \
+curl -k "$BASE/noa/v1/objects/download?object_key=videos/clip.mp4" \
   "${AUTH[@]}" \
   -o clip.mp4
 ```
 
-### `GET /n1/objects/download/chunk`
+### `GET /noa/v1/objects/download/chunk`
 
 Query parameters:
 
@@ -947,7 +952,7 @@ Server-side limits:
 
 - `chunk_size` must be greater than `0`.
 - `chunk_size` must be `<= 8388608` bytes (`8 MiB`).
-- Use `/n1/objects/download` or `/n1/objects/stream/{object_key}` for normal large downloads. The chunk route exists for bounded browser save flows and must not be used with huge per-request buffers.
+- Use `/noa/v1/objects/download` or `/noa/v1/objects/stream/{object_key}` for normal large downloads. The chunk route exists for bounded browser save flows and must not be used with huge per-request buffers.
 
 Responses:
 
@@ -956,7 +961,7 @@ Responses:
 - `400 Bad Request`: invalid or overflowing range.
 - `413 Payload Too Large`: requested chunk exceeds the server maximum.
 
-### `POST /n1/objects/signed-url`
+### `POST /noa/v1/objects/signed-url`
 
 Creates a temporary signed read URL.
 
@@ -972,19 +977,19 @@ Body:
 }
 ```
 
-### `GET /n1/objects/signed-read`
+### `GET /noa/v1/objects/signed-read`
 
 Public signed read endpoint. The signed URL generator returns the full URL.
 
-### `DELETE /n1/objects/{object_key}`
+### `DELETE /noa/v1/objects/{object_key}`
 
 Soft deletes a file or folder.
 
-### `POST /n1/objects/recover/{object_key}`
+### `POST /noa/v1/objects/recover/{object_key}`
 
 Recovers a trash path.
 
-### `POST /n1/objects/rename`
+### `POST /noa/v1/objects/rename`
 
 Body:
 
@@ -997,7 +1002,7 @@ Body:
 }
 ```
 
-### `POST /n1/objects/bulk-delete`
+### `POST /noa/v1/objects/bulk-delete`
 
 Body:
 
@@ -1005,7 +1010,7 @@ Body:
 { "object_keys": ["a.txt", "b.txt"] }
 ```
 
-### `POST /n1/objects/bulk-recover`
+### `POST /noa/v1/objects/bulk-recover`
 
 Body:
 
@@ -1022,7 +1027,7 @@ Multipart upload is pipelined inside N1's foreground write lane. Different parts
 ### One-shot Upload
 
 ```http
-POST /n1/upload/one-shot/{object_key}
+POST /noa/v1/upload/one-shot/{object_key}
 ```
 
 Query parameters:
@@ -1037,7 +1042,7 @@ Request body is raw bytes.
 Example:
 
 ```bash
-curl -k "$BASE/n1/upload/one-shot/docs/readme.txt" \
+curl -k "$BASE/noa/v1/upload/one-shot/docs/readme.txt" \
   "${AUTH[@]}" \
   -H 'Content-Type: text/plain' \
   --data-binary @readme.txt
@@ -1046,7 +1051,7 @@ curl -k "$BASE/n1/upload/one-shot/docs/readme.txt" \
 ### Multipart Initiate
 
 ```http
-POST /n1/upload/multipart/init/{object_key}
+POST /noa/v1/upload/multipart/init/{object_key}
 ```
 
 Body:
@@ -1072,7 +1077,7 @@ Response:
 ### Multipart Upload Part
 
 ```http
-PUT /n1/upload/multipart/{version_id}/{part_index}
+PUT /noa/v1/upload/multipart/{version_id}/{part_index}
 ```
 
 Query parameters:
@@ -1089,7 +1094,7 @@ Clients should use bounded in-flight parts for large files instead of increasing
 Example:
 
 ```bash
-curl -k "$BASE/n1/upload/multipart/$VERSION_ID/0?io_gate=true" \
+curl -k "$BASE/noa/v1/upload/multipart/$VERSION_ID/0?io_gate=true" \
   "${AUTH[@]}" \
   -H 'Content-Type: application/octet-stream' \
   --data-binary @part-000
@@ -1098,7 +1103,7 @@ curl -k "$BASE/n1/upload/multipart/$VERSION_ID/0?io_gate=true" \
 ### Multipart Status
 
 ```http
-GET /n1/upload/multipart/{version_id}
+GET /noa/v1/upload/multipart/{version_id}
 ```
 
 Response:
@@ -1119,13 +1124,13 @@ Response:
 ### List Active Multipart Uploads
 
 ```http
-GET /n1/upload/multipart?limit=100&offset=0
+GET /noa/v1/upload/multipart?limit=100&offset=0
 ```
 
 ### Multipart Finalize
 
 ```http
-POST /n1/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/large.mp4
+POST /noa/v1/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/large.mp4
 ```
 
 Body should match the initiate sizing:
@@ -1144,14 +1149,14 @@ If any part is missing, N1 returns the uploaded and missing part indexes.
 ### Multipart Cancel
 
 ```http
-DELETE /n1/upload/multipart/{version_id}?object_key=videos/large.mp4
+DELETE /noa/v1/upload/multipart/{version_id}?object_key=videos/large.mp4
 ```
 
 Cancel removes the pending upload session. GC can later reclaim orphaned partial payloads.
 
 ## Archive Download
 
-### `POST /n1/objects/archive`
+### `POST /noa/v1/objects/archive`
 
 Downloads selected files or folders as an archive.
 
@@ -1171,7 +1176,7 @@ Body:
 
 Use `tar` for very large folder downloads. `zip` is available but is not ideal for very large archives.
 
-### `POST /n1/objects/archive/manifest`
+### `POST /noa/v1/objects/archive/manifest`
 
 Streams an archive from a request manifest.
 
@@ -1188,7 +1193,7 @@ Recovery is allowed only while the configured `trash_retention_seconds` has not 
 
 The background lifecycle scans `.trash`, not the full blob plane. For an expired entry it writes a durable reclamation receipt, removes the namespace reference, verifies that each candidate object id has no live or remaining trash reference, directly reclaims safe immutable object directories, and then clears the receipt. Interrupted work is retried from the receipt.
 
-N1 3.1.1 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
+N1 3.2.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
 
 Legacy HTTP clients receive `410 Gone` from the retired destructive routes.
 This explicit tombstone prevents a former `/objects/permanent/...` URL from
@@ -1198,7 +1203,7 @@ names fail as unsupported requests.
 Recover all trash:
 
 ```bash
-curl -k -X POST "$BASE/n1/trash/recover-all" "${AUTH[@]}"
+curl -k -X POST "$BASE/noa/v1/trash/recover-all" "${AUTH[@]}"
 ```
 
 Lifecycle state is reported in the system health `maintenance` object through `trash_lifecycle_running`, `trash_lifecycle_phase`, `trash_retention_seconds`, and `trash_versions_expired`.
@@ -1256,13 +1261,13 @@ an actual no-progress stall or system CPU/RAM/load pressure is observed.
 System health:
 
 ```http
-GET /n1/maintenance/health?deep_scan=true&refresh=true
+GET /noa/v1/maintenance/health?deep_scan=true&refresh=true
 ```
 
 Fragment health:
 
 ```http
-GET /n1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
+GET /noa/v1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
 ```
 
 The system health `maintenance.auto_healing` object reports the current
@@ -1282,7 +1287,7 @@ still be satisfied.
 Object status:
 
 ```http
-GET /n1/objects/status/{object_key}?mode=availability
+GET /noa/v1/objects/status/{object_key}?mode=availability
 ```
 
 Response:
@@ -1306,7 +1311,7 @@ Response:
 Object repair:
 
 ```http
-POST /n1/objects/repair/{object_key}?mode=strict
+POST /noa/v1/objects/repair/{object_key}?mode=strict
 ```
 
 Modes:
@@ -1346,10 +1351,10 @@ Manual repair remains available for diagnosis or an immediate operator-driven
 cycle:
 
 ```http
-POST /n1/maintenance/fragments/{fragment}/repair/start?mode=strict
-POST /n1/maintenance/repair/start?fragment={fragment}&mode=strict
-POST /n1/maintenance/repair/stop
-GET  /n1/maintenance/repair/status
+POST /noa/v1/maintenance/fragments/{fragment}/repair/start?mode=strict
+POST /noa/v1/maintenance/repair/start?fragment={fragment}&mode=strict
+POST /noa/v1/maintenance/repair/stop
+GET  /noa/v1/maintenance/repair/status
 ```
 
 Useful query parameters:
@@ -1365,10 +1370,10 @@ Useful query parameters:
 ### Garbage Collection
 
 ```http
-POST /n1/maintenance/fragments/{fragment}/gc/start?mode=availability
-POST /n1/maintenance/gc/start?fragment={fragment}&mode=availability
-POST /n1/maintenance/gc/stop
-GET  /n1/maintenance/gc/status
+POST /noa/v1/maintenance/fragments/{fragment}/gc/start?mode=availability
+POST /noa/v1/maintenance/gc/start?fragment={fragment}&mode=availability
+POST /noa/v1/maintenance/gc/stop
+GET  /noa/v1/maintenance/gc/status
 ```
 
 Modes:
@@ -1380,10 +1385,10 @@ Modes:
 ### Redistribution
 
 ```http
-POST /n1/maintenance/fragments/{fragment}/redistribution/start?mode=strict
-POST /n1/maintenance/redistribution/start?fragment={fragment}&mode=strict
-POST /n1/maintenance/redistribution/stop
-GET  /n1/maintenance/redistribution/status
+POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start?mode=strict
+POST /noa/v1/maintenance/redistribution/start?fragment={fragment}&mode=strict
+POST /noa/v1/maintenance/redistribution/stop
+GET  /noa/v1/maintenance/redistribution/status
 ```
 
 Useful query parameters:
@@ -1420,7 +1425,7 @@ automatic repair fails closed and requires operator investigation.
 Connect with a fragment token:
 
 ```text
-wss://127.0.0.1:50001/ws?token=<access_token>
+wss://127.0.0.1:50001/noa/v1/ws?token=<access_token>
 ```
 
 The websocket emits namespace deltas for CRUD and POSIX changes. It does not ask clients to reload the whole tree after each operation.
@@ -1502,8 +1507,8 @@ Wait for the configured automatic availability cycle or start an immediate
 manual repair, then refresh health:
 
 ```bash
-curl -k -X POST "$BASE/n1/maintenance/fragments/$FRAGMENT/repair/start?mode=strict" "${AUTH[@]}"
-curl -k "$BASE/n1/maintenance/fragments/$FRAGMENT/health?deep_scan=true&refresh=true" "${AUTH[@]}"
+curl -k -X POST "$BASE/noa/v1/maintenance/fragments/$FRAGMENT/repair/start?mode=strict" "${AUTH[@]}"
+curl -k "$BASE/noa/v1/maintenance/fragments/$FRAGMENT/health?deep_scan=true&refresh=true" "${AUTH[@]}"
 ```
 
 ### Trash recovery path

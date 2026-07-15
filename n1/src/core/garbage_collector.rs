@@ -365,7 +365,7 @@ pub async fn run_garbage_collector(
     if GC_RUNNING.swap(true, Ordering::SeqCst) {
         return (
             StatusCode::CONFLICT,
-            "GC is already running. Check /n1/maintenance/gc/status.".to_string(),
+            "GC is already running. Check /noa/v1/maintenance/gc/status.".to_string(),
         );
     }
     GC_STOP_SIGNAL.store(false, Ordering::Relaxed);

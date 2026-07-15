@@ -2,7 +2,7 @@ impl Proof {
     async fn posix_crud_gc_proof(&self, expected: &mut BTreeSet<String>) -> ProofResult<Value> {
         let start = Instant::now();
         let base = format!("{}n1-crud", self.args.prefix);
-        self.posix_post("/n1/posix/mkdir", json!({"path": format!("{base}/folder")}))
+        self.posix_post("/noa/v1/posix/mkdir", json!({"path": format!("{base}/folder")}))
             .await?;
 
         let old_file = format!("{base}/rename-me.txt");
@@ -12,7 +12,7 @@ impl Proof {
         self.upload_bytes(&old_file, rename_payload, "text/plain")
             .await?;
         self.posix_post(
-            "/n1/posix/rename",
+            "/noa/v1/posix/rename",
             json!({"source_path": old_file, "destination_path": new_file}),
         )
         .await?;
@@ -26,7 +26,7 @@ impl Proof {
         self.upload_bytes(&child, child_payload, "text/plain")
             .await?;
         self.posix_post(
-            "/n1/posix/rename",
+            "/noa/v1/posix/rename",
             json!({"source_path": format!("{base}/folder"), "destination_path": format!("{base}/folder-renamed")}),
         )
         .await?;
@@ -34,14 +34,14 @@ impl Proof {
             .await?;
 
         self.posix_post(
-            "/n1/posix/trash",
+            "/noa/v1/posix/trash",
             json!({"path": format!("{base}/folder-renamed")}),
         )
         .await?;
         self.posix_stat(&format!("{base}/folder-renamed"), true)
             .await?;
         self.posix_post(
-            "/n1/posix/recover",
+            "/noa/v1/posix/recover",
             json!({"path": format!("{base}/folder-renamed")}),
         )
         .await?;
@@ -54,7 +54,7 @@ impl Proof {
         let version_id = self
             .upload_bytes(&delete_me, delete_payload, "application/octet-stream")
             .await?;
-        self.posix_post("/n1/posix/trash", json!({"path": delete_me}))
+        self.posix_post("/noa/v1/posix/trash", json!({"path": delete_me}))
             .await?;
         tokio::time::sleep(std::time::Duration::from_secs(
             self.args.trash_retention_seconds.saturating_add(1),
@@ -89,7 +89,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/init/{}",
                 self.base_url,
                 encode_path(&logical)
             ))
@@ -112,7 +112,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/n1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
                     self.base_url, init.version_id, idx
                 ))
                 .bearer_auth(&self.token)
@@ -132,7 +132,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,
@@ -175,7 +175,7 @@ impl Proof {
 
         let response = self
             .client
-            .post(format!("{}/n1/objects/archive", self.base_url))
+            .post(format!("{}/noa/v1/objects/archive", self.base_url))
             .bearer_auth(&self.token)
             .json(
                 &json!({"prefixes": [archive_prefix], "format": "tar", "filename": "n1-proof.tar"}),
@@ -235,7 +235,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/objects/repair/{}?mode=strict",
+                "{}/noa/v1/objects/repair/{}?mode=strict",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -344,7 +344,7 @@ impl Proof {
         let client = self.client.clone();
         let token = self.token.clone();
         let url = format!(
-            "{}/n1/objects/repair/{}?mode=strict",
+            "{}/noa/v1/objects/repair/{}?mode=strict",
             self.base_url,
             encode_path(object_key)
         );
@@ -366,7 +366,7 @@ impl Proof {
             .into());
         }
         let fragment_repair = self
-            .wait_job("/n1/maintenance/repair/status", "repair")
+            .wait_job("/noa/v1/maintenance/repair/status", "repair")
             .await?;
         self.wait_for_path(&removed, true, Duration::from_secs(60))
             .await?;
@@ -423,7 +423,7 @@ impl Proof {
         }
 
         let repair = self
-            .wait_job("/n1/maintenance/repair/status", "repair")
+            .wait_job("/noa/v1/maintenance/repair/status", "repair")
             .await?;
         self.assert_expected_visible(expected).await?;
         self.assert_download_sha256(sample_key, sample_sha).await?;

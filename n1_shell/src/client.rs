@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use cli_core::client::{
-    AuthSession, CreateFragmentRequest, DynError, N1_AUTH_ROUTES, api_url,
+    AuthSession, CreateFragmentRequest, DynError, NOA_AUTH_ROUTES, api_url,
     authenticate_with_routes, build_client, fetch_json, fetch_json_query, get_base_url, get_secret,
     print_output, print_response_message, send_query_only, send_with_session, send_without_body,
     watch_rendered,
@@ -65,7 +65,7 @@ async fn resolve_n1_auth_fragment(
     }
 
     let response = client
-        .get(api_url(base_url, "/n1/fragments/hash"))
+        .get(api_url(base_url, "/noa/v1/fragments/hash"))
         .json(&FragmentHashLookupRequest {
             fragment: fragment_hint.to_string(),
         })
@@ -119,7 +119,7 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
                 &base_url,
                 &secret,
                 &auth_fragment,
-                N1_AUTH_ROUTES,
+                NOA_AUTH_ROUTES,
             )
             .await?;
             handle_authenticated_command(&client, &base_url, &mut session, &cli).await
@@ -270,7 +270,7 @@ async fn handle_fragment_command(
     match command {
         FragmentCommands::Create(args) => {
             let response = client
-                .post(api_url(base_url, "/n1/fragments"))
+                .post(api_url(base_url, "/noa/v1/fragments"))
                 .json(&CreateFragmentRequest {
                     name: args.name.clone(),
                     key: args.key.clone(),
@@ -301,7 +301,7 @@ async fn handle_authenticated_command(
         Commands::Health { watch, deep_scan } => {
             let url = format!(
                 "{}?deep_scan={}",
-                api_url(base_url, "/n1/maintenance/health"),
+                api_url(base_url, "/noa/v1/maintenance/health"),
                 if *deep_scan { "true" } else { "false" }
             );
 
@@ -330,7 +330,7 @@ async fn handle_authenticated_command(
                     session,
                     &format!(
                         "{}?path={}&limit={}",
-                        api_url(base_url, "/n1/posix/list"),
+                        api_url(base_url, "/noa/v1/posix/list"),
                         encode_query(path),
                         (*limit).clamp(1, 1000)
                     ),
@@ -345,7 +345,7 @@ async fn handle_authenticated_command(
                     session,
                     &format!(
                         "{}?path={}",
-                        api_url(base_url, "/n1/posix/stat"),
+                        api_url(base_url, "/noa/v1/posix/stat"),
                         encode_query(path)
                     ),
                 )
@@ -365,7 +365,7 @@ async fn handle_authenticated_command(
                         session,
                         &format!(
                             "{}/{}",
-                            api_url(base_url, "/n1/objects/versions"),
+                            api_url(base_url, "/noa/v1/objects/versions"),
                             encode_path(object_key)
                         ),
                     )
@@ -389,7 +389,7 @@ async fn handle_authenticated_command(
                         session,
                         &format!(
                             "{}/{}",
-                            api_url(base_url, "/n1/objects/meta"),
+                            api_url(base_url, "/noa/v1/objects/meta"),
                             encode_path(object_key)
                         ),
                     )
@@ -404,7 +404,7 @@ async fn handle_authenticated_command(
                     session,
                     &format!(
                         "{}/{}",
-                        api_url(base_url, "/n1/objects/versions"),
+                        api_url(base_url, "/noa/v1/objects/versions"),
                         encode_path(object_key)
                     ),
                 )
@@ -418,7 +418,7 @@ async fn handle_authenticated_command(
                     session,
                     &format!(
                         "{}/{}?mode={}",
-                        api_url(base_url, "/n1/objects/status"),
+                        api_url(base_url, "/noa/v1/objects/status"),
                         encode_path(object_key),
                         encode_query(mode)
                     ),
@@ -431,7 +431,7 @@ async fn handle_authenticated_command(
                     client
                         .post(format!(
                             "{}/{}?mode={}",
-                            api_url(base_url, "/n1/objects/repair"),
+                            api_url(base_url, "/noa/v1/objects/repair"),
                             encode_path(object_key),
                             encode_query(mode)
                         ))
@@ -451,7 +451,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/upload/multipart"),
+                    &api_url(base_url, "/noa/v1/upload/multipart"),
                     &query,
                 )
                 .await?;
@@ -462,7 +462,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, &format!("/n1/upload/multipart/{version_id}")),
+                    &api_url(base_url, &format!("/noa/v1/upload/multipart/{version_id}")),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_upload_status(&status))
@@ -482,7 +482,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/n1/maintenance/gc/start"),
+                    &api_url(base_url, "/noa/v1/maintenance/gc/start"),
                     &query,
                 )
                 .await?;
@@ -490,7 +490,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/gc/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/gc/status"),
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -503,7 +503,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/gc/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/gc/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
@@ -514,7 +514,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/n1/maintenance/gc/stop"),
+                    &api_url(base_url, "/noa/v1/maintenance/gc/stop"),
                 )
                 .await
             }
@@ -523,7 +523,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/gc/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/gc/status"),
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -551,7 +551,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/n1/maintenance/repair/start"),
+                    &api_url(base_url, "/noa/v1/maintenance/repair/start"),
                     &query,
                 )
                 .await?;
@@ -559,7 +559,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/repair/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/repair/status"),
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -572,7 +572,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/repair/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/repair/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
@@ -583,7 +583,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/n1/maintenance/repair/stop"),
+                    &api_url(base_url, "/noa/v1/maintenance/repair/stop"),
                 )
                 .await
             }
@@ -592,7 +592,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/repair/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/repair/status"),
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -621,7 +621,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/n1/maintenance/redistribution/start"),
+                    &api_url(base_url, "/noa/v1/maintenance/redistribution/start"),
                     &query,
                 )
                 .await?;
@@ -629,7 +629,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/redistribution/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/redistribution/status"),
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -642,7 +642,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/redistribution/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/redistribution/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
@@ -653,7 +653,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/n1/maintenance/redistribution/stop"),
+                    &api_url(base_url, "/noa/v1/maintenance/redistribution/stop"),
                 )
                 .await
             }
@@ -662,7 +662,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/n1/maintenance/redistribution/status"),
+                    &api_url(base_url, "/noa/v1/maintenance/redistribution/status"),
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -691,7 +691,7 @@ async fn handle_authenticated_fragment_command(
                 client,
                 base_url,
                 session,
-                &api_url(base_url, "/n1/fragments"),
+                &api_url(base_url, "/noa/v1/fragments"),
             )
             .await?;
             print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
@@ -705,7 +705,7 @@ async fn handle_authenticated_fragment_command(
                 })?;
             let response = send_with_session(client, base_url, session, |token| {
                 client
-                    .get(api_url(base_url, "/n1/fragments/hash"))
+                    .get(api_url(base_url, "/noa/v1/fragments/hash"))
                     .bearer_auth(token)
                     .json(&FragmentHashLookupRequest {
                         fragment: fragment.to_string(),
@@ -719,7 +719,7 @@ async fn handle_authenticated_fragment_command(
                 client,
                 base_url,
                 session,
-                &api_url(base_url, "/n1/capacity/fragment"),
+                &api_url(base_url, "/noa/v1/capacity/fragment"),
             )
             .await?;
             print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)

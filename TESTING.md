@@ -107,9 +107,9 @@ SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_rele
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
-## N1 3.1.1 Development Release Requirement
+## N1 3.2.0 Development Release Requirement
 
-N1 3.1.1 must retain every N1 2.0 storage invariant and additionally prove:
+N1 3.2.0 must retain every N1 2.0 storage invariant and additionally prove:
 
 - delete is soft-only across HTTP, POSIX, native protocol, shell, and console
 - each deletion receives a unique trash entry id
@@ -120,13 +120,20 @@ N1 3.1.1 must retain every N1 2.0 storage invariant and additionally prove:
 - expiry writes a replayable receipt before removing namespace reachability
 - exact object ids are reclaimed directly only after live/trash reference verification
 - folder delete remains a directory rename and descendant inspection is deferred until expiry
-- N1 2.x and unversioned fragment metadata fail closed; N1 3.1.1 performs no compatibility adoption or migration
+- N1 2.x and unversioned fragment metadata fail closed; N1 3.2.0 performs no compatibility adoption or migration
 
 Evidence for the current release belongs under `/home/wlzambo/DEV-TEST` and
 must record the exact binary hash, configuration, disk topology, commands,
 results, and any unproven boundaries.
 
-The reusable release runner has three focused autonomous-maintenance gates:
+The reusable release runner has one bounded API gate and three focused
+autonomous-maintenance gates:
+
+- `--noa-api-proof` starts an optimized real N1 process and proves canonical
+  NOA ping/auth, one-shot upload, list/stat/download/range integrity, object
+  status, realtime WebSocket events, POSIX file/folder rename, trash/recover,
+  TTL reclamation, maintenance status, deep health, restart persistence, clean
+  logs, and absence of the former `/n1/...` namespace.
 
 - `--auto-healing-proof` injects data/parity loss, root loss, root-identity
   mismatch, unrecoverable damage and later recovery, scheduled online checksum
@@ -179,7 +186,7 @@ Focused N1 2.0.0 evidence from June 11, 2026:
 - Object-level redistribution passed a real `1 + 0 -> 1 + 1` topology change:
   one object scanned, one mismatch found, one migration completed, zero errors,
   followed by physical `.ndx + payload` verification on both blob roots.
-- N1 3.1.1 redistribution tests must prove that a higher durable namespace
+- N1 3.2.0 redistribution tests must prove that a higher durable namespace
   generation wins after `2 -> 1 -> 2`, including equal-count replacement and
   newer deletion cases, while same-generation content disagreement and writes
   attempted before reconciliation still fail closed.

@@ -379,7 +379,7 @@ async fn spawn_server(router: Router) -> (String, JoinHandle<()>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragment_create_uses_direct_route() {
-    let router = Router::new().route("/n1/fragments", post(create_fragment_handler));
+    let router = Router::new().route("/noa/v1/fragments", post(create_fragment_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-shell")
@@ -410,9 +410,9 @@ async fn fragment_create_uses_direct_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragment_usage_uses_authenticated_route() {
     let router = Router::new()
-        .route("/n1/auth/fragment", post(auth_handler))
-        .route("/n1/fragments/hash", get(fragment_hash_handler))
-        .route("/n1/capacity/fragment", get(fragment_usage_handler));
+        .route("/noa/v1/auth/fragment", post(auth_handler))
+        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
+        .route("/noa/v1/capacity/fragment", get(fragment_usage_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-shell")
@@ -441,9 +441,9 @@ async fn fragment_usage_uses_authenticated_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_renders_disk_usage_and_health() {
     let router = Router::new()
-        .route("/n1/fragments/hash", get(fragment_hash_handler))
-        .route("/n1/auth/fragment", post(auth_handler))
-        .route("/n1/maintenance/health", get(health_handler));
+        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
+        .route("/noa/v1/auth/fragment", post(auth_handler))
+        .route("/noa/v1/maintenance/health", get(health_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-shell")
@@ -480,10 +480,10 @@ async fn health_renders_disk_usage_and_health() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_status_can_emit_json() {
     let router = Router::new()
-        .route("/n1/fragments/hash", get(fragment_hash_handler))
-        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
+        .route("/noa/v1/auth/fragment", post(auth_handler))
         .route(
-            "/n1/upload/multipart/{version_id}",
+            "/noa/v1/upload/multipart/{version_id}",
             get(upload_status_handler),
         );
     let (base_url, handle) = spawn_server(router).await;
@@ -523,10 +523,10 @@ async fn uploads_status_can_emit_json() {
 async fn health_auto_refreshes_expiring_access_token() {
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
-        .route("/n1/fragments/hash", get(fragment_hash_handler))
-        .route("/n1/auth/fragment", post(auth_with_refresh_handler))
-        .route("/n1/auth/refresh", post(refresh_handler))
-        .route("/n1/maintenance/health", get(health_handler))
+        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
+        .route("/noa/v1/auth/fragment", post(auth_with_refresh_handler))
+        .route("/noa/v1/auth/refresh", post(refresh_handler))
+        .route("/noa/v1/maintenance/health", get(health_handler))
         .with_state(refresh_calls.clone());
     let (base_url, handle) = spawn_server(router).await;
 
@@ -558,14 +558,17 @@ async fn health_auto_refreshes_expiring_access_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maintenance_status_commands_use_n1_routes() {
+async fn maintenance_status_commands_use_noa_routes() {
     let router = Router::new()
-        .route("/n1/fragments/hash", get(fragment_hash_handler))
-        .route("/n1/auth/fragment", post(auth_handler))
-        .route("/n1/maintenance/gc/status", get(gc_status_handler))
-        .route("/n1/maintenance/repair/status", get(repair_status_handler))
+        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
+        .route("/noa/v1/auth/fragment", post(auth_handler))
+        .route("/noa/v1/maintenance/gc/status", get(gc_status_handler))
         .route(
-            "/n1/maintenance/redistribution/status",
+            "/noa/v1/maintenance/repair/status",
+            get(repair_status_handler),
+        )
+        .route(
+            "/noa/v1/maintenance/redistribution/status",
             get(redistribution_status_handler),
         );
     let (base_url, handle) = spawn_server(router).await;

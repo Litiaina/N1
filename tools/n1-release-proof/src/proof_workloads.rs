@@ -28,7 +28,7 @@ impl Proof {
         let denied_upload = self
             .client
             .post(format!(
-                "{}/n1/upload/one-shot/{}",
+                "{}/noa/v1/upload/one-shot/{}",
                 self.base_url,
                 encode_path(&format!(
                     "{}auth-boundary/should-deny.txt",
@@ -51,7 +51,7 @@ impl Proof {
 
         let denied_mkdir = self
             .client
-            .post(format!("{}/n1/posix/mkdir", self.base_url))
+            .post(format!("{}/noa/v1/posix/mkdir", self.base_url))
             .bearer_auth(&read_only)
             .json(&json!({"path": format!("{}auth-boundary/should-deny-dir", self.args.prefix)}))
             .send()
@@ -76,7 +76,7 @@ impl Proof {
     async fn fragment_usage_api_proof(&self) -> ProofResult<Value> {
         let usage = self
             .client
-            .get(format!("{}/n1/capacity/fragment", self.base_url))
+            .get(format!("{}/noa/v1/capacity/fragment", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -121,7 +121,7 @@ impl Proof {
         self.assert_download_sha256(&old_key, &first_sha).await?;
 
         self.posix_post(
-            "/n1/posix/rename",
+            "/noa/v1/posix/rename",
             json!({"source_path": &old_key, "destination_path": &new_key}),
         )
         .await?;
@@ -164,7 +164,10 @@ impl Proof {
         expected: &mut BTreeSet<String>,
     ) -> ProofResult<Value> {
         let token = encode_query_value(&self.token);
-        let ws_url = format!("wss://127.0.0.1:{}/ws?token={}", self.args.port, token);
+        let ws_url = format!(
+            "wss://127.0.0.1:{}/noa/v1/ws?token={}",
+            self.args.port, token
+        );
         let connector = TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
@@ -187,7 +190,7 @@ impl Proof {
         let payload = b"n1 websocket namespace delta\n".to_vec();
         let sha = sha256_bytes(&payload);
 
-        self.posix_post("/n1/posix/mkdir", json!({"path": &dir}))
+        self.posix_post("/noa/v1/posix/mkdir", json!({"path": &dir}))
             .await?;
         let mkdir_event = self
             .wait_ws_namespace_event(&mut ws, "mkdir", Some(&dir), None)
@@ -199,7 +202,7 @@ impl Proof {
             .await?;
 
         self.posix_post(
-            "/n1/posix/rename",
+            "/noa/v1/posix/rename",
             json!({"source_path": &file, "destination_path": &renamed}),
         )
         .await?;
@@ -210,12 +213,12 @@ impl Proof {
         self.assert_download_sha256(&renamed, &sha).await?;
         expected.insert(renamed.clone());
 
-        self.posix_post("/n1/posix/trash", json!({"path": &dir}))
+        self.posix_post("/noa/v1/posix/trash", json!({"path": &dir}))
             .await?;
         let trash_event = self
             .wait_ws_namespace_event(&mut ws, "trash", Some(&dir), None)
             .await?;
-        self.posix_post("/n1/posix/recover", json!({"path": &dir}))
+        self.posix_post("/noa/v1/posix/recover", json!({"path": &dir}))
             .await?;
         let recover_event = self
             .wait_ws_namespace_event(&mut ws, "recover", Some(&dir), None)
@@ -244,7 +247,7 @@ impl Proof {
         });
         let start = Instant::now();
         let init_url = format!(
-            "{}/n1/upload/multipart/init/{}",
+            "{}/noa/v1/upload/multipart/init/{}",
             self.base_url,
             encode_path(object_key)
         );
@@ -278,7 +281,7 @@ impl Proof {
         )
         .await?;
         let finalize_url = format!(
-            "{}/n1/upload/multipart/{}/{}/finalize?object_key={}",
+            "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
             self.base_url,
             init.version_id,
             init.session_id,
@@ -621,13 +624,13 @@ impl Proof {
         let start = Instant::now();
         self.posix_post_with_token(
             token,
-            "/n1/posix/mkdir",
+            "/noa/v1/posix/mkdir",
             json!({"path": format!("{base}/inbox")}),
         )
         .await?;
         self.posix_post_with_token(
             token,
-            "/n1/posix/mkdir",
+            "/noa/v1/posix/mkdir",
             json!({"path": format!("{base}/work")}),
         )
         .await?;
@@ -643,7 +646,7 @@ impl Proof {
                 .await?;
             self.posix_post_with_token(
                 token,
-                "/n1/posix/rename",
+                "/noa/v1/posix/rename",
                 json!({"source_path": source, "destination_path": dest}),
             )
             .await?;
@@ -658,7 +661,7 @@ impl Proof {
 
         let folder_source = format!("{base}/folder-source");
         let folder_dest = format!("{base}/folder-dest");
-        self.posix_post_with_token(token, "/n1/posix/mkdir", json!({"path": &folder_source}))
+        self.posix_post_with_token(token, "/noa/v1/posix/mkdir", json!({"path": &folder_source}))
             .await?;
         for idx in 0..16usize {
             let child = format!("{folder_source}/child-{idx:04}.bin");
@@ -668,7 +671,7 @@ impl Proof {
         }
         self.posix_post_with_token(
             token,
-            "/n1/posix/rename",
+            "/noa/v1/posix/rename",
             json!({"source_path": folder_source, "destination_path": folder_dest}),
         )
         .await?;
@@ -682,7 +685,7 @@ impl Proof {
         let recover_dir = format!("{base}/recover-dir");
         let recover_child = format!("{recover_dir}/payload.bin");
         let recover_sha = sha256_bytes(&deterministic_payload(64 * 1024, recover_child.as_bytes()));
-        self.posix_post_with_token(token, "/n1/posix/mkdir", json!({"path": &recover_dir}))
+        self.posix_post_with_token(token, "/noa/v1/posix/mkdir", json!({"path": &recover_dir}))
             .await?;
         self.upload_bytes_with_token(
             token,
@@ -691,11 +694,11 @@ impl Proof {
             "application/octet-stream",
         )
         .await?;
-        self.posix_post_with_token(token, "/n1/posix/trash", json!({"path": &recover_dir}))
+        self.posix_post_with_token(token, "/noa/v1/posix/trash", json!({"path": &recover_dir}))
             .await?;
         self.posix_post_with_token(
             token,
-            "/n1/posix/recover",
+            "/noa/v1/posix/recover",
             json!({"path": recover_dir}),
         )
         .await?;
@@ -705,7 +708,7 @@ impl Proof {
 
         let retained_dir = format!("{base}/retained-dir");
         let retained_child = format!("{retained_dir}/payload.bin");
-        self.posix_post_with_token(token, "/n1/posix/mkdir", json!({"path": &retained_dir}))
+        self.posix_post_with_token(token, "/noa/v1/posix/mkdir", json!({"path": &retained_dir}))
             .await?;
         self.upload_bytes_with_token(
             token,
@@ -714,11 +717,11 @@ impl Proof {
             "application/octet-stream",
         )
         .await?;
-        self.posix_post_with_token(token, "/n1/posix/trash", json!({"path": &retained_dir}))
+        self.posix_post_with_token(token, "/noa/v1/posix/trash", json!({"path": &retained_dir}))
             .await?;
         self.posix_post_with_token(
             token,
-            "/n1/posix/recover",
+            "/noa/v1/posix/recover",
             json!({"path": retained_dir}),
         )
         .await?;
@@ -835,7 +838,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/init/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -856,7 +859,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/n1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
                     self.base_url, init.version_id, idx
                 ))
                 .bearer_auth(token)
@@ -876,7 +879,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/n1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,
@@ -914,7 +917,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/posix/list?path={}&limit={}",
+                "{}/noa/v1/posix/list?path={}&limit={}",
                 self.base_url,
                 encode_query_value(path),
                 limit

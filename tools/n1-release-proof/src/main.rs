@@ -27,6 +27,7 @@ include!("proof_environment.rs");
 include!("proof_workloads.rs");
 include!("proof_client.rs");
 include!("proof_native.rs");
+include!("proof_noa.rs");
 include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
 include!("proof_multipart_resume.rs");
@@ -62,6 +63,8 @@ async fn main() {
         proof.run_native_transport_benchmark().await
     } else if proof.args.native_protocol_proof {
         proof.run_native_protocol_smoke().await
+    } else if proof.args.noa_api_proof {
+        proof.run_noa_api_smoke().await
     } else if proof.args.maintenance_interrupt_proof {
         proof.run_maintenance_interrupt_proof().await
     } else {

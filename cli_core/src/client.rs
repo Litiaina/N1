@@ -21,9 +21,9 @@ pub const LEGACY_AUTH_ROUTES: AuthRouteSet = AuthRouteSet {
     refresh_path: "/authenticate/refresh",
 };
 
-pub const N1_AUTH_ROUTES: AuthRouteSet = AuthRouteSet {
-    fragment_auth_path: "/n1/auth/fragment",
-    refresh_path: "/n1/auth/refresh",
+pub const NOA_AUTH_ROUTES: AuthRouteSet = AuthRouteSet {
+    fragment_auth_path: "/noa/v1/auth/fragment",
+    refresh_path: "/noa/v1/auth/refresh",
 };
 
 #[derive(Serialize)]

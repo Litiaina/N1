@@ -44,7 +44,7 @@ impl Proof {
             .await?;
         let health = self
             .client
-            .get(format!("{}/n1/maintenance/health", self.base_url))
+            .get(format!("{}/noa/v1/maintenance/health", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .await?;

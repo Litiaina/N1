@@ -74,16 +74,16 @@ impl Proof {
         let iterations = self.args.benchmark_iterations.max(1);
         let warmup = self.args.benchmark_warmup;
         let stat_path = format!(
-            "/n1/posix/stat?path={}",
+            "/noa/v1/posix/stat?path={}",
             encode_query_value(&object_key)
         );
         let list_path = format!(
-            "/n1/posix/list?path={}&limit=1000",
+            "/noa/v1/posix/list?path={}&limit=1000",
             encode_query_value(&bench_prefix)
         );
 
         let http_ping = self
-            .benchmark_http_get("http_ping", "/n1/ping", iterations, warmup)
+            .benchmark_http_get("http_ping", "/noa/v1/ping", iterations, warmup)
             .await?;
         let native_ping = self
             .benchmark_native_op(
@@ -215,7 +215,7 @@ impl Proof {
 
     async fn http_get_ok(&self, path: &str) -> ProofResult<usize> {
         let request = self.client.get(format!("{}{}", self.base_url, path));
-        let request = if path == "/n1/ping" {
+        let request = if path == "/noa/v1/ping" {
             request
         } else {
             request.bearer_auth(&self.token)
@@ -316,7 +316,7 @@ impl Proof {
         let response = self
             .client
             .get(format!(
-                "{}/n1/objects/download?object_key={}",
+                "{}/noa/v1/objects/download?object_key={}",
                 self.base_url,
                 encode_query_value(object_key)
             ))

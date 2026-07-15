@@ -24,14 +24,14 @@ through its supported APIs or through the native client crate.
 
 ## Development Status
 
-- **Current engine/package version:** `3.1.1`
+- **Current engine/package version:** `3.2.0`
 - **Release channel:** development
 - **Storage engine format:** `3`
 - **Stable release for this engine line:** not yet declared
 
 The engine/package version identifies the actively evolving implementation; it
 does not itself declare production stability. Engine-format compatibility is a
-separate contract: N1 3.1.1 uses engine format 3 and fails closed on older or
+separate contract: N1 3.2.0 uses engine format 3 and fails closed on older or
 unversioned storage roots rather than adopting or migrating them.
 
 ## What Is Included
@@ -43,6 +43,7 @@ unversioned storage roots rather than adopting or migrating them.
 - `cli_core/` - small shared shell support crate used by `n1_shell`.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling.
 - `DOCUMENTATION.md` - user-facing N1 documentation.
+- `NOA.md` - canonical NOA v1 transport contract implemented by N1 3.2.0.
 - `ARCHITECTURE.md` - storage architecture and invariants.
 - `TESTING.md` / `VERIFICATION.md` - validation and release evidence.
 - `deploy/systemd/` and `scripts/install-n1-systemd.sh` - production service installation.
@@ -76,11 +77,14 @@ placement, while namespace movement remains confined to index roots.
 
 N1 exposes two supported faces:
 
-- `/n1/...` over HTTPS for general clients, browsers, and integrations.
+- NOA v1 at `/noa/v1/...` over HTTPS for general clients, browsers, and integrations.
 - `n1://` for Litiaina-owned low-level tools and services.
 
 Both faces are expected to preserve the same object-storage semantics. The
 native protocol is not a separate storage engine.
+
+NOA v1 preserves the existing simple N1 request and response semantics while
+giving the HTTPS surface a stable, engine-independent name. See [NOA.md](NOA.md).
 
 ## Build
 
