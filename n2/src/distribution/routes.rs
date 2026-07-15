@@ -1,3 +1,4 @@
+use crate::distribution::auto_healing::{auto_healing_status, trigger_auto_healing_cycle};
 use crate::distribution::health::cluster_health_snapshot;
 use crate::distribution::maintenance::{
     distributed_maintenance_status, start_distributed_maintenance,
@@ -373,27 +374,35 @@ pub async fn reload_membership(
 
 pub fn build_cluster_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/n2/cluster/membership", get(cluster_membership))
-        .route("/n2/cluster/membership/reload", post(reload_membership))
-        .route("/n2/cluster/layout", get(cluster_layout))
-        .route("/n2/cluster/health", get(cluster_health))
-        .route("/n2/cluster/monitor", get(cluster_monitor))
-        .route("/n2/cluster/usage", get(cluster_usage))
-        .route("/n2/cluster/placement/preview", get(placement_preview))
-        .route("/n2/cluster/rebalance/plan", get(rebalance_plan))
-        .route("/n2/cluster/rebalance/start", post(rebalance_start))
-        .route("/n2/cluster/rebalance/stop", post(rebalance_stop))
-        .route("/n2/cluster/rebalance/status", get(rebalance_status_route))
-        .route("/n2/cluster/repair/plan", get(repair_plan))
-        .route("/n2/cluster/repair/start", post(repair_start))
-        .route("/n2/cluster/repair/stop", post(repair_stop))
-        .route("/n2/cluster/repair/status", get(repair_status_route))
+        .route("/noa/v1/cluster/membership", get(cluster_membership))
+        .route("/noa/v1/cluster/membership/reload", post(reload_membership))
+        .route("/noa/v1/cluster/layout", get(cluster_layout))
+        .route("/noa/v1/cluster/health", get(cluster_health))
+        .route("/noa/v1/cluster/healing/status", get(auto_healing_status))
         .route(
-            "/n2/cluster/maintenance/distributed/start",
+            "/noa/v1/cluster/healing/cycle",
+            post(trigger_auto_healing_cycle),
+        )
+        .route("/noa/v1/cluster/monitor", get(cluster_monitor))
+        .route("/noa/v1/cluster/usage", get(cluster_usage))
+        .route("/noa/v1/cluster/placement/preview", get(placement_preview))
+        .route("/noa/v1/cluster/rebalance/plan", get(rebalance_plan))
+        .route("/noa/v1/cluster/rebalance/start", post(rebalance_start))
+        .route("/noa/v1/cluster/rebalance/stop", post(rebalance_stop))
+        .route(
+            "/noa/v1/cluster/rebalance/status",
+            get(rebalance_status_route),
+        )
+        .route("/noa/v1/cluster/repair/plan", get(repair_plan))
+        .route("/noa/v1/cluster/repair/start", post(repair_start))
+        .route("/noa/v1/cluster/repair/stop", post(repair_stop))
+        .route("/noa/v1/cluster/repair/status", get(repair_status_route))
+        .route(
+            "/noa/v1/cluster/maintenance/distributed/start",
             post(start_distributed_maintenance),
         )
         .route(
-            "/n2/cluster/maintenance/distributed/status",
+            "/noa/v1/cluster/maintenance/distributed/status",
             get(distributed_maintenance_status),
         )
 }

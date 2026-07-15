@@ -256,12 +256,12 @@ metric_speed() {
 wait_ping() {
   local base="$1"
   for _ in $(seq 1 60); do
-    if curl -k --http1.1 -fsS "$base/n2/ping" >/dev/null 2>&1; then
+    if curl -k --http1.1 -fsS "$base/noa/v1/ping" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  curl -k --http1.1 -fsS "$base/n2/ping" >/dev/null
+  curl -k --http1.1 -fsS "$base/noa/v1/ping" >/dev/null
 }
 
 start_nodes() {
@@ -363,20 +363,20 @@ fi
 
 start_nodes
 
-curl_json -X POST "$LOCAL_BASE/n2/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\"}" > "$OUT/create-local.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/fragments" -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\"}" > "$OUT/create-local.json"
 FRAGMENT="$(jq -r '.fragment_hash' "$OUT/create-local.json")"
 STABLE_FRAGMENT="$(jq -r '.stable_fragment_id' "$OUT/create-local.json")"
-curl_json -X POST "$REMOTE_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" > "$OUT/create-remote.json"
+curl_json -X POST "$REMOTE_BASE/noa/v1/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" > "$OUT/create-remote.json"
 jq -e '.access_token | type == "string"' "$OUT/create-remote.json" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_json -X POST "$REMOTE2_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" > "$OUT/create-remote2.json"
+  curl_json -X POST "$REMOTE2_BASE/noa/v1/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" > "$OUT/create-remote2.json"
   jq -e '.access_token | type == "string"' "$OUT/create-remote2.json" >/dev/null
 else
   printf '{}\n' > "$OUT/create-remote2.json"
 fi
-curl_json -X POST "$LOCAL_BASE/n2/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":21600}" > "$OUT/auth-local.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/auth/fragment" -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":21600}" > "$OUT/auth-local.json"
 TOKEN="$(jq -r '.access_token' "$OUT/auth-local.json")"
-curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/cluster-health-initial.json"
+curl_auth "$LOCAL_BASE/noa/v1/cluster/health" > "$OUT/cluster-health-initial.json"
 
 if [[ -f "$SOURCE_VIDEO" ]]; then
   dd if="$SOURCE_VIDEO" of="$OUT/mhw-proof.bin" bs=1M count="$PROOF_MIB" status=none
@@ -393,22 +393,22 @@ PART=67108864
 EXPECTED_PARTS=$(( (SIZE + PART - 1) / PART ))
 RESUME_SPLIT=$(( EXPECTED_PARTS / 2 ))
 if (( RESUME_SPLIT < 1 )); then RESUME_SPLIT=1; fi
-curl_json -X POST "$LOCAL_BASE/n2/upload/multipart/init/$KEY_MP" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"video/mp4\",\"total_size_bytes\":$SIZE,\"expected_parts\":$EXPECTED_PARTS,\"part_size_bytes\":$PART}" > "$OUT/multipart-init.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/upload/multipart/init/$KEY_MP" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"video/mp4\",\"total_size_bytes\":$SIZE,\"expected_parts\":$EXPECTED_PARTS,\"part_size_bytes\":$PART}" > "$OUT/multipart-init.json"
 VERSION="$(jq -r '.version_id' "$OUT/multipart-init.json")"
 SESSION="$(jq -r '.session_id' "$OUT/multipart-init.json")"
 mp_start="$(date +%s%N)"
 for i in $(seq 0 $((RESUME_SPLIT - 1))); do
   part_file="$OUT/part-$(printf '%02d' "$i")"
-  curl_auth -X PUT "$LOCAL_BASE/n2/upload/multipart/$VERSION/$i" --data-binary @"$part_file" -o "$OUT/part-$i.json"
+  curl_auth -X PUT "$LOCAL_BASE/noa/v1/upload/multipart/$VERSION/$i" --data-binary @"$part_file" -o "$OUT/part-$i.json"
 done
-curl_auth "$LOCAL_BASE/n2/upload/multipart/$VERSION" > "$OUT/multipart-status-before-restart.json"
+curl_auth "$LOCAL_BASE/noa/v1/upload/multipart/$VERSION" > "$OUT/multipart-status-before-restart.json"
 stop_nodes
 start_nodes
 for i in $(seq "$RESUME_SPLIT" $((EXPECTED_PARTS - 1))); do
   part_file="$OUT/part-$(printf '%02d' "$i")"
-  curl_auth -X PUT "$LOCAL_BASE/n2/upload/multipart/$VERSION/$i" --data-binary @"$part_file" -o "$OUT/part-$i.json"
+  curl_auth -X PUT "$LOCAL_BASE/noa/v1/upload/multipart/$VERSION/$i" --data-binary @"$part_file" -o "$OUT/part-$i.json"
 done
-curl_json -X POST "$LOCAL_BASE/n2/upload/multipart/$VERSION/$SESSION/finalize?object_key=$KEY_MP" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"video/mp4\",\"total_size_bytes\":$SIZE,\"expected_parts\":$EXPECTED_PARTS,\"part_size_bytes\":$PART}" > "$OUT/multipart-finalize.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/upload/multipart/$VERSION/$SESSION/finalize?object_key=$KEY_MP" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"video/mp4\",\"total_size_bytes\":$SIZE,\"expected_parts\":$EXPECTED_PARTS,\"part_size_bytes\":$PART}" > "$OUT/multipart-finalize.json"
 mp_ns=$(( "$(date +%s%N)" - mp_start ))
 printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s}\n' "$SIZE" "$(awk -v ns="$mp_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(metric_speed "$SIZE" "$mp_ns")" > "$OUT/multipart-resume-upload-metrics.json"
 
@@ -425,7 +425,7 @@ for side in "${SIDES[@]}"; do
     base="$REMOTE2_BASE"
   fi
   start="$(date +%s%N)"
-  curl_auth -G "$base/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/download-$side.bin"
+  curl_auth -G "$base/noa/v1/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/download-$side.bin"
   ns=$(( "$(date +%s%N)" - start ))
   sha256sum "$OUT/download-$side.bin" > "$OUT/download-$side.sha256"
   printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s}\n' "$SIZE" "$(awk -v ns="$ns" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(metric_speed "$SIZE" "$ns")" > "$OUT/download-$side-metrics.json"
@@ -440,23 +440,23 @@ fi
 
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   stop_remote_node_b
-  curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/node-loss-health-down.json"
+  curl_auth "$LOCAL_BASE/noa/v1/cluster/health" > "$OUT/node-loss-health-down.json"
   start="$(date +%s%N)"
-  curl_auth -G "$LOCAL_BASE/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/node-loss-download.bin"
+  curl_auth -G "$LOCAL_BASE/noa/v1/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/node-loss-download.bin"
   loss_download_ns=$(( "$(date +%s%N)" - start ))
   cmp -s "$OUT/mhw-proof.bin" "$OUT/node-loss-download.bin"
   printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s,"lost_node":"node-b"}\n' "$SIZE" "$(awk -v ns="$loss_download_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(metric_speed "$SIZE" "$loss_download_ns")" > "$OUT/node-loss-download-metrics.json"
-  curl_auth -G "$LOCAL_BASE/n2/posix/list" --data-urlencode 'path=videos' --data-urlencode 'limit=100' > "$OUT/node-loss-list.json"
+  curl_auth -G "$LOCAL_BASE/noa/v1/posix/list" --data-urlencode 'path=videos' --data-urlencode 'limit=100' > "$OUT/node-loss-list.json"
   NODE_LOSS_RENAMED="videos/node-loss-rename-$TS.mp4"
-  curl_json -X POST "$LOCAL_BASE/n2/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$KEY_MP\",\"destination_path\":\"$NODE_LOSS_RENAMED\"}" > "$OUT/node-loss-rename-forward.json"
-  curl_json -X POST "$LOCAL_BASE/n2/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$NODE_LOSS_RENAMED\",\"destination_path\":\"$KEY_MP\"}" > "$OUT/node-loss-rename-back.json"
+  curl_json -X POST "$LOCAL_BASE/noa/v1/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$KEY_MP\",\"destination_path\":\"$NODE_LOSS_RENAMED\"}" > "$OUT/node-loss-rename-forward.json"
+  curl_json -X POST "$LOCAL_BASE/noa/v1/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"$NODE_LOSS_RENAMED\",\"destination_path\":\"$KEY_MP\"}" > "$OUT/node-loss-rename-back.json"
   dd if=/dev/urandom of="$OUT/node-loss-small.bin" bs=4096 count=1 status=none
   start="$(date +%s%N)"
-  node_loss_upload_status="$(curl -k --http1.1 -m 20 -sS -o "$OUT/node-loss-upload-response.json" -w '%{http_code}' -X POST "$LOCAL_BASE/n2/upload/one-shot/$NODE_LOSS_OBJECT" -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss-small.bin" || true)"
+  node_loss_upload_status="$(curl -k --http1.1 -m 20 -sS -o "$OUT/node-loss-upload-response.json" -w '%{http_code}' -X POST "$LOCAL_BASE/noa/v1/upload/one-shot/$NODE_LOSS_OBJECT" -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss-small.bin" || true)"
   node_loss_upload_ns=$(( "$(date +%s%N)" - start ))
   printf '{"status":"%s","seconds":%.3f,"bounded":true}\n' "$node_loss_upload_status" "$(awk -v ns="$node_loss_upload_ns" 'BEGIN{printf "%.3f", ns/1000000000}')" > "$OUT/node-loss-upload-bounded.json"
   start_remote_node_b
-  curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/node-loss-health-restored.json"
+  curl_auth "$LOCAL_BASE/noa/v1/cluster/health" > "$OUT/node-loss-health-restored.json"
 else
   printf '{}\n' > "$OUT/node-loss-health-down.json"
   printf '{}\n' > "$OUT/node-loss-download-metrics.json"
@@ -467,7 +467,7 @@ else
   printf '{}\n' > "$OUT/node-loss-health-restored.json"
 fi
 
-curl_auth -G "$LOCAL_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-before-repair.json"
+curl_auth -G "$LOCAL_BASE/noa/v1/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-before-repair.json"
 jq -e '.status == "healthy" and .repairable == true' "$OUT/object-status-before-repair.json" >/dev/null
 
 find "$L_BLOB_ROOT" -path '*/@o_*/*' -name "$VERSION*.ncdx" -print > "$OUT/main-version-ncdx-local.txt"
@@ -505,33 +505,33 @@ if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
 fi
 printf '%s\n' "$LOCAL_NCDX_SHA" > "$OUT/main-version-ncdx.sha256"
 
-curl_auth -X POST -G "$LOCAL_BASE/n2/objects/repair/$KEY_MP" --data-urlencode 'mode=scrub' > "$OUT/object-repair.json"
-curl_auth -G "$REMOTE_BASE/n2/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-after-repair-remote.json"
+curl_auth -X POST -G "$LOCAL_BASE/noa/v1/objects/repair/$KEY_MP" --data-urlencode 'mode=scrub' > "$OUT/object-repair.json"
+curl_auth -G "$REMOTE_BASE/noa/v1/objects/status/$KEY_MP" --data-urlencode 'mode=availability' > "$OUT/object-status-after-repair-remote.json"
 jq -e '.status == "healthy"' "$OUT/object-status-after-repair-remote.json" >/dev/null
 
-curl_auth -X DELETE "$REMOTE_BASE/n2/objects/$KEY_MP" > "$OUT/trash-object-remote.json"
-curl_auth -G "$LOCAL_BASE/n2/trash" --data-urlencode 'prefix=videos/' --data-urlencode 'limit=100' > "$OUT/trash-list-local.json"
-jq -e --arg key "$KEY_MP" '.objects[]? | select(.object_key == $key)' "$OUT/trash-list-local.json" >/dev/null
+curl_auth -X DELETE "$REMOTE_BASE/noa/v1/objects/$KEY_MP" > "$OUT/trash-object-remote.json"
+curl_auth -G "$LOCAL_BASE/noa/v1/trash" --data-urlencode 'prefix=videos/' --data-urlencode 'limit=100' > "$OUT/trash-list-local.json"
+jq -e --arg key "$KEY_MP" '.entries[]? | select(.record == $key)' "$OUT/trash-list-local.json" >/dev/null
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
   RECOVER_BASE="$REMOTE2_BASE"
 else
   RECOVER_BASE="$LOCAL_BASE"
 fi
-curl_auth -X POST "$RECOVER_BASE/n2/objects/recover/$KEY_MP" > "$OUT/recover-object.json"
-curl_auth -G "$REMOTE_BASE/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/read-after-recover.bin"
+curl_auth -X POST "$RECOVER_BASE/noa/v1/objects/recover/$KEY_MP" > "$OUT/recover-object.json"
+curl_auth -G "$REMOTE_BASE/noa/v1/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/read-after-recover.bin"
 cmp -s "$OUT/mhw-proof.bin" "$OUT/read-after-recover.bin"
 
 ns_start="$(date +%s%N)"
 for i in $(seq -w 1 "$NAMESPACE_OPS"); do
-  curl_json -X POST "$LOCAL_BASE/n2/posix/mkdir" -H "Authorization: Bearer $TOKEN" -d "{\"path\":\"stress/dir-$i\"}" >/dev/null
-  curl_json -X POST "$LOCAL_BASE/n2/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"stress/dir-$i\",\"destination_path\":\"stress/renamed-$i\"}" >/dev/null
+  curl_json -X POST "$LOCAL_BASE/noa/v1/posix/mkdir" -H "Authorization: Bearer $TOKEN" -d "{\"path\":\"stress/dir-$i\"}" >/dev/null
+  curl_json -X POST "$LOCAL_BASE/noa/v1/posix/rename" -H "Authorization: Bearer $TOKEN" -d "{\"source_path\":\"stress/dir-$i\",\"destination_path\":\"stress/renamed-$i\"}" >/dev/null
 done
 ns_total=$(( NAMESPACE_OPS * 2 ))
 ns_elapsed=$(( "$(date +%s%N)" - ns_start ))
 printf '{"operations":%s,"seconds":%.3f,"ops_per_sec":%.2f}\n' "$ns_total" "$(awk -v ns="$ns_elapsed" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(awk -v ops="$ns_total" -v ns="$ns_elapsed" 'BEGIN{sec=ns/1000000000; printf "%.2f", ops/sec}')" > "$OUT/namespace-stress-metrics.json"
-curl_auth -G "$REMOTE_BASE/n2/posix/list" --data-urlencode 'path=stress' --data-urlencode 'limit=1000' > "$OUT/namespace-stress-remote-list.json"
+curl_auth -G "$REMOTE_BASE/noa/v1/posix/list" --data-urlencode 'path=stress' --data-urlencode 'limit=1000' > "$OUT/namespace-stress-remote-list.json"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_auth -G "$REMOTE2_BASE/n2/posix/list" --data-urlencode 'path=stress' --data-urlencode 'limit=1000' > "$OUT/namespace-stress-remote2-list.json"
+  curl_auth -G "$REMOTE2_BASE/noa/v1/posix/list" --data-urlencode 'path=stress' --data-urlencode 'limit=1000' > "$OUT/namespace-stress-remote2-list.json"
 else
   printf '{}\n' > "$OUT/namespace-stress-remote2-list.json"
 fi
@@ -541,7 +541,7 @@ dd if=/dev/urandom of="$SMALL" bs=4096 count=1 status=none
 scale_start="$(date +%s%N)"
 scale_pids=()
 for i in $(seq -w 1 "$SMALL_OBJECTS"); do
-  curl_auth -X POST "$LOCAL_BASE/n2/upload/one-shot/scale/obj-$i.bin" --data-binary @"$SMALL" -o /dev/null &
+  curl_auth -X POST "$LOCAL_BASE/noa/v1/upload/one-shot/scale/obj-$i.bin" --data-binary @"$SMALL" -o /dev/null &
   scale_pids+=("$!")
   if (( 10#$i % 12 == 0 )); then
     for pid in "${scale_pids[@]}"; do wait "$pid"; done
@@ -551,17 +551,17 @@ done
 for pid in "${scale_pids[@]}"; do wait "$pid"; done
 scale_elapsed=$(( "$(date +%s%N)" - scale_start ))
 printf '{"objects":%s,"bytes_per_object":4096,"seconds":%.3f,"objects_per_sec":%.2f}\n' "$SMALL_OBJECTS" "$(awk -v ns="$scale_elapsed" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(awk -v objects="$SMALL_OBJECTS" -v ns="$scale_elapsed" 'BEGIN{sec=ns/1000000000; printf "%.2f", objects/sec}')" > "$OUT/scale-upload-metrics.json"
-curl_auth -G "$REMOTE_BASE/n2/posix/list" --data-urlencode 'path=scale' --data-urlencode 'limit=1000' > "$OUT/scale-remote-list.json"
+curl_auth -G "$REMOTE_BASE/noa/v1/posix/list" --data-urlencode 'path=scale' --data-urlencode 'limit=1000' > "$OUT/scale-remote-list.json"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_auth -G "$REMOTE2_BASE/n2/posix/list" --data-urlencode 'path=scale' --data-urlencode 'limit=1000' > "$OUT/scale-remote2-list.json"
+  curl_auth -G "$REMOTE2_BASE/noa/v1/posix/list" --data-urlencode 'path=scale' --data-urlencode 'limit=1000' > "$OUT/scale-remote2-list.json"
 else
   printf '{}\n' > "$OUT/scale-remote2-list.json"
 fi
 
-curl_json -X POST "$LOCAL_BASE/n2/upload/multipart/init/tmp/cancel-$TS.bin" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":134217728,\"expected_parts\":2,\"part_size_bytes\":67108864}" > "$OUT/cancel-init.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/upload/multipart/init/tmp/cancel-$TS.bin" -H "Authorization: Bearer $TOKEN" -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":134217728,\"expected_parts\":2,\"part_size_bytes\":67108864}" > "$OUT/cancel-init.json"
 CVERSION="$(jq -r '.version_id' "$OUT/cancel-init.json")"
-curl_auth -X DELETE -G "$LOCAL_BASE/n2/upload/multipart/$CVERSION" --data-urlencode "object_key=tmp/cancel-$TS.bin" -o "$OUT/cancel-response.json"
-curl_auth "$LOCAL_BASE/n2/upload/multipart/$CVERSION" > "$OUT/cancel-status.json" || true
+curl_auth -X DELETE -G "$LOCAL_BASE/noa/v1/upload/multipart/$CVERSION" --data-urlencode "object_key=tmp/cancel-$TS.bin" -o "$OUT/cancel-response.json"
+curl_auth "$LOCAL_BASE/noa/v1/upload/multipart/$CVERSION" > "$OUT/cancel-status.json" || true
 
 find "$L_INDEX_ROOT" "$L_BLOB_ROOT" \( -path '*/.cluster/*' -o -path '*/.namespace/*' -o -path '*/.intents/*' -o -path '*/.blobs/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print | sort -u > "$OUT/forbidden-layout-local.txt"
 ssh_remote "find '$R_INDEX_ROOT' '$R_BLOB_ROOT' \( -path '*/.cluster/*' -o -path '*/.namespace/*' -o -path '*/.intents/*' -o -path '*/.blobs/*' -o -name '*.nmtd' -o -name '*.ndx' \) -print | sort -u" > "$OUT/forbidden-layout-remote.txt"
@@ -605,28 +605,28 @@ if [[ -z "$DELETED" ]]; then
 fi
 rm -f "$DELETED"
 start="$(date +%s%N)"
-curl_auth -G "$LOCAL_BASE/n2/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/reconstruct-after-delete.bin"
+curl_auth -G "$LOCAL_BASE/noa/v1/objects/download" --data-urlencode "object_key=$KEY_MP" -o "$OUT/reconstruct-after-delete.bin"
 recon_elapsed=$(( "$(date +%s%N)" - start ))
 cmp -s "$OUT/mhw-proof.bin" "$OUT/reconstruct-after-delete.bin"
 printf '{"bytes":%s,"seconds":%.3f,"mib_per_sec":%s,"deleted_shard":"%s"}\n' "$SIZE" "$(awk -v ns="$recon_elapsed" 'BEGIN{printf "%.3f", ns/1000000000}')" "$(metric_speed "$SIZE" "$recon_elapsed")" "$DELETED" > "$OUT/reconstruct-after-delete-metrics.json"
 
-curl_json -X POST "$LOCAL_BASE/n2/cluster/repair/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"videos/\",\"dry_run\":false}" > "$OUT/cluster-repair-start.json"
-wait_job "$LOCAL_BASE/n2/cluster/repair/status" "$OUT/cluster-repair-status.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/cluster/repair/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"videos/\",\"dry_run\":false}" > "$OUT/cluster-repair-start.json"
+wait_job "$LOCAL_BASE/noa/v1/cluster/repair/status" "$OUT/cluster-repair-status.json"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_auth -G "$LOCAL_BASE/n2/objects/status/$NODE_LOSS_OBJECT" --data-urlencode 'mode=availability' > "$OUT/targeted-rebalance-before.json"
+  curl_auth -G "$LOCAL_BASE/noa/v1/objects/status/$NODE_LOSS_OBJECT" --data-urlencode 'mode=availability' > "$OUT/targeted-rebalance-before.json"
   jq -e '.layout.state == "older_recorded_layout"' "$OUT/targeted-rebalance-before.json" >/dev/null
 fi
-curl_json -X POST "$LOCAL_BASE/n2/cluster/rebalance/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"node-loss/\",\"dry_run\":false}" > "$OUT/cluster-rebalance-start.json"
-wait_job "$LOCAL_BASE/n2/cluster/rebalance/status" "$OUT/cluster-rebalance-status.json"
+curl_json -X POST "$LOCAL_BASE/noa/v1/cluster/rebalance/start" -H "Authorization: Bearer $TOKEN" -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"node-loss/\",\"dry_run\":false}" > "$OUT/cluster-rebalance-start.json"
+wait_job "$LOCAL_BASE/noa/v1/cluster/rebalance/status" "$OUT/cluster-rebalance-status.json"
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then
-  curl_auth -G "$LOCAL_BASE/n2/objects/status/$NODE_LOSS_OBJECT" --data-urlencode 'mode=availability' > "$OUT/targeted-rebalance-after.json"
+  curl_auth -G "$LOCAL_BASE/noa/v1/objects/status/$NODE_LOSS_OBJECT" --data-urlencode 'mode=availability' > "$OUT/targeted-rebalance-after.json"
   jq -e '.status == "healthy" and .layout.state == "current_layout"' "$OUT/targeted-rebalance-after.json" >/dev/null
   jq -e '.rewritten == 1 and .failed == 0' "$OUT/cluster-rebalance-status.json" >/dev/null
 else
   printf '{}\n' > "$OUT/targeted-rebalance-before.json"
   printf '{}\n' > "$OUT/targeted-rebalance-after.json"
 fi
-curl_auth "$LOCAL_BASE/n2/cluster/health" > "$OUT/cluster-health-final.json"
+curl_auth "$LOCAL_BASE/noa/v1/cluster/health" > "$OUT/cluster-health-final.json"
 
 scp_remote administrator@"$REMOTE_IP":"$RROOT/rss-remote.csv" "$OUT/rss-remote.csv" >/dev/null || true
 if [[ "$N2_PROOF_NODE_COUNT" == "3" ]]; then

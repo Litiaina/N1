@@ -4,8 +4,9 @@ use crate::core::disk_manager::{
 };
 use crate::core::download::download_object_chunk_from_metadata;
 use crate::core::index;
-use crate::core::repair_manager::ObjectLayoutStatus;
-use crate::distribution::download::shard_probe_readable;
+use crate::core::repair_manager::{
+    ObjectLayoutStatus, RepairCheckMode, repair_cluster_object_recorded_layout,
+};
 use crate::distribution::layout::resolve_write_layout;
 use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
 use crate::distribution::namespace::commit_upload_quorum;
@@ -13,6 +14,7 @@ use crate::distribution::peer::parse_peer_shard_locator;
 use crate::distribution::placement::{
     ClusterShardPlacement, ClusterShardRole, build_placement_plan,
 };
+use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
     finalize_cluster_upload, initiate_cluster_upload, put_cluster_part,
 };
@@ -93,6 +95,9 @@ pub struct ClusterRewriteJobStatus {
     pub budget: Option<MaintenanceBudgetSnapshot>,
     pub scanned: u64,
     pub rewritten: u64,
+    pub repaired_objects: u64,
+    pub repaired_shards: u64,
+    pub unrecoverable_objects: u64,
     pub skipped: u64,
     pub skipped_current_layout: u64,
     pub skipped_healthy: u64,
@@ -126,14 +131,9 @@ pub fn plan_rebalance(runtime: &ClusterRuntime) -> Result<ClusterRebalancePlan, 
         bounded_object_erasure_set: true,
         max_auto_data_shards: runtime.layout_policy.auto_max_data_shards,
         max_auto_parity_shards: runtime.layout_policy.auto_max_parity_shards,
-        automatic_rebalance: runtime.auto_rebalance,
-        recommendation: if runtime.auto_rebalance {
-            "automatic rebalance is enabled for background rewrite jobs; new objects always use the current bounded layout"
-                .to_string()
-        } else {
-            "new objects use the current bounded layout; old objects stay on their recorded layout until manual rebalance"
-                .to_string()
-        },
+        automatic_rebalance: false,
+        recommendation: "new objects use the current bounded layout; old objects stay on their recorded layout until explicit rebalance"
+            .to_string(),
     })
 }
 
@@ -435,15 +435,37 @@ pub fn metadata_matches_current_layout(meta: &ObjectMetadata, runtime: &ClusterR
         .unwrap_or(false)
 }
 
-async fn object_has_unreadable_shard(meta: &ObjectMetadata) -> bool {
-    for part in &meta.parts {
-        for shard in &part.shards {
-            if !shard_probe_readable(shard).await {
-                return true;
-            }
-        }
+async fn repair_recorded_layout(
+    meta: &ObjectMetadata,
+    check_mode: RepairCheckMode,
+    dry_run: bool,
+) -> Result<(bool, u64), AppError> {
+    let before = inspect_cluster_object_status(meta, check_mode).await?;
+    if before.status == "healthy" {
+        return Ok((false, 0));
     }
-    false
+    if !before.repairable {
+        return Err(AppError::ServiceUnavailable(format!(
+            "object {}/{} version {} is {} and cannot be reconstructed from its recorded {}+{} layout",
+            meta.fragment,
+            meta.object_key,
+            meta.version_id,
+            before.status,
+            meta.data_shards,
+            meta.parity_shards
+        )));
+    }
+    if dry_run {
+        return Ok((true, 0));
+    }
+    let after = repair_cluster_object_recorded_layout(meta, check_mode).await?;
+    if after.status != "healthy" || after.failed_repairs > 0 {
+        return Err(AppError::ServiceUnavailable(format!(
+            "object {}/{} version {} remained {} after recorded-layout repair ({} failed shard repair(s))",
+            meta.fragment, meta.object_key, meta.version_id, after.status, after.failed_repairs
+        )));
+    }
+    Ok((true, after.repaired_shards))
 }
 
 pub async fn rewrite_object_to_current_layout(
@@ -653,7 +675,7 @@ async fn run_rewrite_job(
                 }
             };
             let should_rewrite = if repair_only {
-                object_has_unreadable_shard(&meta).await
+                true
             } else if req.mismatched_only {
                 !metadata_matches_current_layout(&meta, &runtime)
             } else {
@@ -674,12 +696,29 @@ async fn run_rewrite_job(
             let rewrite_bytes = meta.total_size_bytes;
             budget.record_bytes(rewrite_bytes);
             mark_budget(status, &budget);
-            match rewrite_object_to_current_layout(entry.path, entry.object_id, meta, req.dry_run)
-                .await
-            {
+            let result = if repair_only {
+                repair_recorded_layout(&meta, RepairCheckMode::Availability, req.dry_run)
+                    .await
+                    .map(|(changed, repaired_shards)| {
+                        if changed {
+                            update_job(status, |guard| {
+                                guard.repaired_objects = guard.repaired_objects.saturating_add(1);
+                                guard.repaired_shards =
+                                    guard.repaired_shards.saturating_add(repaired_shards);
+                            });
+                        }
+                        changed
+                    })
+            } else {
+                rewrite_object_to_current_layout(entry.path, entry.object_id, meta, req.dry_run)
+                    .await
+            };
+            match result {
                 Ok(true) => {
                     update_job(status, |guard| {
-                        guard.rewritten = guard.rewritten.saturating_add(1);
+                        if !repair_only {
+                            guard.rewritten = guard.rewritten.saturating_add(1);
+                        }
                         if !req.dry_run {
                             guard.bytes_processed =
                                 guard.bytes_processed.saturating_add(rewrite_bytes);
@@ -691,6 +730,9 @@ async fn run_rewrite_job(
                 }),
                 Err(err) => update_job(status, |guard| {
                     guard.failed = guard.failed.saturating_add(1);
+                    if repair_only {
+                        guard.unrecoverable_objects = guard.unrecoverable_objects.saturating_add(1);
+                    }
                     guard.last_error = Some(err.to_string());
                 }),
             }
@@ -719,10 +761,11 @@ pub fn start_repair(req: ClusterRebalanceRequest) -> Result<ClusterRewriteJobSta
     Ok(repair_status())
 }
 
-pub async fn run_rewrite_fragment_once(
+async fn run_fragment_maintenance_once(
     req: ClusterRebalanceRequest,
-    repair_only: bool,
+    repair_mode: Option<RepairCheckMode>,
 ) -> ClusterRewriteJobStatus {
+    let repair_only = repair_mode.is_some();
     let job_name = if repair_only {
         format!("cluster_repair:{}", req.fragment)
     } else {
@@ -828,7 +871,7 @@ pub async fn run_rewrite_fragment_once(
                 }
             };
             let should_rewrite = if repair_only {
-                object_has_unreadable_shard(&meta).await
+                true
             } else if req.mismatched_only {
                 !metadata_matches_current_layout(&meta, &runtime)
             } else {
@@ -848,11 +891,29 @@ pub async fn run_rewrite_fragment_once(
             out.budget = Some(budget.snapshot());
             out.budget_exhausted = budget.exhausted();
             out.budget_reason = budget.snapshot().exhaustion_reason;
-            match rewrite_object_to_current_layout(entry.path, entry.object_id, meta, req.dry_run)
+            let result = if repair_only {
+                repair_recorded_layout(
+                    &meta,
+                    repair_mode.unwrap_or(RepairCheckMode::Availability),
+                    req.dry_run,
+                )
                 .await
-            {
+                .map(|(changed, repaired_shards)| {
+                    if changed {
+                        out.repaired_objects = out.repaired_objects.saturating_add(1);
+                        out.repaired_shards = out.repaired_shards.saturating_add(repaired_shards);
+                    }
+                    changed
+                })
+            } else {
+                rewrite_object_to_current_layout(entry.path, entry.object_id, meta, req.dry_run)
+                    .await
+            };
+            match result {
                 Ok(true) => {
-                    out.rewritten = out.rewritten.saturating_add(1);
+                    if !repair_only {
+                        out.rewritten = out.rewritten.saturating_add(1);
+                    }
                     if !req.dry_run {
                         out.bytes_processed = out.bytes_processed.saturating_add(rewrite_bytes);
                     }
@@ -860,6 +921,9 @@ pub async fn run_rewrite_fragment_once(
                 Ok(false) => out.skipped = out.skipped.saturating_add(1),
                 Err(err) => {
                     out.failed = out.failed.saturating_add(1);
+                    if repair_only {
+                        out.unrecoverable_objects = out.unrecoverable_objects.saturating_add(1);
+                    }
                     out.last_error = Some(err.to_string());
                 }
             }
@@ -874,6 +938,20 @@ pub async fn run_rewrite_fragment_once(
     out.running = false;
     out.finished_at_unix = Some(chrono::Utc::now().timestamp());
     out
+}
+
+pub async fn run_rewrite_fragment_once(
+    req: ClusterRebalanceRequest,
+    repair_only: bool,
+) -> ClusterRewriteJobStatus {
+    run_fragment_maintenance_once(req, repair_only.then_some(RepairCheckMode::Availability)).await
+}
+
+pub async fn run_repair_fragment_once(
+    req: ClusterRebalanceRequest,
+    check_mode: RepairCheckMode,
+) -> ClusterRewriteJobStatus {
+    run_fragment_maintenance_once(req, Some(check_mode)).await
 }
 
 pub fn stop_rebalance() -> ClusterRewriteJobStatus {

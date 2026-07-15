@@ -25,7 +25,7 @@ pub fn scrub_control_snapshot() -> ScrubControlSnapshot {
         automatic_scheduler_enabled: false,
         explicit_operator_action: true,
         recommended_interval_seconds: recommended_interval_seconds(),
-        route: "/n2/maintenance/gc/start?mode=scrub",
+        route: "/noa/v1/maintenance/gc/start?mode=scrub",
         native_operation: "maintenance.gc.start",
         note: "N2 keeps scrub explicit; operators schedule it externally so weak nodes are not surprised by background IO.",
     }

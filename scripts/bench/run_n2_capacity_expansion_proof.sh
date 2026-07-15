@@ -149,10 +149,10 @@ CFG
 wait_ping() {
   local base="$1"
   for _ in $(seq 1 80); do
-    curl -sk --http1.1 -fsS "$base/n2/ping" >/dev/null 2>&1 && return 0
+    curl -sk --http1.1 -fsS "$base/noa/v1/ping" >/dev/null 2>&1 && return 0
     sleep 1
   done
-  curl -sk --http1.1 -fsS "$base/n2/ping" >/dev/null
+  curl -sk --http1.1 -fsS "$base/noa/v1/ping" >/dev/null
 }
 
 start_a() { (cd "$LROOT"; setsid ./litiaina-n2 </dev/null >server.log 2>&1 & echo $! >n2.pid); wait_ping "$LOCAL_BASE"; }
@@ -163,7 +163,7 @@ stop_b() { ssh_b "if [ -f '$RROOT/n2.pid' ]; then kill \$(cat '$RROOT/n2.pid') 2
 stop_c() { ssh_c "if [ -f '$CROOT/n2.pid' ]; then kill \$(cat '$CROOT/n2.pid') 2>/dev/null || true; rm -f '$CROOT/n2.pid'; fi"; }
 
 auth() {
-  curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/n2/auth/fragment" \
+  curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/noa/v1/auth/fragment" \
     -H 'Content-Type: application/json' \
     -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":21600}" \
     >"$OUT/auth.json"
@@ -174,7 +174,7 @@ curl_auth() { curl -sk --http1.1 -fsS -H "Authorization: Bearer $TOKEN" "$@"; }
 
 upload_one() {
   local key="$1" file="$2" out="$3"
-  curl_auth -X POST "$LOCAL_BASE/n2/upload/one-shot/$key" --data-binary @"$file" >"$out"
+  curl_auth -X POST "$LOCAL_BASE/noa/v1/upload/one-shot/$key" --data-binary @"$file" >"$out"
 }
 
 echo "[capacity-proof] out=$OUT"
@@ -200,19 +200,19 @@ scp_b "$LROOT/fs/n2_membership.json" administrator@"$REMOTE_IP":"$RROOT/fs/n2_me
 start_b
 start_a
 
-curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/n2/fragments" \
+curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/noa/v1/fragments" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"$FRAG_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAG_KEY\"}" >"$OUT/create-a.json"
 FRAGMENT="$(jq -r '.fragment_hash' "$OUT/create-a.json")"
 STABLE="$(jq -r '.stable_fragment_id' "$OUT/create-a.json")"
-curl -sk --http1.1 -fsS -X POST "$REMOTE_BASE/n2/auth/fragment" \
+curl -sk --http1.1 -fsS -X POST "$REMOTE_BASE/noa/v1/auth/fragment" \
   -H 'Content-Type: application/json' \
   -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" >"$OUT/create-b.json"
 auth
 
 dd if=/dev/urandom of="$OUT/old-layout.bin" bs=1M count="$PROOF_MIB" status=none
 upload_one "capacity/old-layout.bin" "$OUT/old-layout.bin" "$OUT/old-upload.json"
-curl_auth -G "$LOCAL_BASE/n2/objects/status/capacity/old-layout.bin" --data-urlencode mode=availability >"$OUT/old-status-before-expand.json"
+curl_auth -G "$LOCAL_BASE/noa/v1/objects/status/capacity/old-layout.bin" --data-urlencode mode=availability >"$OUT/old-status-before-expand.json"
 
 stop_a
 stop_b
@@ -223,7 +223,7 @@ start_c
 start_b
 start_a
 for _ in $(seq 1 30); do
-  if curl -sk --http1.1 -fsS -X POST "$REMOTE2_BASE/n2/auth/fragment" \
+  if curl -sk --http1.1 -fsS -X POST "$REMOTE2_BASE/noa/v1/auth/fragment" \
       -H 'Content-Type: application/json' \
       -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAG_KEY\",\"read\":true}" \
       >"$OUT/create-c.json"; then
@@ -236,19 +236,19 @@ auth
 
 dd if=/dev/urandom of="$OUT/new-layout.bin" bs=1M count="$PROOF_MIB" status=none
 upload_one "capacity/new-layout.bin" "$OUT/new-layout.bin" "$OUT/new-upload.json"
-curl_auth -G "$LOCAL_BASE/n2/objects/status/capacity/old-layout.bin" --data-urlencode mode=availability >"$OUT/old-status-after-expand.json"
-curl_auth -G "$LOCAL_BASE/n2/objects/status/capacity/new-layout.bin" --data-urlencode mode=availability >"$OUT/new-status-after-expand.json"
-curl_auth -G "$REMOTE2_BASE/n2/objects/download" --data-urlencode object_key=capacity/old-layout.bin -o "$OUT/old-download-after-expand.bin"
-curl_auth -G "$REMOTE_BASE/n2/objects/download" --data-urlencode object_key=capacity/new-layout.bin -o "$OUT/new-download-after-expand.bin"
+curl_auth -G "$LOCAL_BASE/noa/v1/objects/status/capacity/old-layout.bin" --data-urlencode mode=availability >"$OUT/old-status-after-expand.json"
+curl_auth -G "$LOCAL_BASE/noa/v1/objects/status/capacity/new-layout.bin" --data-urlencode mode=availability >"$OUT/new-status-after-expand.json"
+curl_auth -G "$REMOTE2_BASE/noa/v1/objects/download" --data-urlencode object_key=capacity/old-layout.bin -o "$OUT/old-download-after-expand.bin"
+curl_auth -G "$REMOTE_BASE/noa/v1/objects/download" --data-urlencode object_key=capacity/new-layout.bin -o "$OUT/new-download-after-expand.bin"
 cmp -s "$OUT/old-layout.bin" "$OUT/old-download-after-expand.bin"
 cmp -s "$OUT/new-layout.bin" "$OUT/new-download-after-expand.bin"
 
-curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/n2/cluster/rebalance/start" \
+curl -sk --http1.1 -fsS -X POST "$LOCAL_BASE/noa/v1/cluster/rebalance/start" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d "{\"fragment\":\"$FRAGMENT\",\"prefix\":\"capacity/\",\"dry_run\":true,\"mismatched_only\":true}" >"$OUT/targeted-rebalance-start.json"
 for _ in $(seq 1 120); do
-  curl_auth "$LOCAL_BASE/n2/cluster/rebalance/status" >"$OUT/targeted-rebalance-status.json"
+  curl_auth "$LOCAL_BASE/noa/v1/cluster/rebalance/status" >"$OUT/targeted-rebalance-status.json"
   [[ "$(jq -r '.running' "$OUT/targeted-rebalance-status.json")" == "false" ]] && break
   sleep 1
 done

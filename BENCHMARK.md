@@ -182,7 +182,7 @@ rotational disks remains the main measured performance hotspot.
 ### Gateway and console
 
 The route-only gateway now has a dedicated WebSocket relay instead of sending
-`/ws` through the ordinary HTTP proxy, which strips upgrade headers. A real
+`/noa/v1/ws` through the ordinary HTTP proxy, which strips upgrade headers. A real
 Chromium smoke test mounted the live fragment and opened File Manager at
 1440x900 and 390x844. Both runs showed `Online (Real-time)`, rendered live
 namespace contents, and recorded zero page errors, console errors, failed

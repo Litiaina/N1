@@ -32,6 +32,17 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("file_ttl_seconds", "3600")
         .set("retention_seconds", "2592000");
 
+    conf.with_section(Some("auto_healing"))
+        .set("enabled", "true")
+        .set("initial_delay_seconds", "30")
+        .set("scan_interval_seconds", "900")
+        .set("coordinator_nodes", "auto")
+        .set("max_parallel_fragments", "2")
+        .set("max_objects_per_fragment_cycle", "256")
+        .set("max_duration_seconds", "30")
+        .set("lease_seconds", "90")
+        .set("checksum_scan_every_cycles", "24");
+
     conf.with_section(Some("set_limits"))
         .set("max_file_size", "5368709120");
 
@@ -104,6 +115,12 @@ mod tests {
             .expect("upload_config section");
         assert_eq!(upload.get("max_part_size"), Some("536870912"));
         assert_eq!(upload.get("stripe_block_size"), Some("4194304"));
+        let healing = ini
+            .section(Some("auto_healing"))
+            .expect("auto_healing section");
+        assert_eq!(healing.get("enabled"), Some("true"));
+        assert_eq!(healing.get("coordinator_nodes"), Some("auto"));
+        assert_eq!(healing.get("checksum_scan_every_cycles"), Some("24"));
         let _ = fs::remove_file(path);
     }
 }

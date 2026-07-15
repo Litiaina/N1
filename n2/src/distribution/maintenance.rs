@@ -2,11 +2,14 @@ use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity::{list_fragment_aliases, stable_fragment_id_for_root};
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::garbage_collector::{GcJobStatus, get_gc_status, start_garbage_collector_job};
+use crate::core::repair_manager::RepairCheckMode;
 use crate::distribution::membership::{
     ClusterNode, active_cluster_runtime, live_active_write_nodes,
 };
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
-use crate::distribution::rebalance::{ClusterRebalanceRequest, run_rewrite_fragment_once};
+use crate::distribution::rebalance::{
+    ClusterRebalanceRequest, run_repair_fragment_once, run_rewrite_fragment_once,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -102,6 +105,9 @@ pub struct FragmentMaintenanceAssignment {
     pub state: FragmentMaintenanceState,
     pub scanned: u64,
     pub rewritten: u64,
+    pub repaired_objects: u64,
+    pub repaired_shards: u64,
+    pub unrecoverable_objects: u64,
     pub skipped: u64,
     pub failed: u64,
     pub bytes_processed: u64,
@@ -119,6 +125,9 @@ impl Default for FragmentMaintenanceAssignment {
             state: FragmentMaintenanceState::Assigned,
             scanned: 0,
             rewritten: 0,
+            repaired_objects: 0,
+            repaired_shards: 0,
+            unrecoverable_objects: 0,
             skipped: 0,
             failed: 0,
             bytes_processed: 0,
@@ -144,6 +153,9 @@ pub struct DistributedMaintenanceStatus {
     pub assignments: Vec<FragmentMaintenanceAssignment>,
     pub scanned: u64,
     pub rewritten: u64,
+    pub repaired_objects: u64,
+    pub repaired_shards: u64,
+    pub unrecoverable_objects: u64,
     pub skipped: u64,
     pub failed: u64,
     pub bytes_processed: u64,
@@ -234,6 +246,20 @@ fn rewrite_request_for_fragment(
     }
 }
 
+fn distributed_repair_check_mode(mode: Option<&str>) -> RepairCheckMode {
+    match mode
+        .unwrap_or("availability")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "checksum" => RepairCheckMode::Checksum,
+        "strict" => RepairCheckMode::Strict,
+        "scrub" => RepairCheckMode::Scrub,
+        _ => RepairCheckMode::Availability,
+    }
+}
+
 async fn wait_gc_job() -> GcJobStatus {
     loop {
         let snapshot = get_gc_status().await;
@@ -247,6 +273,9 @@ async fn wait_gc_job() -> GcJobStatus {
 fn summarize_assignments(status: &mut DistributedMaintenanceStatus) {
     status.scanned = 0;
     status.rewritten = 0;
+    status.repaired_objects = 0;
+    status.repaired_shards = 0;
+    status.unrecoverable_objects = 0;
     status.skipped = 0;
     status.failed = 0;
     status.bytes_processed = 0;
@@ -255,6 +284,15 @@ fn summarize_assignments(status: &mut DistributedMaintenanceStatus) {
     for assignment in &status.assignments {
         status.scanned = status.scanned.saturating_add(assignment.scanned);
         status.rewritten = status.rewritten.saturating_add(assignment.rewritten);
+        status.repaired_objects = status
+            .repaired_objects
+            .saturating_add(assignment.repaired_objects);
+        status.repaired_shards = status
+            .repaired_shards
+            .saturating_add(assignment.repaired_shards);
+        status.unrecoverable_objects = status
+            .unrecoverable_objects
+            .saturating_add(assignment.unrecoverable_objects);
         status.skipped = status.skipped.saturating_add(assignment.skipped);
         status.failed = status.failed.saturating_add(assignment.failed);
         status.bytes_processed = status
@@ -303,20 +341,25 @@ async fn run_peer_maintenance_worker(
             DistributedMaintenanceKind::Repair | DistributedMaintenanceKind::Rebalance => {
                 let rewrite_req = rewrite_request_for_fragment(&req, &fragment);
                 let timeout_secs = req.max_duration_seconds.unwrap_or(900).clamp(5, 86_400);
-                let snapshot = timeout(
-                    Duration::from_secs(timeout_secs),
-                    run_rewrite_fragment_once(
-                        rewrite_req,
-                        matches!(req.kind, DistributedMaintenanceKind::Repair),
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    AppError::Timeout(format!(
-                        "distributed {:?} fragment {} exceeded {}s",
-                        req.kind, fragment, timeout_secs
-                    ))
-                });
+                let work = async {
+                    if matches!(req.kind, DistributedMaintenanceKind::Repair) {
+                        run_repair_fragment_once(
+                            rewrite_req,
+                            distributed_repair_check_mode(req.mode.as_deref()),
+                        )
+                        .await
+                    } else {
+                        run_rewrite_fragment_once(rewrite_req, false).await
+                    }
+                };
+                let snapshot = timeout(Duration::from_secs(timeout_secs), work)
+                    .await
+                    .map_err(|_| {
+                        AppError::Timeout(format!(
+                            "distributed {:?} fragment {} exceeded {}s",
+                            req.kind, fragment, timeout_secs
+                        ))
+                    });
                 match snapshot {
                     Ok(snapshot) => Ok(FragmentMaintenanceAssignment {
                         fragment: fragment.clone(),
@@ -328,6 +371,9 @@ async fn run_peer_maintenance_worker(
                         },
                         scanned: snapshot.scanned,
                         rewritten: snapshot.rewritten,
+                        repaired_objects: snapshot.repaired_objects,
+                        repaired_shards: snapshot.repaired_shards,
+                        unrecoverable_objects: snapshot.unrecoverable_objects,
                         skipped: snapshot.skipped,
                         failed: snapshot.failed,
                         bytes_processed: snapshot.bytes_processed,
@@ -378,6 +424,9 @@ async fn run_peer_maintenance_worker(
                         assignment.state = snapshot.state;
                         assignment.scanned = snapshot.scanned;
                         assignment.rewritten = snapshot.rewritten;
+                        assignment.repaired_objects = snapshot.repaired_objects;
+                        assignment.repaired_shards = snapshot.repaired_shards;
+                        assignment.unrecoverable_objects = snapshot.unrecoverable_objects;
                         assignment.skipped = snapshot.skipped;
                         assignment.failed = snapshot.failed;
                         assignment.bytes_processed = snapshot.bytes_processed;

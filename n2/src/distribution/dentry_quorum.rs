@@ -22,13 +22,23 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 
-const DENTRY_READ_TIMEOUT: Duration = Duration::from_millis(1_500);
+const DEFAULT_DENTRY_READ_TIMEOUT: Duration = Duration::from_millis(5_000);
+const DENTRY_READ_RETRIES: usize = 4;
+const DENTRY_READ_RETRY_BASE: Duration = Duration::from_millis(25);
+
+fn dentry_read_timeout() -> Duration {
+    std::env::var("N2_NAMESPACE_READ_REMOTE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|millis| Duration::from_millis(millis.clamp(500, 30_000)))
+        .unwrap_or(DEFAULT_DENTRY_READ_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDentryReadRequest {
@@ -91,6 +101,24 @@ pub async fn quorum_get_dentry_with_runtime(
     key: DentryKey,
     parent_layout: DirectoryLayout,
 ) -> Result<Option<NamespaceDentry>, AppError> {
+    let mut attempt = 0usize;
+    loop {
+        match quorum_get_dentry_once_with_runtime(runtime.clone(), key.clone(), parent_layout).await
+        {
+            Err(err) if attempt < DENTRY_READ_RETRIES && is_transient_quorum_read_error(&err) => {
+                attempt = attempt.saturating_add(1);
+                sleep(DENTRY_READ_RETRY_BASE * attempt as u32).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn quorum_get_dentry_once_with_runtime(
+    runtime: Arc<ClusterRuntime>,
+    key: DentryKey,
+    parent_layout: DirectoryLayout,
+) -> Result<Option<NamespaceDentry>, AppError> {
     let partition = virtual_partition(
         &key.fragment,
         &key.parent_directory_id,
@@ -100,23 +128,42 @@ pub async fn quorum_get_dentry_with_runtime(
     let assignment = assignment_for_partition_at_epoch(&runtime, partition, parent_layout.epoch)?;
     let voters = assignment_nodes(&runtime, &assignment)?;
     let required = quorum_required(voters.len());
-    let responses = join_all(voters.into_iter().map(|node| {
-        read_dentry_from_node(
-            runtime.clone(),
-            node,
-            PeerDentryReadRequest {
-                key: key.clone(),
-                parent_layout,
-                assignment: assignment.clone(),
-            },
-        )
-    }))
-    .await;
-    let mut successful = responses
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    for response in &mut successful {
+    let mut responses = FuturesUnordered::new();
+    for node in voters {
+        let runtime = runtime.clone();
+        let assignment = assignment.clone();
+        let key = key.clone();
+        responses.push(tokio::spawn(async move {
+            read_dentry_from_node(
+                runtime,
+                node,
+                PeerDentryReadRequest {
+                    key,
+                    parent_layout,
+                    assignment,
+                },
+            )
+            .await
+        }));
+    }
+    let mut candidates = BTreeMap::new();
+    let mut successful = 0usize;
+    let mut last_error = None;
+    while let Some(result) = responses.next().await {
+        let mut response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => {
+                last_error = Some(AppError::ServiceUnavailable(format!(
+                    "namespace dentry read task failed: {err}"
+                )));
+                continue;
+            }
+        };
+        successful = successful.saturating_add(1);
         if let Some(intent) = response.intent.as_ref() {
             if let Some(certificate) =
                 quorum_read_decision_with_runtime(runtime.clone(), &intent.transaction_id).await?
@@ -125,12 +172,21 @@ pub async fn quorum_get_dentry_with_runtime(
                 replay_committed_partition(intent.clone(), certificate).await?;
             }
         }
+        if let Some(value) = record_quorum_candidate(&mut candidates, response.record, required)? {
+            return Ok(value);
+        }
     }
-    select_quorum_value(
-        successful.into_iter().map(|response| response.record),
-        required,
-        "namespace dentry",
-    )
+    if let Some(err) = last_error {
+        tracing::warn!(
+            successful,
+            required,
+            error = %err,
+            "namespace dentry read voter failed"
+        );
+    }
+    Err(AppError::ServiceUnavailable(format!(
+        "namespace dentry has no identical {required}-voter quorum"
+    )))
 }
 
 pub async fn quorum_list_parent(
@@ -168,29 +224,76 @@ async fn quorum_list_bucket_with_runtime(
     layout: DirectoryLayout,
     bucket: u32,
 ) -> Result<Vec<NamespaceDentry>, AppError> {
+    let mut attempt = 0usize;
+    loop {
+        match quorum_list_bucket_once_with_runtime(
+            runtime.clone(),
+            fragment.clone(),
+            parent_directory_id.clone(),
+            layout,
+            bucket,
+        )
+        .await
+        {
+            Err(err) if attempt < DENTRY_READ_RETRIES && is_transient_quorum_read_error(&err) => {
+                attempt = attempt.saturating_add(1);
+                sleep(DENTRY_READ_RETRY_BASE * attempt as u32).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn quorum_list_bucket_once_with_runtime(
+    runtime: Arc<ClusterRuntime>,
+    fragment: String,
+    parent_directory_id: String,
+    layout: DirectoryLayout,
+    bucket: u32,
+) -> Result<Vec<NamespaceDentry>, AppError> {
     let partition = virtual_partition_for_bucket(&fragment, &parent_directory_id, bucket);
     let assignment = assignment_for_partition_at_epoch(&runtime, partition, layout.epoch)?;
     let voters = assignment_nodes(&runtime, &assignment)?;
     let required = quorum_required(voters.len());
-    let responses = join_all(voters.into_iter().map(|node| {
-        read_bucket_from_node(
-            runtime.clone(),
-            node,
-            PeerDentryBucketRequest {
-                fragment: fragment.clone(),
-                parent_directory_id: parent_directory_id.clone(),
-                layout,
-                bucket,
-                assignment: assignment.clone(),
-            },
-        )
-    }))
-    .await;
-    let mut successful = responses
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    for response in &mut successful {
+    let mut responses = FuturesUnordered::new();
+    for node in voters {
+        let runtime = runtime.clone();
+        let assignment = assignment.clone();
+        let fragment = fragment.clone();
+        let parent_directory_id = parent_directory_id.clone();
+        responses.push(tokio::spawn(async move {
+            read_bucket_from_node(
+                runtime,
+                node,
+                PeerDentryBucketRequest {
+                    fragment,
+                    parent_directory_id,
+                    layout,
+                    bucket,
+                    assignment,
+                },
+            )
+            .await
+        }));
+    }
+    let mut candidates = BTreeMap::new();
+    let mut successful = 0usize;
+    let mut last_error = None;
+    while let Some(result) = responses.next().await {
+        let mut response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => {
+                last_error = Some(AppError::ServiceUnavailable(format!(
+                    "namespace bucket read task failed: {err}"
+                )));
+                continue;
+            }
+        };
+        successful = successful.saturating_add(1);
         for intent in response.intents.clone() {
             if let Some(certificate) =
                 quorum_read_decision_with_runtime(runtime.clone(), &intent.transaction_id).await?
@@ -202,12 +305,21 @@ async fn quorum_list_bucket_with_runtime(
         response
             .entries
             .sort_by(|left, right| left.key.name.cmp(&right.key.name));
+        if let Some(value) = record_quorum_candidate(&mut candidates, response.entries, required)? {
+            return Ok(value);
+        }
     }
-    select_quorum_value(
-        successful.into_iter().map(|response| response.entries),
-        required,
-        "namespace directory bucket",
-    )
+    if let Some(err) = last_error {
+        tracing::warn!(
+            successful,
+            required,
+            error = %err,
+            "namespace bucket read voter failed"
+        );
+    }
+    Err(AppError::ServiceUnavailable(format!(
+        "namespace directory bucket has no identical {required}-voter quorum"
+    )))
 }
 
 async fn read_dentry_from_node(
@@ -228,7 +340,7 @@ async fn read_dentry_from_node(
     if let Some(secret) = cluster_secret() {
         send = send.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(DENTRY_READ_TIMEOUT, send.send())
+    let response = timeout(dentry_read_timeout(), send.send())
         .await
         .map_err(|_| AppError::ServiceUnavailable(format!("dentry read timed out at {}", node.id)))?
         .map_err(|err| {
@@ -264,7 +376,7 @@ async fn read_bucket_from_node(
     if let Some(secret) = cluster_secret() {
         send = send.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(DENTRY_READ_TIMEOUT, send.send())
+    let response = timeout(dentry_read_timeout(), send.send())
         .await
         .map_err(|_| AppError::ServiceUnavailable(format!("bucket read timed out at {}", node.id)))?
         .map_err(|err| {
@@ -348,36 +460,59 @@ async fn quorum_read_decision_with_runtime(
         decision_partition: partition,
         assignment: assignment.clone(),
     };
-    let responses = join_all(
-        voters
-            .into_iter()
-            .map(|node| read_decision_from_node(runtime.clone(), node, request.clone())),
-    )
-    .await;
     let mut candidates: BTreeMap<Vec<u8>, (Option<NamespaceCommitDecision>, Vec<String>)> =
         BTreeMap::new();
-    for response in responses.into_iter().filter_map(Result::ok) {
+    let mut responses = FuturesUnordered::new();
+    for node in voters {
+        let runtime = runtime.clone();
+        let request = request.clone();
+        responses.push(tokio::spawn(async move {
+            read_decision_from_node(runtime, node, request).await
+        }));
+    }
+    let mut last_error = None;
+    while let Some(result) = responses.next().await {
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => {
+                last_error = Some(AppError::ServiceUnavailable(format!(
+                    "namespace decision read task failed: {err}"
+                )));
+                continue;
+            }
+        };
         let encoded = rmp_serde::to_vec_named(&response.decision)?;
         let candidate = candidates
             .entry(encoded)
             .or_insert_with(|| (response.decision.clone(), Vec::new()));
         candidate.1.push(response.node_id);
+        if candidate.1.len() >= required {
+            return Ok(candidate
+                .0
+                .clone()
+                .map(|decision| NamespaceCommitCertificate {
+                    decision_partition: partition,
+                    assignment,
+                    decision,
+                    acknowledged_voters: candidate.1.clone(),
+                }));
+        }
     }
-    let Some((decision, acknowledged_voters)) = candidates
-        .into_values()
-        .filter(|(_, voters)| voters.len() >= required)
-        .max_by_key(|(_, voters)| voters.len())
-    else {
-        return Err(AppError::ServiceUnavailable(format!(
-            "namespace transaction decision has no identical {required}-voter quorum"
-        )));
-    };
-    Ok(decision.map(|decision| NamespaceCommitCertificate {
-        decision_partition: partition,
-        assignment,
-        decision,
-        acknowledged_voters,
-    }))
+    if let Some(err) = last_error {
+        tracing::warn!(
+            transaction_id,
+            required,
+            error = %err,
+            "namespace decision read voter failed"
+        );
+    }
+    Err(AppError::ServiceUnavailable(format!(
+        "namespace transaction decision has no identical {required}-voter quorum"
+    )))
 }
 
 async fn read_decision_from_node(
@@ -398,7 +533,7 @@ async fn read_decision_from_node(
     if let Some(secret) = cluster_secret() {
         send = send.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(DENTRY_READ_TIMEOUT, send.send())
+    let response = timeout(dentry_read_timeout(), send.send())
         .await
         .map_err(|_| AppError::ServiceUnavailable("decision read timed out".into()))?
         .map_err(|err| AppError::ServiceUnavailable(format!("decision read failed: {err}")))?;
@@ -528,6 +663,7 @@ fn validate_assignment(
     Ok(())
 }
 
+#[cfg(test)]
 fn select_quorum_value<T>(
     values: impl IntoIterator<Item = T>,
     required: usize,
@@ -552,6 +688,36 @@ where
                 "{label} has no identical {required}-voter quorum"
             ))
         })
+}
+
+fn record_quorum_candidate<T>(
+    candidates: &mut BTreeMap<Vec<u8>, (T, usize)>,
+    value: T,
+    required: usize,
+) -> Result<Option<T>, AppError>
+where
+    T: Clone + Serialize,
+{
+    let encoded = rmp_serde::to_vec_named(&value)?;
+    let candidate = candidates.entry(encoded).or_insert((value, 0));
+    candidate.1 = candidate.1.saturating_add(1);
+    if candidate.1 >= required {
+        Ok(Some(candidate.0.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_transient_quorum_read_error(err: &AppError) -> bool {
+    match err {
+        AppError::ServiceUnavailable(message) => {
+            message.contains("no identical")
+                || message.contains("timed out")
+                || message.contains("failed at")
+                || message.contains("task failed")
+        }
+        _ => false,
+    }
 }
 
 async fn peer_read_dentry(

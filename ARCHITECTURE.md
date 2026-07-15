@@ -63,6 +63,10 @@ The N2 1.0 storage model is defined by these rules:
 - every version records the exact membership epoch, EC shape, and shard
   placement that wrote it;
 - adding nodes does not invalidate or automatically rewrite old objects;
+- automatic healing restores recorded placement only and never changes an
+  object's EC shape, membership epoch, or immutable version;
+- redistribution is explicit immutable re-encoding; topology growth never
+  invokes it automatically;
 - no `.cluster`, `.namespace`, `.blobs`, `.nmtd`, `.ndx`, or mutable latest
   pointer exists in the accepted disk format.
 
@@ -391,7 +395,8 @@ Every object version records its resolved layout. Therefore:
 N2 maintenance uses immutable version metadata and recorded placement:
 
 - object status verifies shard availability and reports layout age;
-- read-on-recover reconstructs a readable result without mutating namespace;
+- recover-on-read serves a reconstructable result first and schedules an
+  idempotent background shard repair without mutating namespace;
 - object repair restores missing or corrupt shards for the recorded layout;
 - object redistribution rewrites one selected object/version into the current
   layout;
@@ -422,8 +427,8 @@ continue.
 Distributed maintenance routes:
 
 ```text
-POST /n2/cluster/maintenance/distributed/start
-GET  /n2/cluster/maintenance/distributed/status
+POST /noa/v1/cluster/maintenance/distributed/start
+GET  /noa/v1/cluster/maintenance/distributed/status
 ```
 
 Supported kinds:
@@ -442,9 +447,41 @@ healthy + older_recorded_layout
 
 Health and topology age are separate facts.
 
+### Autonomous Fragment Healing
+
+N2 1.1.0 runs the same scheduler on every node without appointing a permanent
+cluster leader. Reachable nodes are ranked deterministically into a bounded HA
+healer pool. Each stable fragment is then assigned to exactly one pool member
+by rendezvous hashing.
+
+Before work starts, the owner must acquire a lease from the bounded namespace
+voter group derived for that stable fragment. A quorum grant prevents two
+different liveness views from repairing the same fragment concurrently. Lease
+expiry permits failover after a coordinator stops. Work duration is bounded
+below the lease lifetime.
+
+```text
+8 reachable nodes
+  -> configured/automatic pool of 4 healers
+  -> fragment F1 owner node-b + quorum lease
+  -> fragment F2 owner node-f + quorum lease
+  -> other nodes remain shard read/write repair participants
+```
+
+Each owner scans its fragments with a persisted continuation token. Independent
+fragments can run in parallel, but repair is bounded globally, per fragment,
+and per object. Availability cycles are cheap; periodic checksum cycles detect
+readable corruption. Restart resumes the cursor, and repeating a repair is
+safe because shard publication is atomic and checksum-verified.
+
+This controller never selects the current topology for repair. It restores the
+EC set recorded in `.ncdx`. Rebalance alone may re-encode into the current
+layout and publish a new immutable version.
+
 ## Proof Status
 
-The 1.0.0 architecture has both unit proof and live-node proof.
+The 1.0.0 architecture has both unit proof and live-node proof. N2 1.1.0 also
+has a bounded three-process/four-disk proof for NOA and autonomous healing.
 
 Unit proof covers immutable dentry transactions, generation conflicts, O(1)
 directory rename, trash/restore identity, strict quorum selection,
@@ -457,6 +494,17 @@ under `/home/wlzambo/DEV-TEST/n2-maintenance-proof-20260708`. The tested build
 passed object repair, fragment repair, global distributed repair, fragment and
 global redistribution, 4->3->4 topology movement, namespace race hardening,
 trash/recover, final SHA-256 content verification, and per-fragment monitoring.
+
+The July 15, 2026 N2 1.1.0 proof is recorded under
+`/home/wlzambo/DEV-TEST/n2-1.1.0-noa-healing-proof-20260715-1655`. Three
+isolated N2 processes each used dedicated test directories on all four physical
+XFS disks. It passed NOA CRUD, multipart restart, POSIX namespace operations,
+soft-delete recovery, concurrent namespace mutation, quorum-leased
+single-owner healing, recorded-layout preservation, recover-on-read,
+restart-persisted scan progress, two-of-three node operation, explicit object
+redistribution, fragment rebalance, and final SHA-256 verification. The proof
+did not soak the engine and did not represent three independent physical host
+failure domains.
 
 One important boundary remains intentionally enforced: a four-node cluster
 reduced to two arbitrary survivors can read objects that still have enough
@@ -492,7 +540,7 @@ Multipart coordinator ownership remains a client-visible N2 rule.
 
 ## Monitoring And IO Control
 
-`/n2/cluster/monitor` and native `cluster.monitor` report:
+`/noa/v1/cluster/monitor` and native `cluster.monitor` report:
 
 - cluster overview;
 - node health and resource state;
@@ -504,7 +552,7 @@ Multipart coordinator ownership remains a client-visible N2 rule.
 - namespace voter, partition, transaction, and placement-epoch state;
 - active upload activity.
 
-Explicit `/n2/cluster/usage` performs the more expensive disk aggregation and
+Explicit `/noa/v1/cluster/usage` performs the more expensive disk aggregation and
 should be operator-driven rather than polled continuously.
 
 N2 protects mixed hardware through:
@@ -525,7 +573,7 @@ truth, or namespace authority.
 
 N2 exposes:
 
-- `/n2/...` HTTPS for browsers and general clients;
+- `/noa/v1/...` HTTPS for browsers and general clients;
 - `n2://` for N2-native tools, shard transport, and node-to-node operations.
 
 The two transports call the same storage and namespace rules. The native

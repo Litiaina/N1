@@ -287,7 +287,7 @@ pub async fn start_garbage_collector_job(
     };
     if GC_RUNNING.swap(true, Ordering::SeqCst) {
         return Err(AppError::Conflict(
-            "GC is already running. Check /n2/maintenance/gc/status.".to_string(),
+            "GC is already running. Check /noa/v1/maintenance/gc/status.".to_string(),
         ));
     }
     GC_STOP_SIGNAL.store(false, Ordering::Relaxed);

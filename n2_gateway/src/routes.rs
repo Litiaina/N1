@@ -29,37 +29,49 @@ pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/gateway/health", get(gateway_health))
         .route("/gateway/nodes", get(gateway_nodes))
-        .route("/ws", get(websocket_proxy))
-        .route("/n2/auth/fragment", post(auth_fragment))
-        .route("/n2/fragments", post(create_fragment))
-        .route("/n2/cluster/rebalance/start", post(cluster_rebalance_start))
+        .route("/noa/v1/ws", get(websocket_proxy))
+        .route("/noa/v1/auth/fragment", post(auth_fragment))
+        .route("/noa/v1/fragments", post(create_fragment))
         .route(
-            "/n2/cluster/rebalance/status",
+            "/noa/v1/cluster/rebalance/start",
+            post(cluster_rebalance_start),
+        )
+        .route(
+            "/noa/v1/cluster/rebalance/status",
             get(cluster_rebalance_status),
         )
-        .route("/n2/cluster/rebalance/stop", post(cluster_rebalance_stop))
-        .route("/n2/cluster/repair/start", post(cluster_repair_start))
-        .route("/n2/cluster/repair/status", get(cluster_repair_status))
-        .route("/n2/cluster/repair/stop", post(cluster_repair_stop))
         .route(
-            "/n2/upload/multipart/init/{*object_key}",
+            "/noa/v1/cluster/rebalance/stop",
+            post(cluster_rebalance_stop),
+        )
+        .route("/noa/v1/cluster/repair/start", post(cluster_repair_start))
+        .route("/noa/v1/cluster/repair/status", get(cluster_repair_status))
+        .route("/noa/v1/cluster/repair/stop", post(cluster_repair_stop))
+        .route(
+            "/noa/v1/upload/multipart/init/{*object_key}",
             post(multipart_init),
         )
         .route(
-            "/n2/upload/multipart/{version_id}/{part_index}",
+            "/noa/v1/upload/multipart/{version_id}/{part_index}",
             put(multipart_put_part),
         )
         .route(
-            "/n2/upload/multipart/{version_id}/{session_id}/finalize",
+            "/noa/v1/upload/multipart/{version_id}/{session_id}/finalize",
             post(multipart_finalize),
         )
-        .route("/n2/upload/multipart/{version_id}", get(multipart_status))
         .route(
-            "/n2/upload/multipart/{version_id}",
+            "/noa/v1/upload/multipart/{version_id}",
+            get(multipart_status),
+        )
+        .route(
+            "/noa/v1/upload/multipart/{version_id}",
             delete(multipart_cancel),
         )
-        .route("/n2/upload/one-shot/{*object_key}", post(one_shot_upload))
-        .route("/n2/objects/download", get(download_object))
+        .route(
+            "/noa/v1/upload/one-shot/{*object_key}",
+            post(one_shot_upload),
+        )
+        .route("/noa/v1/objects/download", get(download_object))
         .fallback(proxy_fallback)
         .layer(build_cors_layer())
         .with_state(state)
@@ -116,7 +128,7 @@ fn websocket_upstream_url(http_url: &str, uri: &axum::http::Uri) -> Result<Strin
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
-        .unwrap_or("/ws");
+        .unwrap_or("/noa/v1/ws");
     Ok(format!("{}{path_and_query}", base.trim_end_matches('/')))
 }
 
@@ -332,7 +344,7 @@ async fn auth_fragment(
     let mut last_error: Option<Response<Body>> = None;
 
     for node in nodes {
-        match post_json_to_node(&state, &node, "/n2/auth/fragment", &payload).await {
+        match post_json_to_node(&state, &node, "/noa/v1/auth/fragment", &payload).await {
             Ok((status, body)) if status.is_success() => {
                 state.nodes.mark_route(&node.id).await;
                 return json_response_value(status, body);
@@ -367,7 +379,7 @@ async fn create_fragment(
         Ok(node) => node,
         Err(response) => return response,
     };
-    match post_json_to_node(&state, &node, "/n2/fragments", &payload).await {
+    match post_json_to_node(&state, &node, "/noa/v1/fragments", &payload).await {
         Ok((status, body)) => {
             if status.is_success() {
                 state.nodes.mark_route(&node.id).await;
@@ -791,17 +803,17 @@ async fn node_for_proxy_path(
     state: &GatewayState,
     path: &str,
 ) -> Result<NodeConfig, Response<Body>> {
-    if path == "/n2/objects/signed-url"
-        || path == "/n2/objects/signed-read"
-        || path.starts_with("/n2/objects/status/")
-        || path.starts_with("/n2/objects/repair/")
-        || path.starts_with("/n2/objects/get/")
-        || path.starts_with("/n2/objects/stream/")
-        || path == "/n2/trash"
-        || path == "/n2/objects"
-        || path.starts_with("/n2/posix/")
-        || path.starts_with("/n2/objects/versions/")
-        || path.starts_with("/n2/objects/meta/")
+    if path == "/noa/v1/objects/signed-url"
+        || path == "/noa/v1/objects/signed-read"
+        || path.starts_with("/noa/v1/objects/status/")
+        || path.starts_with("/noa/v1/objects/repair/")
+        || path.starts_with("/noa/v1/objects/get/")
+        || path.starts_with("/noa/v1/objects/stream/")
+        || path == "/noa/v1/trash"
+        || path == "/noa/v1/objects"
+        || path.starts_with("/noa/v1/posix/")
+        || path.starts_with("/noa/v1/objects/versions/")
+        || path.starts_with("/noa/v1/objects/meta/")
     {
         return preferred_node(state, read_preferred_node_id().as_str()).await;
     }
@@ -1176,7 +1188,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/n2/upload/multipart/init/videos/test.mp4")
+                    .uri("/noa/v1/upload/multipart/init/videos/test.mp4")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
@@ -1205,7 +1217,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/objects/download?object_key=present")
+                    .uri("/noa/v1/objects/download?object_key=present")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1222,7 +1234,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/objects/download?object_key=missing")
+                    .uri("/noa/v1/objects/download?object_key=missing")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1248,7 +1260,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/n2/upload/multipart/ver-a/0?crc32=123&coordinator_node_id=node-a")
+                    .uri("/noa/v1/upload/multipart/ver-a/0?crc32=123&coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_LENGTH, "5")
                     .body(Body::from("hello"))
@@ -1263,7 +1275,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/upload/multipart/ver-a?coordinator_node_id=node-a")
+                    .uri("/noa/v1/upload/multipart/ver-a?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1277,7 +1289,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/n2/upload/multipart/ver-a/sess-a/finalize?coordinator_node_id=node-a")
+                    .uri(
+                        "/noa/v1/upload/multipart/ver-a/sess-a/finalize?coordinator_node_id=node-a",
+                    )
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
@@ -1291,7 +1305,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/n2/upload/multipart/ver-a?coordinator_node_id=node-a")
+                    .uri("/noa/v1/upload/multipart/ver-a?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1328,7 +1342,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/upload/multipart/ver-a")
+                    .uri("/noa/v1/upload/multipart/ver-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1354,7 +1368,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/upload/multipart/ver-a?coordinator_node_id=node-a")
+                    .uri("/noa/v1/upload/multipart/ver-a?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1376,7 +1390,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/n2/cluster/rebalance/start")
+                    .uri("/noa/v1/cluster/rebalance/start")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"fragment":"frag","mismatched_only":true}"#))
@@ -1395,7 +1409,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/cluster/rebalance/status?coordinator_node_id=node-a")
+                    .uri("/noa/v1/cluster/rebalance/status?coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1408,7 +1422,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/n2/cluster/rebalance/status")
+                    .uri("/noa/v1/cluster/rebalance/status")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1429,7 +1443,7 @@ mod tests {
         for method in [Method::GET, Method::HEAD] {
             let request = Request::builder()
                 .method(method.clone())
-                .uri("/n2/objects/stream/video.mp4?version=latest")
+                .uri("/noa/v1/objects/stream/video.mp4?version=latest")
                 .header(header::AUTHORIZATION, "Bearer token")
                 .body(Body::empty())
                 .unwrap();
@@ -1455,7 +1469,7 @@ mod tests {
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             let request = Request::builder()
                 .method(method)
-                .uri("/n2/objects")
+                .uri("/noa/v1/objects")
                 .body(Body::from("mutation"))
                 .unwrap();
             assert!(replay_safe_proxy_template(&request).is_none());
@@ -1464,14 +1478,14 @@ mod tests {
 
     #[test]
     fn websocket_upstream_url_preserves_the_authenticated_path_and_query() {
-        let uri = "/ws?token=header.payload.signature".parse().unwrap();
+        let uri = "/noa/v1/ws?token=header.payload.signature".parse().unwrap();
         assert_eq!(
             websocket_upstream_url("https://10.0.0.2:53101/", &uri).unwrap(),
-            "wss://10.0.0.2:53101/ws?token=header.payload.signature"
+            "wss://10.0.0.2:53101/noa/v1/ws?token=header.payload.signature"
         );
         assert_eq!(
             websocket_upstream_url("http://127.0.0.1:53101", &uri).unwrap(),
-            "ws://127.0.0.1:53101/ws?token=header.payload.signature"
+            "ws://127.0.0.1:53101/noa/v1/ws?token=header.payload.signature"
         );
     }
 

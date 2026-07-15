@@ -11,17 +11,25 @@ For production service setup, systemd templates, and validation order, see
 ## Status
 
 N2 `1.0.0` is the architecture-final line for the distributed object storage
-system. That means the core shape is set: `/n2/...` HTTP API, `n2://` native
-protocol, immutable blob and `.ncdx` records, native partitioned namespace
-coordination, cluster monitoring, repair, rebalance, and N2 console/shell
+system. N2 `1.1.0` preserves that storage contract while standardizing the
+public surface as NOA v1 and adding autonomous distributed healing. The core
+shape remains: `/noa/v1/...` HTTP API, `n2://` native protocol, immutable blob
+and `.ncdx` records, native partitioned namespace coordination, cluster
+monitoring, recorded-layout repair, explicit rebalance, and N2 console/shell
 flows.
 
 The July 8, 2026 four-node proof passed object repair, fragment repair, global
 repair, redistribution, 4->3->4 topology movement, namespace race hardening,
 trash/recover, content SHA verification, and final per-fragment monitoring.
-This is the 1.0.0 architecture lock, not an LTS claim. Long soak, larger
-cluster proof, namespace voter migration, and wider UI viewport proof remain
-validation and hardening work.
+The July 15, 2026 bounded N2 1.1.0 proof passed NOA CRUD, multipart restart,
+POSIX namespace operations, quorum-leased recorded-layout healing,
+recover-on-read, healing progress across restart, two-of-three node operation,
+explicit object redistribution, fragment rebalance, and final content SHA
+verification. The three test nodes were isolated processes on one four-disk
+physical server. This is architectural correctness evidence, not an LTS or
+soak claim. Independent-host N2 1.1.0 failure testing, larger cluster proof,
+namespace voter migration, and wider UI viewport proof remain validation and
+hardening work.
 
 ## What N2 Is
 
@@ -240,6 +248,17 @@ cleanup_interval_seconds=3600
 file_ttl_seconds=3600
 retention_seconds=2592000
 
+[auto_healing]
+enabled=true
+initial_delay_seconds=30
+scan_interval_seconds=900
+coordinator_nodes=auto
+max_parallel_fragments=2
+max_objects_per_fragment_cycle=256
+max_duration_seconds=30
+lease_seconds=90
+checksum_scan_every_cycles=24
+
 [set_limits]
 max_file_size=5368709120
 
@@ -291,6 +310,15 @@ Notes:
 - `auto_rebalance=false` means new objects adapt to the current bounded
   layout, while old objects stay in their recorded layout until manual
   rebalance.
+- `auto_rebalance=true` is rejected. Redistribution is always an explicit
+  operation because older recorded layouts remain valid object truth.
+- `[auto_healing]` controls bounded, restart-resumable scanning. `coordinator_nodes=auto`
+  selects half of the reachable nodes as an HA healer pool; one quorum lease
+  owns each stable fragment at a time.
+- Availability cycles detect missing/unreadable shards cheaply. Every
+  `checksum_scan_every_cycles` cycle performs full checksum verification.
+- `lease_seconds` is raised at runtime when necessary so it is always longer
+  than twice the configured per-fragment work budget.
 - N2 uses cluster capacity monitoring and physical free-space admission.
   Per-fragment business limits belong above N2 when needed.
 
@@ -505,9 +533,9 @@ Start `litiaina-n2` on every node.
 Validate process liveness:
 
 ```bash
-curl -k https://192.168.0.22:50001/n2/ping
-curl -k https://192.168.0.13:50001/n2/ping
-curl -k https://192.168.0.18:50001/n2/ping
+curl -k https://192.168.0.22:50001/noa/v1/ping
+curl -k https://192.168.0.13:50001/noa/v1/ping
+curl -k https://192.168.0.18:50001/noa/v1/ping
 ```
 
 Validate native ports from the gateway host:
@@ -521,7 +549,7 @@ nc -vz 192.168.0.18 50002
 After authenticating, validate cluster health from any node:
 
 ```bash
-curl -k https://192.168.0.22:50001/n2/cluster/health \
+curl -k https://192.168.0.22:50001/noa/v1/cluster/health \
   -H "Authorization: Bearer $N2_TOKEN"
 ```
 
@@ -581,7 +609,7 @@ Create fragments, authenticate, upload, list, download, repair, and rebalance
 through the gateway endpoint:
 
 ```bash
-curl -k https://gateway.example.com:51002/n2/ping
+curl -k https://gateway.example.com:51002/noa/v1/ping
 curl -k https://gateway.example.com:51002/gateway/health
 ```
 
@@ -619,7 +647,7 @@ Authorization: Bearer <access_token>
 Create a fragment access token:
 
 ```http
-POST /n2/auth/fragment
+POST /noa/v1/auth/fragment
 Content-Type: application/json
 ```
 
@@ -663,7 +691,7 @@ Response:
 Refresh:
 
 ```http
-POST /n2/auth/refresh
+POST /noa/v1/auth/refresh
 Content-Type: application/json
 ```
 
@@ -676,7 +704,7 @@ Content-Type: application/json
 Logout refresh token:
 
 ```http
-POST /n2/auth/logout
+POST /noa/v1/auth/logout
 Content-Type: application/json
 ```
 
@@ -708,18 +736,18 @@ Binary download routes return object bytes. JSON routes return JSON.
 ### Ping
 
 ```http
-GET /n2/ping
+GET /noa/v1/ping
 ```
 
 Use this as the simplest process-level liveness check. Cluster-level readiness
-uses `/n2/cluster/health`.
+uses `/noa/v1/cluster/health`.
 
 ## Fragment API
 
 ### Create Fragment
 
 ```http
-POST /n2/fragments
+POST /noa/v1/fragments
 Content-Type: application/json
 ```
 
@@ -749,7 +777,7 @@ Response:
 ### List Fragments
 
 ```http
-GET /n2/fragments
+GET /noa/v1/fragments
 Authorization: Bearer <token>
 ```
 
@@ -758,7 +786,7 @@ Requires `read`.
 ### Update Fragment
 
 ```http
-PATCH /n2/fragments/{fragment}
+PATCH /noa/v1/fragments/{fragment}
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -782,7 +810,7 @@ Rules:
 ### Delete Fragment
 
 ```http
-DELETE /n2/fragments/{fragment}
+DELETE /noa/v1/fragments/{fragment}
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -801,8 +829,8 @@ Requires token `delete` and `MASTER_KEY`.
 ### Fragment Check And Hash
 
 ```http
-GET /n2/fragments/check
-GET /n2/fragments/hash
+GET /noa/v1/fragments/check
+GET /noa/v1/fragments/hash
 ```
 
 Body:
@@ -823,7 +851,7 @@ fragment, authenticate it, then use the returned token.
 Use for smaller files and simple clients.
 
 ```http
-POST /n2/upload/one-shot/{object_key}?durability=auto
+POST /noa/v1/upload/one-shot/{object_key}?durability=auto
 Authorization: Bearer <token>
 Content-Type: video/mp4
 Content-Length: <bytes>
@@ -844,7 +872,7 @@ Example:
 
 ```bash
 curl -k -X POST \
-  "https://127.0.0.1:50001/n2/upload/one-shot/videos/sample.mp4" \
+  "https://127.0.0.1:50001/noa/v1/upload/one-shot/videos/sample.mp4" \
   -H "$AUTH_HEADER" \
   -H "Content-Type: video/mp4" \
   --data-binary @sample.mp4
@@ -872,7 +900,7 @@ Response is object metadata:
 Use for large files and resumable uploads.
 
 ```http
-POST /n2/upload/multipart/init/{object_key}
+POST /noa/v1/upload/multipart/init/{object_key}
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -905,7 +933,7 @@ When using N2 Gateway, include `coordinator_node_id` as a query field or
 ### Multipart Put Part
 
 ```http
-PUT /n2/upload/multipart/{version_id}/{part_index}
+PUT /noa/v1/upload/multipart/{version_id}/{part_index}
 Authorization: Bearer <token>
 Content-Length: <part-bytes>
 ```
@@ -926,7 +954,7 @@ Example:
 
 ```bash
 curl -k -X PUT \
-  "https://node-a:50001/n2/upload/multipart/$VERSION_ID/0" \
+  "https://node-a:50001/noa/v1/upload/multipart/$VERSION_ID/0" \
   -H "$AUTH_HEADER" \
   --data-binary @part-000
 ```
@@ -936,7 +964,7 @@ Returns `200 OK` when accepted.
 ### Multipart Status
 
 ```http
-GET /n2/upload/multipart/{version_id}?coordinator_node_id=node-a
+GET /noa/v1/upload/multipart/{version_id}?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -958,14 +986,14 @@ Response:
 ### List Active Uploads
 
 ```http
-GET /n2/upload/multipart?limit=100
+GET /noa/v1/upload/multipart?limit=100
 Authorization: Bearer <token>
 ```
 
 ### Multipart Finalize
 
 ```http
-POST /n2/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/mhw.mp4&coordinator_node_id=node-a
+POST /noa/v1/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/mhw.mp4&coordinator_node_id=node-a
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -996,7 +1024,7 @@ binding.
 ### Multipart Cancel
 
 ```http
-DELETE /n2/upload/multipart/{version_id}?object_key=videos/mhw.mp4&coordinator_node_id=node-a
+DELETE /noa/v1/upload/multipart/{version_id}?object_key=videos/mhw.mp4&coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -1008,7 +1036,7 @@ binding when possible.
 ### List Objects
 
 ```http
-GET /n2/objects?prefix=videos/&delimiter=/&limit=200&continuation_token=...
+GET /noa/v1/objects?prefix=videos/&delimiter=/&limit=200&continuation_token=...
 Authorization: Bearer <token>
 ```
 
@@ -1022,14 +1050,14 @@ Query fields:
 ### List Trash
 
 ```http
-GET /n2/trash?prefix=videos/&limit=200
+GET /noa/v1/trash?prefix=videos/&limit=200
 Authorization: Bearer <token>
 ```
 
 ### List Versions
 
 ```http
-GET /n2/objects/versions/{object_key}
+GET /noa/v1/objects/versions/{object_key}
 Authorization: Bearer <token>
 ```
 
@@ -1039,15 +1067,15 @@ live version by ULID/version order.
 ### Metadata
 
 ```http
-GET /n2/objects/meta/{object_key}
+GET /noa/v1/objects/meta/{object_key}
 Authorization: Bearer <token>
 ```
 
 ### Object Bytes
 
 ```http
-GET /n2/objects/get/{object_key}
-GET /n2/objects/stream/{object_key}
+GET /noa/v1/objects/get/{object_key}
+GET /noa/v1/objects/stream/{object_key}
 Authorization: Bearer <token>
 ```
 
@@ -1056,7 +1084,7 @@ Range reads use normal HTTP `Range` headers where supported by the route.
 ### Download
 
 ```http
-GET /n2/objects/download?object_key=videos/mhw.mp4&filename=mhw.mp4
+GET /noa/v1/objects/download?object_key=videos/mhw.mp4&filename=mhw.mp4
 Authorization: Bearer <token>
 ```
 
@@ -1069,7 +1097,7 @@ Query fields:
 ### Download Chunk
 
 ```http
-GET /n2/objects/download/chunk?object_key=videos/mhw.mp4&offset=0&chunk_size=8388608
+GET /noa/v1/objects/download/chunk?object_key=videos/mhw.mp4&offset=0&chunk_size=8388608
 Authorization: Bearer <token>
 ```
 
@@ -1087,27 +1115,27 @@ parallelism.
 Mint signed URL:
 
 ```http
-POST /n2/objects/signed-url
+POST /noa/v1/objects/signed-url
 Authorization: Bearer <token>
 ```
 
 Read signed URL:
 
 ```http
-GET /n2/objects/signed-read?token=...
+GET /noa/v1/objects/signed-read?token=...
 ```
 
 Signed read is for temporary read access without exposing a fragment token.
 
 ## Namespace API
 
-N2 exposes POSIX-style namespace commands under `/n2/posix/...`. This is object
+N2 exposes POSIX-style namespace commands under `/noa/v1/posix/...`. This is object
 namespace control, not an operating-system filesystem.
 
 ### List Directory
 
 ```http
-GET /n2/posix/list?path=videos&limit=200&trash=false&continuation_token=...
+GET /noa/v1/posix/list?path=videos&limit=200&trash=false&continuation_token=...
 Authorization: Bearer <token>
 ```
 
@@ -1134,14 +1162,14 @@ Response:
 ### Stat Path
 
 ```http
-GET /n2/posix/stat?path=videos/mhw.mp4&trash=false
+GET /noa/v1/posix/stat?path=videos/mhw.mp4&trash=false
 Authorization: Bearer <token>
 ```
 
 ### Make Directory
 
 ```http
-POST /n2/posix/mkdir
+POST /noa/v1/posix/mkdir
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1155,8 +1183,8 @@ Content-Type: application/json
 ### Rename Or Move
 
 ```http
-POST /n2/posix/rename
-POST /n2/posix/move
+POST /noa/v1/posix/rename
+POST /noa/v1/posix/move
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1173,7 +1201,7 @@ Rename and move are namespace mutations. They do not rewrite object payloads.
 ### Trash
 
 ```http
-POST /n2/posix/trash
+POST /noa/v1/posix/trash
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1187,7 +1215,7 @@ Content-Type: application/json
 ### Recover
 
 ```http
-POST /n2/posix/recover
+POST /noa/v1/posix/recover
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1213,7 +1241,7 @@ These routes are object-oriented aliases around the same namespace truth.
 ### Rename Object
 
 ```http
-POST /n2/objects/rename
+POST /noa/v1/objects/rename
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1233,44 +1261,22 @@ fragment.
 ### Trash Object
 
 ```http
-DELETE /n2/objects/{object_key}
+DELETE /noa/v1/objects/{object_key}
 Authorization: Bearer <token>
 ```
 
 ### Recover Object
 
 ```http
-POST /n2/objects/recover/{object_key}
+POST /noa/v1/objects/recover/{object_key}
 Authorization: Bearer <token>
 ```
 
-### Permanent Delete Object
+### Bulk Delete And Recover
 
 ```http
-DELETE /n2/objects/permanent/{object_key}
-Authorization: Bearer <token>
-```
-
-### Delete Version
-
-```http
-DELETE /n2/objects/version/{version_id}/{object_key}
-Authorization: Bearer <token>
-```
-
-### Recover Version
-
-```http
-POST /n2/objects/recover/version/{version_id}/{object_key}
-Authorization: Bearer <token>
-```
-
-### Bulk Delete, Recover, Purge
-
-```http
-POST /n2/objects/bulk-delete
-POST /n2/objects/bulk-recover
-POST /n2/objects/permanent/bulk-delete
+POST /noa/v1/objects/bulk-delete
+POST /noa/v1/objects/bulk-recover
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1309,7 +1315,7 @@ is removed by lifecycle/GC after namespace reachability checks.
 ### Object Status
 
 ```http
-GET /n2/objects/status/{object_key}?mode=availability&version_id=01KS...
+GET /noa/v1/objects/status/{object_key}?mode=availability&version_id=01KS...
 Authorization: Bearer <token>
 ```
 
@@ -1366,7 +1372,7 @@ failure; it is eligible for operator-controlled redistribution.
 ### Object Repair
 
 ```http
-POST /n2/objects/repair/{object_key}?mode=scrub
+POST /noa/v1/objects/repair/{object_key}?mode=scrub
 Authorization: Bearer <token>
 ```
 
@@ -1375,7 +1381,7 @@ Requires `write` and `modify`.
 ### Object Redistribution
 
 ```http
-POST /n2/objects/redistribute/{object_key}?version_id=01KS...&dry_run=false&force=false
+POST /noa/v1/maintenance/objects/redistribution/start/{object_key}?version_id=01KS...&dry_run=false&force=false
 Authorization: Bearer <token>
 ```
 
@@ -1419,7 +1425,7 @@ Response:
 ### Selected Archive
 
 ```http
-POST /n2/objects/archive
+POST /noa/v1/objects/archive
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1441,7 +1447,7 @@ Body:
 ### Manifest Archive
 
 ```http
-POST /n2/objects/archive/manifest?format=tar&filename=export.tar
+POST /noa/v1/objects/archive/manifest?format=tar&filename=export.tar
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1453,7 +1459,7 @@ Body is a manifest accepted by the archive implementation.
 ### Node Capacity Usage
 
 ```http
-GET /n2/capacity/usage
+GET /noa/v1/capacity/usage
 Authorization: Bearer <token>
 ```
 
@@ -1469,14 +1475,14 @@ This records monitoring metadata only in N2. It does not block uploads.
 ### Membership
 
 ```http
-GET /n2/cluster/membership
+GET /noa/v1/cluster/membership
 Authorization: Bearer <token>
 ```
 
 ### Layout
 
 ```http
-GET /n2/cluster/layout
+GET /noa/v1/cluster/layout
 Authorization: Bearer <token>
 ```
 
@@ -1492,7 +1498,7 @@ Response includes:
 ### Health
 
 ```http
-GET /n2/cluster/health
+GET /noa/v1/cluster/health
 Authorization: Bearer <token>
 ```
 
@@ -1501,7 +1507,7 @@ Cluster health summarizes membership, layout, node state, and cluster readiness.
 ### Detailed Cluster Monitor
 
 ```http
-GET /n2/cluster/monitor?fragment=n2-test&object_limit=96
+GET /noa/v1/cluster/monitor?fragment=n2-test&object_limit=96
 Authorization: Bearer <token>
 ```
 
@@ -1547,14 +1553,14 @@ Response sections:
   namespace-consensus notes.
 - `uploads`: aggregate active/stale multipart activity reported by nodes.
 
-Normal console polling should use `/n2/cluster/monitor`. Use
-`/n2/cluster/usage` only when an operator explicitly requests disk/fragment
+Normal console polling should use `/noa/v1/cluster/monitor`. Use
+`/noa/v1/cluster/usage` only when an operator explicitly requests disk/fragment
 usage totals.
 
 ### Usage
 
 ```http
-GET /n2/cluster/usage?fragment=n2-test
+GET /noa/v1/cluster/usage?fragment=n2-test
 Authorization: Bearer <token>
 ```
 
@@ -1563,7 +1569,7 @@ short bounded local usage cache so explicit monitoring does not repeatedly walk
 the same disks. Use `refresh=true` when the operator needs a fresh scan.
 
 ```http
-GET /n2/cluster/usage?fragment=n2-test&refresh=true
+GET /noa/v1/cluster/usage?fragment=n2-test&refresh=true
 Authorization: Bearer <token>
 ```
 
@@ -1580,7 +1586,7 @@ cache is cold or refresh is forced.
 ### Placement Preview
 
 ```http
-GET /n2/cluster/placement/preview?fragment=n2-test&object_key=videos/mhw.mp4&version_id=preview
+GET /noa/v1/cluster/placement/preview?fragment=n2-test&object_key=videos/mhw.mp4&version_id=preview
 Authorization: Bearer <token>
 ```
 
@@ -1590,7 +1596,7 @@ and layout.
 ### Membership Reload
 
 ```http
-POST /n2/cluster/membership/reload
+POST /noa/v1/cluster/membership/reload
 Authorization: Bearer <token>
 ```
 
@@ -1602,15 +1608,15 @@ implemented. Restart N2 after membership edits.
 ### System Health
 
 ```http
-GET /n2/maintenance/health
+GET /noa/v1/maintenance/health
 Authorization: Bearer <token>
 ```
 
 ### Fragment Storage Init And Cleanup
 
 ```http
-POST /n2/maintenance/fragment/init
-POST /n2/maintenance/fragment/cleanup
+POST /noa/v1/maintenance/fragment/init
+POST /noa/v1/maintenance/fragment/cleanup
 Authorization: Bearer <token>
 ```
 
@@ -1621,17 +1627,17 @@ fragment is already provisioned correctly.
 ### Fragment Health
 
 ```http
-GET /n2/maintenance/fragments/{fragment}/health?mode=availability
+GET /noa/v1/maintenance/fragments/{fragment}/health?mode=availability
 Authorization: Bearer <token>
 ```
 
 ### GC
 
 ```http
-POST /n2/maintenance/gc/start?mode=availability&fast_mode=true
-POST /n2/maintenance/fragments/{fragment}/gc/start?mode=scrub&fast_mode=true
-POST /n2/maintenance/gc/stop
-GET  /n2/maintenance/gc/status
+POST /noa/v1/maintenance/gc/start?mode=availability&fast_mode=true
+POST /noa/v1/maintenance/fragments/{fragment}/gc/start?mode=scrub&fast_mode=true
+POST /noa/v1/maintenance/gc/stop
+GET  /noa/v1/maintenance/gc/status
 Authorization: Bearer <token>
 ```
 
@@ -1641,10 +1647,10 @@ rules allow it.
 ### Repair
 
 ```http
-POST /n2/maintenance/repair/start?mode=availability&fast_mode=true
-POST /n2/maintenance/fragments/{fragment}/repair/start?mode=scrub&fast_mode=false
-POST /n2/maintenance/repair/stop
-GET  /n2/maintenance/repair/status
+POST /noa/v1/maintenance/repair/start?mode=availability&fast_mode=true
+POST /noa/v1/maintenance/fragments/{fragment}/repair/start?mode=scrub&fast_mode=false
+POST /noa/v1/maintenance/repair/stop
+GET  /noa/v1/maintenance/repair/status
 Authorization: Bearer <token>
 ```
 
@@ -1659,39 +1665,57 @@ Useful query fields:
 ### Redistribution
 
 ```http
-POST /n2/maintenance/redistribution/start?mode=availability&fast_mode=true
-POST /n2/maintenance/fragments/{fragment}/redistribution/start?mode=strict
-POST /n2/maintenance/redistribution/stop
-GET  /n2/maintenance/redistribution/status
+POST /noa/v1/maintenance/redistribution/start?mode=availability&fast_mode=true
+POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start?mode=strict
+POST /noa/v1/maintenance/redistribution/stop
+GET  /noa/v1/maintenance/redistribution/status
 Authorization: Bearer <token>
 ```
 
 Redistribution rewrites objects onto the current local disk layout where
 applicable. Cluster-level rebalance is covered below.
 
-### Trash Job Status
+## Cluster Repair And Rebalance
+
+Cluster repair and rebalance are deliberately different. Repair reconstructs
+missing or corrupt shards into the immutable placement recorded by the object;
+it does not change EC shape, placement epoch, object version, or namespace.
+Rebalance is an explicit distributed rewrite that commits a new immutable
+version under the current layout.
+
+### Autonomous Healing
 
 ```http
-GET /n2/maintenance/trash/recover/status
-GET /n2/maintenance/trash/empty/status
+GET  /noa/v1/cluster/healing/status
+POST /noa/v1/cluster/healing/cycle
 Authorization: Bearer <token>
 ```
 
-## Cluster Repair And Rebalance
+Every node runs the scheduler, but only nodes in the deterministic bounded HA
+pool can own work. A stable fragment maps to one pool member, and that member
+must obtain a lease from the fragment's namespace voter quorum before scanning.
+The scan cursor is persisted under `fs_storage_path/.n2/auto-healing`, so a
+restart resumes rather than requiring one unbounded pass. Independent
+fragments run in bounded parallel; object repair uses per-object and
+per-fragment concurrency gates.
 
-Cluster repair and rebalance are distributed rewrite jobs.
+If a degraded object still has its recorded data-shard threshold, healing
+restores it. An unrecoverable object is reported as critical debt without
+freezing unrelated fragments. New writes already require a safe EC layout and
+namespace quorum, so topology loss naturally rejects unsafe mutations while
+readable recorded-layout objects remain readable.
 
 ### Cluster Repair Plan
 
 ```http
-GET /n2/cluster/repair/plan
+GET /noa/v1/cluster/repair/plan
 Authorization: Bearer <token>
 ```
 
 ### Start Cluster Repair
 
 ```http
-POST /n2/cluster/repair/start
+POST /noa/v1/cluster/repair/start
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1730,7 +1754,7 @@ When this request is sent through N2 Gateway, the response includes
 ### Stop Cluster Repair
 
 ```http
-POST /n2/cluster/repair/stop?coordinator_node_id=node-a
+POST /noa/v1/cluster/repair/stop?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -1739,7 +1763,7 @@ Authorization: Bearer <token>
 ### Cluster Repair Status
 
 ```http
-GET /n2/cluster/repair/status?coordinator_node_id=node-a
+GET /noa/v1/cluster/repair/status?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -1748,14 +1772,14 @@ Authorization: Bearer <token>
 ### Cluster Rebalance Plan
 
 ```http
-GET /n2/cluster/rebalance/plan
+GET /noa/v1/cluster/rebalance/plan
 Authorization: Bearer <token>
 ```
 
 ### Start Cluster Rebalance
 
 ```http
-POST /n2/cluster/rebalance/start
+POST /noa/v1/cluster/rebalance/start
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -1794,7 +1818,7 @@ When this request is sent through N2 Gateway, the response includes
 ### Stop Cluster Rebalance
 
 ```http
-POST /n2/cluster/rebalance/stop?coordinator_node_id=node-a
+POST /noa/v1/cluster/rebalance/stop?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -1803,7 +1827,7 @@ Authorization: Bearer <token>
 ### Cluster Rebalance Status
 
 ```http
-GET /n2/cluster/rebalance/status?coordinator_node_id=node-a
+GET /noa/v1/cluster/rebalance/status?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
@@ -1986,7 +2010,7 @@ protection.
 The WebSocket endpoint is:
 
 ```text
-/ws
+/noa/v1/ws
 ```
 
 It is used by consoles to receive storage and namespace events. HTTP APIs are
@@ -2011,7 +2035,7 @@ state simple and robust.
 ### Create And Use A Fragment
 
 ```bash
-curl -k -X POST https://node-a:50001/n2/fragments \
+curl -k -X POST https://node-a:50001/noa/v1/fragments \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "n2-test",
@@ -2019,7 +2043,7 @@ curl -k -X POST https://node-a:50001/n2/fragments \
     "secret": "'"$MASTER_KEY"'"
   }'
 
-TOKEN=$(curl -sk https://node-a:50001/n2/auth/fragment \
+TOKEN=$(curl -sk https://node-a:50001/noa/v1/auth/fragment \
   -H 'Content-Type: application/json' \
   -d '{
     "fragment": "n2-test",
@@ -2034,7 +2058,7 @@ TOKEN=$(curl -sk https://node-a:50001/n2/auth/fragment \
 ### Upload A Large File With Multipart
 
 ```bash
-curl -k -X POST "https://node-a:50001/n2/upload/multipart/init/videos/mhw.mp4" \
+curl -k -X POST "https://node-a:50001/noa/v1/upload/multipart/init/videos/mhw.mp4" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -2050,10 +2074,10 @@ Send all part/status/finalize calls for that session back to `node-a`.
 ### Read From Another Node After Finalize
 
 ```bash
-curl -k "https://node-b:50001/n2/posix/list?path=videos" \
+curl -k "https://node-b:50001/noa/v1/posix/list?path=videos" \
   -H "Authorization: Bearer $TOKEN"
 
-curl -k "https://node-c:50001/n2/objects/download?object_key=videos/mhw.mp4" \
+curl -k "https://node-c:50001/noa/v1/objects/download?object_key=videos/mhw.mp4" \
   -H "Authorization: Bearer $TOKEN" \
   -o mhw.mp4
 ```
@@ -2061,7 +2085,7 @@ curl -k "https://node-c:50001/n2/objects/download?object_key=videos/mhw.mp4" \
 ### Monitor Cluster Usage
 
 ```bash
-curl -k "https://node-a:50001/n2/cluster/usage?fragment=n2-test" \
+curl -k "https://node-a:50001/noa/v1/cluster/usage?fragment=n2-test" \
   -H "Authorization: Bearer $TOKEN"
 ```
 

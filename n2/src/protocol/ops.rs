@@ -52,7 +52,7 @@ use crate::distribution::rebalance::{
     repair_status, rewrite_object_to_current_layout, start_rebalance, start_repair, stop_rebalance,
     stop_repair,
 };
-use crate::distribution::repair::{repair_cluster_object_shards, repair_policy};
+use crate::distribution::repair::repair_policy;
 use crate::distribution::resolve_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
@@ -422,7 +422,10 @@ async fn execute_native_op_inner(
                 if status.status == "healthy" {
                     status
                 } else if status.repairable {
-                    repair_cluster_object_shards(&metadata, check_mode).await?
+                    crate::core::repair_manager::repair_cluster_object_recorded_layout(
+                        &metadata, check_mode,
+                    )
+                    .await?
                 } else {
                     status
                 }

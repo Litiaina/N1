@@ -165,18 +165,12 @@ impl DistributedNamespace {
                         virtual_partition: partition,
                         prepared_at_unix: now_unix,
                         legs: vec![NamespaceTransactionLeg::Insert {
-                            record,
+                            record: record.clone(),
                             parent_layout: directory.layout,
                         }],
                     };
                     match commit_namespace_transaction(vec![prepared]).await {
-                        Ok(_) => quorum_get_dentry(key.clone(), directory.layout)
-                            .await?
-                            .ok_or_else(|| {
-                                AppError::InternalServerError(
-                                    "committed directory is absent from quorum".into(),
-                                )
-                            })?,
+                        Ok(_) => record,
                         Err(err @ AppError::Conflict(_)) => {
                             match quorum_get_dentry(key.clone(), directory.layout).await? {
                                 Some(entry) => entry,
@@ -264,14 +258,12 @@ impl DistributedNamespace {
             virtual_partition: partition,
             prepared_at_unix: now_unix,
             legs: vec![NamespaceTransactionLeg::Insert {
-                record,
+                record: record.clone(),
                 parent_layout: parent.layout,
             }],
         }])
         .await?;
-        quorum_get_dentry(key, parent.layout).await?.ok_or_else(|| {
-            AppError::InternalServerError("committed object dentry is absent from quorum".into())
-        })
+        Ok(record)
     }
 
     pub async fn rename(
@@ -373,24 +365,41 @@ impl DistributedNamespace {
                 "trash retention expired; lifecycle owns permanent deletion".into(),
             ));
         }
-        Self::move_entry(
+        let destination_key = DentryKey {
+            fragment: fragment.to_string(),
+            parent_directory_id: context.original_parent_directory_id.clone(),
+            name: context.original_name.clone(),
+        };
+        let restored = Self::move_entry(
             DistributedResolvedEntry {
                 path: context.original_path.clone(),
                 parent_directory_id: key.parent_directory_id,
                 parent_layout: DirectoryLayout::default(),
-                record,
+                record: record.clone(),
             },
-            DentryKey {
-                fragment: fragment.to_string(),
-                parent_directory_id: context.original_parent_directory_id,
-                name: context.original_name,
-            },
+            destination_key.clone(),
             context.original_parent_layout,
             mutation_id,
             now_unix,
             None,
         )
-        .await
+        .await;
+        match restored {
+            Ok(record) => Ok(record),
+            Err(AppError::Conflict(message)) if message.contains("destination") => {
+                let Some(existing) =
+                    quorum_get_dentry(destination_key, context.original_parent_layout).await?
+                else {
+                    return Err(AppError::Conflict(message));
+                };
+                if existing.target == record.target && existing.trash.is_none() {
+                    Ok(existing)
+                } else {
+                    Err(AppError::Conflict(message))
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn purge_expired_reference(
@@ -651,13 +660,7 @@ impl DistributedNamespace {
                 .collect(),
         )
         .await?;
-        quorum_get_dentry(destination_key, destination_layout)
-            .await?
-            .ok_or_else(|| {
-                AppError::InternalServerError(
-                    "committed namespace destination is absent from quorum".into(),
-                )
-            })
+        Ok(destination)
     }
 }
 

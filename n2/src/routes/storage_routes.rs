@@ -37,6 +37,7 @@ use crate::core::upload::{
     get_upload_status as get_upload_status_impl, list_active_uploads as list_active_uploads_impl,
 };
 use crate::core::{index, index_store};
+use crate::distribution::auto_healing::build_auto_healing_peer_routes;
 use crate::distribution::dentry_quorum::build_dentry_quorum_routes;
 use crate::distribution::dentry_transaction::build_dentry_transaction_routes;
 use crate::distribution::download::part_has_remote_shards;
@@ -51,7 +52,6 @@ use crate::distribution::peer::build_peer_routes;
 use crate::distribution::rebalance::{
     metadata_matches_current_layout, rewrite_object_to_current_layout,
 };
-use crate::distribution::repair::repair_cluster_object_shards;
 use crate::distribution::routes::build_cluster_routes;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -851,7 +851,10 @@ async fn repair_object_scoped(
     let mut status = if metadata.parts.iter().any(part_has_remote_shards) {
         let status = inspect_cluster_object_status(&metadata, check_mode).await?;
         if status.status != "healthy" && status.repairable {
-            repair_cluster_object_shards(&metadata, check_mode).await?
+            crate::core::repair_manager::repair_cluster_object_recorded_layout(
+                &metadata, check_mode,
+            )
+            .await?
         } else {
             status
         }
@@ -1321,39 +1324,42 @@ pub fn build_storage_routes_unbound_with_options(
 
     let object_storage_routes = {
         let read_ops = Router::new()
-            .route("/n2/capacity/usage", get(get_capacity_usage_scoped))
-            .route("/n2/fragments", get(list_fragments))
-            .route("/n2/objects", get(list_objects_scoped))
-            .route("/n2/objects/signed-url", post(mint_signed_read_url_scoped))
-            .route("/n2/trash", get(list_trash_objects_scoped))
+            .route("/noa/v1/capacity/usage", get(get_capacity_usage_scoped))
+            .route("/noa/v1/fragments", get(list_fragments))
+            .route("/noa/v1/objects", get(list_objects_scoped))
             .route(
-                "/n2/objects/versions/{*object_key}",
+                "/noa/v1/objects/signed-url",
+                post(mint_signed_read_url_scoped),
+            )
+            .route("/noa/v1/trash", get(list_trash_objects_scoped))
+            .route(
+                "/noa/v1/objects/versions/{*object_key}",
                 get(list_object_versions_scoped),
             )
-            .route("/n2/objects/get/{*object_key}", get(get_object_scoped))
+            .route("/noa/v1/objects/get/{*object_key}", get(get_object_scoped))
             .route(
-                "/n2/objects/stream/{*object_key}",
+                "/noa/v1/objects/stream/{*object_key}",
                 get(stream_object_scoped),
             )
             .route(
-                "/n2/objects/meta/{*object_key}",
+                "/noa/v1/objects/meta/{*object_key}",
                 get(get_object_metadata_scoped),
             )
             .route(
-                "/n2/objects/status/{*object_key}",
+                "/noa/v1/objects/status/{*object_key}",
                 get(get_object_repair_status_scoped),
             )
-            .route("/n2/objects/download", get(download_object_scoped))
+            .route("/noa/v1/objects/download", get(download_object_scoped))
             .route(
-                "/n2/objects/download/chunk",
+                "/noa/v1/objects/download/chunk",
                 get(download_object_chunk_scoped),
             )
             .route(
-                "/n2/objects/archive",
+                "/noa/v1/objects/archive",
                 post(download_selected_archive_scoped),
             )
             .route(
-                "/n2/objects/archive/manifest",
+                "/noa/v1/objects/archive/manifest",
                 post(download_manifest_archive_scoped),
             )
             .merge(build_posix_read_routes());
@@ -1363,98 +1369,110 @@ pub fn build_storage_routes_unbound_with_options(
             .layer(from_fn(enforce_quiesced_mode_on_reads));
 
         let write_ops = Router::new()
-            .route("/n2/fragments/{:fragment}", delete(delete_fragment))
-            .route("/n2/fragments/{:fragment}", patch(update_fragment))
-            .route("/n2/objects/rename", post(rename_object_scoped))
-            .route("/n2/objects/bulk-delete", post(bulk_delete_objects_scoped))
+            .route("/noa/v1/fragments/{:fragment}", delete(delete_fragment))
+            .route("/noa/v1/fragments/{:fragment}", patch(update_fragment))
+            .route("/noa/v1/objects/rename", post(rename_object_scoped))
             .route(
-                "/n2/objects/redistribute/{*object_key}",
+                "/noa/v1/objects/bulk-delete",
+                post(bulk_delete_objects_scoped),
+            )
+            .route(
+                "/noa/v1/maintenance/objects/redistribution/start/{*object_key}",
                 post(redistribute_object_scoped),
             )
-            .route("/n2/objects/{*object_key}", delete(delete_object_scoped))
             .route(
-                "/n2/objects/repair/{*object_key}",
+                "/noa/v1/objects/{*object_key}",
+                delete(delete_object_scoped),
+            )
+            .route(
+                "/noa/v1/objects/repair/{*object_key}",
                 post(repair_object_scoped),
             )
             .route(
-                "/n2/objects/bulk-recover",
+                "/noa/v1/objects/bulk-recover",
                 post(bulk_recover_objects_scoped),
             )
             .route(
-                "/n2/objects/recover/{*object_key}",
+                "/noa/v1/objects/recover/{*object_key}",
                 post(recover_object_scoped),
             )
             .route(
-                "/n2/upload/multipart/init/{*object_key}",
+                "/noa/v1/upload/multipart/init/{*object_key}",
                 post(initiate_object_upload_scoped),
             )
             .route(
-                "/n2/upload/one-shot/{*object_key}",
+                "/noa/v1/upload/one-shot/{*object_key}",
                 post(upload_object_one_shot_scoped),
             )
             .route(
-                "/n2/upload/multipart/{:version_id}",
+                "/noa/v1/upload/multipart/{:version_id}",
                 get(get_upload_status_scoped),
             )
-            .route("/n2/upload/multipart", get(list_active_uploads_scoped))
+            .route("/noa/v1/upload/multipart", get(list_active_uploads_scoped))
             .route(
-                "/n2/upload/multipart/{:version_id}/{:part_index}",
+                "/noa/v1/upload/multipart/{:version_id}/{:part_index}",
                 put(object_upload_part_scoped),
             )
             .route(
-                "/n2/upload/multipart/{:version_id}/{:session_id}/finalize",
+                "/noa/v1/upload/multipart/{:version_id}/{:session_id}/finalize",
                 post(finalize_object_upload_scoped),
             )
             .route(
-                "/n2/upload/multipart/{:version_id}",
+                "/noa/v1/upload/multipart/{:version_id}",
                 delete(cancel_upload_session_scoped),
             )
             .merge(build_posix_write_routes());
 
         let maintenance_ops = Router::new()
             .route(
-                "/n2/maintenance/fragment/cleanup",
+                "/noa/v1/maintenance/fragment/cleanup",
                 post(sync_fragment_metadata),
             )
             .route(
-                "/n2/maintenance/fragment/init",
+                "/noa/v1/maintenance/fragment/init",
                 post(initialize_fragment_storage_api),
             )
-            .route("/n2/maintenance/repair/start", post(trigger_repair_job_api))
-            .route("/n2/maintenance/repair/stop", post(stop_repair_job_api))
-            .route("/n2/maintenance/repair/status", get(get_repair_status_api))
-            .route("/n2/maintenance/gc/start", post(run_garbage_collector))
             .route(
-                "/n2/maintenance/fragments/{:fragment}/gc/start",
+                "/noa/v1/maintenance/repair/start",
+                post(trigger_repair_job_api),
+            )
+            .route("/noa/v1/maintenance/repair/stop", post(stop_repair_job_api))
+            .route(
+                "/noa/v1/maintenance/repair/status",
+                get(get_repair_status_api),
+            )
+            .route("/noa/v1/maintenance/gc/start", post(run_garbage_collector))
+            .route(
+                "/noa/v1/maintenance/fragments/{:fragment}/gc/start",
                 post(run_fragment_gc),
             )
-            .route("/n2/maintenance/gc/stop", post(stop_garbage_collector))
-            .route("/n2/maintenance/gc/status", get(get_gc_status_api))
+            .route("/noa/v1/maintenance/gc/stop", post(stop_garbage_collector))
+            .route("/noa/v1/maintenance/gc/status", get(get_gc_status_api))
             .route(
-                "/n2/maintenance/redistribution/start",
+                "/noa/v1/maintenance/redistribution/start",
                 post(trigger_redistribution_job_api),
             )
             .route(
-                "/n2/maintenance/fragments/{:fragment}/redistribution/start",
+                "/noa/v1/maintenance/fragments/{:fragment}/redistribution/start",
                 post(trigger_fragment_redistribution_job),
             )
             .route(
-                "/n2/maintenance/redistribution/stop",
+                "/noa/v1/maintenance/redistribution/stop",
                 post(stop_redistribution_job_api),
             )
             .route(
-                "/n2/maintenance/redistribution/status",
+                "/noa/v1/maintenance/redistribution/status",
                 get(get_redist_status_api),
             )
             .route(
-                "/n2/maintenance/fragments/{:fragment}/repair/start",
+                "/noa/v1/maintenance/fragments/{:fragment}/repair/start",
                 post(trigger_fragment_repair_job),
             )
             .route(
-                "/n2/maintenance/fragments/{:fragment}/health",
+                "/noa/v1/maintenance/fragments/{:fragment}/health",
                 get(get_fragment_health),
             )
-            .route("/n2/maintenance/health", get(get_system_health))
+            .route("/noa/v1/maintenance/health", get(get_system_health))
             .merge(build_cluster_routes());
 
         let maintenance_ops = layers.layer_global(maintenance_ops);
@@ -1472,36 +1490,42 @@ pub fn build_storage_routes_unbound_with_options(
         Router::new().merge(protected_routes)
     };
 
-    let ws_routes = { Router::new().route("/ws", get(ws_handler)) };
+    let ws_routes = { Router::new().route("/noa/v1/ws", get(ws_handler)) };
 
     let public_global_routes = Router::new()
-        .route("/n2/fragments/check", get(verify_fragment_existence))
-        .route("/n2/fragments/hash", get(get_fragment_hash))
-        .route("/n2/objects/signed-read", get(read_object_via_signed_url));
+        .route("/noa/v1/fragments/check", get(verify_fragment_existence))
+        .route("/noa/v1/fragments/hash", get(get_fragment_hash))
+        .route(
+            "/noa/v1/objects/signed-read",
+            get(read_object_via_signed_url),
+        );
     let public_global_routes = layers.layer_global(public_global_routes);
 
     let peer_routes = Router::new()
         .merge(build_peer_routes())
+        .merge(build_auto_healing_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
         .merge(build_lifecycle_peer_routes())
         .merge(build_dentry_quorum_routes())
         .merge(build_dentry_transaction_routes());
 
-    let create_fragment_route = Router::new().route("/n2/fragments", post(create_fragment));
+    let create_fragment_route = Router::new().route("/noa/v1/fragments", post(create_fragment));
     let create_fragment_route = layers
         .layer_auth(create_fragment_route)
         .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
-    let fragment_auth_route = Router::new().route("/n2/auth/fragment", post(authorize_fragment));
+    let fragment_auth_route =
+        Router::new().route("/noa/v1/auth/fragment", post(authorize_fragment));
     let fragment_auth_route = layers.layer_auth(fragment_auth_route);
 
-    let refresh_auth_route = Router::new().route("/n2/auth/refresh", post(refresh_access_token));
+    let refresh_auth_route =
+        Router::new().route("/noa/v1/auth/refresh", post(refresh_access_token));
     let refresh_auth_route = layers.layer_auth(refresh_auth_route);
 
-    let logout_auth_route = Router::new().route("/n2/auth/logout", post(logout_refresh_token));
+    let logout_auth_route = Router::new().route("/noa/v1/auth/logout", post(logout_refresh_token));
     let logout_auth_route = layers.layer_auth(logout_auth_route);
 
-    let ping_route = Router::new().route("/n2/ping", get(ping));
+    let ping_route = Router::new().route("/noa/v1/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
 
     let mut router = Router::new()
@@ -1532,4 +1556,46 @@ pub async fn serve_storage_routes() -> Router {
 
 async fn ping() -> &'static str {
     "pong"
+}
+
+#[cfg(test)]
+mod noa_route_tests {
+    use super::ping;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn canonical_noa_ping_is_present_and_retired_n2_ping_is_absent() {
+        let router = Router::new().route("/noa/v1/ping", get(ping));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/noa/v1/ping")
+                    .body(Body::empty())
+                    .expect("NOA request"),
+            )
+            .await
+            .expect("NOA response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 16).await.expect("pong body"),
+            "pong"
+        );
+
+        let legacy = router
+            .oneshot(
+                Request::builder()
+                    .uri("/n2/ping")
+                    .body(Body::empty())
+                    .expect("legacy request"),
+            )
+            .await
+            .expect("legacy response");
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
 }

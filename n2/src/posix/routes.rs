@@ -289,15 +289,15 @@ async fn posix_recover(
 
 pub fn build_posix_read_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/n2/posix/list", get(posix_list))
-        .route("/n2/posix/stat", get(posix_stat))
+        .route("/noa/v1/posix/list", get(posix_list))
+        .route("/noa/v1/posix/stat", get(posix_stat))
 }
 
 pub fn build_posix_write_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/n2/posix/mkdir", post(posix_mkdir))
-        .route("/n2/posix/rename", post(posix_rename))
-        .route("/n2/posix/move", post(posix_rename))
-        .route("/n2/posix/trash", post(posix_trash))
-        .route("/n2/posix/recover", post(posix_recover))
+        .route("/noa/v1/posix/mkdir", post(posix_mkdir))
+        .route("/noa/v1/posix/rename", post(posix_rename))
+        .route("/noa/v1/posix/move", post(posix_rename))
+        .route("/noa/v1/posix/trash", post(posix_trash))
+        .route("/noa/v1/posix/recover", post(posix_recover))
 }

@@ -847,6 +847,19 @@ pub async fn repair_object(
     Ok(after)
 }
 
+/// Repairs a distributed object in-place against the immutable placement
+/// recorded in its metadata. This deliberately does not select the current
+/// cluster layout or publish a new object version; that is redistribution.
+pub async fn repair_cluster_object_recorded_layout(
+    meta: &ObjectMetadata,
+    check_mode: RepairCheckMode,
+) -> Result<ObjectRepairStatus, AppError> {
+    let _permit =
+        acquire_object_maintenance_permit(meta, ObjectMaintenanceKind::Repair, true).await?;
+    let _io = try_acquire_disk_io(DiskIoClass::BackgroundRepair, Some(&meta.fragment))?;
+    repair_cluster_object_shards(meta, check_mode).await
+}
+
 pub async fn get_repair_status() -> RepairJobStatus {
     REPAIR_STATUS.read().await.clone()
 }
@@ -1205,7 +1218,7 @@ async fn process_object_repair(
             let failed = usize::from(!cfg.dry_run && before.status != "healthy");
             return Ok((0, before.corrupt_shards as usize, failed, None));
         }
-        let after = repair_cluster_object_shards(&meta, cfg.check_mode).await?;
+        let after = repair_cluster_object_recorded_layout(&meta, cfg.check_mode).await?;
         let last_repaired =
             (after.repaired_shards > 0).then(|| format!("{}/{}", meta.fragment, meta.object_key));
         return Ok((

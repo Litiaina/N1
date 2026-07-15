@@ -19,10 +19,12 @@ namespace, and maintenance operations on any healthy node, places immutable
 object shards across the cluster, and keeps namespace mutation as the
 coordination boundary.
 
-N2 `1.0.0` locks the architecture as a high-performance object storage engine
-with first-class filesystem-like namespace semantics. Blob shards and `.ncdx`
-object metadata are immutable. Directory names, paths, rename, move, trash,
-and recover live in a native partitioned namespace quorum.
+N2 `1.0.0` locked the architecture as a high-performance object storage engine
+with first-class filesystem-like namespace semantics. N2 `1.1.0` keeps that
+disk and namespace design and adds the shared NOA v1 public contract plus
+autonomous, distributed recorded-layout healing. Blob shards and `.ncdx`
+object metadata remain immutable. Directory names, paths, rename, move, trash,
+and recover remain native partitioned namespace quorum operations.
 
 N2 deliberately keeps POSIX-style namespace operations fast without becoming a
 filesystem. Directory listing, rename, move, trash, and recover operate on a
@@ -32,7 +34,7 @@ common object-storage weakness where path-oriented workflows degrade into
 large metadata scans or payload rewrites.
 
 N2 is not an S3 clone and does not use S3 as its core identity. Its public
-surface is LOA-style `/n2/...` HTTP API plus the `n2://` native protocol for
+surface is the NOA v1 `/noa/v1/...` HTTP API plus the `n2://` native protocol for
 N2-native operators, peers, tools, and future internal systems.
 
 ## What Ships Here
@@ -47,6 +49,8 @@ N2-native operators, peers, tools, and future internal systems.
 
 - [DOCUMENTATION.md](DOCUMENTATION.md): setup, operations, API usage, request
   bodies, query fields, examples, and troubleshooting.
+- [NOA.md](NOA.md): canonical NOA v1 public routes, N2 cluster extensions, and
+  the boundary between NOA and N2-native internals.
 - [INSTALLATION.md](INSTALLATION.md): production setup, systemd templates,
   gateway deployment, and validation checklist.
 - [ARCHITECTURE.md](ARCHITECTURE.md): storage layout, object identity,
@@ -78,9 +82,14 @@ The result is simple operational behavior:
   version, and targeted rebalance skips already-current objects.
 - cluster monitoring exposes overview, nodes, topology, object-layout health,
   redistribution, jobs, namespace consensus, and upload activity in one
-  efficient `/n2/cluster/monitor` snapshot.
+  efficient `/noa/v1/cluster/monitor` snapshot.
 - distributed maintenance assigns fragments across reachable nodes for
   fragment-level GC, repair, and targeted rebalance.
+- autonomous healing selects a bounded HA coordinator pool, obtains a
+  quorum-held lease per stable fragment, resumes scans after restart, and
+  repairs only the immutable layout recorded by each object.
+- redistribution remains explicit; adding a node never degrades or rewrites a
+  healthy older-layout object.
 
 N2 uses unified storage devices. Every configured `storage_disks` path can hold
 immutable object shards, immutable `.ncdx` records, and assigned namespace
@@ -198,6 +207,17 @@ auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
 auto_rebalance=false
+
+[auto_healing]
+enabled=true
+initial_delay_seconds=30
+scan_interval_seconds=900
+coordinator_nodes=auto
+max_parallel_fragments=2
+max_objects_per_fragment_cycle=256
+max_duration_seconds=30
+lease_seconds=90
+checksum_scan_every_cycles=24
 ```
 
 For multi-node clusters, every node uses its own `node_id`, HTTP endpoint,
@@ -206,16 +226,16 @@ node list and epoch.
 
 ## API Entry Points
 
-- HTTP API: `/n2/...`
+- HTTP API: `/noa/v1/...`
 - Native protocol: `n2://host:port`
-- WebSocket event stream: `/ws`
+- WebSocket event stream: `/noa/v1/ws`
 - Peer routes: `/n2/peer/...` and namespace peer routes are internal
   node-to-node surfaces.
 
 Basic HTTP auth:
 
 ```bash
-curl -k https://127.0.0.1:50001/n2/auth/fragment \
+curl -k https://127.0.0.1:50001/noa/v1/auth/fragment \
   -H 'Content-Type: application/json' \
   -d '{
     "fragment": "n2-test",
@@ -231,7 +251,7 @@ The response contains a Bearer access token and optional refresh token. Use the
 access token on protected routes:
 
 ```bash
-curl -k https://127.0.0.1:50001/n2/posix/list?path=videos \
+curl -k https://127.0.0.1:50001/noa/v1/posix/list?path=videos \
   -H "Authorization: Bearer $N2_TOKEN"
 ```
 
@@ -307,6 +327,26 @@ The proof harnesses are intended for multi-node correctness checks and write
 ignored local output under `.n2-bench/`. The hardening harness does not kill
 existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
 
+N2 1.1.0 bounded architectural proof summary (July 15, 2026):
+
+```text
+N2 package tests: 120 passed
+Gateway package tests: 16 passed
+Topology: 3 simulated N2 nodes, each using all 4 physical XFS disks
+NOA v1 CRUD/multipart/POSIX/trash-recover: passed
+Distributed healing: quorum lease, single owner, recorded-layout repair: passed
+Recover-on-read and restart-persisted healing progress: passed
+Two-of-three node operation: readable, namespace quorum available, safe 1+1 writes
+Explicit object redistribution and fragment rebalance: passed
+Final content SHA-256 verification: passed
+```
+
+Evidence is stored outside the repository under
+`/home/wlzambo/DEV-TEST/n2-1.1.0-noa-healing-proof-20260715-1655`.
+This was deliberately a bounded correctness proof, not a soak test. Its three
+N2 nodes were isolated processes on one physical server, so independent-host
+power, network-partition, and failure-domain testing remains separate work.
+
 N2 1.0.0 real-node proof summary:
 
 ```text
@@ -327,9 +367,11 @@ Evidence is stored outside the repository under
 
 - N2 `1.0.0` means the product shape and architecture are finalized enough for
   the 1.0 line.
+- N2 `1.1.0` keeps that architecture and adds NOA v1 plus distributed,
+  restart-proof recorded-layout healing.
 - It is not an LTS statement yet.
-- Long soak, clusters larger than four nodes, and wider UI viewport proof
-  remain release-validation work.
+- Long soak, independent-host N2 1.1.0 failure testing, clusters larger than
+  four nodes, and wider UI viewport proof remain release-validation work.
 - Earlier development layouts are intentionally rejected rather than migrated;
   the 1.0 line uses the documented unified-device namespace/object layout.
 - A three-node cluster is the production minimum for namespace write

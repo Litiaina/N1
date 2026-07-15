@@ -15,13 +15,21 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
-const MUTATION_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_MUTATION_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn mutation_timeout() -> Duration {
+    std::env::var("N2_NAMESPACE_MUTATION_REMOTE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|millis| Duration::from_millis(millis.clamp(500, 30_000)))
+        .unwrap_or(DEFAULT_MUTATION_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparePartitionRequest {
@@ -86,10 +94,16 @@ pub async fn commit_namespace_transaction(
     // Preparing these legs in parallel allows opposite renames to each hold
     // one partition and livelock. Disjoint transactions still execute fully
     // concurrently because they share no partition locks.
+    let mut prepared_voters_by_partition = BTreeMap::new();
     for prepared in partitions.iter().cloned() {
-        if let Err(error) = prepare_partition_quorum(runtime.clone(), prepared).await {
-            abort_all(runtime.clone(), &partitions).await;
-            return Err(error);
+        match prepare_partition_quorum(runtime.clone(), prepared.clone()).await {
+            Ok(prepared_voters) => {
+                prepared_voters_by_partition.insert(prepared.virtual_partition, prepared_voters);
+            }
+            Err(error) => {
+                abort_all(runtime.clone(), &partitions).await;
+                return Err(error);
+            }
         }
     }
 
@@ -121,11 +135,19 @@ pub async fn commit_namespace_transaction(
         }
     };
 
-    let commit_results =
-        join_all(partitions.iter().cloned().map(|prepared| {
-            commit_partition_quorum(runtime.clone(), prepared, certificate.clone())
-        }))
-        .await;
+    let commit_results = join_all(partitions.iter().cloned().map(|prepared| {
+        let prepared_voters = prepared_voters_by_partition
+            .get(&prepared.virtual_partition)
+            .cloned()
+            .unwrap_or_default();
+        commit_partition_quorum(
+            runtime.clone(),
+            prepared,
+            certificate.clone(),
+            prepared_voters,
+        )
+    }))
+    .await;
     if let Some(error) = commit_results.into_iter().find_map(Result::err) {
         return Err(AppError::ServiceUnavailable(format!(
             "namespace transaction {} is durably committed but requires replay: {error}",
@@ -138,7 +160,7 @@ pub async fn commit_namespace_transaction(
 async fn prepare_partition_quorum(
     runtime: Arc<ClusterRuntime>,
     prepared: PreparedNamespacePartition,
-) -> Result<(), AppError> {
+) -> Result<Vec<ClusterNode>, AppError> {
     let assignment = assignment_for_partition_at_epoch(
         &runtime,
         prepared.virtual_partition,
@@ -152,19 +174,23 @@ async fn prepare_partition_quorum(
     };
     // Every coordinator visits voters in the assignment's deterministic order.
     // The first reachable voter therefore arbitrates only conflicting keys;
-    // unrelated keys and partitions remain fully concurrent. Parallel prepare
-    // fan-out permits two coordinators to split locks across voters and makes
-    // both otherwise-valid transactions lose progress.
-    let mut acknowledgements = 0usize;
+    // unrelated keys and partitions remain fully concurrent. Do not stop at
+    // the first quorum: if a reachable voter misses transaction A, it can fail
+    // to apply transaction B because its source dentry is stale. Quorum remains
+    // the durability requirement, but reachable voters are kept in the same
+    // namespace generation chain.
+    let mut acknowledgements = Vec::new();
     let mut last_error = None;
     for node in voters {
-        match send_prepare(runtime.clone(), node, request.clone()).await {
-            Ok(_) => acknowledgements += 1,
+        match send_prepare(runtime.clone(), node.clone(), request.clone()).await {
+            Ok(_) => {
+                acknowledgements.push(node);
+            }
             Err(err @ AppError::Conflict(_)) => return Err(err),
             Err(err) => last_error = Some(err),
         }
     }
-    if acknowledgements < required {
+    if acknowledgements.len() < required {
         if let Some(err) = last_error {
             tracing::warn!(
                 transaction_id = %request.prepared.transaction_id,
@@ -174,10 +200,12 @@ async fn prepare_partition_quorum(
             );
         }
         return Err(AppError::ServiceUnavailable(format!(
-            "namespace partition prepare received {acknowledgements}/{required} required votes"
+            "namespace partition prepare received {}/{} required votes",
+            acknowledgements.len(),
+            required
         )));
     }
-    Ok(())
+    Ok(acknowledgements)
 }
 
 async fn persist_decision_quorum(
@@ -193,17 +221,41 @@ async fn persist_decision_quorum(
         assignment: assignment.clone(),
         decision: decision.clone(),
     };
-    let acknowledged_voters = join_all(
-        voters
-            .into_iter()
-            .map(|node| send_decision(runtime.clone(), node, request.clone())),
-    )
-    .await
-    .into_iter()
-    .filter_map(Result::ok)
-    .map(|ack| ack.node_id)
-    .collect::<Vec<_>>();
+    let mut tasks = FuturesUnordered::new();
+    for node in voters {
+        let runtime = runtime.clone();
+        let request = request.clone();
+        tasks.push(tokio::spawn(async move {
+            send_decision(runtime, node, request).await
+        }));
+    }
+    let mut acknowledged_voters = Vec::new();
+    let mut last_error = None;
+    while let Some(result) = tasks.next().await {
+        match result {
+            Ok(Ok(ack)) => {
+                acknowledged_voters.push(ack.node_id);
+                if acknowledged_voters.len() >= required {
+                    break;
+                }
+            }
+            Ok(Err(err)) => last_error = Some(err),
+            Err(err) => {
+                last_error = Some(AppError::ServiceUnavailable(format!(
+                    "namespace decision task failed: {err}"
+                )));
+            }
+        }
+    }
     if acknowledged_voters.len() < required {
+        if let Some(err) = last_error {
+            tracing::warn!(
+                transaction_id = %request.decision.transaction_id,
+                decision_partition = request.decision_partition,
+                error = %err,
+                "namespace decision voter failed"
+            );
+        }
         return Err(AppError::ServiceUnavailable(format!(
             "namespace commit decision received {}/{} required votes",
             acknowledged_voters.len(),
@@ -222,6 +274,7 @@ async fn commit_partition_quorum(
     runtime: Arc<ClusterRuntime>,
     prepared: PreparedNamespacePartition,
     certificate: NamespaceCommitCertificate,
+    prepared_voters: Vec<ClusterNode>,
 ) -> Result<(), AppError> {
     let assignment = assignment_for_partition_at_epoch(
         &runtime,
@@ -230,6 +283,13 @@ async fn commit_partition_quorum(
     )?;
     let voters = assignment_nodes(&runtime, &assignment)?;
     let required = quorum_required(voters.len());
+    if prepared_voters.len() < required {
+        return Err(AppError::ServiceUnavailable(format!(
+            "namespace partition commit has only {}/{} prepared voters",
+            prepared_voters.len(),
+            required
+        )));
+    }
     let request = PartitionMutationRequest {
         transaction_id: prepared.transaction_id.clone(),
         virtual_partition: prepared.virtual_partition,
@@ -237,16 +297,38 @@ async fn commit_partition_quorum(
         certificate: Some(certificate),
         prepared: Some(prepared),
     };
-    let acknowledgements = join_all(
-        voters
-            .into_iter()
-            .map(|node| send_commit(runtime.clone(), node, request.clone())),
-    )
-    .await
-    .into_iter()
-    .filter_map(Result::ok)
-    .count();
+    let mut tasks = FuturesUnordered::new();
+    for node in voters {
+        let runtime = runtime.clone();
+        let request = request.clone();
+        tasks.push(tokio::spawn(async move {
+            send_commit(runtime, node, request).await
+        }));
+    }
+    let mut acknowledgements = 0usize;
+    let mut last_error = None;
+    while let Some(result) = tasks.next().await {
+        match result {
+            Ok(Ok(_)) => {
+                acknowledgements += 1;
+            }
+            Ok(Err(err)) => last_error = Some(err),
+            Err(err) => {
+                last_error = Some(AppError::ServiceUnavailable(format!(
+                    "namespace commit task failed: {err}"
+                )));
+            }
+        }
+    }
     if acknowledgements < required {
+        if let Some(err) = last_error {
+            tracing::warn!(
+                transaction_id = %request.transaction_id,
+                virtual_partition = request.virtual_partition,
+                error = %err,
+                "namespace commit voter failed"
+            );
+        }
         return Err(AppError::ServiceUnavailable(format!(
             "namespace partition commit received {acknowledgements}/{required} required votes"
         )));
@@ -259,7 +341,13 @@ pub async fn replay_committed_partition(
     certificate: NamespaceCommitCertificate,
 ) -> Result<(), AppError> {
     let runtime = active_cluster_runtime()?;
-    commit_partition_quorum(runtime, prepared, certificate).await
+    let assignment = assignment_for_partition_at_epoch(
+        &runtime,
+        prepared.virtual_partition,
+        prepared_placement_epoch(&prepared)?,
+    )?;
+    let voters = assignment_nodes(&runtime, &assignment)?;
+    commit_partition_quorum(runtime, prepared, certificate, voters).await
 }
 
 async fn abort_all(runtime: Arc<ClusterRuntime>, partitions: &[PreparedNamespacePartition]) {
@@ -349,7 +437,7 @@ async fn post_peer<T: Serialize + ?Sized>(
     if let Some(secret) = cluster_secret() {
         send = send.header("x-n2-cluster-secret", secret);
     }
-    let response = timeout(MUTATION_TIMEOUT, send.send())
+    let response = timeout(mutation_timeout(), send.send())
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!("namespace mutation timed out at {}", node.id))

@@ -128,7 +128,7 @@ async fn native_endpoint_is_reachable(endpoint: &str) -> bool {
 }
 
 async fn http_endpoint_is_reachable(endpoint: &str) -> bool {
-    let url = format!("{}/n2/ping", endpoint.trim_end_matches('/'));
+    let url = format!("{}/noa/v1/ping", endpoint.trim_end_matches('/'));
     matches!(
         CLUSTER_PROBE_HTTP_CLIENT.get(url).send().await,
         Ok(response) if response.status().is_success()
@@ -391,7 +391,13 @@ pub fn init_cluster_runtime(
             "auto_max_data_shards must be greater than zero".into(),
         ));
     }
-    let auto_rebalance = parse_bool(section.and_then(|s| s.get("auto_rebalance")), false);
+    if parse_bool(section.and_then(|s| s.get("auto_rebalance")), false) {
+        return Err(AppError::BadRequest(
+            "auto_rebalance=true is not supported: N2 preserves recorded object layouts and only redistributes through an explicit operator request"
+                .into(),
+        ));
+    }
+    let auto_rebalance = false;
     let membership = load_or_create_membership(
         &membership_path,
         &node_id,

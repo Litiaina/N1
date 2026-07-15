@@ -191,6 +191,17 @@ cleanup_interval_seconds=3600
 file_ttl_seconds=3600
 retention_seconds=2592000
 
+[auto_healing]
+enabled=true
+initial_delay_seconds=30
+scan_interval_seconds=900
+coordinator_nodes=auto
+max_parallel_fragments=2
+max_objects_per_fragment_cycle=256
+max_duration_seconds=30
+lease_seconds=90
+checksum_scan_every_cycles=24
+
 [set_limits]
 max_file_size=5368709120
 
@@ -367,9 +378,9 @@ sudo systemctl status litiaina-n2-gateway --no-pager
 Check each node:
 
 ```bash
-curl -k https://192.168.0.22:50001/n2/ping
-curl -k https://192.168.0.13:50001/n2/ping
-curl -k https://192.168.0.18:50001/n2/ping
+curl -k https://192.168.0.22:50001/noa/v1/ping
+curl -k https://192.168.0.13:50001/noa/v1/ping
+curl -k https://192.168.0.18:50001/noa/v1/ping
 ```
 
 Check native ports from the gateway host:
@@ -390,7 +401,7 @@ curl -k https://127.0.0.1:51002/gateway/nodes
 After fragment auth, check cluster monitor:
 
 ```bash
-curl -k "https://192.168.0.22:50001/n2/cluster/monitor?object_limit=96" \
+curl -k "https://192.168.0.22:50001/noa/v1/cluster/monitor?object_limit=96" \
   -H "Authorization: Bearer $N2_TOKEN"
 ```
 

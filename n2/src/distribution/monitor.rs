@@ -1,6 +1,7 @@
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
 use crate::core::repair_manager::{ObjectLayoutStatus, ObjectRepairStatus, RepairCheckMode};
+use crate::distribution::auto_healing::{AutoHealingStatus, auto_healing_status_snapshot};
 use crate::distribution::dentry_group::configured_namespace_replicas;
 use crate::distribution::health::{ClusterHealthSnapshot, cluster_health_snapshot};
 use crate::distribution::layout::resolve_write_layout;
@@ -193,6 +194,7 @@ pub struct ClusterRedistributionSummary {
 pub struct ClusterJobsSummary {
     pub repair: ClusterRewriteJobStatus,
     pub rebalance: ClusterRewriteJobStatus,
+    pub healing: AutoHealingStatus,
     pub gc: Value,
     pub any_running: bool,
 }
@@ -272,11 +274,12 @@ pub async fn cluster_monitor_snapshot(
     let namespace_consensus = namespace_consensus_summary(&runtime, fragment.clone(), &health);
     let repair = repair_status();
     let rebalance = rebalance_status();
+    let healing = auto_healing_status_snapshot().await;
     let gc = serde_json::to_value(get_gc_status().await).unwrap_or(Value::Null);
     let sampled_at_unix = chrono::Utc::now().timestamp();
 
     let mut notes = health.notes.clone();
-    notes.push("cluster monitor is read-only; usage scans, repair, GC, and rebalance remain explicit operator actions".to_string());
+    notes.push("cluster monitor is read-only; autonomous healing restores recorded layouts, while usage scans, GC, and rebalance remain explicit operator actions".to_string());
     notes.push("multipart resumability is coordinator/client aware; the gateway only routes and does not own cluster truth".to_string());
     if let Some(fragment) = fragment.as_deref() {
         notes.push(format!(
@@ -355,9 +358,10 @@ pub async fn cluster_monitor_snapshot(
             rebalance,
         },
         jobs: ClusterJobsSummary {
-            any_running: repair.running || rebalance_status().running,
+            any_running: repair.running || rebalance_status().running || healing.running,
             repair,
             rebalance: rebalance_status(),
+            healing,
             gc,
         },
         namespace_consensus,

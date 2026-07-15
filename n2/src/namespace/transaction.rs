@@ -84,7 +84,12 @@ impl NamespaceTransactionStore {
         let mut claimed = Vec::new();
         for leg in sorted_legs(&prepared.legs) {
             let lock = lock_path(root, prepared.virtual_partition, leg.key());
-            match claim_lock(&lock, &prepared.transaction_id) {
+            match claim_lock(
+                root,
+                prepared.virtual_partition,
+                leg.key(),
+                &prepared.transaction_id,
+            ) {
                 Ok(()) => claimed.push(lock),
                 Err(err) => {
                     for path in claimed {
@@ -246,9 +251,16 @@ impl NamespaceTransactionStore {
             }
         };
         let path = intent_path_for(root, transaction_id.trim(), partition);
-        let bytes = fs::read(&path).map_err(|err| {
-            AppError::Io(err, format!("read namespace intent {}", path.display()))
-        })?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(AppError::Io(
+                    err,
+                    format!("read namespace intent {}", path.display()),
+                ));
+            }
+        };
         Ok(Some(rmp_serde::from_slice(&bytes)?))
     }
 
@@ -279,12 +291,16 @@ impl NamespaceTransactionStore {
             if !name.ends_with(&suffix) {
                 continue;
             }
-            let bytes = fs::read(child.path()).map_err(|err| {
-                AppError::Io(
-                    err,
-                    format!("read namespace intent {}", child.path().display()),
-                )
-            })?;
+            let bytes = match fs::read(child.path()) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(AppError::Io(
+                        err,
+                        format!("read namespace intent {}", child.path().display()),
+                    ));
+                }
+            };
             let intent: PreparedNamespacePartition = rmp_serde::from_slice(&bytes)?;
             validate_prepared(&intent)?;
             prepared.push(intent);
@@ -530,7 +546,13 @@ fn decision_path_for(root: &Path, transaction_id: &str) -> PathBuf {
     ))
 }
 
-fn claim_lock(path: &Path, transaction_id: &str) -> Result<(), AppError> {
+fn claim_lock(
+    root: &Path,
+    partition: u64,
+    key: &DentryKey,
+    transaction_id: &str,
+) -> Result<(), AppError> {
+    let path = lock_path(root, partition, key);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             AppError::Io(
@@ -539,42 +561,74 @@ fn claim_lock(path: &Path, transaction_id: &str) -> Result<(), AppError> {
             )
         })?;
     }
-    match OpenOptions::new().create_new(true).write(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(transaction_id.as_bytes()).map_err(|err| {
-                AppError::Io(err, format!("write namespace lock {}", path.display()))
-            })?;
-            file.sync_all().map_err(|err| {
-                AppError::Io(err, format!("sync namespace lock {}", path.display()))
-            })?;
-            sync_parent(path)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let owner = fs::read_to_string(path).map_err(|read_err| {
-                AppError::Io(read_err, format!("read namespace lock {}", path.display()))
-            })?;
-            if owner == transaction_id {
-                Ok(())
-            } else {
-                Err(AppError::Conflict(format!(
-                    "namespace key is prepared by transaction {}",
-                    owner.trim()
-                )))
+
+    let mut cleaned_stale_lock = false;
+    loop {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(transaction_id.as_bytes()).map_err(|err| {
+                    AppError::Io(err, format!("write namespace lock {}", path.display()))
+                })?;
+                file.sync_all().map_err(|err| {
+                    AppError::Io(err, format!("sync namespace lock {}", path.display()))
+                })?;
+                return sync_parent(&path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = fs::read_to_string(&path).map_err(|read_err| {
+                    AppError::Io(read_err, format!("read namespace lock {}", path.display()))
+                })?;
+                let owner = owner.trim();
+                if owner == transaction_id {
+                    return Ok(());
+                }
+                let owner_intent = intent_path_for(root, owner, partition);
+                if !cleaned_stale_lock && !owner_intent.exists() {
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            sync_parent(&path)?;
+                            cleaned_stale_lock = true;
+                            continue;
+                        }
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
+                            cleaned_stale_lock = true;
+                            continue;
+                        }
+                        Err(remove_err) => {
+                            return Err(AppError::Io(
+                                remove_err,
+                                format!("remove stale namespace lock {}", path.display()),
+                            ));
+                        }
+                    }
+                }
+                return Err(AppError::Conflict(format!(
+                    "namespace key is prepared by transaction {owner}"
+                )));
+            }
+            Err(err) => {
+                return Err(AppError::Io(
+                    err,
+                    format!("claim namespace lock {}", path.display()),
+                ));
             }
         }
-        Err(err) => Err(AppError::Io(
-            err,
-            format!("claim namespace lock {}", path.display()),
-        )),
     }
 }
 
 fn release_lock(path: &Path, transaction_id: &str) -> Result<(), AppError> {
     match fs::read_to_string(path) {
         Ok(owner) if owner == transaction_id => {
-            fs::remove_file(path).map_err(|err| {
-                AppError::Io(err, format!("remove namespace lock {}", path.display()))
-            })?;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(AppError::Io(
+                        err,
+                        format!("remove namespace lock {}", path.display()),
+                    ));
+                }
+            }
             sync_parent(path)
         }
         Ok(_) => Err(AppError::Conflict(

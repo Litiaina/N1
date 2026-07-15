@@ -236,7 +236,7 @@ fn build_signed_read_path(
     let signature = utf8_percent_encode(signature, NON_ALPHANUMERIC).to_string();
 
     let mut path = format!(
-        "/n2/objects/signed-read?fragment={}&object_key={}&expires={}&disposition={}&signature={}",
+        "/noa/v1/objects/signed-read?fragment={}&object_key={}&expires={}&disposition={}&signature={}",
         fragment, object_key, expires, disposition, signature
     );
 
@@ -515,7 +515,7 @@ mod tests {
             Some("ver/1"),
             Some("video clip.mp4"),
         );
-        assert!(path.starts_with("/n2/objects/signed-read?"));
+        assert!(path.starts_with("/noa/v1/objects/signed-read?"));
         assert!(path.contains("fragment=frag%20hash"));
         assert!(path.contains(&format!("object_key={}", encoded_object_key)));
         assert!(path.contains(&format!("version_id={}", encoded_version_id)));

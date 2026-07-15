@@ -37,7 +37,7 @@ for user-facing traffic and stable public endpoints.
 External clients use HTTPS:
 
 ```text
-https://gateway.example.com/n2/...
+https://gateway.example.com/noa/v1/...
 ```
 
 Gateway hot paths use N2 native upstreams where possible:
@@ -50,7 +50,7 @@ Fragment auth is gateway-aware: the gateway tries available N2 nodes until a
 valid fragment session is minted. Hot-path bearer traffic then uses native
 upstreams where the gateway has a native operation for that route.
 
-Fragment creation is also gateway-aware. `POST /n2/fragments` provisions the
+Fragment creation is also gateway-aware. `POST /noa/v1/fragments` provisions the
 same stable fragment identity on every available N2 node, so later gateway
 auth, uploads, reads, and maintenance do not depend on which node receives a
 request.
@@ -128,7 +128,7 @@ disks or manage cluster membership.
 
 Each node needs:
 
-- HTTPS API enabled with `/n2/...`
+- HTTPS API enabled with `/noa/v1/...`
 - native protocol enabled with `n2://`
 - the same cluster membership view
 - a unique `node_id`
@@ -201,7 +201,7 @@ Gateway HTTPS: 51002/tcp
 2. Confirm each node is reachable directly:
 
    ```bash
-   curl -k https://192.168.0.22:50001/n2/ping
+   curl -k https://192.168.0.22:50001/noa/v1/ping
    ```
 
 3. Confirm the native port is open from the gateway host:
@@ -246,24 +246,24 @@ GET /gateway/nodes
 These routes have gateway-specific routing rules:
 
 ```text
-POST /n2/fragments                         fan out fragment creation to all available nodes
-POST /n2/auth/fragment                     try available nodes until auth succeeds
-POST /n2/upload/one-shot/{object_key}      stream through native N2 to a selected coordinator
-POST /n2/upload/multipart/init/{object_key} select coordinator and return coordinator_node_id
-PUT  /n2/upload/multipart/{version}/{part} route to client-supplied coordinator_node_id
-GET  /n2/upload/multipart/{version}        route to client-supplied coordinator_node_id
-POST /n2/upload/multipart/{version}/{session}/finalize
-DELETE /n2/upload/multipart/{version}
-POST /n2/cluster/repair/start              select coordinator and return coordinator_node_id
-GET  /n2/cluster/repair/status             route to client-supplied coordinator_node_id
-POST /n2/cluster/repair/stop               route to client-supplied coordinator_node_id
-POST /n2/cluster/rebalance/start           select coordinator and return coordinator_node_id
-GET  /n2/cluster/rebalance/status          route to client-supplied coordinator_node_id
-POST /n2/cluster/rebalance/stop            route to client-supplied coordinator_node_id
-GET  /n2/objects/download                  stream through native N2 from a selected node
+POST /noa/v1/fragments                         fan out fragment creation to all available nodes
+POST /noa/v1/auth/fragment                     try available nodes until auth succeeds
+POST /noa/v1/upload/one-shot/{object_key}      stream through native N2 to a selected coordinator
+POST /noa/v1/upload/multipart/init/{object_key} select coordinator and return coordinator_node_id
+PUT  /noa/v1/upload/multipart/{version}/{part} route to client-supplied coordinator_node_id
+GET  /noa/v1/upload/multipart/{version}        route to client-supplied coordinator_node_id
+POST /noa/v1/upload/multipart/{version}/{session}/finalize
+DELETE /noa/v1/upload/multipart/{version}
+POST /noa/v1/cluster/repair/start              select coordinator and return coordinator_node_id
+GET  /noa/v1/cluster/repair/status             route to client-supplied coordinator_node_id
+POST /noa/v1/cluster/repair/stop               route to client-supplied coordinator_node_id
+POST /noa/v1/cluster/rebalance/start           select coordinator and return coordinator_node_id
+GET  /noa/v1/cluster/rebalance/status          route to client-supplied coordinator_node_id
+POST /noa/v1/cluster/rebalance/stop            route to client-supplied coordinator_node_id
+GET  /noa/v1/objects/download                  stream through native N2 from a selected node
 ```
 
-All other `/n2/...` routes are proxied to an available N2 node.
+All other `/noa/v1/...` routes are proxied to an available N2 node.
 
 These endpoints expose gateway routing health only.
 
@@ -272,22 +272,22 @@ These endpoints expose gateway routing health only.
 The gateway handles these paths through N2 native upstreams:
 
 ```text
-POST   /n2/upload/one-shot/{object_key}
-POST   /n2/upload/multipart/init/{object_key}
-PUT    /n2/upload/multipart/{version_id}/{part_index}
-GET    /n2/upload/multipart/{version_id}
-POST   /n2/upload/multipart/{version_id}/{session_id}/finalize
-DELETE /n2/upload/multipart/{version_id}
-GET    /n2/objects/download?object_key=...
-POST   /n2/cluster/repair/start
-GET    /n2/cluster/repair/status?coordinator_node_id=...
-POST   /n2/cluster/repair/stop?coordinator_node_id=...
-POST   /n2/cluster/rebalance/start
-GET    /n2/cluster/rebalance/status?coordinator_node_id=...
-POST   /n2/cluster/rebalance/stop?coordinator_node_id=...
+POST   /noa/v1/upload/one-shot/{object_key}
+POST   /noa/v1/upload/multipart/init/{object_key}
+PUT    /noa/v1/upload/multipart/{version_id}/{part_index}
+GET    /noa/v1/upload/multipart/{version_id}
+POST   /noa/v1/upload/multipart/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/{version_id}
+GET    /noa/v1/objects/download?object_key=...
+POST   /noa/v1/cluster/repair/start
+GET    /noa/v1/cluster/repair/status?coordinator_node_id=...
+POST   /noa/v1/cluster/repair/stop?coordinator_node_id=...
+POST   /noa/v1/cluster/rebalance/start
+GET    /noa/v1/cluster/rebalance/status?coordinator_node_id=...
+POST   /noa/v1/cluster/rebalance/stop?coordinator_node_id=...
 ```
 
-Other `/n2/...` routes are transparently proxied over HTTP to a healthy N2 node.
+Other `/noa/v1/...` routes are transparently proxied over HTTP to a healthy N2 node.
 
 ## Failure Behavior
 

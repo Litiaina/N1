@@ -23,7 +23,7 @@ fi
 
 auth() {
   local base="$1" out="$2"
-  curl -sk --http1.1 -fsS -X POST "$base/n2/auth/fragment" \
+  curl -sk --http1.1 -fsS -X POST "$base/noa/v1/auth/fragment" \
     -H 'Content-Type: application/json' \
     -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$SECRET\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":21600}" \
     >"$out"
@@ -52,7 +52,7 @@ curl_upload() {
   bytes="$(stat -c%s "$file")"
   start="$(date +%s%N)"
   status="$(curl -sk --http1.1 -o "$OUT/$label-upload.json" -w '%{http_code}' \
-    -X POST "$base/n2/upload/one-shot/$key" \
+    -X POST "$base/noa/v1/upload/one-shot/$key" \
     -H "Authorization: Bearer $token" \
     --data-binary @"$file")"
   seconds="$(awk -v ns="$(( $(date +%s%N) - start ))" 'BEGIN{printf "%.6f", ns/1000000000}')"
@@ -67,7 +67,7 @@ curl_download() {
   local bytes start status seconds speed
   start="$(date +%s%N)"
   status="$(curl -sk --http1.1 -o "$OUT/$label-download.bin" -w '%{http_code}' \
-    -G "$base/n2/objects/download" \
+    -G "$base/noa/v1/objects/download" \
     -H "Authorization: Bearer $token" \
     --data-urlencode "object_key=$key")"
   seconds="$(awk -v ns="$(( $(date +%s%N) - start ))" 'BEGIN{printf "%.6f", ns/1000000000}')"
@@ -87,7 +87,7 @@ multipart_gateway() {
   part_bytes=$(( PART_MIB * 1024 * 1024 ))
   expected=$(( (bytes + part_bytes - 1) / part_bytes ))
   split -b "$part_bytes" -d -a 4 "$file" "$OUT/gw-part-"
-  curl -sk --http1.1 -fsS -X POST "$GATEWAY_BASE/n2/upload/multipart/init/$key" \
+  curl -sk --http1.1 -fsS -X POST "$GATEWAY_BASE/noa/v1/upload/multipart/init/$key" \
     -H "Authorization: Bearer $TOKEN_GATEWAY" \
     -H 'Content-Type: application/json' \
     -d "{\"total_size_bytes\":$bytes,\"expected_parts\":$expected,\"part_size_bytes\":$part_bytes,\"content_type\":\"application/octet-stream\"}" \
@@ -97,11 +97,11 @@ multipart_gateway() {
   coordinator="$(jq -r '.coordinator_node_id // .gateway.coordinator_node_id' "$OUT/gateway-multipart-init.json")"
   start="$(date +%s%N)"
   for ((i=0; i<expected; i++)); do
-    curl -sk --http1.1 -fsS -X PUT "$GATEWAY_BASE/n2/upload/multipart/$version/$i?coordinator_node_id=$coordinator" \
+    curl -sk --http1.1 -fsS -X PUT "$GATEWAY_BASE/noa/v1/upload/multipart/$version/$i?coordinator_node_id=$coordinator" \
       -H "Authorization: Bearer $TOKEN_GATEWAY" \
       --data-binary @"$OUT/gw-part-$(printf '%04d' "$i")" >"$OUT/gateway-multipart-part-$i.json"
   done
-  curl -sk --http1.1 -fsS -X POST "$GATEWAY_BASE/n2/upload/multipart/$version/$session/finalize?object_key=$key&coordinator_node_id=$coordinator" \
+  curl -sk --http1.1 -fsS -X POST "$GATEWAY_BASE/noa/v1/upload/multipart/$version/$session/finalize?object_key=$key&coordinator_node_id=$coordinator" \
     -H "Authorization: Bearer $TOKEN_GATEWAY" \
     -H 'Content-Type: application/json' \
     -d "{\"total_size_bytes\":$bytes,\"expected_parts\":$expected,\"part_size_bytes\":$part_bytes,\"content_type\":\"application/octet-stream\"}" \
@@ -134,7 +134,7 @@ latency_probe() {
   : >"$out"
   for _ in $(seq 1 "$LATENCY_SAMPLES"); do
     curl -sk --http1.1 -o /dev/null -w '%{time_total}\n' \
-      -G "$base/n2/posix/list" \
+      -G "$base/noa/v1/posix/list" \
       -H "Authorization: Bearer $token" \
       --data-urlencode 'path=bench' \
       --data-urlencode 'limit=20' >>"$out"
