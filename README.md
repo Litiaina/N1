@@ -24,14 +24,14 @@ through its supported APIs or through the native client crate.
 
 ## Development Status
 
-- **Current engine/package version:** `3.1.0`
+- **Current engine/package version:** `3.1.1`
 - **Release channel:** development
 - **Storage engine format:** `3`
 - **Stable release for this engine line:** not yet declared
 
 The engine/package version identifies the actively evolving implementation; it
 does not itself declare production stability. Engine-format compatibility is a
-separate contract: N1 3.1.0 uses engine format 3 and fails closed on older or
+separate contract: N1 3.1.1 uses engine format 3 and fails closed on older or
 unversioned storage roots rather than adopting or migrating them.
 
 ## What Is Included

@@ -107,9 +107,9 @@ SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_rele
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
-## N1 3.1.0 Development Release Requirement
+## N1 3.1.1 Development Release Requirement
 
-N1 3.1.0 must retain every N1 2.0 storage invariant and additionally prove:
+N1 3.1.1 must retain every N1 2.0 storage invariant and additionally prove:
 
 - delete is soft-only across HTTP, POSIX, native protocol, shell, and console
 - each deletion receives a unique trash entry id
@@ -120,11 +120,28 @@ N1 3.1.0 must retain every N1 2.0 storage invariant and additionally prove:
 - expiry writes a replayable receipt before removing namespace reachability
 - exact object ids are reclaimed directly only after live/trash reference verification
 - folder delete remains a directory rename and descendant inspection is deferred until expiry
-- N1 2.x and unversioned fragment metadata fail closed; N1 3.1.0 performs no compatibility adoption or migration
+- N1 2.x and unversioned fragment metadata fail closed; N1 3.1.1 performs no compatibility adoption or migration
 
 Evidence for the current release belongs under `/home/wlzambo/DEV-TEST` and
 must record the exact binary hash, configuration, disk topology, commands,
 results, and any unproven boundaries.
+
+The reusable release runner has three focused autonomous-maintenance gates:
+
+- `--auto-healing-proof` injects data/parity loss, root loss, root-identity
+  mismatch, unrecoverable damage and later recovery, scheduled online checksum
+  with a successful concurrent mutation, and a prospective EC change.
+- `--maintenance-coverage-proof` proves Deep Scan/Fresh Snapshot observation,
+  multipart restart, online availability repair, manual checksum/strict
+  read-only gates, scrub quiescence, and clean gate release.
+- `--trash-maintenance-proof` repairs trashed objects across restart and across
+  the 128-entry metadata batch boundary before recovering and hashing all 141
+  objects.
+
+Pass explicit `--data-shards`, `--parity-shards`, `--disk-roots`,
+`--colocated-roots`, and `--cleanup-roots`. Every `D + P` proof root must be on
+a distinct physical device; same-device directories are functional tests, not
+EC hardware evidence.
 
 Recover-on-read fault injection must remove a data shard (`.shard`) that the
 read path actually consumes. Removing parity (`.parity`) exercises explicit
@@ -162,7 +179,7 @@ Focused N1 2.0.0 evidence from June 11, 2026:
 - Object-level redistribution passed a real `1 + 0 -> 1 + 1` topology change:
   one object scanned, one mismatch found, one migration completed, zero errors,
   followed by physical `.ndx + payload` verification on both blob roots.
-- N1 3.1.0 redistribution tests must prove that a higher durable namespace
+- N1 3.1.1 redistribution tests must prove that a higher durable namespace
   generation wins after `2 -> 1 -> 2`, including equal-count replacement and
   newer deletion cases, while same-generation content disagreement and writes
   attempted before reconciliation still fail closed.

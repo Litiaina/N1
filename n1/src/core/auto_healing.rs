@@ -301,7 +301,11 @@ async fn start_automatic_scan(check_mode: RepairCheckMode, state: Arc<AppState>)
         shard_repair_concurrency: cfg.shard_repair_concurrency,
         meta_batch_size: cfg.metadata_batch_size,
     };
-    let access_mode = check_mode.maintenance_access_mode();
+    // Scheduled availability and checksum work is deliberately online. The
+    // repair manager still enforces read-only/quiesced minimums for strict or
+    // scrub modes, while genuine topology or repair failures use the separate
+    // persistent safety gate below.
+    let access_mode = check_mode.minimum_maintenance_access_mode();
     let result = run_repair_job_with_options(
         run_cfg,
         RepairRunOptions {

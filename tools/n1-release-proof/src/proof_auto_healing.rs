@@ -53,6 +53,147 @@ impl Drop for DisplacedProofRoot {
 }
 
 impl Proof {
+    async fn run_trash_maintenance_proof(&mut self) -> ProofResult<()> {
+        const DIRECTORY_OBJECTS: usize = 140;
+
+        self.validate()?;
+        if self.data_shards == 0 || self.parity_shards == 0 {
+            return Err("trash maintenance proof requires non-zero data and parity shards".into());
+        }
+        self.prepare_dirs()?;
+        self.write_config()?;
+        self.start_server("trash-maintenance-before-restart")
+            .await?;
+        self.wait_for_log_count(
+            "trash-maintenance-before-restart",
+            "leaving automatic read-only mode",
+            1,
+            Duration::from_secs(30),
+        )
+        .await?;
+        self.create_fragment().await?;
+        self.auth().await?;
+        self.wait_for_write_safe("trash maintenance startup")
+            .await?;
+
+        let base = format!("{}trash-maintenance-directory", self.args.prefix);
+        let nested = format!("{base}/nested");
+        self.posix_post("/n1/posix/mkdir", json!({"path": &base}))
+            .await?;
+        self.posix_post("/n1/posix/mkdir", json!({"path": &nested}))
+            .await?;
+
+        let direct_key = format!("{}trash-maintenance-direct.bin", self.args.prefix);
+        let direct_payload = deterministic_payload(8 * 1024, b"n1-trash-direct");
+        let direct_sha = sha256_bytes(&direct_payload);
+        let direct_version = self
+            .upload_bytes(&direct_key, direct_payload, "application/octet-stream")
+            .await?;
+
+        let mut directory_objects = Vec::with_capacity(DIRECTORY_OBJECTS);
+        for index in 0..DIRECTORY_OBJECTS {
+            let key = format!("{nested}/item-{index:03}.bin");
+            let seed = format!("n1-trash-directory-{index:03}");
+            let payload = deterministic_payload(4 * 1024, seed.as_bytes());
+            let sha = sha256_bytes(&payload);
+            let version = self
+                .upload_bytes(&key, payload, "application/octet-stream")
+                .await?;
+            directory_objects.push((key, sha, version));
+        }
+
+        self.posix_post("/n1/posix/trash", json!({"path": &direct_key}))
+            .await?;
+        self.posix_post("/n1/posix/trash", json!({"path": &base}))
+            .await?;
+
+        let removed_direct = self.remove_one_shard_matching(&direct_version, |path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("parity")
+        })?;
+        let last_version = &directory_objects
+            .last()
+            .ok_or("trash maintenance proof created no directory objects")?
+            .2;
+        let removed_after_page_boundary =
+            self.remove_one_shard_matching(last_version, |path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some("parity")
+            })?;
+
+        self.stop_server()?;
+        self.start_server("trash-maintenance-after-restart").await?;
+        self.auth().await?;
+        self.wait_for_path(&removed_direct, true, Duration::from_secs(30))
+            .await?;
+        self.wait_for_path(
+            &removed_after_page_boundary,
+            true,
+            Duration::from_secs(30),
+        )
+        .await?;
+        let scan_health = self
+            .wait_for_auto_healing_state(
+                "successful restarted trash maintenance scan",
+                Duration::from_secs(30),
+                |snapshot| {
+                    snapshot
+                        .pointer("/maintenance/auto_healing/last_availability_scan_at")
+                        .is_some_and(Value::is_number)
+                        && snapshot
+                            .pointer("/maintenance/auto_healing/write_safe")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        && snapshot
+                            .pointer("/maintenance/access_mode")
+                            .and_then(Value::as_str)
+                            == Some("availability")
+                },
+            )
+            .await?;
+
+        self.posix_post("/n1/posix/recover", json!({"path": &direct_key}))
+            .await?;
+        self.posix_post("/n1/posix/recover", json!({"path": &base}))
+            .await?;
+        self.assert_download_sha256(&direct_key, &direct_sha).await?;
+        for (key, sha, _) in &directory_objects {
+            self.assert_download_sha256(key, sha).await?;
+        }
+        let final_health = self.wait_for_write_safe("post-recovery write safety").await?;
+
+        self.summary = json!({
+            "status": "PASS",
+            "proof": "n1_trash_maintenance_real_disk",
+            "physical_topology": {
+                "disk_roots": self.disk_roots()?,
+                "data_shards": self.data_shards,
+                "parity_shards": self.parity_shards,
+                "colocated_roots": self.args.colocated_roots,
+            },
+            "trash_scope": {
+                "direct_objects": 1,
+                "deleted_directory_objects": DIRECTORY_OBJECTS,
+                "metadata_batch_size": 128,
+                "crossed_batch_boundary": DIRECTORY_OBJECTS > 128,
+            },
+            "fault_injection": {
+                "direct_trash_shard_removed_and_restored": removed_direct,
+                "directory_tail_shard_removed_and_restored": removed_after_page_boundary,
+                "server_restarted_while_objects_were_trashed": true,
+            },
+            "recovery_validation": {
+                "objects_downloaded_and_sha256_verified": DIRECTORY_OBJECTS + 1,
+            },
+            "scan_health": scan_health,
+            "final_health": final_health,
+        });
+        self.write_summary()?;
+        self.stop_server()?;
+        if self.args.cleanup_roots {
+            self.cleanup_roots()?;
+        }
+        Ok(())
+    }
+
     async fn auto_healing_health(&self) -> ProofResult<Value> {
         let response = self
             .client
@@ -151,11 +292,65 @@ impl Proof {
         Ok(json!({"status": status.as_u16(), "body": body}))
     }
 
+    async fn prove_scheduled_checksum_remains_online(&self) -> ProofResult<Value> {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut last = json!(null);
+        let mut attempt = 0usize;
+        while Instant::now() < deadline {
+            last = self.auto_healing_health().await?;
+            let automatic_checksum_running = last
+                .pointer("/maintenance/auto_healing/phase")
+                .and_then(Value::as_str)
+                == Some("running_checksum_scrub");
+            if automatic_checksum_running {
+                let access_mode = last
+                    .pointer("/maintenance/access_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing");
+                if access_mode != "availability" {
+                    return Err(format!(
+                        "scheduled checksum entered {access_mode} instead of preserving availability: {last}"
+                    )
+                    .into());
+                }
+
+                let key = format!(
+                    "{}auto-healing/online-checksum-write-{attempt:03}.txt",
+                    self.args.prefix
+                );
+                let (status, body) = self.raw_one_shot_mutation(&key).await?;
+                if status != StatusCode::CREATED {
+                    return Err(format!(
+                        "scheduled checksum blocked a foreground mutation: status={status} body={body} health={last}"
+                    )
+                    .into());
+                }
+                let after_write = self.auto_healing_health().await?;
+                return Ok(json!({
+                    "running_health": last,
+                    "write_status": status.as_u16(),
+                    "write_object_key": key,
+                    "health_after_write": after_write,
+                }));
+            }
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!(
+            "timed out observing a scheduled checksum while online; last={last}"
+        )
+        .into())
+    }
+
     async fn run_auto_healing_proof(&mut self) -> ProofResult<()> {
         self.validate()?;
-        if self.data_shards != 1 || self.parity_shards != 1 {
-            return Err("auto-healing proof currently requires the minimum 1+1 EC topology".into());
+        if self.data_shards == 0 || self.parity_shards == 0 {
+            return Err("auto-healing proof requires non-zero data and parity shards".into());
         }
+        let original_data_shards = self.data_shards;
+        let original_parity_shards = self.parity_shards;
+        let original_width =
+            usize::from(original_data_shards) + usize::from(original_parity_shards);
         self.prepare_dirs()?;
         self.write_config()?;
         self.start_server("auto-healing").await?;
@@ -177,9 +372,10 @@ impl Proof {
             .upload_bytes(&object_key, payload, "application/octet-stream")
             .await?;
         let initial_shards = self.version_shard_paths(&version_id)?;
-        if initial_shards.len() != 2 {
+        if initial_shards.len() != original_width {
             return Err(format!(
-                "1+1 object did not create exactly two shards: {initial_shards:?}"
+                "{}+{} object did not create exactly {} shards: {initial_shards:?}",
+                original_data_shards, original_parity_shards, original_width
             )
             .into());
         }
@@ -208,6 +404,38 @@ impl Proof {
             )
             .await?;
         self.assert_object_status_clean(&object_key, "scheduled_auto_repair")
+            .await?;
+
+        let checksum_key = format!("{}auto-healing/checksum-baseline.bin", self.args.prefix);
+        let checksum_payload =
+            deterministic_payload(128 * 1024 * 1024, b"n1-online-checksum-proof");
+        let checksum_sha = sha256_bytes(&checksum_payload);
+        self.upload_complete_multipart_payload(
+            &checksum_key,
+            &checksum_payload,
+            32 * 1024 * 1024,
+        )
+        .await?;
+        let scheduled_checksum_online = self.prove_scheduled_checksum_remains_online().await?;
+        self.wait_for_auto_healing_state(
+            "completed scheduled online checksum",
+            Duration::from_secs(45),
+            |snapshot| {
+                snapshot
+                    .pointer("/maintenance/auto_healing/last_checksum_scrub_at")
+                    .is_some_and(Value::is_number)
+                    && snapshot
+                        .pointer("/maintenance/auto_healing/phase")
+                        .and_then(Value::as_str)
+                        == Some("idle")
+                    && snapshot
+                        .pointer("/maintenance/access_mode")
+                        .and_then(Value::as_str)
+                        == Some("availability")
+            },
+        )
+        .await?;
+        self.assert_download_sha256(&checksum_key, &checksum_sha)
             .await?;
 
         let root = self
@@ -302,7 +530,9 @@ impl Proof {
                 },
             )
             .await?;
-        fs::copy(&backups[0].1, &backups[0].0)?;
+        for (path, backup) in backups.iter().take(usize::from(original_data_shards)) {
+            fs::copy(backup, path)?;
+        }
         for (path, _) in &backups {
             self.wait_for_path(path, true, Duration::from_secs(30))
                 .await?;
@@ -340,7 +570,10 @@ impl Proof {
         .await?;
         let old_layout_after = self.object_version_dirs(&version_id)?.len();
         let new_layout = self.object_version_dirs(&new_version)?.len();
-        if old_layout_before != 2 || old_layout_after != 2 || new_layout != 1 {
+        if old_layout_before != original_width
+            || old_layout_after != original_width
+            || new_layout != 1
+        {
             return Err(format!(
                 "per-object EC topology changed unexpectedly: old_before={old_layout_before} old_after={old_layout_after} new={new_layout}"
             )
@@ -357,6 +590,7 @@ impl Proof {
             "startup": startup,
             "recover_on_read": {"removed_and_restored": removed_on_read},
             "scheduled_repair": {"removed_and_restored": removed_by_scan, "health": scheduled_repair},
+            "scheduled_checksum_online": scheduled_checksum_online,
             "missing_root": {"root": root, "health": missing_health, "mutation": rejected_mutation, "restored": restored_health},
             "identity_mismatch": {"health": replacement_health, "restored": identity_restored_health},
             "unrecoverable_fail_safe": {"health": scan_failure, "recovered": recovered_from_fault},

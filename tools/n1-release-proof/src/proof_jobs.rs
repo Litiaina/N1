@@ -799,14 +799,7 @@ impl Proof {
             let mut line_count = 0usize;
             for (idx, line) in text.lines().enumerate() {
                 line_count += 1;
-                let lower = line.to_ascii_lowercase();
-                let bad = lower.contains(" warn ")
-                    || lower.contains(" error ")
-                    || lower.contains("panic")
-                    || lower.contains("critical")
-                    || lower.contains("degraded")
-                    || lower.contains("failed");
-                if bad {
+                if log_line_is_failure(line) {
                     bad_lines.push(json!({
                         "file": path,
                         "line": idx + 1,
@@ -888,6 +881,41 @@ impl Proof {
     }
 }
 
+fn strip_ansi_control_sequences(line: &str) -> String {
+    let mut cleaned = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for control in chars.by_ref() {
+                if ('@'..='~').contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
+}
+
+fn log_line_is_failure(line: &str) -> bool {
+    let cleaned = strip_ansi_control_sequences(line);
+    let has_failure_level = cleaned
+        .split_whitespace()
+        .any(|token| matches!(token, "WARN" | "ERROR"));
+    if has_failure_level {
+        return true;
+    }
+
+    let lower = cleaned.to_ascii_lowercase();
+    let zero_failed_counter = lower.contains("failed: 0") || lower.contains("failed=0");
+    lower.contains("panic")
+        || lower.contains("critical")
+        || lower.contains("degraded")
+        || (lower.contains("failed") && !zero_failed_counter)
+}
+
 fn is_erasure_shard_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -902,7 +930,7 @@ fn is_data_shard_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod proof_job_tests {
-    use super::{is_data_shard_path, is_erasure_shard_path};
+    use super::{is_data_shard_path, is_erasure_shard_path, log_line_is_failure};
     use std::path::Path;
 
     #[test]
@@ -917,5 +945,15 @@ mod proof_job_tests {
         assert!(is_data_shard_path(data));
         assert!(!is_data_shard_path(parity));
         assert!(!is_data_shard_path(metadata));
+    }
+
+    #[test]
+    fn log_scan_accepts_zero_failed_counter_and_detects_real_levels() {
+        let healthy = "\u{1b}[32m INFO\u{1b}[0m Repair Job Ended. Failed: 0";
+        let warning = "\u{1b}[33m WARN\u{1b}[0m repair retry required";
+        let failed = "\u{1b}[32m INFO\u{1b}[0m Repair Job Ended. Failed: 2";
+        assert!(!log_line_is_failure(healthy));
+        assert!(log_line_is_failure(warning));
+        assert!(log_line_is_failure(failed));
     }
 }

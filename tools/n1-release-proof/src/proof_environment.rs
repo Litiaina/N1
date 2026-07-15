@@ -148,11 +148,33 @@ impl Proof {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let auto_healing_enabled = self.args.auto_healing_proof;
+        let auto_healing_enabled = self.args.auto_healing_proof
+            || self.args.trash_maintenance_proof
+            || self.args.maintenance_coverage_proof;
         let topology_recovery_stability_seconds = if auto_healing_enabled { 2 } else { 0 };
-        let initial_scan_delay_seconds = if auto_healing_enabled { 2 } else { 60 };
-        let availability_scan_interval_seconds = if auto_healing_enabled { 2 } else { 3600 };
-        let checksum_scrub_interval_seconds = if auto_healing_enabled { 5 } else { 604800 };
+        let initial_scan_delay_seconds = if self.args.maintenance_coverage_proof {
+            3600
+        } else if auto_healing_enabled {
+            2
+        } else {
+            60
+        };
+        let availability_scan_interval_seconds = if self.args.maintenance_coverage_proof {
+            3600
+        } else if auto_healing_enabled {
+            2
+        } else {
+            3600
+        };
+        let checksum_scrub_interval_seconds = if self.args.maintenance_coverage_proof {
+            3600
+        } else if self.args.trash_maintenance_proof {
+            300
+        } else if auto_healing_enabled {
+            5
+        } else {
+            604800
+        };
         let config = format!(
             r#"[server]
 host=127.0.0.1

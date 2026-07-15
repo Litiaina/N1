@@ -1867,7 +1867,6 @@ fn scan_trash_page(
     prefix: Option<String>,
     limit: usize,
     continuation_token: Option<String>,
-    full_metadata: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let prefix = prefix
         .map(|prefix| normalize_object_key(&prefix))
@@ -1918,34 +1917,22 @@ fn scan_trash_page(
         }
 
         let version_id = record.version_ids.last().cloned().unwrap_or_default();
-        let mut metadata = if full_metadata {
-            let Some(object_id) = record.object_keys.first() else {
-                continue;
-            };
-            let Some(mut meta) = read_latest_trash(fragment, object_id)? else {
-                continue;
-            };
-            meta.object_key = record.original_path.clone();
-            meta
-        } else {
-            ObjectMetadata {
-                object_key: record.original_path.clone(),
-                fragment: fragment.to_string(),
-                version_id,
-                upload_session_id: String::new(),
-                owner_uid: fragment.to_string(),
-                content_type: "application/octet-stream".to_string(),
-                total_size_bytes: 0,
-                created_at: record.deleted_at_unix,
-                data_shards: 0,
-                parity_shards: 0,
-                placement_generation: 0,
-                parts: Vec::new(),
-                is_delete_marker: false,
-                stripe_size_bytes: super::disk_manager::default_stripe_size(),
-            }
+        let metadata = ObjectMetadata {
+            object_key: record.original_path.clone(),
+            fragment: fragment.to_string(),
+            version_id,
+            upload_session_id: String::new(),
+            owner_uid: fragment.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            total_size_bytes: 0,
+            created_at: record.deleted_at_unix,
+            data_shards: 0,
+            parity_shards: 0,
+            placement_generation: 0,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: super::disk_manager::default_stripe_size(),
         };
-        metadata.object_key = record.original_path.clone();
         let entry = IndexListEntry {
             record: name.clone(),
             kind: "file".to_string(),
@@ -1985,6 +1972,65 @@ fn scan_trash_page(
     })
 }
 
+fn scan_trash_maintenance_page(
+    fragment: &str,
+    limit: usize,
+    continuation_token: Option<String>,
+) -> Result<ListObjectsResult, AppError> {
+    let limit = limit.max(1);
+    let after = continuation_token
+        .as_deref()
+        .map(|token| {
+            token.split_once(':').ok_or_else(|| {
+                AppError::BadRequest("invalid N1 trash maintenance continuation token".to_string())
+            })
+        })
+        .transpose()?;
+    let mut candidates = Vec::<(String, ObjectMetadata)>::with_capacity(limit.saturating_add(1));
+
+    'records: for record in stored_trash_records(fragment)? {
+        if after.is_some_and(|(record_id, _)| record.trash_entry_id.as_str() < record_id) {
+            continue;
+        }
+        let record = hydrate_trash_record(fragment, record)?;
+        for object_id in &record.object_keys {
+            if after.is_some_and(|(record_id, after_object_id)| {
+                record.trash_entry_id == record_id && object_id.as_str() <= after_object_id
+            }) {
+                continue;
+            }
+            let Some(metadata) = read_latest_trash(fragment, object_id)? else {
+                continue;
+            };
+            let token = format!("{}:{object_id}", record.trash_entry_id);
+            candidates.push((token, metadata));
+            if candidates.len() > limit {
+                break 'records;
+            }
+        }
+    }
+
+    let continuation = if candidates.len() > limit {
+        candidates.truncate(limit);
+        candidates.last().map(|(token, _)| token.clone())
+    } else {
+        None
+    };
+    let objects = candidates
+        .into_iter()
+        .map(|(_, metadata)| metadata)
+        .collect();
+    Ok(ListObjectsResult {
+        prefix: None,
+        limit: Some(limit),
+        entries: Vec::new(),
+        objects,
+        common_prefixes: Vec::new(),
+        continuation_token: continuation.clone(),
+        next_continuation_token: continuation,
+    })
+}
+
 pub fn scan_trash_heads_page(
     fragment: &str,
     prefix: Option<String>,
@@ -1993,18 +2039,18 @@ pub fn scan_trash_heads_page(
     continuation_token: Option<String>,
     _include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    scan_trash_page(fragment, prefix, limit, continuation_token, false)
+    scan_trash_page(fragment, prefix, limit, continuation_token)
 }
 
 pub fn scan_trash_full_metadata_page(
     fragment: &str,
-    prefix: Option<String>,
+    _prefix: Option<String>,
     _delimiter: Option<String>,
     limit: usize,
     continuation_token: Option<String>,
     _include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    scan_trash_page(fragment, prefix, limit, continuation_token, true)
+    scan_trash_maintenance_page(fragment, limit, continuation_token)
 }
 
 pub fn list_object_keys_with_trash_versions(fragment: &str) -> Result<Vec<String>, AppError> {
@@ -3991,6 +4037,94 @@ mod tests {
             vec![third_id.as_str()]
         );
         assert!(second.continuation_token.is_none());
+    }
+
+    #[test]
+    fn trash_maintenance_scan_preserves_physical_object_id() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-trash-maintenance-{}", Ulid::new());
+        let logical_path = "docs/recoverable report.txt";
+        let object_id = publish_logical_object(&roots, &fragment, logical_path, 42);
+        let version_ids = list_live_versions(&fragment, &object_id)
+            .expect("list test versions")
+            .into_iter()
+            .map(|metadata| metadata.version_id)
+            .collect::<Vec<_>>();
+        let trash_entry_id = Ulid::new().to_string();
+        let source_relative_path = format!(".entries/{trash_entry_id}");
+
+        for root in &roots {
+            let fragment_root = fragment_root_on(root, &fragment);
+            let source = fragment_root.join(logical_path);
+            let destination = fragment_root.join(TRASH_DIR).join(&source_relative_path);
+            fs::create_dir_all(destination.parent().expect("trash parent"))
+                .expect("create trash payload parent");
+            fs::rename(source, destination).expect("move namespace link into trash");
+        }
+        write_trash_record_for_fragment(
+            &fragment,
+            &TrashRecord {
+                trash_entry_id,
+                original_path: logical_path.to_string(),
+                source_relative_path,
+                kind: TrashKind::File,
+                object_keys: vec![object_id.clone()],
+                version_ids,
+                deleted_at_unix: 1_777_905_001,
+            },
+        )
+        .expect("publish trash record");
+
+        let user_page =
+            scan_trash_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
+                .expect("scan user trash page");
+        assert_eq!(user_page.objects.len(), 1);
+        assert_eq!(user_page.objects[0].object_key, logical_path);
+
+        let maintenance_page = scan_trash_full_metadata_page(&fragment, None, None, 10, None, true)
+            .expect("scan maintenance trash page");
+        assert_eq!(maintenance_page.objects.len(), 1);
+        assert_eq!(maintenance_page.objects[0].object_key, object_id);
+        assert!(normalize_object_id(&maintenance_page.objects[0].object_key).is_ok());
+    }
+
+    #[test]
+    fn trash_maintenance_scan_descends_into_deleted_directories() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-trash-directory-maintenance-{}", Ulid::new());
+        let logical_path = "archive/nested/report.bin";
+        let object_id = publish_logical_object(&roots, &fragment, logical_path, 73);
+        let trash_entry_id = Ulid::new().to_string();
+        let source_relative_path = format!(".entries/{trash_entry_id}");
+
+        for root in &roots {
+            let fragment_root = fragment_root_on(root, &fragment);
+            let destination = fragment_root.join(TRASH_DIR).join(&source_relative_path);
+            fs::create_dir_all(destination.parent().expect("trash parent"))
+                .expect("create trash payload parent");
+            fs::rename(fragment_root.join("archive"), destination)
+                .expect("move namespace directory into trash");
+        }
+        write_trash_record_for_fragment(
+            &fragment,
+            &TrashRecord {
+                trash_entry_id,
+                original_path: "archive".to_string(),
+                source_relative_path,
+                kind: TrashKind::Directory,
+                object_keys: Vec::new(),
+                version_ids: Vec::new(),
+                deleted_at_unix: 1_777_905_002,
+            },
+        )
+        .expect("publish directory trash record");
+
+        let maintenance_page = scan_trash_full_metadata_page(&fragment, None, None, 10, None, true)
+            .expect("scan deleted directory maintenance page");
+        assert_eq!(maintenance_page.objects.len(), 1);
+        assert_eq!(maintenance_page.objects[0].object_key, object_id);
     }
 
     #[test]

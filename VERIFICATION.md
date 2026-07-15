@@ -2,7 +2,7 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.1.0` on the development channel, using
+The current package line is N1 `3.1.1` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
 line. Dated `3.0.0` and `3.0.1` evidence names below remain unchanged because
 they identify the exact candidate binaries and runs that produced them.
@@ -148,13 +148,16 @@ N1 2.0.0 IO-control proof completed on June 11, 2026:
 - The final log scan passed with `bad_lines: []`.
 - Evidence: `/tmp/n1-2.0-io-control-proof/summary.json`.
 
-## N1 3.1.0 Development-Engine Autonomous-Maintenance Confidence Matrix
+## N1 3.1.1 Development-Engine Autonomous-Maintenance Confidence Matrix
 
-N1 3.1.0 intentionally has no metadata or upload-manifest compatibility
+N1 3.1.1 intentionally has no metadata or upload-manifest compatibility
 with an earlier engine. The package, native client, and shell versions are
-aligned at `3.1.0`. This development line incorporates the earlier 3.0.x
+aligned at `3.1.1`. This development line incorporates the earlier 3.0.x
 namespace/lifecycle hardening and adds object-owned EC topology plus autonomous
 repair. Historical proof names retain the version used when each run completed.
+Version 3.1.1 is a bug-fix package over 3.1.0: it preserves engine format 3 and
+the established architecture while correcting the internal trash-maintenance
+projection so repair always consumes immutable physical object identities.
 
 | Edge case | Locked invariant | Regression proof | Status |
 | --- | --- | --- | --- |
@@ -171,6 +174,8 @@ repair. Historical proof names retain the version used when each run completed.
 | Scheduled repair cannot find a distinct replacement or cannot complete IO | The scan records unresolved debt and finishes failed, causing the autonomous controller to retain read-only mode | `unresolved_automatic_repair_debt_fails_the_scan` | PASS |
 | Topology or healer read-only is enforced through HTTP and direct/native paths | Mutations receive `503 Service Unavailable`; reads remain available unless explicitly quiesced | `persistent_safety_read_only_returns_service_unavailable`, operation-gate suite | PASS |
 | Disk/EC configuration changes but recorded objects remain healthy | Health treats the recorded object layout as authoritative and reports current-layout mismatch only as optional redistribution opportunity | monitoring and object-layout unit suite | PASS |
+| A deleted file has a POSIX name that is not a valid physical object id | User trash listings expose the original path, but repair and redistribution retain the immutable physical object id | `trash_maintenance_scan_preserves_physical_object_id` | PASS |
+| A deleted directory contains one or more immutable objects | Maintenance descends through the directory trash payload and checks every referenced object instead of treating the directory anchor as an object | `trash_maintenance_scan_descends_into_deleted_directories` | PASS |
 
 Fast, non-soak verification commands for this implementation:
 
@@ -183,7 +188,7 @@ cargo check --workspace --all-targets
 cargo test --workspace
 ```
 
-The fast N1 library gate passed all `129` tests on July 14, 2026. No soak or
+The fast N1 library gate passed all `131` tests on July 15, 2026. No soak or
 long-running proof was started, per the implementation-stage test boundary.
 The ordinary workspace matrix also passed: proof runner `3/3`, N1 Shell
 integration `7/7`, SIMD unit `107` passed with `6` intentional ignores, SIMD
@@ -191,9 +196,44 @@ integration `5` passed with `2` intentional ignores, and documentation tests
 `4/4`. All workspace targets, including benchmark targets, compiled.
 The real HDD+SSD evidence below remains valid for the immutable-object, EC,
 namespace, CRUD, POSIX, recovery, repair, and redistribution primitives carried
-into N1 3.1.0. The historical evidence-directory names retain the package label
+into N1 3.1.1. The historical evidence-directory names retain the package label
 used by each run; the dedicated `--auto-healing-proof` section separately
 records direct failure-injection proof of the autonomous controller.
+
+On July 15, 2026, a real Space-driven trash/recover cycle exposed and closed
+an internal catalog-boundary defect: the user-facing trash projection was
+passing an original POSIX path into object maintenance, which correctly
+rejected it as an invalid N1 object id and held the engine read-only. The
+maintenance catalog now preserves immutable physical ids and scans objects
+inside directory trash records, while the user catalog continues to expose
+logical names. The full workspace suite passed with `131/131` N1 library
+tests. A restarted HDD+SSD `1 + 1` smoke process then completed an automatic
+availability scan with `3` objects scanned and no failures, and a Space cycle
+successfully deleted and recovered its test object. That smoke established
+the original reproduction was closed, but was not treated as pagination or
+fault-injection evidence.
+
+A dedicated bounded real-disk proof subsequently ran against the HDD
+`/mnt/DISK001` and SSD `/home/wlzambo/SERVER-TEST/disk-00`, using colocated
+index/blob roots and minimum `1 + 1` EC. It placed one file and a 140-object
+nested directory in trash, deliberately removed a parity shard from the
+directly trashed file and from `item-139.bin`, then restarted N1 while all 141
+objects remained in trash. The second fault is beyond the configured
+`metadata_batch_size=128` boundary, so successful repair requires both
+directory expansion and maintenance continuation. After restart, the
+availability job reported `Scanned: 141, Repaired: 2, Corrupt: 0, Failed: 0,
+MissingMeta: 0, DivergentMeta: 0`. Both deleted paths were recovered and all
+141 downloads matched their expected SHA-256 values. Final health was
+`write_safe=true`, `phase=idle`, `read_only_reason=null`, and
+`last_error=null`. The machine-readable result and server logs are retained
+under `/home/wlzambo/DEV-TEST/n1-3.1.0-trash-maintenance-real-20260715`.
+
+The first invocation of this new proof was invalidated during setup because
+the proof-only five-second checksum scrub entered strict maintenance while
+uploads were still being created. The harness now keeps the checksum scrub
+outside this bounded availability scenario; the corrected invocation above
+completed with `N1_RELEASE_PROOF PASS`. This was a harness scheduling issue,
+not counted as engine evidence or an engine pass.
 
 ### N1 3.1.0 Fast Real-Disk Smoke
 
@@ -258,13 +298,89 @@ the logs contain no panic. Reproducible evidence is stored at:
 The reusable command path is `n1-release-proof --auto-healing-proof`; every
 state wait is bounded to 30 seconds.
 
-## N1 3.1.0 Namespace Edge-Case Evidence
+### N1 3.1.1 Self-Healing And Maintenance Coverage
+
+On July 15, 2026, a fresh optimized N1 3.1.1 release binary completed three
+isolated real-device gates using the HDD `/mnt/DISK001`, SSD
+`/home/wlzambo/SERVER-TEST/disk-00`, colocated index/blob roots, and minimum
+`1 + 1` EC.
+
+The dedicated `--maintenance-coverage-proof` established that Console Deep
+Scan plus Fresh Snapshot is observational: access remained `availability`, the
+healer stayed write-safe with no error, and an immediate mutation succeeded.
+It also restarted N1 with an unfinished multipart upload, repeated the deep
+scan, resumed and finalized the upload, and verified its SHA-256. Manual
+availability repair permitted a concurrent write; checksum and strict repair
+temporarily rejected writes with HTTP `403` while checksum preserved reads;
+scrub temporarily rejected reads and writes with HTTP `503`. Every clean mode
+completion returned to `availability` with zero failed repairs and no
+persistent healer fault.
+
+The optimized `--auto-healing-proof` passed recover-on-read, scheduled parity
+repair, missing-root fail-safe, replacement-identity rejection, unrecoverable
+object `scan_failed`, automatic recovery after one shard returned, and
+prospective EC-change preservation. The optimized `--trash-maintenance-proof`
+passed the 141-object directory/pagination/restart/two-shard repair and recovery
+matrix. `cargo test --workspace --no-fail-fast` also passed: N1 `131/131`,
+proof runner `3/3`, Shell integration `7/7`, SIMD unit `107` passed with `6`
+ignored, SIMD integration `5` passed with `2` ignored, and docs `4/4`.
+
+That first coverage pass identified an autonomous-availability mismatch. The
+controller scheduled automatic checksum work using the same read-only default
+as an operator-requested checksum. This explained the periodic temporary gate
+seen in the interactive run; Deep Scan and Fresh Snapshot did not cause it.
+
+The mismatch is now resolved without weakening fail-safe behavior. Repair mode
+policy distinguishes the operator default from the algorithm's safe minimum:
+a manual checksum remains read-only, strict remains read-only, scrub remains
+quiesced, and a healthy scheduled checksum runs online. Topology failure,
+root-identity failure, and unresolved automatic repair debt still activate the
+persistent read-only gate. The online path is valid because repair re-reads the
+current immutable version under its object-operation lock and publishes any
+placement change atomically.
+
+The correction then passed an isolated optimized `3 + 1` matrix on four
+distinct XFS devices at `/mnt/DISK0` through `/mnt/DISK3`. While health reported
+`running_checksum_scrub`, maintenance access remained `availability`; a real
+foreground mutation returned HTTP `201`, and the following health snapshot
+still reported the checksum running in `availability`. Missing-root and
+unrecoverable-object injections continued to enter read-only and reject unsafe
+mutations. Manual maintenance modes, 141-object trash repair/recovery, and a
+170-object lifecycle/release matrix also passed. The latter covered TTL GC,
+POSIX CRUD, native protocol, multipart restart/resume, concurrency, archive,
+recover-on-read, object repair, simulated disk-format repair, redistribution,
+physical placement inspection, and a clean log audit.
+
+The first lifecycle wrapper result was a harness false positive: it matched the
+zero counter `Failed: 0`. The scanner was patched to parse ANSI severity and
+retain rejection of real warning/error/panic/degraded/nonzero-failure evidence.
+Its regression test and a full lifecycle rerun passed. Current workspace totals
+are N1 `132/132`, proof runner `4/4`, Shell integration `7/7`, SIMD unit `107`
+passed with `6` ignored, SIMD integration `5` passed with `2` ignored, and docs
+`4/4`.
+
+The proof used uniquely named nested directories and low CPU/IO priority. Both
+pre-existing production N1 services retained their original PIDs and remained
+active. After copying evidence, all temporary processes, ports, OS files, and
+four disk roots were removed. Pre/post top-level disk entry/inode fingerprints
+matched exactly on every disk.
+
+Evidence is retained at:
+
+- `/home/wlzambo/DEV-TEST/n1-3.1.1-maintenance-coverage-20260715/summary.json`
+- `/home/wlzambo/DEV-TEST/n1-3.1.1-auto-healing-coverage-20260715/summary.json`
+- `/home/wlzambo/DEV-TEST/n1-3.1.1-trash-healing-coverage-20260715/summary.json`
+- `/home/wlzambo/DEV-TEST/n1-3.1.1-self-healing-coverage-20260715/REPORT.md`
+- `/home/wlzambo/DEV-TEST/n1-3.1.1-four-disk-self-healing-20260715-103538/REPORT.md`
+- `/home/wlzambo/DEV-TEST/n1-3.1.1-four-disk-self-healing-20260715-103538/final-results/summaries/`
+
+## N1 3.1.1 Namespace Edge-Case Evidence
 
 The unreleased N1 3.0.1 work was hardening on engine format 3. It did not redesign the
 immutable object plane, stable object identities, EC placement, or O(1)
 namespace rename. The patch closes mutation-boundary edge cases identified
 after the initial N1 3.0 lifecycle implementation. All of these patches are
-incorporated into the current 3.1.0 development engine; historical evidence
+incorporated into the current 3.1.1 development engine; historical evidence
 paths retain their original names.
 
 | Edge case | Locked invariant | Regression proof | Status |

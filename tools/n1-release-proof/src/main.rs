@@ -31,6 +31,7 @@ include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
 include!("proof_multipart_resume.rs");
 include!("proof_auto_healing.rs");
+include!("proof_maintenance_coverage.rs");
 include!("proof_maintenance.rs");
 include!("proof_jobs.rs");
 include!("proof_utils.rs");
@@ -45,7 +46,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.auto_healing_proof {
+    let result = if proof.args.maintenance_coverage_proof {
+        proof.run_maintenance_coverage_proof().await
+    } else if proof.args.trash_maintenance_proof {
+        proof.run_trash_maintenance_proof().await
+    } else if proof.args.auto_healing_proof {
         proof.run_auto_healing_proof().await
     } else if proof.args.object_maintenance_gate_proof {
         proof.run_object_maintenance_gate_proof().await

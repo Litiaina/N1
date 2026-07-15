@@ -1,15 +1,15 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.1.0 development-engine storage contract. It is the reference for
+This document defines the N1 3.1.1 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.1.0 uses engine format 3 and preserves N1's immutable-object and
+N1 3.1.1 uses engine format 3 and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle,
 per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
-Version `3.1.0` identifies the current development package line; it does not
+Version `3.1.1` identifies the current development package line; it does not
 declare stable-release status. Engine format `3` is the independent on-disk
 compatibility boundary defined by this document.
 
@@ -166,7 +166,7 @@ without overwriting an older recoverable deletion. Folder soft delete remains
 a constant-sized directory rename; descendants are inspected only if the
 folder reaches lifecycle expiry.
 
-There is no manual empty-trash or hard-delete operation in N1 3.1.0. Recovery
+There is no manual empty-trash or hard-delete operation in N1 3.1.1. Recovery
 is allowed until the configured trash retention deadline. Once that deadline
 is reached, lifecycle owns the entry and recovery fails closed.
 
@@ -390,6 +390,14 @@ automatically. An unresolved automatic repair keeps N1 read-only and remains
 visible in repair and health status; it is never converted into a false
 successful scan.
 
+Healthy scheduled availability and checksum cycles run online and preserve
+foreground reads and mutations. This is safe because immutable object versions
+are re-read and repaired under an object-operation lock, namespace mutations
+remain atomic, and placement metadata is published atomically.
+Operator-requested checksum remains read-only by default, strict repair is
+read-only, and scrub is quiesced. Only unsafe topology, root-identity failure,
+or unresolved automatic repair debt activates the persistent safety gate.
+
 Autonomous repair does not invoke redistribution. Redistribution remains an
 explicit operator request for intentionally rewriting otherwise valid objects
 into the current EC or placement policy.
@@ -410,7 +418,7 @@ trash lifecycle operation, not a full object-plane scan:
 
 An interrupted expiry retries from the durable receipt and never needs to
 rediscover headless blobs through a global scan. Earlier-engine trash entries
-are not adopted: N1 3.1.0 requires freshly initialized format-3 fragments and
+are not adopted: N1 3.1.1 requires freshly initialized format-3 fragments and
 fails closed when an earlier or unversioned fragment marker is encountered.
 
 Full GC remains an explicit operator maintenance tool for orphan detection,
@@ -479,7 +487,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.1.0 is correct only while all of these remain true:
+N1 3.1.1 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -519,6 +527,6 @@ N1 3.1.0 is correct only while all of these remain true:
 36. Repair scans fragments serially, bound object concurrency, and process an object's missing shards one at a time.
 37. A repair relocation publishes a higher placement generation only after the reconstructed shard is durable; stale lower-generation metadata cannot override it.
 38. Equal placement generations with different immutable metadata fail closed.
-39. Automatic availability and checksum scans report unresolved repair debt as failure and keep user mutations read-only until a successful retry.
+39. Healthy automatic availability and checksum scans preserve foreground availability; unresolved repair debt is reported as failure and keeps user mutations read-only until a successful retry.
 40. Recover-on-read may repair a recorded live root in the background, but only the scheduled healer may relocate a shard and change placement metadata.
 41. Automatic healing never performs or requires redistribution of a healthy recorded object layout.

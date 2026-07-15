@@ -81,6 +81,10 @@ struct Args {
     multipart_resume_proof: bool,
     #[arg(long, default_value_t = false)]
     auto_healing_proof: bool,
+    #[arg(long, default_value_t = false)]
+    trash_maintenance_proof: bool,
+    #[arg(long, default_value_t = false)]
+    maintenance_coverage_proof: bool,
     #[arg(long, default_value_t = 1_000)]
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]

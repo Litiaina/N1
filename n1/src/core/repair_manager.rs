@@ -254,10 +254,25 @@ pub enum RepairCheckMode {
 }
 
 impl RepairCheckMode {
-    pub(crate) fn maintenance_access_mode(self) -> MaintenanceAccessMode {
+    /// Operator-requested default. A manual checksum intentionally protects
+    /// the namespace with a read-only gate unless the caller selected a
+    /// stronger mode.
+    pub(crate) fn default_maintenance_access_mode(self) -> MaintenanceAccessMode {
         match self {
             Self::Availability => MaintenanceAccessMode::Availability,
             Self::Checksum | Self::Strict => MaintenanceAccessMode::ReadOnly,
+            Self::Scrub => MaintenanceAccessMode::Quiesced,
+        }
+    }
+
+    /// Lowest safe gate for the repair algorithm itself. Online checksum is
+    /// safe for autonomous maintenance because objects are immutable and each
+    /// repair re-reads the current version while holding N1's object operation
+    /// lock. Strict and scrub retain their stronger isolation contracts.
+    pub(crate) fn minimum_maintenance_access_mode(self) -> MaintenanceAccessMode {
+        match self {
+            Self::Availability | Self::Checksum => MaintenanceAccessMode::Availability,
+            Self::Strict => MaintenanceAccessMode::ReadOnly,
             Self::Scrub => MaintenanceAccessMode::Quiesced,
         }
     }
@@ -923,7 +938,7 @@ pub async fn trigger_repair_job_api(
     let (default_meta_conc, default_repair_conc, default_batch) =
         repair_defaults_for_runtime(check_mode, fast_mode, ram_gib, cpu_cores);
     let (max_meta_conc, max_repair_conc, max_batch_size) = repair_limits_for_ram_gib(ram_gib);
-    let mut access_mode = check_mode.maintenance_access_mode();
+    let mut access_mode = check_mode.default_maintenance_access_mode();
     if read_only_fast && access_mode == MaintenanceAccessMode::Availability {
         access_mode = MaintenanceAccessMode::ReadOnly;
     }
@@ -1499,7 +1514,7 @@ pub async fn run_repair_job(
 ) -> Result<(), AppError> {
     let run_opts = RepairRunOptions {
         fast_mode: false,
-        access_mode: cfg.check_mode.maintenance_access_mode(),
+        access_mode: cfg.check_mode.default_maintenance_access_mode(),
         replay_pending_redistribution: true,
     };
     run_repair_job_with_options(cfg, run_opts, ws_manager).await
@@ -1540,7 +1555,7 @@ async fn run_repair_job_inner(
     let start_time = Instant::now();
     let effective_access_mode = opts
         .access_mode
-        .max(cfg.check_mode.maintenance_access_mode());
+        .max(cfg.check_mode.minimum_maintenance_access_mode());
     if effective_access_mode != opts.access_mode {
         info!(
             "Repair mode upgraded maintenance gate from {:?} to {:?} based on check_mode={:?}",
@@ -2057,6 +2072,7 @@ mod tests {
     use crate::core::fragment_identity::{
         fragment_alias_dir, physical_fragment_dir_name, physical_fragment_root_on,
     };
+    use crate::core::operation_gate::MaintenanceAccessMode;
     use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -2093,6 +2109,26 @@ mod tests {
 
         params.insert("access_mode".to_string(), "readonly".to_string());
         assert_eq!(parse_check_mode(&params), RepairCheckMode::Strict);
+    }
+
+    #[test]
+    fn checksum_gate_distinguishes_manual_default_from_autonomous_minimum() {
+        assert_eq!(
+            RepairCheckMode::Checksum.default_maintenance_access_mode(),
+            MaintenanceAccessMode::ReadOnly
+        );
+        assert_eq!(
+            RepairCheckMode::Checksum.minimum_maintenance_access_mode(),
+            MaintenanceAccessMode::Availability
+        );
+        assert_eq!(
+            RepairCheckMode::Strict.minimum_maintenance_access_mode(),
+            MaintenanceAccessMode::ReadOnly
+        );
+        assert_eq!(
+            RepairCheckMode::Scrub.minimum_maintenance_access_mode(),
+            MaintenanceAccessMode::Quiesced
+        );
     }
 
     #[tokio::test]
