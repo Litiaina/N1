@@ -1238,7 +1238,6 @@ async fn repair_fragment_index_db(
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
     let fragment = fragment.to_string();
-    let _namespace_guard = crate::namespace::runtime::namespace_mutation_guard(&fragment).await;
     tokio::task::spawn_blocking(move || {
         index_store::repair_fragment_all_partition_replicas(&fragment, dry_run)
     })

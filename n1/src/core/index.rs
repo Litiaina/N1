@@ -603,7 +603,6 @@ pub async fn delete_object_fast(
 
 pub async fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
     let fragment = fragment.to_string();
-    let _namespace_guard = crate::namespace::runtime::namespace_mutation_guard(&fragment).await;
     run_index_blocking(move || index_store::sync_fragment_partition_replicas(&fragment)).await
 }
 

@@ -2,7 +2,7 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.2.0` on the development channel, using
+The current package line is N1 `3.2.2` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
 line. Dated evidence names below remain unchanged because they identify the
 exact candidate binaries and runs that produced them.
@@ -17,7 +17,7 @@ Before an LTS release, N1 should pass:
 - download hash match
 - range/view streaming
 - CRUD and POSIX namespace operations
-- unique-id trash, pre-TTL recover, TTL expiry, targeted reclamation, and removed purge surfaces
+- direct-path trash, pre-TTL recover, TTL expiry, targeted reclamation, and removed purge surfaces
 - recover-on-read after one disk is wiped
 - repair after simulated disk loss or reformat
 - autonomous repair after recoverable data- and parity-shard loss
@@ -438,31 +438,32 @@ Evidence is retained at:
 - `/home/wlzambo/DEV-TEST/n1-3.1.1-four-disk-self-healing-20260715-103538/REPORT.md`
 - `/home/wlzambo/DEV-TEST/n1-3.1.1-four-disk-self-healing-20260715-103538/final-results/summaries/`
 
-## N1 3.1.1 Namespace Edge-Case Evidence
+## N1 3.2.2 Namespace And Lifecycle Evidence
 
-The unreleased N1 3.0.1 work was hardening on engine format 3. It did not redesign the
-immutable object plane, stable object identities, EC placement, or O(1)
-namespace rename. The patch closes mutation-boundary edge cases identified
-after the initial N1 3.0 lifecycle implementation. All of these patches are
-incorporated into the current 3.1.1 development engine; historical evidence
-paths retain their original names.
+N1 3.2.2 restores the proven 1.0.1 filesystem-native namespace mutation path
+while retaining engine-format-3 immutable objects, object-level EC placement,
+NOA, recover-on-read, redistribution, and autonomous healing. Trash TTL is the
+only lifecycle addition: the physical `.trash/<logical-path>` entry and its
+filesystem modification time are authoritative. There are no `.entries`,
+`.records`, reclamation receipts, namespace generations, or foreground
+directory-sync chains.
 
 | Edge case | Locked invariant | Regression proof | Status |
 | --- | --- | --- | --- |
-| Recovery record exists but every trash payload placement is missing | Recovery fails closed and retains lifecycle metadata; it never reports a successful headless recovery | `n1_recover_fails_closed_when_record_has_no_payload_placement` | PASS |
-| Recovery races TTL ownership and physical reclamation | All namespace/lifecycle mutations for one fragment use the same bounded per-fragment lock stripe | `n1_recover_and_ttl_sweep_are_serialized_per_fragment` runs 32 adversarial races and accepts only the two complete serial outcomes | PASS |
-| A later index root fails during live rename | Earlier root renames are rolled back and both parent directories are synced | `n1_live_rename_rolls_back_every_replica_after_later_root_failure` | PASS |
-| Finalize encounters an invalid later-root namespace parent | Every root is preflighted before publishing the first new namespace link; newly published links are rolled back on runtime failure | `n1_finalize_preflights_every_replica_before_namespace_publication` | PASS |
+| Direct file soft delete | Delete performs one rename to `.trash/<same-logical-path>` per index root and writes no lifecycle record | `n1_soft_delete_ttl_reclaims_only_after_namespace_expiry` | PASS |
+| Folder delete and recover | Both operations rename the directory anchor without walking descendants | `n1_trash_list_shows_only_explicit_folder_delete_anchor`, `n1_resolve_any_and_recover_use_the_physical_trash_path` | PASS |
+| Repeated delete at one logical path | The existing trash slot returns `Conflict`; neither live nor retained data is overwritten | `n1_trash_path_collision_is_a_conflict_and_never_overwrites` | PASS |
+| Repeated recover | A completed second click returns `NotFound`, never an internal server error | `n1_repeated_recover_returns_not_found_instead_of_internal_error` | PASS |
+| Recovery races TTL GC | Filesystem operations select a complete winner without a namespace mutation lock; no reachable object is reclaimed | `n1_recover_and_ttl_sweep_race_preserves_data_without_a_namespace_lock` runs 32 adversarial races | PASS |
+| TTL boundary | The physical entry remains before TTL and namespace plus unreferenced immutable object data are reclaimed at TTL | `n1_soft_delete_ttl_reclaims_only_after_namespace_expiry` | PASS |
+| A candidate object remains live elsewhere | Reference verification prevents immutable object reclamation | `n1_ttl_reclaim_preserves_an_object_still_referenced_live` | PASS |
+| Fragment creation crosses a wall-clock second while replicating metadata | One timestamp is captured before the replica loop, so every `.fragment.ndx` publishes identical authority bytes | Isolated three-HDD proof first failed on the old per-root timestamp and passed after the shared-timestamp patch | PASS |
+| Finalize encounters a later-root destination conflict | Every root is preflighted before publishing the first new namespace link | `n1_finalize_preflights_replica_path_conflicts_before_publication` | PASS |
 | Recursive pagination token sorts after a parent directory but before one of its descendants | Continuation filtering never prunes directory traversal | `n1_recursive_reference_pagination_never_skips_cursor_directory_descendants` | PASS |
-| Repeated deletes create multiple retained generations at one path | Any-object resolution and recovery both select max `(deleted_at_unix, trash_entry_id)` | `n1_resolve_any_selects_the_same_latest_trash_generation_as_recovery` | PASS |
-| Corrupt namespace parent is a symlink outside the fragment root | Mutation parent chains accept directories only and reject symlinks/non-directories before creation or rename | `n1_namespace_mutations_reject_parent_symlink_escape` | PASS |
+| Parent traversal in a logical path | Normalization rejects it before any filesystem mutation | `n1_namespace_mutations_reject_parent_traversal` | PASS |
 | Two replicas have equal link counts but different paths, kinds, targets, or control bytes | Replica inspection hashes deterministic namespace/control content; destructive repair refuses an equally complete disagreement | `replica_inspection_detects_equal_count_different_namespace_content` | PASS |
 | Identical replicas expose directory entries in different filesystem iteration order | Every directory level is sorted before content hashing, so the digest depends only on namespace/control content | `replica_content_digest_is_independent_of_directory_iteration_order` | PASS |
-| A `2 -> 1 -> 2` cycle returns a stale replica with the same link count but different targets | The continuously active replica has a higher durable namespace generation and is copied to the returning replica | `redistribution_reconciles_equal_count_stale_replica_from_higher_generation` | PASS |
-| A returning stale replica has more links because the active replica deleted or expired an entry | Higher generation outranks record count, preventing stale-link resurrection | `redistribution_generation_outranks_stale_replica_with_more_links` | PASS |
-| A normal mutation arrives before stale replicas are reconciled | Different generations reject the mutation before any namespace path changes | `n1_namespace_mutation_is_blocked_until_stale_generation_is_reconciled` | PASS |
-| Namespace authority tracking accidentally scans the namespace or mutates object state | Mutations update one constant-size internal generation record per participating index root; the record is excluded from the content digest and `.objects` remains untouched | `n1_namespace_mutations_advance_the_replicated_authority_generation` | PASS |
-| Existing 3.0 lifecycle, lineage, folder move, trash generation, POSIX pagination, and shared-reference behavior regress | All pre-existing namespace runtime tests remain green beside the new adversarial cases | `cargo test -p n1 namespace::runtime::tests -- --test-threads=1` | PASS: 19/19 |
+| Existing lineage, O(1) folder move, POSIX pagination, EC, healing, repair, redistribution, and NOA behavior regress | The complete N1 library suite remains green beside the 3.2.2 lifecycle cases | `cargo test -p n1 --lib -- --test-threads=1` | PASS: 131/131 local |
 
 Focused verification commands:
 
@@ -471,10 +472,72 @@ cargo check -p n1 --tests
 cargo test -p n1 namespace::runtime::tests -- --test-threads=1
 cargo test -p n1 equal_count_different_namespace_content -- --nocapture
 cargo test -p n1 replica_content_digest -- --nocapture
-cargo test -p n1 redistribution_reconciles_equal_count_stale_replica -- --nocapture
-cargo test -p n1 redistribution_generation_outranks_stale_replica -- --nocapture
-cargo test -p n1 n1_namespace_mutation_is_blocked_until_stale_generation_is_reconciled -- --nocapture
+cargo test -p n1 --lib -- --test-threads=1
 ```
+
+### N1 3.2.2 Three-HDD Proof And Production Deployment
+
+On July 16, 2026, the exact release binary was tested against three physical
+XFS HDDs at `/mnt/NDISK001`, `/mnt/NDISK002`, and `/mnt/NDISK003` with all
+three roots colocated as index and blob roots and a static `2 + 1` object EC
+layout. The test used isolated fragment/root names and did not modify existing
+production objects.
+
+The first broad proof correctly failed before deployment: fragment metadata
+replicas could receive different second-resolution timestamps when slow HDD
+initialization crossed a wall-clock second. Fragment creation now captures one
+timestamp before the replica loop. The failed roots were removed and the fresh
+proof was rerun from the beginning.
+
+The corrected broad matrix passed all `20` gates: native protocol, `64 MiB`
+multipart restart/resume, restart persistence, authorization boundaries,
+fragment usage, namespace lineage, WebSocket deltas, concurrent and contended
+uploads, multi-fragment isolation, NOA/POSIX CRUD, direct trash/recover and TTL
+GC, archive, recover-on-read, object repair, disk-format repair, and
+`3 -> 2 -> 3` redistribution. It finished with `216` unique live objects,
+`216` matching live links per root, and `bad_lines: []`. A second focused NOA
+run against the exact final binary also passed.
+
+Direct loopback latency was then measured over one persistent TLS connection,
+with no Nginx or other proxy. Each operation mutated all three XFS namespace
+replicas:
+
+| Operation | Samples | p50 | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Empty-folder rename | 250 | 0.846 ms | 0.907 ms | 0.924 ms | 0.928 ms |
+| 128-descendant folder rename | 250 | 0.848 ms | 0.892 ms | 0.908 ms | 0.918 ms |
+| Folder trash | 100 | 0.757 ms | 0.817 ms | 0.837 ms | 0.838 ms |
+| Folder recover | 100 | 0.711 ms | 0.763 ms | 0.774 ms | 0.791 ms |
+
+The empty and populated folder results are equivalent: folder rename does not
+walk descendants. Hardware counters attached only to the N1 process during
+`710` executed operations recorded `830,104,706` cycles, `591,240,349`
+instructions, `3,557` context switches, `3` CPU migrations, and `5` page
+faults over `0.718 s`: approximately `1,169,162` cycles and `832,733`
+instructions per executed operation. These process counters include N1 runtime
+work during the same bounded interval, so they are a reproducible server
+baseline rather than a claim about every machine.
+
+A separate tracing run was intentionally excluded from latency numbers because
+tracing perturbs execution. Across `60` operations it observed exactly `180`
+`renameat` calls (one per index root per operation), `15` `utimensat` calls
+(one per root for five trash operations), no `fsync`/`fdatasync`, no subtree
+directory scan, and zero blob bytes written. Physical inspection found all
+`128` descendants on every replica, an empty trash directory, and zero
+`.entries`, `.records`, or namespace-generation files.
+
+After warning-denied workspace tests passed, the same binary was deployed to
+the production service. Pre- and post-deployment deep health both reported
+healthy: three roots online, `2 + 1` write safety, zero missing/divergent/
+corrupt index replicas, and autonomous healing idle and write-safe. A rollback
+copy of the previous binary and the removed empty legacy control artifacts was
+retained outside active storage. No soak claim is made by this bounded proof.
+
+Evidence is retained under
+`/home/wlzambo/DEV-TEST/n1-3.2.2-three-hdd-proof-20260716`.
+
+Historical evidence below describes earlier development candidates and is not
+evidence that their retired generation/record mechanisms remain in 3.2.2.
 
 On July 13, 2026, the warning-denied N1 gate passed all `116` N1 tests, and
 the warning-denied workspace library/binary/integration gate also passed (`7`
@@ -542,7 +605,7 @@ The full LTS proof should include:
 - disk wipe, disk removal/re-add, repair, and health refresh
 - redistribution after disk topology changes
 - targeted TTL reclamation plus explicit orphan GC after upload cancellation
-- trash/recover by unique trash entry id with lifecycle context stored inside `.trash`
+- direct-path trash/recover with filesystem-mtime TTL and one trash slot per logical path
 - 10k+ object namespace storm
 - four concurrent users on one fragment doing upload, mkdir, rename, move, trash, recover, and listing
 - four concurrent users across four fragments

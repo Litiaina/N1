@@ -28,10 +28,12 @@ the same engine operations but is not renamed or presented as part of NOA.
 
 ## Compatibility Rule
 
-NOA v1 preserves the N1 3.1.1 HTTP methods, request bodies, query parameters,
-response bodies, status codes, authentication behavior, streaming behavior,
-and lifecycle semantics. The contract change in N1 3.2.0 is the public route
-namespace and API identity only.
+NOA v1 began from the N1 3.1.1 HTTP methods, request bodies, query parameters,
+response bodies, status codes, authentication behavior, and streaming
+behavior. The contract change in N1 3.2.0 was the public route namespace and
+API identity. Later N1 3.2.x bug fixes continue to use the same NOA v1 route
+families; internal namespace, lifecycle, EC, and healing implementations are
+not part of the NOA standard.
 
 Clients authenticate protected calls with:
 

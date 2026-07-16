@@ -315,10 +315,10 @@ async fn write_fragment_metadata_with_policy(
 
     let mut any_ok = false;
     let mut failed_paths = Vec::new();
+    let now = Utc::now().timestamp();
 
     for root in roots {
         let p = fragment_meta_path(&root, &meta.stable_fragment_id);
-        let now = Utc::now().timestamp();
         let mut edge = match read_index_fragment_meta_if_exists(&p).await {
             Ok(Some(existing)) => existing,
             Ok(None) => IndexFragmentMeta {

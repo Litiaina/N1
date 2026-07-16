@@ -31,14 +31,11 @@ use ulid::Ulid;
 pub(crate) const OBJECTS_DIR: &str = N1_OBJECTS_DIR;
 pub(crate) const UPLOADS_DIR: &str = ".uploads";
 pub(crate) const TRASH_DIR: &str = ".trash";
-pub(crate) const TRASH_ENTRIES_DIR: &str = ".entries";
-pub(crate) const TRASH_RECORDS_DIR: &str = ".records";
 pub(crate) const TMP_DIR: &str = ".tmp";
 pub(crate) const LOCKS_DIR: &str = ".locks";
 pub(crate) const GC_DIR: &str = ".gc";
 pub(crate) const REPAIR_DIR: &str = ".repair";
 const FRAGMENT_META_FILE: &str = ".fragment.ndx";
-const NAMESPACE_GENERATION_FILE: &str = ".namespace-generation.ndx";
 pub(crate) const N1_ENGINE_FORMAT_VERSION: u16 = 3;
 const MANIFEST_FILE: &str = "manifest.ndx";
 const BINDING_FILE: &str = "binding.ndx";
@@ -96,16 +93,6 @@ pub(crate) struct TrashRecord {
     pub deleted_at_unix: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct TrashReclaimReceipt {
-    pub operation_id: String,
-    pub fragment: String,
-    pub trash_entry_id: String,
-    pub object_ids: Vec<String>,
-    pub version_ids: Vec<String>,
-    pub prepared_at_unix: i64,
-}
-
 #[derive(Debug, Clone)]
 struct NdxSummary {
     version_id: String,
@@ -127,13 +114,6 @@ struct ReplicaScore {
 struct ReplicaState {
     score: ReplicaScore,
     content_digest: [u8; 32],
-    namespace_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct NamespaceGenerationRecord {
-    engine_format_version: u16,
-    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -255,7 +235,6 @@ fn reserved_user_segment(segment: &str) -> bool {
         || segment.starts_with(REPAIR_DIR)
         || segment.starts_with(INTENTS_DIR)
         || segment.starts_with(TRASH_JOBS_DIR)
-        || segment.starts_with(NAMESPACE_GENERATION_FILE)
 }
 
 pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
@@ -274,7 +253,6 @@ pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
                 | INTENTS_DIR
                 | TRASH_JOBS_DIR
                 | FRAGMENT_META_FILE
-                | NAMESPACE_GENERATION_FILE
         )
 }
 
@@ -373,116 +351,6 @@ pub(crate) fn namespace_path(root: &Path, fragment: &str, logical_path: &str) ->
     fragment_root_on(root, fragment).join(logical_path)
 }
 
-fn validate_namespace_component(path: &Path) -> Result<bool, AppError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(AppError::InternalServerError(format!(
-                "N1 namespace invariant: parent component {} is a symlink",
-                path.display()
-            )))
-        }
-        Ok(metadata) if metadata.is_dir() => Ok(true),
-        Ok(_) => Err(AppError::InternalServerError(format!(
-            "N1 namespace invariant: parent component {} is not a directory",
-            path.display()
-        ))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(io_err(err, "inspect N1 namespace parent")),
-    }
-}
-
-pub(crate) fn validate_namespace_parent(
-    fragment_root: &Path,
-    target: &Path,
-) -> Result<(), AppError> {
-    let parent = target.parent().ok_or_else(|| {
-        AppError::InternalServerError("N1 namespace target has no parent".to_string())
-    })?;
-    let relative = parent.strip_prefix(fragment_root).map_err(|_| {
-        AppError::InternalServerError(format!(
-            "N1 namespace invariant: {} escapes fragment root {}",
-            target.display(),
-            fragment_root.display()
-        ))
-    })?;
-    if !validate_namespace_component(fragment_root)? {
-        return Err(AppError::InternalServerError(format!(
-            "N1 namespace invariant: fragment root {} is missing",
-            fragment_root.display()
-        )));
-    }
-    let mut current = fragment_root.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(segment) = component else {
-            return Err(AppError::InternalServerError(format!(
-                "N1 namespace invariant: invalid parent component in {}",
-                target.display()
-            )));
-        };
-        current.push(segment);
-        if !validate_namespace_component(&current)? {
-            return Err(AppError::InternalServerError(format!(
-                "N1 namespace invariant: parent component {} is missing",
-                current.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_namespace_directory(
-    fragment_root: &Path,
-    directory: &Path,
-) -> Result<(), AppError> {
-    let relative = directory.strip_prefix(fragment_root).map_err(|_| {
-        AppError::InternalServerError(format!(
-            "N1 namespace invariant: {} escapes fragment root {}",
-            directory.display(),
-            fragment_root.display()
-        ))
-    })?;
-    if !validate_namespace_component(fragment_root)? {
-        fs::create_dir(fragment_root).map_err(|e| io_err(e, "create N1 fragment root"))?;
-        if let Some(parent) = fragment_root.parent() {
-            sync_dir(parent);
-        }
-    }
-    let mut current = fragment_root.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(segment) = component else {
-            return Err(AppError::InternalServerError(format!(
-                "N1 namespace invariant: invalid directory component in {}",
-                directory.display()
-            )));
-        };
-        let parent = current.clone();
-        current.push(segment);
-        if validate_namespace_component(&current)? {
-            continue;
-        }
-        match fs::create_dir(&current) {
-            Ok(()) => sync_dir(&parent),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !validate_namespace_component(&current)? {
-                    return Err(AppError::InternalServerError(format!(
-                        "N1 namespace invariant: failed to create directory {}",
-                        current.display()
-                    )));
-                }
-            }
-            Err(err) => return Err(io_err(err, "create N1 namespace directory")),
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_namespace_parent(fragment_root: &Path, target: &Path) -> Result<(), AppError> {
-    let parent = target.parent().ok_or_else(|| {
-        AppError::InternalServerError("N1 namespace target has no parent".to_string())
-    })?;
-    ensure_namespace_directory(fragment_root, parent)
-}
-
 fn object_symlink_target(object_id: &str) -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(object_dir_name_for_id(object_id)?))
 }
@@ -500,7 +368,11 @@ pub(crate) fn read_namespace_symlink_object_id(
     if !meta.file_type().is_symlink() {
         return Ok(None);
     }
-    let target = fs::read_link(link_path).map_err(|e| io_err(e, "read N1 namespace link"))?;
+    let target = match fs::read_link(link_path) {
+        Ok(target) => target,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io_err(err, "read N1 namespace link")),
+    };
     if target.is_absolute() {
         return Err(AppError::InternalServerError(format!(
             "N1 namespace link {} has absolute target",
@@ -527,11 +399,10 @@ pub(crate) fn publish_namespace_link(
 ) -> Result<(), AppError> {
     let logical_path = normalize_object_key(logical_path)?;
     let link = namespace_path(root, fragment, &logical_path);
-    let fragment_root = fragment_root_on(root, fragment);
-    ensure_namespace_parent(&fragment_root, &link)?;
     let parent = link.parent().ok_or_else(|| {
         AppError::InternalServerError("N1 namespace link has no parent".to_string())
     })?;
+    fs::create_dir_all(parent).map_err(|err| io_err(err, "create N1 namespace parent"))?;
 
     if let Some(existing) = read_namespace_symlink_object_id(root, fragment, &link)? {
         if existing == normalize_object_id(object_id)? {
@@ -1612,223 +1483,102 @@ pub fn list_trash_versions(
     Ok(out)
 }
 
-fn trash_record_file(root: &Path, fragment: &str, trash_entry_id: &str) -> PathBuf {
-    fragment_root_on(root, fragment)
-        .join(TRASH_DIR)
-        .join(TRASH_RECORDS_DIR)
-        .join(format!("{trash_entry_id}.ndx"))
-}
-
-fn trash_reclaim_receipt_file(root: &Path, fragment: &str, operation_id: &str) -> PathBuf {
-    fragment_root_on(root, fragment)
-        .join(GC_DIR)
-        .join("trash-lifecycle")
-        .join(format!("{operation_id}.ndx"))
-}
-
-pub(crate) fn write_trash_record_for_fragment(
-    fragment: &str,
-    record: &TrashRecord,
-) -> Result<(), AppError> {
-    let bytes = encode(record)?;
-    let mut written = Vec::<PathBuf>::new();
-    for root in index_roots() {
-        let path = trash_record_file(&root, fragment, &record.trash_entry_id);
-        if let Err(err) = write_atomic(&path, &bytes) {
-            for written_path in written {
-                let _ = remove_file_if_exists(&written_path);
-                if let Some(parent) = written_path.parent() {
-                    sync_dir(parent);
-                }
-            }
-            return Err(err);
-        }
-        written.push(path);
-    }
-    Ok(())
-}
-
-pub(crate) fn remove_trash_record(fragment: &str, trash_entry_id: &str) -> Result<(), AppError> {
-    for root in index_roots() {
-        let path = trash_record_file(&root, fragment, trash_entry_id);
-        if remove_file_if_exists(&path)? {
-            if let Some(parent) = path.parent() {
-                sync_dir(parent);
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn remove_trash_payload(fragment: &str, record: &TrashRecord) -> Result<(), AppError> {
+pub(crate) fn remove_trash_payload(fragment: &str, record: &TrashRecord) -> Result<bool, AppError> {
+    let mut removed_primary = false;
     for root in index_roots() {
         let payload = fragment_root_on(&root, fragment)
             .join(TRASH_DIR)
             .join(&record.source_relative_path);
         let meta = match fs::symlink_metadata(&payload) {
             Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !removed_primary => {
+                return Ok(false);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(io_err(err, "inspect N1 expired trash payload")),
         };
         if meta.file_type().is_symlink() || meta.is_file() {
-            fs::remove_file(&payload).map_err(|e| io_err(e, "remove N1 expired trash file"))?;
+            match fs::remove_file(&payload) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && !removed_primary => {
+                    return Ok(false);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_err(err, "remove N1 expired trash file")),
+            }
         } else if meta.is_dir() {
-            fs::remove_dir_all(&payload)
-                .map_err(|e| io_err(e, "remove N1 expired trash directory"))?;
-        }
-        if let Some(parent) = payload.parent() {
-            sync_dir(parent);
-        }
-    }
-    remove_trash_record(fragment, &record.trash_entry_id)
-}
-
-pub(crate) fn write_trash_reclaim_receipt(receipt: &TrashReclaimReceipt) -> Result<(), AppError> {
-    let bytes = encode(receipt)?;
-    for root in index_roots() {
-        write_atomic(
-            &trash_reclaim_receipt_file(&root, &receipt.fragment, &receipt.operation_id),
-            &bytes,
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn list_trash_reclaim_receipts(
-    fragment: &str,
-) -> Result<Vec<TrashReclaimReceipt>, AppError> {
-    let mut receipts = BTreeMap::<String, TrashReclaimReceipt>::new();
-    for root in index_roots() {
-        let dir = fragment_root_on(&root, fragment)
-            .join(GC_DIR)
-            .join("trash-lifecycle");
-        if !dir.is_dir() {
-            continue;
-        }
-        for name in read_dir_names(&dir)? {
-            if !name.ends_with(".ndx") {
-                continue;
-            }
-            let path = dir.join(name);
-            let receipt: TrashReclaimReceipt =
-                decode(&fs::read(&path).map_err(|e| io_err(e, "read N1 trash reclaim receipt"))?)?;
-            match receipts.entry(receipt.operation_id.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(receipt);
+            match fs::remove_dir_all(&payload) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && !removed_primary => {
+                    return Ok(false);
                 }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &receipt => {
-                    return Err(AppError::Conflict(format!(
-                        "divergent N1 trash reclaim receipt replica for operation {}",
-                        receipt.operation_id
-                    )));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_err(err, "remove N1 expired trash directory")),
             }
         }
+        removed_primary = true;
     }
-    Ok(receipts.into_values().collect())
+    Ok(removed_primary)
 }
 
-pub(crate) fn remove_trash_reclaim_receipt(
-    fragment: &str,
-    operation_id: &str,
-) -> Result<(), AppError> {
-    for root in index_roots() {
-        let path = trash_reclaim_receipt_file(&root, fragment, operation_id);
-        if remove_file_if_exists(&path)? {
-            if let Some(parent) = path.parent() {
-                sync_dir(parent);
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn stored_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
-    let mut records = BTreeMap::<String, TrashRecord>::new();
-    for root in existing_fragment_roots(fragment) {
-        let dir = root.join(TRASH_DIR).join(TRASH_RECORDS_DIR);
-        if !dir.is_dir() {
-            continue;
-        }
-        for name in read_dir_names(&dir)? {
-            if !name.ends_with(".ndx") {
-                continue;
-            }
-            let path = dir.join(name);
-            let record: TrashRecord =
-                decode(&fs::read(&path).map_err(|e| io_err(e, "read N1 trash lifecycle record"))?)?;
-            match records.entry(record.trash_entry_id.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(record);
-                }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &record => {
-                    return Err(AppError::Conflict(format!(
-                        "divergent N1 trash lifecycle record replica for entry {}",
-                        record.trash_entry_id
-                    )));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-    }
-    Ok(records.into_values().collect())
-}
-
-pub(crate) fn hydrate_trash_record(
-    fragment: &str,
-    mut record: TrashRecord,
-) -> Result<TrashRecord, AppError> {
-    let mut object_ids = BTreeSet::new();
-    let mut version_ids = BTreeSet::new();
+pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for fragment_root in existing_fragment_roots(fragment) {
         let index_root = fragment_root
             .parent()
             .unwrap_or(&fragment_root)
             .to_path_buf();
-        let payload = fragment_root
-            .join(TRASH_DIR)
-            .join(&record.source_relative_path);
-        if fs::symlink_metadata(&payload).is_err() {
-            continue;
-        }
-        let mut stack = vec![payload];
-        while let Some(current) = stack.pop() {
-            if let Some(object_id) =
-                read_namespace_symlink_object_id(&index_root, fragment, &current)?
-            {
-                if object_ids.insert(object_id.clone()) {
-                    for meta in list_live_versions(fragment, &object_id)? {
-                        version_ids.insert(meta.version_id);
-                    }
-                }
+        let trash_root = fragment_root.join(TRASH_DIR);
+        let mut stack = vec![(trash_root, String::new())];
+        while let Some((dir, relative)) = stack.pop() {
+            if !dir.is_dir() {
                 continue;
             }
-            let Ok(meta) = fs::symlink_metadata(&current) else {
-                continue;
-            };
-            if !meta.is_dir() {
-                continue;
-            }
-            for name in read_dir_names(&current)? {
+            for name in read_dir_names(&dir)? {
                 if internal_namespace_entry_name(&name) {
                     continue;
                 }
-                stack.push(current.join(name));
+                let child = dir.join(&name);
+                let child_relative = if relative.is_empty() {
+                    name
+                } else {
+                    format!("{relative}/{name}")
+                };
+                if let Some(object_id) =
+                    read_namespace_symlink_object_id(&index_root, fragment, &child)?
+                {
+                    if !seen.insert(child_relative.clone()) {
+                        continue;
+                    }
+                    let mut version_ids = list_live_versions(fragment, &object_id)?
+                        .into_iter()
+                        .map(|metadata| metadata.version_id)
+                        .collect::<Vec<_>>();
+                    version_ids.sort();
+                    version_ids.dedup();
+                    let deleted_at_unix = fs::symlink_metadata(&child)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs() as i64)
+                        .unwrap_or_else(|| Utc::now().timestamp());
+                    out.push(TrashRecord {
+                        trash_entry_id: child_relative.clone(),
+                        original_path: child_relative.clone(),
+                        source_relative_path: child_relative,
+                        kind: TrashKind::File,
+                        object_keys: vec![object_id],
+                        version_ids,
+                        deleted_at_unix,
+                    });
+                } else if child.is_dir() {
+                    stack.push((child, child_relative));
+                }
             }
         }
         break;
     }
-    record.object_keys = object_ids.into_iter().collect();
-    record.version_ids = version_ids.into_iter().collect();
-    Ok(record)
-}
-
-pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
-    let mut out = stored_trash_records(fragment)?
-        .into_iter()
-        .map(|record| hydrate_trash_record(fragment, record))
-        .collect::<Result<Vec<_>, _>>()?;
     out.sort_by(|a, b| a.source_relative_path.cmp(&b.source_relative_path));
     Ok(out)
 }
@@ -1988,11 +1738,10 @@ fn scan_trash_maintenance_page(
         .transpose()?;
     let mut candidates = Vec::<(String, ObjectMetadata)>::with_capacity(limit.saturating_add(1));
 
-    'records: for record in stored_trash_records(fragment)? {
+    'records: for record in scan_trash_records(fragment)? {
         if after.is_some_and(|(record_id, _)| record.trash_entry_id.as_str() < record_id) {
             continue;
         }
-        let record = hydrate_trash_record(fragment, record)?;
         for object_id in &record.object_keys {
             if after.is_some_and(|(record_id, after_object_id)| {
                 record.trash_entry_id == record_id && object_id.as_str() <= after_object_id
@@ -2424,91 +2173,6 @@ fn count_namespace_links(root: &Path, fragment: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn namespace_generation_path(fragment_root: &Path) -> PathBuf {
-    fragment_root.join(NAMESPACE_GENERATION_FILE)
-}
-
-fn read_namespace_generation_from_fragment_root(
-    fragment_root: &Path,
-) -> Result<Option<u64>, AppError> {
-    let path = namespace_generation_path(fragment_root);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(io_err(err, "read N1 namespace generation")),
-    };
-    let record: NamespaceGenerationRecord = decode(&bytes)?;
-    if record.engine_format_version != N1_ENGINE_FORMAT_VERSION {
-        return Err(AppError::InternalServerError(format!(
-            "N1 namespace generation at {} uses engine format {}, expected {}",
-            path.display(),
-            record.engine_format_version,
-            N1_ENGINE_FORMAT_VERSION
-        )));
-    }
-    Ok(Some(record.generation))
-}
-
-#[cfg(test)]
-pub(crate) fn namespace_generation_on_root(
-    root: &Path,
-    fragment: &str,
-) -> Result<Option<u64>, AppError> {
-    read_namespace_generation_from_fragment_root(&fragment_root_on(root, fragment))
-}
-
-#[cfg(test)]
-pub(crate) fn set_namespace_generation_on_root(
-    root: &Path,
-    fragment: &str,
-    generation: u64,
-) -> Result<(), AppError> {
-    write_namespace_generation_to_fragment_root(&fragment_root_on(root, fragment), generation)
-}
-
-fn write_namespace_generation_to_fragment_root(
-    fragment_root: &Path,
-    generation: u64,
-) -> Result<(), AppError> {
-    write_atomic(
-        &namespace_generation_path(fragment_root),
-        &encode(&NamespaceGenerationRecord {
-            engine_format_version: N1_ENGINE_FORMAT_VERSION,
-            generation,
-        })?,
-    )
-}
-
-pub(crate) fn advance_namespace_generation(fragment: &str) -> Result<u64, AppError> {
-    let roots = existing_fragment_roots(fragment);
-    if roots.is_empty() {
-        return Err(AppError::InternalServerError(format!(
-            "N1 namespace generation cannot advance: fragment '{fragment}' has no index replica"
-        )));
-    }
-    let mut observed_generation = None::<Option<u64>>;
-    let mut current = 0u64;
-    for fragment_root in &roots {
-        let generation = read_namespace_generation_from_fragment_root(fragment_root)?;
-        if observed_generation.is_some_and(|observed| observed != generation) {
-            return Err(AppError::Conflict(format!(
-                "N1 namespace replicas for fragment '{fragment}' have different authority generations; run namespace redistribution before accepting another mutation"
-            )));
-        }
-        observed_generation = Some(generation);
-        current = current.max(generation.unwrap_or_default());
-    }
-    let next = current.checked_add(1).ok_or_else(|| {
-        AppError::InternalServerError(format!(
-            "N1 namespace generation overflow for fragment '{fragment}'"
-        ))
-    })?;
-    for fragment_root in roots {
-        write_namespace_generation_to_fragment_root(&fragment_root, next)?;
-    }
-    Ok(next)
-}
-
 fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
     ReplicaScore {
         meta_present: u64::from(
@@ -2533,7 +2197,7 @@ fn hash_replica_tree(
         if directory == fragment_root
             && matches!(
                 name.as_str(),
-                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | REPAIR_DIR | NAMESPACE_GENERATION_FILE
+                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | REPAIR_DIR
             )
         {
             continue;
@@ -2598,7 +2262,6 @@ fn replica_state(root: &Path, fragment: &str) -> Result<ReplicaState, AppError> 
     Ok(ReplicaState {
         score: replica_score(root, fragment),
         content_digest: hasher.finalize().into(),
-        namespace_generation: read_namespace_generation_from_fragment_root(&fragment_root)?,
     })
 }
 
@@ -2619,7 +2282,7 @@ fn mtime_nanos(path: &Path) -> u128 {
 }
 
 fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
-    let mut latest = 0;
+    let mut latest = mtime_nanos(fragment_root);
     let Ok(entries) = fs::read_dir(fragment_root) else {
         return latest;
     };
@@ -2658,28 +2321,18 @@ fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaState)> {
         let take = match best.as_ref() {
             None => true,
             Some((_, current_state, current_modified)) => {
-                match (
-                    state.namespace_generation,
-                    current_state.namespace_generation,
-                ) {
-                    (Some(candidate), Some(current)) if candidate != current => candidate > current,
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    _ => {
-                        let records = replica_index_records(&state.score);
-                        let current_records = replica_index_records(&current_state.score);
-                        if records > current_records {
-                            true
-                        } else if records < current_records {
-                            false
-                        } else {
-                            // Maintenance and redistribution can touch stale replicas after a
-                            // one-disk write. Use mtime only when the N1 index content matches.
-                            modified > *current_modified
-                                || (modified == *current_modified
-                                    && state.score > current_state.score)
-                        }
-                    }
+                let records = replica_index_records(&state.score);
+                let current_records = replica_index_records(&current_state.score);
+                if records > current_records {
+                    true
+                } else if records < current_records {
+                    false
+                } else {
+                    // Namespace replicas are filesystem state. For equal-size replicas,
+                    // the latest filesystem mutation is authoritative and maintenance
+                    // reconciles the other roots outside the request path.
+                    modified > *current_modified
+                        || (modified == *current_modified && state.score > current_state.score)
                 }
             }
         };
@@ -2728,15 +2381,7 @@ pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) ->
             valid_replicas += 1;
             continue;
         }
-        let stale_generation = match (
-            state.namespace_generation,
-            canonical_state.namespace_generation,
-        ) {
-            (Some(replica), Some(canonical)) => replica < canonical,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        if stale_generation || state.score < canonical_state.score {
+        if state.score < canonical_state.score {
             missing_replicas += 1;
         } else {
             divergent_replicas += 1;
@@ -2780,7 +2425,7 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
     let Some((source, source_state)) = choose_replica_source(fragment) else {
         return Ok(());
     };
-    ensure_replica_source_unambiguous(fragment, &source_state)?;
+    ensure_replica_source_unambiguous(fragment, &source, &source_state)?;
     let source_root = source.parent().unwrap_or(&source).to_path_buf();
     let source_state = replica_state(&source_root, fragment)?;
     for dst in fragment_roots(fragment) {
@@ -2816,7 +2461,7 @@ pub fn repair_fragment_all_partition_replicas(
         return Ok((0, 0, 0));
     };
     if !dry_run {
-        ensure_replica_source_unambiguous(fragment, &source_state)?;
+        ensure_replica_source_unambiguous(fragment, &source, &source_state)?;
         let source_root = source.parent().unwrap_or(&source).to_path_buf();
         source_state = replica_state(&source_root, fragment)?;
     }
@@ -2864,26 +2509,27 @@ pub fn repair_fragment_all_partition_replicas(
 
 fn ensure_replica_source_unambiguous(
     fragment: &str,
+    source: &Path,
     source_state: &ReplicaState,
 ) -> Result<(), AppError> {
+    let source_root = source.parent().unwrap_or(source);
+    let source_objects = collect_symlink_object_ids_under(source_root, fragment, source, true)?;
     for root in index_roots() {
         let fragment_root = fragment_root_on(&root, fragment);
-        if !fragment_root.exists() {
+        if !fragment_root.exists() || fragment_root == source {
             continue;
         }
         let Ok(state) = replica_state(&root, fragment) else {
             continue;
         };
-        let same_known_generation = source_state.namespace_generation.is_some()
-            && state.namespace_generation == source_state.namespace_generation;
-        let equally_complete_legacy = source_state.namespace_generation.is_none()
-            && state.namespace_generation.is_none()
-            && state.score == source_state.score;
-        if state.content_digest != source_state.content_digest
-            && (same_known_generation || equally_complete_legacy)
+        if state.score != source_state.score || state.content_digest == source_state.content_digest
         {
+            continue;
+        }
+        let objects = collect_symlink_object_ids_under(&root, fragment, &fragment_root, true)?;
+        if objects != source_objects {
             return Err(AppError::Conflict(format!(
-                "N1 namespace replicas for fragment '{fragment}' have the same authority generation but different content; refusing destructive automatic repair"
+                "N1 namespace replicas for fragment '{fragment}' reference different objects; refusing destructive automatic repair"
             )));
         }
     }
@@ -3595,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn redistribution_reconciles_equal_count_stale_replica_from_higher_generation() {
+    fn redistribution_refuses_equal_count_object_identity_divergence() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         assert!(roots.len() >= 2);
@@ -3604,11 +3250,7 @@ mod tests {
         let replacement_object = new_object_id();
         upsert_live_version(&test_metadata(&fragment, &replacement_object, 456))
             .expect("publish replacement object metadata");
-        for root in &roots {
-            write_namespace_generation_to_fragment_root(&fragment_root_on(root, &fragment), 41)
-                .expect("write shared namespace generation");
-        }
-
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let authoritative_link = fragment_root_on(&roots[0], &fragment).join("docs/report.bin");
         fs::remove_file(&authoritative_link).expect("remove prior authoritative link");
         unix_fs::symlink(
@@ -3616,63 +3258,39 @@ mod tests {
             &authoritative_link,
         )
         .expect("publish one-disk replacement");
-        write_namespace_generation_to_fragment_root(&fragment_root_on(&roots[0], &fragment), 42)
-            .expect("advance active one-disk generation");
-
-        let before = inspect_fragment_partition_replicas(&fragment, &roots);
-        assert!(!before.healthy);
-        assert_eq!(
-            before.canonical_path,
-            Some(fragment_root_on(&roots[0], &fragment).display().to_string())
-        );
-        sync_fragment_partition_replicas(&fragment)
-            .expect("reconcile returning stale namespace replica");
-
-        for root in &roots {
-            let link = fragment_root_on(root, &fragment).join("docs/report.bin");
-            assert_eq!(
-                read_namespace_symlink_object_id(root, &fragment, &link)
-                    .expect("read reconciled link"),
-                Some(replacement_object.clone())
-            );
-            assert_eq!(
-                read_namespace_generation_from_fragment_root(&fragment_root_on(root, &fragment))
-                    .expect("read reconciled generation"),
-                Some(42)
-            );
-        }
+        assert!(matches!(
+            sync_fragment_partition_replicas(&fragment),
+            Err(AppError::Conflict(_))
+        ));
         assert_ne!(original_object, replacement_object);
-        assert!(inspect_fragment_partition_replicas(&fragment, &roots).healthy);
     }
 
     #[test]
-    fn redistribution_generation_outranks_stale_replica_with_more_links() {
+    fn redistribution_repairs_a_partial_folder_rename_without_foreground_coordination() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         assert!(roots.len() >= 2);
-        let fragment = format!("n1-redistribution-delete-generation-{}", Ulid::new());
-        publish_logical_object(&roots, &fragment, "docs/expired.bin", 123);
-        for root in &roots {
-            write_namespace_generation_to_fragment_root(&fragment_root_on(root, &fragment), 51)
-                .expect("write shared generation before one-disk delete");
-        }
+        let fragment = format!("n1-redistribution-partial-rename-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "before/item.bin", 123);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::rename(
+            fragment_root_on(&roots[0], &fragment).join("before"),
+            fragment_root_on(&roots[0], &fragment).join("after"),
+        )
+        .expect("rename on continuously active replica");
 
-        fs::remove_file(fragment_root_on(&roots[0], &fragment).join("docs/expired.bin"))
-            .expect("delete on continuously active replica");
-        write_namespace_generation_to_fragment_root(&fragment_root_on(&roots[0], &fragment), 52)
-            .expect("advance generation after one-disk delete");
-
-        let (source, state) = choose_replica_source(&fragment).expect("authoritative source");
+        let (source, _) = choose_replica_source(&fragment).expect("authoritative source");
         assert_eq!(source, fragment_root_on(&roots[0], &fragment));
-        assert_eq!(state.namespace_generation, Some(52));
         sync_fragment_partition_replicas(&fragment)
-            .expect("higher generation must override richer stale replica");
+            .expect("latest filesystem mutation must repair the stale replica");
         for root in &roots {
             assert!(
-                fs::symlink_metadata(fragment_root_on(root, &fragment).join("docs/expired.bin"))
-                    .is_err(),
-                "a stale retained link must not resurrect a newer namespace deletion"
+                fragment_root_on(root, &fragment)
+                    .join("after/item.bin")
+                    .is_symlink(),
+                "the repaired replica must contain the renamed namespace entry"
             );
+            assert!(!fragment_root_on(root, &fragment).join("before").exists());
         }
         assert!(inspect_fragment_partition_replicas(&fragment, &roots).healthy);
     }
@@ -4051,30 +3669,16 @@ mod tests {
             .into_iter()
             .map(|metadata| metadata.version_id)
             .collect::<Vec<_>>();
-        let trash_entry_id = Ulid::new().to_string();
-        let source_relative_path = format!(".entries/{trash_entry_id}");
+        assert!(!version_ids.is_empty());
 
         for root in &roots {
             let fragment_root = fragment_root_on(root, &fragment);
             let source = fragment_root.join(logical_path);
-            let destination = fragment_root.join(TRASH_DIR).join(&source_relative_path);
+            let destination = fragment_root.join(TRASH_DIR).join(logical_path);
             fs::create_dir_all(destination.parent().expect("trash parent"))
                 .expect("create trash payload parent");
             fs::rename(source, destination).expect("move namespace link into trash");
         }
-        write_trash_record_for_fragment(
-            &fragment,
-            &TrashRecord {
-                trash_entry_id,
-                original_path: logical_path.to_string(),
-                source_relative_path,
-                kind: TrashKind::File,
-                object_keys: vec![object_id.clone()],
-                version_ids,
-                deleted_at_unix: 1_777_905_001,
-            },
-        )
-        .expect("publish trash record");
 
         let user_page =
             scan_trash_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
@@ -4096,30 +3700,15 @@ mod tests {
         let fragment = format!("n1-trash-directory-maintenance-{}", Ulid::new());
         let logical_path = "archive/nested/report.bin";
         let object_id = publish_logical_object(&roots, &fragment, logical_path, 73);
-        let trash_entry_id = Ulid::new().to_string();
-        let source_relative_path = format!(".entries/{trash_entry_id}");
 
         for root in &roots {
             let fragment_root = fragment_root_on(root, &fragment);
-            let destination = fragment_root.join(TRASH_DIR).join(&source_relative_path);
+            let destination = fragment_root.join(TRASH_DIR).join("archive");
             fs::create_dir_all(destination.parent().expect("trash parent"))
                 .expect("create trash payload parent");
             fs::rename(fragment_root.join("archive"), destination)
                 .expect("move namespace directory into trash");
         }
-        write_trash_record_for_fragment(
-            &fragment,
-            &TrashRecord {
-                trash_entry_id,
-                original_path: "archive".to_string(),
-                source_relative_path,
-                kind: TrashKind::Directory,
-                object_keys: Vec::new(),
-                version_ids: Vec::new(),
-                deleted_at_unix: 1_777_905_002,
-            },
-        )
-        .expect("publish directory trash record");
 
         let maintenance_page = scan_trash_full_metadata_page(&fragment, None, None, 10, None, true)
             .expect("scan deleted directory maintenance page");

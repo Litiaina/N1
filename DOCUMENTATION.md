@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 3.2.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.2.2 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -10,7 +10,7 @@ notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Version And Release Status
 
-N1 `3.2.0` is the current development engine/package version. It is on the
+N1 `3.2.2` is the current development engine/package version. It is on the
 development release channel and is not a declaration that this engine line has
 reached its stable product milestone. Storage compatibility is tracked
 separately as engine format `3`; package updates within this development line
@@ -27,7 +27,7 @@ the current package version advances to `3.2.0`.
 - **Namespace:** The user-facing tree of folders and files. This is what `/noa/v1/posix/*` and the UI show.
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
-- **Trash:** Soft delete moves namespace entries into `.trash` under unique lifecycle ids. Recover moves retained paths back to the live namespace. Configured TTL expiry removes namespace references and directly reclaims only safely unreferenced immutable objects.
+- **Trash:** Soft delete renames a live entry directly to `.trash/<same-logical-path>`. Recover performs the reverse rename. The trash entry's filesystem modification time is its deletion time; configured TTL expiry removes the namespace entry and reclaims only safely unreferenced immutable objects.
 - **Repair:** Rebuilds missing namespace/control replicas, immutable object metadata placements, and shard/parity payload when enough data remains.
 - **Redistribution:** Explicitly rewrites selected object versions into the current blob/EC topology. Existing objects remain valid under their recorded topology until redistributed.
 
@@ -1187,11 +1187,11 @@ Query parameters:
 
 ## Trash And Recovery
 
-Soft delete moves a file or folder into the internal `.trash` namespace and assigns a unique `trash_entry_id`. Live listing no longer shows it. The lifecycle record stores its original path, deletion time, kind, and internal payload location. Multiple deleted generations of the same path can coexist and be recovered independently by id.
+Soft delete renames a file or folder directly from its live path to `.trash/<same-logical-path>` on every index root. Live listing no longer shows it. The trash entry itself is the complete lifecycle state: its path preserves the recovery destination and its filesystem modification time is the deletion time. There are no per-delete records, ids, generations, or hidden payload containers.
 
-Recovery is allowed only while the configured `trash_retention_seconds` has not expired. Folder soft delete remains a directory rename; N1 does not scan descendants until that retained folder reaches expiry.
+Recovery is the reverse rename and remains available while the physical trash entry exists. Folder soft delete and recovery remain directory renames; N1 does not scan descendants until a retained folder reaches expiry.
 
-The background lifecycle scans `.trash`, not the full blob plane. For an expired entry it writes a durable reclamation receipt, removes the namespace reference, verifies that each candidate object id has no live or remaining trash reference, directly reclaims safe immutable object directories, and then clears the receipt. Interrupted work is retried from the receipt.
+The background lifecycle scans `.trash`, not the full blob plane. It compares each trash entry's filesystem modification time with `trash_retention_seconds`. For expired entries it removes the namespace reference, verifies all candidate object ids once against the remaining namespace, and directly reclaims only unreferenced immutable object directories. A crash can leave only safe immutable orphan data; explicit deep GC reclaims that leak without risking reachable objects.
 
 N1 3.2.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
 
@@ -1410,15 +1410,14 @@ Changing the configured EC width affects new versions only. Added disks enter
 the deterministic placement pool for new objects and as eligible repair
 targets; healthy existing objects are neither degraded nor rewritten.
 
-Namespace redistribution also reconciles returning index replicas. Every
-accepted namespace mutation advances a constant-size durable generation on
-the participating index roots. After a `2 -> 1 -> 2` topology cycle, the
-higher generation identifies the continuously active namespace even when link
-counts match or the returning replica contains more stale links. Run
-redistribution before resuming namespace writes after re-adding an index root;
-N1 rejects namespace mutations while configured replicas expose different
-generations. If replicas have the same generation but different content,
-automatic repair fails closed and requires operator investigation.
+Namespace maintenance also reconciles missing or incomplete index replicas.
+Ordinary namespace mutations are direct filesystem operations on every
+accepted index root and write no generation record. Root-identity and topology
+safety prevent mutations while a configured root is absent or replaced, so a
+returning root cannot silently miss foreground writes. Replica inspection uses
+a deterministic digest of sorted namespace/control content; destructive repair
+fails closed when equally complete replicas reference different immutable
+objects.
 
 ## Realtime Namespace Websocket
 

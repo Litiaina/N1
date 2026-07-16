@@ -61,8 +61,6 @@ pub async fn repair_namespace_replicas(
     dry_run: bool,
 ) -> Result<NamespaceReplicaRepairReport, AppError> {
     let fragment_name = fragment.to_string();
-    let _namespace_guard =
-        crate::namespace::runtime::namespace_mutation_guard(&fragment_name).await;
     let (missing, divergent, corrupt) = tokio::task::spawn_blocking(move || {
         index_store::repair_fragment_all_partition_replicas(&fragment_name, dry_run)
     })
