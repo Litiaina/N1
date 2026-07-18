@@ -8,7 +8,7 @@ use crate::core::repair_manager::{
     ObjectLayoutStatus, RepairCheckMode, repair_cluster_object_recorded_layout,
 };
 use crate::distribution::layout::resolve_write_layout;
-use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
+use crate::distribution::membership::{ClusterRuntime, NodeRole, active_cluster_runtime};
 use crate::distribution::namespace::commit_upload_quorum;
 use crate::distribution::peer::parse_peer_shard_locator;
 use crate::distribution::placement::{
@@ -116,7 +116,9 @@ static REPAIR_STATUS: LazyLock<Mutex<ClusterRewriteJobStatus>> =
     LazyLock::new(|| Mutex::new(ClusterRewriteJobStatus::default()));
 
 pub fn plan_rebalance(runtime: &ClusterRuntime) -> Result<ClusterRebalancePlan, AppError> {
-    let active_nodes = runtime.membership.active_write_nodes();
+    let active_nodes = runtime
+        .membership
+        .active_write_nodes_for_role(NodeRole::Blob);
     let layout = resolve_write_layout(
         active_nodes.len(),
         active_nodes.len(),
@@ -307,7 +309,9 @@ pub fn object_layout_status(
     meta: &ObjectMetadata,
     runtime: &ClusterRuntime,
 ) -> Result<ObjectLayoutStatus, AppError> {
-    let active = runtime.membership.active_write_nodes();
+    let active = runtime
+        .membership
+        .active_write_nodes_for_role(NodeRole::Blob);
     let layout = resolve_write_layout(active.len(), active.len(), &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
     let recorded_total_shards = meta
@@ -750,6 +754,7 @@ async fn run_rewrite_job(
 }
 
 pub fn start_rebalance(req: ClusterRebalanceRequest) -> Result<ClusterRewriteJobStatus, AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     begin_job(&REBALANCE_STATUS, "cluster_rebalance", &req)?;
     tokio::spawn(run_rewrite_job(&REBALANCE_STATUS, req, false));
     Ok(rebalance_status())
@@ -972,17 +977,24 @@ pub fn stop_repair() -> ClusterRewriteJobStatus {
 mod tests {
     use super::*;
     use crate::core::disk_manager::{PartMetadata, ShardInfo};
-    use crate::distribution::membership::{ClusterMembership, ClusterNode, NodeState};
+    use crate::distribution::membership::{
+        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION,
+        NamespaceCatalogLayout, NamespaceCatalogReplica, NodeRole, NodeState, StorageRoot,
+    };
     use crate::distribution::peer::{PeerShardTarget, encode_peer_shard_locator};
 
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.into(),
+            role: NodeRole::Blob,
             endpoint: format!("http://{id}"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
             weight: 1,
-            storage_roots: vec![],
+            storage_roots: vec![StorageRoot {
+                id: format!("root-{id}"),
+                path: format!("/disk-{id}"),
+            }],
             joined_epoch: 1,
             capacity_bytes: None,
             used_bytes: None,
@@ -993,11 +1005,32 @@ mod tests {
     fn runtime(epoch: u64) -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "a".into(),
+            local_role: NodeRole::Blob,
+            local_storage_roots: vec![],
             membership_path: "membership.json".into(),
             layout_policy: crate::distribution::layout::ClusterLayoutPolicy::default(),
             membership: ClusterMembership {
+                format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch,
+                policy: ClusterPolicy {
+                    namespace_redundancy: 2,
+                    object_data_shards: 2,
+                    object_parity_shards: 1,
+                },
+                namespace_catalog: NamespaceCatalogLayout {
+                    generation: epoch,
+                    replicas: vec![
+                        NamespaceCatalogReplica {
+                            node_id: "a".into(),
+                            root_id: "root-a".into(),
+                        },
+                        NamespaceCatalogReplica {
+                            node_id: "b".into(),
+                            root_id: "root-b".into(),
+                        },
+                    ],
+                },
                 nodes: vec![node("a"), node("b"), node("c")],
             },
             auto_rebalance: false,
@@ -1025,7 +1058,9 @@ mod tests {
     }
 
     fn meta_matching_runtime(runtime: &ClusterRuntime) -> ObjectMetadata {
-        let active = runtime.membership.active_write_nodes();
+        let active = runtime
+            .membership
+            .active_write_nodes_for_role(NodeRole::Blob);
         let layout =
             resolve_write_layout(active.len(), active.len(), &runtime.layout_policy).unwrap();
         let plan = build_placement_plan(
@@ -1047,6 +1082,7 @@ mod tests {
                 } else {
                     encode_peer_shard_locator(&PeerShardTarget {
                         node_id: placement.node_id.clone(),
+                        root_id: placement.root_id.clone(),
                         endpoint: placement
                             .native_endpoint
                             .clone()

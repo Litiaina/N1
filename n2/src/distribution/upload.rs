@@ -7,10 +7,9 @@ use crate::core::ec::ErasureStreamWriter;
 use crate::core::index;
 use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
-use crate::distribution::dentry_group::{
-    configured_namespace_replicas, guaranteed_reachable_voters, quorum_required,
+use crate::distribution::membership::{
+    NodeRole, active_cluster_runtime, live_blob_write_nodes, live_namespace_write_nodes,
 };
-use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
     publish_cluster_object_metadata,
@@ -150,7 +149,10 @@ fn configured_layout(
     runtime: &crate::distribution::membership::ClusterRuntime,
 ) -> Result<ClusterEcLayout, AppError> {
     resolve_configured_layout(
-        runtime.membership.active_write_nodes().len(),
+        runtime
+            .membership
+            .active_write_nodes_for_role(NodeRole::Blob)
+            .len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::BadRequest)
@@ -158,18 +160,13 @@ fn configured_layout(
 
 fn validate_write_admission(
     runtime: &crate::distribution::membership::ClusterRuntime,
-    active_nodes: usize,
+    reachable_namespace_nodes: usize,
+    reachable_blob_nodes: usize,
     write_layout: ClusterEcLayout,
 ) -> Result<(), AppError> {
-    let voter_count = runtime
-        .membership
-        .nodes
-        .len()
-        .max(1)
-        .min(configured_namespace_replicas());
-    let required_voters = quorum_required(voter_count);
-    let reachable_voter_estimate =
-        guaranteed_reachable_voters(runtime.membership.nodes.len(), active_nodes, voter_count);
+    let voter_count = runtime.membership.policy.namespace_redundancy;
+    let required_voters = (voter_count / 2).saturating_add(1);
+    let reachable_voter_estimate = reachable_namespace_nodes.min(voter_count);
     if reachable_voter_estimate < required_voters {
         return Err(AppError::ServiceUnavailable(format!(
             "N2 namespace quorum is unavailable: {} reachable voter(s), {} required",
@@ -178,11 +175,13 @@ fn validate_write_admission(
     }
 
     let configured = configured_layout(runtime)?;
-    if configured.parity_shards > 0 && write_layout.parity_shards == 0 {
-        return Err(AppError::ServiceUnavailable(
-            "N2 durable writes require at least two writable nodes for a redundant object layout"
-                .into(),
-        ));
+    if write_layout != configured || reachable_blob_nodes < configured.total_shards() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 object writes require the configured {}+{} layout on {} distinct writable blob nodes",
+            configured.data_shards,
+            configured.parity_shards,
+            configured.total_shards()
+        )));
     }
     Ok(())
 }
@@ -211,15 +210,20 @@ async fn current_write_context() -> Result<
     ),
     AppError,
 > {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     let runtime = active_cluster_runtime()?;
-    let active = live_active_write_nodes(&runtime).await;
+    let active = live_blob_write_nodes(&runtime).await;
+    let namespace = live_namespace_write_nodes(&runtime).await;
     let layout = resolve_write_layout(
         active.len(),
-        runtime.membership.active_write_nodes().len(),
+        runtime
+            .membership
+            .active_write_nodes_for_role(NodeRole::Blob)
+            .len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::ServiceUnavailable)?;
-    validate_write_admission(&runtime, active.len(), layout)?;
+    validate_write_admission(&runtime, namespace.len(), active.len(), layout)?;
     Ok((runtime, active, layout))
 }
 
@@ -344,16 +348,20 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
 }
 
 async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let root = runtime
+        .local_storage_roots
+        .iter()
+        .find(|root| root.id == target.root_id)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(format!(
+                "blob root '{}' is not configured on node '{}'",
+                target.root_id, runtime.local_node_id
+            ))
+        })?;
     let pm = ObjectPathManager::new();
-    let roots = pm.get_storage_roots();
-    if roots.is_empty() {
-        return Err(AppError::InternalServerError(
-            "No blob storage disks configured".into(),
-        ));
-    }
-    let disk_idx = (target.part_index as usize + target.shard_index) % roots.len();
     let dir = pm.get_shard_dir_on_disk(
-        &roots[disk_idx],
+        &PathBuf::from(&root.path),
         &target.fragment,
         &target.object_id,
         &target.version_id,
@@ -391,6 +399,7 @@ async fn open_writers_for_plan(
         );
         let target = PeerShardTarget {
             node_id: placement.node_id.clone(),
+            root_id: placement.root_id.clone(),
             endpoint: placement
                 .native_endpoint
                 .clone()
@@ -435,13 +444,14 @@ where
             "cluster membership changed during upload session; restart the multipart upload".into(),
         ));
     }
-    let active = live_active_write_nodes(&runtime).await;
+    let active = live_blob_write_nodes(&runtime).await;
+    let namespace = live_namespace_write_nodes(&runtime).await;
     let layout = ClusterEcLayout {
         data_shards,
         parity_shards,
     };
     validate_pinned_upload_layout(layout, active.len())?;
-    validate_write_admission(&runtime, active.len(), layout)?;
+    validate_write_admission(&runtime, namespace.len(), active.len(), layout)?;
     let placement = build_placement_plan(
         fragment,
         object_key,
@@ -710,7 +720,6 @@ where
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
     };
-    let _lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     publish_cluster_object_metadata(&object_meta).await?;
     Ok(object_meta)
 }
@@ -776,7 +785,6 @@ pub async fn finalize_cluster_upload(
         is_delete_marker: false,
         stripe_size_bytes: state.manifest.stripe_size_bytes,
     };
-    let _lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     publish_cluster_object_metadata(&object_meta).await?;
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
     Ok(FinalizeUploadResult::Complete(object_meta))
@@ -801,7 +809,9 @@ mod tests {
     use super::*;
     use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
     use crate::distribution::membership::{
-        ClusterMembership, ClusterNode, ClusterRuntime, NodeState,
+        ClusterMembership, ClusterNode, ClusterPolicy, ClusterRuntime,
+        N2_MEMBERSHIP_FORMAT_VERSION, NamespaceCatalogLayout, NamespaceCatalogReplica, NodeRole,
+        NodeState, StorageRoot,
     };
     use std::path::PathBuf;
 
@@ -855,6 +865,8 @@ mod tests {
     fn fixed_runtime() -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "a".into(),
+            local_role: NodeRole::Blob,
+            local_storage_roots: vec![],
             membership_path: PathBuf::from("membership.json"),
             layout_policy: ClusterLayoutPolicy {
                 mode: ClusterLayoutMode::Fixed,
@@ -863,69 +875,78 @@ mod tests {
                 ..ClusterLayoutPolicy::default()
             },
             membership: ClusterMembership {
+                format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch: 7,
-                nodes: ["a", "b", "c"]
-                    .into_iter()
-                    .map(|id| ClusterNode {
-                        id: id.into(),
-                        endpoint: format!("https://{id}:50001"),
-                        native_endpoint: Some(format!("n2://{id}:50002")),
-                        state: Some(NodeState::Online),
-                        weight: 1,
-                        storage_roots: Vec::new(),
-                        joined_epoch: 1,
-                        capacity_bytes: None,
-                        used_bytes: None,
-                        last_seen_unix: None,
-                    })
-                    .collect(),
+                policy: ClusterPolicy {
+                    namespace_redundancy: 2,
+                    object_data_shards: 2,
+                    object_parity_shards: 1,
+                },
+                namespace_catalog: NamespaceCatalogLayout {
+                    generation: 7,
+                    replicas: vec![
+                        NamespaceCatalogReplica {
+                            node_id: "ns-a".into(),
+                            root_id: "root-ns-a".into(),
+                        },
+                        NamespaceCatalogReplica {
+                            node_id: "ns-b".into(),
+                            root_id: "root-ns-b".into(),
+                        },
+                    ],
+                },
+                nodes: [
+                    ("ns-a", NodeRole::Namespace),
+                    ("ns-b", NodeRole::Namespace),
+                    ("a", NodeRole::Blob),
+                    ("b", NodeRole::Blob),
+                    ("c", NodeRole::Blob),
+                ]
+                .into_iter()
+                .map(|(id, role)| ClusterNode {
+                    id: id.into(),
+                    role,
+                    endpoint: format!("https://{id}:50001"),
+                    native_endpoint: Some(format!("n2://{id}:50002")),
+                    state: Some(NodeState::Online),
+                    weight: 1,
+                    storage_roots: vec![StorageRoot {
+                        id: format!("root-{id}"),
+                        path: format!("/disk-{id}"),
+                    }],
+                    joined_epoch: 1,
+                    capacity_bytes: None,
+                    used_bytes: None,
+                    last_seen_unix: None,
+                })
+                .collect(),
             },
             auto_rebalance: false,
         }
     }
 
     #[test]
-    fn fixed_cluster_admits_redundant_one_plus_one_writes_with_two_nodes() {
+    fn fixed_cluster_admits_only_the_complete_configured_object_width() {
         let runtime = fixed_runtime();
-        let layout = resolve_write_layout(2, 3, &runtime.layout_policy).unwrap();
+        let layout = resolve_write_layout(3, 3, &runtime.layout_policy).unwrap();
 
-        assert_eq!(layout.data_shards, 1);
+        assert_eq!(layout.data_shards, 2);
         assert_eq!(layout.parity_shards, 1);
-        assert!(validate_write_admission(&runtime, 2, layout).is_ok());
+        assert!(validate_write_admission(&runtime, 2, 3, layout).is_ok());
     }
 
     #[test]
-    fn fixed_cluster_rejects_non_redundant_writes_with_one_node() {
+    fn fixed_cluster_rejects_an_under_width_blob_plane() {
         let runtime = fixed_runtime();
-        let layout = resolve_write_layout(1, 3, &runtime.layout_policy).unwrap();
-
-        assert_eq!(layout.data_shards, 1);
-        assert_eq!(layout.parity_shards, 0);
-        assert!(validate_write_admission(&runtime, 1, layout).is_err());
+        assert!(resolve_write_layout(2, 3, &runtime.layout_policy).is_err());
     }
 
     #[test]
-    fn four_node_namespace_rejects_two_arbitrary_survivors_without_voter_migration() {
-        let mut runtime = fixed_runtime();
-        runtime.layout_policy.fixed_data_shards = Some(3);
-        runtime.membership.nodes.push(ClusterNode {
-            id: "d".into(),
-            endpoint: "https://d:50001".into(),
-            native_endpoint: Some("n2://d:50002".into()),
-            state: Some(NodeState::Online),
-            weight: 1,
-            storage_roots: Vec::new(),
-            joined_epoch: 1,
-            capacity_bytes: None,
-            used_bytes: None,
-            last_seen_unix: None,
-        });
-        let layout = resolve_write_layout(2, 4, &runtime.layout_policy).unwrap();
-
-        assert_eq!(layout.data_shards, 1);
-        assert_eq!(layout.parity_shards, 1);
-        assert!(validate_write_admission(&runtime, 2, layout).is_err());
+    fn strict_two_of_two_namespace_rejects_one_reachable_voter() {
+        let runtime = fixed_runtime();
+        let layout = resolve_write_layout(3, 3, &runtime.layout_policy).unwrap();
+        assert!(validate_write_admission(&runtime, 1, 3, layout).is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use ulid::Ulid;
 use crate::core::disk_manager::ObjectMetadata;
 use crate::distribution::dentry_service::DistributedNamespace;
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::dentry::{DentryTarget, DirectoryLayout, NamespaceDentry, root_directory_id};
+use crate::namespace::inode_store::{InodeDentry, InodeDentryTarget, InodeLayout};
 use crate::namespace::models::{
     LifecycleState, NamespaceEntry, NamespaceEntryKind, NamespaceMutationSummary,
 };
@@ -112,9 +112,9 @@ pub struct PeerNamespaceApplyRequest {
     pub metadata: Option<ObjectMetadata>,
 }
 
-/// All namespace reads use the same bounded dentry quorum as mutations.
-/// Returning `Some` is deliberate: the legacy local-filesystem fallback no
-/// longer owns any namespace truth.
+/// All namespace reads use the exact replica layout recorded by each stable
+/// directory inode. Returning `Some` is deliberate: N2 2.0 has no legacy
+/// local-filesystem namespace fallback.
 pub async fn namespace_read_if_remote(
     request: PeerNamespaceReadRequest,
 ) -> Result<Option<PeerNamespaceReadResponse>, AppError> {
@@ -125,15 +125,15 @@ pub async fn namespace_read_if_remote(
                 DistributedNamespace::list_trash(&request.fragment)
                     .await?
                     .into_iter()
-                    .map(trash_dentry_to_namespace_entry)
+                    .map(|entry| trash_dentry_to_namespace_entry(&request.fragment, entry))
                     .collect::<Result<Vec<_>, _>>()?
             } else {
                 DistributedNamespace::list_directory(&request.fragment, &path)
                     .await?
                     .into_iter()
                     .map(|entry| {
-                        let child_path = join_path(path.trim_matches('/'), &entry.key.name);
-                        live_dentry_to_namespace_entry(entry, child_path)
+                        let child_path = join_path(path.trim_matches('/'), &entry.name);
+                        live_dentry_to_namespace_entry(&request.fragment, entry, child_path)
                     })
                     .collect()
             };
@@ -153,13 +153,19 @@ pub async fn namespace_read_if_remote(
         PeerNamespaceReadKind::Entry => {
             let entry = DistributedNamespace::resolve_entry(&request.fragment, &path)
                 .await?
-                .map(|resolved| live_dentry_to_namespace_entry(resolved.record, resolved.path));
+                .map(|resolved| {
+                    live_dentry_to_namespace_entry(
+                        &request.fragment,
+                        resolved.record,
+                        resolved.path,
+                    )
+                });
             PeerNamespaceReadResponse::Entry(entry)
         }
         PeerNamespaceReadKind::TrashedEntry => {
             let entry = find_trash_entry(&request.fragment, &path)
                 .await?
-                .map(trash_dentry_to_namespace_entry)
+                .map(|entry| trash_dentry_to_namespace_entry(&request.fragment, entry))
                 .transpose()?;
             PeerNamespaceReadResponse::Entry(entry)
         }
@@ -293,11 +299,11 @@ pub async fn commit_namespace_quorum(
             let trash_entry = find_trash_entry(&request.fragment, requested)
                 .await?
                 .ok_or(AppError::NotFound)?;
-            let trash_entry_id = trash_entry.key.name.clone();
+            let trash_entry_id = trash_entry.name.clone();
             let original_path = trash_entry
                 .trash
                 .as_ref()
-                .map(|context| context.original_path.clone())
+                .map(|context| context.path.clone())
                 .ok_or_else(|| {
                     AppError::InternalServerError("trash dentry has no lifecycle context".into())
                 })?;
@@ -356,24 +362,28 @@ pub async fn commit_namespace_summary_quorum(
 async fn find_trash_entry(
     fragment: &str,
     requested: &str,
-) -> Result<Option<NamespaceDentry>, AppError> {
+) -> Result<Option<InodeDentry>, AppError> {
     Ok(DistributedNamespace::list_trash(fragment)
         .await?
         .into_iter()
         .find(|entry| {
-            entry.key.name == requested
+            entry.name == requested
                 || entry
                     .trash
                     .as_ref()
-                    .is_some_and(|trash| trash.original_path == requested)
+                    .is_some_and(|trash| trash.path == requested)
         }))
 }
 
-fn live_dentry_to_namespace_entry(entry: NamespaceDentry, path: String) -> NamespaceEntry {
+fn live_dentry_to_namespace_entry(
+    fragment: &str,
+    entry: InodeDentry,
+    path: String,
+) -> NamespaceEntry {
     NamespaceEntry {
-        fragment: entry.key.fragment,
+        fragment: fragment.to_string(),
         parent_path: crate::namespace::paths::parent_path(&path),
-        name: entry.key.name,
+        name: entry.name,
         kind: dentry_kind(&entry.target),
         object_id: object_id(&entry.target),
         size_bytes: None,
@@ -382,41 +392,46 @@ fn live_dentry_to_namespace_entry(entry: NamespaceDentry, path: String) -> Names
         lifecycle: LifecycleState::Live,
         trash_entry_id: None,
         deleted_at_unix: None,
-        created_at_unix: entry.created_at_unix,
-        updated_at_unix: entry.updated_at_unix,
+        created_at_unix: nanos_to_unix_seconds(entry.created_at_unix_nanos),
+        updated_at_unix: nanos_to_unix_seconds(entry.updated_at_unix_nanos),
         path,
     }
 }
 
-fn trash_dentry_to_namespace_entry(entry: NamespaceDentry) -> Result<NamespaceEntry, AppError> {
+fn trash_dentry_to_namespace_entry(
+    fragment: &str,
+    entry: InodeDentry,
+) -> Result<NamespaceEntry, AppError> {
     let trash = entry.trash.clone().ok_or_else(|| {
         AppError::InternalServerError("trash dentry has no lifecycle context".into())
     })?;
     Ok(NamespaceEntry {
-        fragment: entry.key.fragment,
-        path: trash.original_path.clone(),
-        parent_path: crate::namespace::paths::parent_path(&trash.original_path),
-        name: crate::namespace::paths::base_name(&trash.original_path),
+        fragment: fragment.to_string(),
+        path: trash.path.clone(),
+        parent_path: crate::namespace::paths::parent_path(&trash.path),
+        name: crate::namespace::paths::base_name(&trash.path),
         kind: dentry_kind(&entry.target),
         object_id: object_id(&entry.target),
         size_bytes: None,
         version_id: None,
         packed_ext_u64: None,
-        lifecycle: LifecycleState::trashed(trash.deleted_at_unix),
-        trash_entry_id: Some(entry.key.name),
-        deleted_at_unix: Some(trash.deleted_at_unix),
-        created_at_unix: entry.created_at_unix,
-        updated_at_unix: entry.updated_at_unix,
+        lifecycle: LifecycleState::trashed(nanos_to_unix_seconds(trash.deleted_at_unix_nanos)),
+        trash_entry_id: Some(entry.name),
+        deleted_at_unix: Some(nanos_to_unix_seconds(trash.deleted_at_unix_nanos)),
+        created_at_unix: nanos_to_unix_seconds(entry.created_at_unix_nanos),
+        updated_at_unix: nanos_to_unix_seconds(entry.updated_at_unix_nanos),
     })
 }
 
 async fn walk_live_namespace(fragment: &str) -> Result<Vec<NamespaceObjectRef>, AppError> {
     let mut refs = Vec::new();
+    let root = DistributedNamespace::resolve_directory(fragment, "").await?;
+    let stable_fragment_id = root.inode.fragment_id.clone();
     walk_directory(
-        fragment,
+        &stable_fragment_id,
         String::new(),
-        root_directory_id(fragment),
-        DirectoryLayout::default(),
+        root.inode.inode_id,
+        root.inode.layout,
         &mut refs,
     )
     .await?;
@@ -425,15 +440,20 @@ async fn walk_live_namespace(fragment: &str) -> Result<Vec<NamespaceObjectRef>, 
 
 async fn walk_trash_namespace(fragment: &str) -> Result<Vec<NamespaceObjectRef>, AppError> {
     let mut refs = Vec::new();
+    let namespace = crate::namespace::catalog::resolve_fragment_namespace(
+        crate::distribution::membership::active_cluster_runtime()?,
+        fragment,
+    )
+    .await?;
     for entry in DistributedNamespace::list_trash(fragment).await? {
         let base = entry
             .trash
             .as_ref()
-            .map(|trash| trash.original_path.clone())
+            .map(|trash| trash.path.clone())
             .ok_or_else(|| {
                 AppError::InternalServerError("trash dentry has no lifecycle context".into())
             })?;
-        walk_target(fragment, base, entry.target, &mut refs).await?;
+        walk_target(&namespace.stable_fragment_id, base, entry.target, &mut refs).await?;
     }
     Ok(refs)
 }
@@ -442,26 +462,30 @@ async fn walk_directory(
     fragment: &str,
     base: String,
     directory_id: String,
-    layout: DirectoryLayout,
+    layout: InodeLayout,
     refs: &mut Vec<NamespaceObjectRef>,
 ) -> Result<(), AppError> {
     let mut stack = vec![(base, directory_id, layout)];
     while let Some((base, directory_id, layout)) = stack.pop() {
         for entry in
-            crate::distribution::dentry_quorum::quorum_list_parent(fragment, &directory_id, layout)
-                .await?
+            DistributedNamespace::list_inode_dentries(fragment, &directory_id, &layout).await?
         {
-            let path = join_path(&base, &entry.key.name);
+            let path = join_path(&base, &entry.name);
             match entry.target {
-                DentryTarget::Directory {
-                    directory_id,
-                    layout,
-                } => stack.push((path, directory_id, layout)),
-                DentryTarget::Object { object_id } => refs.push(NamespaceObjectRef {
+                InodeDentryTarget::Directory { inode_id, layout } => {
+                    stack.push((path, inode_id, layout))
+                }
+                InodeDentryTarget::Object { object_id } => refs.push(NamespaceObjectRef {
                     path,
                     object_id,
                     version_id: String::new(),
                 }),
+                InodeDentryTarget::Symlink { .. } => {}
+                InodeDentryTarget::Fragment { .. } => {
+                    return Err(AppError::Conflict(
+                        "fragment catalog target appeared inside a fragment namespace".into(),
+                    ));
+                }
             }
         }
     }
@@ -471,26 +495,31 @@ async fn walk_directory(
 async fn walk_target(
     fragment: &str,
     path: String,
-    target: DentryTarget,
+    target: InodeDentryTarget,
     refs: &mut Vec<NamespaceObjectRef>,
 ) -> Result<(), AppError> {
     match target {
-        DentryTarget::Object { object_id } => refs.push(NamespaceObjectRef {
+        InodeDentryTarget::Object { object_id } => refs.push(NamespaceObjectRef {
             path,
             object_id,
             version_id: String::new(),
         }),
-        DentryTarget::Directory {
-            directory_id,
-            layout,
-        } => walk_directory(fragment, path, directory_id, layout, refs).await?,
+        InodeDentryTarget::Directory { inode_id, layout } => {
+            walk_directory(fragment, path, inode_id, layout, refs).await?
+        }
+        InodeDentryTarget::Symlink { .. } => {}
+        InodeDentryTarget::Fragment { .. } => {
+            return Err(AppError::Conflict(
+                "fragment catalog target appeared inside a fragment namespace".into(),
+            ));
+        }
     }
     Ok(())
 }
 
 fn summary_from_dentry(
     operation: &str,
-    record: &NamespaceDentry,
+    record: &InodeDentry,
     source_path: Option<String>,
     destination_path: Option<String>,
 ) -> NamespaceMutationSummary {
@@ -498,26 +527,37 @@ fn summary_from_dentry(
         operation: operation.to_string(),
         kind: dentry_kind(&record.target),
         affected_paths: 1,
-        affected_objects: usize::from(matches!(record.target, DentryTarget::Object { .. })),
+        affected_objects: usize::from(matches!(record.target, InodeDentryTarget::Object { .. })),
         source_path,
         destination_path,
-        trash_entry_id: record.trash.as_ref().map(|_| record.key.name.clone()),
-        deleted_at_unix: record.trash.as_ref().map(|trash| trash.deleted_at_unix),
+        trash_entry_id: record.trash.as_ref().map(|_| record.name.clone()),
+        deleted_at_unix: record
+            .trash
+            .as_ref()
+            .map(|trash| nanos_to_unix_seconds(trash.deleted_at_unix_nanos)),
     }
 }
 
-fn dentry_kind(target: &DentryTarget) -> NamespaceEntryKind {
+fn dentry_kind(target: &InodeDentryTarget) -> NamespaceEntryKind {
     match target {
-        DentryTarget::Directory { .. } => NamespaceEntryKind::Directory,
-        DentryTarget::Object { .. } => NamespaceEntryKind::File,
+        InodeDentryTarget::Directory { .. } => NamespaceEntryKind::Directory,
+        InodeDentryTarget::Object { .. } => NamespaceEntryKind::File,
+        InodeDentryTarget::Symlink { .. } => NamespaceEntryKind::File,
+        InodeDentryTarget::Fragment { .. } => NamespaceEntryKind::Directory,
     }
 }
 
-fn object_id(target: &DentryTarget) -> Option<String> {
+fn object_id(target: &InodeDentryTarget) -> Option<String> {
     match target {
-        DentryTarget::Object { object_id } => Some(object_id.clone()),
-        DentryTarget::Directory { .. } => None,
+        InodeDentryTarget::Object { object_id } => Some(object_id.clone()),
+        InodeDentryTarget::Directory { .. }
+        | InodeDentryTarget::Symlink { .. }
+        | InodeDentryTarget::Fragment { .. } => None,
     }
+}
+
+fn nanos_to_unix_seconds(nanos: i64) -> i64 {
+    nanos / 1_000_000_000
 }
 
 fn required<'a>(value: &'a Option<String>, message: &str) -> Result<&'a str, AppError> {

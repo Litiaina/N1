@@ -14,6 +14,149 @@ use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
 const CLUSTER_NODE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
+pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    Namespace,
+    Blob,
+}
+
+impl NodeRole {
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "namespace" => Ok(Self::Namespace),
+            "blob" => Ok(Self::Blob),
+            other => Err(AppError::BadRequest(format!(
+                "node_role must be namespace or blob, got '{other}'"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Namespace => f.write_str("namespace"),
+            Self::Blob => f.write_str("blob"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageRoot {
+    pub id: String,
+    pub path: String,
+}
+
+pub fn parse_storage_roots(raw: &str) -> Result<Vec<StorageRoot>, AppError> {
+    let mut roots = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (id, path) = entry.split_once('=').ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "storage_roots entry '{entry}' must use ROOT_ID=/absolute/path"
+            ))
+        })?;
+        let root = StorageRoot {
+            id: id.trim().to_string(),
+            path: path.trim().to_string(),
+        };
+        root.validate()?;
+        if !ids.insert(root.id.clone()) {
+            return Err(AppError::BadRequest(format!(
+                "storage root ID '{}' is configured more than once",
+                root.id
+            )));
+        }
+        if !paths.insert(root.path.clone()) {
+            return Err(AppError::BadRequest(format!(
+                "storage path '{}' is configured more than once",
+                root.path
+            )));
+        }
+        roots.push(root);
+    }
+    if roots.is_empty() {
+        return Err(AppError::BadRequest(
+            "N2 2.0 requires at least one storage_roots entry".into(),
+        ));
+    }
+    Ok(roots)
+}
+
+impl StorageRoot {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "storage root ID cannot be empty".into(),
+            ));
+        }
+        if self.id.contains('/')
+            || self.id.contains('=')
+            || self.id.chars().any(char::is_whitespace)
+        {
+            return Err(AppError::BadRequest(format!(
+                "storage root ID '{}' contains an invalid character",
+                self.id
+            )));
+        }
+        let path = Path::new(self.path.trim());
+        if !path.is_absolute() {
+            return Err(AppError::BadRequest(format!(
+                "storage root '{}' must use an absolute path",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterPolicy {
+    pub namespace_redundancy: usize,
+    pub object_data_shards: usize,
+    pub object_parity_shards: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceCatalogReplica {
+    pub node_id: String,
+    pub root_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceCatalogLayout {
+    pub generation: u64,
+    pub replicas: Vec<NamespaceCatalogReplica>,
+}
+
+impl ClusterPolicy {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.namespace_redundancy < 2 {
+            return Err(AppError::BadRequest(
+                "N2 2.0 namespace_redundancy must be at least 2".into(),
+            ));
+        }
+        if self.object_data_shards == 0 || self.object_parity_shards == 0 {
+            return Err(AppError::BadRequest(
+                "N2 2.0 object EC requires at least 1 data and 1 parity shard".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn object_width(&self) -> usize {
+        self.object_data_shards
+            .saturating_add(self.object_parity_shards)
+    }
+}
 
 static CLUSTER_PROBE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -46,6 +189,7 @@ impl NodeState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterNode {
     pub id: String,
+    pub role: NodeRole,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_endpoint: Option<String>,
@@ -53,8 +197,7 @@ pub struct ClusterNode {
     pub state: Option<NodeState>,
     #[serde(default = "default_weight")]
     pub weight: u32,
-    #[serde(default)]
-    pub storage_roots: Vec<String>,
+    pub storage_roots: Vec<StorageRoot>,
     #[serde(default = "default_joined_epoch")]
     pub joined_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,12 +228,139 @@ impl ClusterNode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterMembership {
+    pub format_version: u32,
     pub cluster_id: String,
     pub epoch: u64,
+    pub policy: ClusterPolicy,
+    pub namespace_catalog: NamespaceCatalogLayout,
     pub nodes: Vec<ClusterNode>,
 }
 
 impl ClusterMembership {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.format_version != N2_MEMBERSHIP_FORMAT_VERSION {
+            return Err(AppError::BadRequest(format!(
+                "membership format {} is not N2 2.0 format {}",
+                self.format_version, N2_MEMBERSHIP_FORMAT_VERSION
+            )));
+        }
+        if self.cluster_id.trim().is_empty() || self.epoch == 0 {
+            return Err(AppError::BadRequest(
+                "membership requires a cluster_id and a positive epoch".into(),
+            ));
+        }
+        self.policy.validate()?;
+
+        let mut node_ids = std::collections::BTreeSet::new();
+        let mut root_ids = std::collections::BTreeSet::new();
+        for node in &self.nodes {
+            if node.id.trim().is_empty() || !node_ids.insert(node.id.clone()) {
+                return Err(AppError::BadRequest(format!(
+                    "membership contains an empty or duplicate node ID '{}'",
+                    node.id
+                )));
+            }
+            if node.endpoint.trim().is_empty() || node.storage_roots.is_empty() {
+                return Err(AppError::BadRequest(format!(
+                    "node '{}' requires an endpoint and at least one storage root",
+                    node.id
+                )));
+            }
+            for root in &node.storage_roots {
+                root.validate()?;
+                if !root_ids.insert(root.id.clone()) {
+                    return Err(AppError::BadRequest(format!(
+                        "storage root ID '{}' is assigned to more than one logical node",
+                        root.id
+                    )));
+                }
+            }
+        }
+        if self.namespace_catalog.generation == 0
+            || self.namespace_catalog.replicas.len() != self.policy.namespace_redundancy
+        {
+            return Err(AppError::BadRequest(format!(
+                "namespace catalog requires exactly {} replicas at a positive layout generation",
+                self.policy.namespace_redundancy
+            )));
+        }
+        let mut catalog_nodes = std::collections::BTreeSet::new();
+        for replica in &self.namespace_catalog.replicas {
+            if !catalog_nodes.insert(replica.node_id.clone()) {
+                return Err(AppError::BadRequest(
+                    "namespace catalog replicas must use distinct namespace nodes".into(),
+                ));
+            }
+            let node = self
+                .nodes
+                .iter()
+                .find(|node| node.id == replica.node_id)
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "namespace catalog references unknown node '{}'",
+                        replica.node_id
+                    ))
+                })?;
+            if node.role != NodeRole::Namespace
+                || !node
+                    .storage_roots
+                    .iter()
+                    .any(|root| root.id == replica.root_id)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "namespace catalog replica '{}:{}' is not a valid namespace root",
+                    replica.node_id, replica.root_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn nodes_for_role(&self, role: NodeRole) -> Vec<ClusterNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.role == role)
+            .cloned()
+            .collect()
+    }
+
+    pub fn active_write_nodes_for_role(&self, role: NodeRole) -> Vec<ClusterNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.role == role && node.effective_state().accepts_new_writes())
+            .cloned()
+            .collect()
+    }
+
+    pub fn readable_nodes_for_role(&self, role: NodeRole) -> Vec<ClusterNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.role == role && node.effective_state().is_readable())
+            .cloned()
+            .collect()
+    }
+
+    pub fn validate_minimum_topology(&self) -> Result<(), AppError> {
+        let namespace_nodes = self.nodes_for_role(NodeRole::Namespace).len();
+        let blob_nodes = self.nodes_for_role(NodeRole::Blob).len();
+        if namespace_nodes < self.policy.namespace_redundancy {
+            return Err(AppError::ServiceUnavailable(format!(
+                "N2 namespace requires {} distinct namespace nodes, but membership has {}",
+                self.policy.namespace_redundancy, namespace_nodes
+            )));
+        }
+        if blob_nodes < self.policy.object_width() {
+            return Err(AppError::ServiceUnavailable(format!(
+                "N2 object EC {}+{} requires {} distinct blob nodes, but membership has {}",
+                self.policy.object_data_shards,
+                self.policy.object_parity_shards,
+                self.policy.object_width(),
+                blob_nodes
+            )));
+        }
+        Ok(())
+    }
+
     pub fn active_write_nodes(&self) -> Vec<ClusterNode> {
         self.nodes
             .iter()
@@ -175,6 +445,25 @@ pub async fn live_active_write_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNod
     .await
 }
 
+pub async fn live_active_write_nodes_for_role(
+    runtime: &ClusterRuntime,
+    role: NodeRole,
+) -> Vec<ClusterNode> {
+    live_filter_nodes(
+        &runtime.local_node_id,
+        runtime.membership.active_write_nodes_for_role(role),
+    )
+    .await
+}
+
+pub async fn live_blob_write_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
+    live_active_write_nodes_for_role(runtime, NodeRole::Blob).await
+}
+
+pub async fn live_namespace_write_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
+    live_active_write_nodes_for_role(runtime, NodeRole::Namespace).await
+}
+
 pub async fn live_readable_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
     live_filter_nodes(&runtime.local_node_id, runtime.membership.readable_nodes()).await
 }
@@ -182,6 +471,8 @@ pub async fn live_readable_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
 #[derive(Clone, Debug)]
 pub struct ClusterRuntime {
     pub local_node_id: String,
+    pub local_role: NodeRole,
+    pub local_storage_roots: Vec<StorageRoot>,
     pub membership_path: PathBuf,
     pub layout_policy: ClusterLayoutPolicy,
     pub membership: ClusterMembership,
@@ -198,25 +489,6 @@ pub fn active_cluster_runtime() -> Result<Arc<ClusterRuntime>, AppError> {
 
 pub fn try_active_cluster_runtime() -> Option<Arc<ClusterRuntime>> {
     CLUSTER_RUNTIME.get().cloned()
-}
-
-fn parse_layout_mode(raw: Option<&str>) -> Result<ClusterLayoutMode, AppError> {
-    match raw.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
-        "auto" | "" => Ok(ClusterLayoutMode::Auto),
-        "fixed" => Ok(ClusterLayoutMode::Fixed),
-        other => Err(AppError::BadRequest(format!(
-            "cluster_layout_mode must be auto or fixed, got {other}"
-        ))),
-    }
-}
-
-fn parse_optional_usize(raw: Option<&str>, key: &str) -> Result<Option<usize>, AppError> {
-    match raw.map(str::trim) {
-        None | Some("") | Some("auto") => Ok(None),
-        Some(value) => value.parse::<usize>().map(Some).map_err(|_| {
-            AppError::BadRequest(format!("{key} must be a positive integer or empty"))
-        }),
-    }
 }
 
 fn parse_usize(raw: Option<&str>, key: &str, default_value: usize) -> Result<usize, AppError> {
@@ -250,15 +522,36 @@ fn resolve_membership_path(raw: &str, fs_storage_path: &str) -> PathBuf {
 
 fn local_membership(
     node_id: &str,
+    role: NodeRole,
     endpoint: &str,
     native_endpoint: &str,
-    storage_roots: &[String],
+    storage_roots: &[StorageRoot],
+    policy: ClusterPolicy,
 ) -> ClusterMembership {
+    let namespace_catalog = NamespaceCatalogLayout {
+        generation: 1,
+        replicas: if role == NodeRole::Namespace {
+            storage_roots
+                .first()
+                .map(|root| NamespaceCatalogReplica {
+                    node_id: node_id.to_string(),
+                    root_id: root.id.clone(),
+                })
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        },
+    };
     ClusterMembership {
+        format_version: N2_MEMBERSHIP_FORMAT_VERSION,
         cluster_id: "n2-local".to_string(),
         epoch: 1,
+        policy,
+        namespace_catalog,
         nodes: vec![ClusterNode {
             id: node_id.to_string(),
+            role,
             endpoint: endpoint.to_string(),
             native_endpoint: Some(native_endpoint.to_string()),
             state: Some(NodeState::Online),
@@ -275,9 +568,11 @@ fn local_membership(
 fn load_or_create_membership(
     path: &Path,
     node_id: &str,
+    role: NodeRole,
     endpoint: &str,
     native_endpoint: &str,
-    storage_roots: &[String],
+    storage_roots: &[StorageRoot],
+    policy: ClusterPolicy,
 ) -> Result<ClusterMembership, AppError> {
     if path.exists() {
         let bytes = fs::read(path)
@@ -288,17 +583,36 @@ fn load_or_create_membership(
                 path.display()
             ))
         })?;
+        membership.validate()?;
+        if membership.policy != policy {
+            return Err(AppError::Conflict(format!(
+                "local cluster policy {:?} does not match membership policy {:?}",
+                policy, membership.policy
+            )));
+        }
         let now = Utc::now().timestamp();
         if let Some(local) = membership.nodes.iter_mut().find(|node| node.id == node_id) {
+            if local.role != role {
+                return Err(AppError::Conflict(format!(
+                    "node '{}' is recorded as role {}, not {}",
+                    node_id, local.role, role
+                )));
+            }
+            if local.storage_roots != storage_roots {
+                return Err(AppError::Conflict(format!(
+                    "configured roots for node '{}' do not match membership",
+                    node_id
+                )));
+            }
             local.endpoint = endpoint.to_string();
             local.native_endpoint = Some(native_endpoint.to_string());
-            local.storage_roots = storage_roots.to_vec();
             local.state.get_or_insert(NodeState::Online);
             local.last_seen_unix = Some(now);
         } else {
             let joined_epoch = membership.epoch.saturating_add(1);
             membership.nodes.push(ClusterNode {
                 id: node_id.to_string(),
+                role,
                 endpoint: endpoint.to_string(),
                 native_endpoint: Some(native_endpoint.to_string()),
                 state: Some(NodeState::Online),
@@ -311,11 +625,19 @@ fn load_or_create_membership(
             });
             membership.epoch = joined_epoch;
         }
+        membership.validate()?;
         write_membership(path, &membership)?;
         return Ok(membership);
     }
 
-    let membership = local_membership(node_id, endpoint, native_endpoint, storage_roots);
+    let membership = local_membership(
+        node_id,
+        role,
+        endpoint,
+        native_endpoint,
+        storage_roots,
+        policy,
+    );
     write_membership(path, &membership)?;
     Ok(membership)
 }
@@ -338,7 +660,7 @@ fn write_membership(path: &Path, membership: &ClusterMembership) -> Result<(), A
 pub fn init_cluster_runtime(
     config: &Ini,
     fs_storage_path: &str,
-    local_storage_roots: &[String],
+    local_storage_roots: &[StorageRoot],
     https_endpoint: &str,
     native_endpoint: &str,
 ) -> Result<Arc<ClusterRuntime>, AppError> {
@@ -349,6 +671,11 @@ pub fn init_cluster_runtime(
         .filter(|value| !value.is_empty())
         .unwrap_or("node-1")
         .to_string();
+    let local_role = NodeRole::parse(
+        section
+            .and_then(|s| s.get("node_role"))
+            .unwrap_or("namespace"),
+    )?;
     let node_endpoint = section
         .and_then(|s| s.get("node_endpoint"))
         .map(str::trim)
@@ -365,32 +692,31 @@ pub fn init_cluster_runtime(
         .filter(|value| !value.is_empty())
         .unwrap_or("n2_membership.json");
     let membership_path = resolve_membership_path(membership_file, fs_storage_path);
-    let layout_policy = ClusterLayoutPolicy {
-        mode: parse_layout_mode(section.and_then(|s| s.get("cluster_layout_mode")))?,
-        fixed_data_shards: parse_optional_usize(
-            section.and_then(|s| s.get("fixed_data_shards")),
-            "fixed_data_shards",
+    let policy = ClusterPolicy {
+        namespace_redundancy: parse_usize(
+            section.and_then(|s| s.get("namespace_redundancy")),
+            "namespace_redundancy",
+            2,
         )?,
-        fixed_parity_shards: parse_optional_usize(
-            section.and_then(|s| s.get("fixed_parity_shards")),
-            "fixed_parity_shards",
+        object_data_shards: parse_usize(
+            section.and_then(|s| s.get("object_data_shards")),
+            "object_data_shards",
+            1,
         )?,
-        auto_max_data_shards: parse_usize(
-            section.and_then(|s| s.get("auto_max_data_shards")),
-            "auto_max_data_shards",
-            DEFAULT_AUTO_MAX_DATA_SHARDS,
-        )?,
-        auto_max_parity_shards: parse_usize(
-            section.and_then(|s| s.get("auto_max_parity_shards")),
-            "auto_max_parity_shards",
-            DEFAULT_AUTO_MAX_PARITY_SHARDS,
+        object_parity_shards: parse_usize(
+            section.and_then(|s| s.get("object_parity_shards")),
+            "object_parity_shards",
+            1,
         )?,
     };
-    if layout_policy.auto_max_data_shards == 0 {
-        return Err(AppError::BadRequest(
-            "auto_max_data_shards must be greater than zero".into(),
-        ));
-    }
+    policy.validate()?;
+    let layout_policy = ClusterLayoutPolicy {
+        mode: ClusterLayoutMode::Fixed,
+        fixed_data_shards: Some(policy.object_data_shards),
+        fixed_parity_shards: Some(policy.object_parity_shards),
+        auto_max_data_shards: DEFAULT_AUTO_MAX_DATA_SHARDS,
+        auto_max_parity_shards: DEFAULT_AUTO_MAX_PARITY_SHARDS,
+    };
     if parse_bool(section.and_then(|s| s.get("auto_rebalance")), false) {
         return Err(AppError::BadRequest(
             "auto_rebalance=true is not supported: N2 preserves recorded object layouts and only redistributes through an explicit operator request"
@@ -401,13 +727,18 @@ pub fn init_cluster_runtime(
     let membership = load_or_create_membership(
         &membership_path,
         &node_id,
+        local_role,
         node_endpoint,
         native_endpoint,
         local_storage_roots,
+        policy,
     )?;
+    membership.validate_minimum_topology()?;
 
     let runtime = Arc::new(ClusterRuntime {
         local_node_id: node_id,
+        local_role,
+        local_storage_roots: local_storage_roots.to_vec(),
         membership_path,
         layout_policy,
         membership,
@@ -435,9 +766,18 @@ mod tests {
         let membership = load_or_create_membership(
             &path,
             "node-a",
+            NodeRole::Namespace,
             "https://127.0.0.1:51001",
             "n2://127.0.0.1:51002",
-            &[root.join("storage").display().to_string()],
+            &[StorageRoot {
+                id: "root-a".into(),
+                path: root.join("storage").display().to_string(),
+            }],
+            ClusterPolicy {
+                namespace_redundancy: 2,
+                object_data_shards: 1,
+                object_parity_shards: 1,
+            },
         )
         .expect("membership");
         assert_eq!(membership.nodes.len(), 1);

@@ -1,10 +1,7 @@
-use crate::distribution::dentry_group::{
-    configured_namespace_replicas, guaranteed_reachable_voters, quorum_required,
-};
-use crate::distribution::layout::ClusterLayoutMode;
-use crate::distribution::layout::{resolve_configured_layout, resolve_write_layout};
+use crate::core::operation_gate::cluster_safety_read_only_state;
+use crate::distribution::layout::resolve_configured_layout;
 use crate::distribution::membership::{
-    ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
+    ClusterNode, ClusterRuntime, NodeRole, NodeState, live_active_write_nodes, live_readable_nodes,
 };
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
 use crate::enums::app_error_enum::AppError;
@@ -22,6 +19,7 @@ pub enum ClusterHealthState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterNodeHealth {
     pub node_id: String,
+    pub role: NodeRole,
     pub state: NodeState,
     pub accepts_writes: bool,
     pub readable: bool,
@@ -45,6 +43,7 @@ pub struct ClusterHealthSnapshot {
     pub namespace_quorum_required: usize,
     pub namespace_quorum_writable: bool,
     pub effective_client_writable: bool,
+    pub safety_read_only: bool,
     pub adaptive_layout: bool,
     pub manual_rebalance_available: bool,
     pub layout_drift_is_health_failure: bool,
@@ -68,55 +67,69 @@ pub fn cluster_health_snapshot_with_live_nodes(
     active: Vec<ClusterNode>,
     readable: Vec<ClusterNode>,
 ) -> Result<ClusterHealthSnapshot, AppError> {
-    let configured_active = runtime.membership.active_write_nodes();
-    let configured_layout =
-        resolve_configured_layout(configured_active.len(), &runtime.layout_policy)
-            .map_err(AppError::BadRequest)?;
-    let layout = resolve_write_layout(
-        active.len(),
-        configured_active.len(),
-        &runtime.layout_policy,
-    )
-    .map_err(AppError::BadRequest)?;
-    let data_plane_readable = readable.len() >= layout.data_shards;
-    let data_plane_writable = active.len() >= layout.total_shards()
-        && (configured_layout.parity_shards == 0 || layout.parity_shards > 0);
-    let namespace_voters = runtime
+    let configured_blob = runtime
         .membership
-        .nodes
-        .len()
-        .max(1)
-        .min(configured_namespace_replicas());
-    let namespace_quorum_required = quorum_required(namespace_voters);
-    let estimated_namespace_reachable_voters = guaranteed_reachable_voters(
-        runtime.membership.nodes.len(),
-        readable.len(),
-        namespace_voters,
-    );
+        .active_write_nodes_for_role(NodeRole::Blob);
+    let active_blob = active
+        .iter()
+        .filter(|node| node.role == NodeRole::Blob)
+        .cloned()
+        .collect::<Vec<_>>();
+    let readable_blob = readable
+        .iter()
+        .filter(|node| node.role == NodeRole::Blob)
+        .cloned()
+        .collect::<Vec<_>>();
+    let readable_namespace = readable
+        .iter()
+        .filter(|node| node.role == NodeRole::Namespace)
+        .count();
+    let configured_layout =
+        resolve_configured_layout(configured_blob.len(), &runtime.layout_policy)
+            .map_err(AppError::BadRequest)?;
+    let layout = configured_layout;
+    let data_plane_readable = readable_blob.len() >= layout.data_shards;
+    let data_plane_writable = active_blob.len() >= layout.total_shards();
+    let configured_namespace_nodes = runtime.membership.nodes_for_role(NodeRole::Namespace).len();
+    let namespace_voters = runtime.membership.policy.namespace_redundancy;
+    let namespace_quorum_required = (namespace_voters / 2).saturating_add(1);
+    let estimated_namespace_reachable_voters = readable_namespace.min(namespace_voters);
     let namespace_quorum_writable =
         estimated_namespace_reachable_voters >= namespace_quorum_required;
-    let effective_client_writable = data_plane_writable && namespace_quorum_writable;
-    let missing_writable = configured_active.len().saturating_sub(active.len());
+    let safety_state = cluster_safety_read_only_state();
+    let safety_read_only = safety_state.is_some();
+    let effective_client_writable =
+        data_plane_writable && namespace_quorum_writable && !safety_read_only;
+    let missing_blob_writable = configured_blob.len().saturating_sub(active_blob.len());
+    let missing_namespace_readable = configured_namespace_nodes.saturating_sub(readable_namespace);
     let live_node_ids = readable
         .iter()
         .map(|node| node.id.clone())
         .collect::<HashSet<_>>();
-    let state = if !data_plane_readable {
+    let state = if !data_plane_readable || safety_read_only {
         ClusterHealthState::Critical
     } else if !effective_client_writable {
         ClusterHealthState::Degraded
-    } else if missing_writable > 0 {
+    } else if missing_blob_writable > 0 || missing_namespace_readable > 0 {
         ClusterHealthState::Degraded
     } else if data_plane_readable {
         ClusterHealthState::Healthy
     } else {
         ClusterHealthState::Critical
     };
-    let rebalance = plan_rebalance(runtime)?;
+    let rebalance_recommendation = plan_rebalance(runtime)
+        .map(|plan| plan.recommendation)
+        .unwrap_or_else(|error| format!("rebalance unavailable while topology is unsafe: {error}"));
     let repair_status = repair_status();
     let rebalance_status = rebalance_status();
-    let mut notes = vec![rebalance.recommendation];
-    if missing_writable == 0 {
+    let mut notes = vec![rebalance_recommendation];
+    if let Some(safety) = safety_state {
+        notes.push(format!(
+            "cluster safety read-only incident {}: {} ({})",
+            safety.incident_id, safety.finding, safety.reason
+        ));
+    }
+    if missing_blob_writable == 0 {
         notes.push(
             "layout drift is not health failure: new objects use the current node layout; old objects stay readable until manual rebalance"
                 .to_string(),
@@ -144,20 +157,18 @@ pub fn cluster_health_snapshot_with_live_nodes(
                 .unwrap_or_default()
         ));
     }
-    if missing_writable > 0 {
+    if missing_blob_writable > 0 {
         if namespace_quorum_writable {
             notes.push(format!(
-                "{} configured writable node(s) are currently unreachable; namespace quorum remains writable and new objects use immutable {}+{} layouts instead of configured {}+{} layouts",
-                missing_writable,
-                layout.data_shards,
-                layout.parity_shards,
+                "{} configured blob node(s) are currently unreachable; namespace quorum remains writable but new object writes stop until the fixed {}+{} width is available",
+                missing_blob_writable,
                 configured_layout.data_shards,
                 configured_layout.parity_shards
             ));
         } else {
             notes.push(format!(
-                "{} configured writable node(s) are currently unreachable; object reads may still work, but namespace quorum is not writable so new client mutations are unavailable",
-                missing_writable
+                "{} configured blob node(s) are currently unreachable and namespace quorum is not writable; existing reconstructable objects may still be read",
+                missing_blob_writable
             ));
         }
     }
@@ -165,7 +176,7 @@ pub fn cluster_health_snapshot_with_live_nodes(
         notes.push(format!(
             "cluster cannot read the current live layout: requires {} readable node(s), has {}",
             layout.data_shards,
-            readable.len()
+            readable_blob.len()
         ));
     }
     if !namespace_quorum_writable {
@@ -195,9 +206,9 @@ pub fn cluster_health_snapshot_with_live_nodes(
         namespace_quorum_required,
         namespace_quorum_writable,
         effective_client_writable,
-        adaptive_layout: matches!(runtime.layout_policy.mode, ClusterLayoutMode::Auto)
-            || layout != configured_layout,
-        manual_rebalance_available: active.len() > 1,
+        safety_read_only,
+        adaptive_layout: false,
+        manual_rebalance_available: active_blob.len() >= layout.total_shards(),
         layout_drift_is_health_failure: false,
         automatic_rebalance: runtime.auto_rebalance,
         repair_running: repair_status.running,
@@ -218,6 +229,7 @@ pub fn cluster_health_snapshot_with_live_nodes(
                 };
                 ClusterNodeHealth {
                     node_id: node.id.clone(),
+                    role: node.role,
                     accepts_writes: state.accepts_new_writes() && effective_client_writable,
                     readable: state.is_readable(),
                     state,
@@ -234,31 +246,16 @@ pub fn cluster_health_snapshot_with_live_nodes(
 mod tests {
     use super::*;
     use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
-    use crate::distribution::membership::{ClusterMembership, ClusterNode};
+    use crate::distribution::membership::{
+        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION,
+        NamespaceCatalogLayout, NamespaceCatalogReplica, NodeRole,
+    };
     use std::path::PathBuf;
 
-    fn runtime(nodes: Vec<ClusterNode>) -> ClusterRuntime {
-        ClusterRuntime {
-            local_node_id: "a".into(),
-            membership_path: PathBuf::from("membership.json"),
-            layout_policy: ClusterLayoutPolicy {
-                mode: ClusterLayoutMode::Auto,
-                fixed_data_shards: None,
-                fixed_parity_shards: None,
-                ..ClusterLayoutPolicy::default()
-            },
-            membership: ClusterMembership {
-                cluster_id: "test".into(),
-                epoch: 3,
-                nodes,
-            },
-            auto_rebalance: false,
-        }
-    }
-
-    fn node(id: &str, state: NodeState) -> ClusterNode {
+    fn node(id: &str, role: NodeRole, state: NodeState) -> ClusterNode {
         ClusterNode {
             id: id.into(),
+            role,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(state),
@@ -271,11 +268,56 @@ mod tests {
         }
     }
 
+    fn runtime(blob_nodes: Vec<ClusterNode>) -> ClusterRuntime {
+        let mut nodes = vec![
+            node("ns-a", NodeRole::Namespace, NodeState::Online),
+            node("ns-b", NodeRole::Namespace, NodeState::Online),
+        ];
+        nodes.extend(blob_nodes);
+        ClusterRuntime {
+            local_node_id: "blob-a".into(),
+            local_role: NodeRole::Blob,
+            local_storage_roots: vec![],
+            membership_path: PathBuf::from("membership.json"),
+            layout_policy: ClusterLayoutPolicy {
+                mode: ClusterLayoutMode::Fixed,
+                fixed_data_shards: Some(1),
+                fixed_parity_shards: Some(1),
+                ..ClusterLayoutPolicy::default()
+            },
+            membership: ClusterMembership {
+                format_version: N2_MEMBERSHIP_FORMAT_VERSION,
+                cluster_id: "test".into(),
+                epoch: 3,
+                policy: ClusterPolicy {
+                    namespace_redundancy: 2,
+                    object_data_shards: 1,
+                    object_parity_shards: 1,
+                },
+                namespace_catalog: NamespaceCatalogLayout {
+                    generation: 3,
+                    replicas: vec![
+                        NamespaceCatalogReplica {
+                            node_id: "ns-a".into(),
+                            root_id: "root-ns-a".into(),
+                        },
+                        NamespaceCatalogReplica {
+                            node_id: "ns-b".into(),
+                            root_id: "root-ns-b".into(),
+                        },
+                    ],
+                },
+                nodes,
+            },
+            auto_rebalance: false,
+        }
+    }
+
     #[test]
     fn health_reflects_writable_layout_capacity() {
         let runtime = runtime(vec![
-            node("a", NodeState::Online),
-            node("b", NodeState::Online),
+            node("blob-a", NodeRole::Blob, NodeState::Online),
+            node("blob-b", NodeRole::Blob, NodeState::Online),
         ]);
         let snap = cluster_health_snapshot_with_live_nodes(
             &runtime,
@@ -286,7 +328,7 @@ mod tests {
         assert_eq!(snap.state, ClusterHealthState::Healthy);
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
-        assert!(snap.adaptive_layout);
+        assert!(!snap.adaptive_layout);
         assert!(snap.manual_rebalance_available);
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
@@ -298,7 +340,7 @@ mod tests {
         assert!(!snap.layout_drift_is_health_failure);
         assert_eq!(
             snap.nodes[0].native_endpoint.as_deref(),
-            Some("n2://a:50002")
+            Some("n2://ns-a:50002")
         );
         assert!(!snap.repair_running);
         assert!(!snap.rebalance_running);
@@ -307,31 +349,28 @@ mod tests {
     #[test]
     fn health_marks_unreachable_configured_node_as_degraded() {
         let runtime = runtime(vec![
-            node("a", NodeState::Online),
-            node("b", NodeState::Online),
-            node("c", NodeState::Online),
+            node("blob-a", NodeRole::Blob, NodeState::Online),
+            node("blob-b", NodeRole::Blob, NodeState::Online),
+            node("blob-c", NodeRole::Blob, NodeState::Online),
         ]);
-        let live = vec![
-            runtime.membership.nodes[0].clone(),
-            runtime.membership.nodes[1].clone(),
-        ];
+        let live = runtime.membership.nodes[..4].to_vec();
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
         assert_eq!(snap.state, ClusterHealthState::Degraded);
-        assert_eq!(snap.active_write_nodes, 2);
+        assert_eq!(snap.active_write_nodes, 4);
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_writable);
         assert!(snap.namespace_quorum_writable);
         assert!(snap.effective_client_writable);
-        assert_eq!(snap.nodes[2].state, NodeState::Offline);
+        assert_eq!(snap.nodes[4].state, NodeState::Offline);
     }
 
     #[test]
-    fn fixed_two_plus_one_reports_redundant_one_plus_one_write_layout() {
+    fn fixed_two_plus_one_stops_writes_instead_of_shrinking_layout() {
         let mut runtime = runtime(vec![
-            node("a", NodeState::Online),
-            node("b", NodeState::Online),
-            node("c", NodeState::Online),
+            node("blob-a", NodeRole::Blob, NodeState::Online),
+            node("blob-b", NodeRole::Blob, NodeState::Online),
+            node("blob-c", NodeRole::Blob, NodeState::Online),
         ]);
         runtime.layout_policy = ClusterLayoutPolicy {
             mode: ClusterLayoutMode::Fixed,
@@ -339,27 +378,28 @@ mod tests {
             fixed_parity_shards: Some(1),
             ..ClusterLayoutPolicy::default()
         };
-        let live = runtime.membership.nodes[..2].to_vec();
+        runtime.membership.policy.object_data_shards = 2;
+        let live = runtime.membership.nodes[..4].to_vec();
 
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
 
         assert_eq!(snap.state, ClusterHealthState::Degraded);
-        assert_eq!(snap.data_shards, 1);
+        assert_eq!(snap.data_shards, 2);
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_readable);
-        assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_writable);
         assert!(snap.namespace_quorum_writable);
-        assert!(snap.effective_client_writable);
-        assert!(snap.adaptive_layout);
+        assert!(!snap.effective_client_writable);
+        assert!(!snap.adaptive_layout);
     }
 
     #[test]
-    fn fixed_layout_accepts_an_explicitly_contracted_membership() {
+    fn wider_fixed_layout_is_healthy_only_at_full_width() {
         let mut runtime = runtime(vec![
-            node("a", NodeState::Offline),
-            node("b", NodeState::Online),
-            node("c", NodeState::Online),
-            node("d", NodeState::Online),
+            node("blob-a", NodeRole::Blob, NodeState::Online),
+            node("blob-b", NodeRole::Blob, NodeState::Online),
+            node("blob-c", NodeRole::Blob, NodeState::Online),
+            node("blob-d", NodeRole::Blob, NodeState::Online),
         ]);
         runtime.layout_policy = ClusterLayoutPolicy {
             mode: ClusterLayoutMode::Fixed,
@@ -367,29 +407,35 @@ mod tests {
             fixed_parity_shards: Some(1),
             ..ClusterLayoutPolicy::default()
         };
+        runtime.membership.policy.object_data_shards = 3;
         let live = runtime.membership.active_write_nodes();
 
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
 
-        assert_eq!(snap.data_shards, 2);
+        assert_eq!(snap.data_shards, 3);
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
         assert!(snap.effective_client_writable);
-        assert!(snap.adaptive_layout);
+        assert!(!snap.adaptive_layout);
     }
 
     #[test]
     fn health_reports_namespace_quorum_blocking_writes() {
         let runtime = runtime(vec![
-            node("a", NodeState::Online),
-            node("b", NodeState::Online),
+            node("blob-a", NodeRole::Blob, NodeState::Online),
+            node("blob-b", NodeRole::Blob, NodeState::Online),
         ]);
-        let live = vec![runtime.membership.nodes[0].clone()];
-        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
+        let active = runtime.membership.active_write_nodes();
+        let readable = vec![
+            runtime.membership.nodes[0].clone(),
+            runtime.membership.nodes[2].clone(),
+            runtime.membership.nodes[3].clone(),
+        ];
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, active, readable).unwrap();
         assert_eq!(snap.state, ClusterHealthState::Degraded);
         assert!(snap.data_plane_readable);
-        assert!(!snap.data_plane_writable);
+        assert!(snap.data_plane_writable);
         assert!(!snap.namespace_quorum_writable);
         assert!(!snap.effective_client_writable);
         assert!(snap.nodes.iter().all(|node| !node.accepts_writes));

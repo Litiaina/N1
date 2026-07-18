@@ -1,12 +1,16 @@
 pub mod auto_healing;
 pub mod download;
+pub mod healing_report;
 pub mod health;
+pub mod inode;
 pub mod layout;
 pub mod lifecycle;
 pub mod maintenance;
 pub mod membership;
 pub mod monitor;
 pub mod namespace;
+pub mod namespace_healing;
+pub mod object_healing;
 pub mod peer;
 pub mod placement;
 pub mod rebalance;
@@ -20,10 +24,8 @@ pub use layout::{
     resolve_configured_layout, resolve_layout, resolve_write_layout,
 };
 pub use membership::{
-    ClusterMembership, ClusterNode, ClusterRuntime, NodeState, active_cluster_runtime,
+    ClusterMembership, ClusterNode, ClusterPolicy, ClusterRuntime, NamespaceCatalogLayout,
+    NamespaceCatalogReplica, NodeRole, NodeState, StorageRoot, active_cluster_runtime,
     init_cluster_runtime,
 };
-pub mod dentry_group;
-pub mod dentry_quorum;
 pub mod dentry_service;
-pub mod dentry_transaction;

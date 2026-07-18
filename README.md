@@ -19,17 +19,17 @@ namespace, and maintenance operations on any healthy node, places immutable
 object shards across the cluster, and keeps namespace mutation as the
 coordination boundary.
 
-N2 `1.0.0` locked the architecture as a high-performance object storage engine
-with first-class filesystem-like namespace semantics. N2 `1.1.0` keeps that
-disk and namespace design and adds the shared NOA v1 public contract plus
-autonomous, distributed recorded-layout healing. Blob shards and `.ncdx`
-object metadata remain immutable. Directory names, paths, rename, move, trash,
-and recover remain native partitioned namespace quorum operations.
+N2 `2.0.0` is the clean redesign boundary for independently expandable
+namespace and blob planes. Blob shards and `.ncdx` object metadata remain
+immutable object-level erasure sets. Directory names, paths, rename, move,
+trash, and recover use stable directory inodes with exact replica layouts and
+quorum-certified generations. Earlier development disk layouts are not opened
+by this engine.
 
 N2 deliberately keeps POSIX-style namespace operations fast without becoming a
-filesystem. Directory listing, rename, move, trash, and recover operate on a
-small partitioned namespace quorum of logical pointers, while object bytes and
-`.ncdx` records remain immutable in the distributed blob plane. This avoids a
+filesystem. Directory listing, rename, move, trash, and recover operate on the
+small recorded replica groups of directly affected inodes, while object bytes
+and `.ncdx` records remain immutable in the distributed blob plane. This avoids a
 common object-storage weakness where path-oriented workflows degrade into
 large metadata scans or payload rewrites.
 
@@ -86,16 +86,17 @@ The result is simple operational behavior:
 - distributed maintenance assigns fragments across reachable nodes for
   fragment-level GC, repair, and targeted rebalance.
 - autonomous healing selects a bounded HA coordinator pool, obtains a
-  quorum-held lease per stable fragment, resumes scans after restart, and
-  repairs only the immutable layout recorded by each object.
+  quorum-held lease per stable fragment, resumes bounded object scans after
+  restart, and repairs only exact recorded inode and object layouts. Very large
+  namespace-walk continuation remains a documented 2.0 release gate.
 - redistribution remains explicit; adding a node never degrades or rewrites a
   healthy older-layout object.
 
-N2 uses unified storage devices. Every configured `storage_disks` path can hold
-immutable object shards, immutable `.ncdx` records, and assigned namespace
-virtual partitions. `fs_storage_path` is process-local control state for
-membership, upload coordination, and maintenance jobs; it is not namespace
-truth and not an index tier.
+N2 2.0 assigns every node one explicit role. Namespace-node storage roots hold
+replicated inode and fragment-catalog state. Blob-node storage roots hold
+immutable shards, parity, and `.ncdx` records. `runtime_path` remains
+process-local control state for membership, upload coordination, and
+maintenance jobs; it is not namespace or object truth.
 
 ## Coordination Model
 
@@ -193,16 +194,18 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/control
+storage_roots=ns-a-root=/mnt/n2/storage
+runtime_path=/mnt/n2/control
 
 [cluster_config]
-node_id=node-a
+node_id=ns-a
+node_role=namespace
 node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
-cluster_layout_mode=auto
-auto_max_data_shards=8
+namespace_redundancy=2
+object_data_shards=1
+object_parity_shards=1
 auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
@@ -365,22 +368,18 @@ Evidence is stored outside the repository under
 
 ## Operational Boundaries
 
-- N2 `1.0.0` means the product shape and architecture are finalized enough for
-  the 1.0 line.
-- N2 `1.1.0` keeps that architecture and adds NOA v1 plus distributed,
-  restart-proof recorded-layout healing.
-- It is not an LTS statement yet.
-- Long soak, independent-host N2 1.1.0 failure testing, clusters larger than
-  four nodes, and wider UI viewport proof remain release-validation work.
-- Earlier development layouts are intentionally rejected rather than migrated;
-  the 1.0 line uses the documented unified-device namespace/object layout.
-- A three-node cluster is the production minimum for namespace write
-  availability. Two-node deployments are development or constrained-lab
-  deployments because a 2-of-2 namespace cannot keep accepting writes after one
-  node loss.
-- A four-node 3+1 object layout tolerates one node loss. Testing two-node-loss
-  object reads on four nodes requires a 2+2 layout, and two-node-loss namespace
-  writes require voter migration/reassignment.
+- N2 `2.0.0` is in development and is not yet an LTS or general
+  production-readiness statement.
+- The absolute minimum is two namespace nodes plus two blob nodes. A 2-of-2
+  namespace is deliberately strict: one lost replica makes affected writes
+  read-only until safe repair or replacement.
+- Namespace redundancy and object EC width are independent. Wider namespace
+  redundancy may preserve writes through a majority; object durability follows
+  each object's recorded `k + m` layout.
+- Adding a node or disk does not remap existing inode or object layouts and does
+  not trigger redistribution.
+- Earlier development layouts are intentionally rejected rather than migrated.
+- Remaining release gates are listed in `N2_2_0_VERIFICATION.md`.
 - N2 exposes capacity monitoring and full-disk admission only. Per-user or
   per-fragment business limits belong outside N2.
 - S3 compatibility is not part of the N2 core. If needed, it should live as an

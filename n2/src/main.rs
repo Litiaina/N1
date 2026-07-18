@@ -12,12 +12,14 @@ use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
+use crate::core::root_identity::initialize_local_root_identities;
 use crate::core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::distribution::init_cluster_runtime;
+use crate::distribution::membership::parse_storage_roots;
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
@@ -543,10 +545,10 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     let disk_section = config.section(Some("disk_config"));
     let fs_storage_path = PathBuf::from(
         disk_section
-            .and_then(|s| s.get("fs_storage_path"))
-            .unwrap_or("fs-storage-path"),
+            .and_then(|s| s.get("runtime_path"))
+            .unwrap_or("n2-runtime"),
     );
-    ensure_existing_writable_dir(&fs_storage_path, "N2 fs_storage_path")?;
+    ensure_existing_writable_dir(&fs_storage_path, "N2 runtime_path")?;
 
     let refresh_store_root = std::env::var("N2_REFRESH_STORE_ROOT")
         .map(PathBuf::from)
@@ -560,15 +562,12 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     })?;
     probe_directory_writable(&refresh_store_root, "N2 refresh session store")?;
 
-    let storage_disks = disk_section
-        .and_then(|s| s.get("storage_disks"))
-        .ok_or_else(|| "Missing storage_disks in [disk_config]".to_string())?;
-    for root in storage_disks
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        ensure_existing_writable_dir(Path::new(root), "N2 storage_disks entry")?;
+    let storage_roots = disk_section
+        .and_then(|s| s.get("storage_roots"))
+        .ok_or_else(|| "Missing storage_roots in [disk_config]".to_string())?;
+    let storage_roots = parse_storage_roots(storage_roots).map_err(|error| error.to_string())?;
+    for root in storage_roots {
+        ensure_existing_writable_dir(Path::new(&root.path), "N2 storage_roots entry")?;
     }
 
     Ok(())
@@ -687,24 +686,26 @@ pub async fn run_server() {
     let disk_section = config.section(Some("disk_config"));
 
     let fs_storage_path = disk_section
-        .and_then(|s| s.get("fs_storage_path"))
-        .unwrap_or("fs-storage-path");
+        .and_then(|s| s.get("runtime_path"))
+        .unwrap_or("n2-runtime");
 
     FS_STORAGE_ROOT
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let storage_disks = disk_section
-        .and_then(|s| s.get("storage_disks"))
-        .expect("Missing storage_disks in [disk_config]");
+    let startup_safety_state = crate::core::operation_gate::load_safety_read_only_marker()
+        .unwrap_or_else(|error| panic!("N2 could not load its safety read-only marker: {error}"));
 
-    let storage_disks: Vec<String> = storage_disks
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let storage_disks = normalize_fs_backed_disk_paths("storage_disks", storage_disks);
+    let storage_roots = disk_section
+        .and_then(|s| s.get("storage_roots"))
+        .expect("Missing storage_roots in [disk_config]");
+    let storage_roots = parse_storage_roots(storage_roots)
+        .unwrap_or_else(|err| panic!("Invalid storage_roots: {err}"));
+    let storage_disks = storage_roots
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+    let storage_disks = normalize_fs_backed_disk_paths("storage_roots", storage_disks);
     let storage_disk_count = storage_disks.len();
     let storage_device_count = detect_unique_storage_devices(&storage_disks);
     let effective_blob_disks_for_auto = storage_device_count.min(storage_disk_count).max(1);
@@ -729,16 +730,48 @@ pub async fn run_server() {
     let cluster_runtime = init_cluster_runtime(
         &config,
         fs_storage_path,
-        STORAGE_DISKS.get().expect("storage devices initialized"),
+        &storage_roots,
         &https_endpoint,
         &native_endpoint,
     )
     .unwrap_or_else(|err| panic!("N2 cluster runtime initialization failed: {}", err));
+    initialize_local_root_identities(&cluster_runtime)
+        .unwrap_or_else(|err| panic!("N2 root identity initialization failed: {err}"));
+    if let Some(state) = startup_safety_state {
+        if state.cluster_id != cluster_runtime.membership.cluster_id
+            || state.membership_epoch > cluster_runtime.membership.epoch
+        {
+            panic!(
+                "N2 safety read-only marker belongs to cluster '{}' epoch {}, but configuration is cluster '{}' epoch {}",
+                state.cluster_id,
+                state.membership_epoch,
+                cluster_runtime.membership.cluster_id,
+                cluster_runtime.membership.epoch
+            );
+        }
+        tracing::error!(
+            incident_id = %state.incident_id,
+            finding = %state.finding,
+            reason = %state.reason,
+            "N2 started in durable cluster safety read-only mode"
+        );
+    }
     tracing::info!(
-        "Cluster runtime: local_node={} membership_epoch={} nodes={} membership_file={} auto_rebalance={}",
+        "Cluster runtime: local_node={} role={} membership_epoch={} namespace_nodes={} blob_nodes={} namespace_redundancy={} object_ec={}+{} membership_file={} auto_rebalance={}",
         cluster_runtime.local_node_id,
+        cluster_runtime.local_role,
         cluster_runtime.membership.epoch,
-        cluster_runtime.membership.nodes.len(),
+        cluster_runtime
+            .membership
+            .nodes_for_role(crate::distribution::membership::NodeRole::Namespace)
+            .len(),
+        cluster_runtime
+            .membership
+            .nodes_for_role(crate::distribution::membership::NodeRole::Blob)
+            .len(),
+        cluster_runtime.membership.policy.namespace_redundancy,
+        cluster_runtime.membership.policy.object_data_shards,
+        cluster_runtime.membership.policy.object_parity_shards,
         cluster_runtime.membership_path.display(),
         cluster_runtime.auto_rebalance
     );

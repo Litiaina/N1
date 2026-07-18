@@ -1,5 +1,10 @@
 # N2 Installation
 
+> N2 2.0 is still in development. The role-separated membership example in
+> `DOCUMENTATION.md` and the release gates in `N2_2_0_VERIFICATION.md` are the
+> current 2.0 authority. Do not treat the legacy deployment walkthrough below
+> as a production-release instruction until Phase 8 is completed.
+
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
@@ -41,27 +46,29 @@ Recommended production paths:
 /var/lib/litiaina/n2-gateway/certificates/
 ```
 
-Use real mounted storage paths. N2 1.0.0 uses unified storage devices:
+Use real mounted storage paths. N2 2.0 assigns each node a namespace or blob
+role, and every configured root on that node belongs to that plane:
 
 ```text
-/mnt/hdd0/n2-storage
-/mnt/hdd1/n2-storage
-/mnt/nvme/n2-control
+namespace node: /mnt/namespace-ssd/n2-storage
+blob node:      /mnt/blob-hdd0/n2-storage, /mnt/blob-hdd1/n2-storage
+each node:      /mnt/nvme/n2-control
 ```
 
-Every configured storage device can hold immutable object data and assigned
-namespace partitions. N2 has no index-disk role and does not migrate earlier
-development layouts in place.
+Namespace-node roots hold inode replicas. Blob-node roots hold immutable object
+data and `.ncdx` records. One logical node cannot mix both roles. N2 does not
+migrate earlier development layouts in place.
 
-`fs_storage_path` holds process-local membership, upload coordination, and job
-state. Namespace truth lives under `.n2/namespace` on `storage_disks`.
+`runtime_path` holds process-local membership, upload coordination, and job
+state. Namespace truth lives only on namespace-node storage roots; object truth
+lives only on blob-node storage roots.
 
 ### Storage Configuration
 
 ```ini
 [disk_config]
-storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/control
+storage_roots=ROOT_ID=/mnt/n2/storage
+runtime_path=/mnt/n2/control
 ```
 
 ## Build
@@ -171,16 +178,18 @@ cert_path=/var/lib/litiaina/n2/certificates/cert.pem
 key_path=/var/lib/litiaina/n2/certificates/key.pem
 
 [disk_config]
-storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/control
+storage_roots=ROOT_ID=/mnt/n2/storage
+runtime_path=/mnt/n2/control
 
 [cluster_config]
 node_id=node-a
+node_role=namespace
 node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
-cluster_layout_mode=auto
-auto_max_data_shards=8
+namespace_redundancy=2
+object_data_shards=1
+object_parity_shards=1
 auto_max_parity_shards=3
 fixed_data_shards=
 fixed_parity_shards=
@@ -239,7 +248,8 @@ parity_shards=0
 stripe_block_size=4194304
 ```
 
-Create the same `n2_membership.json` on every node under `fs_storage_path`:
+Create the same format-v2 `n2_membership.json` on every node under
+`runtime_path`. Use the complete role-separated example in `DOCUMENTATION.md`:
 
 ```json
 {

@@ -1,9 +1,9 @@
 # Litiaina Node Object API (NOA)
 
 NOA is the versioned HTTPS and WebSocket contract shared by Litiaina object
-storage engines. N2 1.1.0 implements NOA v1 without changing N2's distributed
-namespace, immutable object format, object-level erasure sets, or peer
-protocol.
+storage engines. N2 2.0 implements NOA v1 over two independent storage planes:
+the replicated inode namespace pool and the immutable object-level EC blob
+pool. NOA meanings do not expose either engine's disk layout.
 
 ## Version Boundary
 
@@ -11,13 +11,13 @@ protocol.
 - API version: `v1`
 - HTTPS prefix: `/noa/v1`
 - Realtime endpoint: `/noa/v1/ws`
-- N2 implementation: `1.1.0`
+- N2 implementation: `2.0.0`
 
 The NOA version is independent of the N2 package and disk-format versions. An
 incompatible public API requires a new prefix such as `/noa/v2`; package
 updates can continue implementing NOA v1.
 
-N2 1.1.0 replaces the former public `/n2/...` HTTPS namespace. It does not
+N2 2.0 retains the NOA v1 public `/noa/v1/...` namespace. It does not
 retain aliases that would turn the retired routes into a second compatibility
 contract.
 
@@ -26,8 +26,8 @@ These N2 identities are intentionally unchanged:
 - `n2://` is the trusted N2-native operator and data protocol;
 - `/n2/peer/...` is authenticated node-to-node transport;
 - `/gateway/...` is N2 Gateway control state;
-- `.ncdx`, namespace voter records, EC placement, and disk paths are engine
-  internals rather than NOA resources.
+- `.ncdx`, inode generations and certificates, exact EC placement, and disk
+  paths are engine internals rather than NOA resources.
 
 ## Common NOA v1 Surface
 
@@ -109,9 +109,10 @@ POST /noa/v1/posix/trash
 POST /noa/v1/posix/recover
 ```
 
-N2 implements these operations through partitioned inode-like dentry voters.
-Folder rename and move mutate bounded namespace records and do not rewrite
-descendant objects.
+N2 implements these operations through stable directory inodes replicated on
+their recorded namespace-node/root layouts. Folder rename and move mutate only
+the directly affected inode groups; they do not rewrite descendants or blob
+records.
 
 ### Health And Maintenance
 

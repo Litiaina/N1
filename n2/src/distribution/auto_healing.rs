@@ -1,18 +1,18 @@
 use crate::core::disk_manager::FS_STORAGE_ROOT;
-use crate::core::repair_manager::RepairCheckMode;
-use crate::distribution::dentry_group::{
-    assignment_for_partition, assignment_nodes, quorum_required,
+use crate::core::operation_gate::{
+    SafetyReadOnlyState, apply_safety_read_only_state, cluster_safety_read_only_state,
+    is_cluster_safety_read_only,
 };
+use crate::core::repair_manager::RepairCheckMode;
+use crate::distribution::healing_report::{AutoHealingReport, write_local_report};
 use crate::distribution::maintenance::discover_local_fragments;
 use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, active_cluster_runtime, live_active_write_nodes,
 };
+use crate::distribution::namespace_healing::scan_and_repair_fragment_namespace;
+use crate::distribution::object_healing::scan_and_repair_fragment_objects;
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
-use crate::distribution::rebalance::{
-    ClusterRebalanceRequest, ClusterRewriteJobStatus, run_repair_fragment_once,
-};
 use crate::enums::app_error_enum::AppError;
-use crate::io_control::IoPriority;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -65,10 +65,15 @@ pub struct AutoHealingStatus {
     pub owned_fragments: usize,
     pub leased_fragments: usize,
     pub scanned_objects: u64,
+    pub scanned_inodes: u64,
+    pub repaired_inodes: u64,
     pub repaired_objects: u64,
     pub repaired_shards: u64,
     pub unrecoverable_objects: u64,
     pub failed_objects: u64,
+    pub headless_objects: u64,
+    pub reports_written: u64,
+    pub safety_read_only: bool,
     pub started_at_unix: Option<i64>,
     pub finished_at_unix: Option<i64>,
     pub last_error: Option<String>,
@@ -99,6 +104,30 @@ pub struct PeerHealingLeaseResponse {
     expires_at_unix: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerSafetyReadOnlyRequest {
+    pub state: SafetyReadOnlyState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerSafetyReadOnlyResponse {
+    pub node_id: String,
+    pub applied: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FragmentHealingOutcome {
+    scanned_inodes: u64,
+    repaired_inodes: u64,
+    scanned_objects: u64,
+    repaired_objects: u64,
+    repaired_shards: u64,
+    unrecoverable_objects: u64,
+    failed_objects: u64,
+    headless_objects: u64,
+    reports_written: u64,
+}
+
 static STATUS: LazyLock<Arc<RwLock<AutoHealingStatus>>> =
     LazyLock::new(|| Arc::new(RwLock::new(AutoHealingStatus::default())));
 static PROGRESS: LazyLock<Mutex<Option<HealingProgressStore>>> = LazyLock::new(|| Mutex::new(None));
@@ -123,9 +152,33 @@ fn hash(parts: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 fn healing_partition(fragment: &str) -> u64 {
     let digest = hash(&[b"n2-auto-healing-lease-v1", fragment.as_bytes()]);
     u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
+}
+
+fn namespace_lease_voters(runtime: &ClusterRuntime) -> Result<Vec<ClusterNode>, AppError> {
+    runtime
+        .membership
+        .namespace_catalog
+        .replicas
+        .iter()
+        .map(|replica| {
+            runtime
+                .membership
+                .nodes
+                .iter()
+                .find(|node| node.id == replica.node_id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::Conflict(format!(
+                        "namespace catalog lease voter '{}' is absent from membership",
+                        replica.node_id
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn score(domain: &[u8], runtime: &ClusterRuntime, subject: &str, node: &ClusterNode) -> [u8; 32] {
@@ -248,18 +301,18 @@ async fn progress_snapshot() -> Result<HealingProgressStore, AppError> {
 async fn update_progress(
     fragment: &str,
     cycle: u64,
-    result: &ClusterRewriteJobStatus,
+    continuation_token: Option<String>,
 ) -> Result<(), AppError> {
     let mut guard = PROGRESS.lock().await;
     load_progress_locked(&mut guard).await?;
     let progress = guard.as_mut().expect("progress loaded");
     progress.cycle = progress.cycle.max(cycle);
     let fragment_progress = progress.fragments.entry(fragment.to_string()).or_default();
-    fragment_progress.continuation_token = result.continuation_token.clone();
-    if result.continuation_token.is_none() {
+    fragment_progress.continuation_token = continuation_token.clone();
+    if continuation_token.is_none() {
         fragment_progress.completed_cycles = fragment_progress.completed_cycles.saturating_add(1);
     }
-    fragment_progress.last_finished_at_unix = result.finished_at_unix;
+    fragment_progress.last_finished_at_unix = Some(Utc::now().timestamp());
     atomic_write_json(&progress_path()?, progress).await
 }
 
@@ -294,11 +347,12 @@ async fn claim_local_lease(
             request.owner_node_id
         )));
     }
-    let assignment = assignment_for_partition(&runtime, healing_partition(&request.fragment))?;
-    if !assignment
-        .voter_node_ids
+    if !runtime
+        .membership
+        .namespace_catalog
+        .replicas
         .iter()
-        .any(|node_id| node_id == &runtime.local_node_id)
+        .any(|replica| replica.node_id == runtime.local_node_id)
     {
         return Err(AppError::Forbidden(
             "this node is not a voter for the fragment healing lease".into(),
@@ -383,9 +437,8 @@ async fn acquire_fragment_lease(
     lease_seconds: u64,
     live_node_ids: &[String],
 ) -> Result<bool, AppError> {
-    let assignment = assignment_for_partition(&runtime, healing_partition(fragment))?;
-    let voters = assignment_nodes(&runtime, &assignment)?;
-    let required = quorum_required(voters.len());
+    let voters = namespace_lease_voters(&runtime)?;
+    let required = (voters.len() / 2).saturating_add(1);
     let mut sorted_live = live_node_ids.to_vec();
     sorted_live.sort();
     let live_view = sorted_live.join(",");
@@ -426,15 +479,133 @@ async fn acquire_fragment_lease(
     Ok(granted >= required)
 }
 
+async fn apply_remote_safety_state(
+    node: ClusterNode,
+    state: SafetyReadOnlyState,
+) -> Result<PeerSafetyReadOnlyResponse, AppError> {
+    let client = peer_http_client()?;
+    let mut request = client
+        .post(format!(
+            "{}/n2/peer/healing/read-only",
+            node.endpoint.trim_end_matches('/')
+        ))
+        .json(&PeerSafetyReadOnlyRequest { state });
+    if let Some(secret) = cluster_secret() {
+        request = request.header("x-n2-cluster-secret", secret);
+    }
+    let response = timeout(HEALING_LEASE_TIMEOUT, request.send())
+        .await
+        .map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "safety read-only propagation to '{}' timed out",
+                node.id
+            ))
+        })?
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!(
+                "safety read-only propagation to '{}': {error}",
+                node.id
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "safety read-only propagation to '{}' returned {}",
+            node.id,
+            response.status()
+        )));
+    }
+    response.json().await.map_err(|error| {
+        AppError::InternalServerError(format!(
+            "decode safety read-only response from '{}': {error}",
+            node.id
+        ))
+    })
+}
+
+async fn propagate_safety_state(
+    runtime: Arc<ClusterRuntime>,
+    state: SafetyReadOnlyState,
+) -> Result<(), AppError> {
+    let local_id = runtime.local_node_id.clone();
+    let results =
+        futures_util::future::join_all(runtime.membership.nodes.iter().cloned().map(|node| {
+            let state = state.clone();
+            let local_id = local_id.clone();
+            async move {
+                if node.id == local_id {
+                    apply_safety_read_only_state(state)
+                        .await
+                        .map(|_| PeerSafetyReadOnlyResponse {
+                            node_id: node.id,
+                            applied: true,
+                        })
+                } else {
+                    apply_remote_safety_state(node, state).await
+                }
+            }
+        }))
+        .await;
+    let catalog_nodes = runtime
+        .membership
+        .namespace_catalog
+        .replicas
+        .iter()
+        .map(|replica| replica.node_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let applied_catalog = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .filter(|response| response.applied && catalog_nodes.contains(response.node_id.as_str()))
+        .count();
+    let required = (catalog_nodes.len() / 2).saturating_add(1);
+    if applied_catalog < required {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster safety read-only reached {applied_catalog}/{required} required namespace catalog voters"
+        )));
+    }
+    Ok(())
+}
+
+async fn activate_cluster_safety_read_only(
+    runtime: Arc<ClusterRuntime>,
+    report: &AutoHealingReport,
+) -> Result<(), AppError> {
+    if let Some(existing) = cluster_safety_read_only_state() {
+        return propagate_safety_state(runtime, existing).await;
+    }
+    let state = SafetyReadOnlyState {
+        incident_id: report.report_id.clone(),
+        cluster_id: runtime.membership.cluster_id.clone(),
+        membership_epoch: runtime.membership.epoch,
+        detecting_node_id: runtime.local_node_id.clone(),
+        fragment_id: report.fragment_id.clone(),
+        finding: report.finding.clone(),
+        report_filename: report.filename(),
+        reason: report
+            .reason
+            .clone()
+            .unwrap_or_else(|| "auto-healing found an unrecoverable invariant".into()),
+        activated_at_unix_nanos: report.completed_at_unix_nanos,
+    };
+    propagate_safety_state(runtime, state).await
+}
+
 async fn heal_owned_fragment(
     runtime: Arc<ClusterRuntime>,
     fragment: String,
     cycle: u64,
     check_mode: RepairCheckMode,
     live_node_ids: Vec<String>,
-) -> Result<Option<ClusterRewriteJobStatus>, AppError> {
+) -> Result<Option<FragmentHealingOutcome>, AppError> {
     let cfg = &CONFIG.auto_healing;
-    if !acquire_fragment_lease(runtime, &fragment, cfg.lease_seconds, &live_node_ids).await? {
+    if !acquire_fragment_lease(
+        runtime.clone(),
+        &fragment,
+        cfg.lease_seconds,
+        &live_node_ids,
+    )
+    .await?
+    {
         return Ok(None);
     }
     let progress = progress_snapshot().await?;
@@ -442,31 +613,61 @@ async fn heal_owned_fragment(
         .fragments
         .get(&fragment)
         .and_then(|progress| progress.continuation_token.clone());
-    let request = ClusterRebalanceRequest {
-        fragment: fragment.clone(),
-        prefix: None,
-        limit: Some(cfg.max_objects_per_fragment_cycle as usize),
-        dry_run: false,
-        mismatched_only: false,
-        max_duration_seconds: Some(cfg.max_duration_seconds),
-        max_objects: Some(cfg.max_objects_per_fragment_cycle),
-        max_bytes: None,
-        max_directories: None,
-        continuation_token,
-        priority: Some(IoPriority::Low),
-    };
-    let result = timeout(
-        Duration::from_secs(cfg.max_duration_seconds.saturating_add(5)),
-        run_repair_fragment_once(request, check_mode),
+    let scan_id = format!("{}-{}", cycle, ulid::Ulid::new());
+    let namespace = scan_and_repair_fragment_namespace(runtime.clone(), &fragment, &scan_id).await;
+    let objects = scan_and_repair_fragment_objects(
+        runtime.clone(),
+        &fragment,
+        &scan_id,
+        &namespace,
+        check_mode,
+        continuation_token.as_deref(),
+        cfg.max_objects_per_fragment_cycle,
+        Duration::from_secs(cfg.max_duration_seconds),
     )
-    .await
-    .map_err(|_| {
-        AppError::Timeout(format!(
-            "auto-healing fragment {fragment} exceeded its bounded work window"
-        ))
-    })?;
-    update_progress(&fragment, cycle, &result).await?;
-    Ok(Some(result))
+    .await;
+
+    let mut reports = namespace.reports;
+    reports.extend(objects.reports);
+    let critical = reports
+        .iter()
+        .find(|report| report.cluster_read_only_triggered)
+        .cloned();
+    let mut reports_written = 0u64;
+    let mut report_error = None;
+    for report in &reports {
+        match write_local_report(report).await {
+            Ok(_) => reports_written = reports_written.saturating_add(1),
+            Err(error) => {
+                tracing::error!(
+                    report_id = %report.report_id,
+                    fragment = %fragment,
+                    "N2 could not persist an auto-healing report: {error}"
+                );
+                if report_error.is_none() {
+                    report_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(report) = critical.as_ref() {
+        activate_cluster_safety_read_only(runtime, report).await?;
+    }
+    if let Some(error) = report_error {
+        return Err(error);
+    }
+    update_progress(&fragment, cycle, objects.continuation_token.clone()).await?;
+    Ok(Some(FragmentHealingOutcome {
+        scanned_inodes: namespace.scanned_inodes,
+        repaired_inodes: namespace.repaired_inodes,
+        scanned_objects: objects.scanned_objects,
+        repaired_objects: objects.repaired_objects,
+        repaired_shards: objects.repaired_shards,
+        unrecoverable_objects: objects.unrecoverable_objects,
+        failed_objects: objects.failed_objects,
+        headless_objects: objects.headless_objects,
+        reports_written,
+    }))
 }
 
 pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
@@ -481,6 +682,9 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
     let _cycle_guard = CycleGuard;
     let cfg = CONFIG.auto_healing.clone();
     let runtime = active_cluster_runtime()?;
+    if let Some(state) = cluster_safety_read_only_state() {
+        propagate_safety_state(runtime.clone(), state).await?;
+    }
     let progress = progress_snapshot().await?;
     let cycle = progress.cycle.saturating_add(1);
     let check_mode = if cycle % cfg.checksum_scan_every_cycles == 0 {
@@ -518,6 +722,7 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
         healer_pool: healer_pool.iter().map(|node| node.id.clone()).collect(),
         discovered_fragments: fragments.len(),
         owned_fragments: owned.len(),
+        safety_read_only: is_cluster_safety_read_only(),
         started_at_unix: Some(Utc::now().timestamp()),
         ..AutoHealingStatus::default()
     };
@@ -541,7 +746,13 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
         match result {
             Ok(Some(result)) => {
                 status.leased_fragments = status.leased_fragments.saturating_add(1);
-                status.scanned_objects = status.scanned_objects.saturating_add(result.scanned);
+                status.scanned_inodes = status.scanned_inodes.saturating_add(result.scanned_inodes);
+                status.repaired_inodes = status
+                    .repaired_inodes
+                    .saturating_add(result.repaired_inodes);
+                status.scanned_objects = status
+                    .scanned_objects
+                    .saturating_add(result.scanned_objects);
                 status.repaired_objects = status
                     .repaired_objects
                     .saturating_add(result.repaired_objects);
@@ -551,10 +762,13 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
                 status.unrecoverable_objects = status
                     .unrecoverable_objects
                     .saturating_add(result.unrecoverable_objects);
-                status.failed_objects = status.failed_objects.saturating_add(result.failed);
-                if result.last_error.is_some() {
-                    status.last_error = result.last_error;
-                }
+                status.failed_objects = status.failed_objects.saturating_add(result.failed_objects);
+                status.headless_objects = status
+                    .headless_objects
+                    .saturating_add(result.headless_objects);
+                status.reports_written = status
+                    .reports_written
+                    .saturating_add(result.reports_written);
             }
             Ok(None) => {}
             Err(err) => {
@@ -571,6 +785,7 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
         atomic_write_json(&progress_path()?, store).await?;
     }
     status.running = false;
+    status.safety_read_only = is_cluster_safety_read_only();
     status.finished_at_unix = Some(Utc::now().timestamp());
     *STATUS.write().await = status.clone();
     Ok(status)
@@ -611,12 +826,14 @@ pub async fn auto_healing_status(claims: Claims) -> Result<Json<AutoHealingStatu
     }
     let mut status = STATUS.read().await.clone();
     status.enabled = CONFIG.auto_healing.enabled;
+    status.safety_read_only = is_cluster_safety_read_only();
     Ok(Json(status))
 }
 
 pub async fn auto_healing_status_snapshot() -> AutoHealingStatus {
     let mut status = STATUS.read().await.clone();
     status.enabled = CONFIG.auto_healing.enabled;
+    status.safety_read_only = is_cluster_safety_read_only();
     status
 }
 
@@ -638,33 +855,89 @@ pub async fn peer_healing_lease(
     Ok(Json(claim_local_lease(&request).await?))
 }
 
+pub async fn peer_safety_read_only(
+    headers: HeaderMap,
+    State(_state): State<Arc<AppState>>,
+    Json(request): Json<PeerSafetyReadOnlyRequest>,
+) -> Result<Json<PeerSafetyReadOnlyResponse>, AppError> {
+    authorize_peer(&headers)?;
+    let runtime = active_cluster_runtime()?;
+    if request.state.cluster_id != runtime.membership.cluster_id
+        || request.state.membership_epoch > runtime.membership.epoch
+    {
+        return Err(AppError::Conflict(
+            "safety read-only marker does not belong to this cluster epoch".into(),
+        ));
+    }
+    apply_safety_read_only_state(request.state).await?;
+    Ok(Json(PeerSafetyReadOnlyResponse {
+        node_id: runtime.local_node_id.clone(),
+        applied: true,
+    }))
+}
+
 pub fn build_auto_healing_peer_routes() -> Router<Arc<AppState>> {
-    Router::new().route("/n2/peer/healing/lease", post(peer_healing_lease))
+    Router::new()
+        .route("/n2/peer/healing/lease", post(peer_healing_lease))
+        .route("/n2/peer/healing/read-only", post(peer_safety_read_only))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::distribution::layout::ClusterLayoutPolicy;
-    use crate::distribution::membership::{ClusterMembership, NodeState};
+    use crate::distribution::membership::{
+        ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NamespaceCatalogLayout,
+        NamespaceCatalogReplica, NodeRole, NodeState, StorageRoot,
+    };
 
     fn runtime() -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "node-a".into(),
+            local_role: NodeRole::Blob,
+            local_storage_roots: vec![],
             membership_path: PathBuf::new(),
             layout_policy: ClusterLayoutPolicy::default(),
             membership: ClusterMembership {
+                format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "healing-test".into(),
                 epoch: 9,
+                policy: ClusterPolicy {
+                    namespace_redundancy: 2,
+                    object_data_shards: 2,
+                    object_parity_shards: 1,
+                },
+                namespace_catalog: NamespaceCatalogLayout {
+                    generation: 9,
+                    replicas: vec![
+                        NamespaceCatalogReplica {
+                            node_id: "node-a".into(),
+                            root_id: "root-node-a".into(),
+                        },
+                        NamespaceCatalogReplica {
+                            node_id: "node-b".into(),
+                            root_id: "root-node-b".into(),
+                        },
+                    ],
+                },
                 nodes: ["node-a", "node-b", "node-c", "node-d"]
                     .into_iter()
-                    .map(|id| ClusterNode {
+                    .enumerate()
+                    .map(|(index, id)| ClusterNode {
                         id: id.into(),
+                        role: if index < 2 {
+                            NodeRole::Namespace
+                        } else {
+                            NodeRole::Blob
+                        },
                         endpoint: format!("https://{id}"),
                         native_endpoint: None,
                         state: Some(NodeState::Online),
                         weight: 1,
-                        storage_roots: Vec::new(),
+                        storage_roots: vec![StorageRoot {
+                            id: format!("root-{id}"),
+                            path: format!("/disk-{id}"),
+                        }],
                         joined_epoch: 1,
                         capacity_bytes: None,
                         used_bytes: None,

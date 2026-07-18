@@ -12,19 +12,18 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("key_path", "");
 
     conf.with_section(Some("disk_config"))
-        .set("storage_disks", "")
-        .set("fs_storage_path", "");
+        .set("storage_roots", "")
+        .set("runtime_path", "");
 
     conf.with_section(Some("cluster_config"))
         .set("node_id", "node-1")
+        .set("node_role", "namespace")
         .set("node_endpoint", "https://127.0.0.1:50001")
         .set("native_endpoint", "n2://127.0.0.1:50002")
         .set("membership_file", "n2_membership.json")
-        .set("cluster_layout_mode", "auto")
-        .set("auto_max_data_shards", "8")
-        .set("auto_max_parity_shards", "3")
-        .set("fixed_data_shards", "")
-        .set("fixed_parity_shards", "")
+        .set("namespace_redundancy", "2")
+        .set("object_data_shards", "1")
+        .set("object_parity_shards", "1")
         .set("auto_rebalance", "false");
 
     conf.with_section(Some("garbage_collector"))
@@ -106,10 +105,16 @@ mod tests {
         let cluster = ini
             .section(Some("cluster_config"))
             .expect("cluster_config section");
-        assert_eq!(cluster.get("cluster_layout_mode"), Some("auto"));
-        assert_eq!(cluster.get("auto_max_data_shards"), Some("8"));
-        assert_eq!(cluster.get("auto_max_parity_shards"), Some("3"));
+        assert_eq!(cluster.get("node_role"), Some("namespace"));
+        assert_eq!(cluster.get("namespace_redundancy"), Some("2"));
+        assert_eq!(cluster.get("object_data_shards"), Some("1"));
+        assert_eq!(cluster.get("object_parity_shards"), Some("1"));
         assert_eq!(cluster.get("membership_file"), Some("n2_membership.json"));
+        let disks = ini
+            .section(Some("disk_config"))
+            .expect("disk_config section");
+        assert!(disks.contains_key("storage_roots"));
+        assert!(disks.contains_key("runtime_path"));
         let upload = ini
             .section(Some("upload_config"))
             .expect("upload_config section");

@@ -78,6 +78,7 @@ async fn repair_cluster_part_after_read(
                 .await?;
         let target = PeerShardTarget {
             node_id: locator.node_id,
+            root_id: locator.root_id,
             endpoint: locator.endpoint,
             fragment: locator.fragment,
             object_id: locator.object_id,
@@ -171,6 +172,7 @@ pub async fn repair_cluster_object_shards(
 
             let target = PeerShardTarget {
                 node_id: locator.node_id,
+                root_id: locator.root_id,
                 endpoint: locator.endpoint,
                 fragment: locator.fragment,
                 object_id: locator.object_id,

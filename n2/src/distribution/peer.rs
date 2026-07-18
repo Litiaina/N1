@@ -32,8 +32,8 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -143,6 +143,7 @@ where
 #[derive(Clone, Debug)]
 pub struct PeerShardTarget {
     pub node_id: String,
+    pub root_id: String,
     pub endpoint: String,
     pub fragment: String,
     pub object_id: String,
@@ -156,6 +157,41 @@ pub struct PeerShardTarget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerObjectMetadataRequest {
     pub metadata: ObjectMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerObjectInventoryRequest {
+    pub fragment: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataReplicaObservation {
+    pub node_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataReplicaRepairOutcome {
+    pub expected_replicas: usize,
+    pub repaired_replicas: u64,
+    pub healthy: bool,
+    pub observations: Vec<MetadataReplicaObservation>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClusterObjectInventory {
+    pub objects: BTreeMap<String, ObjectMetadata>,
+    pub expected_blob_nodes: usize,
+    pub responding_blob_nodes: usize,
+    pub errors: Vec<String>,
+}
+
+impl ClusterObjectInventory {
+    pub fn complete(&self) -> bool {
+        self.responding_blob_nodes == self.expected_blob_nodes
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +278,7 @@ struct CachedPeerUsage {
 
 #[derive(Debug, Deserialize)]
 pub struct PeerShardQuery {
+    pub root_id: String,
     #[serde(default)]
     pub parity: Option<bool>,
     #[serde(default)]
@@ -376,6 +413,7 @@ async fn native_put_peer_shard(
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
         fragment: target.fragment.clone(),
+        root_id: target.root_id.clone(),
         object_id: target.object_id.clone(),
         version_id: target.version_id.clone(),
         part_index: target.part_index,
@@ -627,6 +665,280 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
     Ok(())
 }
 
+fn object_metadata_bytes(metadata: &ObjectMetadata) -> Result<Vec<u8>, AppError> {
+    rmp_serde::to_vec_named(metadata).map_err(AppError::from)
+}
+
+fn metadata_participant_nodes(metadata: &ObjectMetadata) -> Result<BTreeSet<String>, AppError> {
+    let mut nodes = BTreeSet::new();
+    for shard in metadata.parts.iter().flat_map(|part| part.shards.iter()) {
+        let locator = parse_peer_shard_locator(&shard.absolute_path).ok_or_else(|| {
+            AppError::Conflict(format!(
+                "object metadata shard '{}' has no exact peer locator",
+                shard.file_name
+            ))
+        })?;
+        nodes.insert(locator.node_id);
+    }
+    if nodes.is_empty() && metadata.total_size_bytes != 0 {
+        return Err(AppError::Conflict(
+            "non-empty object metadata has no shard-bearing participants".into(),
+        ));
+    }
+    Ok(nodes)
+}
+
+async fn metadata_on_node(
+    runtime: &ClusterRuntime,
+    node: &ClusterNode,
+    metadata: &ObjectMetadata,
+) -> Result<Option<ObjectMetadata>, AppError> {
+    let request = PeerObjectResolveRequest {
+        fragment: metadata.fragment.clone(),
+        object_id: metadata.object_key.clone(),
+        version_id: Some(metadata.version_id.clone()),
+    };
+    let records = if node.id == runtime.local_node_id {
+        local_object_metadata(&request)?
+    } else {
+        post_object_resolve(&node.endpoint, &request).await?
+    };
+    Ok(records.into_iter().next())
+}
+
+async fn repair_metadata_on_node(
+    runtime: &ClusterRuntime,
+    node: &ClusterNode,
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
+    if node.id == runtime.local_node_id {
+        index::publish_object(metadata).await.map(|_| ())
+    } else {
+        post_object_metadata(&node.endpoint, metadata).await
+    }
+}
+
+/// Verify and restore the immutable NCDX metadata copy on every exact
+/// shard-bearing participant. Divergent immutable metadata is never replaced.
+pub async fn inspect_and_repair_metadata_replicas(
+    metadata: &ObjectMetadata,
+) -> Result<MetadataReplicaRepairOutcome, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let participant_ids = metadata_participant_nodes(metadata)?;
+    let expected_bytes = object_metadata_bytes(metadata)?;
+    let mut observations = Vec::with_capacity(participant_ids.len());
+    let mut missing = Vec::new();
+    for node_id in &participant_ids {
+        let node = runtime
+            .membership
+            .nodes
+            .iter()
+            .find(|node| node.id == *node_id)
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "object metadata participant '{node_id}' is absent from membership"
+                ))
+            })?;
+        match metadata_on_node(&runtime, node, metadata).await {
+            Ok(Some(found)) if object_metadata_bytes(&found)? == expected_bytes => {
+                observations.push(MetadataReplicaObservation {
+                    node_id: node_id.clone(),
+                    status: "healthy".into(),
+                    error: None,
+                });
+            }
+            Ok(Some(_)) => observations.push(MetadataReplicaObservation {
+                node_id: node_id.clone(),
+                status: "divergent".into(),
+                error: Some("immutable NCDX metadata differs".into()),
+            }),
+            Ok(None) => {
+                observations.push(MetadataReplicaObservation {
+                    node_id: node_id.clone(),
+                    status: "missing".into(),
+                    error: None,
+                });
+                missing.push(node.clone());
+            }
+            Err(error) => {
+                observations.push(MetadataReplicaObservation {
+                    node_id: node_id.clone(),
+                    status: "unavailable".into(),
+                    error: Some(error.to_string()),
+                });
+                missing.push(node.clone());
+            }
+        }
+    }
+
+    let mut repaired_replicas = 0u64;
+    let mut repaired_nodes = BTreeSet::new();
+    for node in missing {
+        if repair_metadata_on_node(&runtime, &node, metadata)
+            .await
+            .is_ok()
+        {
+            repaired_replicas = repaired_replicas.saturating_add(1);
+            repaired_nodes.insert(node.id.clone());
+        }
+    }
+
+    let mut healthy = true;
+    let mut final_observations = Vec::with_capacity(participant_ids.len());
+    for node_id in participant_ids {
+        let node = runtime
+            .membership
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("metadata participant membership checked");
+        match metadata_on_node(&runtime, node, metadata).await {
+            Ok(Some(found)) if object_metadata_bytes(&found)? == expected_bytes => {
+                final_observations.push(MetadataReplicaObservation {
+                    status: if repaired_nodes.contains(&node_id) {
+                        "repaired"
+                    } else {
+                        "healthy"
+                    }
+                    .into(),
+                    node_id,
+                    error: None,
+                });
+            }
+            Ok(Some(_)) => {
+                healthy = false;
+                final_observations.push(MetadataReplicaObservation {
+                    node_id,
+                    status: "divergent".into(),
+                    error: Some("immutable NCDX metadata differs after repair".into()),
+                });
+            }
+            Ok(None) => {
+                healthy = false;
+                final_observations.push(MetadataReplicaObservation {
+                    node_id,
+                    status: "missing".into(),
+                    error: Some("NCDX metadata remained missing after repair".into()),
+                });
+            }
+            Err(error) => {
+                healthy = false;
+                final_observations.push(MetadataReplicaObservation {
+                    node_id,
+                    status: "unavailable".into(),
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(MetadataReplicaRepairOutcome {
+        expected_replicas: final_observations.len(),
+        repaired_replicas,
+        healthy,
+        observations: final_observations,
+    })
+}
+
+async fn post_object_inventory(
+    endpoint: &str,
+    fragment: &str,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let client = peer_http_client()?;
+    let mut request = client
+        .post(format!(
+            "{}/n2/peer/objects/inventory",
+            endpoint.trim_end_matches('/')
+        ))
+        .json(&PeerObjectInventoryRequest {
+            fragment: fragment.to_string(),
+        });
+    if let Some(secret) = cluster_secret() {
+        request = request.header("x-n2-cluster-secret", secret);
+    }
+    let response = request
+        .timeout(PEER_READ_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!(
+                "read N2 object inventory from {endpoint}: {error}"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 object inventory peer {endpoint} returned {}",
+            response.status()
+        )));
+    }
+    response.json().await.map_err(|error| {
+        AppError::InternalServerError(format!(
+            "decode N2 object inventory from {endpoint}: {error}"
+        ))
+    })
+}
+
+pub async fn collect_cluster_object_inventory(
+    fragment: &str,
+) -> Result<ClusterObjectInventory, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let nodes = runtime
+        .membership
+        .nodes
+        .iter()
+        .filter(|node| node.role == crate::distribution::membership::NodeRole::Blob)
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_blob_nodes = nodes.len();
+    let local_id = runtime.local_node_id.clone();
+    let results = futures_util::future::join_all(nodes.into_iter().map(|node| {
+        let fragment = fragment.to_string();
+        let local_id = local_id.clone();
+        async move {
+            let result = if node.id == local_id {
+                index::list_fragment_live_objects(&fragment).await
+            } else {
+                post_object_inventory(&node.endpoint, &fragment).await
+            };
+            (node.id, result)
+        }
+    }))
+    .await;
+    let mut inventory = ClusterObjectInventory {
+        expected_blob_nodes,
+        ..ClusterObjectInventory::default()
+    };
+    for (node_id, result) in results {
+        let records = match result {
+            Ok(records) => {
+                inventory.responding_blob_nodes = inventory.responding_blob_nodes.saturating_add(1);
+                records
+            }
+            Err(error) => {
+                inventory.errors.push(format!("{node_id}: {error}"));
+                continue;
+            }
+        };
+        for record in records {
+            match inventory.objects.get(&record.object_key) {
+                Some(existing) if existing.version_id == record.version_id => {
+                    if object_metadata_bytes(existing)? != object_metadata_bytes(&record)? {
+                        return Err(AppError::Conflict(format!(
+                            "divergent immutable NCDX inventory for object {} version {}",
+                            record.object_key, record.version_id
+                        )));
+                    }
+                }
+                Some(existing) if existing.version_id > record.version_id => {}
+                _ => {
+                    inventory.objects.insert(record.object_key.clone(), record);
+                }
+            }
+        }
+    }
+    Ok(inventory)
+}
+
 pub async fn peer_publish_object_metadata(
     headers: HeaderMap,
     Json(request): Json<PeerObjectMetadataRequest>,
@@ -634,6 +946,16 @@ pub async fn peer_publish_object_metadata(
     authorize_peer(&headers)?;
     index::publish_object(&request.metadata).await?;
     Ok(StatusCode::CREATED)
+}
+
+pub async fn peer_object_inventory(
+    headers: HeaderMap,
+    Json(request): Json<PeerObjectInventoryRequest>,
+) -> Result<Json<Vec<ObjectMetadata>>, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(
+        index::list_fragment_live_objects(&request.fragment).await?,
+    ))
 }
 
 fn local_object_metadata(
@@ -1079,6 +1401,7 @@ pub async fn peer_resolve_object_metadata_batch(
 }
 
 async fn apply_fragment_control(request: &PeerFragmentControlRequest) -> Result<(), AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     match request {
         PeerFragmentControlRequest::Provision {
             fragment_hash,
@@ -1163,6 +1486,9 @@ async fn peer_fragment_snapshot(headers: HeaderMap) -> Result<impl IntoResponse,
 }
 
 pub async fn sync_fragment_controls_from_cluster() -> Result<usize, AppError> {
+    if crate::core::operation_gate::is_cluster_safety_read_only() {
+        return Ok(0);
+    }
     let runtime = active_cluster_runtime()?;
     let client = peer_http_client()?;
     let mut by_alias =
@@ -1393,6 +1719,7 @@ fn decode_segment(value: &str) -> Option<String> {
 #[derive(Clone, Debug)]
 pub struct PeerShardLocator {
     pub node_id: String,
+    pub root_id: String,
     pub endpoint: String,
     pub fragment: String,
     pub object_id: String,
@@ -1404,8 +1731,9 @@ pub struct PeerShardLocator {
 
 pub fn encode_peer_shard_locator(target: &PeerShardTarget) -> String {
     format!(
-        "n2-peer|{}|{}|{}|{}|{}|{}|{}|{}",
+        "n2-peer-v2|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         encode_segment(&target.node_id),
+        encode_segment(&target.root_id),
         encode_segment(&target.endpoint),
         encode_segment(&target.fragment),
         encode_segment(&target.object_id),
@@ -1418,10 +1746,11 @@ pub fn encode_peer_shard_locator(target: &PeerShardTarget) -> String {
 
 pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
     let mut parts = value.split('|');
-    if parts.next()? != "n2-peer" {
+    if parts.next()? != "n2-peer-v2" {
         return None;
     }
     let node_id = decode_segment(parts.next()?)?;
+    let root_id = decode_segment(parts.next()?)?;
     let endpoint = decode_segment(parts.next()?)?;
     let fragment = decode_segment(parts.next()?)?;
     let object_id = decode_segment(parts.next()?)?;
@@ -1431,6 +1760,7 @@ pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
     let is_parity = parts.next()?.parse().ok()?;
     Some(PeerShardLocator {
         node_id,
+        root_id,
         endpoint,
         fragment,
         object_id,
@@ -1443,13 +1773,14 @@ pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
 
 fn peer_shard_url(target: &PeerShardTarget) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}/{}?parity={}&expected_len={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?root_id={}&parity={}&expected_len={}",
         target.endpoint.trim_end_matches('/'),
         encode_segment(&target.fragment),
         encode_segment(&target.object_id),
         encode_segment(&target.version_id),
         target.part_index,
         target.shard_index,
+        encode_segment(&target.root_id),
         target.is_parity,
         target.expected_len
     )
@@ -1457,13 +1788,14 @@ fn peer_shard_url(target: &PeerShardTarget) -> String {
 
 fn peer_shard_read_url(locator: &PeerShardLocator, offset: u64, length: usize) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}/{}?parity={}&offset={}&length={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?root_id={}&parity={}&offset={}&length={}",
         locator.endpoint.trim_end_matches('/'),
         encode_segment(&locator.fragment),
         encode_segment(&locator.object_id),
         encode_segment(&locator.version_id),
         locator.part_index,
         locator.shard_index,
+        encode_segment(&locator.root_id),
         locator.is_parity,
         offset,
         length
@@ -1559,6 +1891,7 @@ async fn native_get_peer_shard(
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
         fragment: locator.fragment.clone(),
+        root_id: locator.root_id.clone(),
         object_id: locator.object_id.clone(),
         version_id: locator.version_id.clone(),
         part_index: locator.part_index,
@@ -1669,21 +2002,35 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
 }
 
 fn shard_dir(
+    root_id: &str,
     fragment: &str,
     object_id: &str,
     version_id: &str,
-    part_index: u64,
-    shard_index: usize,
 ) -> Result<std::path::PathBuf, AppError> {
-    let pm = ObjectPathManager::new();
-    let roots = pm.get_storage_roots();
-    if roots.is_empty() {
-        return Err(AppError::InternalServerError(
-            "No blob storage disks configured".into(),
-        ));
+    let runtime = active_cluster_runtime()?;
+    if runtime.local_role != crate::distribution::membership::NodeRole::Blob {
+        return Err(AppError::ServiceUnavailable(format!(
+            "node '{}' is a namespace node and cannot store object shards",
+            runtime.local_node_id
+        )));
     }
-    let disk_idx = (part_index as usize + shard_index) % roots.len();
-    Ok(pm.get_shard_dir_on_disk(&roots[disk_idx], fragment, object_id, version_id))
+    let root = runtime
+        .local_storage_roots
+        .iter()
+        .find(|root| root.id == root_id)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(format!(
+                "blob root '{}' is not configured on node '{}'",
+                root_id, runtime.local_node_id
+            ))
+        })?;
+    let pm = ObjectPathManager::new();
+    Ok(pm.get_shard_dir_on_disk(
+        &std::path::PathBuf::from(&root.path),
+        fragment,
+        object_id,
+        version_id,
+    ))
 }
 
 pub async fn peer_put_shard(
@@ -1702,7 +2049,7 @@ pub async fn peer_put_shard(
     let started = Instant::now();
     let is_parity = query.parity.unwrap_or(false);
     let expected_len = query.expected_len.unwrap_or(0);
-    let dir = shard_dir(&fragment, &object_id, &version_id, part_index, shard_index)?;
+    let dir = shard_dir(&query.root_id, &fragment, &object_id, &version_id)?;
     fs::create_dir_all(&dir)
         .await
         .map_err(|e| AppError::Io(e, format!("create peer shard dir {}", dir.display())))?;
@@ -1786,7 +2133,7 @@ pub async fn peer_get_shard(
     Query(query): Query<PeerShardQuery>,
 ) -> Result<Response, AppError> {
     authorize_peer(&headers)?;
-    let dir = shard_dir(&fragment, &object_id, &version_id, part_index, shard_index)?;
+    let dir = shard_dir(&query.root_id, &fragment, &object_id, &version_id)?;
     let file_name = stable_name(part_index, shard_index, query.parity.unwrap_or(false));
     let path = dir.join(file_name);
     let mut file = fs::File::open(&path)
@@ -1858,6 +2205,7 @@ pub struct NativePeerShardPayload {
     #[serde(default)]
     pub secret: Option<String>,
     pub fragment: String,
+    pub root_id: String,
     pub object_id: String,
     pub version_id: String,
     pub part_index: u64,
@@ -1894,11 +2242,10 @@ where
     authorize_peer_secret(payload.secret.as_deref())?;
     let expected_len = payload.expected_len.unwrap_or(body_len);
     let dir = shard_dir(
+        &payload.root_id,
         &payload.fragment,
         &payload.object_id,
         &payload.version_id,
-        payload.part_index,
-        payload.shard_index,
     )?;
     fs::create_dir_all(&dir)
         .await
@@ -1986,11 +2333,10 @@ pub async fn native_peer_get_shard_bytes(
 ) -> Result<Vec<u8>, AppError> {
     authorize_peer_secret(payload.secret.as_deref())?;
     let dir = shard_dir(
+        &payload.root_id,
         &payload.fragment,
         &payload.object_id,
         &payload.version_id,
-        payload.part_index,
-        payload.shard_index,
     )?;
     let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
     let path = dir.join(file_name);
@@ -2054,6 +2400,10 @@ pub fn build_peer_routes() -> Router<Arc<AppState>> {
             axum::routing::post(peer_resolve_object_metadata_batch),
         )
         .route(
+            "/n2/peer/objects/inventory",
+            axum::routing::post(peer_object_inventory),
+        )
+        .route(
             "/n2/peer/fragments/control",
             axum::routing::post(peer_fragment_control),
         )
@@ -2075,6 +2425,7 @@ mod tests {
     fn peer_shard_locator_round_trips_endpoint_and_identity() {
         let target = PeerShardTarget {
             node_id: "node-a".into(),
+            root_id: "blob-root-a".into(),
             endpoint: "https://node-a.local:50001".into(),
             fragment: "frag".into(),
             object_id: "object-1".into(),
@@ -2087,6 +2438,7 @@ mod tests {
         let encoded = encode_peer_shard_locator(&target);
         let decoded = parse_peer_shard_locator(&encoded).expect("locator");
         assert_eq!(decoded.node_id, target.node_id);
+        assert_eq!(decoded.root_id, target.root_id);
         assert_eq!(decoded.endpoint, target.endpoint);
         assert_eq!(decoded.fragment, target.fragment);
         assert_eq!(decoded.object_id, target.object_id);

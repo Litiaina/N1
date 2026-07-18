@@ -139,6 +139,7 @@ async fn local_purge(
     local_node_id: &str,
     request: PeerObjectPurgeRequest,
 ) -> Result<PeerObjectPurgeAck, AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     let _ = index::delete_object_fast(&request.fragment, &request.object_id).await?;
     Ok(PeerObjectPurgeAck {
         node_id: local_node_id.to_string(),

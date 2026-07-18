@@ -270,6 +270,7 @@ pub async fn start_garbage_collector_job(
     mode: Option<String>,
     fast_mode: Option<bool>,
 ) -> Result<(), AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     let execution_mode = match mode
         .as_deref()
         .map(str::trim)
@@ -693,16 +694,6 @@ async fn process_fragment_gc(
             return stats;
         }
     };
-    let reference_counts = match DistributedNamespace::object_reference_counts(fragment).await {
-        Ok(counts) => counts,
-        Err(err) => {
-            warn!(
-                "GC: failed to count quorum namespace references for fragment {}: {}",
-                fragment, err
-            );
-            return stats;
-        }
-    };
     for entry in distributed_trash {
         if should_stop_gc() {
             return stats;
@@ -710,11 +701,11 @@ async fn process_fragment_gc(
         let Some(trash) = entry.trash.as_ref() else {
             warn!(
                 "GC: refusing malformed trash dentry {} without lifecycle context",
-                entry.key.name
+                entry.name
             );
             continue;
         };
-        let age = trash_deleted_age(trash.deleted_at_unix, now_unix);
+        let age = trash_deleted_age(trash.deleted_at_unix_nanos / 1_000_000_000, now_unix);
         if age < retention {
             continue;
         }
@@ -726,18 +717,15 @@ async fn process_fragment_gc(
                 Err(err) => {
                     warn!(
                         "GC: failed to inspect expired trash subtree {}/{}: {}",
-                        fragment, entry.key.name, err
+                        fragment, entry.name, err
                     );
                     continue;
                 }
             };
-        let lifecycle_id = format!("gc-{}-{}", entry.key.name, now_unix);
+        let lifecycle_id = format!("gc-{}-{}", entry.name, now_unix);
         let mut reclaim = Vec::new();
         let mut inspect_failed = false;
-        for (object_id, subtree_references) in &subtree_counts {
-            if reference_counts.get(object_id).copied().unwrap_or(0) > *subtree_references {
-                continue;
-            }
+        for object_id in subtree_counts.keys() {
             let versions =
                 match index::list_live_object_versions_metadata(fragment, object_id).await {
                     Ok(versions) => versions,
@@ -760,9 +748,27 @@ async fn process_fragment_gc(
         if inspect_failed {
             continue;
         }
+        let mut reclaimed = Vec::with_capacity(reclaim.len());
+        let mut reclaim_failed = false;
+        for (object_id, refund, versions) in reclaim {
+            match purge_object_from_holders(fragment, &object_id, &lifecycle_id).await {
+                Ok(()) => reclaimed.push((refund, versions)),
+                Err(err) => {
+                    warn!(
+                        "GC: expired object {}/{} physical reclamation requires retry; trash anchor remains: {}",
+                        fragment, object_id, err
+                    );
+                    reclaim_failed = true;
+                    break;
+                }
+            }
+        }
+        if reclaim_failed {
+            continue;
+        }
         if let Err(err) = DistributedNamespace::purge_expired_tree(
             fragment,
-            &entry.key.name,
+            &entry.name,
             retention.as_secs(),
             now_unix,
             &lifecycle_id,
@@ -770,23 +776,14 @@ async fn process_fragment_gc(
         .await
         {
             warn!(
-                "GC: namespace expiry for trash {}/{} requires retry; immutable data was preserved: {}",
-                fragment, entry.key.name, err
+                "GC: physical data was reclaimed but namespace expiry for trash {}/{} requires retry: {}",
+                fragment, entry.name, err
             );
             continue;
         }
-        for (object_id, refund, versions) in reclaim {
-            match purge_object_from_holders(fragment, &object_id, &lifecycle_id).await {
-                Ok(()) => {
-                    stats.refund_bytes = stats.refund_bytes.saturating_add(refund);
-                    stats.trash_versions_expired =
-                        stats.trash_versions_expired.saturating_add(versions);
-                }
-                Err(err) => warn!(
-                    "GC: expired object {}/{} is namespace-unreachable but physical reclamation requires retry: {}",
-                    fragment, object_id, err
-                ),
-            }
+        for (refund, versions) in reclaimed {
+            stats.refund_bytes = stats.refund_bytes.saturating_add(refund);
+            stats.trash_versions_expired = stats.trash_versions_expired.saturating_add(versions);
         }
     }
     let physical_live_objects = match index::list_fragment_live_objects(fragment).await {

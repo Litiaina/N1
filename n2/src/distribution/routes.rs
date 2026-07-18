@@ -4,7 +4,7 @@ use crate::distribution::maintenance::{
     distributed_maintenance_status, start_distributed_maintenance,
 };
 use crate::distribution::membership::{
-    ClusterNode, active_cluster_runtime, live_active_write_nodes,
+    ClusterNode, NodeRole, active_cluster_runtime, live_blob_write_nodes,
 };
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::peer::{
@@ -92,8 +92,11 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = live_active_write_nodes(&runtime).await;
-    let configured_nodes = runtime.membership.active_write_nodes().len();
+    let active = live_blob_write_nodes(&runtime).await;
+    let configured_nodes = runtime
+        .membership
+        .active_write_nodes_for_role(NodeRole::Blob)
+        .len();
     let configured_layout = resolve_configured_layout(configured_nodes, &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
     let layout = resolve_write_layout(active.len(), configured_nodes, &runtime.layout_policy)
@@ -104,7 +107,7 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         "active_write_nodes": active.len(),
         "layout": layout,
         "configured_layout": configured_layout,
-        "degraded_write_layout": layout != configured_layout,
+        "degraded_write_layout": false,
         "bounded_object_erasure_set": true,
         "max_auto_data_shards": runtime.layout_policy.auto_max_data_shards,
         "max_auto_parity_shards": runtime.layout_policy.auto_max_parity_shards,
@@ -273,10 +276,13 @@ pub async fn placement_preview(
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = live_active_write_nodes(&runtime).await;
+    let active = live_blob_write_nodes(&runtime).await;
     let layout = resolve_write_layout(
         active.len(),
-        runtime.membership.active_write_nodes().len(),
+        runtime
+            .membership
+            .active_write_nodes_for_role(NodeRole::Blob)
+            .len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::BadRequest)?;

@@ -38,9 +38,8 @@ use crate::core::upload::{
 };
 use crate::core::{index, index_store};
 use crate::distribution::auto_healing::build_auto_healing_peer_routes;
-use crate::distribution::dentry_quorum::build_dentry_quorum_routes;
-use crate::distribution::dentry_transaction::build_dentry_transaction_routes;
 use crate::distribution::download::part_has_remote_shards;
+use crate::distribution::inode::build_inode_peer_routes;
 use crate::distribution::lifecycle::build_lifecycle_peer_routes;
 use crate::distribution::maintenance::build_distributed_maintenance_peer_routes;
 use crate::distribution::membership::active_cluster_runtime;
@@ -1503,11 +1502,10 @@ pub fn build_storage_routes_unbound_with_options(
 
     let peer_routes = Router::new()
         .merge(build_peer_routes())
+        .merge(build_inode_peer_routes())
         .merge(build_auto_healing_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
-        .merge(build_lifecycle_peer_routes())
-        .merge(build_dentry_quorum_routes())
-        .merge(build_dentry_transaction_routes());
+        .merge(build_lifecycle_peer_routes());
 
     let create_fragment_route = Router::new().route("/noa/v1/fragments", post(create_fragment));
     let create_fragment_route = layers

@@ -10,38 +10,34 @@ For production service setup, systemd templates, and validation order, see
 
 ## Status
 
-N2 `1.0.0` is the architecture-final line for the distributed object storage
-system. N2 `1.1.0` preserves that storage contract while standardizing the
-public surface as NOA v1 and adding autonomous distributed healing. The core
-shape remains: `/noa/v1/...` HTTP API, `n2://` native protocol, immutable blob
-and `.ncdx` records, native partitioned namespace coordination, cluster
-monitoring, recorded-layout repair, explicit rebalance, and N2 console/shell
-flows.
+N2 `2.0.0` is an in-development engine boundary. It separates an independently
+expandable namespace-node collection from an independently expandable blob-node
+collection. The namespace uses stable directory inodes, exact replica layouts,
+quorum-certified immutable generations, and bounded cross-inode transactions.
+The blob plane retains immutable `.ncdx` records and object-level erasure sets.
+Earlier development layouts are intentionally not opened by the 2.0 engine.
 
-The July 8, 2026 four-node proof passed object repair, fragment repair, global
-repair, redistribution, 4->3->4 topology movement, namespace race hardening,
-trash/recover, content SHA verification, and final per-fragment monitoring.
-The July 15, 2026 bounded N2 1.1.0 proof passed NOA CRUD, multipart restart,
-POSIX namespace operations, quorum-leased recorded-layout healing,
-recover-on-read, healing progress across restart, two-of-three node operation,
-explicit object redistribution, fragment rebalance, and final content SHA
-verification. The three test nodes were isolated processes on one four-disk
-physical server. This is architectural correctness evidence, not an LTS or
-soak claim. Independent-host N2 1.1.0 failure testing, larger cluster proof,
-namespace voter migration, and wider UI viewport proof remain validation and
-hardening work.
+The July 17, 2026 independent-host `2 namespace + 2 blob` architectural proof
+covered NOA CRUD, nested directories, same-parent rename, cross-parent move,
+object-level `1 + 1` EC placement, exact node/root locators, byte-identical
+reads, strict namespace and blob fail-closed behavior, recover-on-read, explicit
+auto-healing, trash/restore invariants, and TTL reclamation. This is bounded
+architectural evidence, not an LTS, long-soak, or general production-readiness
+claim. The current evidence and remaining release gates are recorded in
+`N2_2_0_VERIFICATION.md`.
 
 ## What N2 Is
 
-N2 stores objects under namespace paths and distributes immutable shard/parity
-payloads across cluster nodes. Every committed object version records the
-layout that wrote it, so N2 can read, inspect, repair, and rebalance objects
-without guessing from the current cluster shape.
+N2 stores POSIX-like paths in the namespace pool and distributes immutable
+shard/parity payloads through the blob pool. Every inode and object version
+records the exact node and disk-root layout that committed it, so N2 never
+guesses historical truth from current membership.
 
 N2 is built around these rules:
 
 - Any healthy node can coordinate a new operation.
-- Namespace mutations are quorum-applied.
+- Namespace mutations touch only the directly affected recorded inode groups.
+- Namespace and blob membership expand independently.
 - Object payloads and object-version records are immutable after commit.
 - New objects use the current cluster layout.
 - Existing objects keep their recorded layout until explicit rebalance.
@@ -72,10 +68,9 @@ N2 supports object-style operations and POSIX-style namespace operations. Both
 address the same namespace truth.
 
 The POSIX-style API is intentionally namespace control, not filesystem
-emulation. Path operations stay fast because they mutate or read partitioned
-namespace pointer state; immutable object metadata and shard/parity payloads
-remain in the blob plane and are not rewritten for list, rename, move, trash,
-or recover.
+emulation. Path operations stay bounded because they mutate or read stable
+directory inodes; immutable object metadata and shard/parity payloads remain in
+the blob plane and are not rewritten for list, rename, move, trash, or recover.
 
 ### Object Version
 
@@ -83,9 +78,20 @@ Each upload creates an immutable object version. The namespace head points to
 the latest live version. Older versions can be listed, inspected, recovered, or
 deleted by version where the API supports it.
 
-### Cluster Layout
+### Namespace And Blob Layouts
 
-N2 treats active nodes as the candidate pool for object-level erasure
+Namespace redundancy and object EC width are separate settings. New directory
+inodes select a fixed-width replica group from live namespace nodes. New object
+versions select a bounded erasure set from live blob nodes. Both layouts record
+exact node and root identities and remain unchanged when membership expands.
+
+The absolute 2.0 minimum is two namespace nodes plus two blob nodes. With
+namespace redundancy two, both namespace replicas are required for writes;
+losing one namespace node makes affected groups read-only rather than risking a
+split brain. A wider namespace redundancy can preserve write availability
+through a majority.
+
+N2 treats active blob nodes as the candidate pool for object-level erasure
 placement. Each object uses a bounded erasure set selected from that pool.
 
 `cluster_layout_mode=auto` derives a bounded layout from writable node count.
@@ -228,19 +234,18 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/control
+storage_roots=ns-a-root=/mnt/n2/namespace
+runtime_path=/mnt/n2/control
 
 [cluster_config]
-node_id=node-a
+node_id=ns-a
+node_role=namespace
 node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
-cluster_layout_mode=auto
-auto_max_data_shards=8
-auto_max_parity_shards=3
-fixed_data_shards=
-fixed_parity_shards=
+namespace_redundancy=2
+object_data_shards=1
+object_parity_shards=1
 auto_rebalance=false
 
 [garbage_collector]
@@ -298,13 +303,16 @@ stripe_block_size=4194304
 
 Notes:
 
-- `storage_disks` is a comma-separated list of unified storage-device paths.
-- Every storage device can hold immutable `.ncdx`/shard data and assigned
-  namespace virtual partitions under `.n2/namespace`.
-- `fs_storage_path` stores process-local membership, upload coordination, and
+- `storage_roots` is a comma-separated `ROOT_ID=/absolute/path` list owned by this logical
+  node. Every root has a stable ID in membership and is bound to the node's
+  single `namespace` or `blob` role.
+- Namespace-node roots hold inode/catalog replicas. Blob-node roots hold
+  immutable `.ncdx`, shard, and parity data. A logical node does not mix roles.
+- `runtime_path` stores process-local membership, upload coordination, and
   maintenance job state. It is not namespace truth.
-- `membership_file` is relative to `fs_storage_path` unless absolute.
-- `cluster_layout_mode=auto` is recommended for normal N2 deployments.
+- `membership_file` is relative to `runtime_path` unless absolute.
+- N2 2.0 production layouts should use fixed object EC. The membership policy
+  is authoritative and never shrinks EC to fit an unsafe live topology.
 - `auto_max_data_shards` and `auto_max_parity_shards` bound each object's
   erasure set so large clusters do not place one object across every node.
 - `auto_rebalance=false` means new objects adapt to the current bounded
@@ -312,29 +320,31 @@ Notes:
   rebalance.
 - `auto_rebalance=true` is rejected. Redistribution is always an explicit
   operation because older recorded layouts remain valid object truth.
-- `[auto_healing]` controls bounded, restart-resumable scanning. `coordinator_nodes=auto`
-  selects half of the reachable nodes as an HA healer pool; one quorum lease
-  owns each stable fragment at a time.
+- `[auto_healing]` controls bounded, restart-resumable object scanning.
+  `coordinator_nodes=auto` selects half of the reachable nodes as an HA healer
+  pool; one quorum lease owns each stable fragment at a time. Directory inodes
+  are visited one at a time; very large namespace-walk continuation remains a
+  2.0 release gate.
 - Availability cycles detect missing/unreadable shards cheaply. Every
   `checksum_scan_every_cycles` cycle performs full checksum verification.
-- `lease_seconds` is raised at runtime when necessary so it is always longer
-  than twice the configured per-fragment work budget.
+- `lease_seconds` is raised at runtime when necessary so it is longer than
+  twice the configured object-work budget.
 - N2 uses cluster capacity monitoring and physical free-space admission.
   Per-fragment business limits belong above N2 when needed.
 
-### Unified Storage Layout
+### Role-Separated Storage Layout
 
-Configure every device that should participate in object and namespace
-placement:
+Configure every device owned by this logical node:
 
 ```ini
 [disk_config]
-storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/control
+storage_roots=ns-a-root=/mnt/n2/namespace
+runtime_path=/mnt/n2/control
 ```
 
-There is no separate index tier. Namespace virtual partitions are distributed
-across these devices independently from object EC placement.
+The node role in membership decides what these roots may contain. Namespace
+and blob collections expand independently, one node or disk at a time, without
+remapping recorded layouts.
 
 Each committed version is stored as:
 
@@ -346,16 +356,14 @@ Each committed version is stored as:
     part_0_shard_1.parity
 ```
 
-The logical path exists only as a namespace symlink to `@o_<object-id>`.
-`.ncdx` stores immutable object identity and recorded cluster placement, not the
-logical path. The maximum valid ULID filename is the head version.
+The logical path exists only as an inode dentry targeting `@o_<object-id>`.
+`.ncdx` stores immutable object identity and recorded cluster placement, not
+the logical path. The maximum valid ULID filename is the head version.
 
-Every configured `storage_disks` root can hold immutable object shards,
-immutable `.ncdx` records, fragment metadata, and assigned namespace virtual
-partitions. `fs_storage_path` is process-local control state for membership,
-upload coordination, and maintenance jobs; it is not namespace truth and not an
-index tier. Older development layouts are not an in-place migration target for
-this release.
+Each configured root contains either namespace truth or blob truth according to
+the node role. `runtime_path` is process-local control state for membership,
+upload coordination, and maintenance jobs; it is neither plane's storage
+truth. Older development layouts are not an in-place migration target.
 
 ## Membership File
 
@@ -364,36 +372,78 @@ membership file should contain every node:
 
 ```json
 {
-  "cluster_id": "litiaina-n2-prod",
+  "format_version": 2,
+  "cluster_id": "litiaina-n2-2-prod",
   "epoch": 1,
+  "policy": {
+    "namespace_redundancy": 2,
+    "object_data_shards": 1,
+    "object_parity_shards": 1
+  },
+  "namespace_catalog": {
+    "generation": 1,
+    "replicas": [
+      { "node_id": "ns-a", "root_id": "ns-a-root" },
+      { "node_id": "ns-b", "root_id": "ns-b-root" }
+    ]
+  },
   "nodes": [
     {
-      "id": "node-a",
+      "id": "ns-a",
+      "role": "namespace",
       "endpoint": "https://192.168.0.22:50001",
       "native_endpoint": "n2://192.168.0.22:50002",
       "state": "online",
       "weight": 1,
-      "storage_roots": ["/mnt/n2/storage"]
+      "storage_roots": [
+        { "id": "ns-a-root", "path": "/mnt/namespace-a/n2" }
+      ],
+      "joined_epoch": 1
     },
     {
-      "id": "node-b",
+      "id": "ns-b",
+      "role": "namespace",
       "endpoint": "https://192.168.0.13:50001",
       "native_endpoint": "n2://192.168.0.13:50002",
       "state": "online",
       "weight": 1,
-      "storage_roots": ["/mnt/n2/storage"]
+      "storage_roots": [
+        { "id": "ns-b-root", "path": "/mnt/namespace-b/n2" }
+      ],
+      "joined_epoch": 1
     },
     {
-      "id": "node-c",
+      "id": "blob-a",
+      "role": "blob",
       "endpoint": "https://192.168.0.18:50001",
       "native_endpoint": "n2://192.168.0.18:50002",
       "state": "online",
       "weight": 1,
-      "storage_roots": ["/mnt/n2/storage"]
+      "storage_roots": [
+        { "id": "blob-a-root", "path": "/mnt/blob-a/n2" }
+      ],
+      "joined_epoch": 1
+    },
+    {
+      "id": "blob-b",
+      "role": "blob",
+      "endpoint": "https://192.168.0.19:50001",
+      "native_endpoint": "n2://192.168.0.19:50002",
+      "state": "online",
+      "weight": 1,
+      "storage_roots": [
+        { "id": "blob-b-root", "path": "/mnt/blob-b/n2" }
+      ],
+      "joined_epoch": 1
     }
   ]
 }
 ```
+
+All nodes use the identical membership document. Each node's local config names
+its own `node_id` and only the roots assigned to that node. Root IDs are stable
+identities; changing a mount path does not authorize rebinding a root identity
+to another node or role.
 
 Node states:
 
@@ -470,19 +520,18 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-storage_disks=/mnt/n2/storage
-fs_storage_path=/mnt/n2/control
+storage_roots=ns-a-root=/mnt/n2/storage
+runtime_path=/mnt/n2/control
 
 [cluster_config]
-node_id=node-a
+node_id=ns-a
+node_role=namespace
 node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
 membership_file=n2_membership.json
-cluster_layout_mode=auto
-auto_max_data_shards=8
-auto_max_parity_shards=3
-fixed_data_shards=
-fixed_parity_shards=
+namespace_redundancy=2
+object_data_shards=1
+object_parity_shards=1
 auto_rebalance=false
 ```
 
@@ -490,7 +539,7 @@ Node B and Node C use the same file with their own IDs and addresses.
 
 ### 3. Write The Membership File
 
-Place the same membership file on every node under `fs_storage_path`, or use an
+Place the same membership file on every node under `runtime_path`, or use an
 absolute `membership_file` path.
 
 ```json
@@ -1693,17 +1742,36 @@ Authorization: Bearer <token>
 
 Every node runs the scheduler, but only nodes in the deterministic bounded HA
 pool can own work. A stable fragment maps to one pool member, and that member
-must obtain a lease from the fragment's namespace voter quorum before scanning.
-The scan cursor is persisted under `fs_storage_path/.n2/auto-healing`, so a
-restart resumes rather than requiring one unbounded pass. Independent
-fragments run in bounded parallel; object repair uses per-object and
-per-fragment concurrency gates.
+must obtain a lease from the fragment catalog's namespace replica quorum before
+scanning. The object cursor is persisted under
+`runtime_path/.n2/auto-healing`, so bounded object work resumes after restart.
+Independent fragments run in bounded parallel. Directory inodes are visited
+one at a time; bounded continuation or lease renewal for a namespace walk that
+outlives its lease remains an explicit release gate.
 
 If a degraded object still has its recorded data-shard threshold, healing
-restores it. An unrecoverable object is reported as critical debt without
-freezing unrelated fragments. New writes already require a safe EC layout and
-namespace quorum, so topology loss naturally rejects unsafe mutations while
-readable recorded-layout objects remain readable.
+restores it to the exact recorded holders. The same cycle walks stable
+directory inodes, repairs missing or stale exact replicas from a certified
+complete snapshot, and verifies every repair before recording success.
+
+Every degraded inode or object produces an immutable JSON report under
+`runtime_path/.reports/auto-heal/<fragment>/`. Report files are local,
+disposable operational evidence: they are never replicated and are never used
+as storage authority. Reports identify the fragment, inode or object, known
+path, exact layout observations, repair attempt, and verified outcome.
+
+An unrepairable inode or object, a dangling namespace pointer, divergent
+immutable metadata, or an impossible recorded topology activates the durable
+cluster safety read-only latch. User mutations, GC, and rebalance stop;
+reconstructable reads and exact-layout repair remain available. A headless
+published object is reported and preserved without tripping the latch because
+blob publication intentionally precedes namespace publication and failed
+finalize can leave safe orphan residue. Incomplete namespace traversal or blob
+inventory defers headless classification instead of guessing.
+
+The safety latch survives restart and is intentionally sticky. N2 2.0 does not
+expose an unsafe delete-marker or force-clear API; a verified cluster-wide
+proof-and-clear procedure remains a release gate.
 
 ### Cluster Repair Plan
 
@@ -2035,18 +2103,18 @@ state simple and robust.
 ### Create And Use A Fragment
 
 ```bash
-curl -k -X POST https://node-a:50001/noa/v1/fragments \
+FRAGMENT_HASH=$(curl -sk -X POST https://node-a:50001/noa/v1/fragments \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "n2-test",
     "key": "123123",
     "secret": "'"$MASTER_KEY"'"
-  }'
+  }' | jq -r .fragment_hash)
 
 TOKEN=$(curl -sk https://node-a:50001/noa/v1/auth/fragment \
   -H 'Content-Type: application/json' \
   -d '{
-    "fragment": "n2-test",
+    "fragment": "'"$FRAGMENT_HASH"'",
     "secret": "123123",
     "read": true,
     "write": true,

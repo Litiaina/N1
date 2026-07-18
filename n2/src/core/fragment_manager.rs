@@ -13,6 +13,7 @@ use tokio::fs;
 use tokio::time::timeout;
 use tracing::info;
 
+use crate::distribution::membership::{NodeRole, active_cluster_runtime};
 use crate::{
     core::{
         disk_manager::ObjectPathManager,
@@ -150,7 +151,9 @@ pub(crate) async fn provision_fragment_local(
     identity_roots.dedup();
     ensure_fragment_identity_on_roots(&identity_roots, fragment_hash, stable_fragment_id).await?;
     prepare_fragment_storage_roots_strict(stable_fragment_id).await?;
-    ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
+    if active_cluster_runtime()?.local_role == NodeRole::Blob {
+        ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
+    }
     if read_fragment_metadata(fragment_hash).await.is_err() {
         let _ = init_fragment_metadata_strict(stable_fragment_id, key).await?;
     }
@@ -179,7 +182,9 @@ pub(crate) async fn apply_fragment_control_snapshot_local(
     ensure_fragment_identity_on_roots(&identity_roots, &snapshot.fragment_hash, stable_fragment_id)
         .await?;
     prepare_fragment_storage_roots_strict(stable_fragment_id).await?;
-    ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
+    if active_cluster_runtime()?.local_role == NodeRole::Blob {
+        ensure_fragment_blob_directories_strict(stable_fragment_id).await?;
+    }
     write_fragment_metadata_strict(&snapshot.metadata).await?;
     Ok(())
 }
@@ -297,6 +302,12 @@ pub async fn create_fragment(
             stable_fragment_id: stable_fragment_id.clone(),
             key: payload.key.clone(),
         },
+    )
+    .await?;
+    crate::namespace::catalog::provision_fragment_namespace(
+        active_cluster_runtime()?,
+        &hash,
+        &stable_fragment_id,
     )
     .await?;
 

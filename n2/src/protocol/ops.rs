@@ -1334,6 +1334,7 @@ fn require_read(claims: &Claims) -> Result<(), AppError> {
 }
 
 fn require_write(claims: &Claims) -> Result<(), AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     if claims.write {
         Ok(())
     } else {
@@ -1342,6 +1343,7 @@ fn require_write(claims: &Claims) -> Result<(), AppError> {
 }
 
 fn require_write_modify(claims: &Claims) -> Result<(), AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     if claims.write && claims.modify {
         Ok(())
     } else {
@@ -1352,6 +1354,7 @@ fn require_write_modify(claims: &Claims) -> Result<(), AppError> {
 }
 
 fn require_write_modify_delete(claims: &Claims) -> Result<(), AppError> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
     if claims.write && claims.modify && claims.delete {
         Ok(())
     } else {

@@ -803,11 +803,12 @@ pub fn build_distributed_maintenance_peer_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::membership::{ClusterNode, NodeState};
+    use crate::distribution::membership::{ClusterNode, NodeRole, NodeState};
 
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.to_string(),
+            role: NodeRole::Blob,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),

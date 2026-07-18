@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::distribution::dentry_group::configured_namespace_replicas;
-use crate::distribution::dentry_group::quorum_required;
 use crate::distribution::dentry_service::DistributedNamespace;
+use crate::distribution::membership::active_cluster_runtime;
 use crate::enums::app_error_enum::AppError;
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -32,27 +31,16 @@ pub struct NamespaceReplicaRepairReport {
     pub selected_source: Option<String>,
 }
 
-pub fn namespace_db_path_for_root(root: &Path, _fragment: &str, partition_id: u16) -> PathBuf {
-    root.join(".n2")
-        .join("namespace")
-        .join("partitions")
-        .join(format!("{partition_id:016x}"))
-}
-
-pub fn namespace_db_paths_for_roots(fragment: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
-    roots
-        .iter()
-        .map(|root| namespace_db_path_for_root(root, fragment, 0))
-        .collect()
-}
-
 pub async fn inspect_namespace_replicas(
     fragment: &str,
     _storage_roots: &[PathBuf],
 ) -> Result<NamespaceReplicaInspection, AppError> {
-    let expected = configured_namespace_replicas() as u64;
-    let quorum = quorum_required(expected as usize) as u64;
-    match DistributedNamespace::object_reference_counts(fragment).await {
+    let expected = active_cluster_runtime()?
+        .membership
+        .policy
+        .namespace_redundancy as u64;
+    let quorum = (expected / 2).saturating_add(1);
+    match DistributedNamespace::list_directory(fragment, "").await {
         Ok(_) => Ok(NamespaceReplicaInspection {
             fragment: fragment.to_string(),
             expected_replicas: expected,
@@ -61,7 +49,7 @@ pub async fn inspect_namespace_replicas(
             healthy: true,
             quorum_verified: true,
             replica_counts_complete: false,
-            canonical_path: Some(".n2/namespace/partitions".into()),
+            canonical_path: Some("@f_<fragment>/.namespace/@i_<inode>".into()),
             ..NamespaceReplicaInspection::default()
         }),
         Err(AppError::ServiceUnavailable(_)) | Err(AppError::Timeout(_)) => {
@@ -72,7 +60,7 @@ pub async fn inspect_namespace_replicas(
                 healthy: false,
                 quorum_verified: false,
                 replica_counts_complete: false,
-                canonical_path: Some(".n2/namespace/partitions".into()),
+                canonical_path: Some("@f_<fragment>/.namespace/@i_<inode>".into()),
                 ..NamespaceReplicaInspection::default()
             })
         }

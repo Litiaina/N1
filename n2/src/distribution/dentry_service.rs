@@ -1,30 +1,31 @@
-use crate::distribution::dentry_quorum::{quorum_get_dentry, quorum_list_parent};
-use crate::distribution::dentry_transaction::commit_namespace_transaction;
-use crate::distribution::membership::active_cluster_runtime;
+use crate::distribution::inode::{
+    InodeReadKind, PeerInodeReadRequest, ReplicatedInodeMutation, commit_replicated_mutation,
+    commit_replicated_transaction, create_replicated_inode, quorum_read, select_inode_layout,
+};
+use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::dentry::{
-    DentryKey, DentryTarget, DirectoryLayout, NamespaceDentry, TrashContext, new_directory_id,
-    root_directory_id, trash_directory_id, virtual_partition,
+use crate::namespace::catalog::{FragmentNamespace, resolve_fragment_namespace};
+use crate::namespace::inode_store::{
+    DirectoryInode, InodeDentry, InodeDentryTarget, InodeLayout, InodeMutationChange,
+    PreparedInodeMutation, TrashOrigin,
 };
 use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, parent_path};
-use crate::namespace::transaction::{NamespaceTransactionLeg, PreparedNamespacePartition};
-use crate::settings::config::CONFIG;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use chrono::Utc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use ulid::Ulid;
 
 #[derive(Debug, Clone)]
 pub struct DistributedResolvedDirectory {
     pub path: String,
-    pub directory_id: String,
-    pub layout: DirectoryLayout,
+    pub inode: DirectoryInode,
 }
 
 #[derive(Debug, Clone)]
 pub struct DistributedResolvedEntry {
     pub path: String,
-    pub parent_directory_id: String,
-    pub parent_layout: DirectoryLayout,
-    pub record: NamespaceDentry,
+    pub parent: DirectoryInode,
+    pub record: InodeDentry,
 }
 
 pub struct DistributedNamespace;
@@ -34,82 +35,35 @@ impl DistributedNamespace {
         fragment: &str,
         path: &str,
     ) -> Result<DistributedResolvedDirectory, AppError> {
-        let path = normalize_user_path(path)?;
-        let mut directory = DistributedResolvedDirectory {
-            path: String::new(),
-            directory_id: root_directory_id(fragment),
-            layout: DirectoryLayout::default(),
-        };
-        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-            let key = DentryKey {
-                fragment: fragment.to_string(),
-                parent_directory_id: directory.directory_id.clone(),
-                name: segment.to_string(),
-            };
-            let entry = quorum_get_dentry(key, directory.layout)
-                .await?
-                .ok_or(AppError::NotFound)?;
-            match entry.target {
-                DentryTarget::Directory {
-                    directory_id,
-                    layout,
-                } => {
-                    directory = DistributedResolvedDirectory {
-                        path: join_path(&directory.path, segment),
-                        directory_id,
-                        layout,
-                    };
-                }
-                DentryTarget::Object { .. } => {
-                    return Err(AppError::BadRequest(format!(
-                        "namespace path '{}' is a file",
-                        join_path(&directory.path, segment)
-                    )));
-                }
-            }
-        }
-        Ok(directory)
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
+        resolve_directory_with(runtime, &namespace, path).await
     }
 
     pub async fn resolve_entry(
         fragment: &str,
         path: &str,
     ) -> Result<Option<DistributedResolvedEntry>, AppError> {
-        let path = normalize_user_path(path)?;
-        if path.is_empty() {
-            return Ok(None);
-        }
-        let parent = Self::resolve_directory(fragment, &parent_path(&path)).await?;
-        let key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: parent.directory_id.clone(),
-            name: base_name(&path),
-        };
-        Ok(quorum_get_dentry(key, parent.layout)
-            .await?
-            .map(|record| DistributedResolvedEntry {
-                path,
-                parent_directory_id: parent.directory_id,
-                parent_layout: parent.layout,
-                record,
-            }))
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
+        resolve_entry_with(runtime, &namespace, path).await
     }
 
-    pub async fn list_directory(
-        fragment: &str,
-        path: &str,
-    ) -> Result<Vec<NamespaceDentry>, AppError> {
+    pub async fn list_directory(fragment: &str, path: &str) -> Result<Vec<InodeDentry>, AppError> {
         let directory = Self::resolve_directory(fragment, path).await?;
-        quorum_list_parent(fragment, &directory.directory_id, directory.layout).await
+        list_inode(&directory.inode).await
     }
 
-    pub async fn list_trash(fragment: &str) -> Result<Vec<NamespaceDentry>, AppError> {
-        quorum_list_parent(
-            fragment,
-            &trash_directory_id(fragment),
-            DirectoryLayout::default(),
+    pub async fn list_trash(fragment: &str) -> Result<Vec<InodeDentry>, AppError> {
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime, fragment).await?;
+        let trash = read_inode(
+            &namespace.stable_fragment_id,
+            &namespace.trash_inode_id,
+            &namespace.trash_layout,
         )
-        .await
+        .await?;
+        list_inode(&trash).await
     }
 
     pub async fn mkdir_all(
@@ -118,89 +72,83 @@ impl DistributedNamespace {
         mutation_id: &str,
         now_unix: i64,
     ) -> Result<DistributedResolvedDirectory, AppError> {
+        crate::core::operation_gate::ensure_client_mutation_allowed()?;
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
         let path = normalize_user_path(path)?;
-        let mut directory = DistributedResolvedDirectory {
-            path: String::new(),
-            directory_id: root_directory_id(fragment),
-            layout: DirectoryLayout::default(),
-        };
+        let mut directory = read_root(&namespace).await?;
+        let mut resolved_path = String::new();
+
         for (index, segment) in path
             .split('/')
             .filter(|segment| !segment.is_empty())
             .enumerate()
         {
-            let key = DentryKey {
-                fragment: fragment.to_string(),
-                parent_directory_id: directory.directory_id.clone(),
-                name: segment.to_string(),
-            };
-            let entry = match quorum_get_dentry(key.clone(), directory.layout).await? {
-                Some(entry) => entry,
-                None => {
-                    let child_id = new_directory_id();
-                    let child_layout = DirectoryLayout {
-                        shard_bits: DirectoryLayout::default().shard_bits,
-                        epoch: active_cluster_runtime()?.membership.epoch,
-                    };
-                    let record = NamespaceDentry {
-                        key: key.clone(),
-                        target: DentryTarget::Directory {
-                            directory_id: child_id,
-                            layout: child_layout,
-                        },
-                        generation: 1,
-                        last_mutation_id: format!("{mutation_id}-{index}"),
-                        created_at_unix: now_unix,
-                        updated_at_unix: now_unix,
-                        trash: None,
-                    };
-                    let partition = virtual_partition(
-                        fragment,
-                        &key.parent_directory_id,
-                        &key.name,
-                        directory.layout,
-                    );
-                    let prepared = PreparedNamespacePartition {
-                        transaction_id: record.last_mutation_id.clone(),
-                        virtual_partition: partition,
-                        prepared_at_unix: now_unix,
-                        legs: vec![NamespaceTransactionLeg::Insert {
-                            record: record.clone(),
-                            parent_layout: directory.layout,
-                        }],
-                    };
-                    match commit_namespace_transaction(vec![prepared]).await {
-                        Ok(_) => record,
-                        Err(err @ AppError::Conflict(_)) => {
-                            match quorum_get_dentry(key.clone(), directory.layout).await? {
-                                Some(entry) => entry,
-                                None => return Err(err),
-                            }
+            if let Some(entry) = read_dentry(&directory, segment).await? {
+                directory = directory_from_target(
+                    &namespace.stable_fragment_id,
+                    &entry,
+                    &join_path(&resolved_path, segment),
+                )
+                .await?;
+                resolved_path = join_path(&resolved_path, segment);
+                continue;
+            }
+
+            let inode_id = Ulid::new().to_string();
+            let layout =
+                select_inode_layout(&runtime, &namespace.stable_fragment_id, &inode_id).await?;
+            let child = DirectoryInode::new(
+                namespace.stable_fragment_id.clone(),
+                inode_id.clone(),
+                Some(directory.inode_id.clone()),
+                layout.clone(),
+                unix_seconds_to_nanos(now_unix),
+            )?;
+            create_replicated_inode(runtime.clone(), child.clone()).await?;
+            let dentry = InodeDentry::live(
+                segment.to_string(),
+                InodeDentryTarget::Directory { inode_id, layout },
+                unix_seconds_to_nanos(now_unix),
+            )?;
+            let mutation = PreparedInodeMutation::new(
+                namespace.stable_fragment_id.clone(),
+                directory.inode_id.clone(),
+                directory.generation,
+                format!("{mutation_id}-{index}"),
+                unix_seconds_to_nanos(now_unix),
+                vec![InodeMutationChange::Upsert { dentry }],
+            )?;
+            match commit_replicated_mutation(runtime.clone(), directory.layout.clone(), mutation)
+                .await
+            {
+                Ok(_) => directory = child,
+                Err(error) => {
+                    let refreshed = read_inode(
+                        &namespace.stable_fragment_id,
+                        &directory.inode_id,
+                        &directory.layout,
+                    )
+                    .await?;
+                    match read_dentry(&refreshed, segment).await? {
+                        Some(entry) => {
+                            directory = directory_from_target(
+                                &namespace.stable_fragment_id,
+                                &entry,
+                                &join_path(&resolved_path, segment),
+                            )
+                            .await?;
                         }
-                        Err(err) => return Err(err),
+                        None => return Err(error),
                     }
                 }
-            };
-            match entry.target {
-                DentryTarget::Directory {
-                    directory_id,
-                    layout,
-                } => {
-                    directory = DistributedResolvedDirectory {
-                        path: join_path(&directory.path, segment),
-                        directory_id,
-                        layout,
-                    };
-                }
-                DentryTarget::Object { .. } => {
-                    return Err(AppError::Conflict(format!(
-                        "cannot create directory through file '{}'",
-                        join_path(&directory.path, segment)
-                    )));
-                }
             }
+            resolved_path = join_path(&resolved_path, segment);
         }
-        Ok(directory)
+        Ok(DistributedResolvedDirectory {
+            path: resolved_path,
+            inode: directory,
+        })
     }
 
     pub async fn publish_object(
@@ -209,7 +157,8 @@ impl DistributedNamespace {
         object_id: &str,
         mutation_id: &str,
         now_unix: i64,
-    ) -> Result<NamespaceDentry, AppError> {
+    ) -> Result<InodeDentry, AppError> {
+        crate::core::operation_gate::ensure_client_mutation_allowed()?;
         let path = normalize_user_path(path)?;
         if path.is_empty() {
             return Err(AppError::BadRequest(
@@ -223,15 +172,11 @@ impl DistributedNamespace {
             now_unix,
         )
         .await?;
-        let key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: parent.directory_id,
-            name: base_name(&path),
-        };
-        if let Some(existing) = quorum_get_dentry(key.clone(), parent.layout).await? {
+        let name = base_name(&path);
+        if let Some(existing) = read_dentry(&parent.inode, &name).await? {
             if existing.target
-                == (DentryTarget::Object {
-                    object_id: object_id.to_string(),
+                == (InodeDentryTarget::Object {
+                    object_id: object_id.into(),
                 })
             {
                 return Ok(existing);
@@ -240,30 +185,24 @@ impl DistributedNamespace {
                 "namespace path '{path}' already exists"
             )));
         }
-        let record = NamespaceDentry {
-            key: key.clone(),
-            target: DentryTarget::Object {
-                object_id: object_id.to_string(),
+        let dentry = InodeDentry::live(
+            name,
+            InodeDentryTarget::Object {
+                object_id: object_id.into(),
             },
-            generation: 1,
-            last_mutation_id: mutation_id.to_string(),
-            created_at_unix: now_unix,
-            updated_at_unix: now_unix,
-            trash: None,
-        };
-        let partition =
-            virtual_partition(fragment, &key.parent_directory_id, &key.name, parent.layout);
-        commit_namespace_transaction(vec![PreparedNamespacePartition {
-            transaction_id: mutation_id.to_string(),
-            virtual_partition: partition,
-            prepared_at_unix: now_unix,
-            legs: vec![NamespaceTransactionLeg::Insert {
-                record: record.clone(),
-                parent_layout: parent.layout,
+            unix_seconds_to_nanos(now_unix),
+        )?;
+        commit_single(
+            active_cluster_runtime()?,
+            &parent.inode,
+            mutation_id,
+            now_unix,
+            vec![InodeMutationChange::Upsert {
+                dentry: dentry.clone(),
             }],
-        }])
+        )
         .await?;
-        Ok(record)
+        Ok(dentry)
     }
 
     pub async fn rename(
@@ -272,7 +211,8 @@ impl DistributedNamespace {
         destination_path: &str,
         mutation_id: &str,
         now_unix: i64,
-    ) -> Result<NamespaceDentry, AppError> {
+    ) -> Result<InodeDentry, AppError> {
+        crate::core::operation_gate::ensure_client_mutation_allowed()?;
         let source_path = normalize_user_path(source_path)?;
         let destination_path = normalize_user_path(destination_path)?;
         if source_path.is_empty() || destination_path.is_empty() {
@@ -283,25 +223,38 @@ impl DistributedNamespace {
                 "destination cannot be inside the source subtree".into(),
             ));
         }
-        let source = Self::resolve_entry(fragment, &source_path)
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
+        let source = resolve_entry_with(runtime.clone(), &namespace, &source_path)
             .await?
             .ok_or(AppError::NotFound)?;
         let destination_parent =
-            Self::resolve_directory(fragment, &parent_path(&destination_path)).await?;
-        let destination_key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: destination_parent.directory_id,
-            name: base_name(&destination_path),
-        };
-        Self::move_entry(
-            source,
-            destination_key,
-            destination_parent.layout,
+            resolve_directory_with(runtime.clone(), &namespace, &parent_path(&destination_path))
+                .await?;
+        let destination_name = base_name(&destination_path);
+        if read_dentry(&destination_parent.inode, &destination_name)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::Conflict(format!(
+                "destination '{destination_path}' already exists"
+            )));
+        }
+        let mut moved = source.record.clone();
+        moved.name = destination_name;
+        moved.trash = None;
+        move_between_inodes(
+            runtime,
+            &namespace.stable_fragment_id,
+            &source.parent,
+            &source.record.name,
+            &destination_parent.inode,
+            moved.clone(),
             mutation_id,
             now_unix,
-            None,
         )
-        .await
+        .await?;
+        Ok(moved)
     }
 
     pub async fn trash(
@@ -310,34 +263,49 @@ impl DistributedNamespace {
         trash_entry_id: &str,
         mutation_id: &str,
         now_unix: i64,
-    ) -> Result<NamespaceDentry, AppError> {
+    ) -> Result<InodeDentry, AppError> {
+        crate::core::operation_gate::ensure_client_mutation_allowed()?;
         let path = normalize_user_path(path)?;
         if path.is_empty() {
             return Err(AppError::BadRequest("root cannot be trashed".into()));
         }
-        let source = Self::resolve_entry(fragment, &path)
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
+        let source = resolve_entry_with(runtime.clone(), &namespace, &path)
             .await?
             .ok_or(AppError::NotFound)?;
-        let context = TrashContext {
-            original_parent_directory_id: source.parent_directory_id.clone(),
-            original_parent_layout: source.parent_layout,
-            original_name: source.record.key.name.clone(),
-            original_path: path,
-            deleted_at_unix: now_unix,
-        };
-        Self::move_entry(
-            source,
-            DentryKey {
-                fragment: fragment.to_string(),
-                parent_directory_id: trash_directory_id(fragment),
-                name: trash_entry_id.to_string(),
-            },
-            DirectoryLayout::default(),
+        let trash = read_inode(
+            &namespace.stable_fragment_id,
+            &namespace.trash_inode_id,
+            &namespace.trash_layout,
+        )
+        .await?;
+        if read_dentry(&trash, trash_entry_id).await?.is_some() {
+            return Err(AppError::Conflict(
+                "trash entry identity already exists".into(),
+            ));
+        }
+        let mut moved = source.record.clone();
+        moved.name = trash_entry_id.into();
+        moved.trash = Some(TrashOrigin {
+            parent_inode_id: source.parent.inode_id.clone(),
+            parent_layout: source.parent.layout.clone(),
+            name: source.record.name.clone(),
+            path: path.clone(),
+            deleted_at_unix_nanos: unix_seconds_to_nanos(now_unix),
+        });
+        move_between_inodes(
+            runtime,
+            &namespace.stable_fragment_id,
+            &source.parent,
+            &source.record.name,
+            &trash,
+            moved.clone(),
             mutation_id,
             now_unix,
-            Some(context),
         )
-        .await
+        .await?;
+        Ok(moved)
     }
 
     pub async fn restore(
@@ -345,171 +313,127 @@ impl DistributedNamespace {
         trash_entry_id: &str,
         mutation_id: &str,
         now_unix: i64,
-    ) -> Result<NamespaceDentry, AppError> {
-        let key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: trash_directory_id(fragment),
-            name: trash_entry_id.to_string(),
-        };
-        let record = quorum_get_dentry(key.clone(), DirectoryLayout::default())
+    ) -> Result<InodeDentry, AppError> {
+        crate::core::operation_gate::ensure_client_mutation_allowed()?;
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
+        let trash = read_inode(
+            &namespace.stable_fragment_id,
+            &namespace.trash_inode_id,
+            &namespace.trash_layout,
+        )
+        .await?;
+        let source = read_dentry(&trash, trash_entry_id)
             .await?
             .ok_or(AppError::NotFound)?;
-        let context = record.trash.clone().ok_or_else(|| {
-            AppError::InternalServerError("trash dentry has no restore context".into())
-        })?;
-        let expires_at = context.deleted_at_unix.saturating_add(
-            i64::try_from(CONFIG.garbage_collector.retention_seconds).unwrap_or(i64::MAX),
-        );
-        if now_unix >= expires_at {
+        let origin = source
+            .trash
+            .clone()
+            .ok_or_else(|| AppError::Conflict("trash entry has no restore origin".into()))?;
+        let live_parent =
+            resolve_directory_with(runtime.clone(), &namespace, &parent_path(&origin.path))
+                .await
+                .map_err(|_| {
+                    AppError::Conflict("restore parent is not live; restore it first".into())
+                })?;
+        if live_parent.inode.inode_id != origin.parent_inode_id
+            || live_parent.inode.layout != origin.parent_layout
+        {
             return Err(AppError::Conflict(
-                "trash retention expired; lifecycle owns permanent deletion".into(),
+                "restore parent identity no longer matches the recorded origin".into(),
             ));
         }
-        let destination_key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: context.original_parent_directory_id.clone(),
-            name: context.original_name.clone(),
-        };
-        let restored = Self::move_entry(
-            DistributedResolvedEntry {
-                path: context.original_path.clone(),
-                parent_directory_id: key.parent_directory_id,
-                parent_layout: DirectoryLayout::default(),
-                record: record.clone(),
-            },
-            destination_key.clone(),
-            context.original_parent_layout,
+        if read_dentry(&live_parent.inode, &origin.name)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::Conflict(format!(
+                "restore destination '{}' already exists",
+                origin.path
+            )));
+        }
+        let mut restored = source.clone();
+        restored.name = origin.name;
+        restored.trash = None;
+        move_between_inodes(
+            runtime,
+            &namespace.stable_fragment_id,
+            &trash,
+            trash_entry_id,
+            &live_parent.inode,
+            restored.clone(),
             mutation_id,
             now_unix,
-            None,
         )
-        .await;
-        match restored {
-            Ok(record) => Ok(record),
-            Err(AppError::Conflict(message)) if message.contains("destination") => {
-                let Some(existing) =
-                    quorum_get_dentry(destination_key, context.original_parent_layout).await?
-                else {
-                    return Err(AppError::Conflict(message));
-                };
-                if existing.target == record.target && existing.trash.is_none() {
-                    Ok(existing)
-                } else {
-                    Err(AppError::Conflict(message))
-                }
-            }
-            Err(err) => Err(err),
-        }
+        .await?;
+        Ok(restored)
     }
 
-    pub async fn purge_expired_reference(
+    pub async fn purge_expired(
         fragment: &str,
         trash_entry_id: &str,
         ttl_seconds: u64,
         now_unix: i64,
         mutation_id: &str,
-    ) -> Result<DentryTarget, AppError> {
-        let key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: trash_directory_id(fragment),
-            name: trash_entry_id.to_string(),
-        };
-        let record = quorum_get_dentry(key.clone(), DirectoryLayout::default())
+    ) -> Result<InodeDentryTarget, AppError> {
+        crate::core::operation_gate::ensure_client_mutation_allowed()?;
+        let runtime = active_cluster_runtime()?;
+        let namespace = resolve_fragment_namespace(runtime.clone(), fragment).await?;
+        let trash = read_inode(
+            &namespace.stable_fragment_id,
+            &namespace.trash_inode_id,
+            &namespace.trash_layout,
+        )
+        .await?;
+        let entry = read_dentry(&trash, trash_entry_id)
             .await?
             .ok_or(AppError::NotFound)?;
-        let context = record.trash.as_ref().ok_or_else(|| {
-            AppError::InternalServerError("trash dentry has no lifecycle context".into())
-        })?;
-        let expires_at = context
-            .deleted_at_unix
+        let origin = entry
+            .trash
+            .as_ref()
+            .ok_or_else(|| AppError::Conflict("trash entry has no lifecycle timestamp".into()))?;
+        let expires_at = nanos_to_unix_seconds(origin.deleted_at_unix_nanos)
             .saturating_add(i64::try_from(ttl_seconds).unwrap_or(i64::MAX));
         if now_unix < expires_at {
             return Err(AppError::Conflict(format!(
                 "trash entry is retained until unix timestamp {expires_at}"
             )));
         }
-        let partition = virtual_partition(
-            fragment,
-            &key.parent_directory_id,
-            &key.name,
-            DirectoryLayout::default(),
-        );
-        commit_namespace_transaction(vec![PreparedNamespacePartition {
-            transaction_id: mutation_id.to_string(),
-            virtual_partition: partition,
-            prepared_at_unix: now_unix,
-            legs: vec![NamespaceTransactionLeg::Remove {
-                key,
-                parent_layout: DirectoryLayout::default(),
-                expected_generation: record.generation,
+        commit_single(
+            runtime,
+            &trash,
+            mutation_id,
+            now_unix,
+            vec![InodeMutationChange::Remove {
+                name: trash_entry_id.into(),
             }],
-        }])
+        )
         .await?;
-        Ok(record.target)
+        Ok(entry.target)
     }
 
-    pub async fn collect_target_object_ids(
+    pub async fn list_inode_dentries(
         fragment: &str,
-        target: &DentryTarget,
-    ) -> Result<BTreeSet<String>, AppError> {
-        Ok(Self::collect_target_reference_counts(fragment, target)
-            .await?
-            .into_keys()
-            .collect())
+        inode_id: &str,
+        layout: &InodeLayout,
+    ) -> Result<Vec<InodeDentry>, AppError> {
+        let inode = read_inode(fragment, inode_id, layout).await?;
+        list_inode(&inode).await
     }
 
     pub async fn collect_target_reference_counts(
         fragment: &str,
-        target: &DentryTarget,
+        target: &InodeDentryTarget,
     ) -> Result<BTreeMap<String, u64>, AppError> {
-        let mut object_ids = BTreeMap::new();
-        let mut directories = Vec::new();
-        match target {
-            DentryTarget::Object { object_id } => {
-                object_ids.insert(object_id.clone(), 1);
-            }
-            DentryTarget::Directory {
-                directory_id,
-                layout,
-            } => directories.push((directory_id.clone(), *layout)),
-        }
-        while let Some((directory_id, layout)) = directories.pop() {
-            for entry in quorum_list_parent(fragment, &directory_id, layout).await? {
-                match entry.target {
-                    DentryTarget::Object { object_id } => {
-                        let count = object_ids.entry(object_id).or_insert(0u64);
-                        *count = count.saturating_add(1);
-                    }
-                    DentryTarget::Directory {
-                        directory_id,
-                        layout,
-                    } => directories.push((directory_id, layout)),
-                }
-            }
-        }
-        Ok(object_ids)
-    }
-
-    pub async fn object_reference_counts(
-        fragment: &str,
-    ) -> Result<BTreeMap<String, u64>, AppError> {
+        let namespace = resolve_fragment_namespace(active_cluster_runtime()?, fragment).await?;
         let mut counts = BTreeMap::new();
-        let mut directories = vec![
-            (root_directory_id(fragment), DirectoryLayout::default()),
-            (trash_directory_id(fragment), DirectoryLayout::default()),
-        ];
-        while let Some((directory_id, layout)) = directories.pop() {
-            for entry in quorum_list_parent(fragment, &directory_id, layout).await? {
-                match entry.target {
-                    DentryTarget::Object { object_id } => {
-                        let count = counts.entry(object_id).or_insert(0u64);
-                        *count = count.saturating_add(1);
-                    }
-                    DentryTarget::Directory {
-                        directory_id,
-                        layout,
-                    } => directories.push((directory_id, layout)),
-                }
+        let mut directories = Vec::new();
+        collect_target(target, &mut counts, &mut directories)?;
+        while let Some((inode_id, layout)) = directories.pop() {
+            for entry in
+                Self::list_inode_dentries(&namespace.stable_fragment_id, &inode_id, &layout).await?
+            {
+                collect_target(&entry.target, &mut counts, &mut directories)?;
             }
         }
         Ok(counts)
@@ -522,150 +446,277 @@ impl DistributedNamespace {
         now_unix: i64,
         mutation_id: &str,
     ) -> Result<BTreeSet<String>, AppError> {
-        let trash_key = DentryKey {
-            fragment: fragment.to_string(),
-            parent_directory_id: trash_directory_id(fragment),
-            name: trash_entry_id.to_string(),
-        };
-        let trash_record = quorum_get_dentry(trash_key, DirectoryLayout::default())
+        let entry = Self::list_trash(fragment)
             .await?
+            .into_iter()
+            .find(|entry| entry.name == trash_entry_id)
             .ok_or(AppError::NotFound)?;
-        let context = trash_record.trash.as_ref().ok_or_else(|| {
-            AppError::InternalServerError("trash dentry has no lifecycle context".into())
-        })?;
-        let expires_at = context
-            .deleted_at_unix
-            .saturating_add(i64::try_from(ttl_seconds).unwrap_or(i64::MAX));
-        if now_unix < expires_at {
-            return Err(AppError::Conflict(format!(
-                "trash entry is retained until unix timestamp {expires_at}"
-            )));
-        }
-
-        let mut objects = BTreeSet::new();
-        let mut descendants = Vec::new();
-        let mut directories = Vec::new();
-        match &trash_record.target {
-            DentryTarget::Object { object_id } => {
-                objects.insert(object_id.clone());
-            }
-            DentryTarget::Directory {
-                directory_id,
-                layout,
-            } => directories.push((directory_id.clone(), *layout)),
-        }
-        while let Some((directory_id, layout)) = directories.pop() {
-            for entry in quorum_list_parent(fragment, &directory_id, layout).await? {
-                match &entry.target {
-                    DentryTarget::Object { object_id } => {
-                        objects.insert(object_id.clone());
-                    }
-                    DentryTarget::Directory {
-                        directory_id,
-                        layout,
-                    } => directories.push((directory_id.clone(), *layout)),
-                }
-                descendants.push((entry, layout));
-            }
-        }
-
-        for (index, (entry, parent_layout)) in descendants.into_iter().enumerate() {
-            let partition = virtual_partition(
-                fragment,
-                &entry.key.parent_directory_id,
-                &entry.key.name,
-                parent_layout,
-            );
-            let transaction_id = format!("{mutation_id}-descendant-{index}");
-            commit_namespace_transaction(vec![PreparedNamespacePartition {
-                transaction_id,
-                virtual_partition: partition,
-                prepared_at_unix: now_unix,
-                legs: vec![NamespaceTransactionLeg::Remove {
-                    key: entry.key,
-                    parent_layout,
-                    expected_generation: entry.generation,
-                }],
-            }])
-            .await?;
-        }
-        Self::purge_expired_reference(fragment, trash_entry_id, ttl_seconds, now_unix, mutation_id)
-            .await?;
-        Ok(objects)
-    }
-
-    async fn move_entry(
-        source: DistributedResolvedEntry,
-        destination_key: DentryKey,
-        destination_layout: DirectoryLayout,
-        mutation_id: &str,
-        now_unix: i64,
-        trash: Option<TrashContext>,
-    ) -> Result<NamespaceDentry, AppError> {
-        if quorum_get_dentry(destination_key.clone(), destination_layout)
+        let objects = Self::collect_target_reference_counts(fragment, &entry.target)
             .await?
-            .is_some()
-        {
-            return Err(AppError::Conflict(format!(
-                "namespace destination '{}' already exists",
-                destination_key.name
-            )));
-        }
-        let destination = NamespaceDentry {
-            key: destination_key.clone(),
-            target: source.record.target.clone(),
-            generation: source.record.generation.saturating_add(1),
-            last_mutation_id: mutation_id.to_string(),
-            created_at_unix: source.record.created_at_unix,
-            updated_at_unix: now_unix,
-            trash,
-        };
-        let remove_partition = virtual_partition(
-            &source.record.key.fragment,
-            &source.record.key.parent_directory_id,
-            &source.record.key.name,
-            source.parent_layout,
-        );
-        let insert_partition = virtual_partition(
-            &destination.key.fragment,
-            &destination.key.parent_directory_id,
-            &destination.key.name,
-            destination_layout,
-        );
-        let mut partitions: BTreeMap<u64, Vec<NamespaceTransactionLeg>> = BTreeMap::new();
-        partitions
-            .entry(remove_partition)
-            .or_default()
-            .push(NamespaceTransactionLeg::Remove {
-                key: source.record.key,
-                parent_layout: source.parent_layout,
-                expected_generation: source.record.generation,
-            });
-        partitions
-            .entry(insert_partition)
-            .or_default()
-            .push(NamespaceTransactionLeg::Insert {
-                record: destination.clone(),
-                parent_layout: destination_layout,
-            });
-        commit_namespace_transaction(
-            partitions
-                .into_iter()
-                .map(|(virtual_partition, legs)| PreparedNamespacePartition {
-                    transaction_id: mutation_id.to_string(),
-                    virtual_partition,
-                    prepared_at_unix: now_unix,
-                    legs,
-                })
-                .collect(),
-        )
-        .await?;
-        Ok(destination)
+            .into_keys()
+            .collect();
+        Self::purge_expired(fragment, trash_entry_id, ttl_seconds, now_unix, mutation_id).await?;
+        Ok(objects)
     }
 }
 
+fn collect_target(
+    target: &InodeDentryTarget,
+    counts: &mut BTreeMap<String, u64>,
+    directories: &mut Vec<(String, InodeLayout)>,
+) -> Result<(), AppError> {
+    match target {
+        InodeDentryTarget::Object { object_id } => {
+            let count = counts.entry(object_id.clone()).or_insert(0u64);
+            *count = count.saturating_add(1);
+        }
+        InodeDentryTarget::Directory { inode_id, layout } => {
+            directories.push((inode_id.clone(), layout.clone()));
+        }
+        InodeDentryTarget::Symlink { .. } => {}
+        InodeDentryTarget::Fragment { .. } => {
+            return Err(AppError::Conflict(
+                "fragment catalog target appeared inside a fragment namespace".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn read_root(namespace: &FragmentNamespace) -> Result<DirectoryInode, AppError> {
+    read_inode(
+        &namespace.stable_fragment_id,
+        &namespace.root_inode_id,
+        &namespace.root_layout,
+    )
+    .await
+}
+
+async fn read_inode(
+    fragment_id: &str,
+    inode_id: &str,
+    layout: &InodeLayout,
+) -> Result<DirectoryInode, AppError> {
+    Ok(quorum_read(
+        active_cluster_runtime()?,
+        PeerInodeReadRequest {
+            fragment_id: fragment_id.into(),
+            inode_id: inode_id.into(),
+            layout: layout.clone(),
+            kind: InodeReadKind::Inode,
+            name: None,
+        },
+    )
+    .await?
+    .inode)
+}
+
+async fn read_dentry(
+    directory: &DirectoryInode,
+    name: &str,
+) -> Result<Option<InodeDentry>, AppError> {
+    Ok(quorum_read(
+        active_cluster_runtime()?,
+        PeerInodeReadRequest {
+            fragment_id: directory.fragment_id.clone(),
+            inode_id: directory.inode_id.clone(),
+            layout: directory.layout.clone(),
+            kind: InodeReadKind::Dentry,
+            name: Some(name.into()),
+        },
+    )
+    .await?
+    .dentry)
+}
+
+async fn list_inode(directory: &DirectoryInode) -> Result<Vec<InodeDentry>, AppError> {
+    Ok(quorum_read(
+        active_cluster_runtime()?,
+        PeerInodeReadRequest {
+            fragment_id: directory.fragment_id.clone(),
+            inode_id: directory.inode_id.clone(),
+            layout: directory.layout.clone(),
+            kind: InodeReadKind::List,
+            name: None,
+        },
+    )
+    .await?
+    .entries)
+}
+
+async fn resolve_directory_with(
+    runtime: Arc<ClusterRuntime>,
+    namespace: &FragmentNamespace,
+    path: &str,
+) -> Result<DistributedResolvedDirectory, AppError> {
+    let path = normalize_user_path(path)?;
+    let mut inode = read_root(namespace).await?;
+    let mut resolved_path = String::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        let entry = quorum_read(
+            runtime.clone(),
+            PeerInodeReadRequest {
+                fragment_id: namespace.stable_fragment_id.clone(),
+                inode_id: inode.inode_id.clone(),
+                layout: inode.layout.clone(),
+                kind: InodeReadKind::Dentry,
+                name: Some(segment.into()),
+            },
+        )
+        .await?
+        .dentry
+        .ok_or(AppError::NotFound)?;
+        resolved_path = join_path(&resolved_path, segment);
+        inode =
+            directory_from_target(&namespace.stable_fragment_id, &entry, &resolved_path).await?;
+    }
+    Ok(DistributedResolvedDirectory {
+        path: resolved_path,
+        inode,
+    })
+}
+
+async fn resolve_entry_with(
+    runtime: Arc<ClusterRuntime>,
+    namespace: &FragmentNamespace,
+    path: &str,
+) -> Result<Option<DistributedResolvedEntry>, AppError> {
+    let path = normalize_user_path(path)?;
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let parent = resolve_directory_with(runtime.clone(), namespace, &parent_path(&path)).await?;
+    let record = quorum_read(
+        runtime,
+        PeerInodeReadRequest {
+            fragment_id: namespace.stable_fragment_id.clone(),
+            inode_id: parent.inode.inode_id.clone(),
+            layout: parent.inode.layout.clone(),
+            kind: InodeReadKind::Dentry,
+            name: Some(base_name(&path)),
+        },
+    )
+    .await?
+    .dentry;
+    Ok(record.map(|record| DistributedResolvedEntry {
+        path,
+        parent: parent.inode,
+        record,
+    }))
+}
+
+async fn directory_from_target(
+    fragment_id: &str,
+    entry: &InodeDentry,
+    path: &str,
+) -> Result<DirectoryInode, AppError> {
+    let InodeDentryTarget::Directory { inode_id, layout } = &entry.target else {
+        return Err(AppError::BadRequest(format!(
+            "namespace path '{path}' is a file, not a directory"
+        )));
+    };
+    read_inode(fragment_id, inode_id, layout).await
+}
+
+async fn commit_single(
+    runtime: Arc<ClusterRuntime>,
+    inode: &DirectoryInode,
+    mutation_id: &str,
+    now_unix: i64,
+    changes: Vec<InodeMutationChange>,
+) -> Result<(), AppError> {
+    let mutation = PreparedInodeMutation::new(
+        inode.fragment_id.clone(),
+        inode.inode_id.clone(),
+        inode.generation,
+        mutation_id.into(),
+        unix_seconds_to_nanos(now_unix),
+        changes,
+    )?;
+    commit_replicated_mutation(runtime, inode.layout.clone(), mutation).await?;
+    Ok(())
+}
+
+async fn move_between_inodes(
+    runtime: Arc<ClusterRuntime>,
+    fragment_id: &str,
+    source: &DirectoryInode,
+    source_name: &str,
+    destination: &DirectoryInode,
+    moved: InodeDentry,
+    mutation_id: &str,
+    now_unix: i64,
+) -> Result<(), AppError> {
+    let now = unix_seconds_to_nanos(now_unix);
+    if source.inode_id == destination.inode_id {
+        return commit_single(
+            runtime,
+            source,
+            mutation_id,
+            now_unix,
+            vec![
+                InodeMutationChange::Remove {
+                    name: source_name.into(),
+                },
+                InodeMutationChange::Upsert { dentry: moved },
+            ],
+        )
+        .await;
+    }
+    let moved_directory = match &moved.target {
+        InodeDentryTarget::Directory { inode_id, layout } => {
+            Some(read_inode(fragment_id, inode_id, layout).await?)
+        }
+        _ => None,
+    };
+    let source_mutation = PreparedInodeMutation::new(
+        fragment_id.into(),
+        source.inode_id.clone(),
+        source.generation,
+        format!("{mutation_id}-source"),
+        now,
+        vec![InodeMutationChange::Remove {
+            name: source_name.into(),
+        }],
+    )?;
+    let destination_mutation = PreparedInodeMutation::new(
+        fragment_id.into(),
+        destination.inode_id.clone(),
+        destination.generation,
+        format!("{mutation_id}-destination"),
+        now,
+        vec![InodeMutationChange::Upsert { dentry: moved }],
+    )?;
+    let mut participants = vec![
+        ReplicatedInodeMutation {
+            layout: source.layout.clone(),
+            mutation: source_mutation,
+        },
+        ReplicatedInodeMutation {
+            layout: destination.layout.clone(),
+            mutation: destination_mutation,
+        },
+    ];
+    if let Some(directory) = moved_directory {
+        let parent_mutation = PreparedInodeMutation::new_parent_move(
+            fragment_id.into(),
+            directory.inode_id.clone(),
+            directory.generation,
+            format!("{mutation_id}-moved-inode"),
+            now,
+            destination.inode_id.clone(),
+        )?;
+        participants.push(ReplicatedInodeMutation {
+            layout: directory.layout,
+            mutation: parent_mutation,
+        });
+    }
+    commit_replicated_transaction(runtime, mutation_id.into(), participants).await?;
+    Ok(())
+}
+
 fn normalize_user_path(path: &str) -> Result<String, AppError> {
-    let path = normalize_path(path).map_err(|err| AppError::BadRequest(err.to_string()))?;
+    let path = normalize_path(path).map_err(|error| AppError::BadRequest(error.to_string()))?;
     if path.split('/').any(|segment| segment == ".trash") {
         return Err(AppError::BadRequest(
             "'.trash' is reserved for N2 lifecycle management".into(),
@@ -674,10 +725,22 @@ fn normalize_user_path(path: &str) -> Result<String, AppError> {
     Ok(path)
 }
 
+fn unix_seconds_to_nanos(seconds: i64) -> i64 {
+    seconds.saturating_mul(1_000_000_000)
+}
+
+fn nanos_to_unix_seconds(nanos: i64) -> i64 {
+    nanos / 1_000_000_000
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
-        name.to_string()
+        name.into()
     } else {
         format!("{parent}/{name}")
     }
+}
+
+pub fn now_unix() -> i64 {
+    Utc::now().timestamp()
 }

@@ -165,20 +165,16 @@ pub fn resolve_write_layout(
 
     let configured_layout =
         resolve_configured_layout(configured_nodes.max(available_nodes), policy)?;
-    if available_nodes >= configured_layout.total_shards() {
-        return Ok(configured_layout);
+    if available_nodes < configured_layout.total_shards() {
+        return Err(format!(
+            "configured object EC {}+{} requires {} writable blob nodes, but only {} are available",
+            configured_layout.data_shards,
+            configured_layout.parity_shards,
+            configured_layout.total_shards(),
+            available_nodes
+        ));
     }
-
-    // Preserve as much of the configured failure tolerance as the live node set
-    // permits. Reducing data width instead of parity turns fixed 2+1 into 1+1
-    // during a one-node outage while keeping the chosen layout immutable per object.
-    let parity_shards = configured_layout
-        .parity_shards
-        .min(available_nodes.saturating_sub(1));
-    Ok(ClusterEcLayout {
-        data_shards: available_nodes.saturating_sub(parity_shards).max(1),
-        parity_shards,
-    })
+    Ok(configured_layout)
 }
 
 #[cfg(test)]
@@ -255,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_layout_degrades_per_object_without_changing_configured_layout() {
+    fn fixed_layout_refuses_under_width_writes_without_changing_policy() {
         let policy = ClusterLayoutPolicy {
             mode: ClusterLayoutMode::Fixed,
             fixed_data_shards: Some(2),
@@ -270,20 +266,8 @@ mod tests {
                 parity_shards: 1,
             }
         );
-        assert_eq!(
-            resolve_write_layout(2, 3, &policy).unwrap(),
-            ClusterEcLayout {
-                data_shards: 1,
-                parity_shards: 1,
-            }
-        );
-        assert_eq!(
-            resolve_write_layout(1, 3, &policy).unwrap(),
-            ClusterEcLayout {
-                data_shards: 1,
-                parity_shards: 0,
-            }
-        );
+        assert!(resolve_write_layout(2, 3, &policy).is_err());
+        assert!(resolve_write_layout(1, 3, &policy).is_err());
 
         assert_eq!(
             resolve_configured_layout(2, &policy).unwrap(),
@@ -292,17 +276,11 @@ mod tests {
                 parity_shards: 1,
             }
         );
-        assert_eq!(
-            resolve_write_layout(2, 2, &policy).unwrap(),
-            ClusterEcLayout {
-                data_shards: 1,
-                parity_shards: 1,
-            }
-        );
+        assert!(resolve_write_layout(2, 2, &policy).is_err());
     }
 
     #[test]
-    fn degraded_layout_preserves_configured_parity_before_data_width() {
+    fn wider_fixed_layout_never_shrinks_to_fit_live_nodes() {
         let policy = ClusterLayoutPolicy {
             mode: ClusterLayoutMode::Fixed,
             fixed_data_shards: Some(5),
@@ -310,20 +288,8 @@ mod tests {
             ..ClusterLayoutPolicy::default()
         };
 
-        assert_eq!(
-            resolve_write_layout(7, 8, &policy).unwrap(),
-            ClusterEcLayout {
-                data_shards: 4,
-                parity_shards: 3,
-            }
-        );
-        assert_eq!(
-            resolve_write_layout(2, 8, &policy).unwrap(),
-            ClusterEcLayout {
-                data_shards: 1,
-                parity_shards: 1,
-            }
-        );
+        assert!(resolve_write_layout(7, 8, &policy).is_err());
+        assert!(resolve_write_layout(2, 8, &policy).is_err());
     }
 
     #[test]

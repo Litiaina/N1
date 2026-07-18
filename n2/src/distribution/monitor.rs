@@ -2,7 +2,6 @@ use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
 use crate::core::repair_manager::{ObjectLayoutStatus, ObjectRepairStatus, RepairCheckMode};
 use crate::distribution::auto_healing::{AutoHealingStatus, auto_healing_status_snapshot};
-use crate::distribution::dentry_group::configured_namespace_replicas;
 use crate::distribution::health::{ClusterHealthSnapshot, cluster_health_snapshot};
 use crate::distribution::layout::resolve_write_layout;
 use crate::distribution::membership::{
@@ -440,7 +439,11 @@ fn monitor_node_from_peer(
         reachable,
         local: node.id == local_node_id,
         last_seen_unix: node.last_seen_unix,
-        storage_roots: node.storage_roots,
+        storage_roots: node
+            .storage_roots
+            .into_iter()
+            .map(|root| root.path)
+            .collect(),
         health_status: health_value
             .and_then(|value| value.get("status"))
             .and_then(Value::as_str)
@@ -660,9 +663,9 @@ fn namespace_consensus_summary(
             .into_iter()
             .map(|root| root.display().to_string())
             .collect(),
-        configured_replica_limit: configured_namespace_replicas(),
-        identity_model: "stable_directory_id+dentry",
-        transaction_model: "partitioned_quorum+durable_decision",
+        configured_replica_limit: runtime.membership.policy.namespace_redundancy,
+        identity_model: "stable_inode+parent_dentry+exact_replica_layout",
+        transaction_model: "per_inode_generation+durable_cross_inode_decision",
     };
     let status = if fragment.is_some() {
         "quorum_configured"

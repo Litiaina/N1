@@ -24,6 +24,7 @@ pub mod recovery;
 pub mod redistribution;
 pub mod repair_manager;
 pub mod retrieve;
+pub mod root_identity;
 pub mod storage_capacity_parser;
 pub mod sync;
 pub mod system;

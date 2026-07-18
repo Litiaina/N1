@@ -2,8 +2,12 @@
 
 ## Status
 
-This document defines the **upcoming N2 2.0 architecture**. It is the target
-for the redesign and does not describe the currently implemented engine.
+This document defines the locked N2 2.0 architecture and the implementation
+contract now being built. Phases 1 through 6 and exact-layout autonomous
+healing are present in the 2.0 development tree; expansion, permanent-holder
+replacement, and Phase 8 operational integration remain release gates.
+Bounded evidence and the exact unclosed gates are recorded in
+`N2_2_0_VERIFICATION.md`.
 
 N2 2.0 is a clean engine boundary. Its namespace layout, node roles, disk
 layout, mutation protocol, and failure rules are defined here without an
@@ -21,7 +25,7 @@ N2 cluster
     └── immutable per-object erasure sets, shards, parity, and .ncdx
 ```
 
-The two collections are not fixed MinIO-style server sets. A collection is the
+The two collections are not fixed server sets. A collection is the
 current set of eligible nodes for that storage plane. After its minimum is
 met, one node or one disk can be added at a time.
 
@@ -201,9 +205,10 @@ Adding a node does not silently change `R` or `k + m`. Existing inode and
 object layouts remain valid. New directory inodes and new objects may use the
 new node immediately.
 
-Changing namespace redundancy or object EC policy is a separate explicit
-operation. Old layouts remain valid under their recorded widths unless an
-operator explicitly requests a verified migration or re-encoding workflow.
+Namespace redundancy is an immutable cluster contract. Once any N2 root is
+enrolled, changing `namespace_redundancy` is rejected. Object EC policy remains
+an independent object-level contract: old object layouts remain valid under
+their recorded widths unless an operator explicitly requests re-encoding.
 
 ## Node Roles
 
@@ -702,25 +707,43 @@ Namespace and blob maintenance remain independent.
 For each recorded inode layout, healing:
 
 1. contacts only the recorded replica group;
-2. selects the highest quorum-certified committed generation;
+2. selects an identical quorum snapshot or the unique highest generation with
+   a valid recorded commit certificate;
 3. rejects divergent uncertified state;
-4. copies a missing replica to a safe namespace node/root;
+4. restores the complete inode header and committed dentry set to its exact
+   recorded node/root;
 5. verifies the rebuilt replica;
-6. publishes a new inode layout generation through its parent dentry, or the
-   fragment catalog for a root inode;
-7. retires stale placement only after the replacement is authoritative.
+6. never changes replica width or redistributes a healthy inode.
 
-With redundancy two, one surviving replica cannot autonomously replace the
-other without fencing because it cannot distinguish failure from partition.
-The affected namespace remains read-only. With redundancy three, two agreeing
-survivors may safely authorize repair after the missing identity is fenced.
+With redundancy two, one surviving complete snapshot can restore its missing
+recorded peer only when its last generation carries the original two-voter
+commit certificate. It cannot silently choose a different logical holder. A
+permanently replaced holder must first be fenced and re-admitted under the
+recorded logical identity. If authority or the target topology cannot be
+proved, the cluster fails closed in durable read-only mode.
 
 ### Object healing
 
 Object healing reads the immutable recorded layout, verifies holder
 availability and checksums, reconstructs only missing or corrupt shards, and
-publishes atomically verified replacements. It never re-encodes healthy
-objects merely because nodes were added.
+restores missing collocated `.ncdx` metadata replicas. It never re-encodes
+healthy objects merely because nodes were added.
+
+Every degraded directory inode or object produces one node-local immutable
+JSON report containing the initial condition and repair outcome. A published
+object without a live or trash namespace reference is reported as headless and
+preserved. A namespace pointer whose target no longer exists is reported as
+dangling and preserved. Reports are disposable operational evidence and are
+never replicated.
+
+An unrepairable inode or object, dangling namespace pointer, divergent
+immutable record, or impossible recorded topology activates the durable
+cluster safety latch. User mutations, GC, and redistribution stop;
+reconstructable reads and healing remain allowed. A physical object without a
+namespace reference is reported and preserved, but it does not by itself trip
+the latch because durable blob publication intentionally precedes namespace
+publication and a failed finalize can leave safe orphan residue. If namespace
+traversal or blob inventory is incomplete, no headless conclusion is made.
 
 Recover-on-read serves reconstructable bytes first and schedules bounded
 repair in the background.
@@ -803,7 +826,7 @@ generations, and then fence the old identity. Unsafe removal is rejected.
 
 ## Read-Only And Failure Semantics
 
-N2 fails closed at the smallest affected scope:
+Ordinary quorum or holder loss fails closed at the smallest affected scope:
 
 - an inode group without a safe write quorum rejects mutations involving that
   inode;
@@ -813,6 +836,13 @@ N2 fails closed at the smallest affected scope:
 - a reconstructable degraded object remains readable;
 - an unreconstructable object is reported explicitly and never fabricated;
 - unrelated healthy fragments, inode groups, and objects continue operating.
+
+Auto-healing escalates a confirmed catastrophic invariant to the durable
+cluster safety latch. Examples are an inode whose authority cannot be proved,
+a namespace pointer with no surviving target, a headless published object, an
+unrecoverable object, or an impossible recorded layout. This stronger response
+prevents further user mutations and reclamation from enlarging damage while
+reads and exact-layout healing remain available.
 
 Node addition never marks anything degraded. Degradation is determined only
 from the recorded layout of the inode or object being evaluated.
@@ -964,8 +994,9 @@ to be rewritten while namespace work is incomplete.
 
 ### Phase 7: autonomous healing and expansion
 
-- repair missing namespace replicas from certified generations;
-- repair missing object shards from immutable recorded layouts;
+- repair missing namespace replicas from certified complete snapshots;
+- repair missing object shards and `.ncdx` replicas from immutable recorded layouts;
+- emit node-local non-replicated JSON findings and fail closed on catastrophic invariants;
 - add namespace and blob nodes one at a time;
 - add disks one at a time;
 - prove that expansion never remaps or degrades existing layouts;
@@ -1086,12 +1117,13 @@ a global writer.
 15. Public hard links and global object reference counting are excluded.
 16. Conflicting inode mutations cannot both commit.
 17. Unrelated inodes and objects operate concurrently without a global lock.
-18. Unsafe topology becomes read-only at the smallest affected scope.
+18. Unsafe topology fails closed; a confirmed catastrophic invariant activates
+    the durable cluster safety read-only latch.
 19. Existing layout truth is never inferred from current membership.
 20. N2 2.0 carries no in-engine backward-compatibility path for earlier
     development layouts.
 21. Every healthy namespace or blob node may coordinate any supported client
     operation without becoming permanent authority.
 
-These invariants define the upcoming N2 2.0 engine. Implementation choices are
+These invariants define the N2 2.0 engine. Implementation choices are
 valid only when they preserve every invariant above.
