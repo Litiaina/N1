@@ -391,6 +391,11 @@ NCNX records. For each record it:
 4. recreates missing or corrupt replicas on their exact roots;
 5. emits one disposable JSON report when degradation or repair occurred.
 
+The healer revalidates the exact NCNX state immediately before a critical
+classification or repair. TTL-expired trash is owned by GC and is never
+resurrected by a stale healing observation. A dangling object-reference report
+also revalidates the exact live reference before it is emitted.
+
 Reports are not replicated and are not storage truth.
 
 ### Object healing
@@ -493,4 +498,6 @@ N2 3.0 is not declared production-stable until the following are proven:
 
 Passing bounded architectural tests proves implementation conformance and
 known failure behavior. It does not replace long-duration soak, hardware fault,
-or independent multi-host production evidence.
+or independent multi-host production evidence. Current results and remaining
+gates are recorded in [TESTING.md](TESTING.md); performance measurements are
+kept separately in [BENCHMARK.md](BENCHMARK.md).
