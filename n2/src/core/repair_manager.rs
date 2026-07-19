@@ -1483,7 +1483,7 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Verifying N2 namespace quorum {}", fragment_hash);
+            status.phase = format!("Verifying N2 NCNX replicas {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 

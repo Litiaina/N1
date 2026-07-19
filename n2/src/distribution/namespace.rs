@@ -1,17 +1,26 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::core::disk_manager::ObjectMetadata;
-use crate::distribution::dentry_service::DistributedNamespace;
+use crate::distribution::ncnx::{
+    LocatedNcnx, PeerNcnxName, copy_live_to_key, copy_live_to_key_with_record, copy_live_to_trash,
+    find_live, list_canonical_names, ncnx_cursor, publish_new, read_canonical_record, remove_live,
+    remove_trash,
+};
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::inode_store::{InodeDentry, InodeDentryTarget, InodeLayout};
 use crate::namespace::models::{
     LifecycleState, NamespaceEntry, NamespaceEntryKind, NamespaceMutationSummary,
 };
+use crate::namespace::ncnx_store::{NcnxRecord, TrashLocator, validate_logical_key};
+use crate::namespace::paths::{base_name, normalize_path, parent_path, rename_prefix};
 use crate::namespace::runtime::{NamespaceObjectRef, NamespaceObjectRefPage};
+
+const LIST_BATCH_MAX: usize = 1_000;
+const PREFIX_MUTATION_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,118 +121,77 @@ pub struct PeerNamespaceApplyRequest {
     pub metadata: Option<ObjectMetadata>,
 }
 
-/// All namespace reads use the exact replica layout recorded by each stable
-/// directory inode. Returning `Some` is deliberate: N2 2.0 has no legacy
-/// local-filesystem namespace fallback.
-pub async fn namespace_read_if_remote(
+/// N2 3.0 namespace operations are already distributed by deterministic NCNX
+/// placement. This facade preserves the NOA/native protocol boundary without
+/// reintroducing a coordinator database or inode quorum.
+pub async fn namespace_read(
     request: PeerNamespaceReadRequest,
 ) -> Result<Option<PeerNamespaceReadResponse>, AppError> {
-    let path = request.path.clone().unwrap_or_default();
     let response = match request.kind {
         PeerNamespaceReadKind::ListDir => {
-            let mut entries = if request.include_trashed {
-                DistributedNamespace::list_trash(&request.fragment)
-                    .await?
-                    .into_iter()
-                    .map(|entry| trash_dentry_to_namespace_entry(&request.fragment, entry))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                DistributedNamespace::list_directory(&request.fragment, &path)
-                    .await?
-                    .into_iter()
-                    .map(|entry| {
-                        let child_path = join_path(path.trim_matches('/'), &entry.name);
-                        live_dentry_to_namespace_entry(&request.fragment, entry, child_path)
-                    })
-                    .collect()
-            };
-            entries.sort_by(|left, right| left.path.cmp(&right.path));
-            if let Some(after) = request.continuation_token.as_deref() {
-                entries.retain(|entry| entry.path.as_str() > after);
-            }
-            let limit = request.limit.unwrap_or(200).clamp(1, 1000);
-            let continuation_token =
-                (entries.len() > limit).then(|| entries[limit - 1].path.clone());
-            entries.truncate(limit);
+            let (entries, continuation_token) = list_directory_page(
+                &request.fragment,
+                request.path.as_deref().unwrap_or_default(),
+                request.include_trashed,
+                request.limit.unwrap_or(200).clamp(1, 1_000),
+                request.continuation_token.as_deref(),
+            )
+            .await?;
             PeerNamespaceReadResponse::ListDir {
                 entries,
                 continuation_token,
             }
         }
         PeerNamespaceReadKind::Entry => {
-            let entry = DistributedNamespace::resolve_entry(&request.fragment, &path)
-                .await?
-                .map(|resolved| {
-                    live_dentry_to_namespace_entry(
-                        &request.fragment,
-                        resolved.record,
-                        resolved.path,
-                    )
-                });
-            PeerNamespaceReadResponse::Entry(entry)
+            let path = request.path.as_deref().unwrap_or_default();
+            PeerNamespaceReadResponse::Entry(namespace_entry(&request.fragment, path).await?)
         }
         PeerNamespaceReadKind::TrashedEntry => {
-            let entry = find_trash_entry(&request.fragment, &path)
-                .await?
-                .map(|entry| trash_dentry_to_namespace_entry(&request.fragment, entry))
-                .transpose()?;
-            PeerNamespaceReadResponse::Entry(entry)
+            let requested = request.path.as_deref().unwrap_or_default();
+            PeerNamespaceReadResponse::Entry(
+                find_trash_record(&request.fragment, requested)
+                    .await?
+                    .map(|(name, located)| trash_entry(&request.fragment, &name, &located)),
+            )
         }
         PeerNamespaceReadKind::ResolveLiveObject => {
-            let object_id = DistributedNamespace::resolve_entry(&request.fragment, &path)
-                .await?
-                .and_then(|resolved| object_id(&resolved.record.target));
-            PeerNamespaceReadResponse::ObjectId(object_id)
+            let path = request.path.as_deref().unwrap_or_default();
+            PeerNamespaceReadResponse::ObjectId(
+                find_live(&request.fragment, path)
+                    .await?
+                    .map(|located| located.record.object_id),
+            )
         }
-        PeerNamespaceReadKind::ObjectRefs
-        | PeerNamespaceReadKind::TrashObjectRefs
-        | PeerNamespaceReadKind::Reachability => {
-            let mut refs = match request.kind {
-                PeerNamespaceReadKind::ObjectRefs => walk_live_namespace(&request.fragment).await?,
-                PeerNamespaceReadKind::TrashObjectRefs => {
-                    walk_trash_namespace(&request.fragment).await?
-                }
-                PeerNamespaceReadKind::Reachability => {
-                    let mut refs = walk_live_namespace(&request.fragment).await?;
-                    if request.include_trashed {
-                        refs.extend(walk_trash_namespace(&request.fragment).await?);
-                    }
-                    refs
-                }
-                _ => unreachable!(),
-            };
-            if matches!(request.kind, PeerNamespaceReadKind::Reachability) {
-                PeerNamespaceReadResponse::Reachability(
-                    refs.into_iter().map(|entry| entry.object_id).collect(),
-                )
-            } else {
-                if let Some(prefix) = request.prefix.as_deref() {
-                    refs.retain(|entry| entry.path.starts_with(prefix));
-                }
-                refs.sort_by(|left, right| left.path.cmp(&right.path));
-                if let Some(after) = request.continuation_token.as_deref() {
-                    refs.retain(|entry| entry.path.as_str() > after);
-                }
-                let limit = request.limit.unwrap_or(200).clamp(1, 1000);
-                let continuation_token = (refs.len() > limit).then(|| refs[limit - 1].path.clone());
-                refs.truncate(limit);
-                PeerNamespaceReadResponse::ObjectRefs(NamespaceObjectRefPage {
-                    entries: refs,
-                    continuation_token,
-                })
+        PeerNamespaceReadKind::ObjectRefs | PeerNamespaceReadKind::TrashObjectRefs => {
+            let trash = matches!(request.kind, PeerNamespaceReadKind::TrashObjectRefs);
+            let page = object_refs_page(
+                &request.fragment,
+                request.prefix.as_deref().unwrap_or_default(),
+                request.continuation_token.as_deref(),
+                request.limit.unwrap_or(200),
+                trash,
+            )
+            .await?;
+            PeerNamespaceReadResponse::ObjectRefs(page)
+        }
+        PeerNamespaceReadKind::Reachability => {
+            let mut ids = collect_object_ids(&request.fragment, false).await?;
+            if request.include_trashed {
+                ids.extend(collect_object_ids(&request.fragment, true).await?);
             }
+            PeerNamespaceReadResponse::Reachability(ids)
         }
     };
     Ok(Some(response))
 }
 
-pub async fn commit_upload_quorum(
+pub async fn commit_upload_pointer(
     fragment: &str,
     logical_path: &str,
     physical_object_id: &str,
     metadata: &ObjectMetadata,
 ) -> Result<String, AppError> {
-    let outcome = commit_namespace_quorum(PeerNamespaceApplyRequest {
+    let outcome = commit_namespace_mutation(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::UploadCommit,
         fragment: fragment.to_string(),
@@ -239,23 +207,27 @@ pub async fn commit_upload_quorum(
         .unwrap_or_else(|| physical_object_id.to_string()))
 }
 
-pub async fn commit_namespace_quorum(
+pub async fn commit_namespace_mutation(
     request: PeerNamespaceApplyRequest,
 ) -> Result<NamespaceApplyOutcome, AppError> {
     let mutation_id = request
         .mutation_id
         .unwrap_or_else(|| Ulid::new().to_string());
-    let now = Utc::now().timestamp();
+    if Ulid::from_string(&mutation_id).is_err() {
+        return Err(AppError::BadRequest(
+            "namespace mutation_id must be a ULID".into(),
+        ));
+    }
+    let now_nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| AppError::InternalServerError("system time exceeds nanoseconds".into()))?;
     match request.kind {
         NamespaceMutationKind::Mkdir => {
             let path = required(&request.source_path, "mkdir requires source_path")?;
-            let existed = match DistributedNamespace::resolve_entry(&request.fragment, path).await {
-                Ok(entry) => entry.is_some(),
-                Err(AppError::NotFound) => false,
-                Err(err) => return Err(err),
-            };
-            DistributedNamespace::mkdir_all(&request.fragment, path, &mutation_id, now).await?;
-            Ok(NamespaceApplyOutcome::Created(!existed))
+            validate_logical_key(path)?;
+            Err(AppError::BadRequest(
+                "N2 3.0 is a flat key namespace and does not persist empty directories".into(),
+            ))
         }
         NamespaceMutationKind::Rename => {
             let source = required(&request.source_path, "rename requires source_path")?;
@@ -263,75 +235,85 @@ pub async fn commit_namespace_quorum(
                 &request.destination_path,
                 "rename requires destination_path",
             )?;
-            let record = DistributedNamespace::rename(
+            let summary = rename_key_or_prefix(
                 &request.fragment,
                 source,
                 destination,
                 &mutation_id,
-                now,
+                now_nanos,
             )
             .await?;
-            Ok(NamespaceApplyOutcome::Summary(summary_from_dentry(
-                "rename",
-                &record,
-                Some(source.to_string()),
-                Some(destination.to_string()),
-            )))
+            Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::Trash => {
             let source = required(&request.source_path, "trash requires source_path")?;
-            let trash_entry_id = Ulid::new().to_string();
-            let record = DistributedNamespace::trash(
-                &request.fragment,
-                source,
-                &trash_entry_id,
-                &mutation_id,
-                now,
-            )
-            .await?;
-            let mut summary = summary_from_dentry("trash", &record, Some(source.to_string()), None);
-            summary.trash_entry_id = Some(trash_entry_id);
-            summary.deleted_at_unix = Some(now);
+            let summary =
+                trash_key_or_prefix(&request.fragment, source, &mutation_id, now_nanos).await?;
             Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::Recover => {
-            let requested = required(&request.source_path, "recover requires a path or trash id")?;
-            let trash_entry = find_trash_entry(&request.fragment, requested)
-                .await?
-                .ok_or(AppError::NotFound)?;
-            let trash_entry_id = trash_entry.name.clone();
-            let original_path = trash_entry
+            let requested = required(&request.source_path, "recover requires path or trash id")?;
+            let recovery = find_trash_recovery_set(&request.fragment, requested).await?;
+            if recovery.is_empty() {
+                return Err(AppError::NotFound);
+            }
+            // Prove every destination before publishing any live pointer. A
+            // different live object at one key rejects the whole request.
+            for (name, located) in &recovery {
+                if let Some(live) = find_live(&request.fragment, &name.logical_key).await?
+                    && live.record.object_id != located.record.object_id
+                {
+                    return Err(AppError::Conflict(format!(
+                        "cannot recover '{}': live key points to another object",
+                        name.logical_key
+                    )));
+                }
+            }
+            let affected = recovery.len();
+            let first_name = recovery.first().expect("non-empty recovery set").0.clone();
+            let first_locator = first_name
                 .trash
-                .as_ref()
-                .map(|context| context.path.clone())
-                .ok_or_else(|| {
-                    AppError::InternalServerError("trash dentry has no lifecycle context".into())
-                })?;
-            let record = DistributedNamespace::restore(
-                &request.fragment,
-                &trash_entry_id,
-                &mutation_id,
-                now,
-            )
-            .await?;
-            Ok(NamespaceApplyOutcome::Summary(summary_from_dentry(
-                "recover",
-                &record,
-                Some(original_path),
-                None,
-            )))
+                .clone()
+                .expect("trash recovery name has a locator");
+            let source_path = if affected == 1 {
+                first_name.logical_key.clone()
+            } else {
+                common_parent_for_keys(recovery.iter().map(|(name, _)| name.logical_key.as_str()))
+            };
+            let mut pending = recovery.into_iter();
+            let mut running = FuturesUnordered::new();
+            loop {
+                while running.len() < PREFIX_MUTATION_CONCURRENCY {
+                    let Some((name, located)) = pending.next() else {
+                        break;
+                    };
+                    running.push(async move { recover_one(&name, &located).await });
+                }
+                match running.next().await {
+                    Some(result) => result?,
+                    None => break,
+                }
+            }
+            Ok(NamespaceApplyOutcome::Summary(NamespaceMutationSummary {
+                operation: "recover".into(),
+                kind: if affected == 1 {
+                    NamespaceEntryKind::File
+                } else {
+                    NamespaceEntryKind::Directory
+                },
+                affected_paths: affected,
+                affected_objects: affected,
+                source_path: Some(source_path.clone()),
+                destination_path: Some(source_path),
+                trash_entry_id: Some(first_locator.delete_mutation_id),
+                deleted_at_unix: Some(first_locator.deleted_at_unix_nanos / 1_000_000_000),
+            }))
         }
         NamespaceMutationKind::UploadCommit => {
             let path = required(&request.source_path, "upload commit requires source_path")?;
             let object_id = required(&request.object_id, "upload commit requires object_id")?;
-            DistributedNamespace::publish_object(
-                &request.fragment,
-                path,
-                object_id,
-                &mutation_id,
-                now,
-            )
-            .await?;
+            let record = NcnxRecord::new(&request.fragment, object_id, mutation_id, now_nanos)?;
+            publish_new(&request.fragment, path, &record).await?;
             Ok(NamespaceApplyOutcome::CommittedObject(
                 object_id.to_string(),
             ))
@@ -339,19 +321,19 @@ pub async fn commit_namespace_quorum(
     }
 }
 
-pub async fn commit_namespace_created_quorum(
+pub async fn commit_namespace_created(
     request: PeerNamespaceApplyRequest,
 ) -> Result<bool, AppError> {
-    Ok(commit_namespace_quorum(request)
+    Ok(commit_namespace_mutation(request)
         .await?
         .created()
         .unwrap_or(false))
 }
 
-pub async fn commit_namespace_summary_quorum(
+pub async fn commit_namespace_summary(
     request: PeerNamespaceApplyRequest,
 ) -> Result<NamespaceMutationSummary, AppError> {
-    commit_namespace_quorum(request)
+    commit_namespace_mutation(request)
         .await?
         .summary()
         .ok_or_else(|| {
@@ -359,205 +341,590 @@ pub async fn commit_namespace_summary_quorum(
         })
 }
 
-async fn find_trash_entry(
+async fn namespace_entry(
     fragment: &str,
-    requested: &str,
-) -> Result<Option<InodeDentry>, AppError> {
-    Ok(DistributedNamespace::list_trash(fragment)
+    requested_path: &str,
+) -> Result<Option<NamespaceEntry>, AppError> {
+    let normalized =
+        normalize_path(requested_path).map_err(|err| AppError::BadRequest(err.to_string()))?;
+    if normalized.is_empty() {
+        return Ok(Some(directory_entry(fragment, "", "")));
+    }
+    if let Some(located) = find_live(fragment, &normalized).await? {
+        return Ok(Some(live_file_entry(fragment, &normalized, &located)));
+    }
+    let prefix = format!("{normalized}/");
+    if !list_canonical_names(fragment, &prefix, None, 1, false)
         .await?
-        .into_iter()
-        .find(|entry| {
-            entry.name == requested
-                || entry
-                    .trash
-                    .as_ref()
-                    .is_some_and(|trash| trash.path == requested)
-        }))
+        .is_empty()
+    {
+        return Ok(Some(directory_entry(
+            fragment,
+            &normalized,
+            &base_name(&normalized),
+        )));
+    }
+    Ok(None)
 }
 
-fn live_dentry_to_namespace_entry(
+async fn list_directory_page(
     fragment: &str,
-    entry: InodeDentry,
-    path: String,
-) -> NamespaceEntry {
+    requested_path: &str,
+    trash: bool,
+    limit: usize,
+    continuation: Option<&str>,
+) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
+    let directory =
+        normalize_path(requested_path).map_err(|err| AppError::BadRequest(err.to_string()))?;
+    let prefix = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{directory}/")
+    };
+    let mut entries = BTreeMap::<String, NamespaceEntry>::new();
+    let mut cursor = continuation.map(ToOwned::to_owned);
+    let mut has_more = false;
+    loop {
+        let names =
+            list_canonical_names(fragment, &prefix, cursor.as_deref(), LIST_BATCH_MAX, trash)
+                .await?;
+        if names.is_empty() {
+            break;
+        }
+        let batch_full = names.len() == LIST_BATCH_MAX;
+        for name in names {
+            let record_cursor = ncnx_cursor(&name.logical_key, name.trash.as_ref());
+            let relative = name.logical_key.strip_prefix(&prefix).unwrap_or_default();
+            let first = relative.split('/').next().unwrap_or_default();
+            if first.is_empty() {
+                cursor = Some(record_cursor);
+                continue;
+            }
+            let child_path = if directory.is_empty() {
+                first.to_string()
+            } else {
+                format!("{directory}/{first}")
+            };
+            let is_directory = relative.contains('/');
+            let entry = if is_directory {
+                directory_entry(fragment, &child_path, first)
+            } else if trash {
+                let located = read_canonical_record(fragment, &name).await?;
+                trash_entry(fragment, &name, &located)
+            } else {
+                // Zero-decode LIST: object identity and object metadata remain
+                // absent until HEAD/GET.
+                zero_decode_file_entry(fragment, &child_path, first)
+            };
+            if !entries.contains_key(&child_path) && entries.len() == limit {
+                has_more = true;
+                break;
+            }
+            entries.entry(child_path).or_insert(entry);
+            cursor = Some(record_cursor);
+        }
+        if has_more || !batch_full {
+            break;
+        }
+    }
+    Ok((
+        entries.into_values().collect(),
+        has_more.then_some(cursor).flatten(),
+    ))
+}
+
+async fn object_refs_page(
+    fragment: &str,
+    prefix: &str,
+    continuation: Option<&str>,
+    limit: usize,
+    trash: bool,
+) -> Result<NamespaceObjectRefPage, AppError> {
+    let limit = limit.clamp(1, 1_000);
+    let names = list_canonical_names(fragment, prefix, continuation, limit + 1, trash).await?;
+    let has_more = names.len() > limit;
+    let selected = names.into_iter().take(limit).collect::<Vec<_>>();
+    let continuation_token = has_more
+        .then(|| {
+            selected
+                .last()
+                .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()))
+        })
+        .flatten();
+    let mut entries = Vec::with_capacity(selected.len());
+    for name in selected {
+        let located = read_canonical_record(fragment, &name).await?;
+        entries.push(NamespaceObjectRef {
+            path: name.logical_key,
+            object_id: located.record.object_id,
+            version_id: String::new(),
+        });
+    }
+    Ok(NamespaceObjectRefPage {
+        entries,
+        continuation_token,
+    })
+}
+
+async fn all_names(
+    fragment: &str,
+    prefix: &str,
+    trash: bool,
+) -> Result<Vec<PeerNcnxName>, AppError> {
+    let mut names = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = list_canonical_names(fragment, prefix, cursor.as_deref(), LIST_BATCH_MAX, trash)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page
+            .last()
+            .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()));
+        let full = page.len() == LIST_BATCH_MAX;
+        names.extend(page);
+        if !full {
+            break;
+        }
+    }
+    Ok(names)
+}
+
+async fn collect_object_ids(fragment: &str, trash: bool) -> Result<BTreeSet<String>, AppError> {
+    let mut ids = BTreeSet::new();
+    for name in all_names(fragment, "", trash).await? {
+        ids.insert(
+            read_canonical_record(fragment, &name)
+                .await?
+                .record
+                .object_id,
+        );
+    }
+    Ok(ids)
+}
+
+async fn find_trash_record(
+    fragment: &str,
+    requested: &str,
+) -> Result<Option<(PeerNcnxName, LocatedNcnx)>, AppError> {
+    let by_id = Ulid::from_string(requested).is_ok();
+    let prefix = if by_id {
+        "".to_string()
+    } else {
+        normalize_path(requested).map_err(|err| AppError::BadRequest(err.to_string()))?
+    };
+    let mut matching = all_names(fragment, &prefix, true)
+        .await?
+        .into_iter()
+        .filter(|name| {
+            let locator = name.trash.as_ref().expect("trash listing includes locator");
+            if by_id {
+                locator.delete_mutation_id == requested
+            } else {
+                locator.logical_key == prefix
+            }
+        })
+        .collect::<Vec<_>>();
+    matching
+        .sort_by_key(|name| std::cmp::Reverse(name.trash.as_ref().unwrap().deleted_at_unix_nanos));
+    let Some(name) = matching.into_iter().next() else {
+        return Ok(None);
+    };
+    let located = read_canonical_record(fragment, &name).await?;
+    Ok(Some((name, located)))
+}
+
+/// Selects one complete trash/recover operation. A mutation ULID identifies
+/// the exact delete group. A logical file selects its newest exact record; a
+/// virtual directory selects the newest mutation group below that prefix.
+async fn find_trash_recovery_set(
+    fragment: &str,
+    requested: &str,
+) -> Result<Vec<(PeerNcnxName, LocatedNcnx)>, AppError> {
+    let by_id = Ulid::from_string(requested).is_ok();
+    let requested_key = if by_id {
+        String::new()
+    } else {
+        validate_logical_key(requested)?
+    };
+    let scan_prefix = if by_id { "" } else { requested_key.as_str() };
+    let mut candidates = all_names(fragment, scan_prefix, true)
+        .await?
+        .into_iter()
+        .filter(|name| {
+            let Some(locator) = name.trash.as_ref() else {
+                return false;
+            };
+            if by_id {
+                locator.delete_mutation_id == requested
+            } else {
+                name.logical_key == requested_key
+                    || name.logical_key.starts_with(&format!("{requested_key}/"))
+            }
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !by_id {
+        if let Some(exact) = candidates
+            .iter()
+            .filter(|name| name.logical_key == requested_key)
+            .max_by_key(|name| name.trash.as_ref().unwrap().deleted_at_unix_nanos)
+            .cloned()
+        {
+            candidates = vec![exact];
+        } else {
+            let newest = candidates
+                .iter()
+                .max_by_key(|name| name.trash.as_ref().unwrap().deleted_at_unix_nanos)
+                .and_then(|name| name.trash.as_ref())
+                .expect("trash candidate has locator")
+                .delete_mutation_id
+                .clone();
+            candidates.retain(|name| {
+                name.trash
+                    .as_ref()
+                    .is_some_and(|locator| locator.delete_mutation_id == newest)
+            });
+        }
+    }
+    candidates.sort_by(|left, right| left.logical_key.cmp(&right.logical_key));
+    let mut recovery = Vec::with_capacity(candidates.len());
+    for name in candidates {
+        let located = read_canonical_record(fragment, &name).await?;
+        recovery.push((name, located));
+    }
+    Ok(recovery)
+}
+
+fn common_parent_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> String {
+    let mut keys = keys;
+    let Some(first) = keys.next() else {
+        return String::new();
+    };
+    let mut common = first.split('/').collect::<Vec<_>>();
+    for key in keys {
+        let components = key.split('/').collect::<Vec<_>>();
+        let shared = common
+            .iter()
+            .zip(components.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(shared);
+    }
+    if common.len() == first.split('/').count() {
+        common.pop();
+    }
+    common.join("/")
+}
+
+async fn rename_key_or_prefix(
+    fragment: &str,
+    source: &str,
+    destination: &str,
+    mutation_id: &str,
+    now_nanos: i64,
+) -> Result<NamespaceMutationSummary, AppError> {
+    let source = validate_logical_key(source)?;
+    let destination = validate_logical_key(destination)?;
+    if source == destination {
+        return Err(AppError::BadRequest(
+            "rename source and destination are identical".into(),
+        ));
+    }
+    if destination.starts_with(&format!("{source}/")) {
+        return Err(AppError::BadRequest(
+            "cannot move a key prefix inside itself".into(),
+        ));
+    }
+    if let Some(located) = find_live(fragment, &source).await? {
+        rename_one(&located, &destination, mutation_id, now_nanos).await?;
+        return Ok(mutation_summary(
+            "rename",
+            NamespaceEntryKind::File,
+            1,
+            Some(source),
+            Some(destination),
+            None,
+            None,
+        ));
+    }
+
+    let source_prefix = format!("{source}/");
+    let names = all_names(fragment, &source_prefix, false).await?;
+    if names.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    let affected = names.len();
+    let mut work = Vec::with_capacity(affected);
+    for name in names {
+        let destination_key = rename_prefix(&name.logical_key, &source, &destination)
+            .map_err(|err| AppError::BadRequest(err.to_string()))?;
+        let source_record = read_canonical_record(fragment, &name).await?;
+        if let Some(existing) = find_live(fragment, &destination_key).await?
+            && existing.record.object_id != source_record.record.object_id
+        {
+            return Err(AppError::Conflict(format!(
+                "rename destination '{destination_key}' already exists"
+            )));
+        }
+        work.push((source_record, destination_key));
+    }
+    run_prefix_rename(work, mutation_id, now_nanos).await?;
+    Ok(mutation_summary(
+        "rename",
+        NamespaceEntryKind::Directory,
+        affected,
+        Some(source),
+        Some(destination),
+        None,
+        None,
+    ))
+}
+
+async fn run_prefix_rename(
+    work: Vec<(LocatedNcnx, String)>,
+    mutation_id: &str,
+    now_nanos: i64,
+) -> Result<(), AppError> {
+    let mut pending = work.into_iter();
+    let mut running = FuturesUnordered::new();
+    loop {
+        while running.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some((located, destination)) = pending.next() else {
+                break;
+            };
+            let mutation_id = mutation_id.to_string();
+            running.push(async move {
+                rename_one(&located, &destination, &mutation_id, now_nanos).await
+            });
+        }
+        match running.next().await {
+            Some(result) => result?,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+async fn rename_one(
+    located: &LocatedNcnx,
+    destination: &str,
+    mutation_id: &str,
+    now_nanos: i64,
+) -> Result<(), AppError> {
+    // The destination is a new immutable namespace generation. Historical
+    // trash from an older name then cannot masquerade as an active tombstone
+    // for this current live pointer.
+    let destination_record = NcnxRecord::new(
+        &located.record.fragment_id,
+        &located.record.object_id,
+        mutation_id,
+        now_nanos,
+    )?;
+    copy_live_to_key_with_record(located, destination, &destination_record).await?;
+    remove_live(located).await
+}
+
+async fn trash_key_or_prefix(
+    fragment: &str,
+    source: &str,
+    mutation_id: &str,
+    now_nanos: i64,
+) -> Result<NamespaceMutationSummary, AppError> {
+    let source = validate_logical_key(source)?;
+    if let Some(located) = find_live(fragment, &source).await? {
+        trash_one(&located, mutation_id, now_nanos).await?;
+        return Ok(mutation_summary(
+            "trash",
+            NamespaceEntryKind::File,
+            1,
+            Some(source),
+            None,
+            Some(mutation_id.to_string()),
+            Some(now_nanos),
+        ));
+    }
+    let names = all_names(fragment, &format!("{source}/"), false).await?;
+    if names.is_empty() {
+        // Repeated user deletion is safe and does not become an internal
+        // server error. Report the already-trashed key when present.
+        if let Some((name, _)) = find_trash_record(fragment, &source).await? {
+            let locator = name.trash.unwrap();
+            return Ok(mutation_summary(
+                "trash",
+                NamespaceEntryKind::File,
+                0,
+                Some(source),
+                None,
+                Some(locator.delete_mutation_id),
+                Some(locator.deleted_at_unix_nanos),
+            ));
+        }
+        return Err(AppError::NotFound);
+    }
+    let affected = names.len();
+    let mut work = Vec::with_capacity(affected);
+    for name in names {
+        work.push(read_canonical_record(fragment, &name).await?);
+    }
+    let mut pending = work.into_iter();
+    let mut running = FuturesUnordered::new();
+    loop {
+        while running.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some(located) = pending.next() else {
+                break;
+            };
+            let mutation_id = mutation_id.to_string();
+            running.push(async move { trash_one(&located, &mutation_id, now_nanos).await });
+        }
+        match running.next().await {
+            Some(result) => result?,
+            None => break,
+        }
+    }
+    Ok(mutation_summary(
+        "trash",
+        NamespaceEntryKind::Directory,
+        affected,
+        Some(source),
+        None,
+        Some(mutation_id.to_string()),
+        Some(now_nanos),
+    ))
+}
+
+async fn trash_one(
+    located: &LocatedNcnx,
+    mutation_id: &str,
+    now_nanos: i64,
+) -> Result<(), AppError> {
+    let locator = TrashLocator {
+        logical_key: located.logical_key.clone(),
+        deleted_at_unix_nanos: now_nanos,
+        delete_mutation_id: mutation_id.to_string(),
+    };
+    copy_live_to_trash(located, &locator).await?;
+    remove_live(located).await
+}
+
+async fn recover_one(name: &PeerNcnxName, located: &LocatedNcnx) -> Result<(), AppError> {
+    let locator = name
+        .trash
+        .as_ref()
+        .ok_or_else(|| AppError::InternalServerError("trash recovery has no locator".into()))?;
+    if let Some(live) = find_live(&located.record.fragment_id, &name.logical_key).await? {
+        if live.record.object_id != located.record.object_id {
+            return Err(AppError::Conflict(format!(
+                "cannot recover '{}': live key points to another object",
+                name.logical_key
+            )));
+        }
+    } else {
+        copy_live_to_key(located, &name.logical_key).await?;
+    }
+    remove_trash(located, locator).await
+}
+
+fn live_file_entry(fragment: &str, path: &str, located: &LocatedNcnx) -> NamespaceEntry {
     NamespaceEntry {
         fragment: fragment.to_string(),
-        parent_path: crate::namespace::paths::parent_path(&path),
-        name: entry.name,
-        kind: dentry_kind(&entry.target),
-        object_id: object_id(&entry.target),
+        path: path.to_string(),
+        parent_path: parent_path(path),
+        name: base_name(path),
+        kind: NamespaceEntryKind::File,
+        object_id: Some(located.record.object_id.clone()),
         size_bytes: None,
         version_id: None,
         packed_ext_u64: None,
         lifecycle: LifecycleState::Live,
         trash_entry_id: None,
         deleted_at_unix: None,
-        created_at_unix: nanos_to_unix_seconds(entry.created_at_unix_nanos),
-        updated_at_unix: nanos_to_unix_seconds(entry.updated_at_unix_nanos),
-        path,
+        created_at_unix: located.record.created_at_unix_nanos / 1_000_000_000,
+        updated_at_unix: located.record.created_at_unix_nanos / 1_000_000_000,
     }
 }
 
-fn trash_dentry_to_namespace_entry(
-    fragment: &str,
-    entry: InodeDentry,
-) -> Result<NamespaceEntry, AppError> {
-    let trash = entry.trash.clone().ok_or_else(|| {
-        AppError::InternalServerError("trash dentry has no lifecycle context".into())
-    })?;
-    Ok(NamespaceEntry {
+fn zero_decode_file_entry(fragment: &str, path: &str, name: &str) -> NamespaceEntry {
+    NamespaceEntry {
         fragment: fragment.to_string(),
-        path: trash.path.clone(),
-        parent_path: crate::namespace::paths::parent_path(&trash.path),
-        name: crate::namespace::paths::base_name(&trash.path),
-        kind: dentry_kind(&entry.target),
-        object_id: object_id(&entry.target),
+        path: path.to_string(),
+        parent_path: parent_path(path),
+        name: name.to_string(),
+        kind: NamespaceEntryKind::File,
+        object_id: None,
         size_bytes: None,
         version_id: None,
         packed_ext_u64: None,
-        lifecycle: LifecycleState::trashed(nanos_to_unix_seconds(trash.deleted_at_unix_nanos)),
-        trash_entry_id: Some(entry.name),
-        deleted_at_unix: Some(nanos_to_unix_seconds(trash.deleted_at_unix_nanos)),
-        created_at_unix: nanos_to_unix_seconds(entry.created_at_unix_nanos),
-        updated_at_unix: nanos_to_unix_seconds(entry.updated_at_unix_nanos),
-    })
-}
-
-async fn walk_live_namespace(fragment: &str) -> Result<Vec<NamespaceObjectRef>, AppError> {
-    let mut refs = Vec::new();
-    let root = DistributedNamespace::resolve_directory(fragment, "").await?;
-    let stable_fragment_id = root.inode.fragment_id.clone();
-    walk_directory(
-        &stable_fragment_id,
-        String::new(),
-        root.inode.inode_id,
-        root.inode.layout,
-        &mut refs,
-    )
-    .await?;
-    Ok(refs)
-}
-
-async fn walk_trash_namespace(fragment: &str) -> Result<Vec<NamespaceObjectRef>, AppError> {
-    let mut refs = Vec::new();
-    let namespace = crate::namespace::catalog::resolve_fragment_namespace(
-        crate::distribution::membership::active_cluster_runtime()?,
-        fragment,
-    )
-    .await?;
-    for entry in DistributedNamespace::list_trash(fragment).await? {
-        let base = entry
-            .trash
-            .as_ref()
-            .map(|trash| trash.path.clone())
-            .ok_or_else(|| {
-                AppError::InternalServerError("trash dentry has no lifecycle context".into())
-            })?;
-        walk_target(&namespace.stable_fragment_id, base, entry.target, &mut refs).await?;
+        lifecycle: LifecycleState::Live,
+        trash_entry_id: None,
+        deleted_at_unix: None,
+        created_at_unix: 0,
+        updated_at_unix: 0,
     }
-    Ok(refs)
 }
 
-async fn walk_directory(
-    fragment: &str,
-    base: String,
-    directory_id: String,
-    layout: InodeLayout,
-    refs: &mut Vec<NamespaceObjectRef>,
-) -> Result<(), AppError> {
-    let mut stack = vec![(base, directory_id, layout)];
-    while let Some((base, directory_id, layout)) = stack.pop() {
-        for entry in
-            DistributedNamespace::list_inode_dentries(fragment, &directory_id, &layout).await?
-        {
-            let path = join_path(&base, &entry.name);
-            match entry.target {
-                InodeDentryTarget::Directory { inode_id, layout } => {
-                    stack.push((path, inode_id, layout))
-                }
-                InodeDentryTarget::Object { object_id } => refs.push(NamespaceObjectRef {
-                    path,
-                    object_id,
-                    version_id: String::new(),
-                }),
-                InodeDentryTarget::Symlink { .. } => {}
-                InodeDentryTarget::Fragment { .. } => {
-                    return Err(AppError::Conflict(
-                        "fragment catalog target appeared inside a fragment namespace".into(),
-                    ));
-                }
-            }
-        }
+fn directory_entry(fragment: &str, path: &str, name: &str) -> NamespaceEntry {
+    NamespaceEntry {
+        fragment: fragment.to_string(),
+        path: path.to_string(),
+        parent_path: parent_path(path),
+        name: name.to_string(),
+        kind: NamespaceEntryKind::Directory,
+        object_id: None,
+        size_bytes: None,
+        version_id: None,
+        packed_ext_u64: None,
+        lifecycle: LifecycleState::Live,
+        trash_entry_id: None,
+        deleted_at_unix: None,
+        created_at_unix: 0,
+        updated_at_unix: 0,
     }
-    Ok(())
 }
 
-async fn walk_target(
-    fragment: &str,
-    path: String,
-    target: InodeDentryTarget,
-    refs: &mut Vec<NamespaceObjectRef>,
-) -> Result<(), AppError> {
-    match target {
-        InodeDentryTarget::Object { object_id } => refs.push(NamespaceObjectRef {
-            path,
-            object_id,
-            version_id: String::new(),
-        }),
-        InodeDentryTarget::Directory { inode_id, layout } => {
-            walk_directory(fragment, path, inode_id, layout, refs).await?
-        }
-        InodeDentryTarget::Symlink { .. } => {}
-        InodeDentryTarget::Fragment { .. } => {
-            return Err(AppError::Conflict(
-                "fragment catalog target appeared inside a fragment namespace".into(),
-            ));
-        }
+fn trash_entry(fragment: &str, name: &PeerNcnxName, located: &LocatedNcnx) -> NamespaceEntry {
+    let locator = name.trash.as_ref().expect("trash name includes locator");
+    NamespaceEntry {
+        fragment: fragment.to_string(),
+        path: name.logical_key.clone(),
+        parent_path: parent_path(&name.logical_key),
+        name: base_name(&name.logical_key),
+        kind: NamespaceEntryKind::File,
+        object_id: Some(located.record.object_id.clone()),
+        size_bytes: None,
+        version_id: None,
+        packed_ext_u64: None,
+        lifecycle: LifecycleState::trashed(locator.deleted_at_unix_nanos / 1_000_000_000),
+        trash_entry_id: Some(locator.delete_mutation_id.clone()),
+        deleted_at_unix: Some(locator.deleted_at_unix_nanos / 1_000_000_000),
+        created_at_unix: located.record.created_at_unix_nanos / 1_000_000_000,
+        updated_at_unix: locator.deleted_at_unix_nanos / 1_000_000_000,
     }
-    Ok(())
 }
 
-fn summary_from_dentry(
+fn mutation_summary(
     operation: &str,
-    record: &InodeDentry,
+    kind: NamespaceEntryKind,
+    affected: usize,
     source_path: Option<String>,
     destination_path: Option<String>,
+    trash_entry_id: Option<String>,
+    deleted_at_nanos: Option<i64>,
 ) -> NamespaceMutationSummary {
     NamespaceMutationSummary {
         operation: operation.to_string(),
-        kind: dentry_kind(&record.target),
-        affected_paths: 1,
-        affected_objects: usize::from(matches!(record.target, InodeDentryTarget::Object { .. })),
+        kind,
+        affected_paths: affected,
+        affected_objects: affected,
         source_path,
         destination_path,
-        trash_entry_id: record.trash.as_ref().map(|_| record.name.clone()),
-        deleted_at_unix: record
-            .trash
-            .as_ref()
-            .map(|trash| nanos_to_unix_seconds(trash.deleted_at_unix_nanos)),
+        trash_entry_id,
+        deleted_at_unix: deleted_at_nanos.map(|value| value / 1_000_000_000),
     }
-}
-
-fn dentry_kind(target: &InodeDentryTarget) -> NamespaceEntryKind {
-    match target {
-        InodeDentryTarget::Directory { .. } => NamespaceEntryKind::Directory,
-        InodeDentryTarget::Object { .. } => NamespaceEntryKind::File,
-        InodeDentryTarget::Symlink { .. } => NamespaceEntryKind::File,
-        InodeDentryTarget::Fragment { .. } => NamespaceEntryKind::Directory,
-    }
-}
-
-fn object_id(target: &InodeDentryTarget) -> Option<String> {
-    match target {
-        InodeDentryTarget::Object { object_id } => Some(object_id.clone()),
-        InodeDentryTarget::Directory { .. }
-        | InodeDentryTarget::Symlink { .. }
-        | InodeDentryTarget::Fragment { .. } => None,
-    }
-}
-
-fn nanos_to_unix_seconds(nanos: i64) -> i64 {
-    nanos / 1_000_000_000
 }
 
 fn required<'a>(value: &'a Option<String>, message: &str) -> Result<&'a str, AppError> {
@@ -565,14 +932,6 @@ fn required<'a>(value: &'a Option<String>, message: &str) -> Result<&'a str, App
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::BadRequest(message.into()))
-}
-
-fn join_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent}/{name}")
-    }
 }
 
 #[cfg(test)]
@@ -592,5 +951,22 @@ mod tests {
         assert!(!encoded.contains("purge"));
         assert!(!encoded.contains("empty"));
         assert!(!encoded.contains("recover_all"));
+    }
+
+    #[test]
+    fn zero_decode_listing_entry_has_no_object_metadata() {
+        let entry = zero_decode_file_entry("fragment", "videos/a.mp4", "a.mp4");
+        assert!(entry.object_id.is_none());
+        assert!(entry.version_id.is_none());
+        assert!(entry.size_bytes.is_none());
+    }
+
+    #[test]
+    fn recovery_group_reports_the_component_aligned_common_parent() {
+        assert_eq!(
+            common_parent_for_keys(["videos/a.mp4", "videos/nested/b.mp4"].into_iter()),
+            "videos"
+        );
+        assert_eq!(common_parent_for_keys(["a/file", "b/file"].into_iter()), "");
     }
 }

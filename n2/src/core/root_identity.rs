@@ -1,4 +1,4 @@
-use crate::distribution::membership::{ClusterRuntime, NodeRole, StorageRoot};
+use crate::distribution::membership::{ClusterRuntime, StorageRoot};
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -6,28 +6,43 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 pub const ROOT_IDENTITY_FILE: &str = ".n2-root.ncdx";
-const ROOT_IDENTITY_FORMAT: &str = "n2-root-v2";
+const ROOT_IDENTITY_FORMAT: &str = "n2-root-v3";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RootIdentity {
     pub format: String,
     pub cluster_id: String,
     pub node_id: String,
-    pub node_role: NodeRole,
+    pub pool_id: String,
+    pub pool_generation: u64,
     pub root_id: String,
-    /// Immutable namespace durability contract for this cluster generation.
-    pub namespace_redundancy: usize,
+    pub node_root_ids: Vec<String>,
+    pub object_data_shards: usize,
+    pub object_parity_shards: usize,
 }
 
 impl RootIdentity {
     fn expected(runtime: &ClusterRuntime, root: &StorageRoot) -> Self {
+        let pool = runtime
+            .membership
+            .pool(&runtime.local_pool_id)
+            .expect("validated N2 runtime must contain its local server pool");
+        let mut node_root_ids = runtime
+            .local_storage_roots
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>();
+        node_root_ids.sort();
         Self {
             format: ROOT_IDENTITY_FORMAT.to_string(),
             cluster_id: runtime.membership.cluster_id.clone(),
             node_id: runtime.local_node_id.clone(),
-            node_role: runtime.local_role,
+            pool_id: runtime.local_pool_id.clone(),
+            pool_generation: pool.generation,
             root_id: root.id.clone(),
-            namespace_redundancy: runtime.membership.policy.namespace_redundancy,
+            node_root_ids,
+            object_data_shards: pool.policy.object_data_shards,
+            object_parity_shards: pool.policy.object_parity_shards,
         }
     }
 }
@@ -90,11 +105,11 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
         Ok(actual) if actual == expected => return Ok(()),
         Ok(actual) => {
             return Err(AppError::Conflict(format!(
-                "root '{}' belongs to cluster='{}' node='{}' role='{}' root_id='{}', not this logical node",
+                "root '{}' belongs to cluster='{}' node='{}' pool='{}' root_id='{}', not this logical node",
                 root_path.display(),
                 actual.cluster_id,
                 actual.node_id,
-                actual.node_role,
+                actual.pool_id,
                 actual.root_id
             )));
         }
@@ -104,7 +119,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
 
     if !root_is_empty(root_path)? {
         return Err(AppError::Conflict(format!(
-            "unenrolled N2 2.0 root '{}' is not empty; use a new isolated directory",
+            "unenrolled N2 3.0 root '{}' is not empty; use a new isolated directory",
             root_path.display()
         )));
     }
@@ -160,10 +175,10 @@ pub fn initialize_local_root_identities(runtime: &ClusterRuntime) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
+    use crate::distribution::layout::ClusterLayoutPolicy;
     use crate::distribution::membership::{
-        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION,
-        NamespaceCatalogLayout, NamespaceCatalogReplica, NodeState,
+        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState,
+        PoolState, ServerPool,
     };
     use ulid::Ulid;
 
@@ -173,37 +188,31 @@ mod tests {
             path: root.display().to_string(),
         };
         let policy = ClusterPolicy {
-            namespace_redundancy: 2,
             object_data_shards: 1,
             object_parity_shards: 1,
         };
         ClusterRuntime {
             local_node_id: node_id.into(),
-            local_role: NodeRole::Namespace,
+            local_pool_id: "pool-test".into(),
             local_storage_roots: vec![storage_root.clone()],
             membership_path: PathBuf::new(),
             layout_policy: ClusterLayoutPolicy {
-                mode: ClusterLayoutMode::Fixed,
-                fixed_data_shards: Some(1),
-                fixed_parity_shards: Some(1),
-                auto_max_data_shards: 8,
-                auto_max_parity_shards: 3,
+                data_shards: 1,
+                parity_shards: 1,
             },
             membership: ClusterMembership {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "cluster-test".into(),
                 epoch: 1,
-                policy,
-                namespace_catalog: NamespaceCatalogLayout {
+                pools: vec![ServerPool {
+                    id: "pool-test".into(),
                     generation: 1,
-                    replicas: vec![NamespaceCatalogReplica {
-                        node_id: node_id.into(),
-                        root_id: "ns-root-1".into(),
-                    }],
-                },
+                    policy,
+                    state: PoolState::Writable,
+                    node_ids: vec![node_id.into()],
+                }],
                 nodes: vec![ClusterNode {
                     id: node_id.into(),
-                    role: NodeRole::Namespace,
                     endpoint: "https://127.0.0.1:1".into(),
                     native_endpoint: None,
                     state: Some(NodeState::Online),
@@ -242,15 +251,37 @@ mod tests {
     }
 
     #[test]
-    fn enrolled_root_rejects_namespace_redundancy_change() {
+    fn enrolled_root_rejects_static_ec_change() {
         let root = std::env::temp_dir().join(format!("n2-root-v2-policy-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         let first = runtime(&root, "namespace-a");
         initialize_local_root_identities(&first).expect("enroll root");
 
         let mut changed = runtime(&root, "namespace-a");
-        changed.membership.policy.namespace_redundancy = 3;
+        changed.membership.pools[0].policy.object_parity_shards = 2;
         assert!(initialize_local_root_identities(&changed).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enrolled_pool_rejects_local_root_set_change() {
+        let first_root = std::env::temp_dir().join(format!("n2-root-v3-set-a-{}", Ulid::new()));
+        let second_root = std::env::temp_dir().join(format!("n2-root-v3-set-b-{}", Ulid::new()));
+        fs::create_dir_all(&first_root).expect("create first root");
+        fs::create_dir_all(&second_root).expect("create second root");
+        let first = runtime(&first_root, "node-a");
+        initialize_local_root_identities(&first).expect("enroll first root set");
+
+        let mut changed = runtime(&first_root, "node-a");
+        let added = StorageRoot {
+            id: "root-2".into(),
+            path: second_root.display().to_string(),
+        };
+        changed.local_storage_roots.push(added.clone());
+        changed.membership.nodes[0].storage_roots.push(added);
+        assert!(initialize_local_root_identities(&changed).is_err());
+
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
     }
 }

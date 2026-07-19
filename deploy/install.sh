@@ -22,6 +22,7 @@ SERVICE_DIR="/etc/systemd/system"
 NODE_RUNTIME_DIR="/var/lib/litiaina/n2"
 GATEWAY_RUNTIME_DIR="/var/lib/litiaina/n2-gateway"
 NODE_ENV_FILE="/etc/litiaina/n2/n2.env"
+ENV_SRC=""
 NODE_LOG_FILTER="n2=info,tower_http=info"
 GATEWAY_LOG_FILTER="n2_gateway=info,tower_http=info"
 
@@ -31,10 +32,13 @@ NODE_HTTP_PORT="50001"
 NODE_NATIVE_PORT="50002"
 NODE_ENDPOINT="https://127.0.0.1:50001"
 NODE_NATIVE_ENDPOINT="n2://127.0.0.1:50002"
-STORAGE_ROOTS="/mnt/n2/storage"
-FS_ROOT="/mnt/n2/fs"
-CLUSTER_ID="litiaina-n2-prod"
-MEMBERSHIP_EPOCH="1"
+STORAGE_ROOTS="root-0=/mnt/n2/storage"
+STATE_ROOT="/var/lib/litiaina/n2/state"
+MEMBERSHIP_SRC=""
+POOL_ID="pool-1"
+POOL_GENERATION="1"
+DATA_SHARDS="1"
+PARITY_SHARDS="1"
 
 GATEWAY_HOST="0.0.0.0"
 GATEWAY_PORT="51002"
@@ -73,16 +77,22 @@ Build/install:
 Node options:
   --runtime-dir PATH      N2 runtime dir. Default: /var/lib/litiaina/n2
   --env-file PATH         N2 environment file. Default: /etc/litiaina/n2/n2.env
+  --env-src PATH          Shared cluster environment source (required for a
+                         fresh node; JWT and peer secrets must match).
   --node-id ID            This node id. Default: node-a
   --host HOST             Server bind host. Default: 0.0.0.0
   --http-port PORT        N2 HTTPS port. Default: 50001
   --native-port PORT      N2 native n2:// port. Default: 50002
   --node-endpoint URL     Public node HTTPS endpoint.
   --native-endpoint URL   Public node native endpoint.
-  --storage-roots LIST    Comma-separated N2 storage devices. Default: /mnt/n2/storage
-  --fs-root PATH          Namespace/runtime storage root. Default: /mnt/n2/fs
-  --cluster-id ID         Membership cluster id. Default: litiaina-n2-prod
-  --membership-epoch N    Initial membership epoch. Default: 1
+  --storage-roots LIST    ROOT_ID=/absolute/path entries, comma separated.
+  --state-root PATH       Process-local runtime state directory.
+  --membership-src PATH  Complete shared format-v3 membership JSON (required
+                         for a fresh node installation).
+  --pool-id ID            Local static server-pool ID. Default: pool-1
+  --pool-generation N     Local pool generation. Default: 1
+  --data-shards N         Static pool data width K. Default: 1
+  --parity-shards N       Static pool parity width M. Default: 1
 
 Gateway options:
   --gateway-runtime-dir PATH  Gateway runtime dir. Default: /var/lib/litiaina/n2-gateway
@@ -96,8 +106,10 @@ Examples:
     --node-id node-a \
     --node-endpoint https://192.168.0.22:50001 \
     --native-endpoint n2://192.168.0.22:50002 \
-    --storage-roots /mnt/DISK0/n2,/mnt/DISK1/n2 \
-    --fs-root /mnt/DISK0/n2-fs \
+    --storage-roots root-0=/mnt/DISK0/n2,root-1=/mnt/DISK1/n2 \
+    --state-root /var/lib/litiaina/n2/state \
+    --env-src ./n2.env \
+    --membership-src ./n2_membership.json \
     --enable --start
 
   sudo deploy/install.sh --gateway --copy-certs \
@@ -133,25 +145,18 @@ need_root() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run as root, or use --dry-run"
 }
 
-csv_to_paths() {
+storage_root_paths() {
     local raw="$1"
-    raw="${raw//,/ }"
-    echo "$raw"
-}
-
-first_csv_path() {
-    local raw="$1"
-    raw="${raw%%,*}"
-    echo "$raw"
-}
-
-random_secret() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 48
-    else
-        tr -dc 'A-Za-z0-9' </dev/urandom | head -c 64
-        echo
-    fi
+    IFS=',' read -r -a entries <<<"$raw"
+    local entry id path
+    for entry in "${entries[@]}"; do
+        entry="$(echo "$entry" | xargs)"
+        [[ "$entry" == *=* ]] || die "storage root '$entry' must use ROOT_ID=/absolute/path"
+        id="${entry%%=*}"
+        path="${entry#*=}"
+        [[ -n "$id" && "$path" == /* ]] || die "invalid storage root '$entry'"
+        printf '%s\n' "$path"
+    done
 }
 
 write_if_missing() {
@@ -227,10 +232,11 @@ ensure_dirs() {
     log "creating runtime directories"
     if [[ "$MODE" == node || "$MODE" == both ]]; then
         run install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$NODE_RUNTIME_DIR" "$NODE_RUNTIME_DIR/certificates"
-        for path in $(csv_to_paths "$STORAGE_ROOTS") "$FS_ROOT"; do
+        while IFS= read -r path; do
             [[ -n "$path" ]] || continue
             run install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$path"
-        done
+        done < <(storage_root_paths "$STORAGE_ROOTS")
+        run install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT"
     fi
     if [[ "$MODE" == gateway || "$MODE" == both ]]; then
         run install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$GATEWAY_RUNTIME_DIR" "$GATEWAY_RUNTIME_DIR/certificates"
@@ -254,21 +260,16 @@ copy_certs() {
 }
 
 write_node_env() {
-    local body
-    body="$(cat <<EOF
-JWT_SECRET='$(random_secret)'
-AUTH_KEY='$(random_secret)'
-MASTER_KEY='$(random_secret)'
-ADMIN_KEY='$(random_secret)'
-ACCESS_TOKEN_DEFAULT_TTL_SECS=900
-ACCESS_TOKEN_MAX_TTL_SECS=3600
-REFRESH_TOKEN_TTL_SECS=604800
-N2_RUNTIME_WORKER_THREADS=
-N2_RUNTIME_MAX_BLOCKING_THREADS=
-N2_RUNTIME_THREAD_STACK_BYTES=
-EOF
-)"
-    write_if_missing "$NODE_ENV_FILE" 0600 root:root "$body"
+    if [[ -e "$NODE_ENV_FILE" && "$FORCE_CONFIG" != true ]]; then
+        log "keeping existing $NODE_ENV_FILE"
+        return
+    fi
+    [[ -n "$ENV_SRC" ]] || die "fresh N2 3.0 node install requires --env-src"
+    [[ -f "$ENV_SRC" ]] || die "environment source is missing: $ENV_SRC"
+    grep -q '^JWT_SECRET=' "$ENV_SRC" || die "environment source lacks JWT_SECRET"
+    grep -q '^N2_CLUSTER_SECRET=' "$ENV_SRC" || die "environment source lacks N2_CLUSTER_SECRET"
+    run install -d -m 0755 "$(dirname "$NODE_ENV_FILE")"
+    run install -m 0600 -o root -g root "$ENV_SRC" "$NODE_ENV_FILE"
 }
 
 write_node_config() {
@@ -282,17 +283,18 @@ cert_path=$NODE_RUNTIME_DIR/certificates/cert.pem
 key_path=$NODE_RUNTIME_DIR/certificates/key.pem
 
 [disk_config]
-storage_disks=$STORAGE_ROOTS
-fs_storage_path=$FS_ROOT
+storage_roots=$STORAGE_ROOTS
+runtime_path=$STATE_ROOT
 
 [cluster_config]
 node_id=$NODE_ID
+pool_id=$POOL_ID
+pool_generation=$POOL_GENERATION
 node_endpoint=$NODE_ENDPOINT
 native_endpoint=$NODE_NATIVE_ENDPOINT
-membership_file=n2_membership.json
-cluster_layout_mode=auto
-fixed_data_shards=
-fixed_parity_shards=
+membership_file=$STATE_ROOT/n2_membership.json
+object_data_shards=$DATA_SHARDS
+object_parity_shards=$PARITY_SHARDS
 auto_rebalance=false
 
 [garbage_collector]
@@ -343,8 +345,8 @@ stream_locality_bias_enabled=true
 monitor_interval_seconds=auto
 monitor_deep_scan_interval_seconds=auto
 max_part_size=52428800
-data_shards=1
-parity_shards=0
+data_shards=$DATA_SHARDS
+parity_shards=$PARITY_SHARDS
 stripe_block_size=262144
 EOF
 )"
@@ -352,46 +354,17 @@ EOF
 }
 
 write_membership() {
-    local membership="$FS_ROOT/n2_membership.json"
-    local storage_json
-    storage_json="$(csv_json_array "$STORAGE_ROOTS")"
-    local body
-    body="$(cat <<EOF
-{
-  "cluster_id": "$CLUSTER_ID",
-  "epoch": $MEMBERSHIP_EPOCH,
-  "nodes": [
-    {
-      "id": "$NODE_ID",
-      "endpoint": "$NODE_ENDPOINT",
-      "native_endpoint": "$NODE_NATIVE_ENDPOINT",
-      "state": "online",
-      "weight": 1,
-      "storage_roots": $storage_json
-    }
-  ]
-}
-EOF
-)"
-    write_if_missing "$membership" 0640 "$SERVICE_USER:$SERVICE_GROUP" "$body"
-}
-
-csv_json_array() {
-    local raw="$1"
-    local first=true
-    printf '['
-    IFS=',' read -r -a values <<<"$raw"
-    for value in "${values[@]}"; do
-        value="$(echo "$value" | xargs)"
-        [[ -n "$value" ]] || continue
-        if [[ "$first" == true ]]; then
-            first=false
-        else
-            printf ', '
-        fi
-        printf '"%s"' "${value//\"/\\\"}"
-    done
-    printf ']'
+    local membership="$STATE_ROOT/n2_membership.json"
+    if [[ -e "$membership" && "$FORCE_CONFIG" != true ]]; then
+        log "keeping existing $membership"
+        return
+    fi
+    [[ -n "$MEMBERSHIP_SRC" ]] || die "fresh N2 3.0 node install requires --membership-src"
+    [[ -f "$MEMBERSHIP_SRC" ]] || die "membership source is missing: $MEMBERSHIP_SRC"
+    command -v jq >/dev/null || die "jq is required to validate membership"
+    jq -e '.format_version == 3 and (.pools | length) > 0 and (.nodes | length) > 0' "$MEMBERSHIP_SRC" >/dev/null \
+        || die "membership source is not a complete N2 format-v3 membership"
+    run install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$MEMBERSHIP_SRC" "$membership"
 }
 
 default_gateway_node() {
@@ -446,7 +419,7 @@ render_service() {
     local template="$1"
     local target="$2"
     local data_paths
-    data_paths="$(csv_to_paths "$STORAGE_ROOTS") $FS_ROOT"
+    data_paths="$(storage_root_paths "$STORAGE_ROOTS" | tr '\n' ' ') $STATE_ROOT"
 
     log "rendering $(basename "$target")"
     if [[ "$DRY_RUN" == true ]]; then
@@ -530,6 +503,7 @@ parse_args() {
             --runtime-dir) NODE_RUNTIME_DIR="${2:?missing --runtime-dir value}"; shift ;;
             --gateway-runtime-dir) GATEWAY_RUNTIME_DIR="${2:?missing --gateway-runtime-dir value}"; shift ;;
             --env-file) NODE_ENV_FILE="${2:?missing --env-file value}"; shift ;;
+            --env-src) ENV_SRC="${2:?missing --env-src value}"; shift ;;
             --node-id) NODE_ID="${2:?missing --node-id value}"; shift ;;
             --host) NODE_HOST="${2:?missing --host value}"; shift ;;
             --http-port) NODE_HTTP_PORT="${2:?missing --http-port value}"; shift ;;
@@ -537,9 +511,12 @@ parse_args() {
             --node-endpoint) NODE_ENDPOINT="${2:?missing --node-endpoint value}"; shift ;;
             --native-endpoint) NODE_NATIVE_ENDPOINT="${2:?missing --native-endpoint value}"; shift ;;
             --storage-roots) STORAGE_ROOTS="${2:?missing --storage-roots value}"; shift ;;
-            --fs-root) FS_ROOT="${2:?missing --fs-root value}"; shift ;;
-            --cluster-id) CLUSTER_ID="${2:?missing --cluster-id value}"; shift ;;
-            --membership-epoch) MEMBERSHIP_EPOCH="${2:?missing --membership-epoch value}"; shift ;;
+            --state-root) STATE_ROOT="${2:?missing --state-root value}"; shift ;;
+            --membership-src) MEMBERSHIP_SRC="${2:?missing --membership-src value}"; shift ;;
+            --pool-id) POOL_ID="${2:?missing --pool-id value}"; shift ;;
+            --pool-generation) POOL_GENERATION="${2:?missing --pool-generation value}"; shift ;;
+            --data-shards) DATA_SHARDS="${2:?missing --data-shards value}"; shift ;;
+            --parity-shards) PARITY_SHARDS="${2:?missing --parity-shards value}"; shift ;;
             --gateway-host) GATEWAY_HOST="${2:?missing --gateway-host value}"; shift ;;
             --gateway-port) GATEWAY_PORT="${2:?missing --gateway-port value}"; shift ;;
             --gateway-node) GATEWAY_NODES+=("${2:?missing --gateway-node value}"); shift ;;

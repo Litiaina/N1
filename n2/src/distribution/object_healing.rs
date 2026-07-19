@@ -2,6 +2,7 @@ use crate::core::repair_manager::{RepairCheckMode, repair_cluster_object_recorde
 use crate::distribution::healing_report::AutoHealingReport;
 use crate::distribution::membership::ClusterRuntime;
 use crate::distribution::namespace_healing::FragmentNamespaceHealingResult;
+use crate::distribution::ncnx::key_references_object;
 use crate::distribution::peer::{
     collect_cluster_object_inventory, inspect_and_repair_metadata_replicas,
     resolve_cluster_object_versions,
@@ -66,6 +67,29 @@ pub async fn scan_and_repair_fragment_objects(
         let versions = match resolve_cluster_object_versions(fragment, object_id).await {
             Ok(versions) if !versions.is_empty() => versions,
             Ok(_) => {
+                match object_reference_still_exists(fragment, object_id, namespace).await {
+                    Ok(false) => {
+                        tracing::debug!(
+                            fragment,
+                            object_id,
+                            "namespace reference was superseded during object healing"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        result.failed_objects = result.failed_objects.saturating_add(1);
+                        result.reports.push(reference_revalidation_report(
+                            &runtime,
+                            fragment,
+                            scan_id,
+                            object_id,
+                            logical_path.clone(),
+                            &error.to_string(),
+                        ));
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
                 result.unrecoverable_objects = result.unrecoverable_objects.saturating_add(1);
                 result.reports.push(dangling_object_report(
                     &runtime,
@@ -78,6 +102,31 @@ pub async fn scan_and_repair_fragment_objects(
                 continue;
             }
             Err(error) => {
+                match object_reference_still_exists(fragment, object_id, namespace).await {
+                    Ok(false) => {
+                        tracing::debug!(
+                            fragment,
+                            object_id,
+                            "namespace reference was superseded during object resolution"
+                        );
+                        continue;
+                    }
+                    Err(revalidation_error) => {
+                        result.failed_objects = result.failed_objects.saturating_add(1);
+                        result.reports.push(reference_revalidation_report(
+                            &runtime,
+                            fragment,
+                            scan_id,
+                            object_id,
+                            logical_path.clone(),
+                            &format!(
+                                "object resolution failed ({error}); namespace revalidation failed ({revalidation_error})"
+                            ),
+                        ));
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
                 result.failed_objects = result.failed_objects.saturating_add(1);
                 result.reports.push(dangling_object_report(
                     &runtime,
@@ -226,8 +275,7 @@ pub async fn scan_and_repair_fragment_objects(
                     &runtime,
                     fragment,
                     scan_id,
-                    runtime.membership.policy.object_data_shards
-                        + runtime.membership.policy.object_parity_shards,
+                    runtime.membership.readable_nodes().len(),
                     0,
                     vec![error.to_string()],
                     immutable_divergence,
@@ -237,6 +285,25 @@ pub async fn scan_and_repair_fragment_objects(
     }
 
     result
+}
+
+async fn object_reference_still_exists(
+    fragment: &str,
+    object_id: &str,
+    namespace: &FragmentNamespaceHealingResult,
+) -> Result<bool, crate::enums::app_error_enum::AppError> {
+    let paths = namespace
+        .live_objects
+        .get(object_id)
+        .into_iter()
+        .flatten()
+        .chain(namespace.trash_objects.get(object_id).into_iter().flatten());
+    for path in paths {
+        if key_references_object(fragment, path, object_id).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn object_repair_report(
@@ -340,6 +407,33 @@ fn dangling_object_report(
     report
 }
 
+fn reference_revalidation_report(
+    runtime: &ClusterRuntime,
+    fragment: &str,
+    scan_id: &str,
+    object_id: &str,
+    logical_path: Option<String>,
+    reason: &str,
+) -> AutoHealingReport {
+    let mut report = AutoHealingReport::new(
+        scan_id,
+        runtime.membership.epoch,
+        fragment,
+        &runtime.local_node_id,
+        "object_reference_revalidation_incomplete",
+        "object",
+    );
+    report.object_id = Some(object_id.into());
+    report.logical_path = logical_path;
+    report.initial_status = "incomplete".into();
+    report.repair_attempted = false;
+    report.repair_outcome = "deferred".into();
+    report.cluster_read_only_triggered = false;
+    report.reason = Some(reason.into());
+    report.completed_at_unix_nanos = now_nanos();
+    report
+}
+
 fn headless_object_report(
     runtime: &ClusterRuntime,
     fragment: &str,
@@ -402,7 +496,7 @@ fn blob_inventory_report(
         .map(|error| json!({ "error": error }))
         .collect();
     report.reason = Some(format!(
-        "only {responding}/{expected} configured blob nodes returned a physical object inventory"
+        "only {responding}/{expected} configured server-pool nodes returned a physical object inventory"
     ));
     report.completed_at_unix_nanos = now_nanos();
     report

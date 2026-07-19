@@ -5,8 +5,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created_quorum,
-    commit_namespace_summary_quorum,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created,
+    commit_namespace_summary,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -130,7 +130,7 @@ async fn posix_mkdir(
         return Err(AppError::Forbidden("Write permission required".into()));
     }
     let path = req.path;
-    let created = commit_namespace_created_quorum(PeerNamespaceApplyRequest {
+    let created = commit_namespace_created(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Mkdir,
         fragment: claims.fragment.clone(),
@@ -171,7 +171,7 @@ async fn posix_rename(
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Rename,
         fragment: claims.fragment.clone(),
@@ -210,7 +210,7 @@ async fn posix_trash(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Trash,
         fragment: claims.fragment.clone(),
@@ -253,7 +253,7 @@ async fn posix_recover(
         .trash_entry_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(req.path);
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: claims.fragment.clone(),

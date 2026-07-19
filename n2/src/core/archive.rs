@@ -31,9 +31,9 @@ use crate::{
     },
     core::{
         index,
-        metadata_parser::{get_metadata, get_version_metadata},
+        metadata_parser::{get_metadata, get_version_metadata_by_id},
         recovery::read_or_recover_chunk,
-        retrieve::get_object_metadata_direct,
+        retrieve::get_object_metadata_by_id,
     },
     enums::app_error_enum::AppError,
     namespace::{
@@ -487,7 +487,7 @@ async fn load_archive_metadata_for_manifest_entry(
 
     let metadata = match version_id.map(str::trim).filter(|value| !value.is_empty()) {
         Some(version_id) => {
-            match get_version_metadata(fragment, &physical_key, version_id, fragment).await {
+            match get_version_metadata_by_id(fragment, &physical_key, version_id).await {
                 Ok(m) if !m.is_delete_marker => m,
                 _ => return Ok(None),
             }
@@ -610,7 +610,7 @@ async fn load_archive_metadata_for_logical_path(
         )));
     };
 
-    let metadata = match get_object_metadata_direct(fragment, &object_id).await {
+    let metadata = match get_object_metadata_by_id(fragment, &object_id).await {
         Ok(metadata) => metadata,
         Err(AppError::NotFound) => return Ok(None),
         Err(err) => return Err(err),

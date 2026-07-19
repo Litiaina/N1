@@ -1,7 +1,7 @@
 use crate::core::operation_gate::cluster_safety_read_only_state;
 use crate::distribution::layout::resolve_configured_layout;
 use crate::distribution::membership::{
-    ClusterNode, ClusterRuntime, NodeRole, NodeState, live_active_write_nodes, live_readable_nodes,
+    ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
 };
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
 use crate::enums::app_error_enum::AppError;
@@ -19,7 +19,6 @@ pub enum ClusterHealthState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterNodeHealth {
     pub node_id: String,
-    pub role: NodeRole,
     pub state: NodeState,
     pub accepts_writes: bool,
     pub readable: bool,
@@ -38,13 +37,12 @@ pub struct ClusterHealthSnapshot {
     pub parity_shards: usize,
     pub data_plane_readable: bool,
     pub data_plane_writable: bool,
-    pub namespace_voters: usize,
-    pub estimated_namespace_reachable_voters: usize,
-    pub namespace_quorum_required: usize,
-    pub namespace_quorum_writable: bool,
+    pub ncnx_replicas: usize,
+    pub estimated_ncnx_replicas_reachable: usize,
+    pub ncnx_replicas_required: usize,
+    pub ncnx_strictly_writable: bool,
     pub effective_client_writable: bool,
     pub safety_read_only: bool,
-    pub adaptive_layout: bool,
     pub manual_rebalance_available: bool,
     pub layout_drift_is_health_failure: bool,
     pub automatic_rebalance: bool,
@@ -67,39 +65,43 @@ pub fn cluster_health_snapshot_with_live_nodes(
     active: Vec<ClusterNode>,
     readable: Vec<ClusterNode>,
 ) -> Result<ClusterHealthSnapshot, AppError> {
+    let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+        AppError::ServiceUnavailable("cluster has no writable server pool".into())
+    })?;
+    let pool_nodes = write_pool.node_ids.iter().collect::<HashSet<_>>();
     let configured_blob = runtime
         .membership
-        .active_write_nodes_for_role(NodeRole::Blob);
+        .active_write_nodes_for_pool(&write_pool.id);
     let active_blob = active
         .iter()
-        .filter(|node| node.role == NodeRole::Blob)
+        .filter(|node| pool_nodes.contains(&node.id))
         .cloned()
         .collect::<Vec<_>>();
     let readable_blob = readable
         .iter()
-        .filter(|node| node.role == NodeRole::Blob)
+        .filter(|node| pool_nodes.contains(&node.id))
         .cloned()
         .collect::<Vec<_>>();
-    let readable_namespace = readable
-        .iter()
-        .filter(|node| node.role == NodeRole::Namespace)
-        .count();
+    let readable_namespace = readable_blob.len();
     let configured_layout =
         resolve_configured_layout(configured_blob.len(), &runtime.layout_policy)
             .map_err(AppError::BadRequest)?;
     let layout = configured_layout;
     let data_plane_readable = readable_blob.len() >= layout.data_shards;
     let data_plane_writable = active_blob.len() >= layout.total_shards();
-    let configured_namespace_nodes = runtime.membership.nodes_for_role(NodeRole::Namespace).len();
-    let namespace_voters = runtime.membership.policy.namespace_redundancy;
-    let namespace_quorum_required = (namespace_voters / 2).saturating_add(1);
-    let estimated_namespace_reachable_voters = readable_namespace.min(namespace_voters);
-    let namespace_quorum_writable =
-        estimated_namespace_reachable_voters >= namespace_quorum_required;
+    let configured_namespace_nodes = runtime.membership.nodes_for_pool(&write_pool.id).len();
+    let ncnx_replicas = write_pool.policy.namespace_replicas();
+    let ncnx_replicas_required = ncnx_replicas;
+    let estimated_ncnx_replicas_reachable = readable_namespace.min(ncnx_replicas);
+    // NCNX placement is deterministic across the static pool membership.
+    // Requiring every pool node here makes the cluster-wide writable signal
+    // truthful for every possible key; an individual existing key may remain
+    // readable with only its selected replicas.
+    let ncnx_strictly_writable = readable_namespace == configured_namespace_nodes;
     let safety_state = cluster_safety_read_only_state();
     let safety_read_only = safety_state.is_some();
     let effective_client_writable =
-        data_plane_writable && namespace_quorum_writable && !safety_read_only;
+        data_plane_writable && ncnx_strictly_writable && !safety_read_only;
     let missing_blob_writable = configured_blob.len().saturating_sub(active_blob.len());
     let missing_namespace_readable = configured_namespace_nodes.saturating_sub(readable_namespace);
     let live_node_ids = readable
@@ -158,16 +160,16 @@ pub fn cluster_health_snapshot_with_live_nodes(
         ));
     }
     if missing_blob_writable > 0 {
-        if namespace_quorum_writable {
+        if ncnx_strictly_writable {
             notes.push(format!(
-                "{} configured blob node(s) are currently unreachable; namespace quorum remains writable but new object writes stop until the fixed {}+{} width is available",
+                "{} configured pool node(s) are currently unreachable; NCNX placement remains readable for unaffected keys but new object writes stop until the fixed {}+{} width is available",
                 missing_blob_writable,
                 configured_layout.data_shards,
                 configured_layout.parity_shards
             ));
         } else {
             notes.push(format!(
-                "{} configured blob node(s) are currently unreachable and namespace quorum is not writable; existing reconstructable objects may still be read",
+                "{} configured server-pool node(s) are currently unreachable and strict NCNX publication is unavailable; existing reconstructable objects may still be read",
                 missing_blob_writable
             ));
         }
@@ -179,15 +181,15 @@ pub fn cluster_health_snapshot_with_live_nodes(
             readable_blob.len()
         ));
     }
-    if !namespace_quorum_writable {
+    if !ncnx_strictly_writable {
         notes.push(format!(
-            "namespace quorum is not writable: requires {} voter(s), has {} reachable voter estimate",
-            namespace_quorum_required, estimated_namespace_reachable_voters
+            "namespace NCNX placement is not uniformly writable: {} of {} server-pool nodes are reachable ({} replicas per key)",
+            readable_namespace, configured_namespace_nodes, ncnx_replicas_required
         ));
     }
-    if data_plane_writable && !namespace_quorum_writable {
+    if data_plane_writable && !ncnx_strictly_writable {
         notes.push(
-            "data-plane placement can accept shards, but client writes still require namespace pointer quorum"
+            "data-plane placement can accept shards, but client writes still require strict NCNX replica publication"
                 .to_string(),
         );
     }
@@ -201,13 +203,12 @@ pub fn cluster_health_snapshot_with_live_nodes(
         parity_shards: layout.parity_shards,
         data_plane_readable,
         data_plane_writable,
-        namespace_voters,
-        estimated_namespace_reachable_voters,
-        namespace_quorum_required,
-        namespace_quorum_writable,
+        ncnx_replicas,
+        estimated_ncnx_replicas_reachable,
+        ncnx_replicas_required,
+        ncnx_strictly_writable,
         effective_client_writable,
         safety_read_only,
-        adaptive_layout: false,
         manual_rebalance_available: active_blob.len() >= layout.total_shards(),
         layout_drift_is_health_failure: false,
         automatic_rebalance: runtime.auto_rebalance,
@@ -229,7 +230,6 @@ pub fn cluster_health_snapshot_with_live_nodes(
                 };
                 ClusterNodeHealth {
                     node_id: node.id.clone(),
-                    role: node.role,
                     accepts_writes: state.accepts_new_writes() && effective_client_writable,
                     readable: state.is_readable(),
                     state,
@@ -245,17 +245,16 @@ pub fn cluster_health_snapshot_with_live_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
+    use crate::distribution::layout::ClusterLayoutPolicy;
     use crate::distribution::membership::{
-        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION,
-        NamespaceCatalogLayout, NamespaceCatalogReplica, NodeRole,
+        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, PoolState,
+        ServerPool,
     };
     use std::path::PathBuf;
 
-    fn node(id: &str, role: NodeRole, state: NodeState) -> ClusterNode {
+    fn node(id: &str, state: NodeState) -> ClusterNode {
         ClusterNode {
             id: id.into(),
-            role,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(state),
@@ -270,43 +269,33 @@ mod tests {
 
     fn runtime(blob_nodes: Vec<ClusterNode>) -> ClusterRuntime {
         let mut nodes = vec![
-            node("ns-a", NodeRole::Namespace, NodeState::Online),
-            node("ns-b", NodeRole::Namespace, NodeState::Online),
+            node("ns-a", NodeState::Online),
+            node("ns-b", NodeState::Online),
         ];
         nodes.extend(blob_nodes);
         ClusterRuntime {
             local_node_id: "blob-a".into(),
-            local_role: NodeRole::Blob,
+            local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: PathBuf::from("membership.json"),
             layout_policy: ClusterLayoutPolicy {
-                mode: ClusterLayoutMode::Fixed,
-                fixed_data_shards: Some(1),
-                fixed_parity_shards: Some(1),
-                ..ClusterLayoutPolicy::default()
+                data_shards: 1,
+                parity_shards: 1,
             },
             membership: ClusterMembership {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch: 3,
-                policy: ClusterPolicy {
-                    namespace_redundancy: 2,
-                    object_data_shards: 1,
-                    object_parity_shards: 1,
-                },
-                namespace_catalog: NamespaceCatalogLayout {
+                pools: vec![ServerPool {
+                    id: "pool-a".into(),
                     generation: 3,
-                    replicas: vec![
-                        NamespaceCatalogReplica {
-                            node_id: "ns-a".into(),
-                            root_id: "root-ns-a".into(),
-                        },
-                        NamespaceCatalogReplica {
-                            node_id: "ns-b".into(),
-                            root_id: "root-ns-b".into(),
-                        },
-                    ],
-                },
+                    policy: ClusterPolicy {
+                        object_data_shards: 1,
+                        object_parity_shards: 1,
+                    },
+                    state: PoolState::Writable,
+                    node_ids: nodes.iter().map(|node| node.id.clone()).collect(),
+                }],
                 nodes,
             },
             auto_rebalance: false,
@@ -316,8 +305,8 @@ mod tests {
     #[test]
     fn health_reflects_writable_layout_capacity() {
         let runtime = runtime(vec![
-            node("blob-a", NodeRole::Blob, NodeState::Online),
-            node("blob-b", NodeRole::Blob, NodeState::Online),
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
         ]);
         let snap = cluster_health_snapshot_with_live_nodes(
             &runtime,
@@ -328,14 +317,13 @@ mod tests {
         assert_eq!(snap.state, ClusterHealthState::Healthy);
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
-        assert!(!snap.adaptive_layout);
         assert!(snap.manual_rebalance_available);
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
-        assert_eq!(snap.namespace_voters, 2);
-        assert_eq!(snap.estimated_namespace_reachable_voters, 2);
-        assert_eq!(snap.namespace_quorum_required, 2);
-        assert!(snap.namespace_quorum_writable);
+        assert_eq!(snap.ncnx_replicas, 2);
+        assert_eq!(snap.estimated_ncnx_replicas_reachable, 2);
+        assert_eq!(snap.ncnx_replicas_required, 2);
+        assert!(snap.ncnx_strictly_writable);
         assert!(snap.effective_client_writable);
         assert!(!snap.layout_drift_is_health_failure);
         assert_eq!(
@@ -349,9 +337,9 @@ mod tests {
     #[test]
     fn health_marks_unreachable_configured_node_as_degraded() {
         let runtime = runtime(vec![
-            node("blob-a", NodeRole::Blob, NodeState::Online),
-            node("blob-b", NodeRole::Blob, NodeState::Online),
-            node("blob-c", NodeRole::Blob, NodeState::Online),
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
+            node("blob-c", NodeState::Online),
         ]);
         let live = runtime.membership.nodes[..4].to_vec();
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
@@ -360,26 +348,24 @@ mod tests {
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_writable);
-        assert!(snap.namespace_quorum_writable);
-        assert!(snap.effective_client_writable);
+        assert!(!snap.ncnx_strictly_writable);
+        assert!(!snap.effective_client_writable);
         assert_eq!(snap.nodes[4].state, NodeState::Offline);
     }
 
     #[test]
-    fn fixed_two_plus_one_stops_writes_instead_of_shrinking_layout() {
+    fn fixed_two_plus_one_stops_writes_below_unified_pool_width() {
         let mut runtime = runtime(vec![
-            node("blob-a", NodeRole::Blob, NodeState::Online),
-            node("blob-b", NodeRole::Blob, NodeState::Online),
-            node("blob-c", NodeRole::Blob, NodeState::Online),
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
+            node("blob-c", NodeState::Online),
         ]);
         runtime.layout_policy = ClusterLayoutPolicy {
-            mode: ClusterLayoutMode::Fixed,
-            fixed_data_shards: Some(2),
-            fixed_parity_shards: Some(1),
-            ..ClusterLayoutPolicy::default()
+            data_shards: 2,
+            parity_shards: 1,
         };
-        runtime.membership.policy.object_data_shards = 2;
-        let live = runtime.membership.nodes[..4].to_vec();
+        runtime.membership.pools[0].policy.object_data_shards = 2;
+        let live = runtime.membership.nodes[..2].to_vec();
 
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
 
@@ -388,26 +374,23 @@ mod tests {
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_readable);
         assert!(!snap.data_plane_writable);
-        assert!(snap.namespace_quorum_writable);
+        assert!(!snap.ncnx_strictly_writable);
         assert!(!snap.effective_client_writable);
-        assert!(!snap.adaptive_layout);
     }
 
     #[test]
     fn wider_fixed_layout_is_healthy_only_at_full_width() {
         let mut runtime = runtime(vec![
-            node("blob-a", NodeRole::Blob, NodeState::Online),
-            node("blob-b", NodeRole::Blob, NodeState::Online),
-            node("blob-c", NodeRole::Blob, NodeState::Online),
-            node("blob-d", NodeRole::Blob, NodeState::Online),
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
+            node("blob-c", NodeState::Online),
+            node("blob-d", NodeState::Online),
         ]);
         runtime.layout_policy = ClusterLayoutPolicy {
-            mode: ClusterLayoutMode::Fixed,
-            fixed_data_shards: Some(3),
-            fixed_parity_shards: Some(1),
-            ..ClusterLayoutPolicy::default()
+            data_shards: 3,
+            parity_shards: 1,
         };
-        runtime.membership.policy.object_data_shards = 3;
+        runtime.membership.pools[0].policy.object_data_shards = 3;
         let live = runtime.membership.active_write_nodes();
 
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
@@ -417,32 +400,27 @@ mod tests {
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
         assert!(snap.effective_client_writable);
-        assert!(!snap.adaptive_layout);
     }
 
     #[test]
-    fn health_reports_namespace_quorum_blocking_writes() {
+    fn health_reports_strict_ncnx_blocking_writes() {
         let runtime = runtime(vec![
-            node("blob-a", NodeRole::Blob, NodeState::Online),
-            node("blob-b", NodeRole::Blob, NodeState::Online),
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
         ]);
         let active = runtime.membership.active_write_nodes();
-        let readable = vec![
-            runtime.membership.nodes[0].clone(),
-            runtime.membership.nodes[2].clone(),
-            runtime.membership.nodes[3].clone(),
-        ];
+        let readable = vec![runtime.membership.nodes[0].clone()];
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, active, readable).unwrap();
         assert_eq!(snap.state, ClusterHealthState::Degraded);
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
-        assert!(!snap.namespace_quorum_writable);
+        assert!(!snap.ncnx_strictly_writable);
         assert!(!snap.effective_client_writable);
         assert!(snap.nodes.iter().all(|node| !node.accepts_writes));
         assert!(
             snap.notes
                 .iter()
-                .any(|note| note.contains("namespace quorum is not writable"))
+                .any(|note| note.contains("namespace NCNX placement is not uniformly writable"))
         );
     }
 }

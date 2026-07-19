@@ -1,7 +1,7 @@
 use crate::core::capacity_manager::get_storage_usage;
 use crate::core::constants::BROWSER_CACHE_MAX_AGE;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
-use crate::core::metadata_parser::get_metadata;
+use crate::core::metadata_parser::get_metadata_by_id;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
 use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
@@ -216,11 +216,20 @@ pub async fn get_object_metadata_direct(
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
     let physical_object_id = resolve_read_object_id(fragment, object_key, false).await?;
-    let mut metadata = get_metadata(fragment, &physical_object_id, fragment).await?;
+    let mut metadata = get_object_metadata_by_id(fragment, &physical_object_id).await?;
+    metadata.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(metadata)
+}
+
+pub async fn get_object_metadata_by_id(
+    fragment: &str,
+    object_id: &str,
+) -> Result<ObjectMetadata, AppError> {
+    let mut metadata = get_metadata_by_id(fragment, object_id).await?;
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
     }
-    metadata.object_key = object_key.trim_start_matches('/').to_string();
+    metadata.object_key = index_store::normalize_object_id(object_id)?;
     Ok(metadata)
 }
 

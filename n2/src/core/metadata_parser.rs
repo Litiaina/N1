@@ -52,6 +52,19 @@ pub async fn get_metadata(
     Ok(metadata)
 }
 
+pub async fn get_metadata_by_id(
+    fragment: &str,
+    object_id: &str,
+) -> Result<ObjectMetadata, AppError> {
+    let physical_object_id = index_store::normalize_object_id(object_id)?;
+    let mut metadata = find_latest_metadata_on_disk(fragment, &physical_object_id).await?;
+    if metadata.fragment != fragment {
+        metadata.fragment = fragment.to_string();
+    }
+    metadata.object_key = physical_object_id;
+    Ok(metadata)
+}
+
 pub async fn get_version_metadata(
     fragment: &str,
     object_key: &str,
@@ -104,4 +117,19 @@ pub async fn get_version_metadata(
         }
         None => Err(logical_not_found()),
     }
+}
+
+pub async fn get_version_metadata_by_id(
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+) -> Result<ObjectMetadata, AppError> {
+    let physical_object_id = index_store::normalize_object_id(object_id)?;
+    let mut metadata =
+        index::read_object_version(fragment, &physical_object_id, version_id).await?;
+    if metadata.fragment != fragment {
+        metadata.fragment = fragment.to_string();
+    }
+    metadata.object_key = physical_object_id;
+    Ok(metadata)
 }

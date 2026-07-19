@@ -4,7 +4,7 @@ use crate::distribution::maintenance::{
     distributed_maintenance_status, start_distributed_maintenance,
 };
 use crate::distribution::membership::{
-    ClusterNode, NodeRole, active_cluster_runtime, live_blob_write_nodes,
+    ClusterNode, active_cluster_runtime, live_newest_pool_write_nodes,
 };
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::peer::{
@@ -92,11 +92,8 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = live_blob_write_nodes(&runtime).await;
-    let configured_nodes = runtime
-        .membership
-        .active_write_nodes_for_role(NodeRole::Blob)
-        .len();
+    let active = live_newest_pool_write_nodes(&runtime).await;
+    let configured_nodes = runtime.membership.active_newest_pool_nodes().len();
     let configured_layout = resolve_configured_layout(configured_nodes, &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
     let layout = resolve_write_layout(active.len(), configured_nodes, &runtime.layout_policy)
@@ -109,9 +106,8 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         "configured_layout": configured_layout,
         "degraded_write_layout": false,
         "bounded_object_erasure_set": true,
-        "max_auto_data_shards": runtime.layout_policy.auto_max_data_shards,
-        "max_auto_parity_shards": runtime.layout_policy.auto_max_parity_shards,
-        "adaptive_without_rebalance": true,
+        "static_server_pool_ec": true,
+        "old_object_layouts_remain_valid": true,
         "automatic_rebalance": runtime.auto_rebalance,
     })))
 }
@@ -276,21 +272,23 @@ pub async fn placement_preview(
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = live_blob_write_nodes(&runtime).await;
+    let active = live_newest_pool_write_nodes(&runtime).await;
     let layout = resolve_write_layout(
         active.len(),
-        runtime
-            .membership
-            .active_write_nodes_for_role(NodeRole::Blob)
-            .len(),
+        runtime.membership.active_newest_pool_nodes().len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::BadRequest)?;
     let version = query.version_id.unwrap_or_else(|| "preview".to_string());
+    let pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+        AppError::ServiceUnavailable("cluster has no writable server pool".into())
+    })?;
     let plan = build_placement_plan(
         &query.fragment,
         &query.object_key,
         &version,
+        &pool.id,
+        pool.generation,
         runtime.membership.epoch,
         layout,
         &active,

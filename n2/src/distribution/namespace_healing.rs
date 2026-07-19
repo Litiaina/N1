@@ -1,31 +1,23 @@
 use crate::distribution::healing_report::AutoHealingReport;
-use crate::distribution::inode::{InodeRepairOutcome, inspect_and_repair_inode};
 use crate::distribution::membership::ClusterRuntime;
-use crate::enums::app_error_enum::AppError;
-use crate::namespace::catalog::{
-    catalog_layout, inspect_and_repair_namespace_catalog, resolve_fragment_namespace,
+use crate::distribution::ncnx::{
+    PeerNcnxName, inspect_and_repair_name, list_replica_names, ncnx_cursor, trash_is_expired,
 };
-use crate::namespace::inode_store::{InodeDentryTarget, InodeLayout};
+use crate::enums::app_error_enum::AppError;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+const HEALING_DISCOVERY_PAGE: usize = 1_000;
+
 #[derive(Clone, Debug, Default)]
 pub struct FragmentNamespaceHealingResult {
     pub complete: bool,
-    pub scanned_inodes: u64,
-    pub repaired_inodes: u64,
+    pub scanned_records: u64,
+    pub repaired_records: u64,
     pub live_objects: BTreeMap<String, Vec<String>>,
     pub trash_objects: BTreeMap<String, Vec<String>>,
     pub reports: Vec<AutoHealingReport>,
-}
-
-struct PendingInode {
-    path: String,
-    inode_id: String,
-    layout: InodeLayout,
-    expected_parent: Option<String>,
-    trash: bool,
 }
 
 pub async fn scan_and_repair_fragment_namespace(
@@ -37,255 +29,216 @@ pub async fn scan_and_repair_fragment_namespace(
         complete: true,
         ..FragmentNamespaceHealingResult::default()
     };
-    let catalog = inspect_and_repair_namespace_catalog(runtime.clone()).await;
-    if catalog.degraded {
-        let mut report = AutoHealingReport::new(
-            scan_id,
-            runtime.membership.epoch,
-            fragment,
-            &runtime.local_node_id,
-            "namespace_catalog_degraded",
-            "namespace-catalog",
-        );
-        report.inode_id = Some("fragment-catalog".into());
-        report.expected_inode_layout = catalog_layout(&runtime).ok();
-        report.repair_attempted = true;
-        report.repair_outcome = if catalog.healthy {
-            "repair_succeeded"
-        } else if catalog.deferred {
-            "deferred"
-        } else {
-            "repair_failed"
-        }
-        .into();
-        report.cluster_read_only_triggered = !catalog.healthy && !catalog.deferred;
-        report.repaired_replicas = catalog.repaired_replicas;
-        report.observations = catalog
-            .observations
-            .iter()
-            .map(|observation| json!(observation))
-            .collect();
-        report.reason = catalog.error;
-        report.completed_at_unix_nanos = now_nanos();
-        result.reports.push(report);
-    }
-    if !catalog.healthy {
-        result.complete = false;
-        return result;
-    }
-    let namespace = match resolve_fragment_namespace(runtime.clone(), fragment).await {
-        Ok(namespace) => namespace,
-        Err(error) => {
-            result.complete = false;
-            result.reports.push(unreachable_fragment_report(
-                &runtime, fragment, scan_id, error,
-            ));
-            return result;
-        }
-    };
-
-    let mut pending = vec![
-        PendingInode {
-            path: String::new(),
-            inode_id: namespace.root_inode_id,
-            layout: namespace.root_layout,
-            expected_parent: None,
-            trash: false,
-        },
-        PendingInode {
-            path: ".trash".into(),
-            inode_id: namespace.trash_inode_id,
-            layout: namespace.trash_layout,
-            expected_parent: None,
-            trash: true,
-        },
-    ];
-    let mut visited = BTreeSet::new();
-
-    while let Some(current) = pending.pop() {
-        if !visited.insert(current.inode_id.clone()) {
-            result.complete = false;
-            result.reports.push(simple_namespace_report(
-                &runtime,
-                &namespace.stable_fragment_id,
-                scan_id,
-                "directory_cycle_or_duplicate",
-                "directory-inode",
-                Some(current.inode_id),
-                Some(current.path),
-                current.layout,
-                "unrepairable",
-                "the same directory inode was reached more than once",
-            ));
-            continue;
-        }
-
-        result.scanned_inodes = result.scanned_inodes.saturating_add(1);
-        let outcome = inspect_and_repair_inode(
-            runtime.clone(),
-            &namespace.stable_fragment_id,
-            &current.inode_id,
-            &current.layout,
-        )
-        .await;
-        if outcome.repaired_replicas > 0 {
-            result.repaired_inodes = result.repaired_inodes.saturating_add(1);
-        }
-        if outcome.degraded {
-            result.reports.push(inode_repair_report(
-                &runtime,
-                &namespace.stable_fragment_id,
-                scan_id,
-                &current,
-                &outcome,
-            ));
-        }
-        let Some(snapshot) = outcome.snapshot else {
-            result.complete = false;
-            continue;
-        };
-        if !outcome.healthy {
-            result.complete = false;
-            continue;
-        }
-        if snapshot.inode.parent_inode_id != current.expected_parent {
-            result.complete = false;
-            result.reports.push(simple_namespace_report(
-                &runtime,
-                &namespace.stable_fragment_id,
-                scan_id,
-                "directory_parent_mismatch",
-                "directory-inode",
-                Some(current.inode_id.clone()),
-                Some(current.path.clone()),
-                current.layout.clone(),
-                "unrepairable",
-                "directory inode parent identity differs from the parent dentry",
-            ));
-            continue;
-        }
-
-        for entry in snapshot.entries {
-            let path = join_path(&current.path, &entry.name);
-            match entry.target {
-                InodeDentryTarget::Directory { inode_id, layout } => pending.push(PendingInode {
-                    path,
-                    inode_id,
-                    layout,
-                    expected_parent: Some(current.inode_id.clone()),
-                    trash: current.trash,
-                }),
-                InodeDentryTarget::Object { object_id } => {
-                    let objects = if current.trash {
-                        &mut result.trash_objects
-                    } else {
-                        &mut result.live_objects
-                    };
-                    objects.entry(object_id).or_default().push(path);
-                }
-                InodeDentryTarget::Symlink { .. } => {}
-                InodeDentryTarget::Fragment { .. } => {
+    let mut seen = BTreeSet::new();
+    for trash in [false, true] {
+        let mut cursor = None;
+        loop {
+            let page = match list_replica_names(
+                fragment,
+                "",
+                cursor.as_deref(),
+                HEALING_DISCOVERY_PAGE,
+                trash,
+            )
+            .await
+            {
+                Ok(page) => page,
+                Err(error) => {
                     result.complete = false;
-                    result.reports.push(simple_namespace_report(
-                        &runtime,
-                        &namespace.stable_fragment_id,
-                        scan_id,
-                        "fragment_target_inside_namespace",
-                        "directory-inode",
-                        Some(current.inode_id.clone()),
-                        Some(path),
-                        current.layout.clone(),
-                        "unrepairable",
-                        "a fragment catalog target appeared inside a fragment namespace",
-                    ));
+                    result
+                        .reports
+                        .push(discovery_report(&runtime, fragment, scan_id, trash, error));
+                    break;
                 }
+            };
+            if page.is_empty() {
+                break;
+            }
+            cursor = page
+                .last()
+                .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()));
+            let full = page.len() == HEALING_DISCOVERY_PAGE;
+            for name in page {
+                let identity = ncnx_cursor(&name.logical_key, name.trash.as_ref());
+                if !seen.insert((trash, identity)) {
+                    continue;
+                }
+                // Once TTL has elapsed, GC exclusively owns this trash
+                // generation. It reclaims immutable object holders before
+                // removing NCNX for restart safety, so healing must neither
+                // repair nor classify the transitional pointer as damage.
+                if name.trash.as_ref().is_some_and(trash_is_expired) {
+                    continue;
+                }
+                result.scanned_records = result.scanned_records.saturating_add(1);
+                match inspect_and_repair_name(fragment, &name).await {
+                    Ok(outcome) => {
+                        if let Some(located) = &outcome.located {
+                            let map = if trash {
+                                &mut result.trash_objects
+                            } else {
+                                &mut result.live_objects
+                            };
+                            map.entry(located.record.object_id.clone())
+                                .or_default()
+                                .push(name.logical_key.clone());
+                        }
+                        if outcome.degraded {
+                            if outcome.healthy {
+                                result.repaired_records = result.repaired_records.saturating_add(1);
+                            } else if !outcome.deferred_by_trash {
+                                result.complete = false;
+                            }
+                            result
+                                .reports
+                                .push(repair_report(&runtime, fragment, scan_id, &name, outcome));
+                        }
+                    }
+                    Err(error) => {
+                        // Discovery is intentionally lockless. A namespace mutation can
+                        // publish its destination and remove this physical name between
+                        // the inventory call above and the record read. Revalidate the
+                        // exact physical identity before calling it corruption. If it no
+                        // longer exists, this scan crossed a valid mutation boundary; an
+                        // incomplete scan also prevents object healing from making a
+                        // false headless-object classification from the mixed view.
+                        if is_all_replicas_unreadable(&error)
+                            && matches!(name_is_still_advertised(fragment, &name).await, Ok(false))
+                        {
+                            result.complete = false;
+                            tracing::debug!(
+                                fragment,
+                                logical_key = %name.logical_key,
+                                trash = name.trash.is_some(),
+                                "NCNX discovery was superseded by a concurrent namespace mutation"
+                            );
+                            continue;
+                        }
+                        result.complete = false;
+                        result.reports.push(unreadable_record_report(
+                            &runtime, fragment, scan_id, &name, error,
+                        ));
+                    }
+                }
+            }
+            if !full {
+                break;
             }
         }
     }
-
     result
 }
 
-fn inode_repair_report(
+fn is_all_replicas_unreadable(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Conflict(message)
+            if message.starts_with("all NCNX replicas are unreadable for key '")
+    )
+}
+
+async fn name_is_still_advertised(fragment: &str, target: &PeerNcnxName) -> Result<bool, AppError> {
+    let target_identity = ncnx_cursor(&target.logical_key, target.trash.as_ref());
+    let mut cursor = None;
+    loop {
+        let page = list_replica_names(
+            fragment,
+            &target.logical_key,
+            cursor.as_deref(),
+            HEALING_DISCOVERY_PAGE,
+            target.trash.is_some(),
+        )
+        .await?;
+        if page
+            .iter()
+            .any(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()) == target_identity)
+        {
+            return Ok(true);
+        }
+        if page.len() < HEALING_DISCOVERY_PAGE {
+            return Ok(false);
+        }
+        cursor = page
+            .last()
+            .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()));
+    }
+}
+
+fn repair_report(
     runtime: &ClusterRuntime,
     fragment: &str,
     scan_id: &str,
-    pending: &PendingInode,
-    outcome: &InodeRepairOutcome,
+    name: &PeerNcnxName,
+    outcome: crate::distribution::ncnx::NcnxRepairOutcome,
 ) -> AutoHealingReport {
-    let missing_target = outcome.snapshot.is_none();
-    let root_unreachable = missing_target && pending.path.is_empty();
     let mut report = AutoHealingReport::new(
         scan_id,
         runtime.membership.epoch,
         fragment,
         &runtime.local_node_id,
-        if outcome.deferred {
-            "directory_scan_deferred"
-        } else if root_unreachable {
-            "fragment_namespace_unreachable"
-        } else if missing_target {
-            "dangling_directory_pointer"
+        if name.trash.is_some() {
+            "trash_ncnx_degraded"
         } else {
-            "directory_inode_degraded"
+            "live_ncnx_degraded"
         },
-        if outcome.deferred {
-            "directory-inode"
-        } else if root_unreachable {
-            "fragment-namespace"
-        } else if missing_target {
-            "dangling-directory"
+        if name.trash.is_some() {
+            "trash-ncnx"
         } else {
-            "directory-inode"
+            "live-ncnx"
         },
     );
-    report.inode_id = Some(pending.inode_id.clone());
-    report.logical_path = Some(pending.path.clone());
-    report.expected_inode_layout = Some(pending.layout.clone());
-    if outcome.deferred {
-        report.initial_status = "busy".into();
-    }
-    report.repair_attempted = true;
-    report.repair_outcome = if missing_target {
-        if outcome.deferred {
-            "deferred"
-        } else {
-            "unrepairable"
-        }
-    } else if outcome.healthy {
+    report.namespace_record_id = Some(name.logical_key.clone());
+    report.object_id = outcome
+        .located
+        .as_ref()
+        .map(|located| located.record.object_id.clone());
+    report.logical_path = Some(name.logical_key.clone());
+    report.expected_ncnx_layout = Some(outcome.layout);
+    report.repair_attempted = !outcome.deferred_by_trash;
+    report.repair_outcome = if outcome.healthy {
         "repair_succeeded"
-    } else if outcome.deferred {
-        "deferred"
+    } else if outcome.deferred_by_trash {
+        "deferred_by_trash_tombstone"
     } else {
         "repair_failed"
     }
     .into();
-    report.cluster_read_only_triggered = !outcome.healthy && !outcome.deferred;
+    report.cluster_read_only_triggered = !outcome.healthy && !outcome.deferred_by_trash;
     report.repaired_replicas = outcome.repaired_replicas;
     report.observations = outcome
         .observations
         .iter()
         .map(|observation| json!(observation))
         .collect();
-    report.reason = outcome.error.clone();
+    report.reason = outcome.deferred_by_trash.then(|| {
+        "a matching trash tombstone exists; live replica repair was skipped to prevent deletion resurrection"
+            .into()
+    });
     report.completed_at_unix_nanos = now_nanos();
     report
 }
 
-fn unreachable_fragment_report(
+fn unreadable_record_report(
     runtime: &ClusterRuntime,
     fragment: &str,
     scan_id: &str,
-    error: AppError,
+    name: &PeerNcnxName,
+    error: crate::enums::app_error_enum::AppError,
 ) -> AutoHealingReport {
     let mut report = AutoHealingReport::new(
         scan_id,
         runtime.membership.epoch,
         fragment,
         &runtime.local_node_id,
-        "fragment_namespace_unreachable",
-        "fragment-namespace",
+        "ncnx_all_replicas_unreadable",
+        if name.trash.is_some() {
+            "trash-ncnx"
+        } else {
+            "live-ncnx"
+        },
     );
+    report.namespace_record_id = Some(name.logical_key.clone());
+    report.logical_path = Some(name.logical_key.clone());
     report.initial_status = "critical".into();
     report.repair_outcome = "unrepairable".into();
     report.cluster_read_only_triggered = true;
@@ -294,48 +247,53 @@ fn unreachable_fragment_report(
     report
 }
 
-#[allow(clippy::too_many_arguments)]
-fn simple_namespace_report(
+fn discovery_report(
     runtime: &ClusterRuntime,
     fragment: &str,
     scan_id: &str,
-    finding: &str,
-    entry_type: &str,
-    inode_id: Option<String>,
-    logical_path: Option<String>,
-    layout: InodeLayout,
-    outcome: &str,
-    reason: &str,
+    trash: bool,
+    error: crate::enums::app_error_enum::AppError,
 ) -> AutoHealingReport {
     let mut report = AutoHealingReport::new(
         scan_id,
         runtime.membership.epoch,
         fragment,
         &runtime.local_node_id,
-        finding,
-        entry_type,
+        "ncnx_inventory_incomplete",
+        if trash {
+            "trash-namespace"
+        } else {
+            "live-namespace"
+        },
     );
-    report.inode_id = inode_id;
-    report.logical_path = logical_path;
-    report.expected_inode_layout = Some(layout);
-    report.initial_status = "critical".into();
-    report.repair_outcome = outcome.into();
-    report.cluster_read_only_triggered = true;
-    report.reason = Some(reason.into());
+    report.initial_status = "incomplete".into();
+    report.repair_outcome = "deferred".into();
+    report.cluster_read_only_triggered = false;
+    report.reason = Some(error.to_string());
     report.completed_at_unix_nanos = now_nanos();
     report
-}
-
-fn join_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent}/{name}")
-    }
 }
 
 fn now_nanos() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or_else(|| chrono::Utc::now().timestamp().saturating_mul(1_000_000_000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_exact_all_replica_unreadable_conflicts_are_revalidated() {
+        assert!(is_all_replicas_unreadable(&AppError::Conflict(
+            "all NCNX replicas are unreadable for key 'videos/a.mp4'".into()
+        )));
+        assert!(!is_all_replicas_unreadable(&AppError::Conflict(
+            "NCNX integrity mismatch".into()
+        )));
+        assert!(!is_all_replicas_unreadable(&AppError::ServiceUnavailable(
+            "node unavailable".into()
+        )));
+    }
 }

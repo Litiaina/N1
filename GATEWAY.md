@@ -145,22 +145,26 @@ cert_path=./certificates/cert.pem
 key_path=./certificates/key.pem
 
 [disk_config]
-storage_disks=/mnt/n2/disk-00,/mnt/n2/disk-01
-fs_storage_path=/mnt/n2/control
+storage_roots=a-disk-1=/mnt/n2/disk-00,a-disk-2=/mnt/n2/disk-01
+runtime_path=/var/lib/litiaina/n2/state
 
 [cluster_config]
 node_id=node-a
+pool_id=pool-1
+pool_generation=1
 node_endpoint=https://192.168.0.22:50001
 native_endpoint=n2://192.168.0.22:50002
-membership_file=n2_membership.json
-cluster_layout_mode=auto
+membership_file=/var/lib/litiaina/n2/state/n2_membership.json
+object_data_shards=2
+object_parity_shards=2
 auto_rebalance=false
 ```
 
-`storage_disks` are unified N2 storage devices: they can hold immutable object
-shards, immutable `.ncdx` records, and assigned namespace partitions.
-`fs_storage_path` is local control state for membership, upload coordination,
-and jobs; it is not a gateway database and not a namespace/index tier.
+`storage_roots` are stable-ID unified N2 3.0 storage roots: they can hold flat
+`.ncnx`, immutable `.ncdx`, shards, parity, uploads, and fragment records.
+`runtime_path` is process-local control state for membership, upload
+coordination, and maintenance jobs; it is not a gateway database or storage
+authority.
 
 For a three-node cluster, the gateway config should point to each node:
 

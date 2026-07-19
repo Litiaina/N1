@@ -1,6 +1,6 @@
 use crate::core::disk_manager::FS_STORAGE_ROOT;
+use crate::distribution::ncnx::NcnxLayout;
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::inode_store::InodeLayout;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,7 +19,7 @@ pub struct AutoHealingReport {
     pub finding: String,
     pub entry_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inode_id: Option<String>,
+    pub namespace_record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,7 +31,7 @@ pub struct AutoHealingReport {
     pub repair_outcome: String,
     pub cluster_read_only_triggered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_inode_layout: Option<InodeLayout>,
+    pub expected_ncnx_layout: Option<NcnxLayout>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observations: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,7 +66,7 @@ impl AutoHealingReport {
             node_id: node_id.to_string(),
             finding: finding.to_string(),
             entry_type: entry_type.to_string(),
-            inode_id: None,
+            namespace_record_id: None,
             object_id: None,
             version_id: None,
             logical_path: None,
@@ -74,7 +74,7 @@ impl AutoHealingReport {
             repair_attempted: false,
             repair_outcome: "not_attempted".into(),
             cluster_read_only_triggered: false,
-            expected_inode_layout: None,
+            expected_ncnx_layout: None,
             observations: Vec::new(),
             object_health_before: None,
             object_health_after: None,
@@ -90,7 +90,7 @@ impl AutoHealingReport {
         let stable_id = self
             .object_id
             .as_deref()
-            .or(self.inode_id.as_deref())
+            .or(self.namespace_record_id.as_deref())
             .unwrap_or(&self.fragment_id);
         format!(
             "{}__node-{}__{}__{}__{}.json",
@@ -189,15 +189,15 @@ mod tests {
             7,
             "fragment-a",
             "namespace/a",
-            "directory_inode_degraded",
-            "directory-inode",
+            "live_ncnx_degraded",
+            "live-ncnx",
         );
-        report.inode_id = Some("inode-a".into());
+        report.namespace_record_id = Some("videos/a.mp4".into());
         report.repair_outcome = "repair_succeeded".into();
         let filename = report.filename();
         assert!(filename.contains("node-namespace_a"));
-        assert!(filename.contains("directory-inode"));
-        assert!(filename.contains("inode-a"));
+        assert!(filename.contains("live-ncnx"));
+        assert!(filename.contains("videos_a_mp4"));
         assert!(filename.ends_with("repair_succeeded.json"));
         assert!(!filename.contains('/'));
     }

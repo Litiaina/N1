@@ -1,173 +1,120 @@
-# N2 Installation
+# N2 3.0 Installation
 
-> N2 2.0 is still in development. The role-separated membership example in
-> `DOCUMENTATION.md` and the release gates in `N2_2_0_VERIFICATION.md` are the
-> current 2.0 authority. Do not treat the legacy deployment walkthrough below
-> as a production-release instruction until Phase 8 is completed.
+N2 3.0 is a clean disk-format generation. Never point it at an N2 2.x root.
+Build a new format-v3 cluster, copy the same membership and cluster secrets to
+every node, and use stable root IDs for every mounted device.
 
-N2 is a high-performance distributed object storage system built for durable,
-redundant, namespace-managed, and efficient storage.
+## Production prerequisites
 
-This guide is the production installation checklist. It intentionally does not
-ship local `.env` or `.ini` files in git. Those files are runtime state and must
-be created on the node that owns them.
+- Linux with stable storage mounts and synchronized time.
+- One TLS certificate/key pair per endpoint, or a certificate valid for all
+  node names.
+- One stable node ID and one or more stable `ROOT_ID=/absolute/path` roots per
+  node.
+- A complete shared format-v3 membership document.
+- Shared `JWT_SECRET` and `N2_CLUSTER_SECRET` values on every node.
+- Exactly `K + M` distinct nodes in each writable static-EC server pool.
 
-## Install Shape
-
-```text
-users / UI / operators
-        |
-        v
-litiaina-n2-gateway        optional public/user front door
-        |
-        v
-litiaina-n2 node-a / node-b / node-c / ...
-```
-
-Every N2 node remains directly usable. The gateway is route-only: it selects a
-healthy node and returns multipart coordinator information to the client. It is
-not namespace truth, cluster truth, or resumability authority.
-
-## Filesystem Layout
-
-Recommended production paths:
-
-```text
-/usr/local/bin/litiaina-n2
-/usr/local/bin/litiaina-n2-shell
-/usr/local/bin/litiaina-n2-gateway
-
-/etc/litiaina/n2/n2.env
-/var/lib/litiaina/n2/n2_config.ini
-/var/lib/litiaina/n2/n2_membership.json
-/var/lib/litiaina/n2/certificates/
-
-/var/lib/litiaina/n2-gateway/n2_gateway_config.ini
-/var/lib/litiaina/n2-gateway/certificates/
-```
-
-Use real mounted storage paths. N2 2.0 assigns each node a namespace or blob
-role, and every configured root on that node belongs to that plane:
-
-```text
-namespace node: /mnt/namespace-ssd/n2-storage
-blob node:      /mnt/blob-hdd0/n2-storage, /mnt/blob-hdd1/n2-storage
-each node:      /mnt/nvme/n2-control
-```
-
-Namespace-node roots hold inode replicas. Blob-node roots hold immutable object
-data and `.ncdx` records. One logical node cannot mix both roles. N2 does not
-migrate earlier development layouts in place.
-
-`runtime_path` holds process-local membership, upload coordination, and job
-state. Namespace truth lives only on namespace-node storage roots; object truth
-lives only on blob-node storage roots.
-
-### Storage Configuration
-
-```ini
-[disk_config]
-storage_roots=ROOT_ID=/mnt/n2/storage
-runtime_path=/mnt/n2/control
-```
+N2 counts nodes, not disks, as failure domains. Two roots on one host do not
+replace two pool nodes.
 
 ## Build
 
 ```bash
-cargo build -p n2 -p n2_shell -p n2_gateway --release
+cargo fmt --all -- --check
+cargo test --workspace --lib --bins --tests
+cargo build --release --workspace
 ```
 
-## Installer
+The node binary is `target/release/litiaina-n2`; the optional gateway and shell
+are `litiaina-n2-gateway` and `litiaina-n2-shell`.
 
-The preferred production path is `deploy/install.sh`. It installs binaries,
-creates runtime directories, writes missing runtime config, renders systemd
-services, and can enable/start the services.
+## Shared environment
 
-The installer does not overwrite existing `n2.env`, `n2_config.ini`,
-`n2_membership.json`, or gateway config unless `--force-config` is passed.
-When it creates a missing environment file, it generates local random secrets
-instead of shipping static credentials.
+Create a root-owned `n2.env` and distribute the same file to every node:
 
-Preview a node install without changing the machine:
-
-```bash
-./deploy/install.sh --node --dry-run \
-  --node-id node-a \
-  --node-endpoint https://192.168.0.22:50001 \
-  --native-endpoint n2://192.168.0.22:50002 \
-  --storage-roots /mnt/DISK0/n2-storage,/mnt/DISK1/n2-storage \
-  --fs-root /mnt/DISK0/n2-control
-```
-
-Install an N2 node:
-
-```bash
-sudo ./deploy/install.sh --node --build --copy-certs \
-  --node-id node-a \
-  --node-endpoint https://192.168.0.22:50001 \
-  --native-endpoint n2://192.168.0.22:50002 \
-  --storage-roots /mnt/DISK0/n2-storage,/mnt/DISK1/n2-storage \
-  --fs-root /mnt/DISK0/n2-control \
-  --enable --start
-```
-
-Install the route-only gateway:
-
-```bash
-sudo ./deploy/install.sh --gateway --build --copy-certs \
-  --gateway-node node-a,https://192.168.0.22:50001,n2://192.168.0.22:50002 \
-  --gateway-node node-b,https://192.168.0.13:50001,n2://192.168.0.13:50002 \
-  --gateway-node node-c,https://192.168.0.18:50001,n2://192.168.0.18:50002 \
-  --enable --start
-```
-
-Install both N2 and gateway on the same machine:
-
-```bash
-sudo ./deploy/install.sh --both --build --copy-certs \
-  --node-id node-a \
-  --node-endpoint https://192.168.0.22:50001 \
-  --native-endpoint n2://192.168.0.22:50002 \
-  --gateway-node node-a,https://192.168.0.22:50001,n2://192.168.0.22:50002 \
-  --enable --start
-```
-
-Manual binary install is still valid when an operator wants to control every
-file directly:
-
-```bash
-sudo install -m 0755 target/release/litiaina-n2 /usr/local/bin/litiaina-n2
-sudo install -m 0755 target/release/litiaina-n2-shell /usr/local/bin/litiaina-n2-shell
-sudo install -m 0755 target/release/litiaina-n2-gateway /usr/local/bin/litiaina-n2-gateway
-```
-
-## Node Runtime
-
-Create runtime directories:
-
-```bash
-sudo mkdir -p /etc/litiaina/n2
-sudo mkdir -p /var/lib/litiaina/n2/certificates
-sudo mkdir -p /mnt/n2/storage /mnt/n2/control
-```
-
-Create `/etc/litiaina/n2/n2.env` on each node:
-
-```bash
-JWT_SECRET='replace-with-long-random-value'
-AUTH_KEY='server-auth-key'
-MASTER_KEY='cluster-master-key'
-ADMIN_KEY='admin-key'
+```dotenv
+JWT_SECRET=<long-random-cluster-value>
+N2_CLUSTER_SECRET=<different-long-random-cluster-value>
+MASTER_KEY=<operator-master-key>
+AUTH_KEY=<operator-master-key>
+ADMIN_KEY=<operator-master-key>
 ACCESS_TOKEN_DEFAULT_TTL_SECS=900
-ACCESS_TOKEN_MAX_TTL_SECS=3600
+ACCESS_TOKEN_MAX_TTL_SECS=21600
 REFRESH_TOKEN_TTL_SECS=604800
-N2_RUNTIME_WORKER_THREADS=
-N2_RUNTIME_MAX_BLOCKING_THREADS=
-N2_RUNTIME_THREAD_STACK_BYTES=
 ```
 
-Create `/var/lib/litiaina/n2/n2_config.ini` on each node. Each node must use a
-unique `node_id`, `node_endpoint`, and `native_endpoint`.
+Use mode `0600`. Do not place secrets in membership JSON or source control.
+
+## Format-v3 membership
+
+All nodes must start with the same complete membership. This four-node example
+defines one static 2+2 pool:
+
+```json
+{
+  "format_version": 3,
+  "cluster_id": "cluster-a",
+  "epoch": 1,
+  "pools": [{
+    "id": "pool-1",
+    "generation": 1,
+    "policy": {
+      "object_data_shards": 2,
+      "object_parity_shards": 2
+    },
+    "state": "writable",
+    "node_ids": ["node-a", "node-b", "node-c", "node-d"]
+  }],
+  "nodes": [
+    {
+      "id": "node-a",
+      "endpoint": "https://10.0.0.11:50001",
+      "native_endpoint": "n2://10.0.0.11:50002",
+      "state": "online",
+      "weight": 1,
+      "storage_roots": [{"id":"a-disk-1","path":"/mnt/NDISK001/n2"}],
+      "joined_epoch": 1
+    },
+    {
+      "id": "node-b",
+      "endpoint": "https://10.0.0.12:50001",
+      "native_endpoint": "n2://10.0.0.12:50002",
+      "state": "online",
+      "weight": 1,
+      "storage_roots": [{"id":"b-disk-1","path":"/mnt/NDISK001/n2"}],
+      "joined_epoch": 1
+    },
+    {
+      "id": "node-c",
+      "endpoint": "https://10.0.0.13:50001",
+      "native_endpoint": "n2://10.0.0.13:50002",
+      "state": "online",
+      "weight": 1,
+      "storage_roots": [{"id":"c-disk-1","path":"/mnt/NDISK001/n2"}],
+      "joined_epoch": 1
+    },
+    {
+      "id": "node-d",
+      "endpoint": "https://10.0.0.14:50001",
+      "native_endpoint": "n2://10.0.0.14:50002",
+      "state": "online",
+      "weight": 1,
+      "storage_roots": [{"id":"d-disk-1","path":"/mnt/NDISK001/n2"}],
+      "joined_epoch": 1
+    }
+  ]
+}
+```
+
+Pool `node_ids`, every node's root-ID set, policy, ID, and generation are
+immutable after enrollment. Expansion adds a new complete pool for future
+writes; it does not reinterpret old NCNX or objects.
+
+## Node configuration
+
+Each node has its own `n2_config.ini`. Only node identity, endpoints, and local
+roots differ:
 
 ```ini
 [server]
@@ -178,21 +125,18 @@ cert_path=/var/lib/litiaina/n2/certificates/cert.pem
 key_path=/var/lib/litiaina/n2/certificates/key.pem
 
 [disk_config]
-storage_roots=ROOT_ID=/mnt/n2/storage
-runtime_path=/mnt/n2/control
+storage_roots=a-disk-1=/mnt/NDISK001/n2,a-disk-2=/mnt/NDISK002/n2
+runtime_path=/var/lib/litiaina/n2/state
 
 [cluster_config]
 node_id=node-a
-node_role=namespace
-node_endpoint=https://192.168.0.22:50001
-native_endpoint=n2://192.168.0.22:50002
-membership_file=n2_membership.json
-namespace_redundancy=2
-object_data_shards=1
-object_parity_shards=1
-auto_max_parity_shards=3
-fixed_data_shards=
-fixed_parity_shards=
+pool_id=pool-1
+pool_generation=1
+node_endpoint=https://10.0.0.11:50001
+native_endpoint=n2://10.0.0.11:50002
+membership_file=/var/lib/litiaina/n2/state/n2_membership.json
+object_data_shards=2
+object_parity_shards=2
 auto_rebalance=false
 
 [garbage_collector]
@@ -242,223 +186,50 @@ stream_readahead_bytes=auto
 stream_locality_bias_enabled=true
 monitor_interval_seconds=auto
 monitor_deep_scan_interval_seconds=auto
-max_part_size=536870912
-data_shards=1
-parity_shards=0
-stripe_block_size=4194304
+max_part_size=52428800
+data_shards=2
+parity_shards=2
+stripe_block_size=262144
 ```
 
-Create the same format-v2 `n2_membership.json` on every node under
-`runtime_path`. Use the complete role-separated example in `DOCUMENTATION.md`:
+The upload EC values must equal the static pool policy. N2 rejects unsafe or
+inconsistent topology instead of adapting durability downward.
 
-```json
-{
-  "cluster_id": "litiaina-n2-prod",
-  "epoch": 1,
-  "nodes": [
-    {
-      "id": "node-a",
-      "endpoint": "https://192.168.0.22:50001",
-      "native_endpoint": "n2://192.168.0.22:50002",
-      "state": "online",
-      "weight": 1,
-      "storage_roots": ["/mnt/n2/storage"]
-    },
-    {
-      "id": "node-b",
-      "endpoint": "https://192.168.0.13:50001",
-      "native_endpoint": "n2://192.168.0.13:50002",
-      "state": "online",
-      "weight": 1,
-      "storage_roots": ["/mnt/n2/storage"]
-    },
-    {
-      "id": "node-c",
-      "endpoint": "https://192.168.0.18:50001",
-      "native_endpoint": "n2://192.168.0.18:50002",
-      "state": "online",
-      "weight": 1,
-      "storage_roots": ["/mnt/n2/storage"]
-    }
-  ]
-}
-```
+## Installer
 
-Membership changes are explicit. Edit the membership file on every node, bump
-`epoch`, then restart N2.
-
-## Systemd Service
-
-The installer renders this service automatically. For manual installs, copy
-`deploy/systemd/litiaina-n2.service.in` to a local service file and replace the
-placeholders:
-
-```text
-@N2_HOME@            repository or release-doc path
-@N2_USER@            service user
-@N2_GROUP@           service group
-@N2_RUNTIME_DIR@     directory containing n2_config.ini
-@N2_ENV_FILE@        /etc/litiaina/n2/n2.env
-@N2_BIN@             /usr/local/bin/litiaina-n2
-@N2_LOG_FILTER@      n2=info,tower_http=info
-@N2_DATA_PATHS@      writable storage/control roots, space separated
-```
-
-Example replacement values:
-
-```text
-@N2_HOME@=/opt/litiaina/n2
-@N2_USER@=litiaina
-@N2_GROUP@=litiaina
-@N2_RUNTIME_DIR@=/var/lib/litiaina/n2
-@N2_ENV_FILE@=/etc/litiaina/n2/n2.env
-@N2_BIN@=/usr/local/bin/litiaina-n2
-@N2_LOG_FILTER@=n2=info,tower_http=info
-@N2_DATA_PATHS@=/mnt/n2/storage /mnt/n2/control
-```
-
-Install and start:
+The installer requires an explicit shared environment and membership for every
+fresh node:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now litiaina-n2
-sudo systemctl status litiaina-n2 --no-pager
+sudo deploy/install.sh --node --build --copy-certs \
+  --node-id node-a \
+  --node-endpoint https://10.0.0.11:50001 \
+  --native-endpoint n2://10.0.0.11:50002 \
+  --storage-roots a-disk-1=/mnt/NDISK001/n2,a-disk-2=/mnt/NDISK002/n2 \
+  --state-root /var/lib/litiaina/n2/state \
+  --pool-id pool-1 --pool-generation 1 \
+  --data-shards 2 --parity-shards 2 \
+  --env-src ./n2.env \
+  --membership-src ./n2_membership.json \
+  --cert-src ./certificates \
+  --enable --start
 ```
 
-## Gateway Runtime
-
-Create gateway runtime directory:
-
-```bash
-sudo mkdir -p /var/lib/litiaina/n2-gateway/certificates
-```
-
-Create `/var/lib/litiaina/n2-gateway/n2_gateway_config.ini`:
-
-```ini
-[server]
-host=0.0.0.0
-https_port=51002
-cert_path=/var/lib/litiaina/n2-gateway/certificates/cert.pem
-key_path=/var/lib/litiaina/n2-gateway/certificates/key.pem
-
-[routing]
-health_interval_seconds=5
-request_timeout_seconds=300
-
-[node.node-a]
-http_url=https://192.168.0.22:50001
-native_url=n2://192.168.0.22:50002
-weight=1
-
-[node.node-b]
-http_url=https://192.168.0.13:50001
-native_url=n2://192.168.0.13:50002
-weight=1
-
-[node.node-c]
-http_url=https://192.168.0.18:50001
-native_url=n2://192.168.0.18:50002
-weight=1
-```
-
-The installer renders this service automatically. For manual installs, copy
-`deploy/systemd/litiaina-n2-gateway.service.in` to a local service file and
-replace:
-
-```text
-@N2_HOME@
-@N2_USER@
-@N2_GROUP@
-@N2_GATEWAY_RUNTIME_DIR@
-@N2_GATEWAY_BIN@
-@N2_GATEWAY_LOG_FILTER@
-```
-
-Install and start:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now litiaina-n2-gateway
-sudo systemctl status litiaina-n2-gateway --no-pager
-```
+Run once with `--dry-run` first. The installer preserves existing configuration
+unless `--force-config` is explicitly supplied.
 
 ## Validation
 
-Check each node:
-
 ```bash
-curl -k https://192.168.0.22:50001/noa/v1/ping
-curl -k https://192.168.0.13:50001/noa/v1/ping
-curl -k https://192.168.0.18:50001/noa/v1/ping
+systemctl status litiaina-n2 --no-pager
+journalctl -u litiaina-n2 -n 100 --no-pager
+curl --cacert /path/to/ca.pem https://10.0.0.11:50001/noa/v1/ping
 ```
 
-Check native ports from the gateway host:
+After authenticating, verify `/noa/v1/cluster/health` reports the expected
+pool, exact `K + M`, NCNX replica count `M + 1`, and writable state. Then run a
+bounded upload/read/checksum, restart, node-loss read, and fail-closed write
+test before admitting production data.
 
-```bash
-nc -vz 192.168.0.22 50002
-nc -vz 192.168.0.13 50002
-nc -vz 192.168.0.18 50002
-```
-
-Check gateway:
-
-```bash
-curl -k https://127.0.0.1:51002/gateway/health
-curl -k https://127.0.0.1:51002/gateway/nodes
-```
-
-After fragment auth, check cluster monitor:
-
-```bash
-curl -k "https://192.168.0.22:50001/noa/v1/cluster/monitor?object_limit=96" \
-  -H "Authorization: Bearer $N2_TOKEN"
-```
-
-Operator proof checklist:
-
-- create fragment through the gateway;
-- authenticate through the gateway;
-- one-shot upload and download;
-- multipart upload, status, finalize, cancel;
-- interrupt a multipart upload, reload the console, resume with the same file;
-- list, mkdir, rename, move, trash, recover;
-- object status and object repair;
-- targeted rebalance dry-run and real run on layout-mismatched objects;
-- stop one node, verify read-on-recover for repairable objects;
-- restore the node and verify cluster monitor returns healthy.
-
-Automated installer proof:
-
-```bash
-scripts/proof/run_n2_installer_proof.sh
-```
-
-Automated hardening proof:
-
-```bash
-N2_PROOF_STORAGE_LAYOUT=separated \
-  scripts/bench/run_n2_hardening_native_proof.sh
-
-N2_PROOF_STORAGE_LAYOUT=shared \
-  scripts/bench/run_n2_hardening_native_proof.sh
-```
-
-The hardening proof uses temporary data roots and test ports. It does not kill
-existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
-It verifies canonical disk layout, absence of object data on separated index
-roots, byte-identical `.ncdx` participant copies, native shell access,
-coordinator multipart resume, degraded reads, missing-shard reconstruction,
-repair, namespace mutation, and targeted rebalance of only mismatched objects.
-
-Capacity expansion proof:
-
-```bash
-scripts/bench/run_n2_capacity_expansion_proof.sh
-```
-
-Benchmark matrix:
-
-```bash
-FRAGMENT=n2-test SECRET=fragment-key scripts/bench/run_n2_benchmark_matrix.sh
-```
+Do not use the gateway as an additional durability layer. It is an optional
+client routing endpoint; every N2 node already accepts and coordinates NOA.

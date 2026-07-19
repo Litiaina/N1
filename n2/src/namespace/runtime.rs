@@ -9,8 +9,8 @@ use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
 use crate::core::{index, index_store};
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, PeerNamespaceReadKind,
-    PeerNamespaceReadRequest, PeerNamespaceReadResponse, commit_namespace_created_quorum,
-    commit_namespace_summary_quorum, namespace_read_if_remote,
+    PeerNamespaceReadRequest, PeerNamespaceReadResponse, commit_namespace_created,
+    commit_namespace_summary, namespace_read,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -50,24 +50,12 @@ pub struct NamespaceObjectRefPage {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NamespaceRuntimeStats {
-    pub loaded_namespace_facades: u64,
-    pub max_loaded_namespace_facades: u64,
-    pub sampled_namespace_facades: u64,
-    pub busy_namespace_facades: u64,
-    pub loaded_namespace_handles: u64,
-    pub max_loaded_namespace_handles: u64,
-    pub nodes: u64,
-    pub child_index_entries: u64,
-    pub objects: u64,
-    pub object_versions: u64,
-    pub object_nodes: u64,
-    pub trash_anchor_entries: u64,
-    pub trash_entry_entries: u64,
-    pub subtree_path_counters: u64,
-    pub subtree_object_counters: u64,
-    pub largest_namespace_nodes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub largest_namespace_fragment: Option<String>,
+    pub flat_ncnx_namespace: bool,
+    pub zero_decode_listing: bool,
+    pub persisted_directory_records: bool,
+    pub object_metadata_cache_entries: u64,
+    pub object_metadata_cache_limit: u64,
+    pub object_metadata_cache_ttl_seconds: u64,
 }
 
 pub struct NamespaceRuntime;
@@ -89,12 +77,17 @@ impl NamespaceRuntime {
     }
 
     pub fn runtime_stats(&self) -> NamespaceRuntimeStats {
+        let cache_entries = OBJECT_META_CACHE
+            .lock()
+            .map(|cache| cache.len() as u64)
+            .unwrap_or(0);
         NamespaceRuntimeStats {
-            loaded_namespace_facades: 1,
-            max_loaded_namespace_facades: 1,
-            loaded_namespace_handles: 1,
-            max_loaded_namespace_handles: 1,
-            ..NamespaceRuntimeStats::default()
+            flat_ncnx_namespace: true,
+            zero_decode_listing: true,
+            persisted_directory_records: false,
+            object_metadata_cache_entries: cache_entries,
+            object_metadata_cache_limit: OBJECT_META_CACHE_MAX as u64,
+            object_metadata_cache_ttl_seconds: OBJECT_META_CACHE_TTL.as_secs(),
         }
     }
 
@@ -118,7 +111,7 @@ impl NamespaceRuntime {
         limit: usize,
         continuation_token: Option<&str>,
     ) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
-        let response = quorum_read(PeerNamespaceReadRequest {
+        let response = distributed_read(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::ListDir,
             path: Some(path.to_string()),
@@ -129,13 +122,12 @@ impl NamespaceRuntime {
         })
         .await?;
         let PeerNamespaceReadResponse::ListDir {
-            mut entries,
+            entries,
             continuation_token,
         } = response
         else {
             return Err(wrong_response("directory listing"));
         };
-        hydrate_entries(fragment, &mut entries).await?;
         Ok((entries, continuation_token))
     }
 
@@ -148,7 +140,7 @@ impl NamespaceRuntime {
         if path.is_empty() {
             return Ok(Some(root_entry(fragment)));
         }
-        let response = quorum_read(PeerNamespaceReadRequest {
+        let response = distributed_read(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::Entry,
             path: Some(path),
@@ -172,7 +164,7 @@ impl NamespaceRuntime {
         fragment: &str,
         path_or_id: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
-        let response = quorum_read(PeerNamespaceReadRequest {
+        let response = distributed_read(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::TrashedEntry,
             path: Some(path_or_id.to_string()),
@@ -237,7 +229,7 @@ impl NamespaceRuntime {
     }
 
     pub async fn mkdir(&self, fragment: &str, path: &str) -> Result<bool, AppError> {
-        commit_namespace_created_quorum(mutation_request(
+        commit_namespace_created(mutation_request(
             NamespaceMutationKind::Mkdir,
             fragment,
             Some(path),
@@ -252,7 +244,7 @@ impl NamespaceRuntime {
         source_path: &str,
         destination_path: &str,
     ) -> Result<NamespaceMutationSummary, AppError> {
-        commit_namespace_summary_quorum(mutation_request(
+        commit_namespace_summary(mutation_request(
             NamespaceMutationKind::Rename,
             fragment,
             Some(source_path),
@@ -266,7 +258,7 @@ impl NamespaceRuntime {
         fragment: &str,
         path: &str,
     ) -> Result<NamespaceMutationSummary, AppError> {
-        commit_namespace_summary_quorum(mutation_request(
+        commit_namespace_summary(mutation_request(
             NamespaceMutationKind::Trash,
             fragment,
             Some(path),
@@ -280,7 +272,7 @@ impl NamespaceRuntime {
         fragment: &str,
         path_or_id: &str,
     ) -> Result<NamespaceMutationSummary, AppError> {
-        commit_namespace_summary_quorum(mutation_request(
+        commit_namespace_summary(mutation_request(
             NamespaceMutationKind::Recover,
             fragment,
             Some(path_or_id),
@@ -314,7 +306,7 @@ impl NamespaceRuntime {
         &self,
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
-        let response = quorum_read(PeerNamespaceReadRequest {
+        let response = distributed_read(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::Reachability,
             path: None,
@@ -337,19 +329,12 @@ impl NamespaceRuntime {
         Ok(Some(snapshot))
     }
 
-    pub async fn purged_object_ids_for_gc(
-        &self,
-        _fragment: &str,
-    ) -> Result<BTreeSet<String>, AppError> {
-        Ok(BTreeSet::new())
-    }
-
     pub async fn resolve_live_object_id(
         &self,
         fragment: &str,
         path: &str,
     ) -> Result<Option<String>, AppError> {
-        let response = quorum_read(PeerNamespaceReadRequest {
+        let response = distributed_read(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
             kind: PeerNamespaceReadKind::ResolveLiveObject,
             path: Some(path.to_string()),
@@ -471,30 +456,59 @@ impl NamespaceRuntime {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(100)
             .clamp(1, 1000);
-        let prefix = params.get("prefix").cloned();
+        let prefix = params.get("prefix").cloned().unwrap_or_default();
         let delimiter = params.get("delimiter").cloned();
         let continuation = params.get("continuation_token").cloned();
-        if trash {
-            index::scan_fragment_trash_metadata_page(
-                fragment,
-                prefix,
-                delimiter,
-                limit,
-                continuation,
-                true,
-            )
-            .await
-        } else {
-            index::scan_fragment_live_metadata_page(
-                fragment,
-                prefix,
-                delimiter,
-                limit,
-                continuation,
-                true,
-            )
-            .await
+        let names = crate::distribution::ncnx::list_canonical_names(
+            fragment,
+            &prefix,
+            continuation.as_deref(),
+            limit.saturating_add(1),
+            trash,
+        )
+        .await?;
+        let has_more = names.len() > limit;
+        let selected = names.into_iter().take(limit).collect::<Vec<_>>();
+        let next = has_more
+            .then(|| {
+                selected.last().map(|name| {
+                    crate::distribution::ncnx::ncnx_cursor(&name.logical_key, name.trash.as_ref())
+                })
+            })
+            .flatten();
+        let mut entries = Vec::new();
+        let mut common_prefixes = BTreeSet::new();
+        for name in selected {
+            if let Some(delimiter) = delimiter.as_deref()
+                && !delimiter.is_empty()
+            {
+                let relative = name.logical_key.strip_prefix(&prefix).unwrap_or_default();
+                if let Some((head, _)) = relative.split_once(delimiter) {
+                    common_prefixes.insert(format!("{prefix}{head}{delimiter}"));
+                    continue;
+                }
+            }
+            entries.push(crate::core::disk_manager::IndexListEntry {
+                record: name.logical_key,
+                kind: if trash { "trashed" } else { "object" }.into(),
+                size_bytes: 0,
+                created_at_unix_nanos: name
+                    .trash
+                    .as_ref()
+                    .map_or(0, |trash| trash.deleted_at_unix_nanos),
+                packed_ext_u64: None,
+                version_ulid: None,
+            });
         }
+        Ok(ListObjectsResult {
+            prefix: (!prefix.is_empty()).then_some(prefix),
+            limit: Some(limit),
+            entries,
+            objects: Vec::new(),
+            common_prefixes: common_prefixes.into_iter().collect(),
+            continuation_token: next.clone(),
+            next_continuation_token: next,
+        })
     }
 
     pub async fn list_live_object_refs_page(
@@ -532,18 +546,18 @@ impl NamespaceRuntime {
     }
 }
 
-async fn quorum_read(
+async fn distributed_read(
     request: PeerNamespaceReadRequest,
 ) -> Result<PeerNamespaceReadResponse, AppError> {
     let timeout_duration = namespace_read_timeout();
-    match tokio::time::timeout(timeout_duration, namespace_read_if_remote(request)).await {
+    match tokio::time::timeout(timeout_duration, namespace_read(request)).await {
         Ok(Ok(Some(response))) => Ok(response),
         Ok(Ok(None)) => Err(AppError::InternalServerError(
-            "namespace quorum returned no response".into(),
+            "distributed NCNX read returned no response".into(),
         )),
         Ok(Err(err)) => Err(err),
         Err(_) => Err(AppError::ServiceUnavailable(format!(
-            "namespace quorum read exceeded {timeout_duration:?}"
+            "distributed NCNX read exceeded {timeout_duration:?}"
         ))),
     }
 }
@@ -555,7 +569,7 @@ async fn object_refs_page(
     continuation_token: Option<&str>,
     limit: usize,
 ) -> Result<NamespaceObjectRefPage, AppError> {
-    let response = quorum_read(PeerNamespaceReadRequest {
+    let response = distributed_read(PeerNamespaceReadRequest {
         fragment: fragment.to_string(),
         kind,
         path: None,
@@ -736,7 +750,7 @@ fn namespace_read_timeout() -> Duration {
 
 fn wrong_response(operation: &str) -> AppError {
     AppError::InternalServerError(format!(
-        "namespace quorum returned the wrong response for {operation}"
+        "distributed NCNX read returned the wrong response for {operation}"
     ))
 }
 

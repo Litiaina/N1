@@ -5,7 +5,7 @@ use crate::distribution::auto_healing::{AutoHealingStatus, auto_healing_status_s
 use crate::distribution::health::{ClusterHealthSnapshot, cluster_health_snapshot};
 use crate::distribution::layout::resolve_write_layout;
 use crate::distribution::membership::{
-    ClusterNode, active_cluster_runtime, live_active_write_nodes, live_readable_nodes,
+    ClusterNode, active_cluster_runtime, live_newest_pool_write_nodes, live_readable_nodes,
 };
 use crate::distribution::peer::{
     PeerMonitorResponse, cluster_secret, local_peer_monitor_snapshot, peer_http_client,
@@ -57,7 +57,7 @@ pub struct ClusterMonitorSnapshot {
     pub io_control: IoControlSnapshot,
     pub redistribution: ClusterRedistributionSummary,
     pub jobs: ClusterJobsSummary,
-    pub namespace_consensus: ClusterNamespaceConsensusSummary,
+    pub namespace_replication: ClusterNamespaceReplicationSummary,
     pub uploads: ClusterUploadActivitySummary,
     pub notes: Vec<String>,
 }
@@ -75,9 +75,8 @@ pub struct ClusterMonitorOverview {
     pub parity_shards: usize,
     pub data_plane_readable: bool,
     pub data_plane_writable: bool,
-    pub namespace_quorum_writable: bool,
+    pub ncnx_strictly_writable: bool,
     pub effective_client_writable: bool,
-    pub adaptive_layout: bool,
     pub automatic_rebalance: bool,
     pub layout_drift_is_health_failure: bool,
     pub summary: String,
@@ -119,19 +118,16 @@ pub struct ClusterMonitorNode {
 #[derive(Clone, Debug, Serialize)]
 pub struct ClusterMonitorTopology {
     pub membership_epoch: u64,
-    pub policy_mode: String,
-    pub fixed_data_shards: Option<usize>,
-    pub fixed_parity_shards: Option<usize>,
-    pub auto_max_data_shards: usize,
-    pub auto_max_parity_shards: usize,
+    pub static_data_shards: usize,
+    pub static_parity_shards: usize,
     pub current_data_shards: usize,
     pub current_parity_shards: usize,
     pub current_total_shards: usize,
     pub active_write_nodes: usize,
     pub readable_nodes: usize,
-    pub namespace_voters: usize,
-    pub estimated_namespace_reachable_voters: usize,
-    pub namespace_quorum_required: usize,
+    pub ncnx_replicas: usize,
+    pub estimated_ncnx_replicas_reachable: usize,
+    pub ncnx_replicas_required: usize,
     pub object_level_erasure_layout: bool,
     pub bounded_object_erasure_set: bool,
     pub old_layouts_remain_valid: bool,
@@ -199,13 +195,13 @@ pub struct ClusterJobsSummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ClusterNamespaceConsensusSummary {
+pub struct ClusterNamespaceReplicationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragment: Option<String>,
-    pub total_voters: usize,
-    pub estimated_reachable_voters: usize,
-    pub quorum_required: usize,
-    pub quorum_writable: bool,
+    pub replicas: usize,
+    pub estimated_replicas_reachable: usize,
+    pub replicas_required: usize,
+    pub strictly_writable: bool,
     pub local_node_id: String,
     pub local_store: NamespaceLocalStoreSummary,
     pub status: String,
@@ -245,11 +241,11 @@ pub async fn cluster_monitor_snapshot(
 
     let runtime = active_cluster_runtime()?;
     let health = cluster_health_snapshot(&runtime).await?;
-    let active = live_active_write_nodes(&runtime).await;
+    let active = live_newest_pool_write_nodes(&runtime).await;
     let readable = live_readable_nodes(&runtime).await;
     let layout = resolve_write_layout(
         active.len(),
-        runtime.membership.active_write_nodes().len(),
+        runtime.membership.active_newest_pool_nodes().len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::BadRequest)?;
@@ -270,7 +266,7 @@ pub async fn cluster_monitor_snapshot(
     .await;
     let uploads = summarize_uploads(&nodes);
     let object_health = sample_object_health(&runtime, fragment.clone(), &query).await;
-    let namespace_consensus = namespace_consensus_summary(&runtime, fragment.clone(), &health);
+    let namespace_replication = namespace_replication_summary(&runtime, fragment.clone(), &health);
     let repair = repair_status();
     let rebalance = rebalance_status();
     let healing = auto_healing_status_snapshot().await;
@@ -306,9 +302,8 @@ pub async fn cluster_monitor_snapshot(
             parity_shards: health.parity_shards,
             data_plane_readable: health.data_plane_readable,
             data_plane_writable: health.data_plane_writable,
-            namespace_quorum_writable: health.namespace_quorum_writable,
+            ncnx_strictly_writable: health.ncnx_strictly_writable,
             effective_client_writable: health.effective_client_writable,
-            adaptive_layout: health.adaptive_layout,
             automatic_rebalance: health.automatic_rebalance,
             layout_drift_is_health_failure: health.layout_drift_is_health_failure,
             summary: format!(
@@ -318,26 +313,23 @@ pub async fn cluster_monitor_snapshot(
                 health.data_shards,
                 health.parity_shards,
                 health.data_plane_writable,
-                health.namespace_quorum_writable,
+                health.ncnx_strictly_writable,
                 health.readable_nodes
             ),
         },
         nodes,
         topology: ClusterMonitorTopology {
             membership_epoch: runtime.membership.epoch,
-            policy_mode: format!("{:?}", runtime.layout_policy.mode).to_ascii_lowercase(),
-            fixed_data_shards: runtime.layout_policy.fixed_data_shards,
-            fixed_parity_shards: runtime.layout_policy.fixed_parity_shards,
-            auto_max_data_shards: runtime.layout_policy.auto_max_data_shards,
-            auto_max_parity_shards: runtime.layout_policy.auto_max_parity_shards,
+            static_data_shards: runtime.layout_policy.data_shards,
+            static_parity_shards: runtime.layout_policy.parity_shards,
             current_data_shards: layout.data_shards,
             current_parity_shards: layout.parity_shards,
             current_total_shards: layout.total_shards(),
             active_write_nodes: active.len(),
             readable_nodes: readable.len(),
-            namespace_voters: health.namespace_voters,
-            estimated_namespace_reachable_voters: health.estimated_namespace_reachable_voters,
-            namespace_quorum_required: health.namespace_quorum_required,
+            ncnx_replicas: health.ncnx_replicas,
+            estimated_ncnx_replicas_reachable: health.estimated_ncnx_replicas_reachable,
+            ncnx_replicas_required: health.ncnx_replicas_required,
             object_level_erasure_layout: true,
             bounded_object_erasure_set: true,
             old_layouts_remain_valid: true,
@@ -363,7 +355,7 @@ pub async fn cluster_monitor_snapshot(
             healing,
             gc,
         },
-        namespace_consensus,
+        namespace_replication,
         uploads,
         notes,
     })
@@ -649,13 +641,13 @@ fn push_object_sample(
     });
 }
 
-fn namespace_consensus_summary(
+fn namespace_replication_summary(
     runtime: &crate::distribution::membership::ClusterRuntime,
     fragment: Option<String>,
     health: &ClusterHealthSnapshot,
-) -> ClusterNamespaceConsensusSummary {
+) -> ClusterNamespaceReplicationSummary {
     let notes = vec![
-        "namespace mutation is quorum-gated; immutable object/layout metadata is not consensus-mutated after commit".to_string(),
+        "namespace mutations publish immutable NCNX records to every deterministic replica; no inode consensus database is present".to_string(),
     ];
     let local_store = NamespaceLocalStoreSummary {
         storage_roots: crate::core::disk_manager::ObjectPathManager::new()
@@ -663,22 +655,26 @@ fn namespace_consensus_summary(
             .into_iter()
             .map(|root| root.display().to_string())
             .collect(),
-        configured_replica_limit: runtime.membership.policy.namespace_redundancy,
-        identity_model: "stable_inode+parent_dentry+exact_replica_layout",
-        transaction_model: "per_inode_generation+durable_cross_inode_decision",
+        configured_replica_limit: runtime
+            .membership
+            .newest_writable_pool()
+            .map(|pool| pool.policy.namespace_replicas())
+            .unwrap_or(0),
+        identity_model: "flat_physical_key+ncnx_pointer+deterministic_replica_layout",
+        transaction_model: "immutable_destination_first_copy_delete",
     };
     let status = if fragment.is_some() {
-        "quorum_configured"
+        "strict_ncnx_replicas_configured"
     } else {
         "fragment_not_selected"
     }
     .to_string();
-    ClusterNamespaceConsensusSummary {
+    ClusterNamespaceReplicationSummary {
         fragment,
-        total_voters: health.namespace_voters,
-        estimated_reachable_voters: health.estimated_namespace_reachable_voters,
-        quorum_required: health.namespace_quorum_required,
-        quorum_writable: health.namespace_quorum_writable,
+        replicas: health.ncnx_replicas,
+        estimated_replicas_reachable: health.estimated_ncnx_replicas_reachable,
+        replicas_required: health.ncnx_replicas_required,
+        strictly_writable: health.ncnx_strictly_writable,
         local_node_id: runtime.local_node_id.clone(),
         local_store,
         status,

@@ -711,7 +711,7 @@ pub async fn run_server() {
     let effective_blob_disks_for_auto = storage_device_count.min(storage_disk_count).max(1);
     if storage_device_count < storage_disk_count {
         tracing::warn!(
-            "storage_disks has {} configured path(s) but only {} unique physical device(s); auto tuning will use {} effective disk(s)",
+            "storage_roots has {} configured path(s) but only {} unique physical device(s); auto tuning will use {} effective disk(s)",
             storage_disk_count,
             storage_device_count,
             effective_blob_disks_for_auto
@@ -756,22 +756,19 @@ pub async fn run_server() {
             "N2 started in durable cluster safety read-only mode"
         );
     }
+    let write_pool = cluster_runtime
+        .membership
+        .newest_writable_pool()
+        .expect("validated N2 membership has a writable server pool");
     tracing::info!(
-        "Cluster runtime: local_node={} role={} membership_epoch={} namespace_nodes={} blob_nodes={} namespace_redundancy={} object_ec={}+{} membership_file={} auto_rebalance={}",
+        "Cluster runtime: local_node={} pool={} membership_epoch={} unified_nodes={} ncnx_replicas={} object_ec={}+{} membership_file={} auto_rebalance={}",
         cluster_runtime.local_node_id,
-        cluster_runtime.local_role,
+        cluster_runtime.local_pool_id,
         cluster_runtime.membership.epoch,
-        cluster_runtime
-            .membership
-            .nodes_for_role(crate::distribution::membership::NodeRole::Namespace)
-            .len(),
-        cluster_runtime
-            .membership
-            .nodes_for_role(crate::distribution::membership::NodeRole::Blob)
-            .len(),
-        cluster_runtime.membership.policy.namespace_redundancy,
-        cluster_runtime.membership.policy.object_data_shards,
-        cluster_runtime.membership.policy.object_parity_shards,
+        cluster_runtime.membership.nodes.len(),
+        write_pool.policy.namespace_replicas(),
+        write_pool.policy.object_data_shards,
+        write_pool.policy.object_parity_shards,
         cluster_runtime.membership_path.display(),
         cluster_runtime.auto_rebalance
     );

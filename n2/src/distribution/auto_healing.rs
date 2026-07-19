@@ -10,6 +10,7 @@ use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, active_cluster_runtime, live_active_write_nodes,
 };
 use crate::distribution::namespace_healing::scan_and_repair_fragment_namespace;
+use crate::distribution::ncnx::build_ncnx_layout;
 use crate::distribution::object_healing::scan_and_repair_fragment_objects;
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
 use crate::enums::app_error_enum::AppError;
@@ -65,8 +66,8 @@ pub struct AutoHealingStatus {
     pub owned_fragments: usize,
     pub leased_fragments: usize,
     pub scanned_objects: u64,
-    pub scanned_inodes: u64,
-    pub repaired_inodes: u64,
+    pub scanned_namespace_records: u64,
+    pub repaired_namespace_records: u64,
     pub repaired_objects: u64,
     pub repaired_shards: u64,
     pub unrecoverable_objects: u64,
@@ -117,8 +118,8 @@ pub struct PeerSafetyReadOnlyResponse {
 
 #[derive(Clone, Debug, Default)]
 struct FragmentHealingOutcome {
-    scanned_inodes: u64,
-    repaired_inodes: u64,
+    scanned_namespace_records: u64,
+    repaired_namespace_records: u64,
     scanned_objects: u64,
     repaired_objects: u64,
     repaired_shards: u64,
@@ -159,11 +160,14 @@ fn healing_partition(fragment: &str) -> u64 {
 }
 
 fn namespace_lease_voters(runtime: &ClusterRuntime) -> Result<Vec<ClusterNode>, AppError> {
-    runtime
+    let pool = runtime
         .membership
-        .namespace_catalog
+        .newest_writable_pool()
+        .ok_or_else(|| AppError::ServiceUnavailable("cluster has no writable pool".into()))?;
+    let layout = build_ncnx_layout(runtime, pool, "healing-control", "lease-holder")?;
+    layout
         .replicas
-        .iter()
+        .into_iter()
         .map(|replica| {
             runtime
                 .membership
@@ -173,7 +177,7 @@ fn namespace_lease_voters(runtime: &ClusterRuntime) -> Result<Vec<ClusterNode>, 
                 .cloned()
                 .ok_or_else(|| {
                     AppError::Conflict(format!(
-                        "namespace catalog lease voter '{}' is absent from membership",
+                        "NCNX healing voter '{}' is absent from membership",
                         replica.node_id
                     ))
                 })
@@ -347,12 +351,9 @@ async fn claim_local_lease(
             request.owner_node_id
         )));
     }
-    if !runtime
-        .membership
-        .namespace_catalog
-        .replicas
+    if !namespace_lease_voters(&runtime)?
         .iter()
-        .any(|replica| replica.node_id == runtime.local_node_id)
+        .any(|node| node.id == runtime.local_node_id)
     {
         return Err(AppError::Forbidden(
             "this node is not a voter for the fragment healing lease".into(),
@@ -545,22 +546,21 @@ async fn propagate_safety_state(
             }
         }))
         .await;
-    let catalog_nodes = runtime
+    let configured_nodes = runtime
         .membership
-        .namespace_catalog
-        .replicas
+        .nodes
         .iter()
-        .map(|replica| replica.node_id.as_str())
+        .map(|node| node.id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let applied_catalog = results
+    let applied_nodes = results
         .iter()
         .filter_map(|result| result.as_ref().ok())
-        .filter(|response| response.applied && catalog_nodes.contains(response.node_id.as_str()))
+        .filter(|response| response.applied && configured_nodes.contains(response.node_id.as_str()))
         .count();
-    let required = (catalog_nodes.len() / 2).saturating_add(1);
-    if applied_catalog < required {
+    let required = (configured_nodes.len() / 2).saturating_add(1);
+    if applied_nodes < required {
         return Err(AppError::ServiceUnavailable(format!(
-            "cluster safety read-only reached {applied_catalog}/{required} required namespace catalog voters"
+            "cluster safety read-only reached {applied_nodes}/{required} required unified nodes"
         )));
     }
     Ok(())
@@ -658,8 +658,8 @@ async fn heal_owned_fragment(
     }
     update_progress(&fragment, cycle, objects.continuation_token.clone()).await?;
     Ok(Some(FragmentHealingOutcome {
-        scanned_inodes: namespace.scanned_inodes,
-        repaired_inodes: namespace.repaired_inodes,
+        scanned_namespace_records: namespace.scanned_records,
+        repaired_namespace_records: namespace.repaired_records,
         scanned_objects: objects.scanned_objects,
         repaired_objects: objects.repaired_objects,
         repaired_shards: objects.repaired_shards,
@@ -746,10 +746,12 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
         match result {
             Ok(Some(result)) => {
                 status.leased_fragments = status.leased_fragments.saturating_add(1);
-                status.scanned_inodes = status.scanned_inodes.saturating_add(result.scanned_inodes);
-                status.repaired_inodes = status
-                    .repaired_inodes
-                    .saturating_add(result.repaired_inodes);
+                status.scanned_namespace_records = status
+                    .scanned_namespace_records
+                    .saturating_add(result.scanned_namespace_records);
+                status.repaired_namespace_records = status
+                    .repaired_namespace_records
+                    .saturating_add(result.repaired_namespace_records);
                 status.scanned_objects = status
                     .scanned_objects
                     .saturating_add(result.scanned_objects);
@@ -887,14 +889,14 @@ mod tests {
     use super::*;
     use crate::distribution::layout::ClusterLayoutPolicy;
     use crate::distribution::membership::{
-        ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NamespaceCatalogLayout,
-        NamespaceCatalogReplica, NodeRole, NodeState, StorageRoot,
+        ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState, PoolState,
+        ServerPool, StorageRoot,
     };
 
     fn runtime() -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "node-a".into(),
-            local_role: NodeRole::Blob,
+            local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: PathBuf::new(),
             layout_policy: ClusterLayoutPolicy::default(),
@@ -902,34 +904,24 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "healing-test".into(),
                 epoch: 9,
-                policy: ClusterPolicy {
-                    namespace_redundancy: 2,
-                    object_data_shards: 2,
-                    object_parity_shards: 1,
-                },
-                namespace_catalog: NamespaceCatalogLayout {
+                pools: vec![ServerPool {
+                    id: "pool-a".into(),
                     generation: 9,
-                    replicas: vec![
-                        NamespaceCatalogReplica {
-                            node_id: "node-a".into(),
-                            root_id: "root-node-a".into(),
-                        },
-                        NamespaceCatalogReplica {
-                            node_id: "node-b".into(),
-                            root_id: "root-node-b".into(),
-                        },
-                    ],
-                },
+                    policy: ClusterPolicy {
+                        object_data_shards: 2,
+                        object_parity_shards: 1,
+                    },
+                    state: PoolState::Writable,
+                    node_ids: ["node-a", "node-b", "node-c", "node-d"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                }],
                 nodes: ["node-a", "node-b", "node-c", "node-d"]
                     .into_iter()
                     .enumerate()
-                    .map(|(index, id)| ClusterNode {
+                    .map(|(_index, id)| ClusterNode {
                         id: id.into(),
-                        role: if index < 2 {
-                            NodeRole::Namespace
-                        } else {
-                            NodeRole::Blob
-                        },
                         endpoint: format!("https://{id}"),
                         native_endpoint: None,
                         state: Some(NodeState::Online),

@@ -17,11 +17,11 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     conf.with_section(Some("cluster_config"))
         .set("node_id", "node-1")
-        .set("node_role", "namespace")
+        .set("pool_id", "pool-1")
+        .set("pool_generation", "1")
         .set("node_endpoint", "https://127.0.0.1:50001")
         .set("native_endpoint", "n2://127.0.0.1:50002")
         .set("membership_file", "n2_membership.json")
-        .set("namespace_redundancy", "2")
         .set("object_data_shards", "1")
         .set("object_parity_shards", "1")
         .set("auto_rebalance", "false");
@@ -75,7 +75,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("monitor_deep_scan_interval_seconds", "auto")
         .set("max_part_size", "536870912")
         .set("data_shards", "1")
-        .set("parity_shards", "0")
+        .set("parity_shards", "1")
         .set("stripe_block_size", "4194304");
 
     conf.write_to_file(path)
@@ -105,8 +105,10 @@ mod tests {
         let cluster = ini
             .section(Some("cluster_config"))
             .expect("cluster_config section");
-        assert_eq!(cluster.get("node_role"), Some("namespace"));
-        assert_eq!(cluster.get("namespace_redundancy"), Some("2"));
+        assert_eq!(cluster.get("pool_id"), Some("pool-1"));
+        assert_eq!(cluster.get("pool_generation"), Some("1"));
+        assert!(!cluster.contains_key("node_role"));
+        assert!(!cluster.contains_key("namespace_redundancy"));
         assert_eq!(cluster.get("object_data_shards"), Some("1"));
         assert_eq!(cluster.get("object_parity_shards"), Some("1"));
         assert_eq!(cluster.get("membership_file"), Some("n2_membership.json"));
@@ -120,6 +122,11 @@ mod tests {
             .expect("upload_config section");
         assert_eq!(upload.get("max_part_size"), Some("536870912"));
         assert_eq!(upload.get("stripe_block_size"), Some("4194304"));
+        assert_eq!(upload.get("data_shards"), cluster.get("object_data_shards"));
+        assert_eq!(
+            upload.get("parity_shards"),
+            cluster.get("object_parity_shards")
+        );
         let healing = ini
             .section(Some("auto_healing"))
             .expect("auto_healing section");

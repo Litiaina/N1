@@ -27,7 +27,7 @@ use crate::core::repair_manager::{
     stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{
-    get_object as get_object_impl, get_object_metadata_direct, list_fragments,
+    get_object as get_object_impl, get_object_metadata_by_id, list_fragments,
     stream_object as stream_object_impl,
 };
 use crate::core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
@@ -39,14 +39,14 @@ use crate::core::upload::{
 use crate::core::{index, index_store};
 use crate::distribution::auto_healing::build_auto_healing_peer_routes;
 use crate::distribution::download::part_has_remote_shards;
-use crate::distribution::inode::build_inode_peer_routes;
 use crate::distribution::lifecycle::build_lifecycle_peer_routes;
 use crate::distribution::maintenance::build_distributed_maintenance_peer_routes;
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
-    commit_upload_quorum,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary,
+    commit_upload_pointer,
 };
+use crate::distribution::ncnx::build_ncnx_peer_routes;
 use crate::distribution::peer::build_peer_routes;
 use crate::distribution::rebalance::{
     metadata_matches_current_layout, rewrite_object_to_current_layout,
@@ -357,7 +357,7 @@ pub(crate) async fn commit_logical_upload_from_meta(
     physical_object_id: &str,
     metadata: &crate::core::disk_manager::ObjectMetadata,
 ) -> Result<String, AppError> {
-    commit_upload_quorum(fragment, logical_path, physical_object_id, metadata).await
+    commit_upload_pointer(fragment, logical_path, physical_object_id, metadata).await
 }
 
 pub(crate) fn emit_logical_file_uploaded(
@@ -508,8 +508,7 @@ async fn get_object_scoped(
     req: axum::http::Request<axum::body::Body>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    get_object_impl(claims, Path((fragment, physical)), req).await
+    get_object_impl(claims, Path((fragment, object_key)), req).await
 }
 
 async fn stream_object_scoped(
@@ -518,8 +517,7 @@ async fn stream_object_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    stream_object_impl(claims, headers, Path((fragment, physical))).await
+    stream_object_impl(claims, headers, Path((fragment, object_key))).await
 }
 
 async fn get_object_metadata_scoped(
@@ -532,7 +530,7 @@ async fn get_object_metadata_scoped(
     }
     let requested_path = object_key;
     let physical = resolve_logical_read_key(&fragment, &requested_path).await?;
-    let mut metadata = get_object_metadata_direct(&fragment, &physical)
+    let mut metadata = get_object_metadata_by_id(&fragment, &physical)
         .await?
         .without_internal_layout();
     metadata.object_key = requested_path;
@@ -554,26 +552,14 @@ async fn download_object_scoped(
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned);
     }
-    if query
-        .version_id
-        .as_deref()
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        let resolved = resolve_logical_read_key(&fragment, &requested).await?;
-        if query.filename.is_none() {
-            query.filename = download_filename_for_logical_path(&requested, &resolved);
-        }
-        query.object_key = resolved;
-    }
     download_object_impl(claims, Path(fragment), Query(query), headers).await
 }
 
 async fn download_object_chunk_scoped(
     claims: Claims,
-    Query(mut params): Query<crate::core::disk_manager::ChunkQuery>,
+    Query(params): Query<crate::core::disk_manager::ChunkQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    params.object_key = resolve_logical_read_key(&fragment, &params.object_key).await?;
     download_object_chunk_impl(claims, Path(fragment), Query(params)).await
 }
 
@@ -614,7 +600,7 @@ async fn delete_object_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Trash,
         fragment: fragment.clone(),
@@ -650,7 +636,7 @@ async fn recover_object_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: fragment.clone(),
@@ -708,7 +694,7 @@ async fn get_object_repair_status_scoped(
         .1
     } else {
         let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-        get_object_metadata_direct(&fragment, &physical).await?
+        get_object_metadata_by_id(&fragment, &physical).await?
     };
     let mut status = inspect_cluster_object_status(&metadata, parse_check_mode(&params)).await?;
     status.object_key = object_key.trim_start_matches('/').to_string();
@@ -758,7 +744,7 @@ async fn redistribute_object_scoped(
         .await?
     } else {
         let physical = resolve_logical_read_key(&fragment, &logical).await?;
-        let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+        let metadata = get_object_metadata_by_id(&fragment, &physical).await?;
         (physical, metadata)
     };
     let check_mode = parse_check_mode(&params);
@@ -801,7 +787,7 @@ async fn redistribute_object_scoped(
 
     rewrite_object_to_current_layout(logical.clone(), physical.clone(), metadata.clone(), false)
         .await?;
-    let rewritten_metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let rewritten_metadata = get_object_metadata_by_id(&fragment, &physical).await?;
     let mut after = inspect_cluster_object_status(&rewritten_metadata, check_mode).await?;
     after.object_key = logical.clone();
     Ok(AxumJson(ObjectRedistributeResponse {
@@ -843,7 +829,7 @@ async fn repair_object_scoped(
         .await?
     } else {
         let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-        let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+        let metadata = get_object_metadata_by_id(&fragment, &physical).await?;
         (physical, metadata)
     };
     let check_mode = parse_check_mode(&params);
@@ -889,7 +875,7 @@ async fn bulk_delete_objects_scoped(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
     for object_key in &unique_keys {
-        match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        match commit_namespace_summary(PeerNamespaceApplyRequest {
             mutation_id: None,
             kind: NamespaceMutationKind::Trash,
             fragment: fragment.clone(),
@@ -960,7 +946,7 @@ async fn bulk_recover_objects_scoped(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
     for object_key in &unique_keys {
-        match commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        match commit_namespace_summary(PeerNamespaceApplyRequest {
             mutation_id: None,
             kind: NamespaceMutationKind::Recover,
             fragment: fragment.clone(),
@@ -1017,7 +1003,7 @@ async fn rename_object_scoped(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Rename,
         fragment: claims.fragment.clone(),
@@ -1502,7 +1488,7 @@ pub fn build_storage_routes_unbound_with_options(
 
     let peer_routes = Router::new()
         .merge(build_peer_routes())
-        .merge(build_inode_peer_routes())
+        .merge(build_ncnx_peer_routes())
         .merge(build_auto_healing_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
         .merge(build_lifecycle_peer_routes());

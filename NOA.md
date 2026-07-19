@@ -1,9 +1,9 @@
 # Litiaina Node Object API (NOA)
 
 NOA is the versioned HTTPS and WebSocket contract shared by Litiaina object
-storage engines. N2 2.0 implements NOA v1 over two independent storage planes:
-the replicated inode namespace pool and the immutable object-level EC blob
-pool. NOA meanings do not expose either engine's disk layout.
+storage engines. N2 3.0 implements NOA v1 over unified static-EC server pools,
+flat replicated NCNX keys, and immutable object-level EC records. NOA meanings
+do not expose either engine's disk layout.
 
 ## Version Boundary
 
@@ -11,13 +11,13 @@ pool. NOA meanings do not expose either engine's disk layout.
 - API version: `v1`
 - HTTPS prefix: `/noa/v1`
 - Realtime endpoint: `/noa/v1/ws`
-- N2 implementation: `2.0.0`
+- N2 implementation: `3.0.0`
 
 The NOA version is independent of the N2 package and disk-format versions. An
 incompatible public API requires a new prefix such as `/noa/v2`; package
 updates can continue implementing NOA v1.
 
-N2 2.0 retains the NOA v1 public `/noa/v1/...` namespace. It does not
+N2 3.0 retains the NOA v1 public `/noa/v1/...` namespace. It does not
 retain aliases that would turn the retired routes into a second compatibility
 contract.
 
@@ -26,7 +26,7 @@ These N2 identities are intentionally unchanged:
 - `n2://` is the trusted N2-native operator and data protocol;
 - `/n2/peer/...` is authenticated node-to-node transport;
 - `/gateway/...` is N2 Gateway control state;
-- `.ncdx`, inode generations and certificates, exact EC placement, and disk
+- `.ncnx`, `.ncdx`, exact EC placement, pool generations, and disk
   paths are engine internals rather than NOA resources.
 
 ## Common NOA v1 Surface
@@ -109,10 +109,12 @@ POST /noa/v1/posix/trash
 POST /noa/v1/posix/recover
 ```
 
-N2 implements these operations through stable directory inodes replicated on
-their recorded namespace-node/root layouts. Folder rename and move mutate only
-the directly affected inode groups; they do not rewrite descendants or blob
-records.
+N2 implements these operations over independent flat NCNX key records.
+Directories are derived common prefixes, so N2 rejects `mkdir` rather than
+pretending an empty directory was persisted. Exact-key rename/move is
+destination-first copy/delete. Folder
+operations enumerate the prefix and apply that same restart-safe protocol per
+key with bounded concurrency; they never rewrite NCDX or object data.
 
 ### Health And Maintenance
 
@@ -174,9 +176,11 @@ GET  /noa/v1/cluster/maintenance/distributed/status
 ```
 
 The healing cycle uses deterministic fragment ownership within a bounded HA
-coordinator pool and a quorum-held fragment lease. Object scans resume from a
+coordinator pool and a time-bounded fragment lease. Object scans resume from a
 persisted continuation token after restart. Independent fragments can run in
-parallel, while object repair remains bounded and idempotent.
+parallel, while each repair follows the exact recorded NCNX or NCDX layout and
+remains bounded and idempotent. Healing reports are disposable JSON evidence,
+never namespace or object authority.
 
 ## Conformance Boundary
 
@@ -186,5 +190,5 @@ error class, streaming behavior, and retry behavior for the shared surface.
 Engine-specific placement and namespace algorithms remain private.
 
 N2 route tests reject the retired public prefix, gateway tests verify NOA
-forwarding and WebSocket upgrade paths, and the bounded three-instance proof
+forwarding and WebSocket upgrade paths, and the bounded four-node proof
 exercises the public API against the actual N2 engine.

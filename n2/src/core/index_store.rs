@@ -137,6 +137,8 @@ struct DiskObjectMetadata {
     content_type: String,
     total_size_bytes: u64,
     created_at: i64,
+    pool_id: String,
+    pool_generation: u64,
     membership_epoch: u64,
     data_shards: u16,
     parity_shards: u16,
@@ -157,6 +159,8 @@ impl From<&ObjectMetadata> for DiskObjectMetadata {
             content_type: meta.content_type.clone(),
             total_size_bytes: meta.total_size_bytes,
             created_at: meta.created_at,
+            pool_id: meta.pool_id.clone(),
+            pool_generation: meta.pool_generation,
             membership_epoch: meta.membership_epoch,
             data_shards: meta.data_shards,
             parity_shards: meta.parity_shards,
@@ -179,6 +183,8 @@ impl From<DiskObjectMetadata> for ObjectMetadata {
             content_type: meta.content_type,
             total_size_bytes: meta.total_size_bytes,
             created_at: meta.created_at,
+            pool_id: meta.pool_id,
+            pool_generation: meta.pool_generation,
             membership_epoch: meta.membership_epoch,
             data_shards: meta.data_shards,
             parity_shards: meta.parity_shards,
@@ -416,13 +422,6 @@ fn object_record_dirs_under_root(
         }
     }
     Ok(out)
-}
-
-pub(crate) fn local_object_dirs_under_root(
-    root: &Path,
-    fragment: &str,
-) -> Result<Vec<(PathBuf, String)>, AppError> {
-    object_record_dirs_under_root(root, fragment)
 }
 
 fn ensure_fragment_dirs(fragment: &str) -> Result<(), AppError> {
@@ -735,6 +734,10 @@ fn summary_metadata(fragment: &str, object_key: String, summary: NcdxSummary) ->
         },
         total_size_bytes: summary.size_bytes,
         created_at: (summary.unix_nanos / 1_000_000_000i128) as i64,
+        // Filename-only summaries are presentation records, never NCDX
+        // durability truth. Exact reads decode the immutable NCDX body.
+        pool_id: String::new(),
+        pool_generation: 0,
         membership_epoch: 0,
         data_shards: 0,
         parity_shards: 0,
@@ -796,6 +799,48 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     Ok(())
 }
 
+fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::InternalServerError(format!("N2 path {} has no parent", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| io_err(error, "create NCDX parent"))?;
+    let temporary = parent.join(format!(".n2-ncdx-publish-{}", Ulid::new()));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| io_err(error, "create NCDX staging file"))?;
+        file.write_all(bytes)
+            .map_err(|error| io_err(error, "write NCDX staging file"))?;
+        file.sync_all()
+            .map_err(|error| io_err(error, "sync NCDX staging file"))?;
+    }
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temporary);
+            sync_dir(parent);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            let existing = fs::read(path).map_err(|error| io_err(error, "read existing NCDX"))?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(AppError::Conflict(format!(
+                    "refused to overwrite divergent immutable NCDX {}",
+                    path.display()
+                )))
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(io_err(error, "publish immutable NCDX"))
+        }
+    }
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<bool, AppError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -820,7 +865,7 @@ fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
         if !object_dir.join(&metadata.version_id).is_dir() {
             continue;
         }
-        write_atomic(&object_dir.join(&file_name), &bytes)?;
+        write_immutable(&object_dir.join(&file_name), &bytes)?;
         written += 1;
     }
     if written == 0 {
@@ -1376,6 +1421,9 @@ fn scan_trash_page(
                 content_type: "application/octet-stream".to_string(),
                 total_size_bytes: 0,
                 created_at: record.deleted_at_unix,
+                // Trash list summaries do not claim an object layout.
+                pool_id: String::new(),
+                pool_generation: 0,
                 membership_epoch: 0,
                 data_shards: 0,
                 parity_shards: 0,
@@ -2070,6 +2118,8 @@ mod tests {
             content_type: "application/pdf".into(),
             total_size_bytes: 4096,
             created_at: 1_782_864_000,
+            pool_id: "pool-a".into(),
+            pool_generation: 7,
             membership_epoch: 7,
             data_shards: 2,
             parity_shards: 1,

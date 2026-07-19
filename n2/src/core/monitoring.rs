@@ -589,7 +589,8 @@ async fn detect_namespace_replica_debt(
     let mut stats = NamespaceReplicaHealthStats::default();
 
     for fragment in fragments {
-        let inspection = inspect_namespace_replicas(&fragment, active_index_roots).await?;
+        let inspection =
+            inspect_namespace_replicas(&fragment, active_index_roots, deep_scan).await?;
         let has_namespace_materialized = inspection.present_replicas > 0;
         let has_indexed_payload = if has_namespace_materialized {
             true
@@ -879,7 +880,7 @@ async fn collect_system_health(
         (
             "degraded",
             format!(
-                "N2 namespace voters need synchronization for {} fragment(s): {}.",
+                "N2 NCNX replicas need repair for {} fragment(s): {}.",
                 namespace_replica_debt.fragments_degraded,
                 namespace_replica_debt.degraded_fragments.join(", ")
             ),

@@ -26,7 +26,7 @@ use crate::core::garbage_collector::{
     get_gc_status, run_garbage_collector, stop_garbage_collector,
 };
 use crate::core::index;
-use crate::core::metadata_parser::get_version_metadata;
+use crate::core::metadata_parser::get_version_metadata_by_id;
 use crate::core::monitoring::system_health_snapshot;
 use crate::core::redistribution::{
     get_redist_status, stop_redistribution_job_api, trigger_redistribution_job_api,
@@ -34,7 +34,7 @@ use crate::core::redistribution::{
 use crate::core::repair_manager::{
     get_repair_status, parse_check_mode, repair_object, stop_repair_job_api, trigger_repair_job_api,
 };
-use crate::core::retrieve::{get_object_metadata_direct, list_fragments};
+use crate::core::retrieve::{get_object_metadata_by_id, list_fragments};
 use crate::core::storage_capacity_parser::get_capacity_usage;
 use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
@@ -42,10 +42,10 @@ use crate::core::upload::{
 };
 use crate::distribution::download::part_has_remote_shards;
 use crate::distribution::health::cluster_health_snapshot;
-use crate::distribution::membership::{active_cluster_runtime, live_active_write_nodes};
+use crate::distribution::membership::{active_cluster_runtime, live_newest_pool_write_nodes};
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary_quorum,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary,
 };
 use crate::distribution::rebalance::{
     ClusterRebalanceRequest, metadata_matches_current_layout, plan_rebalance, rebalance_status,
@@ -53,7 +53,7 @@ use crate::distribution::rebalance::{
     stop_repair,
 };
 use crate::distribution::repair::repair_policy;
-use crate::distribution::resolve_layout;
+use crate::distribution::resolve_write_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -400,10 +400,9 @@ async fn execute_native_op_inner(
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
             let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
-                get_version_metadata(&claims.fragment, &physical, &version_id, &claims.fragment)
-                    .await?
+                get_version_metadata_by_id(&claims.fragment, &physical, &version_id).await?
             } else {
-                get_object_metadata_direct(&claims.fragment, &physical).await?
+                get_object_metadata_by_id(&claims.fragment, &physical).await?
             };
             let mut status =
                 inspect_cluster_object_status(&metadata, check_mode_payload(&payload)).await?;
@@ -415,7 +414,7 @@ async fn execute_native_op_inner(
             require_write_modify(&claims)?;
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
-            let metadata = get_object_metadata_direct(&claims.fragment, &physical).await?;
+            let metadata = get_object_metadata_by_id(&claims.fragment, &physical).await?;
             let check_mode = check_mode_payload(&payload);
             let mut status = if metadata.parts.iter().any(part_has_remote_shards) {
                 let status = inspect_cluster_object_status(&metadata, check_mode).await?;
@@ -442,10 +441,9 @@ async fn execute_native_op_inner(
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
             let requested_version_id = string_field(&payload, "version_id");
             let metadata = if let Some(version_id) = requested_version_id.as_deref() {
-                get_version_metadata(&claims.fragment, &physical, version_id, &claims.fragment)
-                    .await?
+                get_version_metadata_by_id(&claims.fragment, &physical, version_id).await?
             } else {
-                get_object_metadata_direct(&claims.fragment, &physical).await?
+                get_object_metadata_by_id(&claims.fragment, &physical).await?
             };
             let check_mode = check_mode_payload(&payload);
             let mut before = inspect_cluster_object_status(&metadata, check_mode).await?;
@@ -490,7 +488,7 @@ async fn execute_native_op_inner(
                 )
                 .await?;
                 let rewritten_metadata =
-                    get_object_metadata_direct(&claims.fragment, &physical).await?;
+                    get_object_metadata_by_id(&claims.fragment, &physical).await?;
                 let mut after =
                     inspect_cluster_object_status(&rewritten_metadata, check_mode).await?;
                 after.object_key = object_key.trim_start_matches('/').to_string();
@@ -536,9 +534,9 @@ async fn execute_native_op_inner(
             let fragment = claims.fragment.clone();
             let physical = resolve_logical_read_key(&fragment, &logical).await?;
             let mut metadata = if let Some(version_id) = string_field(&payload, "version_id") {
-                get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+                get_version_metadata_by_id(&fragment, &physical, &version_id).await?
             } else {
-                get_object_metadata_direct(&fragment, &physical).await?
+                get_object_metadata_by_id(&fragment, &physical).await?
             };
             metadata.object_key = logical.trim_start_matches('/').to_string();
             metadata.strip_internal_layout();
@@ -578,7 +576,7 @@ async fn execute_native_op_inner(
             if !version_exists {
                 return Err(AppError::NotFound);
             }
-            let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+            let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
                 mutation_id: None,
                 kind: NamespaceMutationKind::Recover,
                 fragment: fragment.clone(),
@@ -807,9 +805,9 @@ async fn execute_native_op_inner(
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&fragment, &logical).await?;
             let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
-                get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+                get_version_metadata_by_id(&fragment, &physical, &version_id).await?
             } else {
-                get_object_metadata_direct(&fragment, &physical).await?
+                get_object_metadata_by_id(&fragment, &physical).await?
             };
             let offset = u64_field(&payload, "offset").unwrap_or(0);
             let chunk_size = usize_field(&payload, "chunk_size").unwrap_or(8 * 1024 * 1024);
@@ -832,9 +830,9 @@ async fn execute_native_op_inner(
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&fragment, &logical).await?;
             let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
-                get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+                get_version_metadata_by_id(&fragment, &physical, &version_id).await?
             } else {
-                get_object_metadata_direct(&fragment, &physical).await?
+                get_object_metadata_by_id(&fragment, &physical).await?
             };
             native_download_metadata(metadata, physical).await?
         }
@@ -856,8 +854,9 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_read(&claims)?;
             let runtime = active_cluster_runtime()?;
-            let active = live_active_write_nodes(&runtime).await;
-            let layout = resolve_layout(active.len(), &runtime.layout_policy)
+            let active = live_newest_pool_write_nodes(&runtime).await;
+            let configured = runtime.membership.active_newest_pool_nodes().len();
+            let layout = resolve_write_layout(active.len(), configured, &runtime.layout_policy)
                 .map_err(AppError::BadRequest)?;
             native_body(json!({
                 "membership_epoch": runtime.membership.epoch,
@@ -865,9 +864,8 @@ async fn execute_native_op_inner(
                 "active_write_nodes": active.len(),
                 "layout": layout,
                 "bounded_object_erasure_set": true,
-                "max_auto_data_shards": runtime.layout_policy.auto_max_data_shards,
-                "max_auto_parity_shards": runtime.layout_policy.auto_max_parity_shards,
-                "adaptive_without_rebalance": true,
+                "static_server_pool_ec": true,
+                "old_object_layouts_remain_valid": true,
                 "automatic_rebalance": runtime.auto_rebalance,
             }))
         }
@@ -1060,9 +1058,9 @@ pub async fn prepare_native_download_stream(
     let logical = required_string(&payload, "object_key")?;
     let physical = resolve_logical_read_key(&fragment, &logical).await?;
     let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
-        get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+        get_version_metadata_by_id(&fragment, &physical, &version_id).await?
     } else {
-        get_object_metadata_direct(&fragment, &physical).await?
+        get_object_metadata_by_id(&fragment, &physical).await?
     };
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -1175,7 +1173,7 @@ async fn native_bulk_namespace_operation(
             BulkNamespaceMode::Trash => NamespaceMutationKind::Trash,
             BulkNamespaceMode::Recover => NamespaceMutationKind::Recover,
         };
-        let result = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+        let result = commit_namespace_summary(PeerNamespaceApplyRequest {
             mutation_id: None,
             kind,
             fragment: fragment.to_string(),

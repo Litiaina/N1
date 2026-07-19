@@ -52,6 +52,7 @@ use crate::core::disk_manager::{
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
 use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, acquire_disk_io};
+use crate::distribution::membership::active_cluster_runtime;
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -74,6 +75,14 @@ const SMALL_BUFFERED_WRITE_LIMIT: u64 = 1024 * 1024;
 static MULTIPART_PART_LOCKS: LazyLock<
     Mutex<std::collections::HashMap<String, Weak<AsyncMutex<()>>>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn current_pool_identity() -> Result<(String, u64), AppError> {
+    let runtime = active_cluster_runtime()?;
+    let pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+        AppError::ServiceUnavailable("no writable N2 server pool is available".into())
+    })?;
+    Ok((pool.id.clone(), pool.generation))
+}
 
 struct MultipartPartGuard {
     _guard: OwnedMutexGuard<()>,
@@ -333,6 +342,8 @@ pub struct UploadSessionManifest {
     pub part_size_bytes: u64,
     pub content_type: String,
     pub created_at: i64,
+    pub pool_id: String,
+    pub pool_generation: u64,
     pub stripe_size_bytes: usize,
     pub membership_epoch: u64,
     #[serde(default)]
@@ -2026,6 +2037,7 @@ pub async fn initiate_object_upload_direct(
         part_size_bytes,
     );
     let stripe_size = choose_upload_stripe_size_for_parts(&planned_sizes);
+    let (pool_id, pool_generation) = current_pool_identity()?;
 
     let manifest = UploadSessionManifest {
         fragment: fragment.clone(),
@@ -2041,6 +2053,8 @@ pub async fn initiate_object_upload_direct(
             .clone()
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         created_at: Utc::now().timestamp(),
+        pool_id,
+        pool_generation,
         stripe_size_bytes: stripe_size,
         membership_epoch: 0,
         data_shards: configured_data_shards() as u16,
@@ -2651,6 +2665,7 @@ async fn upload_object_one_shot_inner(
         .filter(|s| !s.is_empty());
     let content_type =
         request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
+    let (pool_id, pool_generation) = current_pool_identity()?;
 
     let path_manager = ObjectPathManager::new();
     let created_at = Utc::now().timestamp();
@@ -2687,6 +2702,8 @@ async fn upload_object_one_shot_inner(
         content_type,
         total_size_bytes: content_length,
         created_at,
+        pool_id,
+        pool_generation,
         membership_epoch: 0,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
@@ -2820,6 +2837,7 @@ where
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let (pool_id, pool_generation) = current_pool_identity()?;
 
     let path_manager = ObjectPathManager::new();
     let created_at = Utc::now().timestamp();
@@ -2856,6 +2874,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
+        pool_id,
+        pool_generation,
         membership_epoch: 0,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
@@ -2920,6 +2940,7 @@ where
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let (pool_id, pool_generation) = current_pool_identity()?;
 
     let path_manager = ObjectPathManager::new();
     let created_at = Utc::now().timestamp();
@@ -2956,6 +2977,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
+        pool_id,
+        pool_generation,
         membership_epoch: 0,
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
@@ -3148,6 +3171,14 @@ pub async fn finalize_object_upload_direct(
         .as_ref()
         .map(|m| m.parity_shards)
         .unwrap_or_else(|| configured_parity_shards() as u16);
+    let (pool_id, pool_generation) = manifest
+        .as_ref()
+        .map(|manifest| (manifest.pool_id.clone(), manifest.pool_generation))
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "N2 3.0 cannot finalize an upload without its pinned server-pool identity".into(),
+            )
+        })?;
 
     let content_type = manifest
         .as_ref()
@@ -3171,6 +3202,8 @@ pub async fn finalize_object_upload_direct(
             .as_ref()
             .map(|m| m.created_at)
             .unwrap_or_else(|| Utc::now().timestamp()),
+        pool_id,
+        pool_generation,
         membership_epoch,
         data_shards,
         parity_shards,

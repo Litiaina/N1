@@ -104,17 +104,17 @@ pub struct ClusterRepairPolicy {
     pub object_repair_scope: String,
     pub fragment_repair_scope: String,
     pub byte_payload_consensus: bool,
-    pub namespace_consensus_required: bool,
+    pub strict_ncnx_replica_repair: bool,
 }
 
 pub fn repair_policy(_runtime: &ClusterRuntime) -> ClusterRepairPolicy {
     ClusterRepairPolicy {
         object_repair_scope: "object placement record and missing shard/parity holders".to_string(),
         fragment_repair_scope:
-            "namespace dentries, immutable object records, and local node storage health"
+            "flat NCNX pointers, immutable object records, and server-pool storage health"
                 .to_string(),
         byte_payload_consensus: false,
-        namespace_consensus_required: true,
+        strict_ncnx_replica_repair: true,
     }
 }
 

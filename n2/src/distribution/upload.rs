@@ -8,7 +8,7 @@ use crate::core::index;
 use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
 use crate::distribution::membership::{
-    NodeRole, active_cluster_runtime, live_blob_write_nodes, live_namespace_write_nodes,
+    active_cluster_runtime, live_active_write_nodes_for_pool, live_newest_pool_write_nodes,
 };
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
@@ -50,6 +50,8 @@ fn validate_cluster_one_shot_size(content_length: u64) -> Result<(), AppError> {
 #[derive(Debug, Serialize)]
 pub struct DistributedPartWrite {
     pub part: PartMetadata,
+    pub pool_id: String,
+    pub pool_generation: u64,
     pub membership_epoch: u64,
     pub data_shards: u16,
     pub parity_shards: u16,
@@ -149,10 +151,7 @@ fn configured_layout(
     runtime: &crate::distribution::membership::ClusterRuntime,
 ) -> Result<ClusterEcLayout, AppError> {
     resolve_configured_layout(
-        runtime
-            .membership
-            .active_write_nodes_for_role(NodeRole::Blob)
-            .len(),
+        runtime.membership.active_newest_pool_nodes().len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::BadRequest)
@@ -164,20 +163,24 @@ fn validate_write_admission(
     reachable_blob_nodes: usize,
     write_layout: ClusterEcLayout,
 ) -> Result<(), AppError> {
-    let voter_count = runtime.membership.policy.namespace_redundancy;
-    let required_voters = (voter_count / 2).saturating_add(1);
-    let reachable_voter_estimate = reachable_namespace_nodes.min(voter_count);
-    if reachable_voter_estimate < required_voters {
+    let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+        AppError::ServiceUnavailable("cluster has no writable server pool".into())
+    })?;
+    let replica_count = write_pool.policy.namespace_replicas();
+    // NCNX publication is an all-replica durability gate. Reads may survive
+    // fewer replicas, but a new mutation is never acknowledged partially.
+    let required_pool_nodes = write_pool.node_ids.len();
+    if reachable_namespace_nodes < required_pool_nodes {
         return Err(AppError::ServiceUnavailable(format!(
-            "N2 namespace quorum is unavailable: {} reachable voter(s), {} required",
-            reachable_voter_estimate, required_voters
+            "N2 NCNX placement is not uniformly writable: {} of {} pool nodes reachable ({} replicas per key)",
+            reachable_namespace_nodes, required_pool_nodes, replica_count
         )));
     }
 
     let configured = configured_layout(runtime)?;
     if write_layout != configured || reachable_blob_nodes < configured.total_shards() {
         return Err(AppError::ServiceUnavailable(format!(
-            "N2 object writes require the configured {}+{} layout on {} distinct writable blob nodes",
+            "N2 object writes require the configured {}+{} layout on {} distinct writable server-pool nodes",
             configured.data_shards,
             configured.parity_shards,
             configured.total_shards()
@@ -212,18 +215,14 @@ async fn current_write_context() -> Result<
 > {
     crate::core::operation_gate::ensure_client_mutation_allowed()?;
     let runtime = active_cluster_runtime()?;
-    let active = live_blob_write_nodes(&runtime).await;
-    let namespace = live_namespace_write_nodes(&runtime).await;
+    let active = live_newest_pool_write_nodes(&runtime).await;
     let layout = resolve_write_layout(
         active.len(),
-        runtime
-            .membership
-            .active_write_nodes_for_role(NodeRole::Blob)
-            .len(),
+        runtime.membership.active_newest_pool_nodes().len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::ServiceUnavailable)?;
-    validate_write_admission(&runtime, namespace.len(), active.len(), layout)?;
+    validate_write_admission(&runtime, active.len(), active.len(), layout)?;
     Ok((runtime, active, layout))
 }
 
@@ -430,6 +429,8 @@ pub async fn write_cluster_part_from_stream<S>(
     content_length: u64,
     data_shards: usize,
     parity_shards: usize,
+    pool_id: &str,
+    pool_generation: u64,
     membership_epoch: u64,
     block_size: usize,
     body_stream: S,
@@ -439,23 +440,31 @@ where
     S: Stream<Item = Result<Bytes, AppError>>,
 {
     let runtime = active_cluster_runtime()?;
-    if runtime.membership.epoch != membership_epoch {
+    let pool = runtime.membership.pool(pool_id).ok_or_else(|| {
+        AppError::Conflict(format!(
+            "upload is pinned to unknown server pool '{pool_id}'"
+        ))
+    })?;
+    if pool.generation != pool_generation
+        || pool.policy.object_data_shards != data_shards
+        || pool.policy.object_parity_shards != parity_shards
+    {
         return Err(AppError::Conflict(
-            "cluster membership changed during upload session; restart the multipart upload".into(),
+            "upload session pool generation or static EC contract changed".into(),
         ));
     }
-    let active = live_blob_write_nodes(&runtime).await;
-    let namespace = live_namespace_write_nodes(&runtime).await;
+    let active = live_active_write_nodes_for_pool(&runtime, pool_id).await;
     let layout = ClusterEcLayout {
         data_shards,
         parity_shards,
     };
     validate_pinned_upload_layout(layout, active.len())?;
-    validate_write_admission(&runtime, namespace.len(), active.len(), layout)?;
     let placement = build_placement_plan(
         fragment,
         object_key,
         version_id,
+        pool_id,
+        pool_generation,
         membership_epoch,
         layout,
         &active,
@@ -522,6 +531,8 @@ where
     }
     shards.sort_by_key(|shard| shard.shard_index);
     Ok(DistributedPartWrite {
+        pool_id: pool_id.to_string(),
+        pool_generation,
         membership_epoch,
         data_shards: layout.data_shards as u16,
         parity_shards: layout.parity_shards as u16,
@@ -569,6 +580,10 @@ pub async fn initiate_cluster_upload(
         ));
     }
     let (runtime, _active, layout) = current_write_context().await?;
+    let write_pool = runtime
+        .membership
+        .newest_writable_pool()
+        .expect("write context requires a writable pool");
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(params.total_size_bytes);
@@ -585,6 +600,8 @@ pub async fn initiate_cluster_upload(
             .content_type
             .unwrap_or_else(|| "application/octet-stream".into()),
         created_at: Utc::now().timestamp(),
+        pool_id: write_pool.id.clone(),
+        pool_generation: write_pool.generation,
         stripe_size_bytes: stripe_size,
         membership_epoch: runtime.membership.epoch,
         data_shards: layout.data_shards as u16,
@@ -639,6 +656,8 @@ where
         content_length,
         usize::from(state.manifest.data_shards),
         usize::from(state.manifest.parity_shards),
+        &state.manifest.pool_id,
+        state.manifest.pool_generation,
         state.manifest.membership_epoch,
         state.manifest.stripe_size_bytes,
         body_stream,
@@ -678,6 +697,10 @@ where
     }
     validate_cluster_one_shot_size(content_length)?;
     let (runtime, _active, layout) = current_write_context().await?;
+    let write_pool = runtime
+        .membership
+        .newest_writable_pool()
+        .expect("write context requires a writable pool");
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(content_length);
@@ -690,6 +713,8 @@ where
         content_length,
         layout.data_shards,
         layout.parity_shards,
+        &write_pool.id,
+        write_pool.generation,
         runtime.membership.epoch,
         stripe_size,
         body_stream,
@@ -713,6 +738,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at: Utc::now().timestamp(),
+        pool_id: part.pool_id.clone(),
+        pool_generation: part.pool_generation,
         membership_epoch: part.membership_epoch,
         data_shards: part.data_shards,
         parity_shards: part.parity_shards,
@@ -778,6 +805,8 @@ pub async fn finalize_cluster_upload(
         ),
         total_size_bytes,
         created_at: state.manifest.created_at,
+        pool_id: state.manifest.pool_id.clone(),
+        pool_generation: state.manifest.pool_generation,
         membership_epoch: state.manifest.membership_epoch,
         data_shards: state.manifest.data_shards,
         parity_shards: state.manifest.parity_shards,
@@ -807,11 +836,10 @@ impl EmptyFallback for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::layout::{ClusterLayoutMode, ClusterLayoutPolicy};
+    use crate::distribution::layout::ClusterLayoutPolicy;
     use crate::distribution::membership::{
         ClusterMembership, ClusterNode, ClusterPolicy, ClusterRuntime,
-        N2_MEMBERSHIP_FORMAT_VERSION, NamespaceCatalogLayout, NamespaceCatalogReplica, NodeRole,
-        NodeState, StorageRoot,
+        N2_MEMBERSHIP_FORMAT_VERSION, NodeState, PoolState, ServerPool, StorageRoot,
     };
     use std::path::PathBuf;
 
@@ -831,6 +859,8 @@ mod tests {
             part_size_bytes,
             content_type: "application/octet-stream".into(),
             created_at: 0,
+            pool_id: "pool-a".into(),
+            pool_generation: 1,
             stripe_size_bytes: 256 * 1024,
             membership_epoch: 0,
             data_shards: 1,
@@ -865,62 +895,51 @@ mod tests {
     fn fixed_runtime() -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "a".into(),
-            local_role: NodeRole::Blob,
+            local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: PathBuf::from("membership.json"),
             layout_policy: ClusterLayoutPolicy {
-                mode: ClusterLayoutMode::Fixed,
-                fixed_data_shards: Some(2),
-                fixed_parity_shards: Some(1),
-                ..ClusterLayoutPolicy::default()
+                data_shards: 2,
+                parity_shards: 1,
             },
             membership: ClusterMembership {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch: 7,
-                policy: ClusterPolicy {
-                    namespace_redundancy: 2,
-                    object_data_shards: 2,
-                    object_parity_shards: 1,
-                },
-                namespace_catalog: NamespaceCatalogLayout {
+                pools: vec![ServerPool {
+                    id: "pool-a".into(),
                     generation: 7,
-                    replicas: vec![
-                        NamespaceCatalogReplica {
-                            node_id: "ns-a".into(),
-                            root_id: "root-ns-a".into(),
-                        },
-                        NamespaceCatalogReplica {
-                            node_id: "ns-b".into(),
-                            root_id: "root-ns-b".into(),
-                        },
+                    policy: ClusterPolicy {
+                        object_data_shards: 2,
+                        object_parity_shards: 1,
+                    },
+                    state: PoolState::Writable,
+                    node_ids: vec![
+                        "ns-a".into(),
+                        "ns-b".into(),
+                        "a".into(),
+                        "b".into(),
+                        "c".into(),
                     ],
-                },
-                nodes: [
-                    ("ns-a", NodeRole::Namespace),
-                    ("ns-b", NodeRole::Namespace),
-                    ("a", NodeRole::Blob),
-                    ("b", NodeRole::Blob),
-                    ("c", NodeRole::Blob),
-                ]
-                .into_iter()
-                .map(|(id, role)| ClusterNode {
-                    id: id.into(),
-                    role,
-                    endpoint: format!("https://{id}:50001"),
-                    native_endpoint: Some(format!("n2://{id}:50002")),
-                    state: Some(NodeState::Online),
-                    weight: 1,
-                    storage_roots: vec![StorageRoot {
-                        id: format!("root-{id}"),
-                        path: format!("/disk-{id}"),
-                    }],
-                    joined_epoch: 1,
-                    capacity_bytes: None,
-                    used_bytes: None,
-                    last_seen_unix: None,
-                })
-                .collect(),
+                }],
+                nodes: ["ns-a", "ns-b", "a", "b", "c"]
+                    .into_iter()
+                    .map(|id| ClusterNode {
+                        id: id.into(),
+                        endpoint: format!("https://{id}:50001"),
+                        native_endpoint: Some(format!("n2://{id}:50002")),
+                        state: Some(NodeState::Online),
+                        weight: 1,
+                        storage_roots: vec![StorageRoot {
+                            id: format!("root-{id}"),
+                            path: format!("/disk-{id}"),
+                        }],
+                        joined_epoch: 1,
+                        capacity_bytes: None,
+                        used_bytes: None,
+                        last_seen_unix: None,
+                    })
+                    .collect(),
             },
             auto_rebalance: false,
         }
@@ -933,7 +952,7 @@ mod tests {
 
         assert_eq!(layout.data_shards, 2);
         assert_eq!(layout.parity_shards, 1);
-        assert!(validate_write_admission(&runtime, 2, 3, layout).is_ok());
+        assert!(validate_write_admission(&runtime, 5, 3, layout).is_ok());
     }
 
     #[test]
@@ -943,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_two_of_two_namespace_rejects_one_reachable_voter() {
+    fn strict_two_replica_ncnx_rejects_one_reachable_node() {
         let runtime = fixed_runtime();
         let layout = resolve_write_layout(3, 3, &runtime.layout_policy).unwrap();
         assert!(validate_write_admission(&runtime, 1, 3, layout).is_err());

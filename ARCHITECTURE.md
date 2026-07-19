@@ -1,1129 +1,496 @@
-# N2 2.0 Architecture Redesign
+# N2 3.0 Architecture
 
 ## Status
 
-This document defines the locked N2 2.0 architecture and the implementation
-contract now being built. Phases 1 through 6 and exact-layout autonomous
-healing are present in the 2.0 development tree; expansion, permanent-holder
-replacement, and Phase 8 operational integration remain release gates.
-Bounded evidence and the exact unclosed gates are recorded in
-`N2_2_0_VERIFICATION.md`.
+This document is the locked implementation contract for N2 3.0. N2 3.0 is a
+clean engine generation. It does not read, migrate, or maintain compatibility
+with the N2 2.0 inode namespace.
 
-N2 2.0 is a clean engine boundary. Its namespace layout, node roles, disk
-layout, mutation protocol, and failure rules are defined here without an
-in-place compatibility contract for earlier development layouts. Any future
-migration utility must be designed and verified separately; it must not add
-compatibility branches to the 2.0 storage engine.
+N2 is a high-performance distributed object storage system built for durable,
+redundant, namespace-managed, and efficient storage.
 
-The redesign has two independently expandable storage planes:
+N2 3.0 combines:
 
-```text
-N2 cluster
-├── namespace-node collection
-│   └── replicated stable directory inodes and dentries
-└── blob-node collection
-    └── immutable per-object erasure sets, shards, parity, and .ncdx
-```
+- immutable, object-level erasure sets;
+- flat physical-key namespace records;
+- incrementally added static-EC server pools;
+- deterministic bounded placement;
+- copy/delete namespace mutation;
+- autonomous object and namespace healing.
 
-The two collections are not fixed server sets. A collection is the
-current set of eligible nodes for that storage plane. After its minimum is
-met, one node or one disk can be added at a time.
+The architecture has no database, global namespace writer, directory inode,
+cluster-wide mutation log, or implicit redistribution.
 
-## Design Objective
+## Architectural Laws
 
-N2 2.0 combines a POSIX-like distributed inode namespace with N2's immutable,
-object-level erasure-coded blob design.
+1. Object data, parity, and `.ncdx` records are immutable after publication.
+2. A committed object records its exact pool, EC width, holders, roots, and
+   layout generation. Current topology never reinterprets an old object.
+3. The namespace is a flat collection of independently mutable `.ncnx`
+   records. Physical directories only partition logical key prefixes.
+4. Each pool has a static `K + M` object EC contract.
+5. A pool generation fixes its node IDs and each node's root-ID set. Expansion
+   appends a new complete pool; it never remaps an enrolled pool in place.
+6. Each live `.ncnx` record has exactly `R = M + 1` replicas on distinct nodes
+   in its immutable namespace home pool.
+7. Every node in a server pool can store namespace records, NCDX, shards,
+   parity, uploads, and fragment state. There are no namespace/blob roles.
+8. A namespace mutation operates only on NCNX records. It never opens or
+   rewrites NCDX, shards, or parity.
+9. Different keys mutate independently. The same logical key is the only
+   unavoidable namespace conflict boundary.
+10. Rename and move use destination-first live copy/delete. Trash and recover
+   use destination-first live/trash copy/delete. Folder operations are per-key,
+   resumable, and deliberately non-atomic across the full prefix.
+11. LIST derives keys and prefixes from filenames and directories. It does not
+    decode NCNX or open NCDX.
+12. Adding a pool adds capacity for future objects. Existing objects are not
+    redistributed unless an operator explicitly requests re-encoding.
+13. When a pool cannot satisfy its exact object EC or NCNX durability, unsafe
+    writes fail closed. Readable committed objects remain readable.
 
-The namespace plane owns names and hierarchy. The blob plane owns bytes and
-immutable placement truth. Namespace operations never rewrite object bytes,
-and blob topology changes never redefine namespace identity.
+## Cluster And Server Pools
 
-```text
-mutable namespace
-  path, directory identity, rename, move, trash, restore
-
-immutable object plane
-  object identity, versions, EC shape, holders, shards, parity, checksums
-```
-
-The scale rule is fixed-width work over expandable collections:
-
-```text
-namespace operation width = recorded inode redundancy R
-object operation width    = recorded object EC width k + m
-
-namespace collection size may grow beyond R
-blob collection size may grow beyond k + m
-```
-
-Adding nodes increases aggregate capacity, placement choices, repair targets,
-and concurrency. It does not increase the number of participants contacted by
-one existing inode or object operation.
-
-## Terminology
-
-### Fragment
-
-A fragment is a logical access and namespace boundary. It behaves like a
-bucket or virtual storage space, not like a physical server pool.
-
-Each fragment has:
-
-- a stable fragment ID;
-- a mutable human alias;
-- one stable root directory inode;
-- one reserved trash directory inode;
-- authentication and policy state;
-- namespace entries that may point to objects on any eligible blob nodes.
-
-A fragment is never full merely because one physical node or historical
-placement is full. New object placements use capacity available in the blob
-node collection.
-
-### Namespace node
-
-A namespace node stores replicas of directory inodes and their dentries. It
-does not need to store object shards. Namespace nodes form one incrementally
-expandable collection.
-
-### Blob node
-
-A blob node stores immutable shards, parity, and byte-identical `.ncdx`
-records for the objects whose layouts selected it. Blob nodes form a separate,
-incrementally expandable collection.
-
-### Directory inode
-
-A directory inode is the stable identity of one directory. Its name exists
-only as a dentry in its parent. Renaming or moving the directory therefore does
-not change its identity or descendants.
-
-### Dentry
-
-A dentry maps one name inside a parent directory inode to one target:
-
-```text
-(parent inode ID, name)
-  -> child directory inode reference
-  or
-  -> immutable object reference
-  or
-  -> symbolic-link reference
-```
-
-### Object layout
-
-An object layout is the immutable physical truth for one object identity and
-version: its EC shape, exact node and disk holders, part and stripe metadata,
-checksums, and shard roles.
-
-## Absolute Minimum And Production Topologies
-
-### Absolute minimum: 2N + 2B
-
-The lowest supported logical topology is:
-
-```text
-namespace nodes:       2
-namespace redundancy:  2
-
-blob nodes:             2
-object EC:              1 data + 1 parity
-```
+An N2 cluster is an ordered collection of server pools:
 
 ```text
 N2 cluster
-├── namespace collection
-│   ├── N1
-│   └── N2
-└── blob collection
-    ├── B1
-    └── B2
+├── pool A, generation 1, EC 4 + 2
+│   ├── A1
+│   ├── A2
+│   ├── A3
+│   ├── A4
+│   ├── A5
+│   └── A6
+├── pool B, generation 2, EC 4 + 2
+│   ├── B1
+│   ├── B2
+│   ├── B3
+│   ├── B4
+│   ├── B5
+│   └── B6
+└── fragments
+    ├── videos
+    └── documents
 ```
 
-Namespace redundancy two is strict synchronous mirroring:
+A fragment is a bucket-like authentication, lifecycle, listing, and policy
+boundary. It is not a server pool. A fragment may contain objects in every
+pool. Adding pool B extends the cluster without migrating pool A.
 
-- every mutation targets both replicas;
-- a mutation commits only after both replicas durably accept the same result;
-- loss, disagreement, or isolation of either replica stops namespace writes;
-- one surviving replica may serve only a generation carrying valid 2-of-2
-  commit evidence;
-- automatic membership replacement is forbidden until the missing identity is
-  restored or conclusively fenced.
+Each pool records:
 
-Object EC `1 + 1` tolerates the loss of either stored shard for existing reads.
-It must not accept new durable object writes when two distinct writable blob
-nodes are unavailable.
+- stable pool ID;
+- monotonically increasing pool generation;
+- static data width `K`;
+- static parity width `M`;
+- ordered node membership and stable node identities;
+- writable or sealed state.
 
-With physically dedicated roles, the absolute minimum is four physical nodes.
-For architectural testing, two namespace processes may share one physical
-machine and two blob processes may share another. That proves protocol and
-restart behavior, not four independent physical failure domains.
+The newest writable pool that can satisfy its static EC accepts new object
+versions. A sealed or full pool remains readable and healable. An object lookup
+uses its recorded pool layout, never a guess based on the newest membership.
 
-### Recommended production minimum
+## Unified Nodes And Disks
 
-The recommended production starting point is:
+Every N2 3.0 node is bidirectional and unified. Any healthy node may receive a
+client operation and coordinate it. Every pool node may also persist the data
+assigned to it:
 
 ```text
-namespace nodes:       3
-namespace redundancy:  3
-
-blob nodes:             at least k + m
-recommended baseline:  3 nodes for object EC 2 + 1
+node A1
+├── disk A1D1
+│   ├── NCNX replicas selected for A1
+│   ├── NCDX replicas selected for A1
+│   └── data/parity shards selected for A1
+├── disk A1D2
+└── N2 coordinator, JWT verifier, peer client, healer
 ```
 
-With three namespace replicas, a 2-of-3 quorum can continue safe mutations
-after one namespace node fails and can autonomously rebuild the missing
-replica after fencing it. Production replicas and EC shards should be placed
-across distinct host, rack, power, and network failure domains when those
-labels are available.
+Node selection always precedes disk selection. Two disks in one host never
+count as two NCNX replicas or two shards of one EC stripe. A node may have one
+or many roots; deterministic root selection distributes independent records
+while preserving a single host failure domain.
 
-## Static Width, Incremental Expansion
+Bidirectionality does not weaken durability. A coordinator without enough
+reachable holders rejects the operation or routes it; it never invents local
+authority.
 
-Namespace redundancy and object EC width are independent static policies:
+## Disk Layout
 
-```text
-namespace_redundancy = R
-object_ec             = k + m
-```
-
-The collection sizes are independent of those widths:
+Each enrolled storage root uses the same N2 3.0 format:
 
 ```text
-namespace_node_count >= R
-blob_node_count      >= k + m
-```
-
-Expansion is always incremental:
-
-```text
-namespace: N1,N2       -> add N3 -> add N4 -> add N5
-blob:      B1,B2,B3    -> add B4 -> add B5 -> add B6
-```
-
-Adding a node does not silently change `R` or `k + m`. Existing inode and
-object layouts remain valid. New directory inodes and new objects may use the
-new node immediately.
-
-Namespace redundancy is an immutable cluster contract. Once any N2 root is
-enrolled, changing `namespace_redundancy` is rejected. Object EC policy remains
-an independent object-level contract: old object layouts remain valid under
-their recorded widths unless an operator explicitly requests re-encoding.
-
-## Node Roles
-
-N2 2.0 separates namespace and blob roles for predictable IO and failure
-behavior:
-
-```text
-namespace node
-  -> namespace roots only
-
-blob node
-  -> blob roots and upload staging only
-```
-
-A production node process belongs to one collection. A laboratory may run
-multiple isolated logical nodes on one physical host, but every logical node
-must have its own node ID, process, ports, roots, logs, and runtime state.
-
-All client-facing N2 nodes use the same cluster authentication and NOA
-contract. Namespace and blob roles are internal storage responsibilities, not
-separate user authentication domains.
-
-## Bidirectional Coordination
-
-N2 2.0 remains bidirectional. Storage role controls local persistence; it does
-not restrict operation coordination.
-
-Every healthy namespace node and every healthy blob node runs the common N2
-authentication, routing, peer-client, and operation-coordinator capabilities.
-Any one of them may receive a client request:
-
-```text
-upload received by namespace node
-  -> resolve destination inode
-  -> select and stream to blob holders
-  -> publish namespace reference
-
-rename received by blob node
-  -> resolve recorded inode groups
-  -> coordinate bounded namespace mutation
-
-download received by namespace or blob node
-  -> resolve namespace object reference
-  -> read exact recorded blob holders
-  -> stream result to client
-```
-
-The receiving node is coordinator only for that operation. It is never a
-permanent cluster leader, namespace owner, object owner, or placement source of
-truth. Authority remains with the recorded inode replica groups and immutable
-object layouts.
-
-A deployment may expose only selected nodes through a load balancer or public
-network, but that is an operational boundary rather than an engine-role
-restriction. Internally, any reachable healthy N2 node can coordinate.
-
-Multipart sessions may remain temporarily owned by the node that initiated
-them. The session records that coordinator identity so the client or another
-N2 endpoint can route resume, finalize, or cancel correctly. A finalized object
-has no permanent coordinator dependency.
-
-Bidirectionality does not permit unsafe fallback. A coordinator that cannot
-reach the required namespace quorum or object durability set rejects or routes
-the request; it never invents authority from its local storage role.
-
-## Failure-Domain Placement
-
-Placement always chooses distinct nodes before choosing disks:
-
-```text
-directory inode replica placement
-  -> choose R distinct namespace nodes
-  -> choose one namespace root on each selected node
-
-object stripe placement
-  -> choose k + m distinct blob nodes
-  -> choose one blob root on each selected node
-```
-
-Two disks in one node never count as two namespace replicas or two shards of
-one EC stripe. Adding a disk increases capacity and local parallelism; adding a
-node adds another distributed failure domain.
-
-Node IDs and storage-root IDs are stable placement identities. Mount paths are
-operational configuration and are not durability truth.
-
-## Namespace Disk Layout
-
-A namespace node may contain many namespace disks. Different directory inodes
-are distributed across those disks, but one replica of one inode lives on one
-root at a time.
-
-```text
-N1
-├── N1DISK001
-├── N1DISK002
-├── ...
-└── N1DISK100
-
-N2
-├── N2DISK001
-├── ...
-└── N2DISK100
-```
-
-Example directory placements with redundancy three:
-
-```text
-@i_root
-├── N1 / N1DISK002
-├── N2 / N2DISK019
-└── N3 / N3DISK071
-
-@i_video
-├── N1 / N1DISK017
-├── N2 / N2DISK063
-└── N3 / N3DISK042
-
-@i_images
-├── N1 / N1DISK081
-├── N2 / N2DISK004
-└── N3 / N3DISK095
-```
-
-The target namespace-root format is:
-
-```text
-<namespace_root>/
+<storage_root>/
   .n2-root.ncdx
   .fragment/
     <fragment-alias-hash> -> ../@f_<stable-fragment-id>
 
   @f_<stable-fragment-id>/
-    .namespace/
-      @i_<directory-id>/
-        .inode
-        <encoded-entry-name>.nref
-```
-
-`.n2-root.ncdx` records the stable root identity and role. `.inode` stores the
-directory's stable identity, fragment identity, parent identity, replica
-layout generation, and committed namespace state. Each `.nref` is a dentry
-record. The representation may use filesystem-safe encoded names while always
-preserving the original logical name inside the record.
-
-All dentries belonging directly to one directory inode are colocated with that
-inode replica. The operating-system filesystem provides local directory
-indexing and atomic local rename primitives. N2 provides cross-node agreement.
-
-## Blob Disk Layout
-
-Blob roots preserve N2's immutable object layout:
-
-```text
-<blob_root>/
-  .n2-root.ncdx
-  .fragment/
-    <fragment-alias-hash> -> ../@f_<stable-fragment-id>
-
-  @f_<stable-fragment-id>/
-    .uploads/
     .fragment.ncdx
+    .namespace/
+      videos/
+        video.mp4.ncnx
+    .trash/
+      videos/
+        video.mp4.ncnx.trashed.<unix-nanos>.<mutation-ulid>
+    .uploads/
     .objects/
       ab/
         cd/
           ef/
             12/
               @o_<object-id>/
-                <version-ulid>.l<layout-generation>.<size>.<unix-nanos>.<packed-ext>.ncdx
-                <version-ulid>/
+                <version>.l<layout-generation>.<size>.<unix-nanos>.<ext>.ncdx
+                <version>/
                   part_0_shard_0.shard
                   part_0_shard_1.shard
                   part_0_shard_2.parity
 ```
 
-Object fanout is derived from immutable object identity. Every shard-bearing
-holder stores its shard or parity plus the same named-MessagePack `.ncdx`
-record for that committed version.
+The `.namespace/videos` directory is only the physical prefix representation
+for keys beginning with `videos/`. It is not an inode, mutable directory
+record, lock owner, durability group, or transaction participant.
 
-The `l<layout-generation>` filename component permits holder replacement to
-publish a new immutable placement record without changing the logical content
-version or editing an earlier `.ncdx` in place.
+Reserved internal components begin with `.n2-` or match N2's physical control
+directories. User keys cannot address them.
 
-## Fragment Catalog And Root Inodes
+## NCNX
 
-The cluster fragment catalog is small namespace state replicated with the
-configured namespace redundancy. It maps a fragment alias and stable fragment
-ID to a root inode reference:
+NCNX means Node Cluster Namespace Index. One live NCNX maps one normalized
+logical key to one stable object identity.
 
-```text
-fragment: videos
-stable_fragment_id: @f_01...
-root:
-  inode_id: @i_root
-  layout_generation: 7
-  replicas:
-    - N1 / N1DISK002
-    - N2 / N2DISK019
-    - N3 / N3DISK071
-```
-
-The catalog is not an object database. Ordinary path traversal leaves the
-catalog after resolving the fragment root and follows inode pointers from
-parent to child.
-
-Fragment rename changes the alias mapping only. It does not change the stable
-fragment ID, directory inodes, object IDs, `.ncdx`, or shards.
-
-## Distributed Inode Model
-
-### Stable directory identity
-
-The logical tree is:
+The key is represented by the NCNX path:
 
 ```text
-fragment root @i_root
-├── "video"  -> @i_video
-└── "images" -> @i_images
-
-@i_video
-└── "video.mp4" -> @o_video_mp4
+.namespace/videos/video.mp4.ncnx
+                         -> object @o_01...
 ```
 
-The directory name belongs to its parent dentry. `@i_video` remains unchanged
-when `video` is renamed, moved, trashed, or restored.
-
-Every directory reference contains:
-
-- target kind;
-- stable directory inode ID;
-- inode layout generation;
-- exact namespace node and root holders;
-- target metadata needed for validation.
-
-Exact recorded holders eliminate current-membership guessing. Adding a
-namespace node cannot silently remap an existing inode.
-
-### Object references
-
-A file dentry points to stable object identity and an immutable layout
-reference:
+NCNX contains only the truth required to validate and resolve the pointer:
 
 ```text
-type: object
-object_id: @o_92af
-version: 01K...
-layout_generation: 4
-ec: 2 + 1
-holders:
-  - B1 / B1DISK005 / data-0
-  - B2 / B2DISK041 / data-1
-  - B3 / B3DISK012 / parity
+format_version
+stable_fragment_id
+object_id
+mutation_id
+created_at_unix_nanos
+payload_crc32
 ```
 
-The dentry contains enough locator information to contact the bounded object
-holder set. The byte-identical `.ncdx` records on those holders remain the
-authoritative immutable body and must agree with the namespace locator before
-bytes are served.
+It does not duplicate object size, content type, checksums, shard holders, or
+version history. Those remain in immutable NCDX. HEAD or GET resolves NCNX and
+then reads NCDX. LIST does not.
 
-N2 2.0 does not expose public hard links. One live or trash dentry owns one
-physical object identity. Symbolic links remain namespace references. This
-keeps object reclamation independent of global reference counting.
+NCNX is named MessagePack, integrity checked, immutable after publication, and
+small enough that namespace mutation performs bounded metadata IO only.
 
-### Parent identity
+### NCNX placement
 
-Every directory inode records its current parent inode ID. Directory movement
-updates the source parent, destination parent, and moved inode parent record in
-one bounded mutation. This provides a stable guard against concurrent cycles
-without rewriting descendants.
-
-The fragment root has no parent. The reserved trash inode is rooted directly
-by the fragment.
-
-## Namespace Placement And Expansion
-
-At directory creation, N2:
-
-1. creates a stable directory inode ID;
-2. selects `R` distinct healthy namespace nodes;
-3. selects one writable namespace root on each node;
-4. writes the identical empty inode replica to all selected roots;
-5. verifies the required durable commit;
-6. publishes the child pointer in the parent inode.
-
-With exactly `R` namespace nodes, every inode uses all of them. With more than
-`R`, different directory inodes use different combinations:
+For a pool with EC `K + M`:
 
 ```text
-R = 3
-
-@i_music   -> N1,N2,N4
-@i_users   -> N1,N3,N4
-@i_reports -> N2,N3,N4
+NCNX replica count R = M + 1
 ```
 
-Adding a node does not relocate healthy existing inodes. The new node is used
-for new directory placements and as a repair target. Explicit whole-inode
-movement may later redistribute a hot or capacity-constrained replica, but it
-must never rewrite descendants or object data.
-
-Adding a namespace disk makes it eligible for new inode replicas on that node.
-It does not create another replica failure domain.
-
-## Namespace Consistency
-
-Namespace is the only mutable user-visible storage plane. It uses bounded,
-per-inode agreement and never a global cluster writer.
-
-For inode redundancy `R`, the default write quorum is:
+For `4 + 2`, every key has three NCNX replicas. For `1 + 1`, every key has two.
+The replica set is selected by deterministic rendezvous scoring over:
 
 ```text
-Qwrite = floor(R / 2) + 1
+(cluster ID, pool ID, pool generation, fragment ID, logical key, node ID)
 ```
 
-For `R = 2`, `Qwrite = 2`. For `R = 3`, `Qwrite = 2`. Reads use a quorum that
-intersects every write quorum and select the highest valid committed
-generation.
+One deterministic selected holder is canonical for listing. The remaining
+holders are durability replicas and read/healing fallbacks. Root selection is
+deterministic inside each selected node.
 
-Every mutation carries:
+All `R` NCNX replicas must be durably published before the namespace mutation
+reports success. N2 does not acknowledge a partially durable key.
 
-- stable mutation ID;
-- affected inode IDs;
-- expected inode/dentry generations;
-- normalized operation and operands;
-- target generation;
-- replica-layout generations.
+## Static Object Placement
 
-Every replica validates the same preconditions. A generation becomes visible
-only with durable quorum commit evidence. Prepared but uncertified mutations
-are not namespace truth. Repeating a mutation ID is idempotent.
-
-This is optimistic, bounded coordination:
-
-- no global namespace mutex;
-- no global writer;
-- no cluster-wide transaction log;
-- unrelated inode groups mutate concurrently;
-- conflicting mutations on the same inode generation cannot both commit.
-
-### Single-directory operations
-
-Create, unlink, same-parent rename, and dentry replacement touch one directory
-inode replica group. Local replicas use atomic filesystem operations; the
-replica group supplies distributed durability and generation agreement.
-
-### Cross-directory moves
-
-A cross-directory move touches only:
-
-- the source parent inode group;
-- the destination parent inode group;
-- the moved directory inode group when the target is a directory.
-
-Participant groups are prepared in canonical inode-ID order. One mutation ID
-and one durable decision bind the groups. Commit and replay are idempotent.
-There is no descendant scan and no cluster-wide transaction.
-
-### Cycle prevention
-
-Before a directory move, N2 validates the destination parent chain. The moved
-directory's parent record and destination directory generation participate in
-the same conditional mutation. Concurrent inverse or multi-directory cycle
-attempts therefore overlap on guarded inode generations; at most one can
-commit.
-
-### Listing and lookup
-
-Path lookup begins at the fragment root, reads each directory reference, and
-contacts only that inode's recorded replicas. Depth is user-controlled; a
-shallow namespace approaches flat-key lookup cost.
-
-Directory listing reads a quorum-consistent committed view of one inode and is
-paginated. Listing `K` entries is necessarily `O(K)` in returned work. N2 does
-not broadcast a lookup or list to the entire namespace collection.
-
-## POSIX-Like Namespace Semantics
-
-N2 2.0 provides namespace semantics for:
-
-- directory creation;
-- object creation and replacement;
-- stable directory identity;
-- same-directory rename;
-- cross-directory move;
-- directory rename and move without descendant rewriting;
-- symbolic links;
-- soft delete and recovery;
-- paginated listing and stat;
-- atomic collision rejection and conditional mutation.
-
-Rename and move are constant with respect to descendant count. They are
-bounded by the replica groups of the directly affected inodes.
-
-Cross-fragment movement is copy/delete rather than one atomic rename. Public
-hard links are excluded from the 2.0 contract so lifecycle never requires a
-cluster-wide object reference count.
-
-## Upload And Publication
-
-An upload is published in durability order:
+Object upload selects exactly `K + M` distinct nodes from one writable pool.
+Each selected node contributes one root and one shard role. NCDX records the
+exact result:
 
 ```text
-authenticate fragment
--> resolve destination parent inode
--> choose k + m distinct blob nodes
--> choose one blob root per node
--> stream and encode object parts
--> durably publish shards/parity
--> durably publish identical immutable .ncdx records
--> commit the object reference in the parent inode group
--> acknowledge success
+object ID
+content version
+pool ID and pool generation
+EC K + M
+membership/layout generation
+node ID, root ID, shard index, shard role
+part sizes and checksums
 ```
 
-Namespace never points to incomplete blob data. A crash before namespace
-publication may leave an unreachable upload or immutable object candidate;
-session cleanup reclaims it after its safety window.
+NCDX is byte-identical on its selected holders. Reads and repairs follow this
+recorded layout. Adding disks, nodes, or pools cannot remap an existing object.
 
-Multipart coordinator state is temporary operational state, not namespace or
-object truth. Finalized objects no longer depend on their upload coordinator.
+## Key Semantics
 
-## Read Path
+N2 3.0 is a flat object-key namespace with prefix presentation:
 
 ```text
-client read
--> authenticate fragment
--> resolve root inode from fragment catalog
--> traverse recorded directory inode replicas
--> resolve object reference and exact holder layout
--> validate matching immutable .ncdx
--> read required data shards concurrently
--> reconstruct from parity when required
--> schedule recover-on-read after serving reconstructable bytes
+videos/a.mp4
+videos/b.mp4
+images/c.jpg
 ```
 
-A healthy read fetches the required data shards first. Parity is fetched only
-for validation, degraded reconstruction, or configured scrub work. One object
-never broadcasts reads to the complete blob-node collection.
+`videos/` is derived from the keys. Independent keys do not update shared
+directory state and therefore do not collide. Empty directories are not
+first-class storage objects. A directory shown by NOA or POSIX-like clients is
+a common prefix.
 
-## Object-Level Erasure Sets
+Exact key lookup contacts the deterministic NCNX replica set for each
+candidate pool. Once found, its physical home pool and `object_id` locate
+immutable object metadata. Pools are checked in newest-to-oldest order; a key
+may have only one live NCNX identity cluster-wide. The NCNX home pool remains
+stable across later content versions; exact version placement remains NCDX
+truth and may use a newer pool.
 
-Every object independently selects `k + m` distinct blob nodes from the
-current eligible collection. Another object may select a different set.
+## Zero-Decode Listing
+
+LIST scans physical `.namespace` paths, not NCNX bodies. A node returns only
+keys for which it is the deterministic canonical NCNX holder. Replica copies
+are skipped mathematically without opening them.
 
 ```text
-blob nodes: B1,B2,B3,B4,B5
-object EC:  2 + 1
-
-object A -> B1,B2,B4
-object B -> B2,B3,B5
-object C -> B1,B4,B5
+coordinator
+  -> request pages from all relevant pool nodes in parallel
+  -> each node walks the requested physical prefix
+  -> node emits only its canonical filenames/common prefixes
+  -> coordinator performs a bounded ordered merge
+  -> opaque cursor stores each source continuation
 ```
 
-Every object records its resolved layout. The current blob-node membership is
-never used to guess an old object's holders.
+Properties:
 
-Adding B6 means:
+- no NCNX decode;
+- no NCDX open;
+- no shard/parity IO;
+- no replica deduplication table;
+- no full-cluster in-memory listing;
+- bounded work proportional to the requested page and traversed prefix.
 
-- existing object layouts remain valid;
-- no healthy object becomes degraded;
-- no automatic redistribution or re-encoding starts;
-- new objects may select B6;
-- repair may use B6 when publishing a safe replacement layout.
+LIST returns key, name, prefix/type, and lifecycle state. Object size, content
+type, checksum, and current version require HEAD because they belong to NCDX.
 
-An older recorded EC shape is not degradation. Health and topology age are
-separate facts.
+## Namespace Mutation
 
-## Immutable `.ncdx` Contract
+Namespace publication is per key and destination first. Every peer operation
+contains a stable mutation ULID and expected record identity so retry is
+idempotent and stale same-key operations fail rather than delete newer state.
 
-Each committed `.ncdx` stores:
+### Upload commit
 
-- stable object and fragment identities;
-- immutable object version;
-- object owner and content attributes;
-- logical size and creation time;
-- data and parity counts;
-- stripe and part metadata;
-- exact node and root holders;
-- shard roles, lengths, and checksums;
-- immutable layout generation identity.
+```text
+publish K + M shards/parity
+-> publish immutable NCDX
+-> create and fsync all R live NCNX replicas
+-> fsync their parent directories
+-> acknowledge
+```
 
-It never stores a mutable user path. Folder and file rename never rewrite
-`.ncdx`.
+If NCNX publication cannot complete, the immutable object is not live. N2
+reports that headless immutable data and preserves it; automatic GC never
+guesses that missing namespace authority makes an object disposable.
 
-When a permanently lost holder must be replaced, N2 publishes a new immutable
-layout generation after the replacement shard and matching metadata are
-durable. The prior `.ncdx` generation is never edited in place and is retained
-until the namespace/object commit makes the replacement authoritative and
-restart-safe.
+### Copy/move one key
+
+```text
+read and validate source NCNX
+-> create a destination NCNX generation stamped with the mutation ULID
+-> create and fsync all destination NCNX replicas
+-> remove the exact expected live source replicas
+-> fsync source parents
+-> acknowledge
+```
+
+The destination becomes live before the source is removed. A crash may leave
+both live names, which is safe and retryable. It must never leave neither name.
+
+### Delete one key
+
+```text
+read and validate live NCNX
+-> copy to all deterministic trash holders
+-> trash filename records deletion time and mutation ULID
+-> fsync trash records and parents
+-> remove only the exact expected live records
+-> fsync live parents
+```
+
+### Recover
+
+```text
+read and validate trash NCNX
+-> reject a conflicting live destination
+-> publish all R live NCNX replicas
+-> remove only the recovered trash mutation records
+```
+
+### Prefix/folder operations
+
+Folder rename, move, delete, and recover enumerate matching keys and execute
+the one-key protocol independently with bounded parallelism. They are:
+
+- resumable;
+- idempotent per key;
+- independent of descendant count for each record;
+- non-atomic across the whole prefix;
+- free of global and physical-directory locks;
+- free of object data IO.
+
+Progress reports count completed, conflicted, and failed keys. Repeating the
+same operation completes remaining keys.
+
+## Lifecycle And Garbage Collection
+
+Trash records use zero-decode expiry names:
+
+```text
+<logical-name>.ncnx.trashed.<unix-nanos>.<mutation-ulid>
+```
+
+GC scans `.trash` only for normal lifecycle work. It reads expiry from the
+filename and builds a temporary live object-ID set from canonical live NCNX
+records.
+
+For each expired trash record:
+
+1. if any live NCNX points to the same object, remove only that expired trash
+   record;
+2. if no live NCNX points to it, reclaim the exact recorded immutable object;
+3. remove the trash NCNX last.
+
+The invariant is **live wins over trash**. Copy/move can leave several live
+keys for one object without risking reclamation. Repeated deletes can leave
+several trash mutations without name collision.
+
+Autonomous healing may inventory immutable objects to report headless data, but
+it preserves those objects because absence of a namespace reference does not
+prove whether the cause was failed publication or catastrophic namespace loss.
+Normal TTL GC never scans all objects and never guesses that a headless object
+is disposable.
+
+GC keeps no persistent reference database, `.entries`, `.records`, or global
+transaction state.
 
 ## Autonomous Healing
 
-Namespace and blob maintenance remain independent.
+Healing is deterministic and object scoped.
 
-### Namespace healing
+### NCNX healing
 
-For each recorded inode layout, healing:
+The deterministic owner for a fragment scans its canonical live and trash
+NCNX records. For each record it:
 
-1. contacts only the recorded replica group;
-2. selects an identical quorum snapshot or the unique highest generation with
-   a valid recorded commit certificate;
-3. rejects divergent uncertified state;
-4. restores the complete inode header and committed dentry set to its exact
-   recorded node/root;
-5. verifies the rebuilt replica;
-6. never changes replica width or redistributes a healthy inode.
+1. derives the exact `R = M + 1` holders;
+2. reads replica observations in parallel;
+3. selects an integrity-valid identical record;
+4. recreates missing or corrupt replicas on their exact roots;
+5. emits one disposable JSON report when degradation or repair occurred.
 
-With redundancy two, one surviving complete snapshot can restore its missing
-recorded peer only when its last generation carries the original two-voter
-commit certificate. It cannot silently choose a different logical holder. A
-permanently replaced holder must first be fenced and re-admitted under the
-recorded logical identity. If authority or the target topology cannot be
-proved, the cluster fails closed in durable read-only mode.
+Reports are not replicated and are not storage truth.
 
 ### Object healing
 
-Object healing reads the immutable recorded layout, verifies holder
-availability and checksums, reconstructs only missing or corrupt shards, and
-restores missing collocated `.ncdx` metadata replicas. It never re-encodes
-healthy objects merely because nodes were added.
+For each canonical live NCNX, the healer resolves NCDX and verifies its exact
+holders, checksums, shards, and parity. Recoverable loss is reconstructed only
+to the recorded layout. Redistribution is a separate explicit re-encode.
 
-Every degraded directory inode or object produces one node-local immutable
-JSON report containing the initial condition and repair outcome. A published
-object without a live or trash namespace reference is reported as headless and
-preserved. A namespace pointer whose target no longer exists is reported as
-dangling and preserved. Reports are disposable operational evidence and are
-never replicated.
+### Safety state
 
-An unrepairable inode or object, dangling namespace pointer, divergent
-immutable record, or impossible recorded topology activates the durable
-cluster safety latch. User mutations, GC, and redistribution stop;
-reconstructable reads and healing remain allowed. A physical object without a
-namespace reference is reported and preserved, but it does not by itself trip
-the latch because durable blob publication intentionally precedes namespace
-publication and a failed finalize can leave safe orphan residue. If namespace
-traversal or blob inventory is incomplete, no headless conclusion is made.
+A pool rejects new writes when:
 
-Recover-on-read serves reconstructable bytes first and schedules bounded
-repair in the background.
+- fewer than `K + M` distinct writable pool nodes are available;
+- fewer than `M + 1` NCNX holders can be durably written;
+- membership/layout identities disagree;
+- healing proves that safe publication or repair is impossible.
 
-### Maintenance concurrency
+Reads continue for objects whose recorded layouts remain decodable. A
+catastrophic object emits a precise report containing fragment, logical key,
+object ID, pool, expected holders, observed loss, and repair result.
 
-Maintenance is bounded by plane, node, disk, fragment, inode, and object. It
-must not create a cluster-wide scan storm. Independent inodes and objects may
-be checked and repaired concurrently while foreground IO continues.
+Work is partitioned by fragment, pool, and canonical key ownership so multiple
+nodes heal concurrently without scanning or repairing the same record.
 
-## Trash, TTL, And Reclamation
+## Fragment Operations
 
-Every fragment has one reserved trash inode. Delete is a namespace pointer
-move:
+A fragment is a deliberate cluster-wide control boundary. Create, alias
+rename, key rotation, policy change, and delete may contact all pools/nodes.
+These operations are expected to be infrequent and may be `O(pools + nodes)`.
+
+Renaming a fragment changes only its alias links/catalog. Stable fragment IDs,
+NCNX relative paths, NCDX, object IDs, and shards do not move.
+
+## Expansion And Rebalancing
+
+Pool expansion is append-only:
 
 ```text
-live parent/name -> target
-                becomes
-trash/<stable-trash-name> -> target
+pool A remains exact and readable
+-> add complete pool B with its own static K + M
+-> increment membership generation
+-> direct new writes to B
 ```
 
-Directory deletion moves only the directory pointer. Descendants remain
-attached to the stable directory inode. Restore moves the pointer back after
-validating the original parent and collision state.
+N2 does not force redistribution when capacity is added. Explicit rebalance is
+object re-encoding into a new immutable layout. It is optional, restartable,
+and never required merely to make a new pool usable.
 
-TTL is recorded on the trash entry. GC scans only trash entries for normal
-lifecycle reclamation:
+The node/root set of an enrolled pool generation is immutable because NCNX
+root placement depends on it. Add disks as roots of nodes in a new complete
+pool generation; never append or remove roots inside an existing generation.
 
-1. ignore entries whose TTL has not expired;
-2. for an expired object entry, reclaim its exact immutable object layout;
-3. for an expired directory entry, traverse that inode subtree;
-4. reclaim object shards and `.ncdx` from their recorded holders;
-5. remove child dentries and directory inodes bottom-up;
-6. remove the trash anchor last.
+## Authentication
 
-The trash anchor is the restart-proof source of truth. GC never destroys the
-anchor before all reachable work is complete.
+JWT authentication remains cluster-wide and stateless. Every node verifies the
+same signed fragment claims locally. Server pools do not introduce separate
+authentication databases or user-visible endpoints.
 
-If a child was trashed before its former parent, it is already a separate
-trash anchor and is not part of the later parent subtree. Each anchor keeps its
-own TTL and is reclaimed independently.
+## Performance Contract
 
-Upload-session cleanup and low-frequency orphan scrub are separate maintenance
-jobs. Normal TTL GC must not scan every blob root looking for headless objects.
+Every N2 3.0 release proof records:
 
-## Expansion, Replacement, And Removal
+- operation latency distributions in microseconds/milliseconds;
+- CPU utilization and cycles when host permissions support hardware counters;
+- context switches and peak memory;
+- bytes read and written;
+- observed process IO and the exact designed participant/phase count per
+  operation. Syscall-level counts require an explicitly instrumented run.
 
-### Adding a namespace node
-
-1. assign a stable namespace-node ID;
-2. register its namespace roots and failure-domain labels;
-3. verify health and writable reserve;
-4. admit it to the eligible namespace collection;
-5. use it for new inode layouts and repairs.
-
-Existing inodes do not move automatically.
-
-### Adding a blob node
-
-1. assign a stable blob-node ID;
-2. register its blob roots and failure-domain labels;
-3. verify health and writable reserve;
-4. admit it to the eligible blob collection;
-5. use it for new object layouts and repairs.
-
-Existing objects do not move automatically.
-
-### Adding a disk
-
-A disk receives a stable root identity and inherits its node's role. It is
-eligible for new placements on that node. Adding a disk does not change inode
-redundancy, object EC, or failure tolerance.
-
-### Removing a node or disk
-
-Removal is never equivalent to deleting it from configuration. N2 must first
-enumerate every recorded inode replica or object shard that depends on the
-identity, create verified replacements, publish authoritative layout
-generations, and then fence the old identity. Unsafe removal is rejected.
-
-## Read-Only And Failure Semantics
-
-Ordinary quorum or holder loss fails closed at the smallest affected scope:
-
-- an inode group without a safe write quorum rejects mutations involving that
-  inode;
-- a fragment root without safe namespace truth makes that fragment read-only
-  or unavailable;
-- insufficient distinct blob nodes for `k + m` rejects new object writes;
-- a reconstructable degraded object remains readable;
-- an unreconstructable object is reported explicitly and never fabricated;
-- unrelated healthy fragments, inode groups, and objects continue operating.
-
-Auto-healing escalates a confirmed catastrophic invariant to the durable
-cluster safety latch. Examples are an inode whose authority cannot be proved,
-a namespace pointer with no surviving target, a headless published object, an
-unrecoverable object, or an impossible recorded layout. This stronger response
-prevents further user mutations and reclamation from enlarging damage while
-reads and exact-layout healing remain available.
-
-Node addition never marks anything degraded. Degradation is determined only
-from the recorded layout of the inode or object being evaluated.
-
-## Concurrency Model
-
-N2 is fully concurrent across independent work, not broadcast-oriented:
+Required namespace properties:
 
 ```text
-one namespace operation -> one to three bounded inode replica groups
-one object operation    -> one bounded k + m object set
-many operations         -> distributed across all eligible nodes and disks
+GET key       = bounded NCNX replica reads + bounded NCDX holder read
+PUT publish   = K+M object holders + M+1 NCNX holders
+DELETE key    = M+1 NCNX holders, zero object data IO
+RENAME key    = source and destination NCNX holders, zero object data IO
+LIST page     = filename traversal only, zero NCNX/NCDX/shard decode
 ```
 
-All of these may proceed simultaneously:
+A test passes correctness only when the measured IO matches these boundaries.
+Fast output with hidden global scans or object-data reads is a failure.
 
-- different fragments;
-- different directories;
-- independent inode mutations;
-- different objects;
-- different multipart sessions;
-- different disks within each selected node;
-- bounded namespace and blob healing.
+## Release Gates
 
-Operations that conflict on the exact same inode or dentry generation must be
-ordered. That is required filesystem semantics, not a global lock. No unrelated
-operation waits for that conflict.
+N2 3.0 is not declared production-stable until the following are proven:
 
-## Capacity And Operational Reserves
+- exact `K + M` shard placement and exact `M + 1` NCNX replication;
+- upload, GET, HEAD, LIST, copy/move, trash, recover, and prefix operations;
+- zero-decode paginated listing with no duplicates or omissions;
+- same-key collision safety and independent-key parallelism;
+- crash/restart at every destination-first copy/delete stage;
+- one- and parity-count node loss behavior;
+- fail-closed writes beyond the configured failure budget;
+- NCNX and object autonomous repair;
+- TTL live-wins-over-trash and orphan safety;
+- explicit object redistribution without changing untouched layouts;
+- append-only server-pool expansion;
+- measured latency, CPU, filesystem calls, bytes, and peer fan-out;
+- clean restart with no manual repair after every bounded chaos case.
 
-Each root reserves space and filesystem inodes for namespace decisions,
-temporary publication, healing, GC, and recovery. Blob payload admission must
-stop before consuming operational reserve. A full data root must never prevent
-delete, rename, repair metadata, or safe shutdown.
-
-Capacity selection considers:
-
-- free bytes and filesystem inodes;
-- observed IO latency and stalls;
-- node and disk health;
-- failure-domain diversity;
-- current foreground and maintenance pressure.
-
-Capacity scoring affects new placement only. It does not redefine existing
-layout truth.
-
-## Honest Scaling Boundaries
-
-Aggregate namespace capacity and throughput grow as namespace nodes and disks
-are added while each inode keeps fixed redundancy `R`. Aggregate blob capacity
-and throughput grow as blob nodes and disks are added while each object keeps
-fixed EC width `k + m`.
-
-A single directory inode is still bounded by its recorded replica nodes and
-the selected disk on each node. One directory containing an extreme number of
-direct children may become hot even when the cluster has unused namespace
-capacity elsewhere. N2 2.0 initially treats one directory as one placement
-unit. Dynamic directory splitting must not be added until measured workloads
-prove it necessary and its invariants are separately specified.
-
-This is architectural horizontal scalability, not a claim that finite
-hardware has infinite capacity or that correlated failures cannot occur.
-
-## NOA And Client Boundary
-
-NOA remains the public object and namespace contract. Clients authenticate to
-the cluster and fragment, not separately to namespace or blob nodes.
-
-Any healthy API endpoint may coordinate a request. The receiving node is an
-operation coordinator only; it does not become permanent namespace, object,
-or cluster truth.
-
-The N2 2.0 engine must preserve common NOA meanings for:
-
-- fragment creation and authentication;
-- object upload, download, stat, versioning, and delete;
-- directory list, mkdir, rename, move, trash, and recover;
-- health, repair, GC, and topology reporting.
-
-Engine-specific inode and object placement remain internal.
-
-## Non-Goals
-
-N2 2.0 does not introduce:
-
-- a SQL or external metadata database;
-- a global namespace writer;
-- a cluster-wide mutable object head;
-- complete namespace replication to every namespace node after the collection
-  grows beyond the recorded inode redundancy;
-- public hard links and global object reference counting;
-- automatic healthy-object redistribution after node addition;
-- automatic rewriting of old EC layouts;
-- atomic rename across fragments;
-- a compatibility layer for earlier development disk layouts.
-
-## Implementation Plan
-
-The redesign must be implemented in isolated stages. Blob invariants are not
-to be rewritten while namespace work is incomplete.
-
-### Phase 1: architecture types and configuration
-
-- introduce explicit namespace-node and blob-node roles;
-- define stable node and root identities;
-- define namespace redundancy separately from object EC;
-- enforce the `2N + 2B` absolute minimum and fail-closed rules;
-- reject roots shared by different logical nodes.
-
-### Phase 2: namespace disk store
-
-- implement fragment catalog and root inode references;
-- implement directory inode and dentry record formats;
-- implement exact replica-layout references;
-- implement atomic local publication using filesystem primitives;
-- implement disk inventory and capacity-safe inode placement.
-
-### Phase 3: replicated inode protocol
-
-- implement quorum-certified generations;
-- implement idempotent mutation IDs;
-- implement single-directory create, replace, rename, and unlink;
-- implement strict 2-of-2 behavior;
-- implement majority behavior for redundancy three and above;
-- implement restart replay without global locks.
-
-### Phase 4: cross-inode POSIX operations
-
-- implement bounded cross-parent move;
-- include moved-directory parent state in the transaction;
-- prevent concurrent cycles;
-- implement collision and stale-generation rejection;
-- prove that descendants and blob bytes remain untouched.
-
-### Phase 5: object publication integration
-
-- retain immutable object-level EC placement;
-- publish namespace object references only after durable `.ncdx` and shards;
-- implement idempotent finalize and orphan-safe failure behavior;
-- verify exact node and root locators on read.
-
-### Phase 6: trash and lifecycle
-
-- implement direct pointer move into the reserved trash inode;
-- implement reverse restore;
-- implement TTL from trash-entry state;
-- reclaim recorded object layouts and remove trash anchors last;
-- keep session cleanup and orphan scrub separate.
-
-### Phase 7: autonomous healing and expansion
-
-- repair missing namespace replicas from certified complete snapshots;
-- repair missing object shards and `.ncdx` replicas from immutable recorded layouts;
-- emit node-local non-replicated JSON findings and fail closed on catastrophic invariants;
-- add namespace and blob nodes one at a time;
-- add disks one at a time;
-- prove that expansion never remaps or degrades existing layouts;
-- enforce safe drain and fencing before removal.
-
-### Phase 8: API, console, and operational integration
-
-- expose the redesign through the existing NOA meanings;
-- update N2 Console topology, namespace, object, and health views;
-- report namespace redundancy independently from object EC;
-- report affected-scope read-only state precisely;
-- remove obsolete 1.x namespace controls and terminology.
-
-## Verification Requirements
-
-N2 2.0 must not be called stable merely because it compiles or passes synthetic
-happy-path tests. Verification must preserve evidence for every invariant.
-
-### Deterministic namespace tests
-
-- create and list across all namespace replica combinations;
-- same-parent rename under concurrency;
-- cross-parent file and directory moves;
-- concurrent inverse and multi-directory cycle attempts;
-- conflicting create, delete, trash, and restore;
-- duplicate mutation replay;
-- crash after prepare, decision, and partial apply;
-- stale replica recovery;
-- namespace disk and node replacement;
-- strict 2-of-2 read-only behavior;
-- 2-of-3 continuation and autonomous repair;
-- node addition without existing-inode remap.
-
-### Deterministic object tests
-
-- `1 + 1`, `2 + 1`, and configured wider EC layouts;
-- exact holder and disk recording;
-- shard and parity corruption;
-- recover-on-read;
-- restart during upload and finalize;
-- holder replacement through immutable layout generation;
-- blob-node and disk addition without redistribution;
-- object status based on recorded layout rather than current topology.
-
-### Lifecycle tests
-
-- object trash, restore, TTL expiry, and reclaim;
-- directory trash with nested objects;
-- child trashed before parent;
-- interrupted subtree reclamation and restart;
-- partial object-holder reclaim and retry;
-- no live or restorable object reclaimed;
-- orphan scrub isolated from normal TTL GC.
-
-### Real topology tests
-
-The minimum architectural test topology is:
-
-```text
-physical machine A
-├── simulated namespace N1
-└── simulated namespace N2
-
-physical machine B
-├── simulated blob B1
-└── simulated blob B2
-```
-
-Each logical node must have isolated roots, processes, ports, and state. This
-test proves the minimum protocol but not independent physical-node durability.
-
-The same NOA operation matrix must be executed through every node role:
-
-- upload through each namespace node and each blob node;
-- download through each namespace node and each blob node;
-- namespace mutation through each namespace node and each blob node;
-- multipart resume through its recorded coordinator;
-- coordinator loss before and after final publication;
-- routing rejection when required namespace or blob authority is unavailable.
-
-Production proof must use independent physical failure domains for namespace
-replicas and object shards.
-
-### Performance evidence
-
-Every release proof records:
-
-- operation latency in milliseconds by phase;
-- namespace RPC and durable-sync counts;
-- object network and disk bytes;
-- CPU time and cycles where supported;
-- memory, threads, descriptors, and queues;
-- foreground versus maintenance IO;
-- number of inode groups, nodes, and disks touched per operation;
-- repair and GC work amplification;
-- behavior under node, disk, and network failure.
-
-The implementation is rejected if a namespace mutation unexpectedly scans a
-subtree, contacts the complete collection, rewrites object data, or introduces
-a global writer.
-
-## Locked N2 2.0 Invariants
-
-1. Namespace nodes and blob nodes are independently expandable collections.
-2. One node or disk may be added at a time after the minimum is met.
-3. Namespace redundancy and object EC width remain independent.
-4. Directory identity is stable and inode-based.
-5. Directory names exist only in parent dentries.
-6. Directory rename and move never rewrite descendants.
-7. Namespace work is bounded by directly affected inode replica groups.
-8. Object work is bounded by that object's recorded `k + m` set.
-9. Shards, parity, and committed `.ncdx` records are immutable.
-10. Every layout records exact node and disk-root identities.
-11. Adding nodes never degrades or remaps existing healthy layouts.
-12. No healthy object is automatically redistributed after expansion.
-13. Namespace publishes an object pointer only after blob durability.
-14. Trash anchors are removed only after complete safe reclamation.
-15. Public hard links and global object reference counting are excluded.
-16. Conflicting inode mutations cannot both commit.
-17. Unrelated inodes and objects operate concurrently without a global lock.
-18. Unsafe topology fails closed; a confirmed catastrophic invariant activates
-    the durable cluster safety read-only latch.
-19. Existing layout truth is never inferred from current membership.
-20. N2 2.0 carries no in-engine backward-compatibility path for earlier
-    development layouts.
-21. Every healthy namespace or blob node may coordinate any supported client
-    operation without becoming permanent authority.
-
-These invariants define the N2 2.0 engine. Implementation choices are
-valid only when they preserve every invariant above.
+Passing bounded architectural tests proves implementation conformance and
+known failure behavior. It does not replace long-duration soak, hardware fault,
+or independent multi-host production evidence.

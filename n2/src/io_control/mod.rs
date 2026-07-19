@@ -6,7 +6,6 @@ pub mod job;
 pub mod latency;
 pub mod metrics;
 pub mod priority;
-pub mod quorum;
 pub mod resource;
 pub mod scrub;
 pub mod stall;
@@ -33,7 +32,6 @@ pub use metrics::{
     IoControlSnapshot, ReadRecoverSnapshot, io_control_snapshot, record_read_recover,
 };
 pub use priority::{IoPriority, IoWorkClass};
-pub use quorum::{QuorumOutcome, quorum_required};
 pub use resource::{ProcessResourceSnapshot, process_resource_snapshot};
 pub use scrub::{ScrubControlSnapshot, scrub_control_snapshot};
 pub use stall::{ProgressTracker, StallSnapshot};

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created_quorum,
-    commit_namespace_summary_quorum,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created,
+    commit_namespace_summary,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -167,7 +167,7 @@ pub async fn mkdir_path(
         ));
     }
 
-    let created = commit_namespace_created_quorum(PeerNamespaceApplyRequest {
+    let created = commit_namespace_created(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Mkdir,
         fragment: fragment.clone(),
@@ -236,7 +236,7 @@ pub async fn rename_path(
         });
     }
 
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Rename,
         fragment: fragment.clone(),
@@ -279,7 +279,7 @@ pub async fn trash_path(
         ));
     }
     let fragment = claims.fragment.clone();
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Trash,
         fragment: fragment.clone(),
@@ -322,7 +322,7 @@ pub async fn recover_path(
         ));
     }
     let fragment = claims.fragment.clone();
-    let summary = commit_namespace_summary_quorum(PeerNamespaceApplyRequest {
+    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
         mutation_id: None,
         kind: NamespaceMutationKind::Recover,
         fragment: fragment.clone(),

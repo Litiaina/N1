@@ -1,386 +1,170 @@
-<div align="center">
-  <img
-    src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
-    alt="Litiaina Icon"
-    width="150"
-    height="150"
-  />
-  <h1>Litiaina N2</h1>
-  <p>
-    N2 is a high-performance distributed object storage system built for
-    durable, redundant, namespace-managed, and efficient storage.
-  </p>
-</div>
+# Litiaina N2 3.0
 
----
+N2 is a high-performance distributed object storage engine built around
+immutable object-level erasure sets and a flat, namespace-managed key plane.
+Version 3.0 is a clean engine generation. It does not open or migrate N2 2.0
+inode layouts.
 
-N2 is Litiaina's distributed object storage system. It accepts storage,
-namespace, and maintenance operations on any healthy node, places immutable
-object shards across the cluster, and keeps namespace mutation as the
-coordination boundary.
+The authoritative design is [ARCHITECTURE.md](ARCHITECTURE.md). The public API
+contract is [NOA.md](NOA.md), deployment is [INSTALLATION.md](INSTALLATION.md),
+and current proof evidence is recorded in
+[N2_3_0_VERIFICATION.md](N2_3_0_VERIFICATION.md).
 
-N2 `2.0.0` is the clean redesign boundary for independently expandable
-namespace and blob planes. Blob shards and `.ncdx` object metadata remain
-immutable object-level erasure sets. Directory names, paths, rename, move,
-trash, and recover use stable directory inodes with exact replica layouts and
-quorum-certified generations. Earlier development disk layouts are not opened
-by this engine.
+## N2 3.0 DNA
 
-N2 deliberately keeps POSIX-style namespace operations fast without becoming a
-filesystem. Directory listing, rename, move, trash, and recover operate on the
-small recorded replica groups of directly affected inodes, while object bytes
-and `.ncdx` records remain immutable in the distributed blob plane. This avoids a
-common object-storage weakness where path-oriented workflows degrade into
-large metadata scans or payload rewrites.
+- Every server-pool node is unified and bidirectional. Any node can coordinate
+  requests, and every node can hold NCNX, NCDX, shards, and parity.
+- Each server pool has a static `K + M` EC contract. N2 never silently shrinks
+  an object's durability to fit a degraded topology.
+- Each object version records its exact pool generation, EC width, holders,
+  roots, shard roles, sizes, and checksums in immutable NCDX.
+- Each logical key is one small immutable NCNX record replicated to exactly
+  `R = M + 1` deterministic holders in its namespace home pool.
+- LIST reads filenames and physical prefixes only. It does not decode NCNX,
+  open NCDX, or touch object data.
+- Rename and move are destination-first live copy/delete. Trash and recover are
+  destination-first live/trash copy/delete. All touch namespace records only.
+- Adding a new pool increases future capacity without moving existing objects.
+  Redistribution is always explicit object re-encoding.
+- Autonomous healing verifies and repairs exact recorded NCNX, NCDX, shard,
+  and parity layouts. Disposable JSON reports are never storage authority.
 
-N2 is not an S3 clone and does not use S3 as its core identity. Its public
-surface is the NOA v1 `/noa/v1/...` HTTP API plus the `n2://` native protocol for
-N2-native operators, peers, tools, and future internal systems.
-
-## What Ships Here
-
-- `litiaina-n2`: the N2 distributed object storage server.
-- `litiaina-n2-shell`: native N2 operator shell.
-- `litiaina-n2-gateway`: route-only N2 front door for user-facing traffic.
-- `n2_native_client`: reusable Rust client for `n2://`.
-- `simd-erasure-core`: SIMD erasure implementation used by N2.
-
-## Documentation
-
-- [DOCUMENTATION.md](DOCUMENTATION.md): setup, operations, API usage, request
-  bodies, query fields, examples, and troubleshooting.
-- [NOA.md](NOA.md): canonical NOA v1 public routes, N2 cluster extensions, and
-  the boundary between NOA and N2-native internals.
-- [INSTALLATION.md](INSTALLATION.md): production setup, systemd templates,
-  gateway deployment, and validation checklist.
-- [ARCHITECTURE.md](ARCHITECTURE.md): storage layout, object identity,
-  cluster placement, namespace coordination, repair, and rebalance design.
-- [GATEWAY.md](GATEWAY.md): gateway deployment, route-only behavior, and
-  client-owned multipart coordinator tracking.
-- [BENCHMARK.md](BENCHMARK.md): measured three-node throughput, hardware,
-  degraded operation, failure tests, and reproduction guidance.
-
-## Core Model
-
-N2 stores object data as immutable versions. Each committed version has:
-
-- a namespace path used by users and APIs, such as `videos/mhw.mp4`;
-- a direct namespace pointer to an immutable `@o_<object-id>`;
-- an immutable `.ncdx` version record colocated with shard data;
-- shard and parity payloads placed across active cluster nodes;
-- a recorded layout, so reads use the layout that actually wrote the object;
-- max-ULID head selection without a mutable latest pointer.
-
-The result is simple operational behavior:
-
-- new uploads can enter through any healthy node;
-- each upload coordinator distributes object payloads across the cluster;
-- finalized objects can be listed, read, inspected, and repaired from any node;
-- folder rename and move are namespace mutations, not object rewrites;
-- old objects remain valid after membership changes until explicit rebalance;
-- object status reports layout drift, object redistribution can rewrite one
-  version, and targeted rebalance skips already-current objects.
-- cluster monitoring exposes overview, nodes, topology, object-layout health,
-  redistribution, jobs, namespace consensus, and upload activity in one
-  efficient `/noa/v1/cluster/monitor` snapshot.
-- distributed maintenance assigns fragments across reachable nodes for
-  fragment-level GC, repair, and targeted rebalance.
-- autonomous healing selects a bounded HA coordinator pool, obtains a
-  quorum-held lease per stable fragment, resumes bounded object scans after
-  restart, and repairs only exact recorded inode and object layouts. Very large
-  namespace-walk continuation remains a documented 2.0 release gate.
-- redistribution remains explicit; adding a node never degrades or rewrites a
-  healthy older-layout object.
-
-N2 2.0 assigns every node one explicit role. Namespace-node storage roots hold
-replicated inode and fragment-catalog state. Blob-node storage roots hold
-immutable shards, parity, and `.ncdx` records. `runtime_path` remains
-process-local control state for membership, upload coordination, and
-maintenance jobs; it is not namespace or object truth.
-
-## Coordination Model
-
-N2 is bidirectional at the node level. Any healthy node can coordinate:
-
-- authentication;
-- fragment access;
-- one-shot upload;
-- multipart upload initiation;
-- object read/download/status;
-- namespace list/mkdir/rename/trash/recover;
-- cluster health, usage, repair, and rebalance flows.
-
-Multipart sessions are intentionally coordinator-owned until finalize. The node
-that accepts `multipart init` owns the temporary upload session and returns its
-`coordinator_node_id`. Clients keep that coordinator and send it on part,
-status, finalize, and cancel requests. The object data is still distributed
-across the cluster; only the temporary resumability state is local to the
-coordinator.
-
-After finalize, the object becomes cluster-visible and can be read from any
-node.
-
-## Repository Layout
+## Physical Layout
 
 ```text
-n2/
-  src/                  N2 server, object storage, namespace, distribution, protocol
-n2_shell/
-  src/                  N2 native operator shell
-n2_native_client/
-  src/                  reusable Rust client for n2://
-n2_gateway/
-  src/                  user-facing route-only N2 gateway
-deploy/systemd/
-  litiaina-n2*.service.in
-deploy/install.sh       production installer for node/gateway systemd setup
-simd-erasure-core/
-  src/                  erasure coding implementation
-scripts/bench/
-  run_n2_benchmark_matrix.sh
-  run_n2_capacity_expansion_proof.sh
-  run_n2_hardening_native_proof.sh
-scripts/proof/
-  run_n2_installer_proof.sh
-certificates/
-  local development TLS certificates
+<storage_root>/
+  .n2-root.ncdx
+  .fragment/
+    <fragment-alias-hash> -> ../@f_<stable-fragment-id>
+
+  @f_<stable-fragment-id>/
+    .fragment.ncdx
+    .namespace/
+      videos/video.mp4.ncnx
+    .trash/
+      videos/video.mp4.ncnx.trashed.<unix-nanos>.<mutation-ulid>
+    .uploads/
+    .objects/
+      ab/cd/ef/12/@o_<object-id>/
+        <version>.l<pool-generation>.<size>.<unix-nanos>.<ext>.ncdx
+        <version>/
+          part_0_shard_0.shard
+          part_0_shard_1.shard
+          part_0_shard_2.parity
 ```
 
-## Build
+The physical `videos/` directory is only key-prefix partitioning. It is not an
+inode, lock, transaction participant, or durability group. Empty directories
+are not persisted; clients derive them from keys.
 
-Build the server:
+## Server Pools
+
+```text
+cluster
+├── pool-a, generation 1, EC 4+2
+│   └── nodes a1..a6
+├── pool-b, generation 2, EC 4+2
+│   └── nodes b1..b6
+└── fragments
+    ├── videos
+    └── documents
+```
+
+Fragments are bucket-like authentication, lifecycle, and policy boundaries.
+They are not server pools. One fragment can contain objects whose exact layouts
+belong to several pool generations.
+
+New writes use the newest complete writable pool. Old objects remain readable
+and healable from their recorded layouts. A missing pool node stops unsafe new
+writes; it does not globally label every existing object as degraded.
+
+## Namespace Semantics
+
+An NCNX record maps one normalized key to one stable object ID. It contains
+only fragment identity, object identity, mutation identity, creation time, and
+an integrity checksum. Object size, content type, versions, and EC layout stay
+in NCDX.
+
+Independent keys never update shared directory state. The unavoidable conflict
+boundary is one exact logical key. Prefix operations enumerate matching keys
+and execute the same one-key protocol with bounded concurrency. They are
+restartable per key and intentionally non-atomic across the entire prefix.
+
+Mkdir is not persisted because N2 3.0 has no empty-directory records. Uploading
+`videos/a.mp4` makes the `videos/` prefix visible.
+
+## Lifecycle
+
+Delete first publishes a uniquely named trash NCNX on all exact replicas, then
+removes only the expected live NCNX bytes. Recover publishes live first and
+removes trash last. Repeated and interrupted requests remain safe at the
+one-key boundary.
+
+Normal GC scans `.trash`, derives expiry from its filenames, and applies the
+rule **live wins over trash**. An expired pointer cannot reclaim an object that
+still has a live key or another unexpired trash reference. Object holders are
+purged before the final trash pointer is removed.
+
+Headless immutable objects are reported and preserved. N2 does not guess that
+missing namespace authority means the object is disposable.
+
+## Build And Test
 
 ```bash
+cargo fmt --all -- --check
+cargo check -p n2
+cargo test -p n2 --lib -- --test-threads=1
 cargo build -p n2 --release
 ```
 
-Build the native shell:
+The finite release proof uses four logical nodes, static 2+2 EC, three NCNX
+replicas, two physical hosts, and isolated temporary roots:
 
 ```bash
-cargo build -p n2_shell --release
+REMOTE_PASS='operator-supplied' \
+  scripts/bench/run_n2_3_0_release_proof.sh
 ```
 
-Build the gateway:
+It proves NOA CRUD, multipart upload, cross-node reads, zero-decode listing,
+folder trash/recovery, NCNX repair, shard repair, TTL GC, node-loss read/write
+behavior, and full restart persistence. It also records latency distributions,
+throughput, PID CPU/IO/memory samples, logs, and physical layouts under
+`/home/wlzambo/DEV-TEST` by default.
 
-```bash
-cargo build -p n2_gateway --release
-```
+This is bounded architectural evidence, not a claim of exabyte deployment or a
+substitute for long-duration independent-hardware soak testing.
 
-Install a production node or gateway:
+## Runtime Files
 
-```bash
-sudo ./deploy/install.sh --node --build --copy-certs --enable --start
-sudo ./deploy/install.sh --gateway --build --copy-certs --enable --start \
-  --gateway-node node-a,https://192.168.0.22:50001,n2://192.168.0.22:50002
-```
-
-Run the server locally:
-
-```bash
-cargo run -p n2 --release
-```
-
-The server creates missing local config files on first run, but production
-deployments should use explicit `n2_config.ini` and environment values.
-
-## Minimal Configuration
-
-```ini
-[server]
-host=0.0.0.0
-https_port=50001
-native_port=50002
-cert_path=./certificates/cert.pem
-key_path=./certificates/key.pem
-
-[disk_config]
-storage_roots=ns-a-root=/mnt/n2/storage
-runtime_path=/mnt/n2/control
-
-[cluster_config]
-node_id=ns-a
-node_role=namespace
-node_endpoint=https://192.168.0.22:50001
-native_endpoint=n2://192.168.0.22:50002
-membership_file=n2_membership.json
-namespace_redundancy=2
-object_data_shards=1
-object_parity_shards=1
-auto_max_parity_shards=3
-fixed_data_shards=
-fixed_parity_shards=
-auto_rebalance=false
-
-[auto_healing]
-enabled=true
-initial_delay_seconds=30
-scan_interval_seconds=900
-coordinator_nodes=auto
-max_parallel_fragments=2
-max_objects_per_fragment_cycle=256
-max_duration_seconds=30
-lease_seconds=90
-checksum_scan_every_cycles=24
-```
-
-For multi-node clusters, every node uses its own `node_id`, HTTP endpoint,
-native endpoint, and local disk roots. The membership file records the cluster
-node list and epoch.
-
-## API Entry Points
-
-- HTTP API: `/noa/v1/...`
-- Native protocol: `n2://host:port`
-- WebSocket event stream: `/noa/v1/ws`
-- Peer routes: `/n2/peer/...` and namespace peer routes are internal
-  node-to-node surfaces.
-
-Basic HTTP auth:
-
-```bash
-curl -k https://127.0.0.1:50001/noa/v1/auth/fragment \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "fragment": "n2-test",
-    "secret": "fragment-key",
-    "read": true,
-    "write": true,
-    "modify": true,
-    "delete": true
-  }'
-```
-
-The response contains a Bearer access token and optional refresh token. Use the
-access token on protected routes:
-
-```bash
-curl -k https://127.0.0.1:50001/noa/v1/posix/list?path=videos \
-  -H "Authorization: Bearer $N2_TOKEN"
-```
-
-See [DOCUMENTATION.md](DOCUMENTATION.md) for full route bodies, query fields,
-and examples.
-
-## Native Shell
-
-```bash
-target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 ping
-
-target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
-  health --fragment n2-test --secret fragment-key
-
-target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
-  list --fragment n2-test --secret fragment-key --path videos --limit 200
-
-target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
-  upload --fragment n2-test --secret fragment-key \
-  --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4
-```
-
-The shell also has a `raw` command for calling supported native operation names
-directly.
-
-Useful operator shell flows:
-
-```bash
-target/release/litiaina-n2-shell \
-  --native-url n2://127.0.0.1:50002 \
-  --fragment n2-test --secret fragment-key \
-  profile save --name lab
-
-target/release/litiaina-n2-shell --profile lab dashboard
-target/release/litiaina-n2-shell --profile lab repair watch
-target/release/litiaina-n2-shell --profile lab rebalance watch
-```
-
-## Proof And Testing
-
-Run unit-level checks:
-
-```bash
-cargo test -p n2 --lib
-cargo test -p n2_shell
-cargo test -p n2_native_client
-```
-
-Run the N2 native hardening harness:
-
-```bash
-N2_PROOF_STORAGE_LAYOUT=separated \
-  scripts/bench/run_n2_hardening_native_proof.sh
-
-N2_PROOF_STORAGE_LAYOUT=shared \
-  scripts/bench/run_n2_hardening_native_proof.sh
-```
-
-Run installer dry-run proof:
-
-```bash
-scripts/proof/run_n2_installer_proof.sh
-```
-
-Run benchmark and capacity-expansion proofs:
-
-```bash
-FRAGMENT=n2-test SECRET=fragment-key scripts/bench/run_n2_benchmark_matrix.sh
-scripts/bench/run_n2_capacity_expansion_proof.sh
-```
-
-The proof harnesses are intended for multi-node correctness checks and write
-ignored local output under `.n2-bench/`. The hardening harness does not kill
-existing N2 services unless `N2_PROOF_ALLOW_PKILL=1` is explicitly set.
-
-N2 1.1.0 bounded architectural proof summary (July 15, 2026):
+Every node requires:
 
 ```text
-N2 package tests: 120 passed
-Gateway package tests: 16 passed
-Topology: 3 simulated N2 nodes, each using all 4 physical XFS disks
-NOA v1 CRUD/multipart/POSIX/trash-recover: passed
-Distributed healing: quorum lease, single owner, recorded-layout repair: passed
-Recover-on-read and restart-persisted healing progress: passed
-Two-of-three node operation: readable, namespace quorum available, safe 1+1 writes
-Explicit object redistribution and fragment rebalance: passed
-Final content SHA-256 verification: passed
+n2.env
+n2_config.ini
+<runtime_path>/n2_membership.json
+TLS certificate and key
+one or more enrolled storage roots
 ```
 
-Evidence is stored outside the repository under
-`/home/wlzambo/DEV-TEST/n2-1.1.0-noa-healing-proof-20260715-1655`.
-This was deliberately a bounded correctness proof, not a soak test. Its three
-N2 nodes were isolated processes on one physical server, so independent-host
-power, network-partition, and failure-domain testing remains separate work.
+All nodes must use the same JWT and cluster peer secrets and the same complete
+format-v3 membership. Each node has a unique stable node ID, endpoints, and
+root IDs. Root identity prevents accidental rebinding, silent static-EC
+changes, or in-place root-set changes that would remap NCNX.
 
-N2 1.0.0 real-node proof summary:
+Use [INSTALLATION.md](INSTALLATION.md) for the full configuration and systemd
+procedure.
 
-```text
-N2 package tests: 116 passed
-Gateway package tests: 16 passed
-Four-node hardware proof: passed
-Final topology: epoch 5, 4 writable/readable nodes, 3+1 layout
-Distributed rebalance: scanned=24, rewritten=4, skipped=20, failed=0
-Distributed repair: scanned=25, skipped=25, failed=0
-Namespace hardening: mkdir race, rename race, collision, trash/recover passed
-Final monitor: all fragments healthy, current layout, zero missing shards
-```
+## API
 
-Evidence is stored outside the repository under
-`/home/wlzambo/DEV-TEST/n2-maintenance-proof-20260708`.
+The canonical surface is `/noa/v1`. Important groups are:
 
-## Operational Boundaries
+- `/noa/v1/fragments` and `/noa/v1/auth/fragment`
+- `/noa/v1/objects`, `/objects/download`, `/objects/rename`
+- `/noa/v1/upload/one-shot` and `/upload/multipart`
+- `/noa/v1/trash` and `/objects/recover`
+- `/noa/v1/posix/list`, `/stat`, `/rename`, `/trash`, `/recover`
+- `/noa/v1/cluster/health`, `/monitor`, `/healing/cycle`
+- `/noa/v1/maintenance/gc/*`, `/repair/*`, `/redistribution/*`
 
-- N2 `2.0.0` is in development and is not yet an LTS or general
-  production-readiness statement.
-- The absolute minimum is two namespace nodes plus two blob nodes. A 2-of-2
-  namespace is deliberately strict: one lost replica makes affected writes
-  read-only until safe repair or replacement.
-- Namespace redundancy and object EC width are independent. Wider namespace
-  redundancy may preserve writes through a majority; object durability follows
-  each object's recorded `k + m` layout.
-- Adding a node or disk does not remap existing inode or object layouts and does
-  not trigger redistribution.
-- Earlier development layouts are intentionally rejected rather than migrated.
-- Remaining release gates are listed in `N2_2_0_VERIFICATION.md`.
-- N2 exposes capacity monitoring and full-disk admission only. Per-user or
-  per-fragment business limits belong outside N2.
-- S3 compatibility is not part of the N2 core. If needed, it should live as an
-  adapter layer.
+NOA standardizes the external contract. It does not weaken N2's recorded
+layout, strict publication, or flat NCNX invariants.

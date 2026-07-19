@@ -44,7 +44,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 use tokio_util::io::ReaderStream;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::routes::storage_routes::AppState;
@@ -582,13 +581,25 @@ async fn post_object_metadata(endpoint: &str, metadata: &ObjectMetadata) -> Resu
     Ok(())
 }
 
-fn metadata_publish_quorum_requirement(data_shards: u16) -> usize {
-    usize::from(data_shards).max(1)
-}
-
-pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    let runtime = active_cluster_runtime()?;
-    let mut participant_ids = BTreeMap::<String, ()>::new();
+fn validate_metadata_pool_contract(
+    runtime: &ClusterRuntime,
+    metadata: &ObjectMetadata,
+) -> Result<BTreeSet<String>, AppError> {
+    let pool = runtime.membership.pool(&metadata.pool_id).ok_or_else(|| {
+        AppError::Conflict(format!(
+            "object metadata references unknown server pool '{}'",
+            metadata.pool_id
+        ))
+    })?;
+    if pool.generation != metadata.pool_generation
+        || pool.policy.object_data_shards != usize::from(metadata.data_shards)
+        || pool.policy.object_parity_shards != usize::from(metadata.parity_shards)
+    {
+        return Err(AppError::Conflict(
+            "object metadata does not match its immutable server-pool EC contract".into(),
+        ));
+    }
+    let mut participant_ids = BTreeSet::new();
     for shard in metadata.parts.iter().flat_map(|part| part.shards.iter()) {
         let locator = parse_peer_shard_locator(&shard.absolute_path).ok_or_else(|| {
             AppError::InternalServerError(format!(
@@ -596,17 +607,63 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
                 shard.file_name
             ))
         })?;
-        participant_ids.insert(locator.node_id, ());
+        if !pool
+            .node_ids
+            .iter()
+            .any(|node_id| node_id == &locator.node_id)
+        {
+            return Err(AppError::Conflict(format!(
+                "object shard references node '{}' outside pool '{}'",
+                locator.node_id, pool.id
+            )));
+        }
+        participant_ids.insert(locator.node_id);
     }
     if participant_ids.is_empty() {
         return Err(AppError::InternalServerError(
             "N2 object metadata has no shard-bearing participants".into(),
         ));
     }
+    let required_width = pool.policy.object_width();
+    if participant_ids.len() != required_width {
+        return Err(AppError::Conflict(format!(
+            "object metadata participants do not match pool '{}' static {}+{} layout",
+            pool.id, pool.policy.object_data_shards, pool.policy.object_parity_shards
+        )));
+    }
+    for part in &metadata.parts {
+        let mut part_nodes = BTreeSet::new();
+        let mut shard_indices = BTreeSet::new();
+        for shard in &part.shards {
+            let locator = parse_peer_shard_locator(&shard.absolute_path).ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "object part {} shard '{}' has no exact peer locator",
+                    part.part_index, shard.file_name
+                ))
+            })?;
+            part_nodes.insert(locator.node_id);
+            shard_indices.insert(shard.shard_index);
+        }
+        if part.shards.len() != required_width
+            || part_nodes != participant_ids
+            || shard_indices != (0..required_width).collect::<BTreeSet<_>>()
+        {
+            return Err(AppError::Conflict(format!(
+                "object part {} does not contain exactly one indexed shard on each of {} pool participants",
+                part.part_index, required_width
+            )));
+        }
+    }
+    Ok(participant_ids)
+}
 
-    let required_metadata_writes = metadata_publish_quorum_requirement(metadata.data_shards);
+pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Result<(), AppError> {
+    let runtime = active_cluster_runtime()?;
+    let participant_ids = validate_metadata_pool_contract(&runtime, metadata)?;
+
+    let required_metadata_writes = participant_ids.len();
     let mut tasks = futures_util::stream::FuturesUnordered::new();
-    for node_id in participant_ids.into_keys() {
+    for node_id in participant_ids {
         let endpoint = runtime
             .membership
             .nodes
@@ -642,7 +699,7 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
     }
     if successes < required_metadata_writes {
         return Err(AppError::ServiceUnavailable(format!(
-            "N2 object metadata publish quorum failed for {}/{} version {}: {} successful, {} required; {}",
+            "strict NCDX publication failed for {}/{} version {}: {} successful, {} required; {}",
             metadata.fragment,
             metadata.object_key,
             metadata.version_id,
@@ -650,17 +707,6 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
             required_metadata_writes,
             failures.join("; ")
         )));
-    }
-    if !failures.is_empty() {
-        warn!(
-            "N2 object metadata for {}/{} version {} published with degraded participant coverage: {} successful, {} failed; {}",
-            metadata.fragment,
-            metadata.object_key,
-            metadata.version_id,
-            successes,
-            failures.len(),
-            failures.join("; ")
-        );
     }
     Ok(())
 }
@@ -882,13 +928,7 @@ pub async fn collect_cluster_object_inventory(
     fragment: &str,
 ) -> Result<ClusterObjectInventory, AppError> {
     let runtime = active_cluster_runtime()?;
-    let nodes = runtime
-        .membership
-        .nodes
-        .iter()
-        .filter(|node| node.role == crate::distribution::membership::NodeRole::Blob)
-        .cloned()
-        .collect::<Vec<_>>();
+    let nodes = runtime.membership.nodes.clone();
     let expected_blob_nodes = nodes.len();
     let local_id = runtime.local_node_id.clone();
     let results = futures_util::future::join_all(nodes.into_iter().map(|node| {
@@ -944,6 +984,8 @@ pub async fn peer_publish_object_metadata(
     Json(request): Json<PeerObjectMetadataRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     authorize_peer(&headers)?;
+    let runtime = active_cluster_runtime()?;
+    validate_metadata_pool_contract(&runtime, &request.metadata)?;
     index::publish_object(&request.metadata).await?;
     Ok(StatusCode::CREATED)
 }
@@ -1063,10 +1105,7 @@ fn merge_immutable_object_record(
     match by_object.get(&object_id) {
         Some(existing)
             if existing.version_id == record.version_id
-                && (existing.membership_epoch != record.membership_epoch
-                    || existing.data_shards != record.data_shards
-                    || existing.parity_shards != record.parity_shards
-                    || existing.total_size_bytes != record.total_size_bytes) =>
+                && object_metadata_bytes(existing)? != object_metadata_bytes(&record)? =>
         {
             Err(AppError::InternalServerError(format!(
                 "divergent immutable N2 metadata for object {} version {}",
@@ -1107,20 +1146,28 @@ fn bounded_metadata_node_batches(
         .map(|node| (node.id.clone(), node))
         .collect::<BTreeMap<_, _>>();
     let fallback_ids = readable_by_id.keys().cloned().collect::<Vec<_>>();
-    let all_nodes = runtime.membership.nodes.clone();
-    let layout = resolve_layout(all_nodes.len(), &runtime.layout_policy).ok();
+    let newest_pool = runtime.membership.newest_writable_pool();
+    let newest_pool_nodes = newest_pool
+        .map(|pool| runtime.membership.nodes_for_pool(&pool.id))
+        .unwrap_or_default();
+    let layout = resolve_layout(newest_pool_nodes.len(), &runtime.layout_policy).ok();
     let mut per_node = BTreeMap::<String, Vec<String>>::new();
 
     for object_id in object_ids {
         let mut selected = Vec::<String>::new();
         if let Some(layout) = layout {
+            let Some(pool) = newest_pool else {
+                continue;
+            };
             if let Ok(plan) = build_placement_plan(
                 fragment,
                 object_id,
                 "",
+                &pool.id,
+                pool.generation,
                 runtime.membership.epoch,
                 layout,
-                &all_nodes,
+                &newest_pool_nodes,
             ) {
                 selected.extend(plan.placements.into_iter().filter_map(|placement| {
                     readable_by_id
@@ -1180,6 +1227,7 @@ async fn resolve_object_heads_from_batches(
         };
         successful_nodes += 1;
         for record in records {
+            validate_metadata_pool_contract(runtime, &record)?;
             merge_immutable_object_record(&mut by_object, record)?;
         }
     }
@@ -1268,12 +1316,10 @@ async fn resolve_object_versions_from_nodes(
         };
         successful_nodes += 1;
         for record in records {
+            validate_metadata_pool_contract(runtime, &record)?;
             match by_version.get(&record.version_id) {
                 Some(existing)
-                    if existing.membership_epoch != record.membership_epoch
-                        || existing.data_shards != record.data_shards
-                        || existing.parity_shards != record.parity_shards
-                        || existing.total_size_bytes != record.total_size_bytes =>
+                    if object_metadata_bytes(existing)? != object_metadata_bytes(&record)? =>
                 {
                     return Err(AppError::InternalServerError(format!(
                         "divergent immutable N2 metadata for object {} version {}",
@@ -1357,12 +1403,10 @@ pub async fn resolve_cluster_object_version(
         .await?;
         successful_nodes = successful_nodes.saturating_add(fallback_successes);
         for record in fallback_versions.into_values() {
+            validate_metadata_pool_contract(&runtime, &record)?;
             match by_version.get(&record.version_id) {
                 Some(existing)
-                    if existing.membership_epoch != record.membership_epoch
-                        || existing.data_shards != record.data_shards
-                        || existing.parity_shards != record.parity_shards
-                        || existing.total_size_bytes != record.total_size_bytes =>
+                    if object_metadata_bytes(existing)? != object_metadata_bytes(&record)? =>
                 {
                     return Err(AppError::InternalServerError(format!(
                         "divergent immutable N2 metadata for object {} version {}",
@@ -2008,12 +2052,6 @@ fn shard_dir(
     version_id: &str,
 ) -> Result<std::path::PathBuf, AppError> {
     let runtime = active_cluster_runtime()?;
-    if runtime.local_role != crate::distribution::membership::NodeRole::Blob {
-        return Err(AppError::ServiceUnavailable(format!(
-            "node '{}' is a namespace node and cannot store object shards",
-            runtime.local_node_id
-        )));
-    }
     let root = runtime
         .local_storage_roots
         .iter()
@@ -2491,13 +2529,5 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn metadata_publish_quorum_allows_degraded_but_repairable_finalize() {
-        assert_eq!(metadata_publish_quorum_requirement(0), 1);
-        assert_eq!(metadata_publish_quorum_requirement(1), 1);
-        assert_eq!(metadata_publish_quorum_requirement(2), 2);
-        assert_eq!(metadata_publish_quorum_requirement(6), 6);
     }
 }

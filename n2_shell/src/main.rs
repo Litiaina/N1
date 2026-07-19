@@ -110,18 +110,12 @@ enum Command {
     List(ListArgs),
     #[command(about = "Stat a namespace path.")]
     Stat(PathArgs),
-    #[command(about = "Create a namespace folder.")]
-    Mkdir(PathArgs),
     #[command(about = "Rename or move a namespace path.")]
     Rename(RenameArgs),
     #[command(about = "Move a path into namespace trash.")]
     Trash(PathArgs),
     #[command(about = "Recover a path from namespace trash.")]
     Recover(PathArgs),
-    #[command(about = "Purge a path from namespace trash.")]
-    Purge(PathArgs),
-    #[command(about = "Empty namespace trash for the active fragment.")]
-    EmptyTrash,
     #[command(about = "Object metadata, versions, status, repair, and download.")]
     Object {
         #[command(subcommand)]
@@ -518,15 +512,6 @@ async fn run_authenticated_command(
             )
             .await
         }
-        Command::Mkdir(args) => {
-            print_op(
-                client,
-                "namespace.mkdir",
-                json!({ "path": args.path }),
-                cli.json,
-            )
-            .await
-        }
         Command::Rename(args) => print_op(
             client,
             "namespace.rename",
@@ -552,16 +537,6 @@ async fn run_authenticated_command(
             )
             .await
         }
-        Command::Purge(args) => {
-            print_op(
-                client,
-                "namespace.purge",
-                json!({ "path": args.path }),
-                cli.json,
-            )
-            .await
-        }
-        Command::EmptyTrash => print_op(client, "trash.empty", json!({}), cli.json).await,
         Command::Object { command } => run_object_command(client, command, cli.json).await,
         Command::Upload(args) => upload_file(client, args, cli, cli.json).await,
         Command::Download(args) => download_file(client, args).await,
@@ -634,6 +609,16 @@ mod tests {
             fragment: "frag".to_string(),
         }));
         assert!(!is_public_fragment_command(&FragmentCommand::List));
+    }
+
+    #[test]
+    fn flat_namespace_shell_has_no_manual_purge_or_empty_directory_commands() {
+        for command in ["mkdir", "purge", "empty-trash"] {
+            assert!(
+                Cli::try_parse_from(["litiaina-n2-shell", command]).is_err(),
+                "retired command '{command}' unexpectedly parsed"
+            );
+        }
     }
 }
 
@@ -1453,9 +1438,6 @@ async fn run_shell_line(
             .await
         }
         ["stat", path] => print_op(client, "namespace.stat", json!({"path": path}), cli.json).await,
-        ["mkdir", path] => {
-            print_op(client, "namespace.mkdir", json!({"path": path}), cli.json).await
-        }
         ["rename", source, destination] | ["move", source, destination] => {
             print_op(
                 client,
@@ -1471,10 +1453,6 @@ async fn run_shell_line(
         ["recover", path] => {
             print_op(client, "namespace.recover", json!({"path": path}), cli.json).await
         }
-        ["purge", path] => {
-            print_op(client, "namespace.purge", json!({"path": path}), cli.json).await
-        }
-        ["empty-trash"] => print_op(client, "trash.empty", json!({}), cli.json).await,
         ["uploads"] => print_op(client, "uploads.list", json!({"limit": 50}), cli.json).await,
         ["upload-status", version_id] => {
             print_op(
@@ -1603,7 +1581,7 @@ async fn run_shell_line(
 
 fn print_shell_help() {
     println!(
-        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  dashboard [probe]\n  monitor [deep|probe]\n  usage [refresh]\n  fragments\n  fragment check <fragment>\n  fragment hash <fragment>\n  list [path]\n  trash-list\n  stat <path>\n  mkdir <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  purge <path>\n  empty-trash\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start|watch|stop\n  rebalance status|plan|start|watch|stop\n  gc status|scrub|watch|stop\n  exit"
+        "commands:\n  ping\n  session\n  health\n  cluster [health]\n  membership\n  layout\n  dashboard [probe]\n  monitor [deep|probe]\n  usage [refresh]\n  fragments\n  fragment check <fragment>\n  fragment hash <fragment>\n  list [path]\n  trash-list\n  stat <path>\n  rename <source> <destination>\n  trash <path>\n  recover <path>\n  uploads\n  upload-status <version_id>\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  object redistribute <object_key> [dry-run]\n  repair status|plan|start|watch|stop\n  rebalance status|plan|start|watch|stop\n  gc status|scrub|watch|stop\n  exit"
     );
 }
 

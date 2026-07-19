@@ -27,16 +27,27 @@ pub struct ClusterPlacementPlan {
     pub fragment: String,
     pub object_key: String,
     pub version_id: String,
+    pub pool_id: String,
+    pub pool_generation: u64,
     pub membership_epoch: u64,
     pub data_shards: usize,
     pub parity_shards: usize,
     pub placements: Vec<ClusterShardPlacement>,
-    pub adaptive_without_rebalance: bool,
 }
 
-fn placement_score(fragment: &str, object_key: &str, node_id: &str) -> [u8; 32] {
+fn placement_score(
+    pool_id: &str,
+    pool_generation: u64,
+    fragment: &str,
+    object_key: &str,
+    node_id: &str,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"n2-placement-v2");
+    hasher.update(b"n2-placement-v3");
+    hasher.update([0]);
+    hasher.update(pool_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(pool_generation.to_le_bytes());
     hasher.update([0]);
     hasher.update(fragment.as_bytes());
     hasher.update([0]);
@@ -46,9 +57,20 @@ fn placement_score(fragment: &str, object_key: &str, node_id: &str) -> [u8; 32] 
     hasher.finalize().into()
 }
 
-fn root_score(fragment: &str, object_key: &str, node_id: &str, root_id: &str) -> [u8; 32] {
+fn root_score(
+    pool_id: &str,
+    pool_generation: u64,
+    fragment: &str,
+    object_key: &str,
+    node_id: &str,
+    root_id: &str,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"n2-root-placement-v2");
+    hasher.update(b"n2-root-placement-v3");
+    hasher.update([0]);
+    hasher.update(pool_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(pool_generation.to_le_bytes());
     hasher.update([0]);
     hasher.update(fragment.as_bytes());
     hasher.update([0]);
@@ -61,6 +83,8 @@ fn root_score(fragment: &str, object_key: &str, node_id: &str, root_id: &str) ->
 }
 
 fn select_root_id(
+    pool_id: &str,
+    pool_generation: u64,
     fragment: &str,
     object_key: &str,
     node: &ClusterNode,
@@ -68,14 +92,28 @@ fn select_root_id(
     node.storage_roots
         .iter()
         .max_by(|left, right| {
-            root_score(fragment, object_key, &node.id, &left.id)
-                .cmp(&root_score(fragment, object_key, &node.id, &right.id))
-                .then_with(|| right.id.cmp(&left.id))
+            root_score(
+                pool_id,
+                pool_generation,
+                fragment,
+                object_key,
+                &node.id,
+                &left.id,
+            )
+            .cmp(&root_score(
+                pool_id,
+                pool_generation,
+                fragment,
+                object_key,
+                &node.id,
+                &right.id,
+            ))
+            .then_with(|| right.id.cmp(&left.id))
         })
         .map(|root| root.id.clone())
         .ok_or_else(|| {
             AppError::ServiceUnavailable(format!(
-                "blob node '{}' has no eligible storage root",
+                "server-pool node '{}' has no eligible storage root",
                 node.id
             ))
         })
@@ -85,6 +123,8 @@ pub fn build_placement_plan(
     fragment: &str,
     object_key: &str,
     version_id: &str,
+    pool_id: &str,
+    pool_generation: u64,
     membership_epoch: u64,
     layout: ClusterEcLayout,
     candidates: &[ClusterNode],
@@ -102,7 +142,12 @@ pub fn build_placement_plan(
 
     let mut scored = candidates
         .iter()
-        .map(|node| (placement_score(fragment, object_key, &node.id), node))
+        .map(|node| {
+            (
+                placement_score(pool_id, pool_generation, fragment, object_key, &node.id),
+                node,
+            )
+        })
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.id.cmp(&right.1.id)));
 
@@ -119,7 +164,7 @@ pub fn build_placement_plan(
                     ClusterShardRole::Parity
                 },
                 node_id: node.id.clone(),
-                root_id: select_root_id(fragment, object_key, node)?,
+                root_id: select_root_id(pool_id, pool_generation, fragment, object_key, node)?,
                 endpoint: node.endpoint.clone(),
                 native_endpoint: node.native_endpoint.clone(),
             })
@@ -130,23 +175,23 @@ pub fn build_placement_plan(
         fragment: fragment.to_string(),
         object_key: object_key.to_string(),
         version_id: version_id.to_string(),
+        pool_id: pool_id.to_string(),
+        pool_generation,
         membership_epoch,
         data_shards: layout.data_shards,
         parity_shards: layout.parity_shards,
         placements,
-        adaptive_without_rebalance: true,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::membership::{NodeRole, NodeState, StorageRoot};
+    use crate::distribution::membership::{NodeState, StorageRoot};
 
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.to_string(),
-            role: NodeRole::Blob,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
@@ -169,8 +214,10 @@ mod tests {
             data_shards: 2,
             parity_shards: 1,
         };
-        let left = build_placement_plan("frag", "obj", "ver", 7, layout, &nodes).unwrap();
-        let right = build_placement_plan("frag", "obj", "ver", 7, layout, &nodes).unwrap();
+        let left =
+            build_placement_plan("frag", "obj", "ver", "pool-a", 1, 7, layout, &nodes).unwrap();
+        let right =
+            build_placement_plan("frag", "obj", "ver", "pool-a", 1, 7, layout, &nodes).unwrap();
         assert_eq!(left, right);
         assert_eq!(left.placements.len(), 3);
         assert_eq!(left.placements[0].role, ClusterShardRole::Data);
@@ -184,8 +231,12 @@ mod tests {
             data_shards: 2,
             parity_shards: 1,
         };
-        let first = build_placement_plan("frag", "obj", "01VERSIONA", 7, layout, &nodes).unwrap();
-        let second = build_placement_plan("frag", "obj", "01VERSIONB", 7, layout, &nodes).unwrap();
+        let first =
+            build_placement_plan("frag", "obj", "01VERSIONA", "pool-a", 1, 7, layout, &nodes)
+                .unwrap();
+        let second =
+            build_placement_plan("frag", "obj", "01VERSIONB", "pool-a", 1, 7, layout, &nodes)
+                .unwrap();
         let first_nodes = first
             .placements
             .iter()

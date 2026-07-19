@@ -32,44 +32,6 @@ impl LifecycleState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NamespaceNode {
-    pub fragment: String,
-    pub node_id: String,
-    pub parent_node_id: Option<String>,
-    pub name: String,
-    pub kind: NamespaceEntryKind,
-    pub object_id: Option<String>,
-    pub head_version_id: Option<String>,
-    pub trashed_at_unix: Option<i64>,
-    #[serde(default)]
-    pub trash_entry_id: Option<String>,
-    pub restore_parent_path: Option<String>,
-    pub restore_name: Option<String>,
-    pub created_at_unix: i64,
-    pub updated_at_unix: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectRecord {
-    pub fragment: String,
-    pub object_id: String,
-    pub created_at_unix: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectVersionRecord {
-    pub fragment: String,
-    pub object_id: String,
-    pub version_id: String,
-    pub previous_version_id: Option<String>,
-    pub storage_object_id: String,
-    pub content_type: String,
-    pub total_size_bytes: u64,
-    pub stripe_size_bytes: u64,
-    pub created_at_unix: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceEntry {
     pub fragment: String,
     pub path: String,
@@ -101,21 +63,6 @@ pub struct ObjectHead {
     pub content_type: String,
     pub total_size_bytes: u64,
     pub lifecycle: LifecycleState,
-    pub created_at_unix: i64,
-    pub updated_at_unix: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NamespaceListEntry {
-    pub name: String,
-    pub path: String,
-    pub kind: NamespaceEntryKind,
-    pub lifecycle: LifecycleState,
-    pub object_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trash_entry_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deleted_at_unix: Option<i64>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }

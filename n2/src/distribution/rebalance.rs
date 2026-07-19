@@ -8,8 +8,8 @@ use crate::core::repair_manager::{
     ObjectLayoutStatus, RepairCheckMode, repair_cluster_object_recorded_layout,
 };
 use crate::distribution::layout::resolve_write_layout;
-use crate::distribution::membership::{ClusterRuntime, NodeRole, active_cluster_runtime};
-use crate::distribution::namespace::commit_upload_quorum;
+use crate::distribution::membership::{ClusterRuntime, active_cluster_runtime};
+use crate::distribution::namespace::commit_upload_pointer;
 use crate::distribution::peer::parse_peer_shard_locator;
 use crate::distribution::placement::{
     ClusterShardPlacement, ClusterShardRole, build_placement_plan,
@@ -73,8 +73,6 @@ pub struct ClusterRebalancePlan {
     pub data_shards: usize,
     pub parity_shards: usize,
     pub bounded_object_erasure_set: bool,
-    pub max_auto_data_shards: usize,
-    pub max_auto_parity_shards: usize,
     pub automatic_rebalance: bool,
     pub recommendation: String,
 }
@@ -116,9 +114,7 @@ static REPAIR_STATUS: LazyLock<Mutex<ClusterRewriteJobStatus>> =
     LazyLock::new(|| Mutex::new(ClusterRewriteJobStatus::default()));
 
 pub fn plan_rebalance(runtime: &ClusterRuntime) -> Result<ClusterRebalancePlan, AppError> {
-    let active_nodes = runtime
-        .membership
-        .active_write_nodes_for_role(NodeRole::Blob);
+    let active_nodes = runtime.membership.active_newest_pool_nodes();
     let layout = resolve_write_layout(
         active_nodes.len(),
         active_nodes.len(),
@@ -131,10 +127,8 @@ pub fn plan_rebalance(runtime: &ClusterRuntime) -> Result<ClusterRebalancePlan, 
         data_shards: layout.data_shards,
         parity_shards: layout.parity_shards,
         bounded_object_erasure_set: true,
-        max_auto_data_shards: runtime.layout_policy.auto_max_data_shards,
-        max_auto_parity_shards: runtime.layout_policy.auto_max_parity_shards,
         automatic_rebalance: false,
-        recommendation: "new objects use the current bounded layout; old objects stay on their recorded layout until explicit rebalance"
+        recommendation: "new objects use the newest pool's static layout; old objects stay on their exact recorded layout until explicit rebalance"
             .to_string(),
     })
 }
@@ -309,9 +303,7 @@ pub fn object_layout_status(
     meta: &ObjectMetadata,
     runtime: &ClusterRuntime,
 ) -> Result<ObjectLayoutStatus, AppError> {
-    let active = runtime
-        .membership
-        .active_write_nodes_for_role(NodeRole::Blob);
+    let active = runtime.membership.active_newest_pool_nodes();
     let layout = resolve_write_layout(active.len(), active.len(), &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
     let recorded_total_shards = meta
@@ -343,10 +335,15 @@ pub fn object_layout_status(
             mismatch_reasons.push("non-empty object has no recorded shard placement".to_string());
         }
     } else {
+        let target_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+            AppError::ServiceUnavailable("cluster has no writable server pool".into())
+        })?;
         let plan = build_placement_plan(
             &meta.fragment,
             &meta.object_key,
             &meta.version_id,
+            &target_pool.id,
+            target_pool.generation,
             runtime.membership.epoch,
             layout,
             &active,
@@ -575,7 +572,7 @@ pub async fn rewrite_object_to_current_layout(
             )));
         }
     };
-    commit_upload_quorum(&fragment, &logical_path, &object_id, &rewritten).await?;
+    commit_upload_pointer(&fragment, &logical_path, &object_id, &rewritten).await?;
     Ok(true)
 }
 
@@ -978,15 +975,14 @@ mod tests {
     use super::*;
     use crate::core::disk_manager::{PartMetadata, ShardInfo};
     use crate::distribution::membership::{
-        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION,
-        NamespaceCatalogLayout, NamespaceCatalogReplica, NodeRole, NodeState, StorageRoot,
+        ClusterMembership, ClusterNode, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState,
+        PoolState, ServerPool, StorageRoot,
     };
     use crate::distribution::peer::{PeerShardTarget, encode_peer_shard_locator};
 
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.into(),
-            role: NodeRole::Blob,
             endpoint: format!("http://{id}"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
@@ -1005,7 +1001,7 @@ mod tests {
     fn runtime(epoch: u64) -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "a".into(),
-            local_role: NodeRole::Blob,
+            local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: "membership.json".into(),
             layout_policy: crate::distribution::layout::ClusterLayoutPolicy::default(),
@@ -1013,24 +1009,16 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch,
-                policy: ClusterPolicy {
-                    namespace_redundancy: 2,
-                    object_data_shards: 2,
-                    object_parity_shards: 1,
-                },
-                namespace_catalog: NamespaceCatalogLayout {
+                pools: vec![ServerPool {
+                    id: "pool-a".into(),
                     generation: epoch,
-                    replicas: vec![
-                        NamespaceCatalogReplica {
-                            node_id: "a".into(),
-                            root_id: "root-a".into(),
-                        },
-                        NamespaceCatalogReplica {
-                            node_id: "b".into(),
-                            root_id: "root-b".into(),
-                        },
-                    ],
-                },
+                    policy: ClusterPolicy {
+                        object_data_shards: 2,
+                        object_parity_shards: 1,
+                    },
+                    state: PoolState::Writable,
+                    node_ids: vec!["a".into(), "b".into(), "c".into()],
+                }],
                 nodes: vec![node("a"), node("b"), node("c")],
             },
             auto_rebalance: false,
@@ -1048,6 +1036,8 @@ mod tests {
             content_type: "application/octet-stream".into(),
             total_size_bytes: 1,
             created_at: 0,
+            pool_id: "pool-a".into(),
+            pool_generation: epoch,
             membership_epoch: epoch,
             data_shards,
             parity_shards,
@@ -1058,15 +1048,15 @@ mod tests {
     }
 
     fn meta_matching_runtime(runtime: &ClusterRuntime) -> ObjectMetadata {
-        let active = runtime
-            .membership
-            .active_write_nodes_for_role(NodeRole::Blob);
+        let active = runtime.membership.active_newest_pool_nodes();
         let layout =
             resolve_write_layout(active.len(), active.len(), &runtime.layout_policy).unwrap();
         let plan = build_placement_plan(
             "frag",
             "obj",
             "v",
+            "pool-a",
+            runtime.membership.pools[0].generation,
             runtime.membership.epoch,
             layout,
             &active,
