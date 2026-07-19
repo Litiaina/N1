@@ -24,7 +24,7 @@ through its supported APIs or through the native client crate.
 
 ## Development Status
 
-- **Current engine/package version:** `3.2.2`
+- **Current engine/package version:** `3.3.0`
 - **Release channel:** development
 - **Storage engine format:** `3`
 - **Stable release for this engine line:** not yet declared
@@ -58,6 +58,7 @@ N1 separates mutable namespace/control state from immutable object truth.
   @f_<stable_fragment_id>/
     .fragment.ndx
     .trash/
+      <unix-nanos>.d<path-depth>/<original-logical-path>
     .uploads/
     <namespace paths>
 

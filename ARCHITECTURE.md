@@ -1,15 +1,15 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.2.2 development-engine storage contract. It is the reference for
+This document defines the N1 3.3.0 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.2.2 uses engine format 3 and preserves N1's immutable-object and
+N1 3.3.0 uses engine format 3 and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle,
 per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
-Version `3.2.2` identifies the current development package line; it does not
+Version `3.3.0` identifies the current development package line; it does not
 declare stable-release status. Engine format `3` is the independent on-disk
 compatibility boundary defined by this document.
 
@@ -52,8 +52,9 @@ receipts, trash, and the user namespace:
         part_p00000000000000000000.<crc32>.receipt
         shard_p00000000000000000000_s0000.<crc32>.receipt
     .trash/
-      docs/
-        deleted-video.mp4 -> @o_<object-id>
+      <unix-nanos>.d<path-depth>/
+        docs/
+          deleted-video.mp4 -> @o_<object-id>
 
     docs/
       video.mp4 -> @o_<object-id>
@@ -157,11 +158,13 @@ Namespace operations are therefore lightweight:
 
 These operations do not rewrite object metadata or EC payload.
 
-Each soft delete retains the same logical path below `.trash`; the filesystem
-modification time is its deletion timestamp. One logical path has one trash
-slot, so a repeated delete conflicts rather than overwriting recoverable data.
-Folder soft delete remains a constant-sized directory rename; descendants are
-inspected only if the folder reaches lifecycle expiry.
+Each soft delete retains the same logical path below a unique timestamp
+generation: `.trash/<unix-nanos>.d<path-depth>/<logical-path>`. The timestamp
+is the TTL authority and the path-depth suffix identifies the renamed anchor
+without a side record. Repeated deletion of one logical path creates another
+generation instead of colliding or overwriting recoverable data. Folder soft
+delete remains a constant-sized directory rename; descendants are inspected
+only if the folder reaches lifecycle expiry.
 
 There is no manual empty-trash or hard-delete operation in N1 3.2.0. Recovery
 is allowed while the physical trash entry exists. At or after the configured
@@ -401,16 +404,17 @@ into the current EC or placement policy.
 The namespace is reachability truth. Normal deletion reclamation is a targeted
 trash lifecycle operation, not a full object-plane scan:
 
-1. scan the physical logical paths under each fragment's `.trash`
-2. read deletion time from the trash entry's filesystem modification time
+1. scan the timestamp generation directories under each fragment's `.trash`
+2. read deletion time directly from each generation name
 3. retain entries younger than `trash_retention_seconds`
 4. collect exact object ids only for an expired file or expired subtree
 5. remove the expired namespace entry on each index replica
 6. verify all candidates once against the remaining live and trash namespace
 7. directly reclaim only unreferenced immutable object directories
 
-There are no lifecycle records, receipts, generations, or hidden per-delete
-containers. If the process stops after namespace reclamation but before object
+There are no lifecycle record files, receipts, databases, or temporary states;
+the generation directory and retained namespace entry are the complete state.
+If the process stops after namespace reclamation but before object
 reclamation, immutable data can only leak safely as an orphan; explicit deep GC
 detects and reclaims it. Earlier-engine trash entries are not adopted: N1
 requires freshly initialized format-3 fragments and fails closed when an
@@ -487,7 +491,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.2.2 is correct only while all of these remain true:
+N1 3.3.0 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -501,8 +505,8 @@ N1 3.2.2 is correct only while all of these remain true:
 10. Fragment rename never rewrites object metadata or payload.
 11. GC derives reachability from live and trash namespace state.
 12. Upload and download remain streaming and memory-bounded.
-13. Delete is exactly one live-path to `.trash/<same-logical-path>` rename per participating index root.
-14. Recovery is the reverse rename and remains possible while the physical trash path still exists.
+13. Delete reserves one timestamp generation and performs exactly one live-path to `.trash/<generation>/<same-logical-path>` rename per participating index root.
+14. Recovery is the reverse rename for one exact `trash_entry_id`; an occupied live destination returns `409 Conflict` and leaves trash unchanged.
 15. No public HTTP, native, POSIX, shell, or console operation can empty or purge trash early.
 16. Normal TTL reclamation scans `.trash`, not the complete immutable object plane.
 17. Namespace removal precedes physical reclamation, and a candidate object is deleted only when no live or trash reference remains.
@@ -511,9 +515,9 @@ N1 3.2.2 is correct only while all of these remain true:
 20. Recovery reads no object metadata and reports success only after at least one physical trash path moved back to live.
 21. Destination conflicts are checked on all participating roots before publication; ordinary live rename remains one atomic filesystem rename per participating index root.
 22. User paths are normalized and reserved internal path segments or parent traversal are rejected.
-23. Ordinary mkdir, rename, move, trash, and recover do not add synchronous record writes, generation writes, or parent-directory fsync barriers; XFS/POSIX namespace semantics remain the foreground durability model.
+23. Ordinary mkdir, rename, move, trash, and recover do not add synchronous record files, databases, journals, or parent-directory fsync barriers; XFS/POSIX namespace semantics remain the foreground durability model.
 24. Recursive continuation tokens filter object entries but never prune a directory whose descendants may sort after the token.
-25. One logical path has one trash slot; a repeated delete conflicts until that slot is recovered or TTL-reclaimed.
+25. Every delete owns a unique timestamp generation; repeated file and directory deletion at the same logical path remains independently recoverable.
 26. Replica health compares deterministic namespace/control content in addition to record counts.
 27. Namespace mutations do not write or consult an authority-generation record and cannot be blocked by generation disagreement.
 28. Equal-size replicas that reference the same object identities may be reconciled from the latest filesystem namespace mutation; different object-identity sets fail closed instead of being destructively repaired.

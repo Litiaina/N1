@@ -107,9 +107,9 @@ SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_rele
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
-## N1 3.2.0 Development Release Requirement
+## N1 3.3.0 Development Release Requirement
 
-N1 3.2.0 must retain every N1 2.0 storage invariant and additionally prove:
+N1 3.3.0 must retain the engine-format-3 storage invariants and additionally prove:
 
 - delete is soft-only across HTTP, POSIX, native protocol, shell, and console
 - each deletion receives a unique trash entry id
@@ -117,10 +117,11 @@ N1 3.2.0 must retain every N1 2.0 storage invariant and additionally prove:
 - recovery succeeds before TTL and fails closed after TTL
 - manual GC cannot shorten trash retention
 - normal lifecycle scans `.trash` rather than the complete blob plane
-- expiry writes a replayable receipt before removing namespace reachability
+- expiry derives its deadline from the timestamp generation and removes no live namespace path
 - exact object ids are reclaimed directly only after live/trash reference verification
 - folder delete remains a directory rename and descendant inspection is deferred until expiry
-- N1 2.x and unversioned fragment metadata fail closed; N1 3.2.0 performs no compatibility adoption or migration
+- strict recovery returns `409 Conflict` without consuming trash when the live destination exists
+- legacy 3.2 direct-path trash is migrated offline before a 3.3 binary starts; live namespace and blob data do not move
 
 Evidence for the current release belongs under `/home/wlzambo/DEV-TEST` and
 must record the exact binary hash, configuration, disk topology, commands,

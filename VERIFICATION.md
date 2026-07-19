@@ -2,7 +2,7 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.2.2` on the development channel, using
+The current package line is N1 `3.3.0` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
 line. Dated evidence names below remain unchanged because they identify the
 exact candidate binaries and runs that produced them.
@@ -17,7 +17,7 @@ Before an LTS release, N1 should pass:
 - download hash match
 - range/view streaming
 - CRUD and POSIX namespace operations
-- direct-path trash, pre-TTL recover, TTL expiry, targeted reclamation, and removed purge surfaces
+- generational trash, strict pre-TTL recover, TTL expiry, targeted reclamation, and removed purge surfaces
 - recover-on-read after one disk is wiped
 - repair after simulated disk loss or reformat
 - autonomous repair after recoverable data- and parity-shard loss
@@ -437,6 +437,48 @@ Evidence is retained at:
 - `/home/wlzambo/DEV-TEST/n1-3.1.1-self-healing-coverage-20260715/REPORT.md`
 - `/home/wlzambo/DEV-TEST/n1-3.1.1-four-disk-self-healing-20260715-103538/REPORT.md`
 - `/home/wlzambo/DEV-TEST/n1-3.1.1-four-disk-self-healing-20260715-103538/final-results/summaries/`
+
+## N1 3.3.0 Generational Trash Evidence
+
+N1 3.3.0 changes only the format-3 trash namespace. Every deletion receives a
+timestamp generation directory containing the unchanged logical path. This
+removes same-path delete collisions without adding `.entries`, `.records`, a
+database, a journal, or a foreground subtree scan. Live namespace paths,
+immutable object metadata, EC layouts, and blob payload placement are unchanged.
+
+| Edge case | Locked invariant | Regression proof | Status |
+| --- | --- | --- | --- |
+| The same file path is uploaded and deleted repeatedly | Every delete has a distinct `trash_entry_id`; neither retained generation is overwritten | `n1_repeated_delete_creates_independent_generations_and_recover_stays_strict` | PASS |
+| The same directory path is recreated and deleted repeatedly | Each directory remains one rename and every retained generation remains independently addressable | `n1_repeated_directory_delete_keeps_each_generation_recoverable` | PASS |
+| Recovery destination already exists | Exact-id and path recovery return `409 Conflict` and leave the retained generation unchanged | repeated file and directory generation tests | PASS |
+| TTL expires one generation | Lifecycle scans `.trash` generations only and reclaims exact objects only after remaining-reference verification | `n1_soft_delete_ttl_reclaims_only_after_namespace_expiry`, `n1_ttl_reclaim_preserves_an_object_still_referenced_live` | PASS |
+| Recover races TTL | One filesystem rename/removal wins without a namespace lifecycle lock; reachable object data survives | `n1_recover_and_ttl_sweep_race_preserves_data_without_a_namespace_lock` | PASS |
+| A 3.2 deployment already has trash entries | The offline migration validates every replica before moving trash anchors; it never touches live namespace or blob paths | `scripts/migrate-n1-3.3-trash.sh` synthetic three-root dry-run/apply proof | PASS |
+
+The complete workspace and production-deployment results are recorded after the
+bounded release test and live deployment below. Historical N1 3.2.2 evidence
+remains unchanged because it describes the exact earlier binary and layout.
+
+### N1 3.3.0 Test And Production Deployment
+
+On July 19, 2026, warning-as-error N1 all-target tests passed `132/132`, the
+complete workspace tests passed, and N1 Shell integration tests passed `7/7`.
+The release binary reported `litiaina-n1 3.3.0` with SHA-256
+`c77e88b0a51bc959a360231d43f133366ee86c4cb1f7962486dc628aa0843a7b`.
+
+Production deployment on `192.168.0.36` stopped `litiaina-n1`, backed up the
+3.2.2 binary, configuration, environment, and all existing trash namespace
+replicas under
+`/var/lib/litiaina/n1/backups/n1-3.3.0-20260719-063051`, then migrated six
+legacy trash anchors across `/mnt/NDISK001`, `/mnt/NDISK002`, and
+`/mnt/NDISK003`. The preflight proved every anchor type, symlink target, or
+directory tree identical across the three replicas before the first move.
+Before/after hashes excluding `.trash`, `.objects`, and `.uploads` were
+byte-identical on every root, proving the migration changed no live namespace
+path. The deployed production-only retention is `86400` seconds. The service
+restarted active on `0.0.0.0:50001` and `0.0.0.0:50002`; its deployed binary
+hash matched the tested release, all trash-replica hashes matched, and the
+post-start journal contained no warning-or-higher entry.
 
 ## N1 3.2.2 Namespace And Lifecycle Evidence
 

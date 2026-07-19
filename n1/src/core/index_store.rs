@@ -93,6 +93,17 @@ pub(crate) struct TrashRecord {
     pub deleted_at_unix: i64,
 }
 
+pub(crate) fn trash_generation_name(unix_nanos: i64, path_depth: usize) -> String {
+    format!("{unix_nanos}.d{path_depth}")
+}
+
+pub(crate) fn parse_trash_generation_name(name: &str) -> Option<(i64, usize)> {
+    let (unix_nanos, path_depth) = name.rsplit_once(".d")?;
+    let unix_nanos = unix_nanos.parse::<i64>().ok()?;
+    let path_depth = path_depth.parse::<usize>().ok()?;
+    (unix_nanos >= 0 && path_depth > 0).then_some((unix_nanos, path_depth))
+}
+
 #[derive(Debug, Clone)]
 struct NdxSummary {
     version_id: String,
@@ -1516,9 +1527,83 @@ pub(crate) fn remove_trash_payload(fragment: &str, record: &TrashRecord) -> Resu
                 Err(err) => return Err(io_err(err, "remove N1 expired trash directory")),
             }
         }
+        let trash_root = fragment_root_on(&root, fragment).join(TRASH_DIR);
+        let mut parent = payload.parent();
+        while let Some(directory) = parent {
+            if directory == trash_root {
+                break;
+            }
+            match fs::remove_dir(directory) {
+                Ok(()) => parent = directory.parent(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    parent = directory.parent();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                Err(err) => return Err(io_err(err, "prune N1 trash generation")),
+            }
+        }
         removed_primary = true;
     }
     Ok(removed_primary)
+}
+
+fn trash_generation_anchor(
+    generation_root: &Path,
+    path_depth: usize,
+) -> Result<(PathBuf, String), AppError> {
+    let mut current = generation_root.to_path_buf();
+    let mut components = Vec::with_capacity(path_depth);
+    for position in 0..path_depth {
+        let names = read_dir_names(&current)?;
+        if names.len() != 1 {
+            return Err(AppError::InternalServerError(format!(
+                "N1 trash generation '{}' has {} entries at logical path depth {}; expected exactly one",
+                generation_root.display(),
+                names.len(),
+                position
+            )));
+        }
+        let name = names.into_iter().next().expect("one trash path component");
+        components.push(name.clone());
+        current = current.join(name);
+        if position + 1 < path_depth && !current.is_dir() {
+            return Err(AppError::InternalServerError(format!(
+                "N1 trash generation '{}' ends before its declared logical path depth {}",
+                generation_root.display(),
+                path_depth
+            )));
+        }
+    }
+    Ok((current, components.join("/")))
+}
+
+fn collect_trash_object_refs(
+    index_root: &Path,
+    fragment: &str,
+    anchor: &Path,
+) -> Result<(Vec<String>, Vec<String>), AppError> {
+    let mut object_keys = BTreeSet::new();
+    let mut version_ids = BTreeSet::new();
+    let mut stack = vec![anchor.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for name in read_dir_names(&directory)? {
+            let child = directory.join(name);
+            if let Some(object_id) = read_namespace_symlink_object_id(index_root, fragment, &child)?
+            {
+                if object_keys.insert(object_id.clone()) {
+                    for metadata in list_live_versions(fragment, &object_id)? {
+                        version_ids.insert(metadata.version_id);
+                    }
+                }
+            } else if child.is_dir() {
+                stack.push(child);
+            }
+        }
+    }
+    Ok((
+        object_keys.into_iter().collect(),
+        version_ids.into_iter().collect(),
+    ))
 }
 
 pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
@@ -1530,56 +1615,70 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
             .unwrap_or(&fragment_root)
             .to_path_buf();
         let trash_root = fragment_root.join(TRASH_DIR);
-        let mut stack = vec![(trash_root, String::new())];
-        while let Some((dir, relative)) = stack.pop() {
-            if !dir.is_dir() {
+        if !trash_root.is_dir() {
+            continue;
+        }
+        for generation in read_dir_names(&trash_root)? {
+            let Some((unix_nanos, path_depth)) = parse_trash_generation_name(&generation) else {
+                return Err(AppError::InternalServerError(format!(
+                    "N1 trash entry '{}' uses the pre-3.3 layout; migrate it before starting N1 3.3",
+                    trash_root.join(&generation).display()
+                )));
+            };
+            if !seen.insert(generation.clone()) {
                 continue;
             }
-            for name in read_dir_names(&dir)? {
-                if internal_namespace_entry_name(&name) {
-                    continue;
-                }
-                let child = dir.join(&name);
-                let child_relative = if relative.is_empty() {
-                    name
-                } else {
-                    format!("{relative}/{name}")
-                };
-                if let Some(object_id) =
-                    read_namespace_symlink_object_id(&index_root, fragment, &child)?
-                {
-                    if !seen.insert(child_relative.clone()) {
-                        continue;
-                    }
-                    let mut version_ids = list_live_versions(fragment, &object_id)?
-                        .into_iter()
-                        .map(|metadata| metadata.version_id)
-                        .collect::<Vec<_>>();
-                    version_ids.sort();
-                    version_ids.dedup();
-                    let deleted_at_unix = fs::symlink_metadata(&child)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_secs() as i64)
-                        .unwrap_or_else(|| Utc::now().timestamp());
-                    out.push(TrashRecord {
-                        trash_entry_id: child_relative.clone(),
-                        original_path: child_relative.clone(),
-                        source_relative_path: child_relative,
-                        kind: TrashKind::File,
-                        object_keys: vec![object_id],
-                        version_ids,
-                        deleted_at_unix,
-                    });
-                } else if child.is_dir() {
-                    stack.push((child, child_relative));
-                }
+            let generation_root = trash_root.join(&generation);
+            if !generation_root.is_dir() {
+                return Err(AppError::InternalServerError(format!(
+                    "N1 trash generation '{}' is not a directory",
+                    generation_root.display()
+                )));
             }
+            let (anchor, original_path) = trash_generation_anchor(&generation_root, path_depth)?;
+            let metadata = fs::symlink_metadata(&anchor)
+                .map_err(|err| io_err(err, "inspect N1 trash generation anchor"))?;
+            let (kind, object_keys, version_ids) = if let Some(object_id) =
+                read_namespace_symlink_object_id(&index_root, fragment, &anchor)?
+            {
+                let mut versions = list_live_versions(fragment, &object_id)?
+                    .into_iter()
+                    .map(|metadata| metadata.version_id)
+                    .collect::<Vec<_>>();
+                versions.sort();
+                versions.dedup();
+                (TrashKind::File, vec![object_id], versions)
+            } else if metadata.is_dir() {
+                let (objects, versions) =
+                    collect_trash_object_refs(&index_root, fragment, &anchor)?;
+                (TrashKind::Directory, objects, versions)
+            } else if metadata.is_file() {
+                (TrashKind::File, Vec::new(), Vec::new())
+            } else {
+                return Err(AppError::InternalServerError(format!(
+                    "N1 trash generation anchor '{}' has an unsupported file type",
+                    anchor.display()
+                )));
+            };
+            let source_relative_path = format!("{generation}/{original_path}");
+            out.push(TrashRecord {
+                trash_entry_id: source_relative_path.clone(),
+                original_path,
+                source_relative_path,
+                kind,
+                object_keys,
+                version_ids,
+                deleted_at_unix: unix_nanos / 1_000_000_000,
+            });
         }
         break;
     }
-    out.sort_by(|a, b| a.source_relative_path.cmp(&b.source_relative_path));
+    out.sort_by(|a, b| {
+        a.original_path
+            .cmp(&b.original_path)
+            .then_with(|| a.deleted_at_unix.cmp(&b.deleted_at_unix))
+            .then_with(|| a.trash_entry_id.cmp(&b.trash_entry_id))
+    });
     Ok(out)
 }
 
@@ -3671,10 +3770,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!version_ids.is_empty());
 
+        let generation = trash_generation_name(Utc::now().timestamp_nanos_opt().unwrap(), 2);
+
         for root in &roots {
             let fragment_root = fragment_root_on(root, &fragment);
             let source = fragment_root.join(logical_path);
-            let destination = fragment_root.join(TRASH_DIR).join(logical_path);
+            let destination = fragment_root
+                .join(TRASH_DIR)
+                .join(&generation)
+                .join(logical_path);
             fs::create_dir_all(destination.parent().expect("trash parent"))
                 .expect("create trash payload parent");
             fs::rename(source, destination).expect("move namespace link into trash");
@@ -3701,9 +3805,14 @@ mod tests {
         let logical_path = "archive/nested/report.bin";
         let object_id = publish_logical_object(&roots, &fragment, logical_path, 73);
 
+        let generation = trash_generation_name(Utc::now().timestamp_nanos_opt().unwrap(), 1);
+
         for root in &roots {
             let fragment_root = fragment_root_on(root, &fragment);
-            let destination = fragment_root.join(TRASH_DIR).join("archive");
+            let destination = fragment_root
+                .join(TRASH_DIR)
+                .join(&generation)
+                .join("archive");
             fs::create_dir_all(destination.parent().expect("trash parent"))
                 .expect("create trash payload parent");
             fs::rename(fragment_root.join("archive"), destination)

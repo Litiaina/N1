@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 3.2.2 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.3.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -10,7 +10,7 @@ notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Version And Release Status
 
-N1 `3.2.2` is the current development engine/package version. It is on the
+N1 `3.3.0` is the current development engine/package version. It is on the
 development release channel and is not a declaration that this engine line has
 reached its stable product milestone. Storage compatibility is tracked
 separately as engine format `3`; package updates within this development line
@@ -27,7 +27,7 @@ the current package version advances to `3.2.0`.
 - **Namespace:** The user-facing tree of folders and files. This is what `/noa/v1/posix/*` and the UI show.
 - **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
 - **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
-- **Trash:** Soft delete renames a live entry directly to `.trash/<same-logical-path>`. Recover performs the reverse rename. The trash entry's filesystem modification time is its deletion time; configured TTL expiry removes the namespace entry and reclaims only safely unreferenced immutable objects.
+- **Trash:** Every soft delete reserves one timestamp generation and renames the live file or directory to `.trash/<unix-nanos>.d<path-depth>/<same-logical-path>`. Repeated deletion of the same path therefore cannot collide. Recovery moves one selected generation back to its original path and returns `409 Conflict` if that live destination exists. Configured TTL expiry removes the generation and reclaims only safely unreferenced immutable objects.
 - **Repair:** Rebuilds missing namespace/control replicas, immutable object metadata placements, and shard/parity payload when enough data remains.
 - **Redistribution:** Explicitly rewrites selected object versions into the current blob/EC topology. Existing objects remain valid under their recorded topology until redistributed.
 
@@ -211,6 +211,7 @@ N1 3.2.0 separates the mutable fragment alias, namespace/control plane, and immu
     .fragment.ndx
     .uploads/
     .trash/
+      <unix-nanos>.d<path-depth>/<original-logical-path>
     <namespace directories>
 
 <blob_root>/
@@ -1187,11 +1188,11 @@ Query parameters:
 
 ## Trash And Recovery
 
-Soft delete renames a file or folder directly from its live path to `.trash/<same-logical-path>` on every index root. Live listing no longer shows it. The trash entry itself is the complete lifecycle state: its path preserves the recovery destination and its filesystem modification time is the deletion time. There are no per-delete records, ids, generations, or hidden payload containers.
+Soft delete reserves one filesystem directory named `<unix-nanos>.d<path-depth>` and renames a file or folder from its live path to `.trash/<generation>/<same-logical-path>` on every index root. Live listing no longer shows it. The generation name supplies deletion time and the retained path supplies the exact recovery destination. There is no lifecycle database, record file, receipt, or temporary state.
 
-Recovery is the reverse rename and remains available while the physical trash entry exists. Folder soft delete and recovery remain directory renames; N1 does not scan descendants until a retained folder reaches expiry.
+Each delete has a distinct `trash_entry_id`, so the same logical path may be deleted repeatedly without overwriting older recoverable data. Recovery selects that id, performs the reverse rename, and returns `409 Conflict` without changing trash if the live destination already exists. Folder soft delete and recovery remain directory renames; N1 does not scan descendants until a retained folder reaches expiry.
 
-The background lifecycle scans `.trash`, not the full blob plane. It compares each trash entry's filesystem modification time with `trash_retention_seconds`. For expired entries it removes the namespace reference, verifies all candidate object ids once against the remaining namespace, and directly reclaims only unreferenced immutable object directories. A crash can leave only safe immutable orphan data; explicit deep GC reclaims that leak without risking reachable objects.
+The background lifecycle scans only timestamp generations below `.trash`, not the full blob plane. It compares each generation timestamp with `trash_retention_seconds`. For expired entries it removes the namespace reference, verifies all candidate object ids once against the remaining namespace, and directly reclaims only unreferenced immutable object directories. A crash can leave only safe immutable orphan data; explicit deep GC reclaims that leak without risking reachable objects.
 
 N1 3.2.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
 
@@ -1512,7 +1513,7 @@ curl -k "$BASE/noa/v1/maintenance/fragments/$FRAGMENT/health?deep_scan=true&refr
 
 ### Trash recovery path
 
-Trash recovery is path based. Send the path shown by trash listing.
+Trash listing returns both the original path and `trash_entry_id`. Send the id to recover one exact deletion generation. Path-only recovery selects the newest retained generation for that path. Recovery remains strict and returns `409 Conflict` when the original live path is occupied.
 
 ```json
 { "path": "videos" }
