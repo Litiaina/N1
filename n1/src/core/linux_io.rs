@@ -324,6 +324,14 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ec::{ALIGNMENT, AlignedBuffer};
+
+    fn direct_io_block(value: u8) -> AlignedBuffer {
+        let mut block = AlignedBuffer::new(ALIGNMENT);
+        block.extend_from_slice(&vec![value; ALIGNMENT]);
+        assert_eq!(block.as_slice().as_ptr() as usize % ALIGNMENT, 0);
+        block
+    }
 
     #[test]
     fn pwrite_and_pread_are_positioned() {
@@ -332,19 +340,22 @@ mod tests {
         let path = root.join("positioned.bin");
 
         let file = open_direct_write_blocking(&path).expect("open direct write");
-        file.set_len(8192).expect("preallocate");
-        pwrite_all_at(&file, &[1u8; 4096], 0).expect("write first block");
-        pwrite_all_at(&file, &[2u8; 4096], 4096).expect("write second block");
+        file.set_len((ALIGNMENT * 2) as u64).expect("preallocate");
+        let first_block = direct_io_block(1);
+        let second_block = direct_io_block(2);
+        pwrite_all_at(&file, first_block.as_slice(), 0).expect("write first block");
+        pwrite_all_at(&file, second_block.as_slice(), ALIGNMENT as u64)
+            .expect("write second block");
         fdatasync_blocking(&file).expect("sync data");
         drop(file);
 
         let file = open_read_blocking(&path).expect("open read");
-        let mut first = vec![0u8; 4096];
-        let mut second = vec![0u8; 4096];
-        pread_exact_at(&file, &mut second, 4096).expect("read second");
+        let mut first = vec![0u8; ALIGNMENT];
+        let mut second = vec![0u8; ALIGNMENT];
+        pread_exact_at(&file, &mut second, ALIGNMENT as u64).expect("read second");
         pread_exact_at(&file, &mut first, 0).expect("read first");
-        assert_eq!(first, vec![1u8; 4096]);
-        assert_eq!(second, vec![2u8; 4096]);
+        assert_eq!(first, vec![1u8; ALIGNMENT]);
+        assert_eq!(second, vec![2u8; ALIGNMENT]);
 
         let _ = std::fs::remove_dir_all(root);
     }
