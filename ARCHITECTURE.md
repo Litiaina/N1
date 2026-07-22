@@ -1,15 +1,19 @@
-# N2 3.0 Architecture
+# N2 3.1 Architecture
 
 ## Status
 
-This document is the locked implementation contract for N2 3.0. N2 3.0 is a
-clean engine generation. It does not read, migrate, or maintain compatibility
-with the N2 2.0 inode namespace.
+This document is the locked implementation contract for N2 3.1, the current
+release of the clean N2 3.x engine generation. It does not read, migrate, or
+maintain compatibility with the N2 2.0 inode namespace.
+
+N2 3.1 accepts only the generation-directory trash layout defined here. A
+pre-3.1 `.ncnx.trashed.*` entry is rejected rather than ignored or guessed;
+upgrade only after the older trash scope is empty.
 
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.0 combines:
+N2 3.1 combines:
 
 - immutable, object-level erasure sets;
 - flat physical-key namespace records;
@@ -93,7 +97,7 @@ uses its recorded pool layout, never a guess based on the newest membership.
 
 ## Unified Nodes And Disks
 
-Every N2 3.0 node is bidirectional and unified. Any healthy node may receive a
+Every N2 3.1 node is bidirectional and unified. Any healthy node may receive a
 client operation and coordinate it. Every pool node may also persist the data
 assigned to it:
 
@@ -118,7 +122,7 @@ authority.
 
 ## Disk Layout
 
-Each enrolled storage root uses the same N2 3.0 format:
+Each enrolled storage root uses the same N2 3.1 format:
 
 ```text
 <storage_root>/
@@ -132,8 +136,9 @@ Each enrolled storage root uses the same N2 3.0 format:
       videos/
         video.mp4.ncnx
     .trash/
-      videos/
-        video.mp4.ncnx.trashed.<unix-nanos>.<mutation-ulid>
+      <unix-nanos>.<mutation-ulid>/
+        videos/
+          video.mp4.ncnx
     .uploads/
     .objects/
       ab/
@@ -228,7 +233,7 @@ recorded layout. Adding disks, nodes, or pools cannot remap an existing object.
 
 ## Key Semantics
 
-N2 3.0 is a flat object-key namespace with prefix presentation:
+N2 3.1 is a flat object-key namespace with prefix presentation:
 
 ```text
 videos/a.mp4
@@ -314,7 +319,8 @@ both live names, which is safe and retryable. It must never leave neither name.
 ```text
 read and validate live NCNX
 -> copy to all deterministic trash holders
--> trash filename records deletion time and mutation ULID
+-> one generation directory records deletion time and mutation ULID
+-> preserve the unchanged logical NCNX path below that directory
 -> fsync trash records and parents
 -> remove only the exact expected live records
 -> fsync live parents
@@ -324,7 +330,7 @@ read and validate live NCNX
 
 ```text
 read and validate trash NCNX
--> reject a conflicting live destination
+-> reject any existing live destination
 -> publish all R live NCNX replicas
 -> remove only the recovered trash mutation records
 ```
@@ -349,23 +355,31 @@ same operation completes remaining keys.
 Trash records use zero-decode expiry names:
 
 ```text
-<logical-name>.ncnx.trashed.<unix-nanos>.<mutation-ulid>
+<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx
 ```
 
 GC scans `.trash` only for normal lifecycle work. It reads expiry from the
-filename and builds a temporary live object-ID set from canonical live NCNX
-records.
+generation directory name and builds temporary live and unexpired-trash
+object-ID sets from canonical NCNX records.
 
 For each expired trash record:
 
-1. if any live NCNX points to the same object, remove only that expired trash
-   record;
-2. if no live NCNX points to it, reclaim the exact recorded immutable object;
+1. if any live or unexpired trash NCNX points to the same object, remove only
+   that expired trash record;
+2. if no live or unexpired trash NCNX points to it, reclaim the exact recorded
+   immutable object;
 3. remove the trash NCNX last.
 
-The invariant is **live wins over trash**. Copy/move can leave several live
-keys for one object without risking reclamation. Repeated deletes can leave
-several trash mutations without name collision.
+The invariant is **live or unexpired trash wins over expired trash**.
+Copy/move can leave several live keys for one object without risking
+reclamation. Repeated deletes create independent generation directories and
+cannot collide. A prefix delete uses one generation directory across every
+key and every deterministic NCNX replica.
+
+Recovery is strict. If the logical key exists live, recovery returns a
+conflict and preserves both records. Otherwise it publishes live NCNX first,
+removes only the selected trash record, and prunes its generation directory
+only when that directory becomes empty.
 
 Autonomous healing may inventory immutable objects to report headless data, but
 it preserves those objects because absence of a namespace reference does not
@@ -456,7 +470,7 @@ authentication databases or user-visible endpoints.
 
 ## Performance Contract
 
-Every N2 3.0 release proof records:
+Every N2 3.1 release proof records:
 
 - operation latency distributions in microseconds/milliseconds;
 - CPU utilization and cycles when host permissions support hardware counters;
@@ -480,7 +494,7 @@ Fast output with hidden global scans or object-data reads is a failure.
 
 ## Release Gates
 
-N2 3.0 is not declared production-stable until the following are proven:
+N2 3.1 is not declared production-stable until the following are proven:
 
 - exact `K + M` shard placement and exact `M + 1` NCNX replication;
 - upload, GET, HEAD, LIST, copy/move, trash, recover, and prefix operations;

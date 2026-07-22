@@ -1,16 +1,17 @@
-# N2 3.0 Testing
+# N2 3.1 Testing
 
 This document is the single correctness and resilience record for the current
-N2 3.0 engine. It covers test scope, procedures, results, failures, fixes, and
+N2 3.1 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Qualification Boundary
 
-N2 3.0 is a clean engine and format. These results qualify only the flat NCNX
-namespace, format-v3 static server pools, immutable NCDX/object layouts,
-copy/delete lifecycle, and healing implementation tested here. N2 1.x and 2.x
-results are historical and do not qualify the 3.0 disk format.
+N2 3.1 retains the clean format-v3 engine, flat NCNX namespace, static server
+pools, immutable NCDX/object layouts, and healing model. Its lifecycle stores
+one delete mutation under
+`.trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx`. N2 1.x and 2.x
+results are historical and do not qualify the 3.x disk format.
 
 The tests use four logical nodes over two physical hosts. They exercise the
 configured `2 + 2` EC loss boundary, but four logical processes on two hosts
@@ -18,7 +19,17 @@ are not four independent host, power, network, or rack failure domains.
 
 ## Repository Gates
 
-The N2 3.0 implementation has passed:
+The N2 3.1 implementation has passed:
+
+- `cargo fmt --all -- --check`;
+- `cargo check --workspace --all-targets`;
+- `cargo test -p n2`: 121 passed;
+- `cargo test --workspace --lib --bins --tests`: 254 passed, 8 ignored;
+- optimized `cargo build -p n2 --release`;
+- release-proof shell syntax and `git diff --check`;
+- finite four-node `2 + 2` proof with the 3.1 generation lifecycle.
+
+The N2 3.0 implementation previously passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets` before the lifecycle regression;
@@ -30,6 +41,30 @@ The N2 3.0 implementation has passed:
 - `git diff --check`.
 
 Documentation-only changes do not alter these engine results.
+
+## N2 3.1 Generation Lifecycle Proof
+
+Authoritative evidence directory:
+
+```text
+/home/wlzambo/DEV-TEST/N2-3.0-proof-20260722-041213
+```
+
+The retained format-v3 proof harness predates the 3.1 package label, but this
+run used the N2 `3.1.0` release binary and its `summary.json` result is `PASS`.
+
+| Test | Result |
+| --- | --- |
+| Same logical key deleted in two generations | PASS; distinct mutation ULIDs |
+| Physical generation placement | PASS; old generation present on all 3 deterministic NCNX holders |
+| Recover while a live key exists | PASS; HTTP 409 and new live bytes unchanged |
+| Recover selected second generation | PASS; exact new bytes restored |
+| Prefix trash generation and recovery | PASS; 2 of 2 keys restored as one group |
+| TTL GC | PASS; 2 expired versions reclaimed, 0 errors, GET returned 404 |
+| NCNX auto-healing | PASS; deleted replica recreated |
+| Object auto-healing | PASS; deleted shard recreated |
+| Full four-node restart | PASS; committed object remained byte-exact |
+| Suspicious engine log lines | 0 |
 
 ## Finite Release Proof
 

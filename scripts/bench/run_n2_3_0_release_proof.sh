@@ -335,6 +335,42 @@ curl_json -X POST "$C_BASE/noa/v1/posix/recover" -H "Authorization: Bearer $TOKE
   -d "{\"path\":\"group\",\"trash_entry_id\":\"$TRASH_ID\"}" > "$OUT/group-recover.json"
 jq -e '.affected == 2 and .kind == "directory"' "$OUT/group-recover.json" >/dev/null
 
+# N2 3.1 generational trash: a new live object makes recovery conflict, the
+# old trash generation remains intact, and deleting the same key again creates
+# another generation without a physical-name collision.
+printf 'collision-old' > "$OUT/collision-old.bin"
+printf 'collision-new' > "$OUT/collision-new.bin"
+curl_auth -X POST "$A_BASE/noa/v1/upload/one-shot/collision/recover.txt" \
+  --data-binary @"$OUT/collision-old.bin" > "$OUT/collision-old-upload.json"
+curl_json -X POST "$B_BASE/noa/v1/posix/trash" -H "Authorization: Bearer $TOKEN" \
+  -d '{"path":"collision/recover.txt"}' > "$OUT/collision-first-trash.json"
+COLLISION_FIRST_ID="$(jq -er '.trash_entry_id' "$OUT/collision-first-trash.json")"
+curl_auth -X POST "$C_BASE/noa/v1/upload/one-shot/collision/recover.txt" \
+  --data-binary @"$OUT/collision-new.bin" > "$OUT/collision-new-upload.json"
+COLLISION_RECOVER_STATUS="$(curl -k --http1.1 -sS -o "$OUT/collision-recover-conflict.json" -w '%{http_code}' \
+  -X POST "$D_BASE/noa/v1/posix/recover" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"path\":\"collision/recover.txt\",\"trash_entry_id\":\"$COLLISION_FIRST_ID\"}")"
+[[ "$COLLISION_RECOVER_STATUS" == "409" ]]
+curl_auth -G "$A_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=collision/recover.txt' -o "$OUT/collision-live-after-conflict.bin"
+cmp -s "$OUT/collision-new.bin" "$OUT/collision-live-after-conflict.bin"
+curl_auth -X DELETE "$B_BASE/noa/v1/objects/collision/recover.txt" > "$OUT/collision-second-trash.json"
+COLLISION_SECOND_ID="$(jq -er '.trash_entry_id' "$OUT/collision-second-trash.json")"
+[[ "$COLLISION_FIRST_ID" != "$COLLISION_SECOND_ID" ]]
+curl_json -X POST "$C_BASE/noa/v1/posix/recover" -H "Authorization: Bearer $TOKEN" \
+  -d "{\"path\":\"collision/recover.txt\",\"trash_entry_id\":\"$COLLISION_SECOND_ID\"}" \
+  > "$OUT/collision-second-recover.json"
+curl_auth -G "$D_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=collision/recover.txt' -o "$OUT/collision-live-after-recover.bin"
+cmp -s "$OUT/collision-new.bin" "$OUT/collision-live-after-recover.bin"
+find "$LOCAL_A_STORE" "$LOCAL_B_STORE" -path '*/.trash/*/collision/recover.txt.ncnx' -type f \
+  > "$OUT/collision-trash-local.txt"
+remote "find '$REMOTE_C_STORE' '$REMOTE_D_STORE' -path '*/.trash/*/collision/recover.txt.ncnx' -type f" \
+  > "$OUT/collision-trash-remote.txt"
+COLLISION_TRASH_COUNT=$(( $(wc -l < "$OUT/collision-trash-local.txt") + $(wc -l < "$OUT/collision-trash-remote.txt") ))
+[[ "$COLLISION_TRASH_COUNT" -eq 3 ]]
+
 printf 'overwrite-v1' > "$OUT/overwrite-v1.bin"
 printf 'overwrite-v2' > "$OUT/overwrite-v2.bin"
 curl_auth -X POST "$A_BASE/noa/v1/upload/one-shot/overwrite.txt" --data-binary @"$OUT/overwrite-v1.bin" > "$OUT/overwrite-v1.json"
@@ -404,8 +440,8 @@ percentiles "$OUT/list-latency.txt" "$OUT/list-latency.json"
 percentiles "$OUT/stat-latency.txt" "$OUT/stat-latency.json"
 percentiles "$OUT/rename-latency.txt" "$OUT/rename-latency.json"
 
-find "$LOCAL_A_STORE" "$LOCAL_B_STORE" -path '*/.trash/videos/main*.ncnx.trashed.*' -type f > "$OUT/rename-trash-local.txt"
-remote "find '$REMOTE_C_STORE' '$REMOTE_D_STORE' -path '*/.trash/videos/main*.ncnx.trashed.*' -type f" > "$OUT/rename-trash-remote.txt"
+find "$LOCAL_A_STORE" "$LOCAL_B_STORE" -path '*/.trash/*/videos/main*.ncnx' -type f > "$OUT/rename-trash-local.txt"
+remote "find '$REMOTE_C_STORE' '$REMOTE_D_STORE' -path '*/.trash/*/videos/main*.ncnx' -type f" > "$OUT/rename-trash-remote.txt"
 [[ ! -s "$OUT/rename-trash-local.txt" && ! -s "$OUT/rename-trash-remote.txt" ]]
 
 find "$LOCAL_A_STORE" "$LOCAL_B_STORE" -path '*/.namespace/videos/main.bin.ncnx' -type f > "$OUT/ncnx-local.txt"
@@ -499,12 +535,15 @@ jq -n \
   --arg fragment "$FRAGMENT" --arg stable_fragment "$STABLE_FRAGMENT" \
   --arg topology 'four logical nodes on two physical hosts; static EC 2+2; NCNX R=3' \
   --arg node_loss_status "$NODE_LOSS_STATUS" --arg ttl_status "$TTL_STATUS" \
+  --arg collision_recover_status "$COLLISION_RECOVER_STATUS" \
+  --arg collision_first_id "$COLLISION_FIRST_ID" --arg collision_second_id "$COLLISION_SECOND_ID" \
   --argjson ncnx_replicas "$NCNX_COUNT" --argjson suspicious_log_lines "$ERROR_LINES" \
+  --argjson collision_trash_replicas "$COLLISION_TRASH_COUNT" \
   --slurpfile upload "$OUT/upload-throughput.json" \
   --slurpfile list "$OUT/list-latency.json" --slurpfile stat "$OUT/stat-latency.json" \
   --slurpfile rename "$OUT/rename-latency.json" --slurpfile gc "$OUT/gc-status.json" \
   --slurpfile monitor "$OUT/monitor-final.json" \
-  '{result:$result,cluster_id:$cluster,pool_id:$pool,fragment:$fragment,stable_fragment_id:$stable_fragment,topology:$topology,ec:"2+2",ncnx_replicas:$ncnx_replicas,upload:$upload[0],latency:{zero_decode_list:$list[0],stat:$stat[0],exact_rename:$rename[0]},rename_lifecycle_trash_records:0,overwrite_versions:2,parallel_independent_key_writes:8,hierarchical_pagination_keys:5,folder_trash_recovery:"2 of 2",ncnx_auto_heal:"recreated deleted replica",object_auto_heal:"recreated deleted shard",node_loss:{one_node_read_survived:true,parity_count_read_survived:true,new_write_http_status:($node_loss_status|tonumber)},ttl_gc:{expired:true,read_after_gc_http_status:($ttl_status|tonumber),status:$gc[0]},restart_persistence:true,suspicious_log_lines:$suspicious_log_lines,monitor:$monitor[0]}' \
+  '{result:$result,cluster_id:$cluster,pool_id:$pool,fragment:$fragment,stable_fragment_id:$stable_fragment,topology:$topology,ec:"2+2",ncnx_replicas:$ncnx_replicas,upload:$upload[0],latency:{zero_decode_list:$list[0],stat:$stat[0],exact_rename:$rename[0]},rename_lifecycle_trash_records:0,trash_generation:{strict_recover_http_status:($collision_recover_status|tonumber),first_mutation_id:$collision_first_id,second_mutation_id:$collision_second_id,ids_are_distinct:($collision_first_id != $collision_second_id),surviving_old_generation_replicas:$collision_trash_replicas},overwrite_versions:2,parallel_independent_key_writes:8,hierarchical_pagination_keys:5,folder_trash_recovery:"2 of 2",ncnx_auto_heal:"recreated deleted replica",object_auto_heal:"recreated deleted shard",node_loss:{one_node_read_survived:true,parity_count_read_survived:true,new_write_http_status:($node_loss_status|tonumber)},ttl_gc:{expired:true,read_after_gc_http_status:($ttl_status|tonumber),status:$gc[0]},restart_persistence:true,suspicious_log_lines:$suspicious_log_lines,monitor:$monitor[0]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_3_0_PROOF_OUT=$OUT"

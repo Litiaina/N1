@@ -19,11 +19,14 @@ namespace, and maintenance operations on any healthy node, places immutable
 erasure-coded object versions across static server pools, and keeps every
 user-visible mutation in a small flat namespace record.
 
-N2 `3.0.0` is a clean engine and disk-format generation. It replaces the N2
-2.x inode namespace with replicated flat NCNX key records while retaining
+N2 `3.1.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+replaced the N2 2.x inode namespace with replicated flat NCNX key records
+while retaining
 immutable NCDX metadata, immutable shards and parity, per-object recorded
 layouts, strict fail-closed publication, explicit redistribution, and
-autonomous healing. N2 3.0 does not open or migrate N2 1.x or 2.x layouts.
+autonomous healing. N2 3.1 stores each delete mutation in one
+`<unix-nanos>.<mutation-ulid>` trash generation without changing server-pool
+or EC placement. N2 3.x does not open or migrate N2 1.x or 2.x layouts.
 
 A key such as `videos/mhw.mp4` is stored as `videos/mhw.mp4.ncnx` on its
 deterministic replica holders. The `videos/` path is a key prefix, not a
@@ -49,7 +52,7 @@ for N2-native operators, peers, tools, and future internal systems.
 - [NOA.md](NOA.md): canonical NOA v1 routes and N2 cluster extensions.
 - [INSTALLATION.md](INSTALLATION.md): production setup, static server-pool
   membership, systemd deployment, gateway deployment, and validation.
-- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.0 storage, NCNX namespace,
+- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.1 storage, NCNX namespace,
   lifecycle, healing, expansion, and failure laws.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
@@ -339,8 +342,8 @@ the repository under `/home/wlzambo/DEV-TEST`.
 
 ## Operational Boundaries
 
-- N2 `3.0.0` is a new engine generation, not an in-place migration from N2
-  1.x or 2.x.
+- N2 `3.1.0` is part of the 3.x engine generation, not an in-place migration
+  from N2 1.x or 2.x.
 - A server pool's `K + M`, node IDs, and root-ID set are static after
   enrollment. Expansion adds a new complete pool generation.
 - NCNX uses `M + 1` deterministic replicas within its home pool.

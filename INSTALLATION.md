@@ -59,7 +59,7 @@ Recommended production paths:
 /mnt/NDISK002/n2
 ```
 
-Every configured N2 3.0 root is unified and can contain:
+Every configured N2 3.x root is unified and can contain:
 
 ```text
 <storage_root>/
@@ -68,7 +68,7 @@ Every configured N2 3.0 root is unified and can contain:
   @f_<stable-fragment-id>/
     .fragment.ncdx
     .namespace/
-    .trash/
+    .trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx
     .uploads/
     .objects/
 ```

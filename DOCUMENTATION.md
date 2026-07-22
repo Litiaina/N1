@@ -10,15 +10,21 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.0.0` is a clean engine and disk-format generation. It replaces the 2.x
-distributed-inode namespace with a flat replicated NCNX key plane. It retains
+N2 `3.1.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
+plane. N2 3.1 adds collision-free per-mutation trash generation directories.
+It retains
 immutable NCDX object metadata, immutable shards and parity, exact recorded
 per-object EC layouts, bidirectional coordination, strict publication,
 explicit redistribution, and autonomous healing.
 
-N2 3.0 intentionally does not open or migrate N2 1.x or 2.x roots. Static
+N2 3.x intentionally does not open or migrate N2 1.x or 2.x roots. Static
 server-pool enrollment, root identity, and format-v3 membership prevent old
 layouts from being silently reinterpreted.
+
+Before replacing a 3.0 test deployment, recover or let GC drain every 3.0
+trash entry. N2 3.1 deliberately fails closed on the retired
+`.ncnx.trashed.*` layout instead of maintaining two lifecycle formats.
 
 The current qualification is bounded evidence, not an LTS declaration or an
 exabyte deployment claim. Exact passed, failed, and unexercised boundaries
@@ -94,7 +100,7 @@ than a mutable latest-pointer file.
 
 ### Namespace And Blob Layouts
 
-N2 3.0 uses unified server-pool roots rather than namespace-only and
+N2 3.1 uses unified server-pool roots rather than namespace-only and
 blob-only node roles. The namespace and payload remain separate logical
 planes even though they share enrolled storage roots:
 
@@ -425,7 +431,7 @@ Fields:
 - `fragment`: fragment name hash or stable fragment identifier accepted by N2.
 - `secret`: fragment key or `MASTER_KEY`.
 - `read`: allow list, read, status, health.
-- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.0 rejects empty-directory persistence.
+- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.1 rejects empty-directory persistence.
 - `modify`: allow rename, repair, rebalance, maintenance mutations.
 - `delete`: allow soft delete and fragment administration. Object reclamation
   remains TTL lifecycle-only.
@@ -967,7 +973,7 @@ Content-Type: application/json
 { "path": "videos" }
 ```
 
-The route is retained as part of the NOA v1 surface, but N2 3.0 returns
+The route is retained as part of the NOA v1 surface, but N2 3.1 returns
 `400 Bad Request`: the flat namespace does not persist empty directories.
 Uploading `videos/a.mp4` makes the `videos/` prefix visible automatically.
 
@@ -1033,21 +1039,24 @@ Recover a precise trash generation when multiple generations exist:
 ```json
 {
   "path": "archive/mhw.mp4",
-  "trash_entry_id": "archive/mhw.mp4.ncnx.trashed.1780000000000000000.01KS..."
+  "trash_entry_id": "01KS..."
 }
 ```
 
 Recover publishes live NCNX first, then removes the expected trash NCNX.
-Folder recovery restores the selected mutation group.
+Folder recovery restores the selected mutation group. If any selected logical
+key already exists live, recovery returns `409 Conflict` and preserves the
+trash record.
 
 ### Trash Lifecycle
 
-N2 3.0 exposes no empty-trash or hard-delete namespace operation. Trash
-expiry is encoded in the immutable trash filename timestamp. Normal GC scans
-only `.trash`, proves live/unexpired reachability, removes object holders
-first, and removes the final expired trash pointer last. Live always wins
-over trash. Headless immutable objects are reported and preserved rather than
-guessed disposable.
+N2 3.1 exposes no empty-trash or hard-delete namespace operation. Each delete
+uses one `.trash/<unix-nanos>.<mutation-ulid>/` generation across all affected
+logical keys and deterministic NCNX replicas. Normal GC reads TTL from that
+directory name, scans only `.trash`, proves live/unexpired reachability,
+removes object holders first, and removes the final expired trash pointer
+last. Live and unexpired trash always win over expired trash. Headless
+immutable objects are reported and preserved rather than guessed disposable.
 
 ## Object Mutation API
 
@@ -1121,7 +1130,7 @@ Response:
 
 ### Trash Lifecycle Boundary
 
-N2 3.0 intentionally has no empty-trash or recover-all namespace mutation.
+N2 3.1 intentionally has no empty-trash or recover-all namespace mutation.
 Recover explicit entries before their retention period expires. Expired trash
 is removed by lifecycle/GC after namespace reachability checks.
 
@@ -2015,7 +2024,7 @@ Inspect lifecycle/chaos options:
 scripts/bench/run_n2_3_0_soak_chaos.sh --help
 ```
 
-For N2 3.0 qualification, prove at minimum:
+For N2 3.1 qualification, prove at minimum:
 
 - identical format-v3 membership and static pool contracts on every node;
 - fragment creation and authentication;

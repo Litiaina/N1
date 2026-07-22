@@ -257,14 +257,16 @@ pub async fn commit_namespace_mutation(
             if recovery.is_empty() {
                 return Err(AppError::NotFound);
             }
-            // Prove every destination before publishing any live pointer. A
-            // different live object at one key rejects the whole request.
-            for (name, located) in &recovery {
-                if let Some(live) = find_live(&request.fragment, &name.logical_key).await?
-                    && live.record.object_id != located.record.object_id
+            // Prove every destination before publishing any live pointer.
+            // Recovery is strict: any live destination rejects the whole
+            // selected generation, even when it points to the same object.
+            for (name, _) in &recovery {
+                if find_live(&request.fragment, &name.logical_key)
+                    .await?
+                    .is_some()
                 {
                     return Err(AppError::Conflict(format!(
-                        "cannot recover '{}': live key points to another object",
+                        "cannot recover '{}': live key already exists",
                         name.logical_key
                     )));
                 }
@@ -816,16 +818,16 @@ async fn recover_one(name: &PeerNcnxName, located: &LocatedNcnx) -> Result<(), A
         .trash
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("trash recovery has no locator".into()))?;
-    if let Some(live) = find_live(&located.record.fragment_id, &name.logical_key).await? {
-        if live.record.object_id != located.record.object_id {
-            return Err(AppError::Conflict(format!(
-                "cannot recover '{}': live key points to another object",
-                name.logical_key
-            )));
-        }
-    } else {
-        copy_live_to_key(located, &name.logical_key).await?;
+    if find_live(&located.record.fragment_id, &name.logical_key)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::Conflict(format!(
+            "cannot recover '{}': live key already exists",
+            name.logical_key
+        )));
     }
+    copy_live_to_key(located, &name.logical_key).await?;
     remove_trash(located, locator).await
 }
 
