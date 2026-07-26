@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
-use crc32fast::Hasher;
 use n2_native_client::{N2NativeClient, NativeClientError, NativeClientResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -308,9 +308,9 @@ struct UploadArgs {
     #[arg(
         long,
         default_value_t = false,
-        help = "Calculate and send CRC32 for each uploaded body/part."
+        help = "Calculate and send SHA-256 for each uploaded body/part."
     )]
-    crc32: bool,
+    sha256: bool,
 }
 
 #[derive(Args)]
@@ -1048,8 +1048,8 @@ async fn upload_file(
         .unwrap_or_else(|| content_type_from_path(&args.file));
 
     if size <= ONE_SHOT_LIMIT {
-        let checksum = if args.crc32 {
-            Some(crc32_range(&mut file, 0, size).await?)
+        let checksum = if args.sha256 {
+            Some(sha256_range(&mut file, 0, size).await?)
         } else {
             None
         };
@@ -1096,8 +1096,8 @@ async fn upload_file(
         for part_index in 0..expected_parts {
             let start = part_index.saturating_mul(part_size);
             let part_len = part_size.min(size.saturating_sub(start));
-            let checksum = if args.crc32 {
-                Some(crc32_range(&mut file, start, part_len).await?)
+            let checksum = if args.sha256 {
+                Some(sha256_range(&mut file, start, part_len).await?)
             } else {
                 None
             };
@@ -1151,7 +1151,7 @@ async fn upload_file(
                     part_index,
                     part_size,
                     size,
-                    args.crc32,
+                    args.sha256,
                     !args.no_io_gate,
                 ));
             }
@@ -1205,7 +1205,7 @@ async fn upload_part_with_new_client(
     part_index: u64,
     part_size: u64,
     total_size: u64,
-    crc32: bool,
+    sha256: bool,
     io_gate: bool,
 ) -> NativeClientResult<(u64, u64)> {
     let mut client = N2NativeClient::connect(&native_url)
@@ -1216,8 +1216,8 @@ async fn upload_part_with_new_client(
     let start = part_index.saturating_mul(part_size);
     let part_len = part_size.min(total_size.saturating_sub(start));
     let mut file = File::open(&file_path).await?;
-    let checksum = if crc32 {
-        Some(crc32_range(&mut file, start, part_len).await?)
+    let checksum = if sha256 {
+        Some(sha256_range(&mut file, start, part_len).await?)
     } else {
         None
     };
@@ -1239,23 +1239,23 @@ async fn upload_part_with_new_client(
     Ok((part_index, start.saturating_add(part_len)))
 }
 
-async fn crc32_range(file: &mut File, offset: u64, len: u64) -> NativeClientResult<String> {
+async fn sha256_range(file: &mut File, offset: u64, len: u64) -> NativeClientResult<String> {
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     let mut remaining = len;
     let mut buffer = vec![0u8; 1024 * 1024];
-    let mut hasher = Hasher::new();
+    let mut hasher = Sha256::new();
     while remaining > 0 {
         let take = buffer.len().min(remaining as usize);
         let read = file.read(&mut buffer[..take]).await?;
         if read == 0 {
             return Err(NativeClientError::protocol(format!(
-                "file ended while calculating CRC32: expected {len} bytes from offset {offset}"
+                "file ended while calculating SHA-256: expected {len} bytes from offset {offset}"
             )));
         }
         hasher.update(&buffer[..read]);
         remaining -= read as u64;
     }
-    Ok(format!("{:08x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn download_file(client: &mut N2NativeClient, args: DownloadArgs) -> NativeClientResult<()> {

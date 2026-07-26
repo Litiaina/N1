@@ -1,3 +1,4 @@
+use crate::core::checksum::Sha256Digest;
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     InitiateUploadParams, InitiateUploadResponse, ObjectMetadata, ObjectPathManager, PartMetadata,
@@ -101,7 +102,7 @@ impl LocalShardWriter {
     async fn finish(
         mut self,
         checksum: String,
-        block_checksums: Vec<u32>,
+        block_checksums: Vec<Sha256Digest>,
         checksum_block_size: usize,
     ) -> Result<ShardInfo, AppError> {
         self.file.flush().await.map_err(|e| {
@@ -263,7 +264,7 @@ impl ClusterShardWriter {
     async fn finish(
         self,
         checksum: String,
-        block_checksums: Vec<u32>,
+        block_checksums: Vec<Sha256Digest>,
         checksum_block_size: usize,
     ) -> Result<ShardInfo, AppError> {
         match self {
@@ -453,12 +454,12 @@ where
             "upload session pool generation or static EC contract changed".into(),
         ));
     }
-    let active = live_active_write_nodes_for_pool(&runtime, pool_id).await;
+    let configured_nodes = runtime.membership.nodes_for_pool(pool_id);
     let layout = ClusterEcLayout {
         data_shards,
         parity_shards,
     };
-    validate_pinned_upload_layout(layout, active.len())?;
+    validate_pinned_upload_layout(layout, configured_nodes.len())?;
     let placement = build_placement_plan(
         fragment,
         object_key,
@@ -467,8 +468,25 @@ where
         pool_generation,
         membership_epoch,
         layout,
-        &active,
+        &configured_nodes,
     )?;
+    let reachable = live_active_write_nodes_for_pool(&runtime, pool_id)
+        .await
+        .into_iter()
+        .map(|node| node.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let unavailable = placement
+        .placements
+        .iter()
+        .filter(|placement| !reachable.contains(&placement.node_id))
+        .map(|placement| placement.node_id.clone())
+        .collect::<Vec<_>>();
+    if !unavailable.is_empty() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "exact server-pool placement for {fragment}/{object_key} cannot write safely; unavailable participant(s): {}",
+            unavailable.join(", ")
+        )));
+    }
     let stripe_data_width = block_size as u64 * data_shards as u64;
     let stripe_count = content_length.div_ceil(stripe_data_width.max(1));
     let final_shard_len = stripe_count.saturating_mul(block_size as u64);
@@ -914,15 +932,9 @@ mod tests {
                         object_parity_shards: 1,
                     },
                     state: PoolState::Writable,
-                    node_ids: vec![
-                        "ns-a".into(),
-                        "ns-b".into(),
-                        "a".into(),
-                        "b".into(),
-                        "c".into(),
-                    ],
+                    node_ids: vec!["a".into(), "b".into(), "c".into()],
                 }],
-                nodes: ["ns-a", "ns-b", "a", "b", "c"]
+                nodes: ["a", "b", "c"]
                     .into_iter()
                     .map(|id| ClusterNode {
                         id: id.into(),
@@ -952,7 +964,7 @@ mod tests {
 
         assert_eq!(layout.data_shards, 2);
         assert_eq!(layout.parity_shards, 1);
-        assert!(validate_write_admission(&runtime, 5, 3, layout).is_ok());
+        assert!(validate_write_admission(&runtime, 3, 3, layout).is_ok());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 pub const ROOT_IDENTITY_FILE: &str = ".n2-root.ncdx";
-const ROOT_IDENTITY_FORMAT: &str = "n2-root-v3";
+const ROOT_IDENTITY_FORMAT: &str = "n2-root-v4";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RootIdentity {
@@ -119,7 +119,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
 
     if !root_is_empty(root_path)? {
         return Err(AppError::Conflict(format!(
-            "unenrolled N2 3.0 root '{}' is not empty; use a new isolated directory",
+            "unenrolled N2 3.2 root '{}' is not empty; use a new isolated directory",
             root_path.display()
         )));
     }
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn root_identity_is_stable_and_rejects_rebinding() {
-        let root = std::env::temp_dir().join(format!("n2-root-v2-{}", Ulid::new()));
+        let root = std::env::temp_dir().join(format!("n2-root-v4-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         let first = runtime(&root, "namespace-a");
         initialize_local_root_identities(&first).expect("enroll root");
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn non_empty_unenrolled_root_is_rejected() {
-        let root = std::env::temp_dir().join(format!("n2-root-v2-dirty-{}", Ulid::new()));
+        let root = std::env::temp_dir().join(format!("n2-root-v4-dirty-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("existing"), b"data").expect("seed root");
         assert!(initialize_local_root_identities(&runtime(&root, "namespace-a")).is_err());
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn enrolled_root_rejects_static_ec_change() {
-        let root = std::env::temp_dir().join(format!("n2-root-v2-policy-{}", Ulid::new()));
+        let root = std::env::temp_dir().join(format!("n2-root-v4-policy-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         let first = runtime(&root, "namespace-a");
         initialize_local_root_identities(&first).expect("enroll root");
@@ -265,8 +265,8 @@ mod tests {
 
     #[test]
     fn enrolled_pool_rejects_local_root_set_change() {
-        let first_root = std::env::temp_dir().join(format!("n2-root-v3-set-a-{}", Ulid::new()));
-        let second_root = std::env::temp_dir().join(format!("n2-root-v3-set-b-{}", Ulid::new()));
+        let first_root = std::env::temp_dir().join(format!("n2-root-v4-set-a-{}", Ulid::new()));
+        let second_root = std::env::temp_dir().join(format!("n2-root-v4-set-b-{}", Ulid::new()));
         fs::create_dir_all(&first_root).expect("create first root");
         fs::create_dir_all(&second_root).expect("create second root");
         let first = runtime(&first_root, "node-a");

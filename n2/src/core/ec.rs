@@ -1,8 +1,9 @@
+use crate::core::checksum::{Sha256Digest, sha256_digest};
 use crate::enums::app_error_enum::AppError;
-use crc32fast::Hasher;
 use futures_util::future::join_all;
 use futures_util::future::poll_fn;
 use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
 use simd_erasure_core::ReedSolomonEncoder;
 use std::alloc::{Layout, alloc, dealloc};
 use std::mem::MaybeUninit;
@@ -182,9 +183,9 @@ pub struct ErasureStreamWriter<W: AsyncWrite + Unpin + Send> {
     shard_len_limit: usize,
     buffer: AlignedBuffer,
     bytes_written_to_shards: usize,
-    total_hasher: Option<Hasher>,
-    shard_hashers: Vec<Hasher>,
-    shard_block_checksums: Vec<Vec<u32>>,
+    total_hasher: Option<Sha256>,
+    shard_hashers: Vec<Sha256>,
+    shard_block_checksums: Vec<Vec<Sha256Digest>>,
     rs_encoder: Option<ReedSolomonEncoder>,
     block_size: usize,
 }
@@ -225,12 +226,12 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         }
 
         let total_hasher = if calc_total_checksum {
-            Some(Hasher::new())
+            Some(Sha256::new())
         } else {
             None
         };
         let shard_hashers = (0..(data_shards + parity_shards))
-            .map(|_| Hasher::new())
+            .map(|_| Sha256::new())
             .collect();
         let shard_block_checksums = vec![Vec::new(); data_shards + parity_shards];
 
@@ -345,7 +346,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                     padding_buf
                         .as_slice()
                         .chunks(self.block_size)
-                        .map(crc32fast::hash),
+                        .map(sha256_digest),
                 );
             }
 
@@ -394,7 +395,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 let start = i * block_size;
                 let end = start + block_size;
                 self.shard_hashers[i].update(&buffer_slice[start..end]);
-                self.shard_block_checksums[i].push(crc32fast::hash(&buffer_slice[start..end]));
+                self.shard_block_checksums[i].push(sha256_digest(&buffer_slice[start..end]));
             }
             for i in 0..self.parity_shards {
                 let slice = result.recovery(i).ok_or_else(|| {
@@ -402,7 +403,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                     AppError::InternalServerError("RS parity shard generation mismatch".into())
                 })?;
                 self.shard_hashers[self.data_shards + i].update(slice);
-                self.shard_block_checksums[self.data_shards + i].push(crc32fast::hash(slice));
+                self.shard_block_checksums[self.data_shards + i].push(sha256_digest(slice));
             }
             let mut shard_slices = Vec::with_capacity(self.data_shards + self.parity_shards);
             for (i, writer_opt) in self.writers.iter().enumerate() {
@@ -429,7 +430,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 let start = i * block_size;
                 let end = start + block_size;
                 self.shard_hashers[i].update(&buffer_slice[start..end]);
-                self.shard_block_checksums[i].push(crc32fast::hash(&buffer_slice[start..end]));
+                self.shard_block_checksums[i].push(sha256_digest(&buffer_slice[start..end]));
             }
 
             let mut shard_slices = Vec::with_capacity(self.data_shards);
@@ -457,17 +458,17 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     pub fn get_total_checksum(&self) -> Option<String> {
         self.total_hasher
             .as_ref()
-            .map(|h| format!("{:08x}", h.clone().finalize()))
+            .map(|h| hex::encode(h.clone().finalize()))
     }
 
     pub fn get_shard_checksums(&self) -> Vec<String> {
         self.shard_hashers
             .iter()
-            .map(|h| format!("{:08x}", h.clone().finalize()))
+            .map(|h| hex::encode(h.clone().finalize()))
             .collect()
     }
 
-    pub fn get_shard_block_checksums(&self) -> Vec<Vec<u32>> {
+    pub fn get_shard_block_checksums(&self) -> Vec<Vec<Sha256Digest>> {
         self.shard_block_checksums.clone()
     }
 
@@ -579,6 +580,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::ErasureStreamWriter;
+    use crate::core::checksum::sha256_digest;
 
     #[tokio::test]
     async fn stream_writer_records_checksums_for_every_immutable_shard_block() {
@@ -599,7 +601,7 @@ mod tests {
         let checksums = writer.get_shard_block_checksums();
         assert_eq!(checksums.len(), 3);
         assert!(checksums.iter().all(|blocks| blocks.len() == 1));
-        assert_eq!(checksums[0][0], crc32fast::hash(&input[..block_size]));
-        assert_eq!(checksums[1][0], crc32fast::hash(&input[block_size..]));
+        assert_eq!(checksums[0][0], sha256_digest(&input[..block_size]));
+        assert_eq!(checksums[1][0], sha256_digest(&input[block_size..]));
     }
 }

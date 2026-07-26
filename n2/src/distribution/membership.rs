@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
 const CLUSTER_NODE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
-pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 3;
+pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageRoot {
@@ -55,7 +55,7 @@ pub fn parse_storage_roots(raw: &str) -> Result<Vec<StorageRoot>, AppError> {
     }
     if roots.is_empty() {
         return Err(AppError::BadRequest(
-            "N2 3.0 requires at least one storage_roots entry".into(),
+            "N2 3.2 requires at least one storage_roots entry".into(),
         ));
     }
     Ok(roots)
@@ -99,7 +99,7 @@ impl ClusterPolicy {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.object_data_shards == 0 || self.object_parity_shards == 0 {
             return Err(AppError::BadRequest(
-                "N2 3.0 pool EC requires at least 1 data and 1 parity shard".into(),
+                "N2 3.2 pool EC requires at least 1 data and 1 parity shard".into(),
             ));
         }
         Ok(())
@@ -153,9 +153,9 @@ impl ServerPool {
                 self.id
             )));
         }
-        if self.node_ids.len() < self.policy.object_width() {
+        if self.node_ids.len() != self.policy.object_width() {
             return Err(AppError::BadRequest(format!(
-                "server pool '{}' EC {}+{} requires at least {} nodes, but records {}",
+                "server pool '{}' EC {}+{} requires exactly {} nodes, but records {}",
                 self.id,
                 self.policy.object_data_shards,
                 self.policy.object_parity_shards,
@@ -251,7 +251,7 @@ impl ClusterMembership {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.format_version != N2_MEMBERSHIP_FORMAT_VERSION {
             return Err(AppError::BadRequest(format!(
-                "membership format {} is not N2 3.0 format {}",
+                "membership format {} is not N2 3.2 format {}",
                 self.format_version, N2_MEMBERSHIP_FORMAT_VERSION
             )));
         }
@@ -262,7 +262,7 @@ impl ClusterMembership {
         }
         if self.pools.is_empty() {
             return Err(AppError::BadRequest(
-                "N2 3.0 membership requires at least one server pool".into(),
+                "N2 3.2 membership requires at least one server pool".into(),
             ));
         }
 
@@ -320,7 +320,7 @@ impl ClusterMembership {
         }
         if assigned_nodes.len() != node_ids.len() {
             return Err(AppError::BadRequest(
-                "every N2 3.0 node must belong to exactly one server pool".into(),
+                "every N2 3.2 node must belong to exactly one server pool".into(),
             ));
         }
         Ok(())
@@ -381,9 +381,9 @@ impl ClusterMembership {
     pub fn validate_minimum_topology(&self) -> Result<(), AppError> {
         for pool in &self.pools {
             let nodes = self.nodes_for_pool(&pool.id).len();
-            if nodes < pool.policy.object_width() {
+            if nodes != pool.policy.object_width() {
                 return Err(AppError::ServiceUnavailable(format!(
-                    "pool '{}' EC {}+{} requires {} distinct nodes, membership has {}",
+                    "pool '{}' EC {}+{} requires exactly {} distinct nodes, membership has {}",
                     pool.id,
                     pool.policy.object_data_shards,
                     pool.policy.object_parity_shards,
@@ -522,7 +522,7 @@ fn parse_usize(raw: Option<&str>, key: &str, default_value: usize) -> Result<usi
     match raw.map(str::trim) {
         None | Some("") => Ok(default_value),
         Some("auto") => Err(AppError::BadRequest(format!(
-            "{key}=auto is not valid in N2 3.0; pool EC is static"
+            "{key}=auto is not valid in N2 3.2; pool EC is static"
         ))),
         Some(value) => value
             .parse::<usize>()
@@ -600,7 +600,7 @@ fn load_or_create_membership(
             .map_err(|e| AppError::Io(e, format!("read N2 membership file {}", path.display())))?;
         let mut membership: ClusterMembership = serde_json::from_slice(&bytes).map_err(|e| {
             AppError::InternalServerError(format!(
-                "decode N2 3.0 membership file '{}': {e}",
+                "decode N2 3.2 membership file '{}': {e}",
                 path.display()
             ))
         })?;
@@ -684,7 +684,7 @@ pub fn init_cluster_runtime(
     let section = config.section(Some("cluster_config"));
     if section.and_then(|s| s.get("node_role")).is_some() {
         return Err(AppError::BadRequest(
-            "node_role was removed in N2 3.0; every server-pool node is unified".into(),
+            "node_role was removed in N2 3.2; every server-pool node is unified".into(),
         ));
     }
     if section
@@ -692,7 +692,7 @@ pub fn init_cluster_runtime(
         .is_some()
     {
         return Err(AppError::BadRequest(
-            "namespace_redundancy was removed in N2 3.0; NCNX replicas equal parity + one".into(),
+            "namespace_redundancy was removed in N2 3.2; NCNX replicas equal parity + one".into(),
         ));
     }
     let node_id = section
@@ -813,7 +813,7 @@ mod tests {
             object_parity_shards: 1,
         };
         let membership = ClusterMembership {
-            format_version: 3,
+            format_version: N2_MEMBERSHIP_FORMAT_VERSION,
             cluster_id: "cluster-a".into(),
             epoch: 1,
             pools: vec![ServerPool {
@@ -831,13 +831,51 @@ mod tests {
     }
 
     #[test]
+    fn rejects_pool_membership_wider_than_its_static_ec_contract() {
+        let pool = ServerPool {
+            id: "pool-a".into(),
+            generation: 1,
+            policy: ClusterPolicy {
+                object_data_shards: 2,
+                object_parity_shards: 1,
+            },
+            state: PoolState::Writable,
+            node_ids: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        };
+        assert!(pool.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_retired_membership_format() {
+        let mut membership = ClusterMembership {
+            format_version: N2_MEMBERSHIP_FORMAT_VERSION,
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            pools: vec![ServerPool {
+                id: "pool-a".into(),
+                generation: 1,
+                policy: ClusterPolicy {
+                    object_data_shards: 1,
+                    object_parity_shards: 1,
+                },
+                state: PoolState::Writable,
+                node_ids: vec!["a".into(), "b".into()],
+            }],
+            nodes: vec![node("a"), node("b")],
+        };
+        membership.validate().expect("format-v4 membership");
+        membership.format_version = 3;
+        assert!(membership.validate().is_err());
+    }
+
+    #[test]
     fn rejects_node_assigned_to_two_pools() {
         let policy = ClusterPolicy {
             object_data_shards: 1,
             object_parity_shards: 1,
         };
         let membership = ClusterMembership {
-            format_version: 3,
+            format_version: N2_MEMBERSHIP_FORMAT_VERSION,
             cluster_id: "cluster-a".into(),
             epoch: 2,
             pools: vec![

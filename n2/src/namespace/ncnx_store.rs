@@ -1,7 +1,7 @@
+use crate::core::checksum::{Sha256Digest, format_sha256, sha256_digest};
 use crate::core::fragment_identity::physical_fragment_root_on;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path, parent_path};
-use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
-pub const NCNX_FORMAT_VERSION: u32 = 3;
+pub const NCNX_FORMAT_VERSION: u32 = 4;
 pub const NAMESPACE_DIR: &str = ".namespace";
 pub const NAMESPACE_TRASH_DIR: &str = ".trash";
 pub const NCNX_SUFFIX: &str = ".ncnx";
@@ -25,7 +25,7 @@ pub struct NcnxRecord {
     pub object_id: String,
     pub mutation_id: String,
     pub created_at_unix_nanos: i64,
-    pub payload_crc32: u32,
+    pub payload_sha256: Sha256Digest,
 }
 
 impl NcnxRecord {
@@ -41,17 +41,17 @@ impl NcnxRecord {
             object_id: object_id.into(),
             mutation_id: mutation_id.into(),
             created_at_unix_nanos,
-            payload_crc32: 0,
+            payload_sha256: [0; 32],
         };
         record.validate_fields()?;
-        record.payload_crc32 = record.expected_crc32()?;
+        record.payload_sha256 = record.expected_sha256()?;
         Ok(record)
     }
 
     fn validate_fields(&self) -> Result<(), AppError> {
         if self.format_version != NCNX_FORMAT_VERSION {
             return Err(AppError::Conflict(format!(
-                "NCNX format {} is not N2 3.0 format {}",
+                "NCNX format {} is not N2 3.2 format {}",
                 self.format_version, NCNX_FORMAT_VERSION
             )));
         }
@@ -67,24 +67,23 @@ impl NcnxRecord {
         Ok(())
     }
 
-    fn expected_crc32(&self) -> Result<u32, AppError> {
+    fn expected_sha256(&self) -> Result<Sha256Digest, AppError> {
         let mut unsigned = self.clone();
-        unsigned.payload_crc32 = 0;
+        unsigned.payload_sha256 = [0; 32];
         let payload = rmp_serde::to_vec_named(&unsigned).map_err(|err| {
             AppError::InternalServerError(format!("encode NCNX integrity payload: {err}"))
         })?;
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        Ok(hasher.finalize())
+        Ok(sha256_digest(&payload))
     }
 
     pub fn validate(&self) -> Result<(), AppError> {
         self.validate_fields()?;
-        let expected = self.expected_crc32()?;
-        if expected != self.payload_crc32 {
+        let expected = self.expected_sha256()?;
+        if expected != self.payload_sha256 {
             return Err(AppError::Conflict(format!(
-                "NCNX integrity mismatch: expected {expected:08x}, recorded {:08x}",
-                self.payload_crc32
+                "NCNX integrity mismatch: expected {}, recorded {}",
+                format_sha256(&expected),
+                format_sha256(&self.payload_sha256)
             )));
         }
         Ok(())
@@ -348,7 +347,7 @@ pub fn validate_logical_key(key: &str) -> Result<String, AppError> {
     let key = normalize_path(key).map_err(|err| AppError::BadRequest(err.to_string()))?;
     if key.is_empty() {
         return Err(AppError::BadRequest(
-            "N2 3.0 object key cannot be empty".into(),
+            "N2 3.2 object key cannot be empty".into(),
         ));
     }
     if key.len() > MAX_KEY_BYTES {
@@ -832,14 +831,14 @@ fn list_generation_trash_names(
             parse_trash_generation_name(&generation_name)
         else {
             return Err(AppError::Conflict(format!(
-                "invalid N2 3.1 trash generation '{}' in {}",
+                "invalid N2 3.2 trash generation '{}' in {}",
                 generation_name,
                 trash_root.display()
             )));
         };
         if !file_type.is_dir() {
             return Err(AppError::Conflict(format!(
-                "N2 3.1 trash generation is not a directory: {}",
+                "N2 3.2 trash generation is not a directory: {}",
                 entry.path().display()
             )));
         }

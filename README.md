@@ -19,14 +19,18 @@ namespace, and maintenance operations on any healthy node, places immutable
 erasure-coded object versions across static server pools, and keeps every
 user-visible mutation in a small flat namespace record.
 
-N2 `3.1.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.2.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the N2 2.x inode namespace with replicated flat NCNX key records
 while retaining
 immutable NCDX metadata, immutable shards and parity, per-object recorded
 layouts, strict fail-closed publication, explicit redistribution, and
 autonomous healing. N2 3.1 stores each delete mutation in one
 `<unix-nanos>.<mutation-ulid>` trash generation without changing server-pool
-or EC placement. N2 3.x does not open or migrate N2 1.x or 2.x layouts.
+or EC placement. N2 3.2 makes SHA-256 the only N2 integrity checksum, embeds
+SHA-256 integrity in NCNX and object NCDX, derives object placement from
+immutable server-pool membership, and uses replica-backed exact listing when a
+canonical listing source is unavailable. N2 3.x does not open or migrate N2
+1.x, 2.x, or earlier experimental 3.x roots.
 
 A key such as `videos/mhw.mp4` is stored as `videos/mhw.mp4.ncnx` on its
 deterministic replica holders. The `videos/` path is a key prefix, not a
@@ -52,7 +56,7 @@ for N2-native operators, peers, tools, and future internal systems.
 - [NOA.md](NOA.md): canonical NOA v1 routes and N2 cluster extensions.
 - [INSTALLATION.md](INSTALLATION.md): production setup, static server-pool
   membership, systemd deployment, gateway deployment, and validation.
-- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.1 storage, NCNX namespace,
+- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.2 storage, NCNX namespace,
   lifecycle, healing, expansion, and failure laws.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
@@ -236,7 +240,7 @@ parity_shards=2
 
 Every node has a unique `node_id`, endpoints, and stable local root IDs.
 Every member of a pool uses the same pool ID, generation, and EC contract.
-The format-v3 membership file defines complete static server-pool generations
+The format-v4 membership file defines complete static server-pool generations
 and every node's root IDs. See [INSTALLATION.md](INSTALLATION.md).
 
 ## API Entry Points
@@ -316,7 +320,8 @@ cargo test --workspace --lib --bins --tests
 cargo build --workspace --release
 ```
 
-Run the finite N2 3.0 release proof:
+Run the finite N2 3.2 release proof (the retained script filename identifies
+the flat-NCNX proof family):
 
 ```bash
 REMOTE_PASS='operator-supplied' \
@@ -342,7 +347,7 @@ the repository under `/home/wlzambo/DEV-TEST`.
 
 ## Operational Boundaries
 
-- N2 `3.1.0` is part of the 3.x engine generation, not an in-place migration
+- N2 `3.2.0` is a clean 3.x engine format, not an in-place migration
   from N2 1.x or 2.x.
 - A server pool's `K + M`, node IDs, and root-ID set are static after
   enrollment. Expansion adds a new complete pool generation.

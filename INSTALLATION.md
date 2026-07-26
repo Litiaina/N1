@@ -3,8 +3,8 @@
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.0 is a clean disk-format generation. Never point it at an N2 1.x or 2.x
-root. Build a new format-v3 cluster, copy the same membership and shared
+N2 3.2 is a clean disk-format generation. Never point it at an earlier N2
+root. Build a new format-v4 cluster, copy the same membership and shared
 cluster secrets to every node, and use stable root IDs for mounted devices.
 
 ## Install Shape
@@ -31,7 +31,7 @@ Production prerequisites:
 - Linux with stable mounts and synchronized time.
 - TLS certificates valid for node endpoints.
 - A unique stable node ID and stable root IDs on every host.
-- One complete shared format-v3 membership document.
+- One complete shared format-v4 membership document.
 - Shared `JWT_SECRET` and `N2_CLUSTER_SECRET` values.
 - Exactly `K + M` distinct nodes in each writable static server pool.
 
@@ -88,7 +88,7 @@ runtime_path=/var/lib/litiaina/n2/state
 
 Never recycle a root ID for different media. Do not silently add a root to an
 enrolled pool node; the pool's complete root-ID set is part of the static
-format-v3 contract.
+format-v4 contract.
 
 ## Build
 
@@ -110,7 +110,7 @@ target/release/litiaina-n2-gateway
 
 The preferred production path is `deploy/install.sh`. It installs binaries,
 creates runtime paths, renders systemd services, and can enable/start them.
-A fresh 3.0 node requires explicit environment and membership sources.
+A fresh 3.2 node requires explicit environment and membership sources.
 
 Preview without changing the host:
 
@@ -256,11 +256,11 @@ stripe_block_size=262144
 Upload EC must equal the pool policy. N2 rejects mismatched or unsafe
 configuration instead of adapting durability downward.
 
-Create the same complete format-v3 membership on all nodes:
+Create the same complete format-v4 membership on all nodes:
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 4,
   "cluster_id": "cluster-a",
   "epoch": 1,
   "pools": [{
@@ -413,7 +413,7 @@ curl --cacert /path/to/ca.pem https://127.0.0.1:51002/gateway/nodes
 
 After fragment authentication, verify:
 
-- cluster membership matches format-v3 on every node;
+- cluster membership matches format-v4 on every node;
 - health reports the expected static `K + M` and `M + 1` NCNX replicas;
 - one-shot and multipart upload return byte-identical downloads;
 - finalized objects read through every node;

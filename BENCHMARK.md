@@ -5,11 +5,79 @@ hardware, topology, and methodology boundaries. Correctness and failure
 qualification are kept in [TESTING.md](TESTING.md) so benchmark results are
 not mistaken for a second verification record.
 
-N2 3.0 measurements qualify only the flat NCNX and format-v3 static-pool
-engine. Earlier N2 results remain below as historical hardware and engine
-evidence; they do not qualify the current disk format.
+The current N2 3.2 measurement is listed first. Earlier N2 results remain
+below as historical hardware and engine evidence; they do not qualify the
+format-v4 membership, NCNX, object-NCDX, and SHA-256 integrity contract.
 
-## N2 3.0 Four-Node Proof
+## N2 3.2 Four-Node Proof
+
+Evidence directory:
+`/home/wlzambo/DEV-TEST/N2-3.0-proof-20260727-013543`.
+
+The proof-script filename is retained for operator continuity, but this run
+used the optimized N2 `3.2.0` binary, format-v4 membership, and clean 3.2
+storage roots.
+
+| Field | Value |
+| --- | --- |
+| Test date | 2026-07-27 |
+| Logical topology | Four N2 nodes on two physical hosts |
+| Client path | Direct N2 HTTPS |
+| Reverse proxy/gateway | None |
+| Static object EC | 2 data + 2 parity |
+| NCNX replication | 3 deterministic copies |
+| Test object | 64 MiB |
+| N2 binary SHA-256 | `40baada7c09bc7463d1380668e39605399ecb994ca2c29a444381242ea052cba` |
+
+### Measured data path
+
+| Operation | Result |
+| --- | ---: |
+| 64 MiB upload | 33.11 MiB/s |
+| Download through node A | 65.84 MiB/s |
+| Download through node B | 64.48 MiB/s |
+| Download through node C | 55.45 MiB/s |
+| Download through node D | 53.29 MiB/s |
+
+All four downloads matched the source SHA-256 exactly. These are end-to-end
+rates through one coordinator at a time, not aggregate-cluster limits.
+
+### Namespace latency
+
+| Operation | Samples | p50 | p95 | p99 | Mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Zero-decode LIST | 30 | 10.483 ms | 15.578 ms | 15.741 ms | 11.330 ms |
+| Exact stat | 30 | 49.175 ms | 51.040 ms | 51.375 ms | 46.237 ms |
+| Exact copy/delete rename | 20 | 80.405 ms | 1152.171 ms | 1152.171 ms | 200.734 ms |
+
+Eighteen of twenty measured renames completed in at most 246.159 ms; two
+durable multi-host mutations were 1.152 s and 1.242 s. The tail is recorded
+as measured and is not hidden by the median.
+
+### Process cost
+
+CPU is Linux process CPU as a percentage of one logical core. RSS is the peak
+resident set sampled during the finite proof.
+
+| Node | Samples | Average CPU | Peak CPU | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| A | 52 | 12.35% | 117.00% | 193.60 MiB |
+| B | 50 | 5.32% | 33.00% | 104.41 MiB |
+| C | 55 | 6.16% | 45.00% | 96.07 MiB |
+| D | 51 | 16.04% | 82.00% | 135.52 MiB |
+
+Exact hardware CPU-cycle counters were unavailable because
+`kernel.perf_event_paranoid=4`; the proof did not change host policy and
+therefore makes no cycle-count claim.
+
+### Measurement boundary
+
+This is a finite correctness/performance baseline on four logical nodes
+hosted by two machines. It does not establish four-host failure isolation,
+long-duration stability, WAN behavior, an exabyte deployment, or a hardware
+ceiling.
+
+## Historical N2 3.0 Four-Node Proof
 
 Evidence directory:
 `/home/wlzambo/DEV-TEST/N2-3.0-proof-20260718-220508`.
@@ -223,12 +291,13 @@ throughput reached about 83.5% and 86.5% of the independently measured raw TCP
 payload ceiling. Every upload retained durable shard sync, immutable metadata
 publication, and namespace quorum commit.
 
-The read optimization changed validation from serial whole-shard reads to a
-bounded stripe pipeline with concurrent shard fetches and immutable per-block
-CRC32 checks. A missing or corrupt data block is reconstructed from parity
-before delivery. Direct cold read improved from 36.85 to 64.45 MiB/s
-(+74.9%); gateway cold read improved from 35.55 to 71.95 MiB/s (+102.4%). Old
-metadata without block checks remains readable through the full-shard verifier.
+This historical read optimization changed validation from serial whole-shard
+reads to a bounded stripe pipeline with concurrent shard fetches and immutable
+per-block CRC32 checks. A missing or corrupt data block was reconstructed from
+parity before delivery. Direct cold read improved from 36.85 to 64.45 MiB/s
+(+74.9%); gateway cold read improved from 35.55 to 71.95 MiB/s (+102.4%).
+These historical CRC32 measurements do not qualify the clean N2 3.2 SHA-256
+format; N2 3.2 requires new performance evidence.
 
 ### Namespace and failure behavior
 

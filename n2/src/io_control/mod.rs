@@ -20,7 +20,7 @@ pub use capacity_cache::{
     record_capacity_cache_hit, record_capacity_cache_invalidation, record_capacity_cache_miss,
     record_capacity_cache_refresh, set_capacity_cache_size, usage_cache_ttl_seconds,
 };
-pub use checksum::upload_crc32_checksum;
+pub use checksum::upload_sha256_checksum;
 pub use job::{
     IoJobGuard, IoJobKind, IoJobRegistrySnapshot, IoJobSnapshot, io_job_registry_snapshot,
     register_io_job, request_io_job_cancel,

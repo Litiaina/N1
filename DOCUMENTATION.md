@@ -10,21 +10,23 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.1.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.2.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
 plane. N2 3.1 adds collision-free per-mutation trash generation directories.
-It retains
+N2 3.2 makes SHA-256 the only engine integrity checksum, adds SHA-256
+integrity to NCNX and object NCDX, derives exact placements from immutable
+server-pool membership, and adds replica-backed degraded listing. It retains
 immutable NCDX object metadata, immutable shards and parity, exact recorded
 per-object EC layouts, bidirectional coordination, strict publication,
 explicit redistribution, and autonomous healing.
 
-N2 3.x intentionally does not open or migrate N2 1.x or 2.x roots. Static
-server-pool enrollment, root identity, and format-v3 membership prevent old
+N2 3.2 intentionally does not open or migrate N2 1.x, 2.x, or earlier
+experimental 3.x roots. Static
+server-pool enrollment, root identity, and format-v4 membership prevent old
 layouts from being silently reinterpreted.
 
-Before replacing a 3.0 test deployment, recover or let GC drain every 3.0
-trash entry. N2 3.1 deliberately fails closed on the retired
-`.ncnx.trashed.*` layout instead of maintaining two lifecycle formats.
+N2 3.2 deliberately fails closed on retired NCNX, NCDX, and trash layouts
+instead of maintaining multiple integrity and lifecycle formats.
 
 The current qualification is bounded evidence, not an LTS declaration or an
 exabyte deployment claim. Exact passed, failed, and unexercised boundaries
@@ -100,7 +102,7 @@ than a mutable latest-pointer file.
 
 ### Namespace And Blob Layouts
 
-N2 3.1 uses unified server-pool roots rather than namespace-only and
+N2 3.2 uses unified server-pool roots rather than namespace-only and
 blob-only node roles. The namespace and payload remain separate logical
 planes even though they share enrolled storage roots:
 
@@ -158,7 +160,7 @@ cargo run -p n2 --release
 ```
 
 Production installs should use [INSTALLATION.md](INSTALLATION.md), reviewed
-format-v3 membership, stable device mounts and root IDs, and systemd.
+format-v4 membership, stable device mounts and root IDs, and systemd.
 
 ## Environment
 
@@ -268,6 +270,7 @@ Configuration laws:
 
 - `storage_roots` uses stable `ROOT_ID=/absolute/path` entries.
 - A root ID must never be rebound to different media.
+- Each server pool contains exactly `K + M` distinct nodes.
 - Upload `data_shards` and `parity_shards` must equal the static pool policy.
 - `node_role`, dynamic EC, and in-place pool expansion are removed in 3.0.
 - `auto_rebalance=false` preserves explicit object-level redistribution.
@@ -275,12 +278,12 @@ Configuration laws:
 
 ## Membership File
 
-All nodes use the same complete format-v3 membership. This example defines
+All nodes use the same complete format-v4 membership. This example defines
 one four-node static `2 + 2` pool:
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 4,
   "cluster_id": "cluster-a",
   "epoch": 1,
   "pools": [{
@@ -360,7 +363,7 @@ ensure the service user owns only the required paths.
 
 Start from the configuration above. Change only the node's identity,
 endpoints, and local root paths. Confirm its pool ID, generation, and EC
-exactly match format-v3 membership.
+exactly match format-v4 membership.
 
 ### 3. Write The Membership File
 
@@ -431,7 +434,7 @@ Fields:
 - `fragment`: fragment name hash or stable fragment identifier accepted by N2.
 - `secret`: fragment key or `MASTER_KEY`.
 - `read`: allow list, read, status, health.
-- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.1 rejects empty-directory persistence.
+- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.2 rejects empty-directory persistence.
 - `modify`: allow rename, repair, rebalance, maintenance mutations.
 - `delete`: allow soft delete and fragment administration. Object reclamation
   remains TTL lifecycle-only.
@@ -622,9 +625,11 @@ Body is raw object bytes.
 
 Query fields:
 
-- `checksum`: optional CRC32 validation value. Accepts `deadbeef` or
-  `crc32:deadbeef`. Headers `x-litiaina-checksum`, `x-n2-checksum-crc32`, and
-  base64 `x-amz-checksum-crc32` are also accepted.
+- `checksum`: optional SHA-256 validation value. Accepts 64 lowercase or
+  uppercase hexadecimal characters, optionally prefixed with `sha256:`.
+  Headers `x-litiaina-checksum`, `x-noa-checksum-sha256`, and
+  `x-n2-checksum-sha256` are also accepted. CRC32 and S3 checksum headers are
+  not N2 3.2 contracts.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
 - `io_gate`: optional boolean.
@@ -703,9 +708,10 @@ Body is raw part bytes.
 
 Query fields:
 
-- `checksum`: optional CRC32 validation value. Accepts `deadbeef` or
-  `crc32:deadbeef`. Headers `x-litiaina-checksum`, `x-n2-checksum-crc32`, and
-  base64 `x-amz-checksum-crc32` are also accepted.
+- `checksum`: optional SHA-256 validation value. Accepts 64 hexadecimal
+  characters, optionally prefixed with `sha256:`. Headers
+  `x-litiaina-checksum`, `x-noa-checksum-sha256`, and
+  `x-n2-checksum-sha256` are also accepted.
 - `coordinator_node_id`: required when this request goes through N2 Gateway.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
@@ -973,7 +979,7 @@ Content-Type: application/json
 { "path": "videos" }
 ```
 
-The route is retained as part of the NOA v1 surface, but N2 3.1 returns
+The route is retained as part of the NOA v1 surface, but N2 3.2 returns
 `400 Bad Request`: the flat namespace does not persist empty directories.
 Uploading `videos/a.mp4` makes the `videos/` prefix visible automatically.
 
@@ -1050,7 +1056,7 @@ trash record.
 
 ### Trash Lifecycle
 
-N2 3.1 exposes no empty-trash or hard-delete namespace operation. Each delete
+N2 3.2 exposes no empty-trash or hard-delete namespace operation. Each delete
 uses one `.trash/<unix-nanos>.<mutation-ulid>/` generation across all affected
 logical keys and deterministic NCNX replicas. Normal GC reads TTL from that
 directory name, scans only `.trash`, proves live/unexpired reachability,
@@ -1130,7 +1136,7 @@ Response:
 
 ### Trash Lifecycle Boundary
 
-N2 3.1 intentionally has no empty-trash or recover-all namespace mutation.
+N2 3.2 intentionally has no empty-trash or recover-all namespace mutation.
 Recover explicit entries before their retention period expires. Expired trash
 is removed by lifecycle/GC after namespace reachability checks.
 
@@ -1305,7 +1311,7 @@ Authorization: Bearer <token>
 ```
 
 Returns `local_node_id`, the active membership path, and the complete
-format-v3 membership including static pools, policies, node IDs, endpoints,
+format-v4 membership including static pools, policies, node IDs, endpoints,
 root IDs, and epoch.
 
 ### Layout
@@ -1416,7 +1422,7 @@ POST /noa/v1/cluster/membership/reload
 Authorization: Bearer <token>
 ```
 
-Live reload is intentionally disabled. Review the format-v3 change and
+Live reload is intentionally disabled. Review the format-v4 change and
 restart N2 through systemd. An enrolled pool cannot be changed in place;
 capacity expansion adds a complete new pool generation.
 
@@ -1749,7 +1755,7 @@ target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   upload --fragment n2-test --secret fragment-key \
   --object-key videos/sample.mp4 --file ./sample.mp4 --content-type video/mp4 \
-  --crc32
+  --sha256
 
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   object redistribute --fragment n2-test --secret fragment-key \
@@ -2011,7 +2017,7 @@ Installer proof:
 scripts/proof/run_n2_installer_proof.sh
 ```
 
-Finite N2 3.0 multi-node proof:
+Finite N2 3.2 multi-node proof (retained proof-family script name):
 
 ```bash
 REMOTE_PASS='operator-supplied' \
@@ -2024,9 +2030,9 @@ Inspect lifecycle/chaos options:
 scripts/bench/run_n2_3_0_soak_chaos.sh --help
 ```
 
-For N2 3.1 qualification, prove at minimum:
+For N2 3.2 qualification, prove at minimum:
 
-- identical format-v3 membership and static pool contracts on every node;
+- identical format-v4 membership and static pool contracts on every node;
 - fragment creation and authentication;
 - one-shot and multipart upload with coordinator stickiness;
 - byte-identical download through every node after finalize;

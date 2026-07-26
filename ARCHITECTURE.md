@@ -1,19 +1,19 @@
-# N2 3.1 Architecture
+# N2 3.2 Architecture
 
 ## Status
 
-This document is the locked implementation contract for N2 3.1, the current
+This document is the locked implementation contract for N2 3.2, the current
 release of the clean N2 3.x engine generation. It does not read, migrate, or
 maintain compatibility with the N2 2.0 inode namespace.
 
-N2 3.1 accepts only the generation-directory trash layout defined here. A
-pre-3.1 `.ncnx.trashed.*` entry is rejected rather than ignored or guessed;
-upgrade only after the older trash scope is empty.
+N2 3.2 is a clean format. It accepts only the generation-directory trash
+layout and SHA-256 NCNX/object-NCDX/shard integrity defined here. Earlier
+experimental 3.x records are rejected rather than ignored or guessed.
 
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.1 combines:
+N2 3.2 combines:
 
 - immutable, object-level erasure sets;
 - flat physical-key namespace records;
@@ -52,6 +52,11 @@ cluster-wide mutation log, or implicit redistribution.
     redistributed unless an operator explicitly requests re-encoding.
 13. When a pool cannot satisfy its exact object EC or NCNX durability, unsafe
     writes fail closed. Readable committed objects remain readable.
+14. SHA-256 is the only N2 integrity checksum for NCNX, object NCDX, upload
+    bodies, immutable shards, and verified shard blocks.
+15. Placement is calculated from the immutable node membership of the selected
+    server-pool generation. An unavailable selected holder is never silently
+    replaced by another pool node.
 
 ## Cluster And Server Pools
 
@@ -91,13 +96,17 @@ Each pool records:
 - ordered node membership and stable node identities;
 - writable or sealed state.
 
+Its membership contains exactly `K + M` distinct node failure domains. Extra
+nodes form another complete server pool; they are never silently folded into
+an existing pool.
+
 The newest writable pool that can satisfy its static EC accepts new object
 versions. A sealed or full pool remains readable and healable. An object lookup
 uses its recorded pool layout, never a guess based on the newest membership.
 
 ## Unified Nodes And Disks
 
-Every N2 3.1 node is bidirectional and unified. Any healthy node may receive a
+Every N2 3.2 node is bidirectional and unified. Any healthy node may receive a
 client operation and coordinate it. Every pool node may also persist the data
 assigned to it:
 
@@ -122,7 +131,7 @@ authority.
 
 ## Disk Layout
 
-Each enrolled storage root uses the same N2 3.1 format:
+Each enrolled storage root uses the same N2 3.2 format:
 
 ```text
 <storage_root>/
@@ -180,7 +189,7 @@ stable_fragment_id
 object_id
 mutation_id
 created_at_unix_nanos
-payload_crc32
+payload_sha256
 ```
 
 It does not duplicate object size, content type, checksums, shard holders, or
@@ -229,11 +238,13 @@ part sizes and checksums
 ```
 
 NCDX is byte-identical on its selected holders. Reads and repairs follow this
-recorded layout. Adding disks, nodes, or pools cannot remap an existing object.
+recorded layout. Its named MessagePack body carries a SHA-256 integrity digest,
+and every shard plus every verified range block is also SHA-256 checked.
+Adding disks, nodes, or pools cannot remap an existing object.
 
 ## Key Semantics
 
-N2 3.1 is a flat object-key namespace with prefix presentation:
+N2 3.2 is a flat object-key namespace with prefix presentation:
 
 ```text
 videos/a.mp4
@@ -265,7 +276,7 @@ coordinator
   -> each node walks the requested physical prefix
   -> node emits only its canonical filenames/common prefixes
   -> coordinator performs a bounded ordered merge
-  -> opaque cursor stores each source continuation
+  -> opaque cursor records the last emitted global NCNX ordering key
 ```
 
 Properties:
@@ -273,9 +284,14 @@ Properties:
 - no NCNX decode;
 - no NCDX open;
 - no shard/parity IO;
-- no replica deduplication table;
+- no replica deduplication table on the healthy canonical path;
 - no full-cluster in-memory listing;
 - bounded work proportional to the requested page and traversed prefix.
+
+If a canonical source is unavailable, the coordinator retries the same page
+against physical replica streams. It deduplicates only that bounded page and
+returns a result only while each pool remains within its `M`-node NCNX
+failure budget. An unavailable source is never interpreted as an empty one.
 
 LIST returns key, name, prefix/type, and lifecycle state. Object size, content
 type, checksum, and current version require HEAD because they belong to NCDX.
@@ -470,7 +486,7 @@ authentication databases or user-visible endpoints.
 
 ## Performance Contract
 
-Every N2 3.1 release proof records:
+Every N2 3.2 release proof records:
 
 - operation latency distributions in microseconds/milliseconds;
 - CPU utilization and cycles when host permissions support hardware counters;
@@ -494,7 +510,7 @@ Fast output with hidden global scans or object-data reads is a failure.
 
 ## Release Gates
 
-N2 3.1 is not declared production-stable until the following are proven:
+N2 3.2 is not declared production-stable until the following are proven:
 
 - exact `K + M` shard placement and exact `M + 1` NCNX replication;
 - upload, GET, HEAD, LIST, copy/move, trash, recover, and prefix operations;

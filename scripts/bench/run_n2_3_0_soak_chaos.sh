@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Twelve-hour N2 3.0 soak and bounded-chaos qualification. The harness uses
-# four logical nodes on two physical hosts, static 2+2 EC, and NCNX R=3. It
-# never installs a service or uses a pre-existing storage directory.
+# N2 3.2 soak and bounded-chaos qualification; the filename is retained for
+# the flat-NCNX proof family. The harness uses four logical nodes on two
+# physical hosts, static 2+2 EC, and NCNX R=3. It never installs a service or
+# uses a pre-existing storage directory.
 
 : "${SSH_IDENTITY_FILE:?set SSH_IDENTITY_FILE to an authorized temporary key}"
 
@@ -199,7 +200,7 @@ cleanup() {
   kill_pidfile "$LOCAL_B/n2.pid"
   stop_remote_node "$REMOTE_C" >/dev/null 2>&1
   stop_remote_node "$REMOTE_D" >/dev/null 2>&1
-  remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'" >/dev/null 2>&1
+  remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'; rmdir '/mnt/NDISK002/$REMOTE_STORE_BASE' '/mnt/NDISK003/$REMOTE_STORE_BASE' 2>/dev/null || true" >/dev/null 2>&1
   remove_remote_authorized_key
   if [[ "$REMOVE_IDENTITY_ON_EXIT" == "true" ]]; then
     rm -f "$SSH_IDENTITY_FILE" "$SSH_IDENTITY_FILE.pub"
@@ -535,7 +536,7 @@ setup_cluster() {
 
   cat > "$OUT/n2_membership.json" <<EOF
 {
-  "format_version": 3,
+  "format_version": 4,
   "cluster_id": "$CLUSTER_ID",
   "epoch": 1,
   "pools": [{

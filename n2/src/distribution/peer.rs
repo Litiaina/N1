@@ -7,7 +7,7 @@ use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, ShardInfo};
 use crate::core::monitoring::system_health_snapshot;
 use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::{index, index_store};
-use crate::distribution::layout::resolve_layout;
+use crate::distribution::layout::ClusterEcLayout;
 use crate::distribution::membership::{ClusterNode, ClusterRuntime, active_cluster_runtime};
 use crate::distribution::placement::build_placement_plan;
 use crate::enums::app_error_enum::AppError;
@@ -26,12 +26,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::put;
 use axum::{Json, Router};
 use bytes::Bytes;
-use crc32fast::Hasher;
 use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind, SeekFrom};
@@ -1120,19 +1120,7 @@ fn merge_immutable_object_record(
     }
 }
 
-fn all_readable_node_batches(
-    runtime: &ClusterRuntime,
-    object_ids: &[String],
-) -> Vec<(ClusterNode, Vec<String>)> {
-    runtime
-        .membership
-        .readable_nodes()
-        .into_iter()
-        .map(|node| (node, object_ids.to_vec()))
-        .collect()
-}
-
-fn bounded_metadata_node_batches(
+fn exact_metadata_node_batches(
     runtime: &ClusterRuntime,
     fragment: &str,
     object_ids: &[String],
@@ -1145,19 +1133,14 @@ fn bounded_metadata_node_batches(
         .into_iter()
         .map(|node| (node.id.clone(), node))
         .collect::<BTreeMap<_, _>>();
-    let fallback_ids = readable_by_id.keys().cloned().collect::<Vec<_>>();
-    let newest_pool = runtime.membership.newest_writable_pool();
-    let newest_pool_nodes = newest_pool
-        .map(|pool| runtime.membership.nodes_for_pool(&pool.id))
-        .unwrap_or_default();
-    let layout = resolve_layout(newest_pool_nodes.len(), &runtime.layout_policy).ok();
     let mut per_node = BTreeMap::<String, Vec<String>>::new();
 
     for object_id in object_ids {
-        let mut selected = Vec::<String>::new();
-        if let Some(layout) = layout {
-            let Some(pool) = newest_pool else {
-                continue;
+        for pool in &runtime.membership.pools {
+            let nodes = runtime.membership.nodes_for_pool(&pool.id);
+            let layout = ClusterEcLayout {
+                data_shards: pool.policy.object_data_shards,
+                parity_shards: pool.policy.object_parity_shards,
             };
             if let Ok(plan) = build_placement_plan(
                 fragment,
@@ -1167,20 +1150,17 @@ fn bounded_metadata_node_batches(
                 pool.generation,
                 runtime.membership.epoch,
                 layout,
-                &newest_pool_nodes,
+                &nodes,
             ) {
-                selected.extend(plan.placements.into_iter().filter_map(|placement| {
-                    readable_by_id
-                        .contains_key(&placement.node_id)
-                        .then_some(placement.node_id)
-                }));
+                for placement in plan.placements {
+                    if readable_by_id.contains_key(&placement.node_id) {
+                        per_node
+                            .entry(placement.node_id)
+                            .or_default()
+                            .push(object_id.clone());
+                    }
+                }
             }
-        }
-        if selected.is_empty() {
-            selected.extend(fallback_ids.iter().cloned());
-        }
-        for node_id in selected {
-            per_node.entry(node_id).or_default().push(object_id.clone());
         }
     }
 
@@ -1199,7 +1179,7 @@ async fn resolve_object_heads_from_batches(
     runtime: &ClusterRuntime,
     fragment: &str,
     batches: Vec<(ClusterNode, Vec<String>)>,
-) -> Result<(BTreeMap<String, ObjectMetadata>, usize), AppError> {
+) -> Result<(BTreeMap<String, ObjectMetadata>, BTreeSet<(String, String)>), AppError> {
     let mut tasks = futures_util::stream::FuturesUnordered::new();
     for (node, object_ids) in batches {
         if object_ids.is_empty() {
@@ -1211,27 +1191,81 @@ async fn resolve_object_heads_from_batches(
         };
         let local_node_id = runtime.local_node_id.clone();
         tasks.push(async move {
-            if node.id == local_node_id {
+            let result = if node.id == local_node_id {
                 local_object_metadata_heads(&request)
             } else {
                 post_object_batch_resolve(&node.endpoint, &request).await
-            }
+            };
+            (node, request.object_ids, result)
         });
     }
 
     let mut by_object = BTreeMap::new();
-    let mut successful_nodes = 0usize;
-    while let Some(result) = tasks.next().await {
+    let mut proven = BTreeSet::new();
+    while let Some((node, object_ids, result)) = tasks.next().await {
         let Ok(records) = result else {
             continue;
         };
-        successful_nodes += 1;
+        let pool_id = runtime
+            .membership
+            .pool_for_node(&node.id)
+            .map(|pool| pool.id.clone())
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "metadata source node '{}' has no server pool",
+                    node.id
+                ))
+            })?;
+        for object_id in object_ids {
+            proven.insert((pool_id.clone(), object_id));
+        }
         for record in records {
             validate_metadata_pool_contract(runtime, &record)?;
             merge_immutable_object_record(&mut by_object, record)?;
         }
     }
-    Ok((by_object, successful_nodes))
+    Ok((by_object, proven))
+}
+
+fn ensure_exact_head_visibility(
+    runtime: &ClusterRuntime,
+    object_ids: &[String],
+    proven: &BTreeSet<(String, String)>,
+) -> Result<(), AppError> {
+    let unproven = runtime
+        .membership
+        .pools
+        .iter()
+        .flat_map(|pool| {
+            object_ids
+                .iter()
+                .map(move |object_id| (pool.id.clone(), object_id.clone()))
+        })
+        .filter(|pair| !proven.contains(pair))
+        .count();
+    if unproven > 0 {
+        return Err(AppError::ServiceUnavailable(format!(
+            "exact NCDX visibility is unproven for {unproven} server-pool/object pair(s)"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_exact_pool_visibility(
+    runtime: &ClusterRuntime,
+    proven_pools: &BTreeSet<String>,
+) -> Result<(), AppError> {
+    if runtime
+        .membership
+        .pools
+        .iter()
+        .any(|pool| !proven_pools.contains(&pool.id))
+    {
+        return Err(AppError::ServiceUnavailable(
+            "exact NCDX visibility is unproven for one or more server pools".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn resolve_cluster_object_heads(
@@ -1259,34 +1293,9 @@ pub async fn resolve_cluster_object_heads(
         });
     };
 
-    let bounded = bounded_metadata_node_batches(&runtime, fragment, object_ids);
-    let (mut by_object, mut successful_nodes) =
-        resolve_object_heads_from_batches(&runtime, fragment, bounded).await?;
-
-    let missing = object_ids
-        .iter()
-        .filter(|object_id| !by_object.contains_key(*object_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        let fallback_ids = if successful_nodes == 0 {
-            object_ids.to_vec()
-        } else {
-            missing
-        };
-        let fallback = all_readable_node_batches(&runtime, &fallback_ids);
-        let (fallback_records, fallback_successes) =
-            resolve_object_heads_from_batches(&runtime, fragment, fallback).await?;
-        successful_nodes = successful_nodes.saturating_add(fallback_successes);
-        for record in fallback_records.into_values() {
-            merge_immutable_object_record(&mut by_object, record)?;
-        }
-    }
-    if successful_nodes == 0 {
-        return Err(AppError::ServiceUnavailable(
-            "no N2 metadata-bearing node was reachable".into(),
-        ));
-    }
+    let exact = exact_metadata_node_batches(&runtime, fragment, object_ids);
+    let (by_object, proven) = resolve_object_heads_from_batches(&runtime, fragment, exact).await?;
+    ensure_exact_head_visibility(&runtime, object_ids, &proven)?;
     Ok(by_object)
 }
 
@@ -1294,27 +1303,38 @@ async fn resolve_object_versions_from_nodes(
     runtime: &ClusterRuntime,
     request: &PeerObjectResolveRequest,
     nodes: Vec<ClusterNode>,
-) -> Result<(BTreeMap<String, ObjectMetadata>, usize), AppError> {
+) -> Result<(BTreeMap<String, ObjectMetadata>, BTreeSet<String>), AppError> {
     let mut tasks = futures_util::stream::FuturesUnordered::new();
     for node in nodes {
         let request = request.clone();
         let local_node_id = runtime.local_node_id.clone();
         tasks.push(async move {
-            if node.id == local_node_id {
+            let result = if node.id == local_node_id {
                 local_object_metadata(&request)
             } else {
                 post_object_resolve(&node.endpoint, &request).await
-            }
+            };
+            (node, result)
         });
     }
 
     let mut by_version = BTreeMap::<String, ObjectMetadata>::new();
-    let mut successful_nodes = 0usize;
-    while let Some(result) = tasks.next().await {
+    let mut proven_pools = BTreeSet::new();
+    while let Some((node, result)) = tasks.next().await {
         let Ok(records) = result else {
             continue;
         };
-        successful_nodes += 1;
+        let pool_id = runtime
+            .membership
+            .pool_for_node(&node.id)
+            .map(|pool| pool.id.clone())
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "metadata source node '{}' has no server pool",
+                    node.id
+                ))
+            })?;
+        proven_pools.insert(pool_id);
         for record in records {
             validate_metadata_pool_contract(runtime, &record)?;
             match by_version.get(&record.version_id) {
@@ -1333,7 +1353,7 @@ async fn resolve_object_versions_from_nodes(
             }
         }
     }
-    Ok((by_version, successful_nodes))
+    Ok((by_version, proven_pools))
 }
 
 pub async fn resolve_cluster_object_versions(
@@ -1348,28 +1368,13 @@ pub async fn resolve_cluster_object_versions(
     let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() else {
         return local_object_metadata(&request);
     };
-    let bounded_nodes = bounded_metadata_node_batches(&runtime, fragment, &[object_id.to_string()])
+    let exact_nodes = exact_metadata_node_batches(&runtime, fragment, &[object_id.to_string()])
         .into_iter()
         .map(|(node, _)| node)
         .collect::<Vec<_>>();
-    let (mut by_version, mut successful_nodes) =
-        resolve_object_versions_from_nodes(&runtime, &request, bounded_nodes).await?;
-
-    if by_version.is_empty() {
-        let (fallback_versions, fallback_successes) = resolve_object_versions_from_nodes(
-            &runtime,
-            &request,
-            runtime.membership.readable_nodes(),
-        )
-        .await?;
-        successful_nodes = successful_nodes.saturating_add(fallback_successes);
-        by_version = fallback_versions;
-    }
-    if successful_nodes == 0 {
-        return Err(AppError::ServiceUnavailable(
-            "no N2 metadata-bearing node was reachable".into(),
-        ));
-    }
+    let (by_version, proven_pools) =
+        resolve_object_versions_from_nodes(&runtime, &request, exact_nodes).await?;
+    ensure_exact_pool_visibility(&runtime, &proven_pools)?;
     Ok(by_version.into_values().collect())
 }
 
@@ -1387,44 +1392,13 @@ pub async fn resolve_cluster_object_version(
         return Ok(local_object_metadata(&request)?.into_iter().next());
     };
 
-    let bounded_nodes = bounded_metadata_node_batches(&runtime, fragment, &[object_id.to_string()])
+    let exact_nodes = exact_metadata_node_batches(&runtime, fragment, &[object_id.to_string()])
         .into_iter()
         .map(|(node, _)| node)
         .collect::<Vec<_>>();
-    let (mut by_version, mut successful_nodes) =
-        resolve_object_versions_from_nodes(&runtime, &request, bounded_nodes).await?;
-
-    if !by_version.contains_key(version_id) {
-        let (fallback_versions, fallback_successes) = resolve_object_versions_from_nodes(
-            &runtime,
-            &request,
-            runtime.membership.readable_nodes(),
-        )
-        .await?;
-        successful_nodes = successful_nodes.saturating_add(fallback_successes);
-        for record in fallback_versions.into_values() {
-            validate_metadata_pool_contract(&runtime, &record)?;
-            match by_version.get(&record.version_id) {
-                Some(existing)
-                    if object_metadata_bytes(existing)? != object_metadata_bytes(&record)? =>
-                {
-                    return Err(AppError::InternalServerError(format!(
-                        "divergent immutable N2 metadata for object {} version {}",
-                        object_id, record.version_id
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    by_version.insert(record.version_id.clone(), record);
-                }
-            }
-        }
-    }
-    if successful_nodes == 0 {
-        return Err(AppError::ServiceUnavailable(
-            "no N2 metadata-bearing node was reachable".into(),
-        ));
-    }
+    let (mut by_version, proven_pools) =
+        resolve_object_versions_from_nodes(&runtime, &request, exact_nodes).await?;
+    ensure_exact_pool_visibility(&runtime, &proven_pools)?;
     Ok(by_version.remove(version_id))
 }
 
@@ -2097,7 +2071,7 @@ pub async fn peer_put_shard(
     let file = create_direct_file(&tmp_path).await?;
     let mut file = DirectWriter::new(file);
     let mut stream = body.into_data_stream();
-    let mut hasher = Hasher::new();
+    let mut hasher = Sha256::new();
     let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
@@ -2149,7 +2123,7 @@ pub async fn peer_put_shard(
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
-        checksum: format!("{:08x}", hasher.finalize()),
+        checksum: hex::encode(hasher.finalize()),
         block_checksums: Vec::new(),
         checksum_block_size: 0,
         is_parity,
@@ -2293,7 +2267,7 @@ where
     let stable_path = dir.join(&file_name);
     let file = create_direct_file(&tmp_path).await?;
     let mut file = DirectWriter::new(file);
-    let mut hasher = Hasher::new();
+    let mut hasher = Sha256::new();
     let mut written = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
     while written < body_len {
@@ -2359,7 +2333,7 @@ where
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
-        checksum: format!("{:08x}", hasher.finalize()),
+        checksum: hex::encode(hasher.finalize()),
         block_checksums: Vec::new(),
         checksum_block_size: 0,
         is_parity: payload.parity,
@@ -2458,6 +2432,58 @@ pub fn build_peer_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distribution::layout::ClusterLayoutPolicy;
+    use crate::distribution::membership::{
+        ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState, PoolState,
+        ServerPool, StorageRoot,
+    };
+
+    fn metadata_runtime() -> ClusterRuntime {
+        let nodes = (0..3)
+            .map(|index| ClusterNode {
+                id: format!("n{index}"),
+                endpoint: format!("https://n{index}:50001"),
+                native_endpoint: Some(format!("n2://n{index}:50002")),
+                state: Some(NodeState::Online),
+                weight: 1,
+                storage_roots: vec![StorageRoot {
+                    id: format!("r{index}"),
+                    path: format!("/disk/{index}"),
+                }],
+                joined_epoch: 1,
+                capacity_bytes: None,
+                used_bytes: None,
+                last_seen_unix: None,
+            })
+            .collect::<Vec<_>>();
+        ClusterRuntime {
+            local_node_id: "n0".into(),
+            local_pool_id: "pool-a".into(),
+            local_storage_roots: nodes[0].storage_roots.clone(),
+            membership_path: std::path::PathBuf::from("/membership"),
+            layout_policy: ClusterLayoutPolicy {
+                data_shards: 2,
+                parity_shards: 1,
+            },
+            membership: ClusterMembership {
+                format_version: N2_MEMBERSHIP_FORMAT_VERSION,
+                cluster_id: "cluster-a".into(),
+                epoch: 1,
+                pools: vec![ServerPool {
+                    id: "pool-a".into(),
+                    generation: 1,
+                    policy: ClusterPolicy {
+                        object_data_shards: 2,
+                        object_parity_shards: 1,
+                    },
+                    state: PoolState::Writable,
+                    node_ids: (0..3).map(|index| format!("n{index}")).collect(),
+                }],
+                nodes,
+            },
+            auto_rebalance: false,
+        }
+    }
 
     #[test]
     fn peer_shard_locator_round_trips_endpoint_and_identity() {
@@ -2502,6 +2528,68 @@ mod tests {
         let large = peer_transfer_timeout(1024 * 1024 * 1024);
         assert!(large > small);
         assert!(small >= PEER_WRITE_TIMEOUT);
+    }
+
+    #[test]
+    fn metadata_lookup_uses_every_exact_static_pool_holder_without_substitution() {
+        let mut runtime = metadata_runtime();
+        let object_id = "object-a".to_string();
+        let pool = runtime.membership.pool("pool-a").unwrap();
+        let nodes = runtime.membership.nodes_for_pool("pool-a");
+        let plan = build_placement_plan(
+            "fragment",
+            &object_id,
+            "",
+            "pool-a",
+            1,
+            1,
+            ClusterEcLayout {
+                data_shards: 2,
+                parity_shards: 1,
+            },
+            &nodes,
+        )
+        .unwrap();
+        let expected = plan
+            .placements
+            .iter()
+            .map(|placement| placement.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected.len(), pool.policy.object_width());
+
+        let selected =
+            exact_metadata_node_batches(&runtime, "fragment", std::slice::from_ref(&object_id))
+                .into_iter()
+                .map(|(node, _)| node.id)
+                .collect::<BTreeSet<_>>();
+        assert_eq!(selected, expected);
+
+        let failed_holder = expected.iter().next().unwrap().clone();
+        runtime
+            .membership
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == failed_holder)
+            .unwrap()
+            .state = Some(NodeState::Offline);
+        let degraded =
+            exact_metadata_node_batches(&runtime, "fragment", std::slice::from_ref(&object_id))
+                .into_iter()
+                .map(|(node, _)| node.id)
+                .collect::<BTreeSet<_>>();
+        assert_eq!(degraded.len(), expected.len() - 1);
+        assert!(degraded.is_subset(&expected));
+    }
+
+    #[test]
+    fn metadata_absence_requires_one_exact_holder_response_per_pool() {
+        let runtime = metadata_runtime();
+        let object_ids = vec!["object-a".to_string()];
+        let proven = BTreeSet::from([("pool-a".to_string(), "object-a".to_string())]);
+        ensure_exact_head_visibility(&runtime, &object_ids, &proven).unwrap();
+        ensure_exact_pool_visibility(&runtime, &BTreeSet::from(["pool-a".to_string()])).unwrap();
+        assert!(ensure_exact_head_visibility(&runtime, &object_ids, &BTreeSet::new()).is_err());
+        assert!(ensure_exact_pool_visibility(&runtime, &BTreeSet::new()).is_err());
     }
 
     #[tokio::test]

@@ -413,45 +413,73 @@ fn local_list(
     let mut names = BTreeMap::<String, PeerNcnxName>::new();
     for root in &runtime.local_storage_roots {
         let store = NcnxStore::new(&root.id, PathBuf::from(&root.path));
-        let candidates = match request.action {
-            PeerNcnxAction::ListLive | PeerNcnxAction::ListLiveAll => store.list_live_names(
-                &request.fragment_id,
-                &request.logical_key,
-                request.after.as_deref(),
-                limit.saturating_add(1),
-            )?,
-            PeerNcnxAction::ListTrash | PeerNcnxAction::ListTrashAll => store.list_trash_names(
-                &request.fragment_id,
-                &request.logical_key,
-                request.after.as_deref(),
-                limit.saturating_add(1),
-            )?,
-            _ => unreachable!(),
-        };
-        for item in candidates {
-            let layout = build_ncnx_layout(runtime, pool, &request.fragment_id, &item.logical_key)?;
-            let canonical = layout.canonical()?;
-            let canonical_only = matches!(
-                request.action,
-                PeerNcnxAction::ListLive | PeerNcnxAction::ListTrash
-            );
-            if canonical_only
-                && (canonical.node_id != runtime.local_node_id || canonical.root_id != root.id)
-            {
-                continue;
+        let canonical_only = matches!(
+            request.action,
+            PeerNcnxAction::ListLive | PeerNcnxAction::ListTrash
+        );
+        let mut source_after = request.after.clone();
+        let mut accepted_from_root = 0usize;
+
+        // The physical scan limit is not the logical page limit: on a replica
+        // root many entries can be non-canonical. Refill this root until it
+        // contributes a complete logical page or its ordered stream ends.
+        loop {
+            let candidates = match request.action {
+                PeerNcnxAction::ListLive | PeerNcnxAction::ListLiveAll => store.list_live_names(
+                    &request.fragment_id,
+                    &request.logical_key,
+                    source_after.as_deref(),
+                    limit,
+                )?,
+                PeerNcnxAction::ListTrash | PeerNcnxAction::ListTrashAll => store
+                    .list_trash_names(
+                        &request.fragment_id,
+                        &request.logical_key,
+                        source_after.as_deref(),
+                        limit,
+                    )?,
+                _ => unreachable!(),
+            };
+            if candidates.is_empty() {
+                break;
             }
-            let cursor = ncnx_cursor(&item.logical_key, item.trash.as_ref());
-            names.insert(
-                cursor,
-                PeerNcnxName {
-                    logical_key: item.logical_key,
-                    trash: item.trash,
-                },
-            );
-            if names.len() > limit {
-                let last = names.keys().next_back().cloned().unwrap();
-                names.remove(&last);
+            let source_exhausted = candidates.len() < limit;
+            let next_source_after = candidates
+                .last()
+                .map(|item| ncnx_cursor(&item.logical_key, item.trash.as_ref()));
+
+            for item in candidates {
+                let layout =
+                    build_ncnx_layout(runtime, pool, &request.fragment_id, &item.logical_key)?;
+                let canonical = layout.canonical()?;
+                if canonical_only
+                    && (canonical.node_id != runtime.local_node_id || canonical.root_id != root.id)
+                {
+                    continue;
+                }
+                accepted_from_root = accepted_from_root.saturating_add(1);
+                let cursor = ncnx_cursor(&item.logical_key, item.trash.as_ref());
+                names.insert(
+                    cursor,
+                    PeerNcnxName {
+                        logical_key: item.logical_key,
+                        trash: item.trash,
+                    },
+                );
+                if names.len() > limit {
+                    names.pop_last();
+                }
             }
+
+            if source_exhausted || accepted_from_root >= limit {
+                break;
+            }
+            if next_source_after == source_after {
+                return Err(AppError::InternalServerError(
+                    "NCNX listing source did not advance".into(),
+                ));
+            }
+            source_after = next_source_after;
         }
     }
     Ok(PeerNcnxResponse {
@@ -988,15 +1016,22 @@ async fn list_node(
         .map_err(|err| AppError::InternalServerError(format!("decode NCNX listing: {err}")))
 }
 
-pub async fn list_canonical_names(
+struct NodeListPage {
+    pool_id: String,
+    node_id: String,
+    allowed_failures: usize,
+    result: Result<Vec<PeerNcnxName>, AppError>,
+}
+
+async fn list_all_nodes(
+    runtime: &ClusterRuntime,
     fragment_id: &str,
     prefix: &str,
     after: Option<&str>,
     limit: usize,
     trash: bool,
-) -> Result<Vec<PeerNcnxName>, AppError> {
-    let runtime = active_cluster_runtime()?;
-    let limit = limit.clamp(1, 10_000);
+    canonical_only: bool,
+) -> Vec<NodeListPage> {
     let mut calls = Vec::new();
     for pool in &runtime.membership.pools {
         for node in runtime.membership.nodes_for_pool(&pool.id) {
@@ -1006,7 +1041,7 @@ pub async fn list_canonical_names(
             let prefix = prefix.to_string();
             let after = after.map(ToOwned::to_owned);
             calls.push(async move {
-                list_node(
+                let result = list_node(
                     &runtime,
                     &pool,
                     &node,
@@ -1015,20 +1050,96 @@ pub async fn list_canonical_names(
                     after.as_deref(),
                     limit,
                     trash,
-                    true,
+                    canonical_only,
                 )
-                .await
+                .await;
+                NodeListPage {
+                    pool_id: pool.id,
+                    node_id: node.id,
+                    allowed_failures: pool.policy.object_parity_shards,
+                    result,
+                }
             });
         }
     }
-    let pages = join_all(calls).await;
+    join_all(calls).await
+}
+
+fn merge_node_pages(
+    pages: Vec<NodeListPage>,
+    limit: usize,
+    tolerate_failures: bool,
+) -> Result<Vec<PeerNcnxName>, AppError> {
+    let mut failures = BTreeMap::<String, (usize, usize, Vec<String>)>::new();
     let mut merged = BTreeMap::<String, PeerNcnxName>::new();
     for page in pages {
-        for name in page? {
-            merged.insert(ncnx_cursor(&name.logical_key, name.trash.as_ref()), name);
+        match page.result {
+            Ok(names) => {
+                for name in names {
+                    merged.insert(ncnx_cursor(&name.logical_key, name.trash.as_ref()), name);
+                }
+            }
+            Err(err) => {
+                let failure = failures
+                    .entry(page.pool_id)
+                    .or_insert_with(|| (0, page.allowed_failures, Vec::new()));
+                failure.0 = failure.0.saturating_add(1);
+                failure.2.push(format!("{}: {}", page.node_id, err));
+            }
         }
     }
+
+    if let Some((pool_id, (failed, allowed, details))) = failures
+        .iter()
+        .find(|(_, (failed, allowed, _))| !tolerate_failures || failed > allowed)
+    {
+        return Err(AppError::ServiceUnavailable(format!(
+            "NCNX listing cannot prove a complete result for pool '{}': {} node failures, tolerance {}; {}",
+            pool_id,
+            failed,
+            allowed,
+            details.join("; ")
+        )));
+    }
+
     Ok(merged.into_values().take(limit).collect())
+}
+
+pub async fn list_canonical_names(
+    fragment_id: &str,
+    prefix: &str,
+    after: Option<&str>,
+    limit: usize,
+    trash: bool,
+) -> Result<Vec<PeerNcnxName>, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let limit = limit.clamp(1, 10_000);
+    let canonical = list_all_nodes(
+        runtime.as_ref(),
+        fragment_id,
+        prefix,
+        after,
+        limit,
+        trash,
+        true,
+    )
+    .await;
+    if canonical.iter().all(|page| page.result.is_ok()) {
+        return merge_node_pages(canonical, limit, false);
+    }
+
+    tracing::warn!("NCNX canonical listing lost a source; retrying surviving namespace replicas");
+    let replicas = list_all_nodes(
+        runtime.as_ref(),
+        fragment_id,
+        prefix,
+        after,
+        limit,
+        trash,
+        false,
+    )
+    .await;
+    merge_node_pages(replicas, limit, true)
 }
 
 /// Healing discovery asks every root for physical names so a missing
@@ -1042,38 +1153,17 @@ pub async fn list_replica_names(
 ) -> Result<Vec<PeerNcnxName>, AppError> {
     let runtime = active_cluster_runtime()?;
     let limit = limit.clamp(1, 10_000);
-    let mut calls = Vec::new();
-    for pool in &runtime.membership.pools {
-        for node in runtime.membership.nodes_for_pool(&pool.id) {
-            let runtime = runtime.clone();
-            let pool = pool.clone();
-            let fragment_id = fragment_id.to_string();
-            let prefix = prefix.to_string();
-            let after = after.map(ToOwned::to_owned);
-            calls.push(async move {
-                list_node(
-                    &runtime,
-                    &pool,
-                    &node,
-                    &fragment_id,
-                    &prefix,
-                    after.as_deref(),
-                    limit,
-                    trash,
-                    false,
-                )
-                .await
-            });
-        }
-    }
-    let pages = join_all(calls).await;
-    let mut merged = BTreeMap::<String, PeerNcnxName>::new();
-    for page in pages {
-        for name in page? {
-            merged.insert(ncnx_cursor(&name.logical_key, name.trash.as_ref()), name);
-        }
-    }
-    Ok(merged.into_values().take(limit).collect())
+    let replicas = list_all_nodes(
+        runtime.as_ref(),
+        fragment_id,
+        prefix,
+        after,
+        limit,
+        trash,
+        false,
+    )
+    .await;
+    merge_node_pages(replicas, limit, true)
 }
 
 pub async fn read_canonical_record(
@@ -1333,8 +1423,10 @@ pub fn unique_object_ids(records: &[LocatedNcnx]) -> BTreeSet<String> {
 mod tests {
     use super::*;
     use crate::distribution::membership::{
-        ClusterMembership, ClusterPolicy, NodeState, PoolState, StorageRoot,
+        ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState, PoolState,
+        StorageRoot,
     };
+    use ulid::Ulid;
 
     fn runtime() -> ClusterRuntime {
         let policy = ClusterPolicy {
@@ -1368,7 +1460,7 @@ mod tests {
                 parity_shards: 2,
             },
             membership: ClusterMembership {
-                format_version: 3,
+                format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "cluster-a".into(),
                 epoch: 1,
                 pools: vec![ServerPool {
@@ -1422,5 +1514,115 @@ mod tests {
         assert!(!trash_is_expired_at(&locator, 109, 10));
         assert!(trash_is_expired_at(&locator, 110, 10));
         assert!(!trash_is_expired_at(&locator, 99, 10));
+    }
+
+    #[test]
+    fn local_canonical_listing_refills_past_noncanonical_physical_names() {
+        let root = std::env::temp_dir().join(format!("n2-ncnx-refill-{}", Ulid::new()));
+        std::fs::create_dir_all(&root).expect("create NCNX test root");
+        let mut runtime = runtime();
+        runtime.local_storage_roots[0].path = root.to_string_lossy().to_string();
+        runtime.membership.nodes[0].storage_roots[0].path = root.to_string_lossy().to_string();
+        let pool = runtime.membership.pool("pool-a").unwrap();
+
+        let mut first_noncanonical = None;
+        let mut later_canonical = None;
+        for index in 0..20_000 {
+            let key = format!("key-{index:05}");
+            let layout = build_ncnx_layout(&runtime, pool, "fragment", &key).unwrap();
+            let stored_here = layout
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == "n0" && replica.root_id == "r0");
+            if !stored_here {
+                continue;
+            }
+            if first_noncanonical.is_none() && layout.canonical().unwrap().node_id != "n0" {
+                first_noncanonical = Some(key);
+            } else if first_noncanonical.is_some() && layout.canonical().unwrap().node_id == "n0" {
+                later_canonical = Some(key);
+                break;
+            }
+        }
+        let first_noncanonical = first_noncanonical.expect("find noncanonical key");
+        let later_canonical = later_canonical.expect("find later canonical key");
+        assert!(first_noncanonical < later_canonical);
+
+        let store = NcnxStore::new("r0", &root);
+        for (index, key) in [&first_noncanonical, &later_canonical]
+            .into_iter()
+            .enumerate()
+        {
+            let record = NcnxRecord::new(
+                "fragment",
+                format!("object-{index}"),
+                Ulid::new().to_string(),
+                1,
+            )
+            .unwrap();
+            store
+                .create_live("fragment", key, &record.encode().unwrap())
+                .unwrap();
+        }
+        let request = PeerNcnxRequest {
+            action: PeerNcnxAction::ListLive,
+            pool_id: "pool-a".into(),
+            pool_generation: 1,
+            fragment_id: "fragment".into(),
+            logical_key: String::new(),
+            root_id: String::new(),
+            trash: None,
+            bytes: None,
+            after: None,
+            limit: Some(1),
+        };
+        let page = local_list(&runtime, &request).expect("list canonical page");
+        assert_eq!(
+            page.names,
+            vec![PeerNcnxName {
+                logical_key: later_canonical,
+                trash: None,
+            }]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replica_listing_tolerates_only_the_configured_namespace_failure_budget() {
+        let name = PeerNcnxName {
+            logical_key: "videos/a.mp4".into(),
+            trash: None,
+        };
+        let pages = vec![
+            NodeListPage {
+                pool_id: "pool-a".into(),
+                node_id: "n0".into(),
+                allowed_failures: 2,
+                result: Ok(vec![name.clone()]),
+            },
+            NodeListPage {
+                pool_id: "pool-a".into(),
+                node_id: "n1".into(),
+                allowed_failures: 2,
+                result: Err(AppError::ServiceUnavailable("offline".into())),
+            },
+            NodeListPage {
+                pool_id: "pool-a".into(),
+                node_id: "n2".into(),
+                allowed_failures: 2,
+                result: Err(AppError::ServiceUnavailable("offline".into())),
+            },
+        ];
+        assert_eq!(merge_node_pages(pages, 100, true).unwrap(), vec![name]);
+
+        let pages = (0..3)
+            .map(|index| NodeListPage {
+                pool_id: "pool-a".into(),
+                node_id: format!("n{index}"),
+                allowed_failures: 2,
+                result: Err(AppError::ServiceUnavailable("offline".into())),
+            })
+            .collect();
+        assert!(merge_node_pages(pages, 100, true).is_err());
     }
 }

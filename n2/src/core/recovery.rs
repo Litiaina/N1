@@ -1,9 +1,10 @@
+use crate::core::checksum::parse_sha256_hex;
 use crate::core::constants::{GC_SUFFIX, N2_BLOB_DIR};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
-use crc32fast::Hasher;
+use sha2::{Digest, Sha256};
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
@@ -228,12 +229,9 @@ async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, 
 }
 
 pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) -> bool {
-    if expected_checksum.is_empty() {
-        return true;
-    }
-    if expected_checksum.len() != 8 {
+    let Some(expected) = parse_sha256_hex(expected_checksum) else {
         return false;
-    }
+    };
 
     let original_pos = match file.seek(SeekFrom::Current(0)).await {
         Ok(pos) => pos,
@@ -244,7 +242,7 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
         return false;
     }
 
-    let mut hasher = Hasher::new();
+    let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
 
     loop {
@@ -258,11 +256,7 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
         }
     }
 
-    let calculated = hasher.finalize();
-    let expected = match u32::from_str_radix(expected_checksum, 16) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    let calculated: [u8; 32] = hasher.finalize().into();
 
     let _ = file.seek(SeekFrom::Start(original_pos)).await;
 
@@ -919,10 +913,23 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn crc32_hex(bytes: &[u8]) -> String {
-        let mut hasher = Hasher::new();
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
         hasher.update(bytes);
-        format!("{:08x}", hasher.finalize())
+        hex::encode(hasher.finalize())
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_rejects_missing_or_non_sha256_checksums() {
+        let path = std::env::temp_dir().join(format!("n2-sha256-check-{}", Ulid::new()));
+        fs::write(&path, b"verified bytes")
+            .await
+            .expect("write test shard");
+        let mut file = File::open(&path).await.expect("open test shard");
+        assert!(!verify_shard_integrity(&mut file, "").await);
+        assert!(!verify_shard_integrity(&mut file, "352441c2").await);
+        assert!(verify_shard_integrity(&mut file, &sha256_hex(b"verified bytes")).await);
+        let _ = fs::remove_file(path).await;
     }
 
     #[tokio::test]
@@ -966,7 +973,7 @@ mod tests {
 
         let mut shard_bytes = vec![0u8; 262_144];
         shard_bytes[..9].copy_from_slice(b"trash-me\n");
-        let checksum = crc32_hex(&shard_bytes);
+        let checksum = sha256_hex(&shard_bytes);
 
         let parity_path = parity_dir.join("part_0_shard_1.parity");
         fs::write(&parity_path, &shard_bytes)
@@ -1030,7 +1037,7 @@ mod tests {
                             .to_string_lossy()
                             .to_string(),
                         size_bytes: 262_144,
-                        checksum: crc32_hex(&shard_bytes),
+                        checksum: sha256_hex(&shard_bytes),
                         block_checksums: Vec::new(),
                         checksum_block_size: 0,
                         is_parity: false,
@@ -1040,7 +1047,7 @@ mod tests {
                         file_name: "part_0_shard_1.parity".to_string(),
                         absolute_path: parity_path.to_string_lossy().to_string(),
                         size_bytes: 262_144,
-                        checksum: crc32_hex(&shard_bytes),
+                        checksum: sha256_hex(&shard_bytes),
                         block_checksums: Vec::new(),
                         checksum_block_size: 0,
                         is_parity: true,

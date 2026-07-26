@@ -1,8 +1,8 @@
+use crate::core::checksum::{Sha256Digest, parse_sha256_hex, sha256_matches};
 use crate::core::disk_manager::{PartMetadata, ShardInfo};
 use crate::distribution::peer::{fetch_peer_shard_chunk, parse_peer_shard_locator};
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_read_recover;
-use crc32fast::Hasher;
 use futures_util::future::join_all;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -120,18 +120,8 @@ pub async fn shard_probe_readable(shard: &ShardInfo) -> bool {
     read_shard_chunk(shard, 0, 1).await.is_ok()
 }
 
-fn expected_crc32(checksum: &str) -> Option<u32> {
-    let checksum = checksum.trim();
-    if checksum.len() != 8 {
-        return None;
-    }
-    u32::from_str_radix(checksum, 16).ok()
-}
-
-fn crc32_matches(bytes: &[u8], expected: u32) -> bool {
-    let mut hasher = Hasher::new();
-    hasher.update(bytes);
-    hasher.finalize() == expected
+fn expected_sha256(checksum: &str) -> Option<Sha256Digest> {
+    parse_sha256_hex(checksum)
 }
 
 pub fn part_has_block_checksums(part: &PartMetadata, block_size: usize) -> bool {
@@ -177,7 +167,7 @@ async fn read_verified_shard_block(
         )));
     }
     let bytes = read_shard_chunk(shard, offset, length).await?;
-    if !crc32_matches(&bytes, expected) {
+    if !sha256_matches(&bytes, &expected) {
         return Err(AppError::ServiceUnavailable(format!(
             "cluster shard {} block {} failed checksum verification",
             shard.file_name, block_index
@@ -351,13 +341,13 @@ async fn read_full_shard(shard: &ShardInfo) -> Result<Vec<u8>, AppError> {
 }
 
 pub async fn shard_probe_verified(shard: &ShardInfo) -> bool {
-    let Some(expected) = expected_crc32(&shard.checksum) else {
-        return shard_probe_readable(shard).await;
+    let Some(expected) = expected_sha256(&shard.checksum) else {
+        return false;
     };
     let Ok(bytes) = read_full_shard(shard).await else {
         return false;
     };
-    bytes.len() as u64 == shard.size_bytes && crc32_matches(&bytes, expected)
+    bytes.len() as u64 == shard.size_bytes && sha256_matches(&bytes, &expected)
 }
 
 pub async fn prefetch_verified_data_shards(part: &PartMetadata, cache: &mut VerifiedShardCache) {
@@ -366,7 +356,7 @@ pub async fn prefetch_verified_data_shards(part: &PartMetadata, cache: &mut Veri
         .iter()
         .filter(|shard| !shard.is_parity)
         .filter_map(|shard| {
-            let expected = expected_crc32(&shard.checksum)?;
+            let expected = expected_sha256(&shard.checksum)?;
             let key = verified_cache_key(shard);
             if cache.verified.contains_key(&key) || cache.rejected.contains(&key) {
                 return None;
@@ -381,7 +371,7 @@ pub async fn prefetch_verified_data_shards(part: &PartMetadata, cache: &mut Veri
     for (key, shard, expected, result) in join_all(pending).await {
         match result {
             Ok(bytes)
-                if bytes.len() as u64 == shard.size_bytes && crc32_matches(&bytes, expected) =>
+                if bytes.len() as u64 == shard.size_bytes && sha256_matches(&bytes, &expected) =>
             {
                 cache.verified.insert(key, bytes);
             }
@@ -401,8 +391,11 @@ pub(crate) async fn read_verified_shard_slice_cached(
     if shard.checksum_block_size > 0 && !shard.block_checksums.is_empty() {
         return read_verified_shard_range_cached(shard, offset, len, cache).await;
     }
-    let Some(expected) = expected_crc32(&shard.checksum) else {
-        return read_shard_chunk(shard, offset, len).await;
+    let Some(expected) = expected_sha256(&shard.checksum) else {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} has no valid SHA-256 checksum",
+            shard.file_name
+        )));
     };
     let key = verified_cache_key(shard);
     if cache.rejected.contains(&key) {
@@ -413,7 +406,7 @@ pub(crate) async fn read_verified_shard_slice_cached(
     }
     if !cache.verified.contains_key(&key) {
         let bytes = read_full_shard(shard).await?;
-        if bytes.len() as u64 != shard.size_bytes || !crc32_matches(&bytes, expected) {
+        if bytes.len() as u64 != shard.size_bytes || !sha256_matches(&bytes, &expected) {
             cache.rejected.insert(key.clone());
             return Err(AppError::ServiceUnavailable(format!(
                 "cluster shard {} failed checksum verification",
@@ -598,13 +591,18 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
     }
 
     out.truncate(total_len);
-    if let Some(expected) = expected_crc32(&target.checksum) {
-        if !crc32_matches(&out, expected) {
+    if let Some(expected) = expected_sha256(&target.checksum) {
+        if !sha256_matches(&out, &expected) {
             return Err(AppError::InternalServerError(format!(
                 "reconstructed shard {} failed checksum validation",
                 target.file_name
             )));
         }
+    } else {
+        return Err(AppError::InternalServerError(format!(
+            "reconstructed shard {} has no valid SHA-256 checksum",
+            target.file_name
+        )));
     }
     Ok(out)
 }
@@ -612,6 +610,7 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::checksum::{format_sha256, sha256_digest};
     use crate::core::disk_manager::ShardInfo;
     use simd_erasure_core::ReedSolomonEncoder;
     use ulid::Ulid;
@@ -626,7 +625,7 @@ mod tests {
         let block_size = 4096usize;
         let block_checksums = data
             .chunks(block_size)
-            .map(crc32fast::hash)
+            .map(sha256_digest)
             .collect::<Vec<_>>();
         let path = root.join("data.shard");
         tokio::fs::write(&path, &data).await.expect("write shard");
@@ -635,7 +634,7 @@ mod tests {
             file_name: "data.shard".into(),
             absolute_path: path.to_string_lossy().to_string(),
             size_bytes: data.len() as u64,
-            checksum: "00000000".into(),
+            checksum: format_sha256(&sha256_digest(&data)),
             block_checksums,
             checksum_block_size: block_size,
             is_parity: false,
@@ -678,7 +677,7 @@ mod tests {
         let parity = encoded.recovery(0).expect("parity").to_vec();
         drop(encoded);
         let parity_path = root.join("part_0_shard_1.parity");
-        tokio::fs::write(&parity_path, parity)
+        tokio::fs::write(&parity_path, &parity)
             .await
             .expect("write parity");
         let part = PartMetadata {
@@ -695,7 +694,7 @@ mod tests {
                         .to_string_lossy()
                         .to_string(),
                     size_bytes: data.len() as u64,
-                    checksum: String::new(),
+                    checksum: format_sha256(&sha256_digest(&data)),
                     block_checksums: Vec::new(),
                     checksum_block_size: 0,
                     is_parity: false,
@@ -705,7 +704,7 @@ mod tests {
                     file_name: "part_0_shard_1.parity".into(),
                     absolute_path: parity_path.to_string_lossy().to_string(),
                     size_bytes: data.len() as u64,
-                    checksum: String::new(),
+                    checksum: format_sha256(&sha256_digest(&parity)),
                     block_checksums: Vec::new(),
                     checksum_block_size: 0,
                     is_parity: true,
@@ -744,7 +743,7 @@ mod tests {
                 file_name: format!("part_0_shard_{index}.shard"),
                 absolute_path: path.to_string_lossy().to_string(),
                 size_bytes: bytes.len() as u64,
-                checksum: format!("{:08x}", crc32fast::hash(bytes)),
+                checksum: format_sha256(&sha256_digest(bytes)),
                 block_checksums: Vec::new(),
                 checksum_block_size: 0,
                 is_parity: false,
@@ -798,8 +797,8 @@ mod tests {
                 file_name: format!("part_0_shard_{index}"),
                 absolute_path: path.to_string_lossy().to_string(),
                 size_bytes: 4,
-                checksum: format!("{:08x}", crc32fast::hash(&expected[index])),
-                block_checksums: vec![crc32fast::hash(&expected[index])],
+                checksum: format_sha256(&sha256_digest(&expected[index])),
+                block_checksums: vec![sha256_digest(&expected[index])],
                 checksum_block_size: 4,
                 is_parity: index == 2,
             });

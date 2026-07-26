@@ -4,6 +4,7 @@ use super::disk_manager::{
 };
 use super::index::{IndexSessionState, SessionPartReceipt, TrashCatalogEntry};
 use super::upload::UploadSessionManifest;
+use crate::core::checksum::{Sha256Digest, format_sha256, parse_sha256_hex, sha256_digest};
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::fragment_identity::{
     FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_root_on as resolved_fragment_root_on,
@@ -35,6 +36,7 @@ const SHARD_RECEIPT_PREFIX: &str = "shard_p";
 const PART_RECEIPT_PREFIX: &str = "part_p";
 const RECEIPT_SUFFIX: &str = ".receipt";
 const PART_META_PREFIX: &str = "part_";
+const NCDX_FORMAT_VERSION: u32 = 4;
 pub(crate) const OBJECT_DIR_PREFIX: &str = "@o_";
 pub(crate) const FRAGMENT_DIR_PREFIX: &str = PHYSICAL_FRAGMENT_PREFIX;
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
@@ -128,6 +130,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskObjectMetadata {
+    format_version: u32,
     object_id: String,
     packed_ext_u64: u64,
     fragment: String,
@@ -145,11 +148,13 @@ struct DiskObjectMetadata {
     parts: Vec<crate::core::disk_manager::PartMetadata>,
     is_delete_marker: bool,
     stripe_size_bytes: usize,
+    payload_sha256: Sha256Digest,
 }
 
 impl From<&ObjectMetadata> for DiskObjectMetadata {
     fn from(meta: &ObjectMetadata) -> Self {
         Self {
+            format_version: NCDX_FORMAT_VERSION,
             object_id: meta.object_key.clone(),
             packed_ext_u64: meta.packed_ext_u64,
             fragment: meta.fragment.clone(),
@@ -167,6 +172,7 @@ impl From<&ObjectMetadata> for DiskObjectMetadata {
             parts: meta.parts.clone(),
             is_delete_marker: meta.is_delete_marker,
             stripe_size_bytes: meta.stripe_size_bytes,
+            payload_sha256: [0; 32],
         }
     }
 }
@@ -196,9 +202,74 @@ impl From<DiskObjectMetadata> for ObjectMetadata {
 }
 
 fn encode_disk_object_metadata(metadata: &ObjectMetadata) -> Result<Vec<u8>, AppError> {
-    Ok(rmp_serde::to_vec_named(&DiskObjectMetadata::from(
-        metadata,
-    ))?)
+    let mut disk = DiskObjectMetadata::from(metadata);
+    disk.validate_fields()?;
+    disk.payload_sha256 = disk.expected_sha256()?;
+    Ok(rmp_serde::to_vec_named(&disk)?)
+}
+
+impl DiskObjectMetadata {
+    fn validate_fields(&self) -> Result<(), AppError> {
+        if self.format_version != NCDX_FORMAT_VERSION {
+            return Err(AppError::Conflict(format!(
+                "NCDX format {} is not N2 3.2 format {}",
+                self.format_version, NCDX_FORMAT_VERSION
+            )));
+        }
+        if self.object_id.trim().is_empty()
+            || self.fragment.trim().is_empty()
+            || self.version_id.trim().is_empty()
+            || self.pool_id.trim().is_empty()
+            || self.pool_generation == 0
+            || self.data_shards == 0
+            || self.parity_shards == 0
+        {
+            return Err(AppError::Conflict(
+                "NCDX requires object, fragment, version, pool, and static EC identities".into(),
+            ));
+        }
+        for part in &self.parts {
+            if let Some(checksum) = part.checksum.as_deref()
+                && parse_sha256_hex(checksum).is_none()
+            {
+                return Err(AppError::Conflict(format!(
+                    "NCDX part {} has an invalid SHA-256 checksum",
+                    part.part_index
+                )));
+            }
+            if part
+                .shards
+                .iter()
+                .any(|shard| parse_sha256_hex(&shard.checksum).is_none())
+            {
+                return Err(AppError::Conflict(format!(
+                    "NCDX part {} contains a shard without a valid SHA-256 checksum",
+                    part.part_index
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_sha256(&self) -> Result<Sha256Digest, AppError> {
+        let mut unsigned = self.clone();
+        unsigned.payload_sha256 = [0; 32];
+        let payload = rmp_serde::to_vec_named(&unsigned)?;
+        Ok(sha256_digest(&payload))
+    }
+
+    fn validate(&self) -> Result<(), AppError> {
+        self.validate_fields()?;
+        let expected = self.expected_sha256()?;
+        if self.payload_sha256 != expected {
+            return Err(AppError::Conflict(format!(
+                "NCDX integrity mismatch: expected {}, recorded {}",
+                format_sha256(&expected),
+                format_sha256(&self.payload_sha256)
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn index_roots() -> Vec<PathBuf> {
@@ -603,35 +674,34 @@ fn session_shard_size(manifest: &UploadSessionManifest, part_size: u64) -> u64 {
     part_size.div_ceil(stripe_data_width) * block_size as u64
 }
 
-fn shard_receipt_name(part_index: u64, shard_index: usize, checksum: u32) -> String {
-    format!("shard_p{part_index:020}_s{shard_index:04}.{checksum:08x}{RECEIPT_SUFFIX}")
+fn shard_receipt_name(part_index: u64, shard_index: usize, checksum: &Sha256Digest) -> String {
+    format!(
+        "shard_p{part_index:020}_s{shard_index:04}.{}{RECEIPT_SUFFIX}",
+        format_sha256(checksum)
+    )
 }
 
-fn part_receipt_name(part_index: u64, checksum: u32) -> String {
-    format!("part_p{part_index:020}.{checksum:08x}{RECEIPT_SUFFIX}")
+fn part_receipt_name(part_index: u64, checksum: &Sha256Digest) -> String {
+    format!(
+        "part_p{part_index:020}.{}{RECEIPT_SUFFIX}",
+        format_sha256(checksum)
+    )
 }
 
-fn parse_crc32_field(value: &str) -> Option<u32> {
-    if value.len() != 8 {
-        return None;
-    }
-    u32::from_str_radix(value, 16).ok()
-}
-
-fn parse_shard_receipt_name(name: &str) -> Option<(u64, usize, u32)> {
+fn parse_shard_receipt_name(name: &str) -> Option<(u64, usize, Sha256Digest)> {
     let stem = name.strip_suffix(RECEIPT_SUFFIX)?;
     let (identity, checksum) = stem.rsplit_once('.')?;
-    let checksum = parse_crc32_field(checksum)?;
+    let checksum = parse_sha256_hex(checksum)?;
     let rest = identity.strip_prefix(SHARD_RECEIPT_PREFIX)?;
     let (part, shard) = rest.split_once("_s")?;
     Some((part.parse().ok()?, shard.parse().ok()?, checksum))
 }
 
-fn parse_part_receipt_name(name: &str) -> Option<(u64, u32)> {
+fn parse_part_receipt_name(name: &str) -> Option<(u64, Sha256Digest)> {
     let stem = name.strip_suffix(RECEIPT_SUFFIX)?;
     let (part, checksum) = stem.rsplit_once('.')?;
     let part = part.strip_prefix(PART_RECEIPT_PREFIX)?;
-    Some((part.parse().ok()?, parse_crc32_field(checksum)?))
+    Some((part.parse().ok()?, parse_sha256_hex(checksum)?))
 }
 
 fn remove_receipts_for_part(dir: &Path, part_index: u64) -> Result<(), AppError> {
@@ -654,8 +724,8 @@ fn remove_receipts_for_part(dir: &Path, part_index: u64) -> Result<(), AppError>
 
 fn push_receipts_from_filename(
     state: &mut IndexSessionState,
-    shard_receipts: BTreeMap<u64, BTreeMap<usize, u32>>,
-    part_checksums: BTreeMap<u64, u32>,
+    shard_receipts: BTreeMap<u64, BTreeMap<usize, Sha256Digest>>,
+    part_checksums: BTreeMap<u64, Sha256Digest>,
 ) {
     let total_shards = session_total_shards(&state.manifest);
     if total_shards == 0 {
@@ -698,7 +768,9 @@ fn push_receipts_from_filename(
 
 fn decode_metadata_file(path: &Path) -> Result<ObjectMetadata, AppError> {
     let bytes = fs::read(path).map_err(|e| io_err(e, "read N2 object metadata"))?;
-    decode::<DiskObjectMetadata>(&bytes).map(Into::into)
+    let metadata = decode::<DiskObjectMetadata>(&bytes)?;
+    metadata.validate()?;
+    Ok(metadata.into())
 }
 
 fn decode_metadata_file_as(path: &Path, object_key: &str) -> Result<ObjectMetadata, AppError> {
@@ -1954,13 +2026,13 @@ pub fn commit_session_part_receipt(
         fs::create_dir_all(&dir).map_err(|e| io_err(e, "create upload receipt dir"))?;
         remove_receipts_for_part(&dir, receipt.part_index)?;
         if let Some(checksum) = receipt.checksum {
-            create_empty_marker(&dir.join(part_receipt_name(receipt.part_index, checksum)))?;
+            create_empty_marker(&dir.join(part_receipt_name(receipt.part_index, &checksum)))?;
         }
         for (shard_index, checksum) in receipt.shard_checksums.iter().copied().enumerate() {
             create_empty_marker(&dir.join(shard_receipt_name(
                 receipt.part_index,
                 shard_index,
-                checksum,
+                &checksum,
             )))?;
         }
         sync_dir(&dir);
@@ -1980,8 +2052,8 @@ pub fn load_session(
         if !dir.is_dir() {
             continue;
         }
-        let mut shard_receipts = BTreeMap::<u64, BTreeMap<usize, u32>>::new();
-        let mut part_checksums = BTreeMap::<u64, u32>::new();
+        let mut shard_receipts = BTreeMap::<u64, BTreeMap<usize, Sha256Digest>>::new();
+        let mut part_checksums = BTreeMap::<u64, Sha256Digest>::new();
         for name in read_dir_names(&dir)? {
             let path = dir.join(&name);
             if name.starts_with(PART_META_PREFIX) && name.ends_with(".ncdx") {
@@ -2134,9 +2206,23 @@ mod tests {
         let bytes = encode_disk_object_metadata(&metadata()).expect("encode metadata");
         let value: Value = rmp_serde::from_slice(&bytes).expect("decode metadata");
         assert!(value.is_object());
+        assert_eq!(
+            value.get("format_version").and_then(Value::as_u64),
+            Some(NCDX_FORMAT_VERSION as u64)
+        );
+        assert!(value.get("payload_sha256").is_some());
         assert!(value.get("object_id").is_some());
         assert!(value.get("object_key").is_none());
         assert!(value.get("logical_path").is_none());
+    }
+
+    #[test]
+    fn immutable_ncdx_rejects_payload_mutation() {
+        let bytes = encode_disk_object_metadata(&metadata()).expect("encode metadata");
+        let mut disk: DiskObjectMetadata =
+            rmp_serde::from_slice(&bytes).expect("decode disk metadata");
+        disk.content_type = "application/corrupt".into();
+        assert!(disk.validate().is_err());
     }
 
     #[test]

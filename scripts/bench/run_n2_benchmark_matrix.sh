@@ -118,7 +118,7 @@ native_upload_download() {
   local key="bench/native-small-$(date +%s).bin"
   "$ROOT_DIR/target/release/litiaina-n2-shell" \
     --native-url "$NATIVE_URL" --fragment "$FRAGMENT" --secret "$SECRET" \
-    upload --object-key "$key" --file "$OUT/small.bin" --crc32 --json \
+    upload --object-key "$key" --file "$OUT/small.bin" --sha256 --json \
     >"$OUT/native-upload.json"
   "$ROOT_DIR/target/release/litiaina-n2-shell" \
     --native-url "$NATIVE_URL" --fragment "$FRAGMENT" --secret "$SECRET" \

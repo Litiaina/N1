@@ -1260,7 +1260,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/noa/v1/upload/multipart/ver-a/0?crc32=123&coordinator_node_id=node-a")
+                    .uri("/noa/v1/upload/multipart/ver-a/0?sha256=123&coordinator_node_id=node-a")
                     .header(header::AUTHORIZATION, "Bearer token")
                     .header(header::CONTENT_LENGTH, "5")
                     .body(Body::from("hello"))

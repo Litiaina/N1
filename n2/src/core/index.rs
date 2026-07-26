@@ -1,3 +1,4 @@
+use crate::core::checksum::{Sha256Digest, parse_sha256_hex};
 use crate::core::disk_manager::{
     IndexListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata,
     ReservationReceipt,
@@ -36,8 +37,8 @@ pub struct SessionPartReceipt {
     pub size_bytes: u64,
     pub shard_size_bytes: u64,
     pub created_at: i64,
-    pub checksum: Option<u32>,
-    pub shard_checksums: Vec<u32>,
+    pub checksum: Option<Sha256Digest>,
+    pub shard_checksums: Vec<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,10 +75,9 @@ pub async fn acquire_object_operation_lock(
     })
 }
 
-fn parse_crc32_hex(value: &str) -> Result<u32, AppError> {
-    u32::from_str_radix(value.trim(), 16).map_err(|e| {
-        AppError::InternalServerError(format!("invalid crc32 value '{}': {}", value, e))
-    })
+fn parse_sha256(value: &str) -> Result<Sha256Digest, AppError> {
+    parse_sha256_hex(value)
+        .ok_or_else(|| AppError::InternalServerError(format!("invalid SHA-256 value '{value}'")))
 }
 
 async fn run_index_blocking<T>(
@@ -140,11 +140,11 @@ pub async fn commit_session_part_receipt(
             .map(|shard| shard.size_bytes)
             .unwrap_or(0),
         created_at: part.created_at,
-        checksum: part.checksum.as_deref().map(parse_crc32_hex).transpose()?,
+        checksum: part.checksum.as_deref().map(parse_sha256).transpose()?,
         shard_checksums: part
             .shards
             .iter()
-            .map(|shard| parse_crc32_hex(&shard.checksum))
+            .map(|shard| parse_sha256(&shard.checksum))
             .collect::<Result<Vec<_>, _>>()?,
     };
     let fragment = fragment.to_string();

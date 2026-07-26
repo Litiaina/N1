@@ -16,18 +16,20 @@ use axum::response::{IntoResponse, Response};
 
 use bytes::Bytes;
 use chrono::Utc;
-use crc32fast::Hasher;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
+
+use crate::core::checksum::format_sha256;
 
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
@@ -1112,7 +1114,7 @@ async fn reconstruct_part_meta_from_disk(
         if meta.len() != expected_shard_len {
             return Ok(None);
         }
-        let checksum = crc32_file_hex(&stable_path).await?;
+        let checksum = sha256_file_hex(&stable_path).await?;
         shards.push(ShardInfo {
             shard_index,
             file_name,
@@ -1132,10 +1134,6 @@ async fn reconstruct_part_meta_from_disk(
         shards,
         checksum: None,
     }))
-}
-
-fn format_crc32_u32(value: u32) -> String {
-    format!("{:08x}", value)
 }
 
 async fn reconstruct_part_meta_from_receipt(
@@ -1175,7 +1173,7 @@ async fn reconstruct_part_meta_from_receipt(
             file_name,
             absolute_path: stable_path.to_string_lossy().to_string(),
             size_bytes: shard_size_bytes,
-            checksum: format_crc32_u32(*checksum),
+            checksum: format_sha256(checksum),
             block_checksums: Vec::new(),
             checksum_block_size: 0,
             is_parity,
@@ -1187,7 +1185,7 @@ async fn reconstruct_part_meta_from_receipt(
         size_bytes: receipt.size_bytes,
         created_at: receipt.created_at,
         shards,
-        checksum: receipt.checksum.map(format_crc32_u32),
+        checksum: receipt.checksum.as_ref().map(format_sha256),
     }))
 }
 
@@ -1478,13 +1476,13 @@ where
         let publish_results = join_all((0..total_shards).map(|i| {
             let tmp_path = tmp_paths[i].clone();
             let stable_path = stable_paths[i].clone();
-            let expected_crc = shard_checksums.get(i).cloned();
+            let expected_sha256 = shard_checksums.get(i).cloned();
             async move {
                 publish_one_shard(
                     tmp_path.as_path(),
                     stable_path.as_path(),
                     final_shard_len,
-                    expected_crc.as_deref(),
+                    expected_sha256.as_deref(),
                 )
                 .await?;
                 Ok::<Option<PathBuf>, AppError>(stable_path.parent().map(Path::to_path_buf))
@@ -1741,13 +1739,13 @@ where
         let publish_results = join_all((0..total_shards).map(|i| {
             let tmp_path = tmp_paths[i].clone();
             let stable_path = stable_paths[i].clone();
-            let expected_crc = shard_checksums.get(i).cloned();
+            let expected_sha256 = shard_checksums.get(i).cloned();
             async move {
                 publish_one_shard(
                     tmp_path.as_path(),
                     stable_path.as_path(),
                     final_shard_len,
-                    expected_crc.as_deref(),
+                    expected_sha256.as_deref(),
                 )
                 .await?;
                 Ok::<Option<PathBuf>, AppError>(stable_path.parent().map(Path::to_path_buf))
@@ -1842,33 +1840,33 @@ async fn cleanup_blob_version_dirs_for_version(
     let _ = join_all(futs).await;
 }
 
-async fn crc32_file_hex(path: &Path) -> Result<String, AppError> {
+async fn sha256_file_hex(path: &Path) -> Result<String, AppError> {
     let mut f = tokio_fs::File::open(path)
         .await
-        .map_err(|e| AppError::Io(e, format!("open for crc32 {}", path.display())))?;
+        .map_err(|e| AppError::Io(e, format!("open for SHA-256 {}", path.display())))?;
 
-    let mut hasher = Hasher::new();
+    let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
 
     loop {
         let n = f
             .read(&mut buf)
             .await
-            .map_err(|e| AppError::Io(e, format!("read crc32 {}", path.display())))?;
+            .map_err(|e| AppError::Io(e, format!("read SHA-256 {}", path.display())))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
 
-    Ok(format!("{:08x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 async fn publish_one_shard(
     tmp_path: &Path,
     stable_path: &Path,
     expected_len: u64,
-    expected_crc32: Option<&str>,
+    expected_sha256: Option<&str>,
 ) -> Result<(), AppError> {
     if !tokio_fs::try_exists(stable_path).await.unwrap_or(false) {
         tokio_fs::rename(tmp_path, stable_path).await.map_err(|e| {
@@ -1890,8 +1888,8 @@ async fn publish_one_shard(
         .unwrap_or(false);
 
     if len_ok {
-        if let Some(exp) = expected_crc32.filter(|s| !s.is_empty()) {
-            let got = crc32_file_hex(stable_path).await?;
+        if let Some(exp) = expected_sha256.filter(|s| !s.is_empty()) {
+            let got = sha256_file_hex(stable_path).await?;
             if got.eq_ignore_ascii_case(exp) {
                 let _ = tokio_fs::remove_file(tmp_path).await;
                 return Ok(());
@@ -3176,7 +3174,7 @@ pub async fn finalize_object_upload_direct(
         .map(|manifest| (manifest.pool_id.clone(), manifest.pool_generation))
         .ok_or_else(|| {
             AppError::Conflict(
-                "N2 3.0 cannot finalize an upload without its pinned server-pool identity".into(),
+                "N2 3.2 cannot finalize an upload without its pinned server-pool identity".into(),
             )
         })?;
 

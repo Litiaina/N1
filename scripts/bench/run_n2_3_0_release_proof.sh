@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Finite N2 3.0 architectural proof. This never installs a service, never uses
-# production ports, and only removes directories containing this run's unique
-# timestamp. REMOTE_PASS is intentionally supplied by the operator at runtime.
+# Finite N2 3.2 architectural proof; the filename is retained for the
+# flat-NCNX proof family. This never installs a service, never uses production
+# ports, and only removes directories containing this run's unique timestamp.
+# REMOTE_PASS is intentionally supplied by the operator at runtime.
 
 : "${REMOTE_PASS:?set REMOTE_PASS for the authorized proof host}"
 REMOTE_HOST="${REMOTE_HOST:-192.168.0.36}"
@@ -78,7 +79,7 @@ cleanup() {
   kill_pidfile "$LOCAL_A/n2.pid"
   kill_pidfile "$LOCAL_B/n2.pid"
   remote "for n in '$REMOTE_C' '$REMOTE_D'; do if [ -f \"\$n/pidstat.pid\" ]; then kill \$(cat \"\$n/pidstat.pid\") 2>/dev/null || true; fi; if [ -f \"\$n/n2.pid\" ]; then kill \$(cat \"\$n/n2.pid\") 2>/dev/null || true; fi; done" >/dev/null 2>&1
-  remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'" >/dev/null 2>&1
+  remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'; rmdir '/mnt/NDISK002/$REMOTE_STORE_BASE' '/mnt/NDISK003/$REMOTE_STORE_BASE' 2>/dev/null || true" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -249,7 +250,7 @@ remote "chmod +x '$REMOTE_C/litiaina-n2' '$REMOTE_D/litiaina-n2'"
 
 cat > "$OUT/n2_membership.json" <<EOF
 {
-  "format_version": 3,
+  "format_version": 4,
   "cluster_id": "$CLUSTER_ID",
   "epoch": 1,
   "pools": [{

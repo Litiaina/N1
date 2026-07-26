@@ -1,33 +1,85 @@
-# N2 3.1 Testing
+# N2 3.2 Testing
 
 This document is the single correctness and resilience record for the current
-N2 3.1 engine. It covers test scope, procedures, results, failures, fixes, and
+N2 3.2 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Qualification Boundary
 
-N2 3.1 retains the clean format-v3 engine, flat NCNX namespace, static server
-pools, immutable NCDX/object layouts, and healing model. Its lifecycle stores
-one delete mutation under
-`.trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx`. N2 1.x and 2.x
-results are historical and do not qualify the 3.x disk format.
+N2 3.2 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
+server pools, immutable NCDX/object layouts, and healing model. Its lifecycle
+stores one delete mutation under
+`.trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx`. NCNX and object NCDX
+use format version 4; server-pool membership and root enrollment are also
+format version 4. N2 1.x, 2.x, and earlier experimental 3.x results do not
+qualify the 3.2 disk format.
 
-The tests use four logical nodes over two physical hosts. They exercise the
-configured `2 + 2` EC loss boundary, but four logical processes on two hosts
-are not four independent host, power, network, or rack failure domains.
+The current finite release proof uses four logical nodes over two physical
+hosts. It exercises the configured `2 + 2` EC loss boundary, but four logical
+processes on two hosts are not four independent host, power, network, or rack
+failure domains.
 
 ## Repository Gates
 
-The N2 3.1 implementation has passed:
+The N2 3.2 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
-- `cargo check --workspace --all-targets`;
-- `cargo test -p n2`: 121 passed;
-- `cargo test --workspace --lib --bins --tests`: 254 passed, 8 ignored;
+- `cargo check -p n2 -p n2_shell -p n2_gateway`;
+- `cargo test -p n2 --lib`: 132 passed;
+- `cargo test -p n2_shell -p n2_gateway`: 20 passed;
 - optimized `cargo build -p n2 --release`;
-- release-proof shell syntax and `git diff --check`;
-- finite four-node `2 + 2` proof with the 3.1 generation lifecycle.
+- `git diff --check`.
+
+These bounded code gates cover SHA-256 NCNX/object-NCDX/shard integrity,
+corrupted block reconstruction, canonical-list refill, replica-backed
+degraded listing, exact static placement, exact metadata visibility,
+copy/delete restart semantics, and existing object/healing invariants.
+
+The format-v4 installer dry-run also passed for node-only, gateway-only, and
+combined installation:
+
+```text
+/home/wlzambo/DEV-TEST/N2-3.0-installer-proof-20260727-013652
+```
+
+## N2 3.2 Finite Release Proof
+
+Authoritative evidence directory:
+
+```text
+/home/wlzambo/DEV-TEST/N2-3.0-proof-20260727-013543
+```
+
+The retained proof-script filename predates N2 3.2. This run used the
+optimized `3.2.0` binary, format-v4 membership, two logical nodes on each of
+two physical hosts, one exact four-node `2 + 2` server pool, and NCNX
+replication `R = 3`. Its `summary.json` result is `PASS`.
+
+| Test | Result |
+| --- | --- |
+| Direct 64 MiB upload | PASS |
+| Download through all four nodes | PASS; source SHA-256 matched |
+| Same-key overwrite | PASS; two immutable versions |
+| Multipart upload/finalize | PASS |
+| Eight concurrent independent keys | PASS |
+| Exact-key and same-prefix one-item pages | PASS; five ordered keys |
+| Copy/delete rename | PASS; no trash record or object rewrite |
+| Repeated same-key delete generations | PASS; distinct mutation ULIDs |
+| Strict recover collision | PASS; HTTP 409 and live object preserved |
+| Prefix trash/recover | PASS; 2 of 2 objects restored |
+| NCNX healing | PASS; deleted replica recreated |
+| Object healing | PASS; deleted shard recreated |
+| One-node and parity-count loss reads | PASS |
+| Write below exact pool width | PASS; HTTP 503 |
+| TTL GC | PASS; two records expired, zero errors, GET returned 404 |
+| Full cluster restart | PASS; committed bytes persisted |
+| Suspicious log lines | 0 |
+
+The cleanup audit confirmed all four proof processes stopped. The two empty
+remote per-run parent directories exposed by that audit were removed with
+`rmdir`, and the proof cleanup trap was corrected to remove them on future
+runs.
 
 The N2 3.0 implementation previously passed:
 
@@ -42,7 +94,7 @@ The N2 3.0 implementation previously passed:
 
 Documentation-only changes do not alter these engine results.
 
-## N2 3.1 Generation Lifecycle Proof
+## Historical N2 3.1 Generation Lifecycle Proof
 
 Authoritative evidence directory:
 
@@ -130,9 +182,18 @@ Code and release tests exercise these flat-namespace laws:
   concurrency and records recoverable mutation groups.
 - Listing emits canonical replicas and uses physical names without decoding
   NCNX or NCDX.
+- A canonical listing-source failure retries physical replica streams, and
+  only within the pool's exact `M`-node namespace failure budget.
 - Exact-key and same-name-prefix order survives continuation pagination.
 - Root identity rejects in-place root-set changes after enrollment.
 - Upload `K + M` must equal the static pool contract.
+- Object placement is calculated from immutable pool membership; an
+  unavailable selected holder is not replaced by an outage-dependent holder.
+- NCNX, object-NCDX, upload-body, shard, and verified-block integrity use
+  SHA-256 only. NCNX and object NCDX reject payload mutation independently of
+  replicas.
+- Metadata absence or latest-version selection is accepted only after an
+  exact selected NCDX holder responds for every candidate server pool.
 - Removed dynamic EC, node-role, hard-delete, and empty-trash contracts are
   rejected.
 

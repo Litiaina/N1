@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "n2"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "argon2",
  "async_zip",
@@ -1914,7 +1914,6 @@ dependencies = [
  "bytes",
  "chrono",
  "core_affinity",
- "crc32fast",
  "dashmap",
  "dotenv",
  "futures-util",
@@ -1998,14 +1997,15 @@ dependencies = [
 
 [[package]]
 name = "n2_shell"
-version = "1.1.0"
+version = "3.2.0"
 dependencies = [
  "clap",
- "crc32fast",
+ "hex",
  "n2_native_client",
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

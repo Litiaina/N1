@@ -14,7 +14,7 @@ printf '%s\n' \
   'MASTER_KEY=installer-proof-master' >"$ENV_SRC"
 printf '%s\n' \
   '{' \
-  '  "format_version": 3,' \
+  '  "format_version": 4,' \
   '  "cluster_id": "installer-proof",' \
   '  "epoch": 1,' \
   '  "pools": [{' \
@@ -66,7 +66,7 @@ run_case both-dry-run --both "${COMMON_NODE[@]}" \
   --gateway-node node-a,https://127.0.0.1:50001,n2://127.0.0.1:50002
 
 jq -n --arg out "$OUT" \
-  '{status:"passed",format_version:3,out:$out,cases:["node-dry-run","gateway-dry-run","both-dry-run"]}' \
+  '{status:"passed",format_version:4,out:$out,cases:["node-dry-run","gateway-dry-run","both-dry-run"]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_INSTALLER_PROOF_OUT=$OUT"

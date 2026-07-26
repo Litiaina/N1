@@ -1,3 +1,4 @@
+use crate::core::checksum::Sha256Digest;
 use crate::core::constants::N2_BLOB_DIR;
 use crate::core::fragment_identity;
 use serde::de::IgnoredAny;
@@ -197,7 +198,7 @@ pub struct ShardInfo {
     pub size_bytes: u64,
     pub checksum: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub block_checksums: Vec<u32>,
+    pub block_checksums: Vec<Sha256Digest>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub checksum_block_size: usize,
     pub is_parity: bool,

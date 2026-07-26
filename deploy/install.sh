@@ -87,7 +87,7 @@ Node options:
   --native-endpoint URL   Public node native endpoint.
   --storage-roots LIST    ROOT_ID=/absolute/path entries, comma separated.
   --state-root PATH       Process-local runtime state directory.
-  --membership-src PATH  Complete shared format-v3 membership JSON (required
+  --membership-src PATH  Complete shared format-v4 membership JSON (required
                          for a fresh node installation).
   --pool-id ID            Local static server-pool ID. Default: pool-1
   --pool-generation N     Local pool generation. Default: 1
@@ -362,8 +362,8 @@ write_membership() {
     [[ -n "$MEMBERSHIP_SRC" ]] || die "fresh N2 3.0 node install requires --membership-src"
     [[ -f "$MEMBERSHIP_SRC" ]] || die "membership source is missing: $MEMBERSHIP_SRC"
     command -v jq >/dev/null || die "jq is required to validate membership"
-    jq -e '.format_version == 3 and (.pools | length) > 0 and (.nodes | length) > 0' "$MEMBERSHIP_SRC" >/dev/null \
-        || die "membership source is not a complete N2 format-v3 membership"
+    jq -e '.format_version == 4 and (.pools | length) > 0 and (.nodes | length) > 0' "$MEMBERSHIP_SRC" >/dev/null \
+        || die "membership source is not a complete N2 format-v4 membership"
     run install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$MEMBERSHIP_SRC" "$membership"
 }
 
