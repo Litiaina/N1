@@ -8,7 +8,9 @@ use crate::core::monitoring::system_health_snapshot;
 use crate::core::upload::{DirectWriter, create_direct_file};
 use crate::core::{index, index_store};
 use crate::distribution::layout::ClusterEcLayout;
-use crate::distribution::membership::{ClusterNode, ClusterRuntime, active_cluster_runtime};
+use crate::distribution::membership::{
+    ClusterNode, ClusterRuntime, active_cluster_runtime, try_active_cluster_runtime,
+};
 use crate::distribution::placement::build_placement_plan;
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::{
@@ -141,7 +143,13 @@ where
 
 #[derive(Clone, Debug)]
 pub struct PeerShardTarget {
+    pub pool_id: String,
+    pub pool_generation: u64,
+    /// Stable logical slot.
     pub node_id: String,
+    /// Physical instance currently bound to `node_id`.
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub root_id: String,
     pub endpoint: String,
     pub fragment: String,
@@ -155,6 +163,9 @@ pub struct PeerShardTarget {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerObjectMetadataRequest {
+    pub target_slot_id: String,
+    pub target_instance_id: String,
+    pub binding_epoch: u64,
     pub metadata: ObjectMetadata,
 }
 
@@ -277,6 +288,11 @@ struct CachedPeerUsage {
 
 #[derive(Debug, Deserialize)]
 pub struct PeerShardQuery {
+    pub pool_id: String,
+    pub pool_generation: u64,
+    pub slot_id: String,
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub root_id: String,
     #[serde(default)]
     pub parity: Option<bool>,
@@ -411,6 +427,11 @@ async fn native_put_peer_shard(
     let _ = stream.set_nodelay(true);
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
+        pool_id: target.pool_id.clone(),
+        pool_generation: target.pool_generation,
+        slot_id: target.node_id.clone(),
+        instance_id: target.instance_id.clone(),
+        binding_epoch: target.binding_epoch,
         fragment: target.fragment.clone(),
         root_id: target.root_id.clone(),
         object_id: target.object_id.clone(),
@@ -555,10 +576,20 @@ pub(crate) fn authorize_peer(headers: &HeaderMap) -> Result<(), AppError> {
     }
 }
 
-async fn post_object_metadata(endpoint: &str, metadata: &ObjectMetadata) -> Result<(), AppError> {
+async fn post_object_metadata(
+    node: &ClusterNode,
+    binding_epoch: u64,
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
     let client = peer_http_client()?;
-    let url = format!("{}/n2/peer/objects/publish", endpoint.trim_end_matches('/'));
+    let url = format!(
+        "{}/n2/peer/objects/publish",
+        node.endpoint.trim_end_matches('/')
+    );
     let mut request = client.post(url).json(&PeerObjectMetadataRequest {
+        target_slot_id: node.id.clone(),
+        target_instance_id: node.instance_id.clone(),
+        binding_epoch,
         metadata: metadata.clone(),
     });
     if let Some(secret) = cluster_secret() {
@@ -569,13 +600,17 @@ async fn post_object_metadata(endpoint: &str, metadata: &ObjectMetadata) -> Resu
         .send()
         .await
         .map_err(|err| {
-            AppError::ServiceUnavailable(format!("publish N2 object metadata to {endpoint}: {err}"))
+            AppError::ServiceUnavailable(format!(
+                "publish N2 object metadata to {}: {err}",
+                node.endpoint
+            ))
         })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(AppError::ServiceUnavailable(format!(
-            "publish N2 object metadata to {endpoint} returned {status}: {body}"
+            "publish N2 object metadata to {} returned {status}: {body}",
+            node.endpoint
         )));
     }
     Ok(())
@@ -664,12 +699,12 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
     let required_metadata_writes = participant_ids.len();
     let mut tasks = futures_util::stream::FuturesUnordered::new();
     for node_id in participant_ids {
-        let endpoint = runtime
+        let node = runtime
             .membership
             .nodes
             .iter()
             .find(|node| node.id == node_id)
-            .map(|node| node.endpoint.clone())
+            .cloned()
             .ok_or_else(|| {
                 AppError::InternalServerError(format!(
                     "N2 shard-bearing participant {node_id} is absent from membership"
@@ -677,12 +712,13 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
             })?;
         let metadata = metadata.clone();
         let local_node_id = runtime.local_node_id.clone();
+        let binding_epoch = runtime.membership.binding_epoch;
         tasks.push(async move {
             let participant = node_id.clone();
             if node_id == local_node_id {
                 index::publish_object(&metadata).await.map(|_| participant)
             } else {
-                post_object_metadata(&endpoint, &metadata)
+                post_object_metadata(&node, binding_epoch, &metadata)
                     .await
                     .map(|_| participant)
             }
@@ -760,7 +796,7 @@ async fn repair_metadata_on_node(
     if node.id == runtime.local_node_id {
         index::publish_object(metadata).await.map(|_| ())
     } else {
-        post_object_metadata(&node.endpoint, metadata).await
+        post_object_metadata(node, runtime.membership.binding_epoch, metadata).await
     }
 }
 
@@ -985,6 +1021,15 @@ pub async fn peer_publish_object_metadata(
 ) -> Result<impl IntoResponse, AppError> {
     authorize_peer(&headers)?;
     let runtime = active_cluster_runtime()?;
+    if runtime.local_is_reserve
+        || request.binding_epoch != runtime.membership.binding_epoch
+        || request.target_slot_id != runtime.local_node_id
+        || request.target_instance_id != runtime.local_instance_id
+    {
+        return Err(AppError::Conflict(
+            "stale or misbound NCDX publication request".into(),
+        ));
+    }
     validate_metadata_pool_contract(&runtime, &request.metadata)?;
     index::publish_object(&request.metadata).await?;
     Ok(StatusCode::CREATED)
@@ -1149,6 +1194,7 @@ fn exact_metadata_node_batches(
                 &pool.id,
                 pool.generation,
                 runtime.membership.epoch,
+                runtime.membership.binding_epoch,
                 layout,
                 &nodes,
             ) {
@@ -1568,6 +1614,18 @@ pub async fn sync_fragment_controls_from_cluster() -> Result<usize, AppError> {
     Ok(applied)
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct PeerFragmentSyncResponse {
+    applied: usize,
+}
+
+async fn peer_fragment_sync(headers: HeaderMap) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(PeerFragmentSyncResponse {
+        applied: sync_fragment_controls_from_cluster().await?,
+    }))
+}
+
 pub fn spawn_fragment_control_sync_task() {
     tokio::spawn(async {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -1736,7 +1794,11 @@ fn decode_segment(value: &str) -> Option<String> {
 
 #[derive(Clone, Debug)]
 pub struct PeerShardLocator {
+    pub pool_id: String,
+    pub pool_generation: u64,
     pub node_id: String,
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub root_id: String,
     pub endpoint: String,
     pub fragment: String,
@@ -1749,10 +1811,11 @@ pub struct PeerShardLocator {
 
 pub fn encode_peer_shard_locator(target: &PeerShardTarget) -> String {
     format!(
-        "n2-peer-v2|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "n2-peer-v3|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        encode_segment(&target.pool_id),
+        target.pool_generation,
         encode_segment(&target.node_id),
         encode_segment(&target.root_id),
-        encode_segment(&target.endpoint),
         encode_segment(&target.fragment),
         encode_segment(&target.object_id),
         encode_segment(&target.version_id),
@@ -1764,20 +1827,49 @@ pub fn encode_peer_shard_locator(target: &PeerShardTarget) -> String {
 
 pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
     let mut parts = value.split('|');
-    if parts.next()? != "n2-peer-v2" {
+    if parts.next()? != "n2-peer-v3" {
         return None;
     }
+    let pool_id = decode_segment(parts.next()?)?;
+    let pool_generation = parts.next()?.parse().ok()?;
     let node_id = decode_segment(parts.next()?)?;
     let root_id = decode_segment(parts.next()?)?;
-    let endpoint = decode_segment(parts.next()?)?;
     let fragment = decode_segment(parts.next()?)?;
     let object_id = decode_segment(parts.next()?)?;
     let version_id = decode_segment(parts.next()?)?;
     let part_index = parts.next()?.parse().ok()?;
     let shard_index = parts.next()?.parse().ok()?;
     let is_parity = parts.next()?.parse().ok()?;
+    let (instance_id, binding_epoch, endpoint) = try_active_cluster_runtime()
+        .and_then(|runtime| {
+            let pool = runtime.membership.pool(&pool_id)?;
+            if pool.generation != pool_generation
+                || !pool.node_ids.iter().any(|slot| slot == &node_id)
+            {
+                return None;
+            }
+            let binding = runtime
+                .membership
+                .nodes
+                .iter()
+                .find(|node| node.id == node_id)?;
+            let endpoint = binding
+                .native_endpoint
+                .clone()
+                .unwrap_or_else(|| binding.endpoint.clone());
+            Some((
+                binding.instance_id.clone(),
+                runtime.membership.binding_epoch,
+                endpoint,
+            ))
+        })
+        .unwrap_or_else(|| (String::new(), 0, String::new()));
     Some(PeerShardLocator {
+        pool_id,
+        pool_generation,
         node_id,
+        instance_id,
+        binding_epoch,
         root_id,
         endpoint,
         fragment,
@@ -1789,15 +1881,69 @@ pub fn parse_peer_shard_locator(value: &str) -> Option<PeerShardLocator> {
     })
 }
 
+pub fn resolve_peer_shard_locator(
+    locator: &PeerShardLocator,
+) -> Result<PeerShardLocator, AppError> {
+    let runtime = active_cluster_runtime()?;
+    let pool = runtime.membership.pool(&locator.pool_id).ok_or_else(|| {
+        AppError::Conflict(format!(
+            "recorded shard references unknown pool '{}'",
+            locator.pool_id
+        ))
+    })?;
+    if pool.generation != locator.pool_generation
+        || !pool.node_ids.iter().any(|slot| slot == &locator.node_id)
+    {
+        return Err(AppError::Conflict(format!(
+            "recorded shard logical slot '{}' is not in pool '{}' generation {}",
+            locator.node_id, locator.pool_id, locator.pool_generation
+        )));
+    }
+    let binding = runtime
+        .membership
+        .nodes
+        .iter()
+        .find(|node| node.id == locator.node_id)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(format!(
+                "logical slot '{}' is currently unbound",
+                locator.node_id
+            ))
+        })?;
+    if !binding
+        .storage_roots
+        .iter()
+        .any(|root| root.id == locator.root_id)
+    {
+        return Err(AppError::Conflict(format!(
+            "logical root '{}' is not present on slot '{}'",
+            locator.root_id, locator.node_id
+        )));
+    }
+    let mut resolved = locator.clone();
+    resolved.instance_id = binding.instance_id.clone();
+    resolved.binding_epoch = runtime.membership.binding_epoch;
+    resolved.endpoint = binding
+        .native_endpoint
+        .clone()
+        .unwrap_or_else(|| binding.endpoint.clone());
+    Ok(resolved)
+}
+
 fn peer_shard_url(target: &PeerShardTarget) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}/{}?root_id={}&parity={}&expected_len={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?pool_id={}&pool_generation={}&slot_id={}&instance_id={}&binding_epoch={}&root_id={}&parity={}&expected_len={}",
         target.endpoint.trim_end_matches('/'),
         encode_segment(&target.fragment),
         encode_segment(&target.object_id),
         encode_segment(&target.version_id),
         target.part_index,
         target.shard_index,
+        encode_segment(&target.pool_id),
+        target.pool_generation,
+        encode_segment(&target.node_id),
+        encode_segment(&target.instance_id),
+        target.binding_epoch,
         encode_segment(&target.root_id),
         target.is_parity,
         target.expected_len
@@ -1806,13 +1952,18 @@ fn peer_shard_url(target: &PeerShardTarget) -> String {
 
 fn peer_shard_read_url(locator: &PeerShardLocator, offset: u64, length: usize) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}/{}?root_id={}&parity={}&offset={}&length={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?pool_id={}&pool_generation={}&slot_id={}&instance_id={}&binding_epoch={}&root_id={}&parity={}&offset={}&length={}",
         locator.endpoint.trim_end_matches('/'),
         encode_segment(&locator.fragment),
         encode_segment(&locator.object_id),
         encode_segment(&locator.version_id),
         locator.part_index,
         locator.shard_index,
+        encode_segment(&locator.pool_id),
+        locator.pool_generation,
+        encode_segment(&locator.node_id),
+        encode_segment(&locator.instance_id),
+        locator.binding_epoch,
         encode_segment(&locator.root_id),
         locator.is_parity,
         offset,
@@ -1825,6 +1976,7 @@ pub async fn fetch_peer_shard_chunk(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, AppError> {
+    let locator = resolve_peer_shard_locator(locator)?;
     let permit = acquire_peer_operation(&locator.node_id, PeerOperation::Read)?;
     let started = Instant::now();
     let label = if endpoint_is_native(&locator.endpoint) {
@@ -1833,9 +1985,9 @@ pub async fn fetch_peer_shard_chunk(
         "peer.read.http"
     };
     let result = if endpoint_is_native(&locator.endpoint) {
-        native_get_peer_shard(locator, offset, length).await
+        native_get_peer_shard(&locator, offset, length).await
     } else {
-        http_get_peer_shard(locator, offset, length).await
+        http_get_peer_shard(&locator, offset, length).await
     };
     let bytes_len = result.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0);
     record_io_latency(label, started.elapsed(), bytes_len, result.is_ok());
@@ -1908,6 +2060,11 @@ async fn native_get_peer_shard(
     let _ = stream.set_nodelay(true);
     let payload = NativePeerShardPayload {
         secret: cluster_secret(),
+        pool_id: locator.pool_id.clone(),
+        pool_generation: locator.pool_generation,
+        slot_id: locator.node_id.clone(),
+        instance_id: locator.instance_id.clone(),
+        binding_epoch: locator.binding_epoch,
         fragment: locator.fragment.clone(),
         root_id: locator.root_id.clone(),
         object_id: locator.object_id.clone(),
@@ -2045,6 +2202,61 @@ fn shard_dir(
     ))
 }
 
+fn validate_peer_binding(
+    pool_id: &str,
+    pool_generation: u64,
+    slot_id: &str,
+    instance_id: &str,
+    binding_epoch: u64,
+    root_id: &str,
+) -> Result<Arc<ClusterRuntime>, AppError> {
+    let runtime = active_cluster_runtime()?;
+    if runtime.local_is_reserve {
+        return Err(AppError::ServiceUnavailable(format!(
+            "reserve instance '{}' is not bound to a logical slot",
+            runtime.local_instance_id
+        )));
+    }
+    if binding_epoch != runtime.membership.binding_epoch {
+        return Err(AppError::Conflict(format!(
+            "stale N2 binding epoch {binding_epoch}; current epoch is {}",
+            runtime.membership.binding_epoch
+        )));
+    }
+    let pool = runtime
+        .membership
+        .pool(pool_id)
+        .ok_or_else(|| AppError::Conflict(format!("unknown server pool '{pool_id}'")))?;
+    if pool.generation != pool_generation
+        || !pool.node_ids.iter().any(|candidate| candidate == slot_id)
+    {
+        return Err(AppError::Conflict(format!(
+            "logical slot '{slot_id}' is not part of pool '{pool_id}' generation {pool_generation}"
+        )));
+    }
+    let binding = runtime
+        .membership
+        .nodes
+        .iter()
+        .find(|node| node.id == slot_id)
+        .ok_or_else(|| AppError::Conflict(format!("logical slot '{slot_id}' is unbound")))?;
+    if binding.instance_id != instance_id
+        || runtime.local_instance_id != instance_id
+        || runtime.local_node_id != slot_id
+        || binding.binding_epoch > binding_epoch
+    {
+        return Err(AppError::Conflict(format!(
+            "logical slot '{slot_id}' is not bound to physical instance '{instance_id}'"
+        )));
+    }
+    if !binding.storage_roots.iter().any(|root| root.id == root_id) {
+        return Err(AppError::Conflict(format!(
+            "logical root '{root_id}' is not bound on slot '{slot_id}'"
+        )));
+    }
+    Ok(runtime)
+}
+
 pub async fn peer_put_shard(
     headers: HeaderMap,
     Path((fragment, object_id, version_id, part_index, shard_index)): Path<(
@@ -2058,6 +2270,14 @@ pub async fn peer_put_shard(
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
     authorize_peer(&headers)?;
+    validate_peer_binding(
+        &query.pool_id,
+        query.pool_generation,
+        &query.slot_id,
+        &query.instance_id,
+        query.binding_epoch,
+        &query.root_id,
+    )?;
     let started = Instant::now();
     let is_parity = query.parity.unwrap_or(false);
     let expected_len = query.expected_len.unwrap_or(0);
@@ -2145,6 +2365,14 @@ pub async fn peer_get_shard(
     Query(query): Query<PeerShardQuery>,
 ) -> Result<Response, AppError> {
     authorize_peer(&headers)?;
+    validate_peer_binding(
+        &query.pool_id,
+        query.pool_generation,
+        &query.slot_id,
+        &query.instance_id,
+        query.binding_epoch,
+        &query.root_id,
+    )?;
     let dir = shard_dir(&query.root_id, &fragment, &object_id, &version_id)?;
     let file_name = stable_name(part_index, shard_index, query.parity.unwrap_or(false));
     let path = dir.join(file_name);
@@ -2216,6 +2444,11 @@ pub async fn peer_monitor(
 pub struct NativePeerShardPayload {
     #[serde(default)]
     pub secret: Option<String>,
+    pub pool_id: String,
+    pub pool_generation: u64,
+    pub slot_id: String,
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub fragment: String,
     pub root_id: String,
     pub object_id: String,
@@ -2252,6 +2485,14 @@ where
     R: AsyncRead + Unpin,
 {
     authorize_peer_secret(payload.secret.as_deref())?;
+    validate_peer_binding(
+        &payload.pool_id,
+        payload.pool_generation,
+        &payload.slot_id,
+        &payload.instance_id,
+        payload.binding_epoch,
+        &payload.root_id,
+    )?;
     let expected_len = payload.expected_len.unwrap_or(body_len);
     let dir = shard_dir(
         &payload.root_id,
@@ -2344,6 +2585,14 @@ pub async fn native_peer_get_shard_bytes(
     payload: NativePeerShardPayload,
 ) -> Result<Vec<u8>, AppError> {
     authorize_peer_secret(payload.secret.as_deref())?;
+    validate_peer_binding(
+        &payload.pool_id,
+        payload.pool_generation,
+        &payload.slot_id,
+        &payload.instance_id,
+        payload.binding_epoch,
+        &payload.root_id,
+    )?;
     let dir = shard_dir(
         &payload.root_id,
         &payload.fragment,
@@ -2424,6 +2673,10 @@ pub fn build_peer_routes() -> Router<Arc<AppState>> {
             axum::routing::get(peer_fragment_snapshot),
         )
         .route(
+            "/n2/peer/fragments/sync",
+            axum::routing::post(peer_fragment_sync),
+        )
+        .route(
             "/n2/peer/shards/{:fragment}/{:object_id}/{:version_id}/{:part_index}/{:shard_index}",
             put(peer_put_shard).get(peer_get_shard),
         )
@@ -2442,12 +2695,15 @@ mod tests {
         let nodes = (0..3)
             .map(|index| ClusterNode {
                 id: format!("n{index}"),
+                instance_id: format!("n{index}"),
+                binding_epoch: 1,
                 endpoint: format!("https://n{index}:50001"),
                 native_endpoint: Some(format!("n2://n{index}:50002")),
                 state: Some(NodeState::Online),
                 weight: 1,
                 storage_roots: vec![StorageRoot {
                     id: format!("r{index}"),
+                    physical_id: None,
                     path: format!("/disk/{index}"),
                 }],
                 joined_epoch: 1,
@@ -2458,6 +2714,8 @@ mod tests {
             .collect::<Vec<_>>();
         ClusterRuntime {
             local_node_id: "n0".into(),
+            local_instance_id: "n0".into(),
+            local_is_reserve: false,
             local_pool_id: "pool-a".into(),
             local_storage_roots: nodes[0].storage_roots.clone(),
             membership_path: std::path::PathBuf::from("/membership"),
@@ -2469,6 +2727,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "cluster-a".into(),
                 epoch: 1,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-a".into(),
                     generation: 1,
@@ -2480,6 +2739,8 @@ mod tests {
                     node_ids: (0..3).map(|index| format!("n{index}")).collect(),
                 }],
                 nodes,
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }
@@ -2488,7 +2749,11 @@ mod tests {
     #[test]
     fn peer_shard_locator_round_trips_endpoint_and_identity() {
         let target = PeerShardTarget {
+            pool_id: "pool-a".into(),
+            pool_generation: 1,
             node_id: "node-a".into(),
+            instance_id: "instance-a".into(),
+            binding_epoch: 1,
             root_id: "blob-root-a".into(),
             endpoint: "https://node-a.local:50001".into(),
             fragment: "frag".into(),
@@ -2503,7 +2768,9 @@ mod tests {
         let decoded = parse_peer_shard_locator(&encoded).expect("locator");
         assert_eq!(decoded.node_id, target.node_id);
         assert_eq!(decoded.root_id, target.root_id);
-        assert_eq!(decoded.endpoint, target.endpoint);
+        assert!(decoded.endpoint.is_empty());
+        assert_eq!(decoded.pool_id, target.pool_id);
+        assert_eq!(decoded.pool_generation, target.pool_generation);
         assert_eq!(decoded.fragment, target.fragment);
         assert_eq!(decoded.object_id, target.object_id);
         assert_eq!(decoded.version_id, target.version_id);
@@ -2541,6 +2808,7 @@ mod tests {
             &object_id,
             "",
             "pool-a",
+            1,
             1,
             1,
             ClusterEcLayout {

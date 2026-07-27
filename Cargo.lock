@@ -1903,8 +1903,9 @@ dependencies = [
 
 [[package]]
 name = "n2"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
+ "arc-swap",
  "argon2",
  "async_zip",
  "axum",
@@ -1997,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "n2_shell"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "clap",
  "hex",

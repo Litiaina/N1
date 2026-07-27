@@ -3,9 +3,10 @@
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.2 is a clean disk-format generation. Never point it at an earlier N2
-root. Build a new format-v4 cluster, copy the same membership and shared
-cluster secrets to every node, and use stable root IDs for mounted devices.
+N2 3.3 is a clean disk-format generation. Never point it at an earlier N2
+root. Build a new format-v5 cluster, copy the same membership and shared
+cluster secrets to every active and reserve instance, and use stable root IDs
+for mounted devices.
 
 ## Install Shape
 
@@ -31,7 +32,8 @@ Production prerequisites:
 - Linux with stable mounts and synchronized time.
 - TLS certificates valid for node endpoints.
 - A unique stable node ID and stable root IDs on every host.
-- One complete shared format-v4 membership document.
+- One complete shared format-v5 membership document with logical slot
+  bindings, optional reserve instances, and retired-instance fences.
 - Shared `JWT_SECRET` and `N2_CLUSTER_SECRET` values.
 - Exactly `K + M` distinct nodes in each writable static server pool.
 
@@ -88,7 +90,7 @@ runtime_path=/var/lib/litiaina/n2/state
 
 Never recycle a root ID for different media. Do not silently add a root to an
 enrolled pool node; the pool's complete root-ID set is part of the static
-format-v4 contract.
+format-v5 contract.
 
 ## Build
 
@@ -110,7 +112,8 @@ target/release/litiaina-n2-gateway
 
 The preferred production path is `deploy/install.sh`. It installs binaries,
 creates runtime paths, renders systemd services, and can enable/start them.
-A fresh 3.2 node requires explicit environment and membership sources.
+A fresh 3.3 active or reserve instance requires explicit environment and
+membership sources.
 
 Preview without changing the host:
 
@@ -216,6 +219,14 @@ max_duration_seconds=30
 lease_seconds=90
 checksum_scan_every_cycles=24
 
+[reserve_set]
+enabled=true
+automatic_promotion=true
+initial_delay_seconds=30
+probe_interval_seconds=5
+failure_threshold=3
+promotion_timeout_seconds=30
+
 [set_limits]
 max_file_size=5368709120
 
@@ -256,13 +267,14 @@ stripe_block_size=262144
 Upload EC must equal the pool policy. N2 rejects mismatched or unsafe
 configuration instead of adapting durability downward.
 
-Create the same complete format-v4 membership on all nodes:
+Create the same complete format-v5 membership on all nodes:
 
 ```json
 {
-  "format_version": 4,
+  "format_version": 5,
   "cluster_id": "cluster-a",
   "epoch": 1,
+  "binding_epoch": 1,
   "pools": [{
     "id": "pool-1",
     "generation": 1,
@@ -271,11 +283,13 @@ Create the same complete format-v4 membership on all nodes:
       "object_parity_shards": 2
     },
     "state": "writable",
-    "node_ids": ["node-a", "node-b", "node-c", "node-d"]
+    "slot_ids": ["node-a", "node-b", "node-c", "node-d"]
   }],
-  "nodes": [
+  "slot_bindings": [
     {
-      "id": "node-a",
+      "slot_id": "node-a",
+      "instance_id": "node-a",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.11:50001",
       "native_endpoint": "n2://10.0.0.11:50002",
       "state": "online",
@@ -284,7 +298,9 @@ Create the same complete format-v4 membership on all nodes:
       "joined_epoch": 1
     },
     {
-      "id": "node-b",
+      "slot_id": "node-b",
+      "instance_id": "node-b",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.12:50001",
       "native_endpoint": "n2://10.0.0.12:50002",
       "state": "online",
@@ -293,7 +309,9 @@ Create the same complete format-v4 membership on all nodes:
       "joined_epoch": 1
     },
     {
-      "id": "node-c",
+      "slot_id": "node-c",
+      "instance_id": "node-c",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.13:50001",
       "native_endpoint": "n2://10.0.0.13:50002",
       "state": "online",
@@ -302,7 +320,9 @@ Create the same complete format-v4 membership on all nodes:
       "joined_epoch": 1
     },
     {
-      "id": "node-d",
+      "slot_id": "node-d",
+      "instance_id": "node-d",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.14:50001",
       "native_endpoint": "n2://10.0.0.14:50002",
       "state": "online",
@@ -310,13 +330,41 @@ Create the same complete format-v4 membership on all nodes:
       "storage_roots": [{"id":"d-disk-1","path":"/mnt/NDISK001/n2"}],
       "joined_epoch": 1
     }
-  ]
+  ],
+  "reserve_nodes": [{
+    "instance_id": "reserve-r1",
+    "endpoint": "https://10.0.0.21:50001",
+    "native_endpoint": "n2://10.0.0.21:50002",
+    "state": "online",
+    "storage_roots": [{"id":"r1-disk-1","path":"/mnt/NDISK001/n2"}]
+  }],
+  "retired_instances": []
 }
 ```
 
-Pool ID, generation, policy, node list, and root-ID sets are immutable after
-enrollment. Expansion adds a complete new pool generation; it does not
-rewrite existing objects.
+Pool ID, generation, policy, logical slot list, and logical root-ID sets are
+immutable after enrollment. Expansion adds a complete new pool generation; it
+does not rewrite existing objects. Reserve instances are separate physical
+bindings and do not participate in placement before promotion.
+
+### Start a Reserve Instance
+
+A reserve runs the same `litiaina-n2` binary. Set `cluster_config.node_id` to
+its `reserve_nodes[].instance_id`, configure the exact physical root IDs and
+paths recorded for that reserve, and provide the same format-v5 membership,
+TLS trust, secrets, and static EC values as the cluster. Do not route ordinary
+client traffic to an unassigned reserve.
+
+A reserve is compatible with a failed slot only when it has the same root
+count and enough declared capacity for the slot's recorded usage. Root order
+does not matter: promotion deterministically maps sorted logical roots to
+sorted physical roots and retains both identities.
+
+After promotion, every active instance persists the new binding epoch. The
+replacement first appears as `degraded`, remains available for exact-width
+writes, heals historical layouts, and becomes `online` only after recovery
+completes. The old physical instance is fenced; do not restart it with the old
+membership or reuse its instance ID.
 
 ## Systemd Service
 
@@ -413,7 +461,7 @@ curl --cacert /path/to/ca.pem https://127.0.0.1:51002/gateway/nodes
 
 After fragment authentication, verify:
 
-- cluster membership matches format-v4 on every node;
+- cluster membership matches format-v5 on every node;
 - health reports the expected static `K + M` and `M + 1` NCNX replicas;
 - one-shot and multipart upload return byte-identical downloads;
 - finalized objects read through every node;

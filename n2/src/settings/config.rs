@@ -22,6 +22,29 @@ pub struct AutoHealingConfig {
     pub checksum_scan_every_cycles: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReserveSetConfig {
+    pub enabled: bool,
+    pub automatic_promotion: bool,
+    pub initial_delay_seconds: u64,
+    pub probe_interval_seconds: u64,
+    pub failure_threshold: u32,
+    pub promotion_timeout_seconds: u64,
+}
+
+impl Default for ReserveSetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            automatic_promotion: true,
+            initial_delay_seconds: 30,
+            probe_interval_seconds: 5,
+            failure_threshold: 3,
+            promotion_timeout_seconds: 30,
+        }
+    }
+}
+
 impl Default for AutoHealingConfig {
     fn default() -> Self {
         Self {
@@ -41,6 +64,7 @@ impl Default for AutoHealingConfig {
 pub struct Config {
     pub garbage_collector: GarbageCollectorConfig,
     pub auto_healing: AutoHealingConfig,
+    pub reserve_set: ReserveSetConfig,
 }
 
 fn parse_bool(value: Option<&str>, default: bool) -> bool {
@@ -148,6 +172,41 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         )
         .max(1),
     };
+    let reserve_defaults = ReserveSetConfig::default();
+    let reserve = conf.section(Some("reserve_set"));
+    let reserve_set = ReserveSetConfig {
+        enabled: parse_bool(
+            reserve.and_then(|section| section.get("enabled")),
+            reserve_defaults.enabled,
+        ),
+        automatic_promotion: parse_bool(
+            reserve.and_then(|section| section.get("automatic_promotion")),
+            reserve_defaults.automatic_promotion,
+        ),
+        initial_delay_seconds: parse_or(
+            reserve.and_then(|section| section.get("initial_delay_seconds")),
+            reserve_defaults.initial_delay_seconds,
+            "reserve_set.initial_delay_seconds",
+        ),
+        probe_interval_seconds: parse_or(
+            reserve.and_then(|section| section.get("probe_interval_seconds")),
+            reserve_defaults.probe_interval_seconds,
+            "reserve_set.probe_interval_seconds",
+        )
+        .clamp(1, 3600),
+        failure_threshold: parse_or(
+            reserve.and_then(|section| section.get("failure_threshold")),
+            reserve_defaults.failure_threshold,
+            "reserve_set.failure_threshold",
+        )
+        .clamp(2, 100),
+        promotion_timeout_seconds: parse_or(
+            reserve.and_then(|section| section.get("promotion_timeout_seconds")),
+            reserve_defaults.promotion_timeout_seconds,
+            "reserve_set.promotion_timeout_seconds",
+        )
+        .clamp(5, 600),
+    };
 
     Config {
         garbage_collector: GarbageCollectorConfig {
@@ -156,5 +215,6 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
             retention_seconds,
         },
         auto_healing,
+        reserve_set,
     }
 });

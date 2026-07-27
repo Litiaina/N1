@@ -1,49 +1,117 @@
-# N2 3.2 Testing
+# N2 3.3 Testing
 
 This document is the single correctness and resilience record for the current
-N2 3.2 engine. It covers test scope, procedures, results, failures, fixes, and
+N2 3.3 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Qualification Boundary
 
-N2 3.2 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
+N2 3.3 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
 server pools, immutable NCDX/object layouts, and healing model. Its lifecycle
 stores one delete mutation under
 `.trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx`. NCNX and object NCDX
-use format version 4; server-pool membership and root enrollment are also
-format version 4. N2 1.x, 2.x, and earlier experimental 3.x results do not
-qualify the 3.2 disk format.
+use the 3.x SHA-256 format; server-pool membership and root enrollment use
+format version 5. Format v5 separates stable logical placement slots from
+replaceable physical instances, adds an independent binding epoch, and records
+reserve and retired instances. N2 1.x, 2.x, and earlier experimental 3.x
+results do not qualify the 3.3 disk format.
 
 The current finite release proof uses four logical nodes over two physical
-hosts. It exercises the configured `2 + 2` EC loss boundary, but four logical
-processes on two hosts are not four independent host, power, network, or rack
+hosts plus one unassigned reserve process. It exercises the configured `2 + 2`
+EC loss boundary and autonomous replacement of one failed physical binding,
+but those processes are not five independent host, power, network, or rack
 failure domains.
 
 ## Repository Gates
 
-The N2 3.2 implementation currently has passed:
+The N2 3.3 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
-- `cargo check -p n2 -p n2_shell -p n2_gateway`;
-- `cargo test -p n2 --lib`: 132 passed;
-- `cargo test -p n2_shell -p n2_gateway`: 20 passed;
+- `cargo check --workspace --all-targets`;
+- `cargo test -p n2 --all-targets`: 140 passed;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
-These bounded code gates cover SHA-256 NCNX/object-NCDX/shard integrity,
-corrupted block reconstruction, canonical-list refill, replica-backed
-degraded listing, exact static placement, exact metadata visibility,
-copy/delete restart semantics, and existing object/healing invariants.
+These bounded code gates cover logical-slot/physical-instance separation,
+reserve exclusion from placement, one-binding promotion, incompatible-root and
+capacity rejection, stale-target fencing, SHA-256 NCNX/object-NCDX/shard
+integrity, corrupted block reconstruction, canonical-list refill,
+replica-backed degraded listing, exact static placement, exact metadata
+visibility, copy/delete restart semantics, and object/healing invariants.
 
-The format-v4 installer dry-run also passed for node-only, gateway-only, and
-combined installation:
+The format-v5 installer dry-run passed node-only, gateway-only, and combined
+installation:
 
 ```text
-/home/wlzambo/DEV-TEST/N2-3.0-installer-proof-20260727-013652
+/home/wlzambo/DEV-TEST/N2-3.3-installer-proof-20260727-045424
 ```
 
-## N2 3.2 Finite Release Proof
+## N2 3.3 Finite Release Proof
+
+```text
+/home/wlzambo/DEV-TEST/N2-3.3-final-proof/N2-3.0-proof-20260727-044408
+```
+
+The retained proof-script filename identifies the flat-NCNX proof family. This
+run used the optimized N2 `3.3.0` binary, format-v5 membership, four logical
+slots across two physical hosts, one exact `2 + 2` server pool, NCNX
+replication `R = 3`, and one unassigned reserve instance. Its `summary.json`
+result is `PASS`.
+
+| Test | Result |
+| --- | --- |
+| Direct 32 MiB upload | PASS; 21.13 MiB/s |
+| Download through all four active slots | PASS; every source SHA-256 matched |
+| Same-key overwrite and multipart finalize | PASS |
+| Eight concurrent independent keys | PASS |
+| Exact-key and same-prefix one-item pages | PASS; five ordered keys |
+| Copy/delete rename and repeated delete generations | PASS |
+| Strict recover collision | PASS; HTTP 409, live object preserved |
+| Prefix trash/recover and TTL GC | PASS |
+| NCNX and object healing before failure | PASS |
+| One active instance stopped | Existing object remained readable |
+| Write before replacement | Correctly rejected with HTTP 503 |
+| Autonomous reserve promotion | PASS; binding epoch advanced exactly once |
+| Logical placement slot/topology epoch | Preserved |
+| Write during historical recovery | PASS at exact `2 + 2` width |
+| Retired physical instance write | Rejected with HTTP 503 |
+| Historical NCNX/NCDX/shards/parity | Healed before slot activation |
+| Parity-count read after replacement | PASS |
+| Full active cluster restart | PASS; replacement binding and bytes persisted |
+| Suspicious engine log lines | 0 |
+
+Health changed from `degraded` with
+`historical_recovery_active=true` to `healthy` with the replacement bound to
+the original logical slot. `safety_read_only` remained false because exact
+safe width had been restored.
+
+The proof also recorded 233 process samples across active and reserve
+processes: mean CPU `6.815%` of one logical core, peak CPU `83%`, aggregate
+sampled peak RSS `230,664 KiB`, and no available hardware cycle counter
+because `kernel.perf_event_paranoid=4`. The proof did not change host policy.
+
+### Defects exposed and corrected during qualification
+
+Earlier 3.3 proof attempts were retained as failed evidence:
+
+- startup grace was too short for the remote native listener; the proof
+  profile now uses a bounded 10-second grace while the runtime default remains
+  30 seconds;
+- replacement healing attempted immutable NCDX repair before rebuilding the
+  recorded shard directory; shard reconstruction now precedes NCDX repair;
+- an immediate post-repair probe could transiently misclassify a byte-correct
+  shard; successful repairs now receive three bounded verification attempts
+  separated by 25 ms;
+- a promoted physical root was compared as if its physical ID were the logical
+  root ID after restart; enrollment now validates physical ID plus path while
+  retaining the logical placement root.
+
+The final run above passed after those corrections.
+The post-run audit found no live proof process and no per-run directory on
+either remote proof disk.
+
+## Historical N2 3.2 Finite Release Proof
 
 Authoritative evidence directory:
 

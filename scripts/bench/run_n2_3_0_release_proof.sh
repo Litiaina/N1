@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Finite N2 3.2 architectural proof; the filename is retained for the
-# flat-NCNX proof family. This never installs a service, never uses production
-# ports, and only removes directories containing this run's unique timestamp.
+# Finite N2 3.3 architectural and autonomous Reserve Set proof; the filename is
+# retained for the flat-NCNX proof family. This never installs a service, never
+# uses production ports, and only removes directories containing this run's
+# unique timestamp.
 # REMOTE_PASS is intentionally supplied by the operator at runtime.
 
 : "${REMOTE_PASS:?set REMOTE_PASS for the authorized proof host}"
@@ -21,8 +22,10 @@ OUT="$OUT_ROOT/N2-3.0-proof-$TS"
 LOCAL_RUN="$OUT/runtime"
 LOCAL_A="$LOCAL_RUN/node-a"
 LOCAL_B="$LOCAL_RUN/node-b"
+LOCAL_R="$LOCAL_RUN/reserve-r"
 LOCAL_A_STORE="$OUT/storage/node-a"
 LOCAL_B_STORE="$OUT/storage/node-b"
+LOCAL_R_STORE="$OUT/storage/reserve-r"
 REMOTE_RUN_BASE="/home/$REMOTE_USER/.cache/N2-3.0-proof-$TS"
 REMOTE_C="$REMOTE_RUN_BASE/node-c"
 REMOTE_D="$REMOTE_RUN_BASE/node-d"
@@ -34,10 +37,12 @@ A_HTTPS=56001; A_NATIVE=56002
 B_HTTPS=56011; B_NATIVE=56012
 C_HTTPS=56021; C_NATIVE=56022
 D_HTTPS=56031; D_NATIVE=56032
+R_HTTPS=56041; R_NATIVE=56042
 A_BASE="https://$LOCAL_IP:$A_HTTPS"
 B_BASE="https://$LOCAL_IP:$B_HTTPS"
 C_BASE="https://$REMOTE_IP:$C_HTTPS"
 D_BASE="https://$REMOTE_IP:$D_HTTPS"
+R_BASE="https://$LOCAL_IP:$R_HTTPS"
 POOL_ID="pool-proof-$TS"
 CLUSTER_ID="cluster-proof-$TS"
 MASTER="n2-3.0-proof-master-$TS"
@@ -76,8 +81,10 @@ cleanup() {
   set +e
   kill_pidfile "$LOCAL_A/pidstat.pid"
   kill_pidfile "$LOCAL_B/pidstat.pid"
+  kill_pidfile "$LOCAL_R/pidstat.pid"
   kill_pidfile "$LOCAL_A/n2.pid"
   kill_pidfile "$LOCAL_B/n2.pid"
+  kill_pidfile "$LOCAL_R/n2.pid"
   remote "for n in '$REMOTE_C' '$REMOTE_D'; do if [ -f \"\$n/pidstat.pid\" ]; then kill \$(cat \"\$n/pidstat.pid\") 2>/dev/null || true; fi; if [ -f \"\$n/n2.pid\" ]; then kill \$(cat \"\$n/n2.pid\") 2>/dev/null || true; fi; done" >/dev/null 2>&1
   remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'; rmdir '/mnt/NDISK002/$REMOTE_STORE_BASE' '/mnt/NDISK003/$REMOTE_STORE_BASE' 2>/dev/null || true" >/dev/null 2>&1
 }
@@ -104,6 +111,35 @@ wait_gc() {
     sleep 0.25
   done
   echo "GC did not complete in the finite wait window" >&2
+  return 1
+}
+
+wait_binding_epoch() {
+  local expected="$1" out="$2"
+  for _ in $(seq 1 120); do
+    if curl_auth "$A_BASE/noa/v1/cluster/health" > "$out" 2>/dev/null \
+      && [[ "$(jq -r '.binding_epoch' "$out")" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "binding epoch $expected was not published in the finite wait window" >&2
+  return 1
+}
+
+wait_replacement_online() {
+  local slot="$1" instance="$2" out="$3"
+  for _ in $(seq 1 480); do
+    if curl_auth "$A_BASE/noa/v1/cluster/health" > "$out" 2>/dev/null \
+      && jq -e --arg slot "$slot" --arg instance "$instance" \
+        '.historical_recovery_active == false
+         and any(.nodes[]; .node_id == $slot and .instance_id == $instance and .state == "online")' \
+        "$out" >/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "replacement $instance did not become online for slot $slot" >&2
   return 1
 }
 
@@ -162,6 +198,14 @@ max_duration_seconds=60
 lease_seconds=90
 checksum_scan_every_cycles=1
 
+[reserve_set]
+enabled=true
+automatic_promotion=true
+initial_delay_seconds=10
+probe_interval_seconds=1
+failure_threshold=2
+promotion_timeout_seconds=30
+
 [set_limits]
 max_file_size=5368709120
 
@@ -214,6 +258,30 @@ percentiles() {
     }' > "$output"
 }
 
+pidstat_summary() {
+  local output="$1"
+  shift
+  awk '
+    $NF == "litiaina-n2" {
+      samples++
+      cpu += $8
+      if ($8 > max_cpu) max_cpu = $8
+      if ($13 > max_rss) max_rss = $13
+      read_kib += $15
+      write_kib += $16
+      voluntary += $19
+      involuntary += $20
+    }
+    END {
+      if (samples == 0) {
+        print "{\"samples\":0}"
+      } else {
+        printf "{\"samples\":%d,\"mean_cpu_percent\":%.3f,\"max_cpu_percent\":%.3f,\"max_rss_kib\":%.0f,\"sampled_read_kib\":%.3f,\"sampled_write_kib\":%.3f,\"sampled_voluntary_context_switches\":%.3f,\"sampled_involuntary_context_switches\":%.3f}\n",
+          samples, cpu/samples, max_cpu, max_rss, read_kib, write_kib, voluntary, involuntary
+      }
+    }' "$@" > "$output"
+}
+
 start_local_node() {
   local run="$1"
   (cd "$run"; setsid ./litiaina-n2 </dev/null >>server.log 2>&1 & echo $! >n2.pid)
@@ -233,15 +301,20 @@ stop_remote_node() {
   remote "if [ -f '$run/pidstat.pid' ]; then kill \$(cat '$run/pidstat.pid') 2>/dev/null || true; rm -f '$run/pidstat.pid'; fi; if [ -f '$run/n2.pid' ]; then kill \$(cat '$run/n2.pid') 2>/dev/null || true; rm -f '$run/n2.pid'; fi"
 }
 
-mkdir -p "$OUT" "$LOCAL_A" "$LOCAL_B" "$LOCAL_A_STORE" "$LOCAL_B_STORE" "$LOCAL_A/state" "$LOCAL_B/state"
+mkdir -p "$OUT" "$LOCAL_A" "$LOCAL_B" "$LOCAL_R" \
+  "$LOCAL_A_STORE" "$LOCAL_B_STORE" "$LOCAL_R_STORE" \
+  "$LOCAL_A/state" "$LOCAL_B/state" "$LOCAL_R/state"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=n2-3.0-proof' \
   -keyout "$OUT/key.pem" -out "$OUT/cert.pem" >/dev/null 2>&1
 cp "$BIN" "$LOCAL_A/litiaina-n2"
 cp "$BIN" "$LOCAL_B/litiaina-n2"
+cp "$BIN" "$LOCAL_R/litiaina-n2"
 cp "$OUT/cert.pem" "$OUT/key.pem" "$LOCAL_A/"
 cp "$OUT/cert.pem" "$OUT/key.pem" "$LOCAL_B/"
+cp "$OUT/cert.pem" "$OUT/key.pem" "$LOCAL_R/"
 write_env "$LOCAL_A/n2.env"
 cp "$LOCAL_A/n2.env" "$LOCAL_B/n2.env"
+cp "$LOCAL_A/n2.env" "$LOCAL_R/n2.env"
 
 remote "mkdir -p '$REMOTE_C' '$REMOTE_D' '$REMOTE_C/state' '$REMOTE_D/state' '$REMOTE_C_STORE' '$REMOTE_D_STORE'"
 copy_remote "$BIN" "$OUT/cert.pem" "$OUT/key.pem" "$LOCAL_A/n2.env" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_C/" >/dev/null
@@ -250,31 +323,38 @@ remote "chmod +x '$REMOTE_C/litiaina-n2' '$REMOTE_D/litiaina-n2'"
 
 cat > "$OUT/n2_membership.json" <<EOF
 {
-  "format_version": 4,
+  "format_version": 5,
   "cluster_id": "$CLUSTER_ID",
   "epoch": 1,
+  "binding_epoch": 1,
   "pools": [{
     "id": "$POOL_ID",
     "generation": 1,
     "policy": {"object_data_shards": 2, "object_parity_shards": 2},
     "state": "writable",
-    "node_ids": ["node-a", "node-b", "node-c", "node-d"]
+    "slot_ids": ["node-a", "node-b", "node-c", "node-d"]
   }],
-  "nodes": [
-    {"id":"node-a","endpoint":"$A_BASE","native_endpoint":"n2://$LOCAL_IP:$A_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-a","path":"$LOCAL_A_STORE"}],"joined_epoch":1},
-    {"id":"node-b","endpoint":"$B_BASE","native_endpoint":"n2://$LOCAL_IP:$B_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-b","path":"$LOCAL_B_STORE"}],"joined_epoch":1},
-    {"id":"node-c","endpoint":"$C_BASE","native_endpoint":"n2://$REMOTE_IP:$C_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-c","path":"$REMOTE_C_STORE"}],"joined_epoch":1},
-    {"id":"node-d","endpoint":"$D_BASE","native_endpoint":"n2://$REMOTE_IP:$D_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-d","path":"$REMOTE_D_STORE"}],"joined_epoch":1}
-  ]
+  "slot_bindings": [
+    {"slot_id":"node-a","instance_id":"node-a","binding_epoch":1,"endpoint":"$A_BASE","native_endpoint":"n2://$LOCAL_IP:$A_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-a","path":"$LOCAL_A_STORE"}],"joined_epoch":1},
+    {"slot_id":"node-b","instance_id":"node-b","binding_epoch":1,"endpoint":"$B_BASE","native_endpoint":"n2://$LOCAL_IP:$B_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-b","path":"$LOCAL_B_STORE"}],"joined_epoch":1},
+    {"slot_id":"node-c","instance_id":"node-c","binding_epoch":1,"endpoint":"$C_BASE","native_endpoint":"n2://$REMOTE_IP:$C_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-c","path":"$REMOTE_C_STORE"}],"joined_epoch":1},
+    {"slot_id":"node-d","instance_id":"node-d","binding_epoch":1,"endpoint":"$D_BASE","native_endpoint":"n2://$REMOTE_IP:$D_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-d","path":"$REMOTE_D_STORE"}],"joined_epoch":1}
+  ],
+  "reserve_nodes": [
+    {"instance_id":"reserve-r","endpoint":"$R_BASE","native_endpoint":"n2://$LOCAL_IP:$R_NATIVE","state":"online","storage_roots":[{"id":"root-r","path":"$LOCAL_R_STORE"}]}
+  ],
+  "retired_instances": []
 }
 EOF
 cp "$OUT/n2_membership.json" "$LOCAL_A/state/"
 cp "$OUT/n2_membership.json" "$LOCAL_B/state/"
+cp "$OUT/n2_membership.json" "$LOCAL_R/state/"
 copy_remote "$OUT/n2_membership.json" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_C/state/" >/dev/null
 copy_remote "$OUT/n2_membership.json" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_D/state/" >/dev/null
 
 write_config "$LOCAL_A/n2_config.ini" node-a "$A_HTTPS" "$A_NATIVE" "$LOCAL_IP" "$LOCAL_A_STORE" "$LOCAL_A" root-a
 write_config "$LOCAL_B/n2_config.ini" node-b "$B_HTTPS" "$B_NATIVE" "$LOCAL_IP" "$LOCAL_B_STORE" "$LOCAL_B" root-b
+write_config "$LOCAL_R/n2_config.ini" reserve-r "$R_HTTPS" "$R_NATIVE" "$LOCAL_IP" "$LOCAL_R_STORE" "$LOCAL_R" root-r
 write_config "$OUT/node-c.ini" node-c "$C_HTTPS" "$C_NATIVE" "$REMOTE_IP" "$REMOTE_C_STORE" "$REMOTE_C" root-c
 write_config "$OUT/node-d.ini" node-d "$D_HTTPS" "$D_NATIVE" "$REMOTE_IP" "$REMOTE_D_STORE" "$REMOTE_D" root-d
 copy_remote "$OUT/node-c.ini" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_C/n2_config.ini" >/dev/null
@@ -284,7 +364,8 @@ start_remote_node "$REMOTE_C"
 start_remote_node "$REMOTE_D"
 start_local_node "$LOCAL_A"
 start_local_node "$LOCAL_B"
-wait_ping "$A_BASE"; wait_ping "$B_BASE"; wait_ping "$C_BASE"; wait_ping "$D_BASE"
+start_local_node "$LOCAL_R"
+wait_ping "$A_BASE"; wait_ping "$B_BASE"; wait_ping "$C_BASE"; wait_ping "$D_BASE"; wait_ping "$R_BASE"
 
 curl_json -X POST "$A_BASE/noa/v1/fragments" \
   -d "{\"name\":\"$FRAGMENT_NAME\",\"secret\":\"$MASTER\",\"key\":\"$FRAGMENT_KEY\"}" > "$OUT/fragment-create.json"
@@ -295,7 +376,12 @@ curl_json -X POST "$B_BASE/noa/v1/auth/fragment" \
 TOKEN="$(jq -er '.access_token' "$OUT/auth.json")"
 
 curl_auth "$A_BASE/noa/v1/cluster/health" > "$OUT/health-initial.json"
-jq -e '.data_shards == 2 and .parity_shards == 2 and .ncnx_replicas == 3 and .effective_client_writable == true' "$OUT/health-initial.json" >/dev/null
+jq -e '.binding_epoch == 1
+  and .data_shards == 2
+  and .parity_shards == 2
+  and .ncnx_replicas == 3
+  and .effective_client_writable == true
+  and (.reserve_nodes | length) == 1' "$OUT/health-initial.json" >/dev/null
 
 dd if=/dev/urandom of="$OUT/source.bin" bs=1M count="$PROOF_MIB" status=none
 SOURCE_SHA="$(sha256sum "$OUT/source.bin" | awk '{print $1}')"
@@ -498,44 +584,89 @@ TTL_STATUS="$(curl -k --http1.1 -sS -o "$OUT/ttl-after-gc.json" -w '%{http_code}
 stop_remote_node "$REMOTE_D"
 curl_auth -G "$A_BASE/noa/v1/objects/download" --data-urlencode 'object_key=videos/main.bin' -o "$OUT/download-node-loss.bin"
 [[ "$(sha256sum "$OUT/download-node-loss.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
-printf 'must-fail' > "$OUT/node-loss.bin"
-NODE_LOSS_STATUS="$(curl -k --http1.1 -sS -o "$OUT/node-loss-write.json" -w '%{http_code}' \
-  -X POST "$A_BASE/noa/v1/upload/one-shot/fail-closed.bin" \
+
+# The exact-width pool is temporarily fail-closed, then the autonomous Reserve
+# Set preserves logical slot node-d while replacing its physical binding.
+printf 'reserve-write' > "$OUT/node-loss.bin"
+PRE_PROMOTION_STATUS="$(curl -k --http1.1 -sS -o "$OUT/pre-promotion-write.json" -w '%{http_code}' \
+  -X POST "$A_BASE/noa/v1/upload/one-shot/pre-promotion-must-not-commit.bin" \
   -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss.bin")"
-[[ "$NODE_LOSS_STATUS" == "503" ]]
+wait_binding_epoch 2 "$OUT/health-after-promotion.json"
+jq -e 'any(.nodes[]; .node_id == "node-d" and .instance_id == "reserve-r"
+    and (.state == "degraded" or .state == "online"))
+  and (.reserve_nodes | length) == 0
+  and .effective_client_writable == true' "$OUT/health-after-promotion.json" >/dev/null
+if [[ "$PRE_PROMOTION_STATUS" == 2* ]]; then
+  jq -e '.binding_epoch == 2' "$OUT/health-after-promotion.json" >/dev/null
+fi
+for _ in $(seq 1 120); do
+  curl_auth "$A_BASE/noa/v1/cluster/reserve" > "$OUT/reserve-after-promotion.json"
+  if jq -e '.binding_epoch == 2 and .last_promoted_slot == "node-d"
+    and .last_promoted_instance == "reserve-r"' "$OUT/reserve-after-promotion.json" >/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+jq -e '.binding_epoch == 2 and .last_promoted_slot == "node-d"
+  and .last_promoted_instance == "reserve-r"' "$OUT/reserve-after-promotion.json" >/dev/null
+
+curl_auth -X POST "$A_BASE/noa/v1/upload/one-shot/write-during-recovery.bin" \
+  --data-binary @"$OUT/node-loss.bin" > "$OUT/write-during-recovery.json"
+curl_auth -G "$R_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=videos/main.bin' -o "$OUT/download-through-replacement.bin"
+[[ "$(sha256sum "$OUT/download-through-replacement.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+
+wait_replacement_online node-d reserve-r "$OUT/health-after-recovery.json"
+jq -e '.binding_epoch == 2 and .state == "healthy"
+  and .historical_recovery_active == false
+  and .effective_client_writable == true' "$OUT/health-after-recovery.json" >/dev/null
+
+# Bring the retired physical instance back with its stale epoch-1 membership.
+# Disable only its reconciliation loop so the request demonstrably originates
+# from the stale binding; current participants must reject the write.
+remote "sed -i 's/^automatic_promotion=true$/automatic_promotion=false/' '$REMOTE_D/n2_config.ini'"
+start_remote_node "$REMOTE_D"; wait_ping "$D_BASE"
+STALE_WRITE_STATUS="$(curl -k --http1.1 -sS -o "$OUT/stale-retired-write.json" -w '%{http_code}' \
+  -X POST "$D_BASE/noa/v1/upload/one-shot/stale-retired-must-not-commit.bin" \
+  -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss.bin")"
+[[ "$STALE_WRITE_STATUS" != 2* ]]
+stop_remote_node "$REMOTE_D"
 
 kill_pidfile "$LOCAL_B/pidstat.pid"
 kill_pidfile "$LOCAL_B/n2.pid"
 curl_auth -G "$A_BASE/noa/v1/objects/download" --data-urlencode 'object_key=videos/main.bin' -o "$OUT/download-parity-count-loss.bin"
 [[ "$(sha256sum "$OUT/download-parity-count-loss.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
 start_local_node "$LOCAL_B"; wait_ping "$B_BASE"
-start_remote_node "$REMOTE_D"; wait_ping "$D_BASE"
-curl_auth -X POST "$D_BASE/noa/v1/upload/one-shot/restarted.bin" --data-binary @"$OUT/node-loss.bin" > "$OUT/write-after-node-return.json"
+curl_auth -X POST "$R_BASE/noa/v1/upload/one-shot/restarted.bin" --data-binary @"$OUT/node-loss.bin" > "$OUT/write-after-node-return.json"
 
-kill_pidfile "$LOCAL_A/n2.pid"; kill_pidfile "$LOCAL_B/n2.pid"
-stop_remote_node "$REMOTE_C"; stop_remote_node "$REMOTE_D"
-start_remote_node "$REMOTE_C"; start_remote_node "$REMOTE_D"; start_local_node "$LOCAL_A"; start_local_node "$LOCAL_B"
-wait_ping "$A_BASE"; wait_ping "$B_BASE"; wait_ping "$C_BASE"; wait_ping "$D_BASE"
+kill_pidfile "$LOCAL_A/n2.pid"; kill_pidfile "$LOCAL_B/n2.pid"; kill_pidfile "$LOCAL_R/n2.pid"
+stop_remote_node "$REMOTE_C"
+start_remote_node "$REMOTE_C"; start_local_node "$LOCAL_A"; start_local_node "$LOCAL_B"; start_local_node "$LOCAL_R"
+wait_ping "$A_BASE"; wait_ping "$B_BASE"; wait_ping "$C_BASE"; wait_ping "$R_BASE"
 curl_auth -G "$C_BASE/noa/v1/objects/download" --data-urlencode 'object_key=videos/main.bin' -o "$OUT/download-after-restart.bin"
 [[ "$(sha256sum "$OUT/download-after-restart.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
 curl_auth "$A_BASE/noa/v1/cluster/monitor?deep_scan=true" > "$OUT/monitor-final.json"
 
 cp "$LOCAL_A/server.log" "$OUT/node-a.log"; cp "$LOCAL_B/server.log" "$OUT/node-b.log"
+cp "$LOCAL_R/server.log" "$OUT/reserve-r.log"
 cp "$LOCAL_A/pidstat.log" "$OUT/node-a-pidstat.log" 2>/dev/null || true
 cp "$LOCAL_B/pidstat.log" "$OUT/node-b-pidstat.log" 2>/dev/null || true
+cp "$LOCAL_R/pidstat.log" "$OUT/reserve-r-pidstat.log" 2>/dev/null || true
 copy_remote "$REMOTE_USER@$REMOTE_HOST:$REMOTE_C/server.log" "$OUT/node-c.log" >/dev/null
 copy_remote "$REMOTE_USER@$REMOTE_HOST:$REMOTE_D/server.log" "$OUT/node-d.log" >/dev/null
 copy_remote "$REMOTE_USER@$REMOTE_HOST:$REMOTE_C/pidstat.log" "$OUT/node-c-pidstat.log" >/dev/null || true
 copy_remote "$REMOTE_USER@$REMOTE_HOST:$REMOTE_D/pidstat.log" "$OUT/node-d-pidstat.log" >/dev/null || true
 
-find "$LOCAL_A_STORE" "$LOCAL_B_STORE" -maxdepth 8 -printf '%P\n' | sort > "$OUT/layout-local.txt"
+pidstat_summary "$OUT/process-observability.json" "$OUT"/*-pidstat.log
+find "$LOCAL_A_STORE" "$LOCAL_B_STORE" "$LOCAL_R_STORE" -maxdepth 8 -printf '%P\n' | sort > "$OUT/layout-local.txt"
 remote "find '$REMOTE_C_STORE' '$REMOTE_D_STORE' -maxdepth 8 -printf '%p\n' | sort" > "$OUT/layout-remote.txt"
-ERROR_LINES="$({ grep -Eih 'panic|fatal|internal server error|corrupt' "$OUT"/node-*.log 2>/dev/null || true; } | wc -l | tr -d ' ')"
+ERROR_LINES="$({ grep -Eih 'panic|fatal|internal server error|corrupt' "$OUT"/node-*.log "$OUT"/reserve-r.log 2>/dev/null || true; } | wc -l | tr -d ' ')"
 jq -n \
   --arg result PASS --arg cluster "$CLUSTER_ID" --arg pool "$POOL_ID" \
   --arg fragment "$FRAGMENT" --arg stable_fragment "$STABLE_FRAGMENT" \
-  --arg topology 'four logical nodes on two physical hosts; static EC 2+2; NCNX R=3' \
-  --arg node_loss_status "$NODE_LOSS_STATUS" --arg ttl_status "$TTL_STATUS" \
+  --arg topology 'four logical slots on two physical hosts; static EC 2+2; NCNX R=3; one autonomous reserve instance' \
+  --arg pre_promotion_status "$PRE_PROMOTION_STATUS" --arg stale_write_status "$STALE_WRITE_STATUS" \
+  --arg ttl_status "$TTL_STATUS" \
   --arg collision_recover_status "$COLLISION_RECOVER_STATUS" \
   --arg collision_first_id "$COLLISION_FIRST_ID" --arg collision_second_id "$COLLISION_SECOND_ID" \
   --argjson ncnx_replicas "$NCNX_COUNT" --argjson suspicious_log_lines "$ERROR_LINES" \
@@ -544,7 +675,14 @@ jq -n \
   --slurpfile list "$OUT/list-latency.json" --slurpfile stat "$OUT/stat-latency.json" \
   --slurpfile rename "$OUT/rename-latency.json" --slurpfile gc "$OUT/gc-status.json" \
   --slurpfile monitor "$OUT/monitor-final.json" \
-  '{result:$result,cluster_id:$cluster,pool_id:$pool,fragment:$fragment,stable_fragment_id:$stable_fragment,topology:$topology,ec:"2+2",ncnx_replicas:$ncnx_replicas,upload:$upload[0],latency:{zero_decode_list:$list[0],stat:$stat[0],exact_rename:$rename[0]},rename_lifecycle_trash_records:0,trash_generation:{strict_recover_http_status:($collision_recover_status|tonumber),first_mutation_id:$collision_first_id,second_mutation_id:$collision_second_id,ids_are_distinct:($collision_first_id != $collision_second_id),surviving_old_generation_replicas:$collision_trash_replicas},overwrite_versions:2,parallel_independent_key_writes:8,hierarchical_pagination_keys:5,folder_trash_recovery:"2 of 2",ncnx_auto_heal:"recreated deleted replica",object_auto_heal:"recreated deleted shard",node_loss:{one_node_read_survived:true,parity_count_read_survived:true,new_write_http_status:($node_loss_status|tonumber)},ttl_gc:{expired:true,read_after_gc_http_status:($ttl_status|tonumber),status:$gc[0]},restart_persistence:true,suspicious_log_lines:$suspicious_log_lines,monitor:$monitor[0]}' \
+  --slurpfile process "$OUT/process-observability.json" \
+  --slurpfile health_promotion "$OUT/health-after-promotion.json" \
+  --slurpfile health_recovery "$OUT/health-after-recovery.json" \
+  --slurpfile download_a "$OUT/download-a-throughput.json" \
+  --slurpfile download_b "$OUT/download-b-throughput.json" \
+  --slurpfile download_c "$OUT/download-c-throughput.json" \
+  --slurpfile download_d "$OUT/download-d-throughput.json" \
+  '{result:$result,cluster_id:$cluster,pool_id:$pool,fragment:$fragment,stable_fragment_id:$stable_fragment,topology:$topology,ec:"2+2",ncnx_replicas:$ncnx_replicas,upload:$upload[0],download:{node_a:$download_a[0],node_b:$download_b[0],node_c:$download_c[0],node_d:$download_d[0]},latency:{zero_decode_list:$list[0],stat:$stat[0],exact_rename:$rename[0]},rename_lifecycle_trash_records:0,trash_generation:{strict_recover_http_status:($collision_recover_status|tonumber),first_mutation_id:$collision_first_id,second_mutation_id:$collision_second_id,ids_are_distinct:($collision_first_id != $collision_second_id),surviving_old_generation_replicas:$collision_trash_replicas},overwrite_versions:2,parallel_independent_key_writes:8,hierarchical_pagination_keys:5,folder_trash_recovery:"2 of 2",ncnx_auto_heal:"recreated deleted replica",object_auto_heal:"recreated deleted shard",reserve_set:{one_node_read_survived:true,pre_promotion_write_http_status:($pre_promotion_status|tonumber),binding_epoch_advanced_once:true,logical_slot_preserved:true,replacement_instance:"reserve-r",write_during_recovery:true,stale_retired_write_http_status:($stale_write_status|tonumber),stale_retired_write_rejected:true,historical_layout_repaired:true,parity_count_read_survived:true,health_after_promotion:$health_promotion[0],health_after_recovery:$health_recovery[0]},ttl_gc:{expired:true,read_after_gc_http_status:($ttl_status|tonumber),status:$gc[0]},restart_persistence:true,observability:{hardware_cycle_counter:"unavailable: kernel perf_event_paranoid=4; no sysctl was changed",process:$process[0]},suspicious_log_lines:$suspicious_log_lines,monitor:$monitor[0]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_3_0_PROOF_OUT=$OUT"

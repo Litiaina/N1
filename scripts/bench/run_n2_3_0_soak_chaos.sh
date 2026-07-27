@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# N2 3.2 soak and bounded-chaos qualification; the filename is retained for
+# N2 3.3 soak and bounded-chaos qualification; the filename is retained for
 # the flat-NCNX proof family. The harness uses four logical nodes on two
 # physical hosts, static 2+2 EC, and NCNX R=3. It never installs a service or
 # uses a pre-existing storage directory.
@@ -536,22 +536,25 @@ setup_cluster() {
 
   cat > "$OUT/n2_membership.json" <<EOF
 {
-  "format_version": 4,
+  "format_version": 5,
   "cluster_id": "$CLUSTER_ID",
   "epoch": 1,
+  "binding_epoch": 1,
   "pools": [{
     "id": "$POOL_ID",
     "generation": 1,
     "policy": {"object_data_shards": 2, "object_parity_shards": 2},
     "state": "writable",
-    "node_ids": ["node-a", "node-b", "node-c", "node-d"]
+    "slot_ids": ["node-a", "node-b", "node-c", "node-d"]
   }],
-  "nodes": [
-    {"id":"node-a","endpoint":"$A_BASE","native_endpoint":"n2://$LOCAL_IP:$A_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-a","path":"$LOCAL_A_STORE"}],"joined_epoch":1},
-    {"id":"node-b","endpoint":"$B_BASE","native_endpoint":"n2://$LOCAL_IP:$B_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-b","path":"$LOCAL_B_STORE"}],"joined_epoch":1},
-    {"id":"node-c","endpoint":"$C_BASE","native_endpoint":"n2://$REMOTE_IP:$C_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-c","path":"$REMOTE_C_STORE"}],"joined_epoch":1},
-    {"id":"node-d","endpoint":"$D_BASE","native_endpoint":"n2://$REMOTE_IP:$D_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-d","path":"$REMOTE_D_STORE"}],"joined_epoch":1}
-  ]
+  "slot_bindings": [
+    {"slot_id":"node-a","instance_id":"node-a","binding_epoch":1,"endpoint":"$A_BASE","native_endpoint":"n2://$LOCAL_IP:$A_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-a","path":"$LOCAL_A_STORE"}],"joined_epoch":1},
+    {"slot_id":"node-b","instance_id":"node-b","binding_epoch":1,"endpoint":"$B_BASE","native_endpoint":"n2://$LOCAL_IP:$B_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-b","path":"$LOCAL_B_STORE"}],"joined_epoch":1},
+    {"slot_id":"node-c","instance_id":"node-c","binding_epoch":1,"endpoint":"$C_BASE","native_endpoint":"n2://$REMOTE_IP:$C_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-c","path":"$REMOTE_C_STORE"}],"joined_epoch":1},
+    {"slot_id":"node-d","instance_id":"node-d","binding_epoch":1,"endpoint":"$D_BASE","native_endpoint":"n2://$REMOTE_IP:$D_NATIVE","state":"online","weight":1,"storage_roots":[{"id":"root-d","path":"$REMOTE_D_STORE"}],"joined_epoch":1}
+  ],
+  "reserve_nodes": [],
+  "retired_instances": []
 }
 EOF
   cp "$OUT/n2_membership.json" "$LOCAL_A/state/"; cp "$OUT/n2_membership.json" "$LOCAL_B/state/"

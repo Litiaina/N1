@@ -1069,6 +1069,7 @@ pub async fn run_server() {
 
     crate::distribution::peer::spawn_fragment_control_sync_task();
     crate::distribution::auto_healing::spawn_auto_healing_task();
+    crate::distribution::reserve_set::spawn_reserve_set_task();
 
     tokio::spawn(async move {
         serve_native_protocol(native_listener, native_addr, native_state).await;

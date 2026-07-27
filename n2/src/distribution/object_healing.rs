@@ -157,6 +157,33 @@ pub async fn scan_and_repair_fragment_objects(
                     continue;
                 }
             };
+            let after = if before.status == "healthy" {
+                before.clone()
+            } else if !before.repairable {
+                before.clone()
+            } else {
+                match repair_cluster_object_recorded_layout(&metadata, check_mode).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        result.failed_objects = result.failed_objects.saturating_add(1);
+                        result.reports.push(object_error_report(
+                            &runtime,
+                            fragment,
+                            scan_id,
+                            object_id,
+                            &metadata.version_id,
+                            logical_path.clone(),
+                            &format!("recorded shard-layout repair failed: {error}"),
+                        ));
+                        continue;
+                    }
+                }
+            };
+
+            // A replacement participant starts without either its shard
+            // version directory or its immutable NCDX copy. Restore the exact
+            // recorded shard first: NCDX publication deliberately refuses to
+            // create metadata ahead of a local shard-bearing directory.
             let metadata_repair = match inspect_and_repair_metadata_replicas(&metadata).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -179,32 +206,6 @@ pub async fn scan_and_repair_fragment_objects(
             if !was_degraded {
                 continue;
             }
-
-            let after = if before.status == "healthy" {
-                before.clone()
-            } else if !before.repairable {
-                before.clone()
-            } else {
-                match repair_cluster_object_recorded_layout(&metadata, check_mode).await {
-                    Ok(status) => status,
-                    Err(error) => {
-                        result.failed_objects = result.failed_objects.saturating_add(1);
-                        result.reports.push(object_repair_report(
-                            &runtime,
-                            fragment,
-                            scan_id,
-                            object_id,
-                            &metadata.version_id,
-                            logical_path.clone(),
-                            &before,
-                            None,
-                            &metadata_repair,
-                            Some(error.to_string()),
-                        ));
-                        continue;
-                    }
-                }
-            };
 
             let healthy =
                 after.status == "healthy" && after.failed_repairs == 0 && metadata_repair.healthy;

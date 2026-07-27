@@ -19,12 +19,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::Duration;
 
-const PEER_NCNX_PATH: &str = "/n2/peer/ncnx-v3";
+const PEER_NCNX_PATH: &str = "/n2/peer/ncnx-v4";
 const PEER_NCNX_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NcnxReplica {
     pub node_id: String,
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub root_id: String,
     pub endpoint: String,
 }
@@ -66,6 +68,9 @@ pub struct PeerNcnxRequest {
     pub action: PeerNcnxAction,
     pub pool_id: String,
     pub pool_generation: u64,
+    pub target_slot_id: String,
+    pub target_instance_id: String,
+    pub binding_epoch: u64,
     pub fragment_id: String,
     #[serde(default)]
     pub logical_key: String,
@@ -259,6 +264,8 @@ pub fn build_ncnx_layout(
                 })?;
             Ok(NcnxReplica {
                 node_id: node.id,
+                instance_id: node.instance_id,
+                binding_epoch: runtime.membership.binding_epoch,
                 root_id: root.id.clone(),
                 endpoint: node.endpoint,
             })
@@ -283,6 +290,16 @@ fn validate_pool_contract<'a>(
         return Err(AppError::Conflict(format!(
             "NCNX pool generation {} does not match recorded generation {}",
             request.pool_generation, pool.generation
+        )));
+    }
+    if runtime.local_is_reserve
+        || request.binding_epoch != runtime.membership.binding_epoch
+        || request.target_slot_id != runtime.local_node_id
+        || request.target_instance_id != runtime.local_instance_id
+    {
+        return Err(AppError::Conflict(format!(
+            "stale or misbound NCNX request for slot '{}' instance '{}' epoch {}",
+            request.target_slot_id, request.target_instance_id, request.binding_epoch
         )));
     }
     if !pool.node_ids.iter().any(|id| id == &runtime.local_node_id) {
@@ -582,6 +599,9 @@ fn request_for_replica(
         action,
         pool_id: layout.pool_id.clone(),
         pool_generation: layout.pool_generation,
+        target_slot_id: replica.node_id.clone(),
+        target_instance_id: replica.instance_id.clone(),
+        binding_epoch: replica.binding_epoch,
         fragment_id: fragment_id.to_string(),
         logical_key: logical_key.to_string(),
         root_id: replica.root_id.clone(),
@@ -964,6 +984,12 @@ async fn list_node(
     trash: bool,
     canonical_only: bool,
 ) -> Result<Vec<PeerNcnxName>, AppError> {
+    if node.effective_state() == crate::distribution::membership::NodeState::Degraded {
+        return Err(AppError::ServiceUnavailable(format!(
+            "NCNX slot '{}' is recovering; listing must use surviving replicas",
+            node.id
+        )));
+    }
     let request = PeerNcnxRequest {
         action: if trash && canonical_only {
             PeerNcnxAction::ListTrash
@@ -976,6 +1002,9 @@ async fn list_node(
         },
         pool_id: pool.id.clone(),
         pool_generation: pool.generation,
+        target_slot_id: node.id.clone(),
+        target_instance_id: node.instance_id.clone(),
+        binding_epoch: runtime.membership.binding_epoch,
         fragment_id: fragment_id.to_string(),
         logical_key: prefix.to_string(),
         root_id: String::new(),
@@ -1436,12 +1465,15 @@ mod tests {
         let nodes = (0..6)
             .map(|index| ClusterNode {
                 id: format!("n{index}"),
+                instance_id: format!("n{index}"),
+                binding_epoch: 1,
                 endpoint: format!("https://n{index}:50001"),
                 native_endpoint: None,
                 state: Some(NodeState::Online),
                 weight: 1,
                 storage_roots: vec![StorageRoot {
                     id: format!("r{index}"),
+                    physical_id: None,
                     path: format!("/disk/{index}"),
                 }],
                 joined_epoch: 1,
@@ -1452,6 +1484,8 @@ mod tests {
             .collect::<Vec<_>>();
         ClusterRuntime {
             local_node_id: "n0".into(),
+            local_instance_id: "n0".into(),
+            local_is_reserve: false,
             local_pool_id: "pool-a".into(),
             local_storage_roots: nodes[0].storage_roots.clone(),
             membership_path: PathBuf::from("/membership"),
@@ -1463,6 +1497,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "cluster-a".into(),
                 epoch: 1,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-a".into(),
                     generation: 1,
@@ -1471,6 +1506,8 @@ mod tests {
                     node_ids: (0..6).map(|index| format!("n{index}")).collect(),
                 }],
                 nodes,
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }
@@ -1568,6 +1605,9 @@ mod tests {
             action: PeerNcnxAction::ListLive,
             pool_id: "pool-a".into(),
             pool_generation: 1,
+            target_slot_id: "n0".into(),
+            target_instance_id: "n0".into(),
+            binding_epoch: 1,
             fragment_id: "fragment".into(),
             logical_key: String::new(),
             root_id: String::new(),

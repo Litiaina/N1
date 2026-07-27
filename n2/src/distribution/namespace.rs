@@ -121,7 +121,7 @@ pub struct PeerNamespaceApplyRequest {
     pub metadata: Option<ObjectMetadata>,
 }
 
-/// N2 3.2 namespace operations are already distributed by deterministic NCNX
+/// N2 3.3 namespace operations are already distributed by deterministic NCNX
 /// placement. This facade preserves the NOA/native protocol boundary without
 /// reintroducing a coordinator database or inode quorum.
 pub async fn namespace_read(
@@ -226,7 +226,7 @@ pub async fn commit_namespace_mutation(
             let path = required(&request.source_path, "mkdir requires source_path")?;
             validate_logical_key(path)?;
             Err(AppError::BadRequest(
-                "N2 3.2 is a flat key namespace and does not persist empty directories".into(),
+                "N2 3.3 is a flat key namespace and does not persist empty directories".into(),
             ))
         }
         NamespaceMutationKind::Rename => {

@@ -51,7 +51,7 @@ impl NcnxRecord {
     fn validate_fields(&self) -> Result<(), AppError> {
         if self.format_version != NCNX_FORMAT_VERSION {
             return Err(AppError::Conflict(format!(
-                "NCNX format {} is not N2 3.2 format {}",
+                "NCNX format {} is not N2 3.3 format {}",
                 self.format_version, NCNX_FORMAT_VERSION
             )));
         }
@@ -347,7 +347,7 @@ pub fn validate_logical_key(key: &str) -> Result<String, AppError> {
     let key = normalize_path(key).map_err(|err| AppError::BadRequest(err.to_string()))?;
     if key.is_empty() {
         return Err(AppError::BadRequest(
-            "N2 3.2 object key cannot be empty".into(),
+            "N2 3.3 object key cannot be empty".into(),
         ));
     }
     if key.len() > MAX_KEY_BYTES {
@@ -831,14 +831,14 @@ fn list_generation_trash_names(
             parse_trash_generation_name(&generation_name)
         else {
             return Err(AppError::Conflict(format!(
-                "invalid N2 3.2 trash generation '{}' in {}",
+                "invalid N2 3.3 trash generation '{}' in {}",
                 generation_name,
                 trash_root.display()
             )));
         };
         if !file_type.is_dir() {
             return Err(AppError::Conflict(format!(
-                "N2 3.2 trash generation is not a directory: {}",
+                "N2 3.3 trash generation is not a directory: {}",
                 entry.path().display()
             )));
         }

@@ -1,19 +1,19 @@
-# N2 3.2 Architecture
+# N2 3.3 Architecture
 
 ## Status
 
-This document is the locked implementation contract for N2 3.2, the current
+This document is the locked implementation contract for N2 3.3, the current
 release of the clean N2 3.x engine generation. It does not read, migrate, or
 maintain compatibility with the N2 2.0 inode namespace.
 
-N2 3.2 is a clean format. It accepts only the generation-directory trash
+N2 3.3 is a clean format. It accepts only the generation-directory trash
 layout and SHA-256 NCNX/object-NCDX/shard integrity defined here. Earlier
 experimental 3.x records are rejected rather than ignored or guessed.
 
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.2 combines:
+N2 3.3 combines:
 
 - immutable, object-level erasure sets;
 - flat physical-key namespace records;
@@ -56,7 +56,16 @@ cluster-wide mutation log, or implicit redistribution.
     bodies, immutable shards, and verified shard blocks.
 15. Placement is calculated from the immutable node membership of the selected
     server-pool generation. An unavailable selected holder is never silently
-    replaced by another pool node.
+    replaced by another active pool node.
+16. Placement names stable logical slots, not replaceable physical instances.
+    Rebinding one failed slot advances only the binding epoch; it does not
+    change the topology epoch, pool generation, EC width, or object layout.
+17. Reserve instances are unassigned physical capacity. They receive no new
+    shards or NCNX replicas and do not participate in LIST before promotion.
+18. Promotion requires repeated failure observations, confirmation from every
+    surviving pool slot and the reserve candidate, compatible roots and
+    capacity, an atomic membership commit, and a durable retired-instance
+    fence.
 
 ## Cluster And Server Pools
 
@@ -98,15 +107,52 @@ Each pool records:
 
 Its membership contains exactly `K + M` distinct node failure domains. Extra
 nodes form another complete server pool; they are never silently folded into
-an existing pool.
+an existing pool. Separately declared reserve instances remain outside every
+pool and do not alter its mathematical placement contract.
 
 The newest writable pool that can satisfy its static EC accepts new object
 versions. A sealed or full pool remains readable and healable. An object lookup
 uses its recorded pool layout, never a guess based on the newest membership.
 
+### Logical slots and the Reserve Set
+
+A pool's ordered members are stable logical slots. Each slot has one current
+physical binding:
+
+```text
+pool A slot A3
+├── logical root A3D1
+└── physical binding instance-a3, binding epoch 1
+
+after confirmed loss
+
+pool A slot A3
+├── logical root A3D1
+└── physical binding reserve-r1 / physical root R1D1, binding epoch 2
+```
+
+The pool ID, pool generation, slot ID, logical root ID, topology epoch, and
+object placement remain unchanged. The reserve's physical root identity is
+retained separately for device validation. The failed instance becomes a
+durable retired-instance fence and cannot publish with its old binding epoch.
+
+N2 changes a binding only after every surviving slot and the reserve candidate
+independently observe the failed physical instance as unreachable. The reserve
+commits first, remote survivors commit next, and the coordinating survivor
+commits last. Membership is persisted with temporary-file write, file `fsync`,
+atomic rename, and parent-directory `fsync`.
+
+New exact-width writes may continue through the promoted degraded binding while
+bounded autonomous healing restores historical layouts. The slot returns to
+`online` only after healing completes with no incomplete, unrecoverable,
+failed, or errored objects. Only one missing slot in a pool is eligible for
+autonomous promotion. Multiple missing slots, incompatible reserve roots,
+insufficient recorded capacity, observation disagreement, or an unreachable
+reserve fail closed without rewriting membership.
+
 ## Unified Nodes And Disks
 
-Every N2 3.2 node is bidirectional and unified. Any healthy node may receive a
+Every N2 3.3 node is bidirectional and unified. Any healthy node may receive a
 client operation and coordinate it. Every pool node may also persist the data
 assigned to it:
 
@@ -131,7 +177,7 @@ authority.
 
 ## Disk Layout
 
-Each enrolled storage root uses the same N2 3.2 format:
+Each enrolled storage root uses the same N2 3.3 format:
 
 ```text
 <storage_root>/
@@ -244,7 +290,7 @@ Adding disks, nodes, or pools cannot remap an existing object.
 
 ## Key Semantics
 
-N2 3.2 is a flat object-key namespace with prefix presentation:
+N2 3.3 is a flat object-key namespace with prefix presentation:
 
 ```text
 videos/a.mp4
@@ -450,6 +496,19 @@ object ID, pool, expected holders, observed loss, and repair result.
 Work is partitioned by fragment, pool, and canonical key ownership so multiple
 nodes heal concurrently without scanning or repairing the same record.
 
+### Reserve replacement healing
+
+Reserve recovery is a persisted continuation of exact-layout healing, not
+redistribution. The promoted slot first synchronizes fragment control records
+and then participates in forced SHA-256 NCNX, NCDX, shard, and parity repair.
+Existing objects keep their recorded pool, slot, and logical-root coordinates.
+A restart while the binding is `degraded` deterministically resumes recovery;
+it does not create a second promotion.
+
+Reserve promotion reports are disposable independent JSON files under the
+membership control directory. They are operational evidence, not replicated
+storage authority.
+
 ## Fragment Operations
 
 A fragment is a deliberate cluster-wide control boundary. Create, alias
@@ -474,9 +533,12 @@ N2 does not force redistribution when capacity is added. Explicit rebalance is
 object re-encoding into a new immutable layout. It is optional, restartable,
 and never required merely to make a new pool usable.
 
-The node/root set of an enrolled pool generation is immutable because NCNX
-root placement depends on it. Add disks as roots of nodes in a new complete
-pool generation; never append or remove roots inside an existing generation.
+The logical slot/root set of an enrolled pool generation is immutable because
+NCNX placement depends on it. Add ordinary capacity as a new complete pool
+generation; never append or remove logical roots inside an existing
+generation. Reserve promotion is the narrow exception at the physical-binding
+layer: it rebinds an existing logical slot/root contract and does not add
+placement identities or capacity.
 
 ## Authentication
 
@@ -486,7 +548,7 @@ authentication databases or user-visible endpoints.
 
 ## Performance Contract
 
-Every N2 3.2 release proof records:
+Every N2 3.3 release proof records:
 
 - operation latency distributions in microseconds/milliseconds;
 - CPU utilization and cycles when host permissions support hardware counters;
@@ -510,7 +572,7 @@ Fast output with hidden global scans or object-data reads is a failure.
 
 ## Release Gates
 
-N2 3.2 is not declared production-stable until the following are proven:
+N2 3.3 is not declared production-stable until the following are proven:
 
 - exact `K + M` shard placement and exact `M + 1` NCNX replication;
 - upload, GET, HEAD, LIST, copy/move, trash, recover, and prefix operations;
@@ -518,6 +580,8 @@ N2 3.2 is not declared production-stable until the following are proven:
 - same-key collision safety and independent-key parallelism;
 - crash/restart at every destination-first copy/delete stage;
 - one- and parity-count node loss behavior;
+- autonomous one-slot reserve promotion, retired-instance fencing, historical
+  exact-layout healing, and restart continuation;
 - fail-closed writes beyond the configured failure budget;
 - NCNX and object autonomous repair;
 - TTL live-wins-over-trash and orphan safety;

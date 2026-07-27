@@ -349,6 +349,16 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
 
 async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter, AppError> {
     let runtime = active_cluster_runtime()?;
+    if runtime.local_is_reserve
+        || runtime.local_node_id != target.node_id
+        || runtime.local_instance_id != target.instance_id
+        || runtime.membership.binding_epoch != target.binding_epoch
+    {
+        return Err(AppError::Conflict(format!(
+            "local logical slot '{}' changed binding before shard writer creation",
+            target.node_id
+        )));
+    }
     let root = runtime
         .local_storage_roots
         .iter()
@@ -398,7 +408,11 @@ async fn open_writers_for_plan(
             crate::distribution::placement::ClusterShardRole::Parity
         );
         let target = PeerShardTarget {
+            pool_id: plan.pool_id.clone(),
+            pool_generation: plan.pool_generation,
             node_id: placement.node_id.clone(),
+            instance_id: placement.instance_id.clone(),
+            binding_epoch: plan.binding_epoch,
             root_id: placement.root_id.clone(),
             endpoint: placement
                 .native_endpoint
@@ -467,6 +481,7 @@ where
         pool_id,
         pool_generation,
         membership_epoch,
+        runtime.membership.binding_epoch,
         layout,
         &configured_nodes,
     )?;
@@ -913,6 +928,8 @@ mod tests {
     fn fixed_runtime() -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "a".into(),
+            local_instance_id: "a".into(),
+            local_is_reserve: false,
             local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: PathBuf::from("membership.json"),
@@ -924,6 +941,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch: 7,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-a".into(),
                     generation: 7,
@@ -938,12 +956,15 @@ mod tests {
                     .into_iter()
                     .map(|id| ClusterNode {
                         id: id.into(),
+                        instance_id: id.into(),
+                        binding_epoch: 1,
                         endpoint: format!("https://{id}:50001"),
                         native_endpoint: Some(format!("n2://{id}:50002")),
                         state: Some(NodeState::Online),
                         weight: 1,
                         storage_roots: vec![StorageRoot {
                             id: format!("root-{id}"),
+                            physical_id: None,
                             path: format!("/disk-{id}"),
                         }],
                         joined_epoch: 1,
@@ -952,6 +973,8 @@ mod tests {
                         last_seen_unix: None,
                     })
                     .collect(),
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }

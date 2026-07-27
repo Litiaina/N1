@@ -1,7 +1,7 @@
 # Litiaina Node Object API (NOA)
 
 NOA is the versioned HTTPS and WebSocket contract shared by Litiaina object
-storage engines. N2 3.2 implements NOA v1 over unified static-EC server pools,
+storage engines. N2 3.3 implements NOA v1 over unified static-EC server pools,
 flat replicated NCNX keys, and immutable object-level EC records. NOA meanings
 do not expose either engine's disk layout.
 
@@ -11,13 +11,13 @@ do not expose either engine's disk layout.
 - API version: `v1`
 - HTTPS prefix: `/noa/v1`
 - Realtime endpoint: `/noa/v1/ws`
-- N2 implementation: `3.2.0`
+- N2 implementation: `3.3.0`
 
 The NOA version is independent of the N2 package and disk-format versions. An
 incompatible public API requires a new prefix such as `/noa/v2`; package
 updates can continue implementing NOA v1.
 
-N2 3.2 retains the NOA v1 public `/noa/v1/...` namespace. It does not
+N2 3.3 retains the NOA v1 public `/noa/v1/...` namespace. It does not
 retain aliases that would turn the retired routes into a second compatibility
 contract.
 
@@ -157,6 +157,8 @@ GET  /noa/v1/cluster/health
 GET  /noa/v1/cluster/monitor
 GET  /noa/v1/cluster/usage
 GET  /noa/v1/cluster/placement/preview
+GET  /noa/v1/cluster/reserve
+POST /noa/v1/cluster/reserve/promote
 
 GET  /noa/v1/cluster/healing/status
 POST /noa/v1/cluster/healing/cycle

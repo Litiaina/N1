@@ -6,43 +6,31 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 pub const ROOT_IDENTITY_FILE: &str = ".n2-root.ncdx";
-const ROOT_IDENTITY_FORMAT: &str = "n2-root-v4";
+const ROOT_IDENTITY_FORMAT: &str = "n2-root-v5";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RootIdentity {
     pub format: String,
     pub cluster_id: String,
-    pub node_id: String,
-    pub pool_id: String,
-    pub pool_generation: u64,
-    pub root_id: String,
-    pub node_root_ids: Vec<String>,
-    pub object_data_shards: usize,
-    pub object_parity_shards: usize,
+    pub instance_id: String,
+    pub physical_root_id: String,
+    pub instance_root_ids: Vec<String>,
 }
 
 impl RootIdentity {
     fn expected(runtime: &ClusterRuntime, root: &StorageRoot) -> Self {
-        let pool = runtime
-            .membership
-            .pool(&runtime.local_pool_id)
-            .expect("validated N2 runtime must contain its local server pool");
-        let mut node_root_ids = runtime
+        let mut instance_root_ids = runtime
             .local_storage_roots
             .iter()
-            .map(|candidate| candidate.id.clone())
+            .map(|candidate| candidate.physical_id().to_string())
             .collect::<Vec<_>>();
-        node_root_ids.sort();
+        instance_root_ids.sort();
         Self {
             format: ROOT_IDENTITY_FORMAT.to_string(),
             cluster_id: runtime.membership.cluster_id.clone(),
-            node_id: runtime.local_node_id.clone(),
-            pool_id: runtime.local_pool_id.clone(),
-            pool_generation: pool.generation,
-            root_id: root.id.clone(),
-            node_root_ids,
-            object_data_shards: pool.policy.object_data_shards,
-            object_parity_shards: pool.policy.object_parity_shards,
+            instance_id: runtime.local_instance_id.clone(),
+            physical_root_id: root.physical_id().to_string(),
+            instance_root_ids,
         }
     }
 }
@@ -105,12 +93,11 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
         Ok(actual) if actual == expected => return Ok(()),
         Ok(actual) => {
             return Err(AppError::Conflict(format!(
-                "root '{}' belongs to cluster='{}' node='{}' pool='{}' root_id='{}', not this logical node",
+                "root '{}' belongs to cluster='{}' instance='{}' physical_root='{}', not this physical instance",
                 root_path.display(),
                 actual.cluster_id,
-                actual.node_id,
-                actual.pool_id,
-                actual.root_id
+                actual.instance_id,
+                actual.physical_root_id
             )));
         }
         Err(AppError::Io(error, _)) if error.kind() == ErrorKind::NotFound => {}
@@ -119,7 +106,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
 
     if !root_is_empty(root_path)? {
         return Err(AppError::Conflict(format!(
-            "unenrolled N2 3.2 root '{}' is not empty; use a new isolated directory",
+            "unenrolled N2 3.3 root '{}' is not empty; use a new isolated directory",
             root_path.display()
         )));
     }
@@ -153,7 +140,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
                 Ok(())
             } else {
                 Err(AppError::Conflict(format!(
-                    "root '{}' was concurrently enrolled by another logical node",
+                    "root '{}' was concurrently enrolled by another physical instance",
                     root_path.display()
                 )))
             }
@@ -185,6 +172,7 @@ mod tests {
     fn runtime(root: &Path, node_id: &str) -> ClusterRuntime {
         let storage_root = StorageRoot {
             id: "ns-root-1".into(),
+            physical_id: None,
             path: root.display().to_string(),
         };
         let policy = ClusterPolicy {
@@ -193,6 +181,8 @@ mod tests {
         };
         ClusterRuntime {
             local_node_id: node_id.into(),
+            local_instance_id: node_id.into(),
+            local_is_reserve: false,
             local_pool_id: "pool-test".into(),
             local_storage_roots: vec![storage_root.clone()],
             membership_path: PathBuf::new(),
@@ -204,6 +194,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "cluster-test".into(),
                 epoch: 1,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-test".into(),
                     generation: 1,
@@ -213,6 +204,8 @@ mod tests {
                 }],
                 nodes: vec![ClusterNode {
                     id: node_id.into(),
+                    instance_id: node_id.into(),
+                    binding_epoch: 1,
                     endpoint: "https://127.0.0.1:1".into(),
                     native_endpoint: None,
                     state: Some(NodeState::Online),
@@ -223,6 +216,8 @@ mod tests {
                     used_bytes: None,
                     last_seen_unix: None,
                 }],
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }
@@ -230,7 +225,7 @@ mod tests {
 
     #[test]
     fn root_identity_is_stable_and_rejects_rebinding() {
-        let root = std::env::temp_dir().join(format!("n2-root-v4-{}", Ulid::new()));
+        let root = std::env::temp_dir().join(format!("n2-root-v5-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         let first = runtime(&root, "namespace-a");
         initialize_local_root_identities(&first).expect("enroll root");
@@ -243,7 +238,7 @@ mod tests {
 
     #[test]
     fn non_empty_unenrolled_root_is_rejected() {
-        let root = std::env::temp_dir().join(format!("n2-root-v4-dirty-{}", Ulid::new()));
+        let root = std::env::temp_dir().join(format!("n2-root-v5-dirty-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("existing"), b"data").expect("seed root");
         assert!(initialize_local_root_identities(&runtime(&root, "namespace-a")).is_err());
@@ -251,22 +246,23 @@ mod tests {
     }
 
     #[test]
-    fn enrolled_root_rejects_static_ec_change() {
-        let root = std::env::temp_dir().join(format!("n2-root-v4-policy-{}", Ulid::new()));
+    fn physical_root_identity_is_independent_of_logical_ec_contract() {
+        let root = std::env::temp_dir().join(format!("n2-root-v5-policy-{}", Ulid::new()));
         fs::create_dir_all(&root).expect("create root");
         let first = runtime(&root, "namespace-a");
         initialize_local_root_identities(&first).expect("enroll root");
 
         let mut changed = runtime(&root, "namespace-a");
         changed.membership.pools[0].policy.object_parity_shards = 2;
-        assert!(initialize_local_root_identities(&changed).is_err());
+        initialize_local_root_identities(&changed)
+            .expect("physical identity must not couple a device to one EC contract");
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn enrolled_pool_rejects_local_root_set_change() {
-        let first_root = std::env::temp_dir().join(format!("n2-root-v4-set-a-{}", Ulid::new()));
-        let second_root = std::env::temp_dir().join(format!("n2-root-v4-set-b-{}", Ulid::new()));
+        let first_root = std::env::temp_dir().join(format!("n2-root-v5-set-a-{}", Ulid::new()));
+        let second_root = std::env::temp_dir().join(format!("n2-root-v5-set-b-{}", Ulid::new()));
         fs::create_dir_all(&first_root).expect("create first root");
         fs::create_dir_all(&second_root).expect("create second root");
         let first = runtime(&first_root, "node-a");
@@ -275,6 +271,7 @@ mod tests {
         let mut changed = runtime(&first_root, "node-a");
         let added = StorageRoot {
             id: "root-2".into(),
+            physical_id: None,
             path: second_root.display().to_string(),
         };
         changed.local_storage_roots.push(added.clone());

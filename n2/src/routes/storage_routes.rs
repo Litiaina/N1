@@ -51,6 +51,7 @@ use crate::distribution::peer::build_peer_routes;
 use crate::distribution::rebalance::{
     metadata_matches_current_layout, rewrite_object_to_current_layout,
 };
+use crate::distribution::reserve_set::build_reserve_peer_routes;
 use crate::distribution::routes::build_cluster_routes;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -1494,6 +1495,7 @@ pub fn build_storage_routes_unbound_with_options(
         .merge(build_ncnx_peer_routes())
         .merge(build_auto_healing_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
+        .merge(build_reserve_peer_routes())
         .merge(build_lifecycle_peer_routes());
 
     let create_fragment_route = Router::new().route("/noa/v1/fragments", post(create_fragment));

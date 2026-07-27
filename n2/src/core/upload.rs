@@ -3174,7 +3174,7 @@ pub async fn finalize_object_upload_direct(
         .map(|manifest| (manifest.pool_id.clone(), manifest.pool_generation))
         .ok_or_else(|| {
             AppError::Conflict(
-                "N2 3.2 cannot finalize an upload without its pinned server-pool identity".into(),
+                "N2 3.3 cannot finalize an upload without its pinned server-pool identity".into(),
             )
         })?;
 

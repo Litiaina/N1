@@ -14,18 +14,21 @@ printf '%s\n' \
   'MASTER_KEY=installer-proof-master' >"$ENV_SRC"
 printf '%s\n' \
   '{' \
-  '  "format_version": 4,' \
+  '  "format_version": 5,' \
   '  "cluster_id": "installer-proof",' \
   '  "epoch": 1,' \
+  '  "binding_epoch": 1,' \
   '  "pools": [{' \
   '    "id": "pool-1", "generation": 1, "state": "writable",' \
   '    "policy": {"object_data_shards": 1, "object_parity_shards": 1},' \
-  '    "node_ids": ["node-a", "node-b"]' \
+  '    "slot_ids": ["node-a", "node-b"]' \
   '  }],' \
-  '  "nodes": [' \
-  '    {"id":"node-a","endpoint":"https://127.0.0.1:50001","native_endpoint":"n2://127.0.0.1:50002","state":"online","weight":1,"storage_roots":[{"id":"root-a","path":"/tmp/n2-proof-a"}],"joined_epoch":1},' \
-  '    {"id":"node-b","endpoint":"https://127.0.0.1:51001","native_endpoint":"n2://127.0.0.1:51002","state":"online","weight":1,"storage_roots":[{"id":"root-b","path":"/tmp/n2-proof-b"}],"joined_epoch":1}' \
-  '  ]' \
+  '  "slot_bindings": [' \
+  '    {"slot_id":"node-a","instance_id":"node-a","binding_epoch":1,"endpoint":"https://127.0.0.1:50001","native_endpoint":"n2://127.0.0.1:50002","state":"online","weight":1,"storage_roots":[{"id":"root-a","path":"/tmp/n2-proof-a"}],"joined_epoch":1},' \
+  '    {"slot_id":"node-b","instance_id":"node-b","binding_epoch":1,"endpoint":"https://127.0.0.1:51001","native_endpoint":"n2://127.0.0.1:51002","state":"online","weight":1,"storage_roots":[{"id":"root-b","path":"/tmp/n2-proof-b"}],"joined_epoch":1}' \
+  '  ],' \
+  '  "reserve_nodes": [],' \
+  '  "retired_instances": []' \
   '}' >"$MEMBERSHIP_SRC"
 
 run_case() {
@@ -66,7 +69,7 @@ run_case both-dry-run --both "${COMMON_NODE[@]}" \
   --gateway-node node-a,https://127.0.0.1:50001,n2://127.0.0.1:50002
 
 jq -n --arg out "$OUT" \
-  '{status:"passed",format_version:4,out:$out,cases:["node-dry-run","gateway-dry-run","both-dry-run"]}' \
+  '{status:"passed",format_version:5,out:$out,cases:["node-dry-run","gateway-dry-run","both-dry-run"]}' \
   | tee "$OUT/summary.json"
 
 echo "N2_INSTALLER_PROOF_OUT=$OUT"

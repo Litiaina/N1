@@ -10,7 +10,7 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.2.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.3.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
 plane. N2 3.1 adds collision-free per-mutation trash generation directories.
 N2 3.2 makes SHA-256 the only engine integrity checksum, adds SHA-256
@@ -20,12 +20,18 @@ immutable NCDX object metadata, immutable shards and parity, exact recorded
 per-object EC layouts, bidirectional coordination, strict publication,
 explicit redistribution, and autonomous healing.
 
-N2 3.2 intentionally does not open or migrate N2 1.x, 2.x, or earlier
-experimental 3.x roots. Static
-server-pool enrollment, root identity, and format-v4 membership prevent old
-layouts from being silently reinterpreted.
+N2 3.3 adds autonomous Reserve Set replacement. Format-v5 membership separates
+stable logical pool slots from physical instances, records a distinct binding
+epoch, keeps reserve instances outside placement, and fences retired
+instances. A promoted reserve preserves the exact pool, EC, slot, logical
+root, and old object layouts while bounded healing restores historical NCNX,
+NCDX, shard, and parity placement.
 
-N2 3.2 deliberately fails closed on retired NCNX, NCDX, and trash layouts
+N2 3.3 intentionally does not open or migrate N2 1.x, 2.x, or earlier
+experimental 3.x roots. Static server-pool enrollment, root identity, and
+format-v5 membership prevent old layouts from being silently reinterpreted.
+
+N2 3.3 deliberately fails closed on retired NCNX, NCDX, and trash layouts
 instead of maintaining multiple integrity and lifecycle formats.
 
 The current qualification is bounded evidence, not an LTS declaration or an
@@ -102,7 +108,7 @@ than a mutable latest-pointer file.
 
 ### Namespace And Blob Layouts
 
-N2 3.2 uses unified server-pool roots rather than namespace-only and
+N2 3.3 uses unified server-pool roots rather than namespace-only and
 blob-only node roles. The namespace and payload remain separate logical
 planes even though they share enrolled storage roots:
 
@@ -160,7 +166,7 @@ cargo run -p n2 --release
 ```
 
 Production installs should use [INSTALLATION.md](INSTALLATION.md), reviewed
-format-v4 membership, stable device mounts and root IDs, and systemd.
+format-v5 membership, stable device mounts and root IDs, and systemd.
 
 ## Environment
 
@@ -229,6 +235,14 @@ max_duration_seconds=30
 lease_seconds=90
 checksum_scan_every_cycles=24
 
+[reserve_set]
+enabled=true
+automatic_promotion=true
+initial_delay_seconds=30
+probe_interval_seconds=5
+failure_threshold=3
+promotion_timeout_seconds=30
+
 [set_limits]
 max_file_size=5368709120
 
@@ -275,17 +289,22 @@ Configuration laws:
 - `node_role`, dynamic EC, and in-place pool expansion are removed in 3.0.
 - `auto_rebalance=false` preserves explicit object-level redistribution.
 - `runtime_path` is control state and must not be treated as object authority.
+- Reserve detection requires at least two consecutive failed observations;
+  the shipped default is three after a 30-second startup grace period.
+- A reserve must have the same number of physical roots as the logical slot it
+  may replace and enough declared capacity for that slot's recorded usage.
 
 ## Membership File
 
-All nodes use the same complete format-v4 membership. This example defines
+All nodes use the same complete format-v5 membership. This example defines
 one four-node static `2 + 2` pool:
 
 ```json
 {
-  "format_version": 4,
+  "format_version": 5,
   "cluster_id": "cluster-a",
   "epoch": 1,
+  "binding_epoch": 1,
   "pools": [{
     "id": "pool-1",
     "generation": 1,
@@ -294,11 +313,13 @@ one four-node static `2 + 2` pool:
       "object_parity_shards": 2
     },
     "state": "writable",
-    "node_ids": ["node-a", "node-b", "node-c", "node-d"]
+    "slot_ids": ["node-a", "node-b", "node-c", "node-d"]
   }],
-  "nodes": [
+  "slot_bindings": [
     {
-      "id": "node-a",
+      "slot_id": "node-a",
+      "instance_id": "node-a",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.11:50001",
       "native_endpoint": "n2://10.0.0.11:50002",
       "state": "online",
@@ -307,7 +328,9 @@ one four-node static `2 + 2` pool:
       "joined_epoch": 1
     },
     {
-      "id": "node-b",
+      "slot_id": "node-b",
+      "instance_id": "node-b",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.12:50001",
       "native_endpoint": "n2://10.0.0.12:50002",
       "state": "online",
@@ -316,7 +339,9 @@ one four-node static `2 + 2` pool:
       "joined_epoch": 1
     },
     {
-      "id": "node-c",
+      "slot_id": "node-c",
+      "instance_id": "node-c",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.13:50001",
       "native_endpoint": "n2://10.0.0.13:50002",
       "state": "online",
@@ -325,7 +350,9 @@ one four-node static `2 + 2` pool:
       "joined_epoch": 1
     },
     {
-      "id": "node-d",
+      "slot_id": "node-d",
+      "instance_id": "node-d",
+      "binding_epoch": 1,
       "endpoint": "https://10.0.0.14:50001",
       "native_endpoint": "n2://10.0.0.14:50002",
       "state": "online",
@@ -333,19 +360,31 @@ one four-node static `2 + 2` pool:
       "storage_roots": [{"id":"d-disk-1","path":"/mnt/NDISK001/n2"}],
       "joined_epoch": 1
     }
-  ]
+  ],
+  "reserve_nodes": [{
+    "instance_id": "reserve-r1",
+    "endpoint": "https://10.0.0.21:50001",
+    "native_endpoint": "n2://10.0.0.21:50002",
+    "state": "online",
+    "storage_roots": [{"id":"r1-disk-1","path":"/mnt/NDISK001/n2"}]
+  }],
+  "retired_instances": []
 }
 ```
 
 Enrollment laws:
 
-- Pool ID, generation, policy, node IDs, and each node's root-ID set are
-  immutable after enrollment.
-- Every node must receive the same complete file and cluster epoch.
+- Pool ID, generation, policy, logical slot IDs, and each slot's logical
+  root-ID set are immutable after enrollment.
+- Every active and reserve instance must receive the same complete file,
+  topology epoch, and binding epoch.
 - New capacity is a new complete pool generation; never append a node to an
   enrolled static pool.
 - Old pools remain online for reads and healing. They may be sealed against
   new writes without invalidating recorded objects.
+- A reserve is outside placement until it replaces one failed logical slot.
+  Promotion increments only `binding_epoch`, preserves the topology `epoch`,
+  and writes a retired-instance fence for the former physical binding.
 
 ## Full Installation With Gateway
 
@@ -363,7 +402,7 @@ ensure the service user owns only the required paths.
 
 Start from the configuration above. Change only the node's identity,
 endpoints, and local root paths. Confirm its pool ID, generation, and EC
-exactly match format-v4 membership.
+exactly match format-v5 membership.
 
 ### 3. Write The Membership File
 
@@ -434,7 +473,7 @@ Fields:
 - `fragment`: fragment name hash or stable fragment identifier accepted by N2.
 - `secret`: fragment key or `MASTER_KEY`.
 - `read`: allow list, read, status, health.
-- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.2 rejects empty-directory persistence.
+- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.3 rejects empty-directory persistence.
 - `modify`: allow rename, repair, rebalance, maintenance mutations.
 - `delete`: allow soft delete and fragment administration. Object reclamation
   remains TTL lifecycle-only.
@@ -629,7 +668,7 @@ Query fields:
   uppercase hexadecimal characters, optionally prefixed with `sha256:`.
   Headers `x-litiaina-checksum`, `x-noa-checksum-sha256`, and
   `x-n2-checksum-sha256` are also accepted. CRC32 and S3 checksum headers are
-  not N2 3.2 contracts.
+  not N2 3.3 contracts.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
 - `io_gate`: optional boolean.
@@ -979,7 +1018,7 @@ Content-Type: application/json
 { "path": "videos" }
 ```
 
-The route is retained as part of the NOA v1 surface, but N2 3.2 returns
+The route is retained as part of the NOA v1 surface, but N2 3.3 returns
 `400 Bad Request`: the flat namespace does not persist empty directories.
 Uploading `videos/a.mp4` makes the `videos/` prefix visible automatically.
 
@@ -1056,7 +1095,7 @@ trash record.
 
 ### Trash Lifecycle
 
-N2 3.2 exposes no empty-trash or hard-delete namespace operation. Each delete
+N2 3.3 exposes no empty-trash or hard-delete namespace operation. Each delete
 uses one `.trash/<unix-nanos>.<mutation-ulid>/` generation across all affected
 logical keys and deterministic NCNX replicas. Normal GC reads TTL from that
 directory name, scans only `.trash`, proves live/unexpired reachability,
@@ -1136,7 +1175,7 @@ Response:
 
 ### Trash Lifecycle Boundary
 
-N2 3.2 intentionally has no empty-trash or recover-all namespace mutation.
+N2 3.3 intentionally has no empty-trash or recover-all namespace mutation.
 Recover explicit entries before their retention period expires. Expired trash
 is removed by lifecycle/GC after namespace reachability checks.
 
@@ -1311,8 +1350,36 @@ Authorization: Bearer <token>
 ```
 
 Returns `local_node_id`, the active membership path, and the complete
-format-v4 membership including static pools, policies, node IDs, endpoints,
-root IDs, and epoch.
+format-v5 membership including static pools, logical slots, physical
+instances, endpoints, logical/physical root identities, topology and binding
+epochs, reserves, and retired-instance fences.
+
+### Reserve Set
+
+```http
+GET /noa/v1/cluster/reserve
+Authorization: Bearer <token>
+```
+
+Requires read permission. It returns whether automatic promotion is enabled or
+running, topology and binding epochs, active and reserve counts, suspected and
+recovering slots, and the last promotion/error state.
+
+```http
+POST /noa/v1/cluster/reserve/promote
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "slot_id": "node-d",
+  "reserve_instance_id": "reserve-r1"
+}
+```
+
+Requires modify permission. Manual promotion uses the same compatibility,
+multi-node failure observation, fencing vote, atomic membership commit, and
+historical healing path as autonomous promotion. It cannot bypass the exact
+pool contract.
 
 ### Layout
 
@@ -1422,9 +1489,11 @@ POST /noa/v1/cluster/membership/reload
 Authorization: Bearer <token>
 ```
 
-Live reload is intentionally disabled. Review the format-v4 change and
-restart N2 through systemd. An enrolled pool cannot be changed in place;
-capacity expansion adds a complete new pool generation.
+Live operator reload is intentionally disabled. Review a format-v5 topology
+change and restart N2 through systemd. Reserve promotion is the only live
+membership transition: it advances the binding epoch while preserving the
+enrolled logical pool. Capacity expansion still adds a complete new pool
+generation.
 
 ## Maintenance API
 
@@ -2017,7 +2086,7 @@ Installer proof:
 scripts/proof/run_n2_installer_proof.sh
 ```
 
-Finite N2 3.2 multi-node proof (retained proof-family script name):
+Finite N2 3.3 multi-node proof (retained proof-family script name):
 
 ```bash
 REMOTE_PASS='operator-supplied' \
@@ -2030,9 +2099,9 @@ Inspect lifecycle/chaos options:
 scripts/bench/run_n2_3_0_soak_chaos.sh --help
 ```
 
-For N2 3.2 qualification, prove at minimum:
+For N2 3.3 qualification, prove at minimum:
 
-- identical format-v4 membership and static pool contracts on every node;
+- identical format-v5 membership and static pool contracts on every node;
 - fragment creation and authentication;
 - one-shot and multipart upload with coordinator stickiness;
 - byte-identical download through every node after finalize;
@@ -2041,6 +2110,8 @@ For N2 3.2 qualification, prove at minimum:
 - exact and prefix rename, trash, recovery, TTL expiry, and live-wins rules;
 - strict `K + M` and `M + 1` publication;
 - one-node and parity-count loss reads plus unsafe-write rejection;
+- one-slot autonomous reserve promotion with topology preservation,
+  binding-epoch advance, retired-instance rejection, healing, and restart;
 - NCNX, NCDX, shard, and parity healing to exact recorded holders;
 - explicit redistribution without changing untouched objects;
 - full restart persistence;

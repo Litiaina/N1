@@ -15,7 +15,11 @@ pub enum ClusterShardRole {
 pub struct ClusterShardPlacement {
     pub shard_index: usize,
     pub role: ClusterShardRole,
+    /// Stable logical slot ID; this is the placement authority.
     pub node_id: String,
+    /// Current physical binding, used only to route this request.
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub root_id: String,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,6 +34,7 @@ pub struct ClusterPlacementPlan {
     pub pool_id: String,
     pub pool_generation: u64,
     pub membership_epoch: u64,
+    pub binding_epoch: u64,
     pub data_shards: usize,
     pub parity_shards: usize,
     pub placements: Vec<ClusterShardPlacement>,
@@ -126,6 +131,7 @@ pub fn build_placement_plan(
     pool_id: &str,
     pool_generation: u64,
     membership_epoch: u64,
+    binding_epoch: u64,
     layout: ClusterEcLayout,
     candidates: &[ClusterNode],
 ) -> Result<ClusterPlacementPlan, AppError> {
@@ -164,6 +170,8 @@ pub fn build_placement_plan(
                     ClusterShardRole::Parity
                 },
                 node_id: node.id.clone(),
+                instance_id: node.instance_id.clone(),
+                binding_epoch: node.binding_epoch,
                 root_id: select_root_id(pool_id, pool_generation, fragment, object_key, node)?,
                 endpoint: node.endpoint.clone(),
                 native_endpoint: node.native_endpoint.clone(),
@@ -178,6 +186,7 @@ pub fn build_placement_plan(
         pool_id: pool_id.to_string(),
         pool_generation,
         membership_epoch,
+        binding_epoch,
         data_shards: layout.data_shards,
         parity_shards: layout.parity_shards,
         placements,
@@ -192,12 +201,15 @@ mod tests {
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.to_string(),
+            instance_id: id.to_string(),
+            binding_epoch: 1,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
             weight: 1,
             storage_roots: vec![StorageRoot {
                 id: format!("root-{id}"),
+                physical_id: None,
                 path: format!("/disk-{id}"),
             }],
             joined_epoch: 1,
@@ -215,9 +227,9 @@ mod tests {
             parity_shards: 1,
         };
         let left =
-            build_placement_plan("frag", "obj", "ver", "pool-a", 1, 7, layout, &nodes).unwrap();
+            build_placement_plan("frag", "obj", "ver", "pool-a", 1, 7, 1, layout, &nodes).unwrap();
         let right =
-            build_placement_plan("frag", "obj", "ver", "pool-a", 1, 7, layout, &nodes).unwrap();
+            build_placement_plan("frag", "obj", "ver", "pool-a", 1, 7, 1, layout, &nodes).unwrap();
         assert_eq!(left, right);
         assert_eq!(left.placements.len(), 3);
         assert_eq!(left.placements[0].role, ClusterShardRole::Data);
@@ -231,12 +243,30 @@ mod tests {
             data_shards: 2,
             parity_shards: 1,
         };
-        let first =
-            build_placement_plan("frag", "obj", "01VERSIONA", "pool-a", 1, 7, layout, &nodes)
-                .unwrap();
-        let second =
-            build_placement_plan("frag", "obj", "01VERSIONB", "pool-a", 1, 7, layout, &nodes)
-                .unwrap();
+        let first = build_placement_plan(
+            "frag",
+            "obj",
+            "01VERSIONA",
+            "pool-a",
+            1,
+            7,
+            1,
+            layout,
+            &nodes,
+        )
+        .unwrap();
+        let second = build_placement_plan(
+            "frag",
+            "obj",
+            "01VERSIONB",
+            "pool-a",
+            1,
+            7,
+            1,
+            layout,
+            &nodes,
+        )
+        .unwrap();
         let first_nodes = first
             .placements
             .iter()

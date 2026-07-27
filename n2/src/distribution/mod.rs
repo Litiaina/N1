@@ -15,6 +15,7 @@ pub mod peer;
 pub mod placement;
 pub mod rebalance;
 pub mod repair;
+pub mod reserve_set;
 pub mod routes;
 pub mod status;
 pub mod upload;
@@ -25,5 +26,6 @@ pub use layout::{
 };
 pub use membership::{
     ClusterMembership, ClusterNode, ClusterPolicy, ClusterRuntime, NodeState, PoolState,
-    ServerPool, StorageRoot, active_cluster_runtime, init_cluster_runtime,
+    ReserveNode, RetiredInstance, ServerPool, StorageRoot, active_cluster_runtime,
+    init_cluster_runtime,
 };

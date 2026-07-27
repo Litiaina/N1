@@ -1,5 +1,6 @@
 use crate::distribution::layout::ClusterLayoutPolicy;
 use crate::enums::app_error_enum::AppError;
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use futures_util::future::join_all;
 use ini::Ini;
@@ -12,11 +13,16 @@ use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
 const CLUSTER_NODE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
-pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 4;
+pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageRoot {
+    /// Logical root ID recorded in immutable object placement.
     pub id: String,
+    /// Stable device/root identity. It remains unchanged when rebound to a
+    /// logical root. If omitted, it is identical to `id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_id: Option<String>,
     pub path: String,
 }
 
@@ -36,6 +42,7 @@ pub fn parse_storage_roots(raw: &str) -> Result<Vec<StorageRoot>, AppError> {
         })?;
         let root = StorageRoot {
             id: id.trim().to_string(),
+            physical_id: None,
             path: path.trim().to_string(),
         };
         root.validate()?;
@@ -55,13 +62,17 @@ pub fn parse_storage_roots(raw: &str) -> Result<Vec<StorageRoot>, AppError> {
     }
     if roots.is_empty() {
         return Err(AppError::BadRequest(
-            "N2 3.2 requires at least one storage_roots entry".into(),
+            "N2 3.3 requires at least one storage_roots entry".into(),
         ));
     }
     Ok(roots)
 }
 
 impl StorageRoot {
+    pub fn physical_id(&self) -> &str {
+        self.physical_id.as_deref().unwrap_or(&self.id)
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
         if self.id.trim().is_empty() {
             return Err(AppError::BadRequest(
@@ -75,6 +86,16 @@ impl StorageRoot {
             return Err(AppError::BadRequest(format!(
                 "storage root ID '{}' contains an invalid character",
                 self.id
+            )));
+        }
+        if self.physical_id().trim().is_empty()
+            || self.physical_id().contains('/')
+            || self.physical_id().contains('=')
+            || self.physical_id().chars().any(char::is_whitespace)
+        {
+            return Err(AppError::BadRequest(format!(
+                "physical storage root ID '{}' contains an invalid character",
+                self.physical_id()
             )));
         }
         if !Path::new(self.path.trim()).is_absolute() {
@@ -99,7 +120,7 @@ impl ClusterPolicy {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.object_data_shards == 0 || self.object_parity_shards == 0 {
             return Err(AppError::BadRequest(
-                "N2 3.2 pool EC requires at least 1 data and 1 parity shard".into(),
+                "N2 3.3 pool EC requires at least 1 data and 1 parity shard".into(),
             ));
         }
         Ok(())
@@ -135,6 +156,7 @@ pub struct ServerPool {
     pub policy: ClusterPolicy,
     #[serde(default)]
     pub state: PoolState,
+    #[serde(rename = "slot_ids")]
     pub node_ids: Vec<String>,
 }
 
@@ -201,7 +223,13 @@ impl NodeState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterNode {
+    /// Stable logical slot identity used by placement and immutable metadata.
+    #[serde(rename = "slot_id")]
     pub id: String,
+    /// Replaceable physical process or machine currently bound to this slot.
+    pub instance_id: String,
+    /// Operational epoch at which `instance_id` was bound to `id`.
+    pub binding_epoch: u64,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_endpoint: Option<String>,
@@ -234,50 +262,106 @@ impl ClusterNode {
     }
 
     pub fn is_local(&self, node_id: &str) -> bool {
-        self.id == node_id
+        self.instance_id == node_id
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReserveNode {
+    pub instance_id: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_endpoint: Option<String>,
+    #[serde(default)]
+    pub state: Option<NodeState>,
+    pub storage_roots: Vec<StorageRoot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_unix: Option<i64>,
+}
+
+impl ReserveNode {
+    pub fn effective_state(&self) -> NodeState {
+        self.state.clone().unwrap_or(NodeState::Online)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetiredInstance {
+    pub instance_id: String,
+    pub former_slot_id: String,
+    pub fenced_at_binding_epoch: u64,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_endpoint: Option<String>,
+    pub storage_roots: Vec<StorageRoot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterMembership {
     pub format_version: u32,
     pub cluster_id: String,
+    /// Topology epoch: changes only for complete server-pool contracts.
     pub epoch: u64,
+    /// Binding epoch: changes only for logical-slot replacement.
+    pub binding_epoch: u64,
     pub pools: Vec<ServerPool>,
+    /// Active logical slots and their current physical bindings.
+    #[serde(rename = "slot_bindings")]
     pub nodes: Vec<ClusterNode>,
+    /// Unassigned physical instances. They never participate in placement.
+    #[serde(default)]
+    pub reserve_nodes: Vec<ReserveNode>,
+    /// Fenced former bindings retained for split-brain rejection and audit.
+    #[serde(default)]
+    pub retired_instances: Vec<RetiredInstance>,
 }
 
 impl ClusterMembership {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.format_version != N2_MEMBERSHIP_FORMAT_VERSION {
             return Err(AppError::BadRequest(format!(
-                "membership format {} is not N2 3.2 format {}",
+                "membership format {} is not N2 3.3 format {}",
                 self.format_version, N2_MEMBERSHIP_FORMAT_VERSION
             )));
         }
-        if self.cluster_id.trim().is_empty() || self.epoch == 0 {
+        if self.cluster_id.trim().is_empty() || self.epoch == 0 || self.binding_epoch == 0 {
             return Err(AppError::BadRequest(
-                "membership requires a cluster_id and positive epoch".into(),
+                "membership requires a cluster_id, positive topology epoch, and positive binding epoch"
+                    .into(),
             ));
         }
         if self.pools.is_empty() {
             return Err(AppError::BadRequest(
-                "N2 3.2 membership requires at least one server pool".into(),
+                "N2 3.3 membership requires at least one server pool".into(),
             ));
         }
 
         let mut node_ids = BTreeSet::new();
+        let mut instance_ids = BTreeSet::new();
         let mut root_ids = BTreeSet::new();
         for node in &self.nodes {
-            if node.id.trim().is_empty() || !node_ids.insert(node.id.clone()) {
+            if node.id.trim().is_empty()
+                || node.instance_id.trim().is_empty()
+                || node.binding_epoch == 0
+                || node.binding_epoch > self.binding_epoch
+                || !node_ids.insert(node.id.clone())
+            {
                 return Err(AppError::BadRequest(format!(
-                    "membership contains an empty or duplicate node ID '{}'.",
+                    "membership contains an invalid or duplicate logical slot ID '{}'.",
                     node.id
+                )));
+            }
+            if !instance_ids.insert(node.instance_id.clone()) {
+                return Err(AppError::BadRequest(format!(
+                    "physical instance '{}' is bound more than once",
+                    node.instance_id
                 )));
             }
             if node.endpoint.trim().is_empty() || node.storage_roots.is_empty() {
                 return Err(AppError::BadRequest(format!(
-                    "node '{}' requires an endpoint and at least one storage root",
+                    "logical slot '{}' requires an endpoint and at least one storage root",
                     node.id
                 )));
             }
@@ -289,6 +373,40 @@ impl ClusterMembership {
                         root.id
                     )));
                 }
+            }
+        }
+        for reserve in &self.reserve_nodes {
+            if reserve.instance_id.trim().is_empty()
+                || reserve.endpoint.trim().is_empty()
+                || reserve.storage_roots.is_empty()
+                || !instance_ids.insert(reserve.instance_id.clone())
+            {
+                return Err(AppError::BadRequest(format!(
+                    "reserve instance '{}' is invalid or assigned more than once",
+                    reserve.instance_id
+                )));
+            }
+            for root in &reserve.storage_roots {
+                root.validate()?;
+                if !root_ids.insert(root.id.clone()) {
+                    return Err(AppError::BadRequest(format!(
+                        "storage root ID '{}' is assigned more than once",
+                        root.id
+                    )));
+                }
+            }
+        }
+        for retired in &self.retired_instances {
+            if retired.instance_id.trim().is_empty()
+                || retired.former_slot_id.trim().is_empty()
+                || retired.fenced_at_binding_epoch == 0
+                || retired.fenced_at_binding_epoch > self.binding_epoch
+                || !instance_ids.insert(retired.instance_id.clone())
+            {
+                return Err(AppError::BadRequest(format!(
+                    "retired instance '{}' has an invalid or duplicate fence record",
+                    retired.instance_id
+                )));
             }
         }
 
@@ -320,7 +438,7 @@ impl ClusterMembership {
         }
         if assigned_nodes.len() != node_ids.len() {
             return Err(AppError::BadRequest(
-                "every N2 3.2 node must belong to exactly one server pool".into(),
+                "every active N2 3.3 logical slot must belong to exactly one server pool".into(),
             ));
         }
         Ok(())
@@ -334,6 +452,24 @@ impl ClusterMembership {
         self.pools
             .iter()
             .find(|pool| pool.node_ids.iter().any(|candidate| candidate == node_id))
+    }
+
+    pub fn node_for_instance(&self, instance_id: &str) -> Option<&ClusterNode> {
+        self.nodes
+            .iter()
+            .find(|node| node.instance_id == instance_id)
+    }
+
+    pub fn reserve(&self, instance_id: &str) -> Option<&ReserveNode> {
+        self.reserve_nodes
+            .iter()
+            .find(|node| node.instance_id == instance_id)
+    }
+
+    pub fn is_fenced_instance(&self, instance_id: &str) -> bool {
+        self.retired_instances
+            .iter()
+            .any(|node| node.instance_id == instance_id)
     }
 
     pub fn newest_writable_pool(&self) -> Option<&ServerPool> {
@@ -467,7 +603,7 @@ async fn live_filter_nodes(local_node_id: &str, candidates: Vec<ClusterNode>) ->
 
 pub async fn live_active_write_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
     live_filter_nodes(
-        &runtime.local_node_id,
+        &runtime.local_instance_id,
         runtime.membership.active_write_nodes(),
     )
     .await
@@ -478,7 +614,7 @@ pub async fn live_active_write_nodes_for_pool(
     pool_id: &str,
 ) -> Vec<ClusterNode> {
     live_filter_nodes(
-        &runtime.local_node_id,
+        &runtime.local_instance_id,
         runtime.membership.active_write_nodes_for_pool(pool_id),
     )
     .await
@@ -492,12 +628,19 @@ pub async fn live_newest_pool_write_nodes(runtime: &ClusterRuntime) -> Vec<Clust
 }
 
 pub async fn live_readable_nodes(runtime: &ClusterRuntime) -> Vec<ClusterNode> {
-    live_filter_nodes(&runtime.local_node_id, runtime.membership.readable_nodes()).await
+    live_filter_nodes(
+        &runtime.local_instance_id,
+        runtime.membership.readable_nodes(),
+    )
+    .await
 }
 
 #[derive(Clone, Debug)]
 pub struct ClusterRuntime {
+    /// Logical slot ID while active; physical instance ID while unassigned reserve.
     pub local_node_id: String,
+    pub local_instance_id: String,
+    pub local_is_reserve: bool,
     pub local_pool_id: String,
     pub local_storage_roots: Vec<StorageRoot>,
     pub membership_path: PathBuf,
@@ -506,23 +649,34 @@ pub struct ClusterRuntime {
     pub auto_rebalance: bool,
 }
 
-static CLUSTER_RUNTIME: OnceLock<Arc<ClusterRuntime>> = OnceLock::new();
+static CLUSTER_RUNTIME: OnceLock<ArcSwap<ClusterRuntime>> = OnceLock::new();
 
 pub fn active_cluster_runtime() -> Result<Arc<ClusterRuntime>, AppError> {
-    CLUSTER_RUNTIME.get().cloned().ok_or_else(|| {
-        AppError::InternalServerError("N2 cluster runtime is not initialized".into())
-    })
+    CLUSTER_RUNTIME
+        .get()
+        .map(ArcSwap::load_full)
+        .ok_or_else(|| {
+            AppError::InternalServerError("N2 cluster runtime is not initialized".into())
+        })
 }
 
 pub fn try_active_cluster_runtime() -> Option<Arc<ClusterRuntime>> {
-    CLUSTER_RUNTIME.get().cloned()
+    CLUSTER_RUNTIME.get().map(ArcSwap::load_full)
+}
+
+pub fn publish_cluster_runtime(runtime: Arc<ClusterRuntime>) -> Result<(), AppError> {
+    let current = CLUSTER_RUNTIME.get().ok_or_else(|| {
+        AppError::InternalServerError("N2 cluster runtime is not initialized".into())
+    })?;
+    current.store(runtime);
+    Ok(())
 }
 
 fn parse_usize(raw: Option<&str>, key: &str, default_value: usize) -> Result<usize, AppError> {
     match raw.map(str::trim) {
         None | Some("") => Ok(default_value),
         Some("auto") => Err(AppError::BadRequest(format!(
-            "{key}=auto is not valid in N2 3.2; pool EC is static"
+            "{key}=auto is not valid in N2 3.3; pool EC is static"
         ))),
         Some(value) => value
             .parse::<usize>()
@@ -550,6 +704,20 @@ fn resolve_membership_path(raw: &str, fs_storage_path: &str) -> PathBuf {
     }
 }
 
+fn physical_root_sets_match(configured: &[StorageRoot], bound: &[StorageRoot]) -> bool {
+    let mut configured = configured
+        .iter()
+        .map(|root| (root.physical_id().to_string(), root.path.clone()))
+        .collect::<Vec<_>>();
+    let mut bound = bound
+        .iter()
+        .map(|root| (root.physical_id().to_string(), root.path.clone()))
+        .collect::<Vec<_>>();
+    configured.sort();
+    bound.sort();
+    configured == bound
+}
+
 fn local_membership(
     node_id: &str,
     pool_id: &str,
@@ -563,6 +731,7 @@ fn local_membership(
         format_version: N2_MEMBERSHIP_FORMAT_VERSION,
         cluster_id: "n2-local".to_string(),
         epoch: 1,
+        binding_epoch: 1,
         pools: vec![ServerPool {
             id: pool_id.to_string(),
             generation: pool_generation,
@@ -572,6 +741,8 @@ fn local_membership(
         }],
         nodes: vec![ClusterNode {
             id: node_id.to_string(),
+            instance_id: node_id.to_string(),
+            binding_epoch: 1,
             endpoint: endpoint.to_string(),
             native_endpoint: Some(native_endpoint.to_string()),
             state: Some(NodeState::Online),
@@ -582,6 +753,8 @@ fn local_membership(
             used_bytes: None,
             last_seen_unix: Some(Utc::now().timestamp()),
         }],
+        reserve_nodes: Vec::new(),
+        retired_instances: Vec::new(),
     }
 }
 
@@ -600,44 +773,75 @@ fn load_or_create_membership(
             .map_err(|e| AppError::Io(e, format!("read N2 membership file {}", path.display())))?;
         let mut membership: ClusterMembership = serde_json::from_slice(&bytes).map_err(|e| {
             AppError::InternalServerError(format!(
-                "decode N2 3.2 membership file '{}': {e}",
+                "decode N2 3.3 membership file '{}': {e}",
                 path.display()
             ))
         })?;
         membership.validate()?;
-        let pool = membership.pool(pool_id).ok_or_else(|| {
-            AppError::Conflict(format!(
-                "local pool '{}' is absent from membership; add the complete pool explicitly",
-                pool_id
-            ))
-        })?;
-        if pool.generation != pool_generation || pool.policy != policy {
-            return Err(AppError::Conflict(format!(
-                "local pool contract {} generation {} {:?} does not match membership generation {} {:?}",
-                pool_id, pool_generation, policy, pool.generation, pool.policy
-            )));
-        }
         let now = Utc::now().timestamp();
-        let local = membership
+        if let Some(local_index) = membership
             .nodes
-            .iter_mut()
-            .find(|node| node.id == node_id)
-            .ok_or_else(|| {
+            .iter()
+            .position(|node| node.instance_id == node_id)
+        {
+            let local_slot_id = membership.nodes[local_index].id.clone();
+            let bound_pool = membership.pool_for_node(&local_slot_id).ok_or_else(|| {
                 AppError::Conflict(format!(
-                    "node '{}' is absent from membership; membership expansion must be explicit",
-                    node_id
+                    "logical slot '{}' is not assigned to a server pool",
+                    local_slot_id
                 ))
             })?;
-        if local.storage_roots != storage_roots {
+            if bound_pool.id != pool_id
+                || bound_pool.generation != pool_generation
+                || bound_pool.policy != policy
+            {
+                return Err(AppError::Conflict(format!(
+                    "local slot contract {} generation {} {:?} does not match membership pool {} generation {} {:?}",
+                    pool_id,
+                    pool_generation,
+                    policy,
+                    bound_pool.id,
+                    bound_pool.generation,
+                    bound_pool.policy
+                )));
+            }
+            let local = &mut membership.nodes[local_index];
+            if !physical_root_sets_match(storage_roots, &local.storage_roots) {
+                return Err(AppError::Conflict(format!(
+                    "configured roots for physical instance '{}' do not match logical slot '{}'",
+                    node_id, local.id
+                )));
+            }
+            local.endpoint = endpoint.to_string();
+            local.native_endpoint = Some(native_endpoint.to_string());
+            local.state.get_or_insert(NodeState::Online);
+            local.last_seen_unix = Some(now);
+        } else if let Some(local) = membership
+            .reserve_nodes
+            .iter_mut()
+            .find(|node| node.instance_id == node_id)
+        {
+            if !physical_root_sets_match(storage_roots, &local.storage_roots) {
+                return Err(AppError::Conflict(format!(
+                    "configured roots for reserve instance '{}' do not match membership",
+                    node_id
+                )));
+            }
+            local.endpoint = endpoint.to_string();
+            local.native_endpoint = Some(native_endpoint.to_string());
+            local.state.get_or_insert(NodeState::Online);
+            local.last_seen_unix = Some(now);
+        } else if membership.is_fenced_instance(node_id) {
             return Err(AppError::Conflict(format!(
-                "configured roots for node '{}' do not match membership",
+                "physical instance '{}' is fenced and cannot rejoin without explicit reserve re-enrollment",
+                node_id
+            )));
+        } else {
+            return Err(AppError::Conflict(format!(
+                "physical instance '{}' is absent from active slots and the reserve set",
                 node_id
             )));
         }
-        local.endpoint = endpoint.to_string();
-        local.native_endpoint = Some(native_endpoint.to_string());
-        local.state.get_or_insert(NodeState::Online);
-        local.last_seen_unix = Some(now);
         membership.validate()?;
         write_membership(path, &membership)?;
         return Ok(membership);
@@ -656,7 +860,7 @@ fn load_or_create_membership(
     Ok(membership)
 }
 
-fn write_membership(path: &Path, membership: &ClusterMembership) -> Result<(), AppError> {
+pub fn write_membership(path: &Path, membership: &ClusterMembership) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             AppError::Io(
@@ -668,10 +872,31 @@ fn write_membership(path: &Path, membership: &ClusterMembership) -> Result<(), A
     let bytes = serde_json::to_vec_pretty(membership)
         .map_err(|e| AppError::InternalServerError(format!("encode N2 membership file: {e}")))?;
     let temp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&temp, bytes)
-        .map_err(|e| AppError::Io(e, format!("write N2 membership file {}", temp.display())))?;
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|e| AppError::Io(e, format!("write N2 membership file {}", temp.display())))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| AppError::Io(e, format!("sync N2 membership file {}", temp.display())))?;
+    }
     fs::rename(&temp, path)
-        .map_err(|e| AppError::Io(e, format!("publish N2 membership file {}", path.display())))
+        .map_err(|e| AppError::Io(e, format!("publish N2 membership file {}", path.display())))?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                AppError::Io(
+                    e,
+                    format!("sync N2 membership directory {}", parent.display()),
+                )
+            })?;
+    }
+    Ok(())
 }
 
 pub fn init_cluster_runtime(
@@ -684,7 +909,7 @@ pub fn init_cluster_runtime(
     let section = config.section(Some("cluster_config"));
     if section.and_then(|s| s.get("node_role")).is_some() {
         return Err(AppError::BadRequest(
-            "node_role was removed in N2 3.2; every server-pool node is unified".into(),
+            "node_role was removed in N2 3.3; every server-pool node is unified".into(),
         ));
     }
     if section
@@ -692,7 +917,7 @@ pub fn init_cluster_runtime(
         .is_some()
     {
         return Err(AppError::BadRequest(
-            "namespace_redundancy was removed in N2 3.2; NCNX replicas equal parity + one".into(),
+            "namespace_redundancy was removed in N2 3.3; NCNX replicas equal parity + one".into(),
         ));
     }
     let node_id = section
@@ -768,20 +993,104 @@ pub fn init_cluster_runtime(
         data_shards: write_policy.object_data_shards,
         parity_shards: write_policy.object_parity_shards,
     };
-
+    let (local_node_id, local_pool_id, local_is_reserve) =
+        if let Some(binding) = membership.node_for_instance(&node_id) {
+            let pool = membership.pool_for_node(&binding.id).ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "local logical slot '{}' is not assigned to a server pool",
+                    binding.id
+                ))
+            })?;
+            (binding.id.clone(), pool.id.clone(), false)
+        } else if membership.reserve(&node_id).is_some() {
+            (node_id.clone(), String::new(), true)
+        } else {
+            return Err(AppError::Conflict(format!(
+                "physical instance '{}' has no active or reserve membership",
+                node_id
+            )));
+        };
     let runtime = Arc::new(ClusterRuntime {
-        local_node_id: node_id,
-        local_pool_id: pool_id,
+        local_node_id,
+        local_instance_id: node_id,
+        local_is_reserve,
+        local_pool_id,
         local_storage_roots: local_storage_roots.to_vec(),
         membership_path,
         layout_policy,
         membership,
         auto_rebalance: false,
     });
-    CLUSTER_RUNTIME.set(runtime.clone()).map_err(|_| {
-        AppError::InternalServerError("N2 cluster runtime initialized twice".into())
-    })?;
+    CLUSTER_RUNTIME
+        .set(ArcSwap::from(runtime.clone()))
+        .map_err(|_| {
+            AppError::InternalServerError("N2 cluster runtime initialized twice".into())
+        })?;
     Ok(runtime)
+}
+
+pub fn commit_local_membership(
+    membership: ClusterMembership,
+) -> Result<Arc<ClusterRuntime>, AppError> {
+    membership.validate()?;
+    membership.validate_minimum_topology()?;
+    let current = active_cluster_runtime()?;
+    let (local_node_id, local_pool_id, local_is_reserve, local_storage_roots) =
+        if let Some(binding) = membership.node_for_instance(&current.local_instance_id) {
+            let pool = membership.pool_for_node(&binding.id).ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "local logical slot '{}' is not assigned to a server pool",
+                    binding.id
+                ))
+            })?;
+            (
+                binding.id.clone(),
+                pool.id.clone(),
+                false,
+                binding.storage_roots.clone(),
+            )
+        } else if let Some(reserve) = membership.reserve(&current.local_instance_id) {
+            (
+                current.local_instance_id.clone(),
+                String::new(),
+                true,
+                reserve.storage_roots.clone(),
+            )
+        } else if membership.is_fenced_instance(&current.local_instance_id) {
+            (
+                current.local_instance_id.clone(),
+                String::new(),
+                true,
+                current.local_storage_roots.clone(),
+            )
+        } else {
+            return Err(AppError::Conflict(format!(
+                "local physical instance '{}' is absent from committed membership",
+                current.local_instance_id
+            )));
+        };
+    let write_policy = membership
+        .newest_writable_pool()
+        .ok_or_else(|| AppError::ServiceUnavailable("membership has no writable pool".into()))?
+        .policy
+        .clone();
+    let next = Arc::new(ClusterRuntime {
+        local_node_id,
+        local_instance_id: current.local_instance_id.clone(),
+        local_is_reserve,
+        local_pool_id,
+        local_storage_roots,
+        membership_path: current.membership_path.clone(),
+        layout_policy: ClusterLayoutPolicy {
+            data_shards: write_policy.object_data_shards,
+            parity_shards: write_policy.object_parity_shards,
+        },
+        membership,
+        auto_rebalance: false,
+    });
+    write_membership(&next.membership_path, &next.membership)?;
+    publish_cluster_runtime(next.clone())?;
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -791,12 +1100,15 @@ mod tests {
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.into(),
+            instance_id: id.into(),
+            binding_epoch: 1,
             endpoint: format!("https://{id}:51001"),
             native_endpoint: Some(format!("n2://{id}:51002")),
             state: Some(NodeState::Online),
             weight: 1,
             storage_roots: vec![StorageRoot {
                 id: format!("root-{id}"),
+                physical_id: None,
                 path: format!("/disk-{id}"),
             }],
             joined_epoch: 1,
@@ -816,6 +1128,7 @@ mod tests {
             format_version: N2_MEMBERSHIP_FORMAT_VERSION,
             cluster_id: "cluster-a".into(),
             epoch: 1,
+            binding_epoch: 1,
             pools: vec![ServerPool {
                 id: "pool-a".into(),
                 generation: 1,
@@ -824,6 +1137,8 @@ mod tests {
                 node_ids: vec!["a".into(), "b".into(), "c".into()],
             }],
             nodes: vec![node("a"), node("b"), node("c")],
+            reserve_nodes: Vec::new(),
+            retired_instances: Vec::new(),
         };
         membership.validate().expect("valid membership");
         assert_eq!(policy.namespace_replicas(), 2);
@@ -851,6 +1166,7 @@ mod tests {
             format_version: N2_MEMBERSHIP_FORMAT_VERSION,
             cluster_id: "cluster-a".into(),
             epoch: 1,
+            binding_epoch: 1,
             pools: vec![ServerPool {
                 id: "pool-a".into(),
                 generation: 1,
@@ -862,10 +1178,31 @@ mod tests {
                 node_ids: vec!["a".into(), "b".into()],
             }],
             nodes: vec![node("a"), node("b")],
+            reserve_nodes: Vec::new(),
+            retired_instances: Vec::new(),
         };
-        membership.validate().expect("format-v4 membership");
-        membership.format_version = 3;
+        membership.validate().expect("format-v5 membership");
+        membership.format_version = 4;
         assert!(membership.validate().is_err());
+    }
+
+    #[test]
+    fn configured_physical_roots_match_a_promoted_logical_binding() {
+        let configured = vec![StorageRoot {
+            id: "reserve-device".into(),
+            physical_id: None,
+            path: "/disk-reserve".into(),
+        }];
+        let promoted = vec![StorageRoot {
+            id: "logical-root-d".into(),
+            physical_id: Some("reserve-device".into()),
+            path: "/disk-reserve".into(),
+        }];
+        assert!(physical_root_sets_match(&configured, &promoted));
+
+        let mut wrong_path = promoted.clone();
+        wrong_path[0].path = "/other-device".into();
+        assert!(!physical_root_sets_match(&configured, &wrong_path));
     }
 
     #[test]
@@ -878,6 +1215,7 @@ mod tests {
             format_version: N2_MEMBERSHIP_FORMAT_VERSION,
             cluster_id: "cluster-a".into(),
             epoch: 2,
+            binding_epoch: 1,
             pools: vec![
                 ServerPool {
                     id: "a".into(),
@@ -895,6 +1233,8 @@ mod tests {
                 },
             ],
             nodes: vec![node("n1"), node("n2"), node("n3")],
+            reserve_nodes: Vec::new(),
+            retired_instances: Vec::new(),
         };
         assert!(membership.validate().is_err());
     }

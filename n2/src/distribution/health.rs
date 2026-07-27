@@ -19,6 +19,8 @@ pub enum ClusterHealthState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterNodeHealth {
     pub node_id: String,
+    pub instance_id: String,
+    pub binding_epoch: u64,
     pub state: NodeState,
     pub accepts_writes: bool,
     pub readable: bool,
@@ -28,9 +30,18 @@ pub struct ClusterNodeHealth {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReserveNodeHealth {
+    pub instance_id: String,
+    pub state: NodeState,
+    pub endpoint: String,
+    pub storage_roots: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterHealthSnapshot {
     pub state: ClusterHealthState,
     pub membership_epoch: u64,
+    pub binding_epoch: u64,
     pub active_write_nodes: usize,
     pub readable_nodes: usize,
     pub data_shards: usize,
@@ -48,7 +59,9 @@ pub struct ClusterHealthSnapshot {
     pub automatic_rebalance: bool,
     pub repair_running: bool,
     pub rebalance_running: bool,
+    pub historical_recovery_active: bool,
     pub nodes: Vec<ClusterNodeHealth>,
+    pub reserve_nodes: Vec<ReserveNodeHealth>,
     pub notes: Vec<String>,
 }
 
@@ -104,6 +117,11 @@ pub fn cluster_health_snapshot_with_live_nodes(
         data_plane_writable && ncnx_strictly_writable && !safety_read_only;
     let missing_blob_writable = configured_blob.len().saturating_sub(active_blob.len());
     let missing_namespace_readable = configured_namespace_nodes.saturating_sub(readable_namespace);
+    let historical_recovery_active = runtime
+        .membership
+        .nodes
+        .iter()
+        .any(|node| node.effective_state() == NodeState::Degraded);
     let live_node_ids = readable
         .iter()
         .map(|node| node.id.clone())
@@ -112,7 +130,10 @@ pub fn cluster_health_snapshot_with_live_nodes(
         ClusterHealthState::Critical
     } else if !effective_client_writable {
         ClusterHealthState::Degraded
-    } else if missing_blob_writable > 0 || missing_namespace_readable > 0 {
+    } else if missing_blob_writable > 0
+        || missing_namespace_readable > 0
+        || historical_recovery_active
+    {
         ClusterHealthState::Degraded
     } else if data_plane_readable {
         ClusterHealthState::Healthy
@@ -134,6 +155,12 @@ pub fn cluster_health_snapshot_with_live_nodes(
     if missing_blob_writable == 0 {
         notes.push(
             "layout drift is not health failure: new objects use the current node layout; old objects stay readable until manual rebalance"
+                .to_string(),
+        );
+    }
+    if historical_recovery_active {
+        notes.push(
+            "a replacement logical slot is serving new full-width writes while historical NCNX/NCDX/shard layouts heal in the background"
                 .to_string(),
         );
     }
@@ -197,6 +224,7 @@ pub fn cluster_health_snapshot_with_live_nodes(
     Ok(ClusterHealthSnapshot {
         state,
         membership_epoch: runtime.membership.epoch,
+        binding_epoch: runtime.membership.binding_epoch,
         active_write_nodes: active.len(),
         readable_nodes: readable.len(),
         data_shards: layout.data_shards,
@@ -214,6 +242,7 @@ pub fn cluster_health_snapshot_with_live_nodes(
         automatic_rebalance: runtime.auto_rebalance,
         repair_running: repair_status.running,
         rebalance_running: rebalance_status.running,
+        historical_recovery_active,
         nodes: runtime
             .membership
             .nodes
@@ -221,7 +250,7 @@ pub fn cluster_health_snapshot_with_live_nodes(
             .map(|node| {
                 let configured_state = node.effective_state();
                 let state = if configured_state.is_readable()
-                    && !node.is_local(&runtime.local_node_id)
+                    && !node.is_local(&runtime.local_instance_id)
                     && !live_node_ids.contains(&node.id)
                 {
                     NodeState::Offline
@@ -230,12 +259,25 @@ pub fn cluster_health_snapshot_with_live_nodes(
                 };
                 ClusterNodeHealth {
                     node_id: node.id.clone(),
+                    instance_id: node.instance_id.clone(),
+                    binding_epoch: node.binding_epoch,
                     accepts_writes: state.accepts_new_writes() && effective_client_writable,
                     readable: state.is_readable(),
                     state,
                     endpoint: node.endpoint.clone(),
                     native_endpoint: node.native_endpoint.clone(),
                 }
+            })
+            .collect(),
+        reserve_nodes: runtime
+            .membership
+            .reserve_nodes
+            .iter()
+            .map(|node| ReserveNodeHealth {
+                instance_id: node.instance_id.clone(),
+                state: node.effective_state(),
+                endpoint: node.endpoint.clone(),
+                storage_roots: node.storage_roots.len(),
             })
             .collect(),
         notes,
@@ -255,6 +297,8 @@ mod tests {
     fn node(id: &str, state: NodeState) -> ClusterNode {
         ClusterNode {
             id: id.into(),
+            instance_id: id.into(),
+            binding_epoch: 1,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(state),
@@ -275,6 +319,8 @@ mod tests {
         nodes.extend(blob_nodes);
         ClusterRuntime {
             local_node_id: "blob-a".into(),
+            local_instance_id: "blob-a".into(),
+            local_is_reserve: false,
             local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: PathBuf::from("membership.json"),
@@ -286,6 +332,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch: 3,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-a".into(),
                     generation: 3,
@@ -297,6 +344,8 @@ mod tests {
                     node_ids: nodes.iter().map(|node| node.id.clone()).collect(),
                 }],
                 nodes,
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }

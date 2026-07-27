@@ -51,7 +51,7 @@ struct HealingProgressStore {
     fragments: HashMap<String, FragmentProgress>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoHealingStatus {
     pub enabled: bool,
@@ -73,6 +73,7 @@ pub struct AutoHealingStatus {
     pub unrecoverable_objects: u64,
     pub failed_objects: u64,
     pub headless_objects: u64,
+    pub incomplete_fragments: u64,
     pub reports_written: u64,
     pub safety_read_only: bool,
     pub started_at_unix: Option<i64>,
@@ -127,6 +128,7 @@ struct FragmentHealingOutcome {
     failed_objects: u64,
     headless_objects: u64,
     reports_written: u64,
+    complete: bool,
 }
 
 static STATUS: LazyLock<Arc<RwLock<AutoHealingStatus>>> =
@@ -667,10 +669,13 @@ async fn heal_owned_fragment(
         failed_objects: objects.failed_objects,
         headless_objects: objects.headless_objects,
         reports_written,
+        complete: namespace.complete && objects.continuation_token.is_none(),
     }))
 }
 
-pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
+async fn run_auto_healing_cycle_with_mode(
+    forced_mode: Option<RepairCheckMode>,
+) -> Result<AutoHealingStatus, AppError> {
     if CYCLE_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -687,11 +692,13 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
     }
     let progress = progress_snapshot().await?;
     let cycle = progress.cycle.saturating_add(1);
-    let check_mode = if cycle % cfg.checksum_scan_every_cycles == 0 {
-        RepairCheckMode::Checksum
-    } else {
-        RepairCheckMode::Availability
-    };
+    let check_mode = forced_mode.unwrap_or_else(|| {
+        if cycle % cfg.checksum_scan_every_cycles == 0 {
+            RepairCheckMode::Checksum
+        } else {
+            RepairCheckMode::Availability
+        }
+    });
     let live_nodes = live_active_write_nodes(&runtime).await;
     let healer_pool = select_healer_pool(&runtime, &live_nodes, cfg.coordinator_nodes);
     let fragments = discover_local_fragments();
@@ -771,6 +778,9 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
                 status.reports_written = status
                     .reports_written
                     .saturating_add(result.reports_written);
+                if !result.complete {
+                    status.incomplete_fragments = status.incomplete_fragments.saturating_add(1);
+                }
             }
             Ok(None) => {}
             Err(err) => {
@@ -791,6 +801,14 @@ pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
     status.finished_at_unix = Some(Utc::now().timestamp());
     *STATUS.write().await = status.clone();
     Ok(status)
+}
+
+pub async fn run_auto_healing_cycle() -> Result<AutoHealingStatus, AppError> {
+    run_auto_healing_cycle_with_mode(None).await
+}
+
+pub async fn run_replacement_healing_cycle() -> Result<AutoHealingStatus, AppError> {
+    run_auto_healing_cycle_with_mode(Some(RepairCheckMode::Checksum)).await
 }
 
 pub fn spawn_auto_healing_task() {
@@ -878,10 +896,22 @@ pub async fn peer_safety_read_only(
     }))
 }
 
+pub async fn peer_replacement_healing_cycle(
+    headers: HeaderMap,
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<AutoHealingStatus>, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(run_replacement_healing_cycle().await?))
+}
+
 pub fn build_auto_healing_peer_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/n2/peer/healing/lease", post(peer_healing_lease))
         .route("/n2/peer/healing/read-only", post(peer_safety_read_only))
+        .route(
+            "/n2/peer/healing/replacement-cycle",
+            post(peer_replacement_healing_cycle),
+        )
 }
 
 #[cfg(test)]
@@ -896,6 +926,8 @@ mod tests {
     fn runtime() -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "node-a".into(),
+            local_instance_id: "node-a".into(),
+            local_is_reserve: false,
             local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: PathBuf::new(),
@@ -904,6 +936,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "healing-test".into(),
                 epoch: 9,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-a".into(),
                     generation: 9,
@@ -922,12 +955,15 @@ mod tests {
                     .enumerate()
                     .map(|(_index, id)| ClusterNode {
                         id: id.into(),
+                        instance_id: id.into(),
+                        binding_epoch: 1,
                         endpoint: format!("https://{id}"),
                         native_endpoint: None,
                         state: Some(NodeState::Online),
                         weight: 1,
                         storage_roots: vec![StorageRoot {
                             id: format!("root-{id}"),
+                            physical_id: None,
                             path: format!("/disk-{id}"),
                         }],
                         joined_epoch: 1,
@@ -936,6 +972,8 @@ mod tests {
                         last_seen_unix: None,
                     })
                     .collect(),
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }

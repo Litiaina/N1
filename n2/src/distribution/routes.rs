@@ -16,6 +16,7 @@ use crate::distribution::rebalance::{
     start_repair, stop_rebalance, stop_repair,
 };
 use crate::distribution::repair::repair_policy;
+use crate::distribution::reserve_set::reserve_routes;
 use crate::distribution::{resolve_configured_layout, resolve_write_layout};
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
@@ -290,6 +291,7 @@ pub async fn placement_preview(
         &pool.id,
         pool.generation,
         runtime.membership.epoch,
+        runtime.membership.binding_epoch,
         layout,
         &active,
     )?;
@@ -409,4 +411,5 @@ pub fn build_cluster_routes() -> Router<Arc<AppState>> {
             "/noa/v1/cluster/maintenance/distributed/status",
             get(distributed_maintenance_status),
         )
+        .merge(reserve_routes())
 }

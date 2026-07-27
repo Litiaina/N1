@@ -42,6 +42,14 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("lease_seconds", "90")
         .set("checksum_scan_every_cycles", "24");
 
+    conf.with_section(Some("reserve_set"))
+        .set("enabled", "true")
+        .set("automatic_promotion", "true")
+        .set("initial_delay_seconds", "30")
+        .set("probe_interval_seconds", "5")
+        .set("failure_threshold", "3")
+        .set("promotion_timeout_seconds", "30");
+
     conf.with_section(Some("set_limits"))
         .set("max_file_size", "5368709120");
 

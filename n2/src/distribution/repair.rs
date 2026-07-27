@@ -11,7 +11,11 @@ use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
+use tokio::time::{Duration, sleep};
 use tracing::warn;
+
+const POST_REPAIR_VERIFY_ATTEMPTS: usize = 3;
+const POST_REPAIR_VERIFY_DELAY: Duration = Duration::from_millis(25);
 
 static CLUSTER_READ_REPAIR_INFLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -77,7 +81,11 @@ async fn repair_cluster_part_after_read(
             reconstruct_cluster_shard_cached(part, shard.shard_index, block_size, &mut cache)
                 .await?;
         let target = PeerShardTarget {
+            pool_id: locator.pool_id,
+            pool_generation: locator.pool_generation,
             node_id: locator.node_id,
+            instance_id: locator.instance_id,
+            binding_epoch: locator.binding_epoch,
             root_id: locator.root_id,
             endpoint: locator.endpoint,
             fragment: locator.fragment,
@@ -171,7 +179,11 @@ pub async fn repair_cluster_object_shards(
             };
 
             let target = PeerShardTarget {
+                pool_id: locator.pool_id,
+                pool_generation: locator.pool_generation,
                 node_id: locator.node_id,
+                instance_id: locator.instance_id,
+                binding_epoch: locator.binding_epoch,
                 root_id: locator.root_id,
                 endpoint: locator.endpoint,
                 fragment: locator.fragment,
@@ -210,6 +222,15 @@ pub async fn repair_cluster_object_shards(
     }
 
     let mut after = inspect_cluster_object_status(meta, check_mode).await?;
+    if repaired_shards > 0 && failed_repairs == 0 {
+        for _ in 1..POST_REPAIR_VERIFY_ATTEMPTS {
+            if after.status == "healthy" {
+                break;
+            }
+            sleep(POST_REPAIR_VERIFY_DELAY).await;
+            after = inspect_cluster_object_status(meta, check_mode).await?;
+        }
+    }
     after.repaired_shards = repaired_shards;
     after.failed_repairs = failed_repairs;
     Ok(after)

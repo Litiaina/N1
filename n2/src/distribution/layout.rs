@@ -16,7 +16,7 @@ impl ClusterEcLayout {
             return Err("cluster data shards must be greater than zero".to_string());
         }
         if self.parity_shards == 0 {
-            return Err("N2 3.2 server pools require at least one parity shard".to_string());
+            return Err("N2 3.3 server pools require at least one parity shard".to_string());
         }
         Ok(self)
     }

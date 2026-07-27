@@ -368,7 +368,7 @@ async fn perform_gc_scan(
         fragments = fragments.len(),
         mode = options.execution_mode.as_str(),
         retention_seconds = retention.as_secs(),
-        "N2 3.2 NCNX generation garbage collection started"
+        "N2 3.3 NCNX generation garbage collection started"
     );
 
     for fragment in fragments {
@@ -424,7 +424,7 @@ fn finish_job(result: Result<(), AppError>) {
             }
         }),
         Err(error) => {
-            error!("N2 3.2 NCNX generation garbage collection failed: {error}");
+            error!("N2 3.3 NCNX generation garbage collection failed: {error}");
             update_status(|status| {
                 status.is_running = false;
                 status.phase = "Failed".into();

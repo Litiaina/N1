@@ -5,11 +5,88 @@ hardware, topology, and methodology boundaries. Correctness and failure
 qualification are kept in [TESTING.md](TESTING.md) so benchmark results are
 not mistaken for a second verification record.
 
-The current N2 3.2 measurement is listed first. Earlier N2 results remain
+The current N2 3.3 measurement is listed first. Earlier N2 results remain
 below as historical hardware and engine evidence; they do not qualify the
-format-v4 membership, NCNX, object-NCDX, and SHA-256 integrity contract.
+format-v5 logical-slot binding and autonomous Reserve Set contract.
 
-## N2 3.2 Four-Node Proof
+## N2 3.3 Four-Slot Plus Reserve Proof
+
+Evidence directory:
+`/home/wlzambo/DEV-TEST/N2-3.3-final-proof/N2-3.0-proof-20260727-044408`.
+
+The retained proof-script filename identifies the flat-NCNX proof family. This
+run used the optimized N2 `3.3.0` binary and format-v5 membership.
+
+| Field | Value |
+| --- | --- |
+| Test date | 2026-07-27 |
+| Logical topology | Four active logical slots plus one reserve process |
+| Physical topology | Two hosts; processes are not independent host failure domains |
+| Client path | Direct N2 HTTPS |
+| Reverse proxy/gateway | None |
+| Static object EC | 2 data + 2 parity |
+| NCNX replication | 3 deterministic copies |
+| Test object | 32 MiB |
+| N2 binary SHA-256 | `592392682b2064f119fdc8d612fe87a1387dfb5926484b902c15151a7147ba43` |
+
+### Measured data path
+
+| Operation | Result |
+| --- | ---: |
+| 32 MiB upload | 21.13 MiB/s |
+| Download through node A | 51.99 MiB/s |
+| Download through node B | 71.87 MiB/s |
+| Download through node C | 47.92 MiB/s |
+| Download through replacement-bound node D | 55.73 MiB/s |
+
+Every download matched the source SHA-256. Rates are end-to-end through one
+coordinator, not aggregate cluster limits.
+
+### Namespace latency
+
+| Operation | Samples | p50 | p95 | p99 | Mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Zero-decode LIST | 30 | 11.663 ms | 15.247 ms | 15.490 ms | 11.158 ms |
+| Exact stat | 30 | 49.827 ms | 50.798 ms | 51.083 ms | 46.209 ms |
+| Exact copy/delete rename | 20 | 80.920 ms | 1015.456 ms | 1015.456 ms | 183.698 ms |
+
+Against the immediately preceding 3.3 pre-Reserve baseline on the same
+two-host topology, LIST p50 improved `3.06%`, stat p50 increased `0.62%`, and
+rename p50 increased `0.28%`. The single 32 MiB upload sample was `18.15%`
+lower (`21.13` versus `25.81 MiB/s`). One sample is not a statistical
+throughput conclusion; the regression is recorded rather than hidden and
+requires repeated controlled hardware measurement before any no-regression
+claim.
+
+### Process cost
+
+The finite proof sampled all active and reserve processes:
+
+| Metric | Result |
+| --- | ---: |
+| Samples | 233 |
+| Mean CPU | 6.815% of one logical core |
+| Peak CPU | 83.000% |
+| Aggregate sampled peak RSS | 230,664 KiB |
+| Sampled reads | 98,732.00 KiB |
+| Sampled writes | 100,619.92 KiB |
+| Voluntary context switches | 365.90 |
+| Involuntary context switches | 15.00 |
+
+Hardware CPU-cycle counters were unavailable because
+`kernel.perf_event_paranoid=4`; the proof did not change host policy.
+
+### Failure-path measurement boundary
+
+The same run stopped one active physical instance, observed a correct
+pre-promotion write rejection, promoted the reserve while preserving the
+logical slot, accepted writes during historical recovery, rejected a stale
+retired-instance write, survived parity-count reads, and persisted the binding
+through full restart. These are bounded two-host measurements, not evidence of
+five independent failure domains, WAN behavior, an exabyte deployment, or a
+hardware ceiling.
+
+## Historical N2 3.2 Four-Node Proof
 
 Evidence directory:
 `/home/wlzambo/DEV-TEST/N2-3.0-proof-20260727-013543`.
@@ -296,8 +373,9 @@ reads to a bounded stripe pipeline with concurrent shard fetches and immutable
 per-block CRC32 checks. A missing or corrupt data block was reconstructed from
 parity before delivery. Direct cold read improved from 36.85 to 64.45 MiB/s
 (+74.9%); gateway cold read improved from 35.55 to 71.95 MiB/s (+102.4%).
-These historical CRC32 measurements do not qualify the clean N2 3.2 SHA-256
-format; N2 3.2 requires new performance evidence.
+These historical CRC32 measurements do not qualify the N2 3.3 SHA-256,
+format-v5 binding, and Reserve Set contract; N2 3.3 requires its own
+performance evidence.
 
 ### Namespace and failure behavior
 

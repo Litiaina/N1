@@ -808,6 +808,8 @@ mod tests {
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.to_string(),
+            instance_id: id.to_string(),
+            binding_epoch: 1,
             endpoint: format!("https://{id}:50001"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),

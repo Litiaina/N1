@@ -345,6 +345,7 @@ pub fn object_layout_status(
             &target_pool.id,
             target_pool.generation,
             runtime.membership.epoch,
+            runtime.membership.binding_epoch,
             layout,
             &active,
         )?;
@@ -983,12 +984,15 @@ mod tests {
     fn node(id: &str) -> ClusterNode {
         ClusterNode {
             id: id.into(),
+            instance_id: id.into(),
+            binding_epoch: 1,
             endpoint: format!("http://{id}"),
             native_endpoint: Some(format!("n2://{id}:50002")),
             state: Some(NodeState::Online),
             weight: 1,
             storage_roots: vec![StorageRoot {
                 id: format!("root-{id}"),
+                physical_id: None,
                 path: format!("/disk-{id}"),
             }],
             joined_epoch: 1,
@@ -1001,6 +1005,8 @@ mod tests {
     fn runtime(epoch: u64) -> ClusterRuntime {
         ClusterRuntime {
             local_node_id: "a".into(),
+            local_instance_id: "a".into(),
+            local_is_reserve: false,
             local_pool_id: "pool-a".into(),
             local_storage_roots: vec![],
             membership_path: "membership.json".into(),
@@ -1009,6 +1015,7 @@ mod tests {
                 format_version: N2_MEMBERSHIP_FORMAT_VERSION,
                 cluster_id: "test".into(),
                 epoch,
+                binding_epoch: 1,
                 pools: vec![ServerPool {
                     id: "pool-a".into(),
                     generation: epoch,
@@ -1020,6 +1027,8 @@ mod tests {
                     node_ids: vec!["a".into(), "b".into(), "c".into()],
                 }],
                 nodes: vec![node("a"), node("b"), node("c")],
+                reserve_nodes: Vec::new(),
+                retired_instances: Vec::new(),
             },
             auto_rebalance: false,
         }
@@ -1058,6 +1067,7 @@ mod tests {
             "pool-a",
             runtime.membership.pools[0].generation,
             runtime.membership.epoch,
+            runtime.membership.binding_epoch,
             layout,
             &active,
         )
@@ -1071,7 +1081,11 @@ mod tests {
                     format!("/tmp/part_0_shard_{}", placement.shard_index)
                 } else {
                     encode_peer_shard_locator(&PeerShardTarget {
+                        pool_id: plan.pool_id.clone(),
+                        pool_generation: plan.pool_generation,
                         node_id: placement.node_id.clone(),
+                        instance_id: placement.instance_id.clone(),
+                        binding_epoch: plan.binding_epoch,
                         root_id: placement.root_id.clone(),
                         endpoint: placement
                             .native_endpoint
