@@ -20,7 +20,9 @@ N2 3.3 combines:
 - incrementally added static-EC server pools;
 - deterministic bounded placement;
 - copy/delete namespace mutation;
-- autonomous object and namespace healing.
+- autonomous object and namespace healing;
+- optional cluster-wide reserve capacity with autonomous logical-slot
+  replacement.
 
 The architecture has no database, global namespace writer, directory inode,
 cluster-wide mutation log, or implicit redistribution.
@@ -87,6 +89,9 @@ N2 cluster
 │   ├── B4
 │   ├── B5
 │   └── B6
+├── Reserve Set, unassigned and outside placement
+│   ├── R1
+│   └── R2
 └── fragments
     ├── videos
     └── documents
@@ -149,6 +154,40 @@ failed, or errored objects. Only one missing slot in a pool is eligible for
 autonomous promotion. Multiple missing slots, incompatible reserve roots,
 insufficient recorded capacity, observation disagreement, or an unreachable
 reserve fail closed without rewriting membership.
+
+### Reserve Set deployment policy
+
+The Reserve Set is architecturally optional. N2 remains a valid static-EC
+engine with `reserve_nodes: []`:
+
+- constrained, low-end, development, and lab deployments may run without a
+  reserve;
+- without a reserve, committed objects remain readable within their recorded
+  parity budget, but loss of an active slot stops new writes to that exact
+  pool until the operator restores the slot or enrolls compatible replacement
+  capacity;
+- omitting a reserve does not reduce the EC recorded for existing objects, but
+  it removes automatic physical-node replacement.
+
+The production operational recommendation is at least one compatible reserve
+instance per cluster. A production reserve must:
+
+- be in an independent physical failure domain from the active pool nodes;
+- have the same physical-root count as every logical slot it is expected to
+  replace;
+- have capacity no smaller than the replaced slot's recorded usage;
+- run the same N2 version, format-v5 membership, TLS trust, and cluster
+  secrets;
+- remain outside client routing and object/namespace placement until
+  promotion.
+
+One reserve replaces one failed physical binding and is consumed by that
+promotion. After recovery, operators replenish the Reserve Set. Clusters with
+multiple pool shapes need at least one reserve compatible with each shape they
+expect to replace automatically; clusters requiring more than one sequential
+replacement without operator intervention provision additional reserves.
+Reserves are availability capacity, not extra parity and not another server
+pool.
 
 ## Unified Nodes And Disks
 
