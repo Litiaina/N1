@@ -208,18 +208,18 @@ pub async fn scan_and_repair_fragment_objects(
             }
 
             let shards_healthy = after.status == "healthy" && after.failed_repairs == 0;
-            let metadata_verification_deferred =
-                shards_healthy && metadata_only_temporarily_unavailable(&metadata_repair);
+            let verification_deferred =
+                object_verification_deferred(&before, Some(&after), &metadata_repair);
             let healthy = shards_healthy && metadata_repair.healthy;
             if healthy {
                 result.repaired_objects = result.repaired_objects.saturating_add(1);
                 result.repaired_shards =
                     result.repaired_shards.saturating_add(after.repaired_shards);
-            } else if metadata_verification_deferred {
+            } else if verification_deferred {
                 // A peer disappearing during a scan is not evidence that its
-                // immutable NCDX replica disappeared. Leave the object for a
-                // later cycle without converting transport loss into a
-                // cluster-wide safety incident.
+                // shard or immutable NCDX replica disappeared. Leave the
+                // object for a later cycle without converting transport loss
+                // into a cluster-wide safety incident.
                 result.failed_objects = result.failed_objects.saturating_add(1);
             } else {
                 result.unrecoverable_objects = result.unrecoverable_objects.saturating_add(1);
@@ -235,10 +235,10 @@ pub async fn scan_and_repair_fragment_objects(
                 Some(&after),
                 &metadata_repair,
                 (!healthy).then(|| {
-                    if metadata_verification_deferred {
-                        "exact NCDX verification was deferred because a participant was \
+                    if verification_deferred {
+                        "exact shard/NCDX verification was deferred because a participant was \
                          temporarily unavailable; transport unavailability is not proof of \
-                         metadata loss"
+                         object damage"
                             .into()
                     } else if !metadata_repair.healthy {
                         "one or more exact NCDX replicas remain missing or divergent".into()
@@ -334,6 +334,16 @@ fn metadata_only_temporarily_unavailable(
     !metadata.healthy && unavailable
 }
 
+fn object_verification_deferred(
+    before: &crate::core::repair_manager::ObjectRepairStatus,
+    after: Option<&crate::core::repair_manager::ObjectRepairStatus>,
+    metadata: &crate::distribution::peer::MetadataReplicaRepairOutcome,
+) -> bool {
+    before.unavailable_shards > 0
+        || after.is_some_and(|status| status.unavailable_shards > 0)
+        || metadata_only_temporarily_unavailable(metadata)
+}
+
 fn object_repair_report(
     runtime: &ClusterRuntime,
     fragment: &str,
@@ -348,16 +358,15 @@ fn object_repair_report(
 ) -> AutoHealingReport {
     let shards_healthy =
         after.is_some_and(|after| after.status == "healthy" && after.failed_repairs == 0);
-    let metadata_verification_deferred =
-        shards_healthy && metadata_only_temporarily_unavailable(metadata);
+    let verification_deferred = object_verification_deferred(before, after, metadata);
     let healthy = shards_healthy && metadata.healthy;
     let mut report = AutoHealingReport::new(
         scan_id,
         runtime.membership.epoch,
         fragment,
         &runtime.local_node_id,
-        if metadata_verification_deferred {
-            "object_metadata_verification_incomplete"
+        if verification_deferred {
+            "object_verification_incomplete"
         } else {
             "object_degraded"
         },
@@ -366,7 +375,7 @@ fn object_repair_report(
     report.object_id = Some(object_id.into());
     report.version_id = Some(version_id.into());
     report.logical_path = logical_path;
-    report.initial_status = if metadata_verification_deferred {
+    report.initial_status = if verification_deferred {
         "incomplete".into()
     } else {
         before.status.clone()
@@ -374,13 +383,13 @@ fn object_repair_report(
     report.repair_attempted = true;
     report.repair_outcome = if healthy {
         "repair_succeeded"
-    } else if metadata_verification_deferred {
+    } else if verification_deferred {
         "deferred_topology_incomplete"
     } else {
         "repair_failed"
     }
     .into();
-    report.cluster_read_only_triggered = !healthy && !metadata_verification_deferred;
+    report.cluster_read_only_triggered = !healthy && !verification_deferred;
     report.object_health_before = Some(json!(before));
     report.object_health_after = after.map(|status| json!(status));
     report.observations = metadata
@@ -552,6 +561,7 @@ fn now_nanos() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::repair_manager::ObjectRepairStatus;
     use crate::distribution::peer::{MetadataReplicaObservation, MetadataReplicaRepairOutcome};
 
     fn metadata_outcome(statuses: &[&str], healthy: bool) -> MetadataReplicaRepairOutcome {
@@ -589,5 +599,50 @@ mod tests {
     fn healthy_metadata_is_not_deferred() {
         let outcome = metadata_outcome(&["healthy", "healthy", "healthy"], true);
         assert!(!metadata_only_temporarily_unavailable(&outcome));
+    }
+
+    fn object_status(status: &str, unavailable_shards: u64) -> ObjectRepairStatus {
+        ObjectRepairStatus {
+            object_key: "object".into(),
+            version_id: "version".into(),
+            status: status.into(),
+            total_parts: 1,
+            total_shards: 4,
+            healthy_shards: 4u64.saturating_sub(unavailable_shards),
+            missing_shards: 0,
+            corrupt_shards: 0,
+            unavailable_shards,
+            repairable: unavailable_shards == 0,
+            repaired_shards: 0,
+            failed_repairs: 0,
+            layout: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_shard_defers_safety_escalation_even_with_healthy_metadata() {
+        let before = object_status("incomplete", 1);
+        let after = object_status("incomplete", 1);
+        let metadata = metadata_outcome(&["healthy", "healthy", "healthy", "healthy"], true);
+
+        assert!(object_verification_deferred(
+            &before,
+            Some(&after),
+            &metadata
+        ));
+    }
+
+    #[test]
+    fn conclusive_shard_damage_is_not_deferred() {
+        let mut before = object_status("degraded", 0);
+        before.healthy_shards = 3;
+        before.corrupt_shards = 1;
+        let metadata = metadata_outcome(&["healthy", "healthy", "healthy", "healthy"], true);
+
+        assert!(!object_verification_deferred(
+            &before,
+            Some(&before),
+            &metadata
+        ));
     }
 }

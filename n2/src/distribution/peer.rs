@@ -2020,6 +2020,9 @@ async fn http_get_peer_shard(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::NotFound);
+        }
         return Err(AppError::ServiceUnavailable(format!(
             "peer shard read from {} returned {}: {}",
             locator.node_id, status, text
@@ -2155,6 +2158,9 @@ fn native_peer_locator_response_error(
     locator: &PeerShardLocator,
     response: &NativeResponse,
 ) -> AppError {
+    if response.status == Some(StatusCode::NOT_FOUND.as_u16()) {
+        return AppError::NotFound;
+    }
     AppError::ServiceUnavailable(format!(
         "N2 native peer shard {op} returned status {:?} from {}: {}",
         response.status,
@@ -2376,9 +2382,13 @@ pub async fn peer_get_shard(
     let dir = shard_dir(&query.root_id, &fragment, &object_id, &version_id)?;
     let file_name = stable_name(part_index, shard_index, query.parity.unwrap_or(false));
     let path = dir.join(file_name);
-    let mut file = fs::File::open(&path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open peer shard {}", path.display())))?;
+    let mut file = fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::NotFound
+        } else {
+            AppError::Io(e, format!("open peer shard {}", path.display()))
+        }
+    })?;
     if let Some(length) = query.length {
         let offset = query.offset.unwrap_or(0);
         file.seek(SeekFrom::Start(offset))
@@ -2601,9 +2611,13 @@ pub async fn native_peer_get_shard_bytes(
     )?;
     let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
     let path = dir.join(file_name);
-    let mut file = fs::File::open(&path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open native peer shard {}", path.display())))?;
+    let mut file = fs::File::open(&path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::NotFound
+        } else {
+            AppError::Io(e, format!("open native peer shard {}", path.display()))
+        }
+    })?;
     if let Some(length) = payload.length {
         file.seek(SeekFrom::Start(payload.offset.unwrap_or(0)))
             .await

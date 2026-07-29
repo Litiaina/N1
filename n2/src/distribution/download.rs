@@ -10,6 +10,14 @@ use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShardProbeResult {
+    Healthy,
+    Missing,
+    ChecksumMismatch,
+    Unavailable,
+}
+
 pub struct VerifiedShardCache {
     verified: HashMap<String, Vec<u8>>,
     rejected: HashSet<String>,
@@ -111,13 +119,6 @@ async fn read_shard_chunk(shard: &ShardInfo, offset: u64, len: usize) -> Result<
         return Ok(bytes);
     }
     read_local_shard_chunk(shard, offset, len).await
-}
-
-pub async fn shard_probe_readable(shard: &ShardInfo) -> bool {
-    if shard.size_bytes == 0 {
-        return true;
-    }
-    read_shard_chunk(shard, 0, 1).await.is_ok()
 }
 
 fn expected_sha256(checksum: &str) -> Option<Sha256Digest> {
@@ -340,14 +341,72 @@ async fn read_full_shard(shard: &ShardInfo) -> Result<Vec<u8>, AppError> {
     read_shard_chunk(shard, 0, len).await
 }
 
-pub async fn shard_probe_verified(shard: &ShardInfo) -> bool {
+fn classify_probe_error(error: AppError) -> ShardProbeResult {
+    match error {
+        AppError::NotFound => ShardProbeResult::Missing,
+        AppError::Io(error, _) if error.kind() == std::io::ErrorKind::NotFound => {
+            ShardProbeResult::Missing
+        }
+        _ => ShardProbeResult::Unavailable,
+    }
+}
+
+async fn read_probe_bytes(shard: &ShardInfo, length: usize) -> Result<Vec<u8>, ShardProbeResult> {
+    if let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) {
+        return match fetch_peer_shard_chunk(&locator, 0, length).await {
+            Ok(bytes) if bytes.len() == length => Ok(bytes),
+            Ok(_) => Err(ShardProbeResult::ChecksumMismatch),
+            Err(error) => Err(classify_probe_error(error)),
+        };
+    }
+
+    let mut file = match File::open(&shard.absolute_path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ShardProbeResult::Missing);
+        }
+        Err(_) => return Err(ShardProbeResult::Unavailable),
+    };
+    let mut bytes = vec![0u8; length];
+    match file.read_exact(&mut bytes).await {
+        Ok(_) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(ShardProbeResult::ChecksumMismatch)
+        }
+        Err(_) => Err(ShardProbeResult::Unavailable),
+    }
+}
+
+pub async fn shard_probe(shard: &ShardInfo, verify_integrity: bool) -> ShardProbeResult {
+    let probe_length = if verify_integrity {
+        let Ok(length) = usize::try_from(shard.size_bytes) else {
+            return ShardProbeResult::ChecksumMismatch;
+        };
+        length
+    } else if shard.size_bytes == 0 {
+        0
+    } else {
+        1
+    };
+
+    let bytes = match read_probe_bytes(shard, probe_length).await {
+        Ok(bytes) => bytes,
+        Err(result) => return result,
+    };
+    if bytes.len() != probe_length {
+        return ShardProbeResult::ChecksumMismatch;
+    }
+    if !verify_integrity {
+        return ShardProbeResult::Healthy;
+    }
     let Some(expected) = expected_sha256(&shard.checksum) else {
-        return false;
+        return ShardProbeResult::ChecksumMismatch;
     };
-    let Ok(bytes) = read_full_shard(shard).await else {
-        return false;
-    };
-    bytes.len() as u64 == shard.size_bytes && sha256_matches(&bytes, &expected)
+    if sha256_matches(&bytes, &expected) {
+        ShardProbeResult::Healthy
+    } else {
+        ShardProbeResult::ChecksumMismatch
+    }
 }
 
 pub async fn prefetch_verified_data_shards(part: &PartMetadata, cache: &mut VerifiedShardCache) {
@@ -614,6 +673,55 @@ mod tests {
     use crate::core::disk_manager::ShardInfo;
     use simd_erasure_core::ReedSolomonEncoder;
     use ulid::Ulid;
+
+    fn local_shard(path: &std::path::Path, expected: &[u8]) -> ShardInfo {
+        ShardInfo {
+            shard_index: 0,
+            file_name: "probe.shard".into(),
+            absolute_path: path.to_string_lossy().to_string(),
+            size_bytes: expected.len() as u64,
+            checksum: format_sha256(&sha256_digest(expected)),
+            block_checksums: Vec::new(),
+            checksum_block_size: 0,
+            is_parity: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_probe_distinguishes_missing_corrupt_and_unavailable() {
+        let root = std::env::temp_dir().join(format!("n2-shard-probe-{}", Ulid::new()));
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let expected = b"verified-shard";
+        let path = root.join("probe.shard");
+        let shard = local_shard(&path, expected);
+
+        assert_eq!(shard_probe(&shard, true).await, ShardProbeResult::Missing);
+
+        tokio::fs::write(&path, b"corrupt-shard")
+            .await
+            .expect("write corrupt shard");
+        assert_eq!(
+            shard_probe(&shard, true).await,
+            ShardProbeResult::ChecksumMismatch
+        );
+
+        tokio::fs::write(&path, expected)
+            .await
+            .expect("write healthy shard");
+        assert_eq!(shard_probe(&shard, true).await, ShardProbeResult::Healthy);
+
+        let directory_shard = local_shard(&root, expected);
+        assert_eq!(
+            shard_probe(&directory_shard, true).await,
+            ShardProbeResult::Unavailable
+        );
+        assert_eq!(
+            classify_probe_error(AppError::ServiceUnavailable("peer offline".into())),
+            ShardProbeResult::Unavailable
+        );
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
 
     #[tokio::test]
     async fn verified_range_reads_only_checksum_blocks_covering_the_slice() {

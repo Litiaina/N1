@@ -155,6 +155,7 @@ pub struct ClusterObjectHealthSummary {
     pub repairable: u64,
     pub missing_shards: u64,
     pub corrupt_shards: u64,
+    pub unavailable_shards: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_token: Option<String>,
     pub samples: Vec<ClusterObjectHealthSample>,
@@ -607,6 +608,7 @@ fn count_repair_status(summary: &mut ClusterObjectHealthSummary, status: &Object
         "degraded" => summary.degraded = summary.degraded.saturating_add(1),
         "critical" => summary.critical = summary.critical.saturating_add(1),
         "lost" => summary.lost = summary.lost.saturating_add(1),
+        "incomplete" => summary.unknown_health = summary.unknown_health.saturating_add(1),
         _ => summary.unknown_health = summary.unknown_health.saturating_add(1),
     }
     if status.repairable {
@@ -614,6 +616,9 @@ fn count_repair_status(summary: &mut ClusterObjectHealthSummary, status: &Object
     }
     summary.missing_shards = summary.missing_shards.saturating_add(status.missing_shards);
     summary.corrupt_shards = summary.corrupt_shards.saturating_add(status.corrupt_shards);
+    summary.unavailable_shards = summary
+        .unavailable_shards
+        .saturating_add(status.unavailable_shards);
 }
 
 fn push_object_sample(

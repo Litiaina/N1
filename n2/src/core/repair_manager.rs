@@ -10,7 +10,7 @@ use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mod
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
 use crate::distribution::download::{
-    part_has_remote_shards, shard_is_remote, shard_probe_readable, shard_probe_verified,
+    ShardProbeResult, part_has_remote_shards, shard_is_remote, shard_probe,
 };
 use crate::distribution::repair::repair_cluster_object_shards;
 use crate::distribution::status::inspect_cluster_object_status;
@@ -90,6 +90,7 @@ pub struct ObjectRepairStatus {
     pub healthy_shards: u64,
     pub missing_shards: u64,
     pub corrupt_shards: u64,
+    pub unavailable_shards: u64,
     pub repairable: bool,
     pub repaired_shards: u64,
     pub failed_repairs: u64,
@@ -682,6 +683,7 @@ async fn inspect_object_parts(
         healthy_shards: 0,
         missing_shards: 0,
         corrupt_shards: 0,
+        unavailable_shards: 0,
         repairable: true,
         repaired_shards: 0,
         failed_repairs: 0,
@@ -693,6 +695,7 @@ async fn inspect_object_parts(
     let mut any_degraded = false;
     let mut any_critical = false;
     let mut any_lost = false;
+    let mut any_unavailable = false;
 
     for part in &meta.parts {
         let normalized = normalize_part_paths_for_repair(
@@ -711,25 +714,30 @@ async fn inspect_object_parts(
             .count()
             .max(1);
         let mut healthy_in_part = 0usize;
+        let mut unavailable_in_part = 0usize;
         let mut bad_indexes = Vec::new();
 
         for shard in &normalized.shards {
             report.total_shards += 1;
             if shard_is_remote(shard) {
-                let healthy = if check_mode.verifies_full_integrity() {
-                    shard_probe_verified(shard).await
-                } else {
-                    shard_probe_readable(shard).await
-                };
-                if healthy {
-                    report.healthy_shards += 1;
-                    healthy_in_part += 1;
-                } else if check_mode.verifies_full_integrity() {
-                    report.corrupt_shards += 1;
-                    bad_indexes.push(shard.shard_index);
-                } else {
-                    report.missing_shards += 1;
-                    bad_indexes.push(shard.shard_index);
+                match shard_probe(shard, check_mode.verifies_full_integrity()).await {
+                    ShardProbeResult::Healthy => {
+                        report.healthy_shards += 1;
+                        healthy_in_part += 1;
+                    }
+                    ShardProbeResult::Missing => {
+                        report.missing_shards += 1;
+                        bad_indexes.push(shard.shard_index);
+                    }
+                    ShardProbeResult::ChecksumMismatch => {
+                        report.corrupt_shards += 1;
+                        bad_indexes.push(shard.shard_index);
+                    }
+                    ShardProbeResult::Unavailable => {
+                        report.unavailable_shards += 1;
+                        unavailable_in_part += 1;
+                        any_unavailable = true;
+                    }
                 }
                 continue;
             }
@@ -750,9 +758,15 @@ async fn inspect_object_parts(
                                     bad_indexes.push(shard.shard_index);
                                 }
                             }
-                            Err(_) => {
-                                report.missing_shards += 1;
-                                bad_indexes.push(shard.shard_index);
+                            Err(error) => {
+                                if error.kind() == std::io::ErrorKind::NotFound {
+                                    report.missing_shards += 1;
+                                    bad_indexes.push(shard.shard_index);
+                                } else {
+                                    report.unavailable_shards += 1;
+                                    unavailable_in_part += 1;
+                                    any_unavailable = true;
+                                }
                             }
                         }
                     } else {
@@ -760,9 +774,15 @@ async fn inspect_object_parts(
                         healthy_in_part += 1;
                     }
                 }
-                Err(_) => {
-                    report.missing_shards += 1;
-                    bad_indexes.push(shard.shard_index);
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        report.missing_shards += 1;
+                        bad_indexes.push(shard.shard_index);
+                    } else {
+                        report.unavailable_shards += 1;
+                        unavailable_in_part += 1;
+                        any_unavailable = true;
+                    }
                 }
             }
         }
@@ -770,12 +790,12 @@ async fn inspect_object_parts(
         if !bad_indexes.is_empty() {
             any_degraded = true;
         }
-        if healthy_in_part == 0 {
+        if unavailable_in_part == 0 && healthy_in_part == 0 {
             any_lost = true;
-        } else if healthy_in_part < data_shards {
+        } else if unavailable_in_part == 0 && healthy_in_part < data_shards {
             any_critical = true;
         }
-        if healthy_in_part < data_shards {
+        if unavailable_in_part == 0 && healthy_in_part < data_shards {
             report.repairable = false;
         }
 
@@ -783,7 +803,12 @@ async fn inspect_object_parts(
         repair_targets.push(bad_indexes);
     }
 
-    report.status = if any_lost {
+    if any_unavailable {
+        report.repairable = false;
+    }
+    report.status = if any_unavailable {
+        "incomplete".to_string()
+    } else if any_lost {
         "lost".to_string()
     } else if any_critical {
         "critical".to_string()
@@ -821,7 +846,7 @@ pub async fn repair_object(
     let _io = try_acquire_disk_io(DiskIoClass::BackgroundRepair, Some(&meta.fragment))?;
     let (mut report, normalized_parts, repair_targets) =
         inspect_object_parts(meta, check_mode).await?;
-    if report.status == "healthy" || !report.repairable {
+    if report.status == "healthy" || report.status == "incomplete" || !report.repairable {
         return Ok(report);
     }
 
@@ -1257,20 +1282,24 @@ async fn process_object_repair(
 
         for shard in &part_arc.shards {
             if shard_is_remote(shard) {
-                let healthy = if cfg.check_mode.verifies_full_integrity() {
-                    shard_probe_verified(shard).await
-                } else {
-                    shard_probe_readable(shard).await
-                };
-                if !healthy {
-                    if cfg.check_mode.verifies_full_integrity() {
-                        corrupt_found += 1;
+                match shard_probe(shard, cfg.check_mode.verifies_full_integrity()).await {
+                    ShardProbeResult::Healthy => {}
+                    ShardProbeResult::Unavailable => {
                         warn!(
-                            "Remote shard failed integrity probe: {}",
+                            "Remote shard verification deferred while participant is unavailable: {}",
                             shard.absolute_path
                         );
                     }
-                    missing_shards.push(shard.shard_index);
+                    ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {
+                        if cfg.check_mode.verifies_full_integrity() {
+                            corrupt_found += 1;
+                            warn!(
+                                "Remote shard failed integrity probe: {}",
+                                shard.absolute_path
+                            );
+                        }
+                        missing_shards.push(shard.shard_index);
+                    }
                 }
                 continue;
             }

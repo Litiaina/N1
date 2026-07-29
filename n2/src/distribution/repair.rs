@@ -1,8 +1,7 @@
 use crate::core::disk_manager::ObjectMetadata;
 use crate::core::repair_manager::{ObjectRepairStatus, RepairCheckMode};
 use crate::distribution::download::{
-    VerifiedShardCache, reconstruct_cluster_shard_cached, shard_probe_readable,
-    shard_probe_verified,
+    ShardProbeResult, VerifiedShardCache, reconstruct_cluster_shard_cached, shard_probe,
 };
 use crate::distribution::membership::ClusterRuntime;
 use crate::distribution::peer::{PeerShardTarget, parse_peer_shard_locator, put_peer_shard_bytes};
@@ -71,8 +70,9 @@ async fn repair_cluster_part_after_read(
     let mut cache = VerifiedShardCache::default();
 
     for shard in &part.shards {
-        if shard_probe_readable(shard).await {
-            continue;
+        match shard_probe(shard, false).await {
+            ShardProbeResult::Healthy | ShardProbeResult::Unavailable => continue,
+            ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {}
         }
         let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) else {
             continue;
@@ -131,7 +131,7 @@ pub async fn repair_cluster_object_shards(
     check_mode: RepairCheckMode,
 ) -> Result<ObjectRepairStatus, AppError> {
     let before = inspect_cluster_object_status(meta, check_mode).await?;
-    if before.status == "healthy" || !before.repairable {
+    if before.status == "healthy" || before.status == "incomplete" || !before.repairable {
         return Ok(before);
     }
 
@@ -141,13 +141,9 @@ pub async fn repair_cluster_object_shards(
     for part in &meta.parts {
         let mut cache = VerifiedShardCache::default();
         for shard in &part.shards {
-            let healthy = if check_mode.verifies_full_integrity() {
-                shard_probe_verified(shard).await
-            } else {
-                shard_probe_readable(shard).await
-            };
-            if healthy {
-                continue;
+            match shard_probe(shard, check_mode.verifies_full_integrity()).await {
+                ShardProbeResult::Healthy | ShardProbeResult::Unavailable => continue,
+                ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {}
             }
 
             let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) else {
