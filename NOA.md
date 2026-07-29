@@ -11,7 +11,7 @@ do not expose either engine's disk layout.
 - API version: `v1`
 - HTTPS prefix: `/noa/v1`
 - Realtime endpoint: `/noa/v1/ws`
-- N2 implementation: `3.3.0`
+- N2 implementation: `3.3.1`
 
 The NOA version is independent of the N2 package and disk-format versions. An
 incompatible public API requires a new prefix such as `/noa/v2`; package

@@ -7,12 +7,19 @@ set -euo pipefail
 # unique timestamp.
 # REMOTE_PASS is intentionally supplied by the operator at runtime.
 
-: "${REMOTE_PASS:?set REMOTE_PASS for the authorized proof host}"
+ALL_LOCAL="${ALL_LOCAL:-false}"
 REMOTE_HOST="${REMOTE_HOST:-192.168.0.36}"
 REMOTE_USER="${REMOTE_USER:-administrator}"
-LOCAL_IP="${LOCAL_IP:-192.168.0.1}"
-REMOTE_IP="${REMOTE_IP:-$REMOTE_HOST}"
+if [[ "$ALL_LOCAL" == "true" ]]; then
+  LOCAL_IP="${LOCAL_IP:-127.0.0.1}"
+  REMOTE_IP="${REMOTE_IP:-127.0.0.1}"
+else
+  : "${REMOTE_PASS:?set REMOTE_PASS for the authorized proof host}"
+  LOCAL_IP="${LOCAL_IP:-192.168.0.1}"
+  REMOTE_IP="${REMOTE_IP:-$REMOTE_HOST}"
+fi
 PROOF_MIB="${PROOF_MIB:-64}"
+KEEP_RUNNING="${N2_PROOF_KEEP_RUNNING:-false}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${N2_PROOF_BIN:-$ROOT_DIR/target/release/litiaina-n2}"
@@ -23,21 +30,21 @@ LOCAL_RUN="$OUT/runtime"
 LOCAL_A="$LOCAL_RUN/node-a"
 LOCAL_B="$LOCAL_RUN/node-b"
 LOCAL_R="$LOCAL_RUN/reserve-r"
-LOCAL_A_STORE="$OUT/storage/node-a"
-LOCAL_B_STORE="$OUT/storage/node-b"
-LOCAL_R_STORE="$OUT/storage/reserve-r"
+LOCAL_A_STORE="${N2_PROOF_A_STORE:-$OUT/storage/node-a}"
+LOCAL_B_STORE="${N2_PROOF_B_STORE:-$OUT/storage/node-b}"
+LOCAL_R_STORE="${N2_PROOF_R_STORE:-$OUT/storage/reserve-r}"
 REMOTE_RUN_BASE="/home/$REMOTE_USER/.cache/N2-3.0-proof-$TS"
 REMOTE_C="$REMOTE_RUN_BASE/node-c"
 REMOTE_D="$REMOTE_RUN_BASE/node-d"
 REMOTE_STORE_BASE=".n2-3.0-proof-$TS"
-REMOTE_C_STORE="/mnt/NDISK002/$REMOTE_STORE_BASE/node-c"
-REMOTE_D_STORE="/mnt/NDISK003/$REMOTE_STORE_BASE/node-d"
+REMOTE_C_STORE="${N2_PROOF_C_STORE:-/mnt/NDISK002/$REMOTE_STORE_BASE/node-c}"
+REMOTE_D_STORE="${N2_PROOF_D_STORE:-/mnt/NDISK003/$REMOTE_STORE_BASE/node-d}"
 
-A_HTTPS=56001; A_NATIVE=56002
-B_HTTPS=56011; B_NATIVE=56012
-C_HTTPS=56021; C_NATIVE=56022
-D_HTTPS=56031; D_NATIVE=56032
-R_HTTPS=56041; R_NATIVE=56042
+A_HTTPS=22001; A_NATIVE=22002
+B_HTTPS=22011; B_NATIVE=22012
+C_HTTPS=22021; C_NATIVE=22022
+D_HTTPS=22031; D_NATIVE=22032
+R_HTTPS=22041; R_NATIVE=22042
 A_BASE="https://$LOCAL_IP:$A_HTTPS"
 B_BASE="https://$LOCAL_IP:$B_HTTPS"
 C_BASE="https://$REMOTE_IP:$C_HTTPS"
@@ -45,22 +52,68 @@ D_BASE="https://$REMOTE_IP:$D_HTTPS"
 R_BASE="https://$LOCAL_IP:$R_HTTPS"
 POOL_ID="pool-proof-$TS"
 CLUSTER_ID="cluster-proof-$TS"
-MASTER="n2-3.0-proof-master-$TS"
+MASTER="${N2_PROOF_MASTER_KEY:-n2-3.0-proof-master-$TS}"
 FRAGMENT_NAME="n2-3.0-proof-$TS"
 FRAGMENT_KEY="n2-3.0-fragment-$TS"
 TOKEN=""
+RESULT="FAIL"
 
-export SSHPASS="$REMOTE_PASS"
-SSH=(sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$REMOTE_USER@$REMOTE_HOST")
-SCP=(sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=8)
+if [[ "$ALL_LOCAL" != "true" ]]; then
+  export SSHPASS="$REMOTE_PASS"
+  SSH=(sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$REMOTE_USER@$REMOTE_HOST")
+  SCP=(sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=8)
+fi
 
-for tool in jq curl openssl sshpass pidstat sha256sum awk; do
+for tool in jq curl openssl pidstat sha256sum awk; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
+if [[ "$ALL_LOCAL" != "true" ]]; then
+  command -v sshpass >/dev/null || { echo "missing required tool: sshpass" >&2; exit 1; }
+fi
 [[ -x "$BIN" ]] || { echo "release binary is missing: $BIN" >&2; exit 1; }
 
-remote() { "${SSH[@]}" "$@"; }
-copy_remote() { "${SCP[@]}" "$@"; }
+assert_ports_available() {
+  local port
+  command -v ss >/dev/null || {
+    echo "missing required tool: ss" >&2
+    exit 1
+  }
+  for port in "$@"; do
+    if [[ -n "$(ss -H -ltn "sport = :$port")" ]]; then
+      echo "required N2 proof port is already in use: $port" >&2
+      exit 1
+    fi
+  done
+}
+assert_ports_available \
+  "$A_HTTPS" "$A_NATIVE" "$B_HTTPS" "$B_NATIVE" \
+  "$C_HTTPS" "$C_NATIVE" "$D_HTTPS" "$D_NATIVE" \
+  "$R_HTTPS" "$R_NATIVE"
+
+remote() {
+  if [[ "$ALL_LOCAL" == "true" ]]; then
+    bash -lc "$*"
+  else
+    "${SSH[@]}" "$@"
+  fi
+}
+
+copy_remote() {
+  if [[ "$ALL_LOCAL" != "true" ]]; then
+    "${SCP[@]}" "$@"
+    return
+  fi
+
+  local args=("$@")
+  local last_index=$(( ${#args[@]} - 1 ))
+  local destination="${args[$last_index]}"
+  if [[ "${args[0]}" == *:* ]]; then
+    cp "${args[0]#*:}" "$destination"
+    return
+  fi
+  destination="${destination#*:}"
+  cp "${args[@]:0:$last_index}" "$destination"
+}
 
 kill_pidfile() {
   local pidfile="$1"
@@ -79,6 +132,9 @@ kill_pidfile() {
 
 cleanup() {
   set +e
+  if [[ "$KEEP_RUNNING" == "true" && "$RESULT" == "PASS" ]]; then
+    return
+  fi
   kill_pidfile "$LOCAL_A/pidstat.pid"
   kill_pidfile "$LOCAL_B/pidstat.pid"
   kill_pidfile "$LOCAL_R/pidstat.pid"
@@ -685,4 +741,5 @@ jq -n \
   '{result:$result,cluster_id:$cluster,pool_id:$pool,fragment:$fragment,stable_fragment_id:$stable_fragment,topology:$topology,ec:"2+2",ncnx_replicas:$ncnx_replicas,upload:$upload[0],download:{node_a:$download_a[0],node_b:$download_b[0],node_c:$download_c[0],node_d:$download_d[0]},latency:{zero_decode_list:$list[0],stat:$stat[0],exact_rename:$rename[0]},rename_lifecycle_trash_records:0,trash_generation:{strict_recover_http_status:($collision_recover_status|tonumber),first_mutation_id:$collision_first_id,second_mutation_id:$collision_second_id,ids_are_distinct:($collision_first_id != $collision_second_id),surviving_old_generation_replicas:$collision_trash_replicas},overwrite_versions:2,parallel_independent_key_writes:8,hierarchical_pagination_keys:5,folder_trash_recovery:"2 of 2",ncnx_auto_heal:"recreated deleted replica",object_auto_heal:"recreated deleted shard",reserve_set:{one_node_read_survived:true,pre_promotion_write_http_status:($pre_promotion_status|tonumber),binding_epoch_advanced_once:true,logical_slot_preserved:true,replacement_instance:"reserve-r",write_during_recovery:true,stale_retired_write_http_status:($stale_write_status|tonumber),stale_retired_write_rejected:true,historical_layout_repaired:true,parity_count_read_survived:true,health_after_promotion:$health_promotion[0],health_after_recovery:$health_recovery[0]},ttl_gc:{expired:true,read_after_gc_http_status:($ttl_status|tonumber),status:$gc[0]},restart_persistence:true,observability:{hardware_cycle_counter:"unavailable: kernel perf_event_paranoid=4; no sysctl was changed",process:$process[0]},suspicious_log_lines:$suspicious_log_lines,monitor:$monitor[0]}' \
   | tee "$OUT/summary.json"
 
+RESULT="PASS"
 echo "N2_3_0_PROOF_OUT=$OUT"

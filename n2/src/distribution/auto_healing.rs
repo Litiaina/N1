@@ -36,6 +36,10 @@ use tokio::time::{Duration, sleep, timeout};
 
 const HEALING_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn full_topology_available(configured_nodes: usize, live_nodes: usize) -> bool {
+    configured_nodes > 0 && live_nodes == configured_nodes
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct FragmentProgress {
@@ -631,6 +635,33 @@ async fn heal_owned_fragment(
 
     let mut reports = namespace.reports;
     reports.extend(objects.reports);
+
+    // A transport failure is not evidence that an immutable replica or shard is
+    // corrupt. The fixed-layout healer may report what it observed, but it must
+    // not escalate an unconfirmed finding while a logical slot is unreachable.
+    // Recheck here because topology can change after the cycle-level gate.
+    let configured_nodes = runtime.membership.nodes.len();
+    let live_nodes = live_active_write_nodes(&runtime).await.len();
+    if !full_topology_available(configured_nodes, live_nodes) {
+        let reason = format!(
+            "safety escalation deferred because topology became incomplete during the scan \
+             ({live_nodes}/{configured_nodes} logical slots live); an unreachable participant \
+             is not proof of data corruption"
+        );
+        for report in reports
+            .iter_mut()
+            .filter(|report| report.cluster_read_only_triggered)
+        {
+            report.cluster_read_only_triggered = false;
+            report.initial_status = "incomplete".into();
+            report.repair_outcome = "deferred_topology_incomplete".into();
+            report.reason = Some(match report.reason.take() {
+                Some(existing) => format!("{existing}; {reason}"),
+                None => reason.clone(),
+            });
+        }
+    }
+
     let critical = reports
         .iter()
         .find(|report| report.cluster_read_only_triggered)
@@ -734,6 +765,20 @@ async fn run_auto_healing_cycle_with_mode(
         ..AutoHealingStatus::default()
     };
     *STATUS.write().await = status.clone();
+
+    if !full_topology_available(status.configured_nodes, status.live_nodes) {
+        status.running = false;
+        status.owned_fragments = 0;
+        status.incomplete_fragments = status.discovered_fragments as u64;
+        status.finished_at_unix = Some(Utc::now().timestamp());
+        status.last_error = Some(format!(
+            "auto-healing deferred: {}/{} logical slots live; unreachable participants are not \
+             evidence of data corruption",
+            status.live_nodes, status.configured_nodes
+        ));
+        *STATUS.write().await = status.clone();
+        return Ok(status);
+    }
 
     let results = stream::iter(owned.into_iter().map(|fragment| {
         let runtime = runtime.clone();
@@ -977,6 +1022,14 @@ mod tests {
             },
             auto_rebalance: false,
         }
+    }
+
+    #[test]
+    fn fixed_layout_healing_requires_every_logical_slot_to_be_live() {
+        assert!(full_topology_available(4, 4));
+        assert!(!full_topology_available(4, 3));
+        assert!(!full_topology_available(4, 2));
+        assert!(!full_topology_available(0, 0));
     }
 
     #[test]

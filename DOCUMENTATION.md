@@ -10,7 +10,7 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.3.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.3.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
 plane. N2 3.1 adds collision-free per-mutation trash generation directories.
 N2 3.2 makes SHA-256 the only engine integrity checksum, adds SHA-256
@@ -26,6 +26,12 @@ epoch, keeps reserve instances outside placement, and fences retired
 instances. A promoted reserve preserves the exact pool, EC, slot, logical
 root, and old object layouts while bounded healing restores historical NCNX,
 NCDX, shard, and parity placement.
+
+N2 3.3.1 hardens autonomous maintenance under node churn. A temporarily
+unreachable NCNX or NCDX participant is recorded as incomplete verification
+and retried by a later healing cycle; it is not treated as proof of immutable
+loss. Confirmed missing, divergent, or corrupt replicas and unrepairable shard
+layouts retain strict safety read-only escalation.
 
 N2 3.3 intentionally does not open or migrate N2 1.x, 2.x, or earlier
 experimental 3.x roots. Static server-pool enrollment, root identity, and

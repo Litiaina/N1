@@ -1365,10 +1365,15 @@ async fn inspect_name_inner(
                 repair_targets.push(replica.clone());
             }
             Err(err) => {
+                let status = if matches!(&err, AppError::ServiceUnavailable(_)) {
+                    "unavailable"
+                } else {
+                    "corrupt"
+                };
                 observations.push(NcnxReplicaObservation {
                     node_id: replica.node_id.clone(),
                     root_id: replica.root_id.clone(),
-                    status: "unreachable_or_corrupt".into(),
+                    status: status.into(),
                     error: Some(err.to_string()),
                 });
                 repair_targets.push(replica.clone());
@@ -1395,17 +1400,21 @@ async fn inspect_name_inner(
             .await;
             if response.is_ok() {
                 repaired_replicas = repaired_replicas.saturating_add(1);
+                if let Some(observation) = observations.iter_mut().find(|observation| {
+                    observation.node_id == replica.node_id && observation.root_id == replica.root_id
+                }) {
+                    observation.status = "repaired".into();
+                    observation.error = None;
+                }
             }
         }
     }
     let healthy = !degraded
         || (repair
             && !deferred_by_trash
-            && repaired_replicas as usize
-                == observations
-                    .iter()
-                    .filter(|observation| observation.status != "healthy")
-                    .count());
+            && observations
+                .iter()
+                .all(|observation| matches!(observation.status.as_str(), "healthy" | "repaired")));
     Ok(NcnxRepairOutcome {
         layout,
         located: Some(located),

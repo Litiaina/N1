@@ -19,7 +19,7 @@ namespace, and maintenance operations on any healthy node, places immutable
 erasure-coded object versions across static server pools, and keeps every
 user-visible mutation in a small flat namespace record.
 
-N2 `3.3.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.3.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the N2 2.x inode namespace with replicated flat NCNX key records
 while retaining
 immutable NCDX metadata, immutable shards and parity, per-object recorded
@@ -36,6 +36,12 @@ logical pool slot without changing the pool generation, EC width, logical
 placement identities, or immutable object layouts. A separate binding epoch
 fences the retired physical instance while bounded healing restores the
 recorded NCNX, NCDX, shard, and parity layouts.
+
+N2 3.3.1 is the node-churn correctness patch for the 3.3 engine. Autonomous
+healing now distinguishes temporary NCNX/NCDX transport unavailability from
+proven missing, divergent, or corrupt immutable state. A node restarting
+during a scan defers verification instead of creating a false cluster
+read-only incident; proven immutable damage retains strict safety escalation.
 
 A key such as `videos/mhw.mp4` is stored as `videos/mhw.mp4.ncnx` on its
 deterministic replica holders. The `videos/` path is a key prefix, not a
@@ -361,7 +367,7 @@ the repository under `/home/wlzambo/DEV-TEST`.
 
 ## Operational Boundaries
 
-- N2 `3.3.0` is a clean 3.x engine format, not an in-place migration
+- N2 `3.3.1` is a clean 3.x engine format, not an in-place migration
   from N2 1.x or 2.x.
 - A server pool's `K + M`, node IDs, and root-ID set are static after
   enrollment. Expansion adds a new complete pool generation.

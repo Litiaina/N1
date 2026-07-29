@@ -2,16 +2,24 @@
 set -Eeuo pipefail
 
 # N2 3.3 soak and bounded-chaos qualification; the filename is retained for
-# the flat-NCNX proof family. The harness uses four logical nodes on two
-# physical hosts, static 2+2 EC, and NCNX R=3. It never installs a service or
-# uses a pre-existing storage directory.
+# the flat-NCNX proof family. The harness uses four logical nodes, static 2+2
+# EC, and NCNX R=3. It never installs a service or uses a pre-existing storage
+# directory.
 
-: "${SSH_IDENTITY_FILE:?set SSH_IDENTITY_FILE to an authorized temporary key}"
-
+ALL_LOCAL="${ALL_LOCAL:-false}"
 REMOTE_HOST="${REMOTE_HOST:-192.168.0.36}"
 REMOTE_USER="${REMOTE_USER:-administrator}"
-LOCAL_IP="${LOCAL_IP:-192.168.0.1}"
-REMOTE_IP="${REMOTE_IP:-$REMOTE_HOST}"
+if [[ "$ALL_LOCAL" == "true" ]]; then
+  LOCAL_IP="${LOCAL_IP:-127.0.0.1}"
+  REMOTE_IP="${REMOTE_IP:-127.0.0.1}"
+  SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-}"
+  TOPOLOGY_LABEL="four logical nodes on one physical host and four isolated HDD roots; static EC 2+2; NCNX R=3"
+else
+  : "${SSH_IDENTITY_FILE:?set SSH_IDENTITY_FILE to an authorized temporary key}"
+  LOCAL_IP="${LOCAL_IP:-192.168.0.1}"
+  REMOTE_IP="${REMOTE_IP:-$REMOTE_HOST}"
+  TOPOLOGY_LABEL="four logical nodes on two physical hosts; static EC 2+2; NCNX R=3"
+fi
 DURATION_SECONDS="${DURATION_SECONDS:-43200}"
 MAX_CYCLES="${MAX_CYCLES:-0}"
 CYCLE_PAUSE_SECONDS="${CYCLE_PAUSE_SECONDS:-8}"
@@ -23,6 +31,10 @@ FAULT_DWELL_SECONDS="${FAULT_DWELL_SECONDS:-2}"
 NORMAL_UPLOAD_ATTEMPTS="${NORMAL_UPLOAD_ATTEMPTS:-3}"
 HEAL_INITIAL_DELAY_SECONDS="${HEAL_INITIAL_DELAY_SECONDS:-10}"
 HEAL_SCAN_INTERVAL_SECONDS="${HEAL_SCAN_INTERVAL_SECONDS:-60}"
+HEAL_VERIFY_TIMEOUT_SECONDS="${HEAL_VERIFY_TIMEOUT_SECONDS:-360}"
+HEAL_STATUS_POLL_SECONDS="${HEAL_STATUS_POLL_SECONDS:-1}"
+HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS="${HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS:-180}"
+CHAOS_START_PHASE="${CHAOS_START_PHASE:-1}"
 AUTHORIZED_KEY_TAG="${AUTHORIZED_KEY_TAG:-}"
 REMOVE_IDENTITY_ON_EXIT="${REMOVE_IDENTITY_ON_EXIT:-false}"
 
@@ -34,19 +46,19 @@ OUT="$OUT_ROOT/N2-3.0-soak-$TS"
 LOCAL_RUN="$OUT/runtime"
 LOCAL_A="$LOCAL_RUN/node-a"
 LOCAL_B="$LOCAL_RUN/node-b"
-LOCAL_A_STORE="$OUT/storage/node-a"
-LOCAL_B_STORE="$OUT/storage/node-b"
+LOCAL_A_STORE="${N2_SOAK_A_STORE:-$OUT/storage/node-a}"
+LOCAL_B_STORE="${N2_SOAK_B_STORE:-$OUT/storage/node-b}"
 REMOTE_RUN_BASE="/home/$REMOTE_USER/.cache/N2-3.0-soak-$TS"
 REMOTE_C="$REMOTE_RUN_BASE/node-c"
 REMOTE_D="$REMOTE_RUN_BASE/node-d"
 REMOTE_STORE_BASE=".n2-3.0-soak-$TS"
-REMOTE_C_STORE="/mnt/NDISK002/$REMOTE_STORE_BASE/node-c"
-REMOTE_D_STORE="/mnt/NDISK003/$REMOTE_STORE_BASE/node-d"
+REMOTE_C_STORE="${N2_SOAK_C_STORE:-/mnt/NDISK002/$REMOTE_STORE_BASE/node-c}"
+REMOTE_D_STORE="${N2_SOAK_D_STORE:-/mnt/NDISK003/$REMOTE_STORE_BASE/node-d}"
 
-A_HTTPS=56101; A_NATIVE=56102
-B_HTTPS=56111; B_NATIVE=56112
-C_HTTPS=56121; C_NATIVE=56122
-D_HTTPS=56131; D_NATIVE=56132
+A_HTTPS=24001; A_NATIVE=24002
+B_HTTPS=24011; B_NATIVE=24012
+C_HTTPS=24021; C_NATIVE=24022
+D_HTTPS=24031; D_NATIVE=24032
 A_BASE="https://$LOCAL_IP:$A_HTTPS"
 B_BASE="https://$LOCAL_IP:$B_HTTPS"
 C_BASE="https://$REMOTE_IP:$C_HTTPS"
@@ -68,13 +80,22 @@ CYCLE=0
 CHAOS_EVENTS=0
 RESULT="RUNNING"
 LAST_OPERATION="initializing"
+FAILURE_CLASS="unclassified"
+FAILURE_DETAIL=""
 
-SSH=(ssh -i "$SSH_IDENTITY_FILE" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$REMOTE_USER@$REMOTE_HOST")
-SCP=(scp -i "$SSH_IDENTITY_FILE" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8)
+if [[ "$ALL_LOCAL" != "true" ]]; then
+  SSH=(ssh -i "$SSH_IDENTITY_FILE" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$REMOTE_USER@$REMOTE_HOST")
+  SCP=(scp -i "$SSH_IDENTITY_FILE" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8)
+fi
 
-for tool in jq curl openssl pidstat sha256sum awk ssh scp dd; do
+for tool in jq curl openssl pidstat sha256sum awk dd; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
+if [[ "$ALL_LOCAL" != "true" ]]; then
+  for tool in ssh scp; do
+    command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
+  done
+fi
 [[ -x "$BIN" ]] || { echo "release binary is missing: $BIN" >&2; exit 1; }
 [[ "$DURATION_SECONDS" =~ ^[0-9]+$ && "$DURATION_SECONDS" -gt 0 ]]
 [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]]
@@ -82,6 +103,27 @@ done
 [[ "$NORMAL_UPLOAD_ATTEMPTS" =~ ^[0-9]+$ && "$NORMAL_UPLOAD_ATTEMPTS" -gt 0 ]]
 [[ "$HEAL_INITIAL_DELAY_SECONDS" =~ ^[0-9]+$ && "$HEAL_INITIAL_DELAY_SECONDS" -gt 0 ]]
 [[ "$HEAL_SCAN_INTERVAL_SECONDS" =~ ^[0-9]+$ && "$HEAL_SCAN_INTERVAL_SECONDS" -gt 0 ]]
+[[ "$HEAL_VERIFY_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$HEAL_VERIFY_TIMEOUT_SECONDS" -ge 180 ]]
+[[ "$HEAL_STATUS_POLL_SECONDS" =~ ^[0-9]+$ && "$HEAL_STATUS_POLL_SECONDS" -gt 0 ]]
+[[ "$HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS" -ge 120 ]]
+[[ "$CHAOS_START_PHASE" =~ ^[1-6]$ ]]
+
+assert_ports_available() {
+  local port
+  command -v ss >/dev/null || {
+    echo "missing required tool: ss" >&2
+    exit 1
+  }
+  for port in "$@"; do
+    if [[ -n "$(ss -H -ltn "sport = :$port")" ]]; then
+      echo "required N2 soak port is already in use: $port" >&2
+      exit 1
+    fi
+  done
+}
+assert_ports_available \
+  "$A_HTTPS" "$A_NATIVE" "$B_HTTPS" "$B_NATIVE" \
+  "$C_HTTPS" "$C_NATIVE" "$D_HTTPS" "$D_NATIVE"
 
 mkdir -p "$OUT" "$OUT/metrics" "$OUT/events" "$OUT/payloads"
 : > "$OUT/metrics/operations.jsonl"
@@ -90,8 +132,30 @@ mkdir -p "$OUT" "$OUT/metrics" "$OUT/events" "$OUT/payloads"
 : > "$OUT/events/lifecycle.jsonl"
 : > "$OUT/events/availability.jsonl"
 
-remote() { "${SSH[@]}" "$@"; }
-copy_remote() { "${SCP[@]}" "$@"; }
+remote() {
+  if [[ "$ALL_LOCAL" == "true" ]]; then
+    bash -lc "$*"
+  else
+    "${SSH[@]}" "$@"
+  fi
+}
+
+copy_remote() {
+  if [[ "$ALL_LOCAL" != "true" ]]; then
+    "${SCP[@]}" "$@"
+    return
+  fi
+
+  local args=("$@")
+  local last_index=$(( ${#args[@]} - 1 ))
+  local destination="${args[$last_index]}"
+  if [[ "${args[0]}" == *:* ]]; then
+    cp "${args[0]#*:}" "$destination"
+    return
+  fi
+  destination="${destination#*:}"
+  cp "${args[@]:0:$last_index}" "$destination"
+}
 
 write_status() {
   local state="$1" message="$2" now elapsed temporary
@@ -152,6 +216,43 @@ upload_with_retry() {
   return 1
 }
 
+multipart_upload() {
+  local operation="$1" base="$2" key="$3" file="$4" response="$5"
+  local bytes part_size expected_parts version session part part_file
+  local started_ns finished_ns seconds
+  bytes="$(stat -c%s "$file")"
+  part_size=67108864
+  expected_parts=$(( (bytes + part_size - 1) / part_size ))
+  part_file="$OUT/payloads/multipart-current.part"
+  started_ns="$(date +%s%N)"
+
+  curl_json -X POST "$base/noa/v1/upload/multipart/init/$key" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":$bytes,\"expected_parts\":$expected_parts,\"part_size_bytes\":$part_size}" \
+    >"$OUT/events/$operation-init.json"
+  version="$(jq -er '.version_id' "$OUT/events/$operation-init.json")"
+  session="$(jq -er '.session_id' "$OUT/events/$operation-init.json")"
+
+  for ((part = 0; part < expected_parts; part++)); do
+    dd if="$file" of="$part_file" bs="$part_size" skip="$part" count=1 status=none
+    curl_auth -X PUT "$base/noa/v1/upload/multipart/$version/$part" \
+      --data-binary @"$part_file" >"$OUT/events/$operation-part-$part.json"
+  done
+  rm -f "$part_file"
+
+  curl_json -X POST \
+    "$base/noa/v1/upload/multipart/$version/$session/finalize?object_key=$key" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":$bytes,\"expected_parts\":$expected_parts,\"part_size_bytes\":$part_size}" \
+    >"$response"
+  jq -e --arg version "$version" '.version_id == $version' "$response" >/dev/null
+
+  finished_ns="$(date +%s%N)"
+  seconds="$(awk -v start="$started_ns" -v finish="$finished_ns" \
+    'BEGIN { printf "%.9f", (finish - start) / 1000000000 }')"
+  metric "$operation" "$base" "$seconds" "$bytes"
+}
+
 kill_pidfile() {
   local pidfile="$1"
   if [[ -f "$pidfile" ]]; then
@@ -182,6 +283,7 @@ collect_remote_logs() {
 }
 
 remove_remote_authorized_key() {
+  [[ "$ALL_LOCAL" != "true" ]] || return 0
   [[ -n "$AUTHORIZED_KEY_TAG" ]] || return 0
   remote "set -e; file=\"\$HOME/.ssh/authorized_keys\"; tmp=\"\$file.n2-soak-$TS\"; if [ -f \"\$file\" ]; then grep -vF '$AUTHORIZED_KEY_TAG' \"\$file\" > \"\$tmp\" || true; chmod 600 \"\$tmp\"; mv \"\$tmp\" \"\$file\"; fi" >/dev/null 2>&1 || true
 }
@@ -200,9 +302,37 @@ cleanup() {
   kill_pidfile "$LOCAL_B/n2.pid"
   stop_remote_node "$REMOTE_C" >/dev/null 2>&1
   stop_remote_node "$REMOTE_D" >/dev/null 2>&1
-  remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'; rmdir '/mnt/NDISK002/$REMOTE_STORE_BASE' '/mnt/NDISK003/$REMOTE_STORE_BASE' 2>/dev/null || true" >/dev/null 2>&1
+  if [[ "$RESULT" == "PASS" ]]; then
+    rm -rf -- "$LOCAL_A_STORE" "$LOCAL_B_STORE"
+    rmdir "$(dirname "$LOCAL_A_STORE")" "$(dirname "$(dirname "$LOCAL_A_STORE")")" \
+      "$(dirname "$LOCAL_B_STORE")" "$(dirname "$(dirname "$LOCAL_B_STORE")")" \
+      2>/dev/null || true
+    remote "rm -rf '$REMOTE_RUN_BASE' '$REMOTE_C_STORE' '$REMOTE_D_STORE'; rmdir '/mnt/NDISK002/$REMOTE_STORE_BASE' '/mnt/NDISK003/$REMOTE_STORE_BASE' 2>/dev/null || true" >/dev/null 2>&1
+    remote "rmdir \
+      '$(dirname "$REMOTE_C_STORE")' '$(dirname "$(dirname "$REMOTE_C_STORE")")' \
+      '$(dirname "$REMOTE_D_STORE")' '$(dirname "$(dirname "$REMOTE_D_STORE")")' \
+      2>/dev/null || true" >/dev/null 2>&1
+  else
+    jq -n \
+      --arg result "$RESULT" \
+      --arg failure_class "$FAILURE_CLASS" \
+      --arg failure_detail "$FAILURE_DETAIL" \
+      --arg local_a "$LOCAL_A_STORE" \
+      --arg local_b "$LOCAL_B_STORE" \
+      --arg remote_c "$REMOTE_C_STORE" \
+      --arg remote_d "$REMOTE_D_STORE" \
+      --arg remote_runtime "$REMOTE_RUN_BASE" \
+      '{
+        result:$result,
+        failure_class:$failure_class,
+        failure_detail:$failure_detail,
+        evidence_preserved:true,
+        storage_roots:[$local_a,$local_b,$remote_c,$remote_d],
+        remote_runtime:$remote_runtime
+      }' >"$OUT/evidence-preserved.json" 2>/dev/null
+  fi
   remove_remote_authorized_key
-  if [[ "$REMOVE_IDENTITY_ON_EXIT" == "true" ]]; then
+  if [[ "$ALL_LOCAL" != "true" && "$REMOVE_IDENTITY_ON_EXIT" == "true" ]]; then
     rm -f "$SSH_IDENTITY_FILE" "$SSH_IDENTITY_FILE.pub"
   fi
 }
@@ -213,8 +343,19 @@ on_error() {
   RESULT="FAIL"
   LAST_OPERATION="failed"
   jq -n --argjson exit_code "$code" --argjson line "$line" \
-    --arg command "$command" --argjson cycle "$CYCLE" --argjson at "$(date +%s)" \
-    '{result:"FAIL",at_unix:$at,cycle:$cycle,exit_code:$exit_code,line:$line,command:$command}' \
+    --arg command "$command" --arg failure_class "$FAILURE_CLASS" \
+    --arg failure_detail "$FAILURE_DETAIL" \
+    --argjson cycle "$CYCLE" --argjson at "$(date +%s)" \
+    '{
+      result:"FAIL",
+      at_unix:$at,
+      cycle:$cycle,
+      exit_code:$exit_code,
+      line:$line,
+      command:$command,
+      failure_class:$failure_class,
+      failure_detail:$failure_detail
+    }' \
     > "$OUT/failure.json"
   write_status FAIL "invariant or harness command failed"
   exit "$code"
@@ -406,13 +547,76 @@ rename_key() {
   metric rename "$base" "$seconds" 0
 }
 
-trigger_healing() {
-  local base
+base_slug() {
+  printf '%s' "$1" | tr ':/' '_'
+}
+
+trigger_healing_node() {
+  local base="$1" slug body temporary http curl_code=0
+  slug="$(base_slug "$base")"
+  body="$OUT/events/healing-$slug.json"
+  temporary="$body.tmp"
+  http="$(curl -k --http1.1 --connect-timeout 5 \
+    --max-time "$HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS" -sS \
+    -o "$temporary" -w '%{http_code}' \
+    -X POST "$base/noa/v1/cluster/healing/cycle" \
+    -H "Authorization: Bearer $TOKEN")" || curl_code=$?
+  mv "$temporary" "$body" 2>/dev/null || true
+  printf '%s\n' "$http" >"$OUT/events/healing-$slug.http"
+  [[ "$curl_code" -eq 0 ]] || return 1
+  [[ "$http" =~ ^2[0-9][0-9]$ || "$http" == "409" ]]
+}
+
+trigger_healing_round() {
+  local base pid failed=0
+  local pids=()
   for base in "${BASES[@]}"; do
-    curl -k --http1.1 --connect-timeout 5 --max-time 180 -sS \
-      -o "$OUT/events/healing-$(printf '%s' "$base" | tr ':/' '_').json" \
-      -X POST "$base/noa/v1/cluster/healing/cycle" -H "Authorization: Bearer $TOKEN" || true
+    trigger_healing_node "$base" &
+    pids+=("$!")
   done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  if (( failed != 0 )); then
+    FAILURE_CLASS="healing_trigger_transport_failure"
+    FAILURE_DETAIL="one or more nodes did not return HTTP 2xx or 409 from the healing trigger"
+    return 1
+  fi
+}
+
+snapshot_healing_status() {
+  local base slug output temporary
+  for base in "${BASES[@]}"; do
+    slug="$(base_slug "$base")"
+    output="$OUT/events/healing-status-$slug.json"
+    temporary="$output.tmp"
+    curl_auth "$base/noa/v1/cluster/healing/status" >"$temporary"
+    mv "$temporary" "$output"
+  done
+}
+
+healing_running_count() {
+  local base slug count=0
+  for base in "${BASES[@]}"; do
+    slug="$(base_slug "$base")"
+    if jq -e '.running == true' "$OUT/events/healing-status-$slug.json" >/dev/null; then
+      count=$((count + 1))
+    fi
+  done
+  printf '%s\n' "$count"
+}
+
+wait_for_healing_idle() {
+  local deadline="$1" running
+  while (( $(date +%s) < deadline )); do
+    snapshot_healing_status
+    running="$(healing_running_count)"
+    (( running == 0 )) && return 0
+    sleep "$HEAL_STATUS_POLL_SECONDS"
+  done
+  FAILURE_CLASS="healing_cycle_timeout"
+  FAILURE_DETAIL="an accepted or already-running healing cycle exceeded the verification deadline"
+  return 1
 }
 
 ncnx_paths() {
@@ -425,18 +629,66 @@ shard_paths() {
   remote "find '$REMOTE_C_STORE' '$REMOTE_D_STORE' -path '*/$ANCHOR_VERSION/part_0_*' -type f" 2>/dev/null
 }
 
+distributed_path_count() {
+  local kind="$1"
+  if [[ "$kind" == "ncnx" ]]; then
+    ncnx_paths | wc -l | tr -d ' '
+  else
+    shard_paths | wc -l | tr -d ' '
+  fi
+}
+
 wait_for_path_count() {
-  local kind="$1" expected="$2" count
-  for _ in $(seq 1 60); do
-    if [[ "$kind" == "ncnx" ]]; then
-      count="$(ncnx_paths | wc -l | tr -d ' ')"
-    else
-      count="$(shard_paths | wc -l | tr -d ' ')"
-    fi
+  local kind="$1" expected="$2" timeout="${3:-30}" deadline count
+  deadline=$(( $(date +%s) + timeout ))
+  while (( $(date +%s) < deadline )); do
+    count="$(distributed_path_count "$kind")"
     [[ "$count" -eq "$expected" ]] && return 0
     sleep 0.5
   done
-  echo "$kind path count did not recover to $expected" >&2
+  FAILURE_CLASS="chaos_precondition_timeout"
+  FAILURE_DETAIL="$kind path count did not reach precondition $expected"
+  echo "$FAILURE_DETAIL" >&2
+  return 1
+}
+
+wait_for_healing_repair() {
+  local kind="$1" expected="$2" deadline count round=0
+  deadline=$(( $(date +%s) + HEAL_VERIFY_TIMEOUT_SECONDS ))
+  while (( $(date +%s) < deadline )); do
+    count="$(distributed_path_count "$kind")"
+    [[ "$count" -eq "$expected" ]] && return 0
+
+    wait_for_healing_idle "$deadline" || return 1
+    count="$(distributed_path_count "$kind")"
+    [[ "$count" -eq "$expected" ]] && return 0
+
+    round=$((round + 1))
+    event "$kind-healing" "round-$round" "triggering synchronized cluster healing"
+    trigger_healing_round || return 1
+    wait_for_healing_idle "$deadline" || return 1
+  done
+
+  count="$(distributed_path_count "$kind")"
+  FAILURE_CLASS="healing_verification_timeout"
+  FAILURE_DETAIL="$kind repair remained at $count/$expected paths after ${HEAL_VERIFY_TIMEOUT_SECONDS}s"
+  snapshot_healing_status 2>/dev/null || true
+  jq -s \
+    --arg kind "$kind" \
+    --arg detail "$FAILURE_DETAIL" \
+    --argjson expected "$expected" \
+    --argjson observed "$count" \
+    --argjson timeout_seconds "$HEAL_VERIFY_TIMEOUT_SECONDS" \
+    '{
+      failure_class:"healing_verification_timeout",
+      kind:$kind,
+      detail:$detail,
+      expected_paths:$expected,
+      observed_paths:$observed,
+      timeout_seconds:$timeout_seconds,
+      node_statuses:.
+    }' "$OUT"/events/healing-status-*.json >"$OUT/healing-timeout.json" 2>/dev/null || true
+  echo "$FAILURE_DETAIL" >&2
   return 1
 }
 
@@ -458,7 +710,7 @@ delete_one_distributed_path() {
 }
 
 run_chaos() {
-  local phase=$(( (CHAOS_EVENTS % 6) + 1 )) status
+  local phase=$(( ((CHAOS_START_PHASE - 1 + CHAOS_EVENTS) % 6) + 1 )) status
   CHAOS_EVENTS=$((CHAOS_EVENTS + 1))
   LAST_OPERATION="chaos-$phase"
   event "phase-$phase" started "bounded failure injection"
@@ -493,15 +745,13 @@ run_chaos() {
     4)
       wait_for_path_count ncnx 3
       delete_one_distributed_path ncnx
-      trigger_healing
-      wait_for_path_count ncnx 3
+      wait_for_healing_repair ncnx 3
       download_verify "$D_BASE" soak/anchor.bin "$ANCHOR_SHA" chaos-ncnx-heal-read
       ;;
     5)
       wait_for_path_count shard 4
       delete_one_distributed_path shard
-      trigger_healing
-      wait_for_path_count shard 4
+      wait_for_healing_repair shard 4
       download_verify "$B_BASE" soak/anchor.bin "$ANCHOR_SHA" chaos-shard-heal-read
       ;;
     6)
@@ -585,7 +835,8 @@ EOF
   dd if=/dev/urandom of="$OUT/payloads/current.bin" bs=1K count="$PAYLOAD_KIB" status=none
   dd if=/dev/urandom of="$OUT/payloads/small.bin" bs=4K count=1 status=none
   ANCHOR_SHA="$(sha256sum "$OUT/payloads/anchor.bin" | awk '{print $1}')"
-  upload_with_retry anchor-upload "$A_BASE" soak/anchor.bin "$OUT/payloads/anchor.bin" "$OUT/anchor-upload.json"
+  multipart_upload anchor-upload "$A_BASE" soak/anchor.bin \
+    "$OUT/payloads/anchor.bin" "$OUT/anchor-upload.json"
   ANCHOR_VERSION="$(jq -er '.version_id' "$OUT/anchor-upload.json")"
   download_verify "$D_BASE" soak/anchor.bin "$ANCHOR_SHA" anchor-download
 
@@ -728,17 +979,40 @@ finish_success() {
   jq -n \
     --arg result PASS --arg cluster_id "$CLUSTER_ID" --arg pool_id "$POOL_ID" \
     --arg fragment "$FRAGMENT" --arg stable_fragment_id "$STABLE_FRAGMENT" \
-    --arg topology 'four logical nodes on two physical hosts; static EC 2+2; NCNX R=3' \
+    --arg topology "$TOPOLOGY_LABEL" \
     --arg cycle_counter_semantics 'cycle zero is included' \
     --argjson started_at "$START_EPOCH" --argjson finished_at "$end" \
     --argjson requested_seconds "$DURATION_SECONDS" --argjson elapsed_seconds "$elapsed" \
     --argjson final_cycle "$CYCLE" --argjson chaos_events "$CHAOS_EVENTS" --argjson availability_events "$availability_events" \
+    --argjson chaos_start_phase "$CHAOS_START_PHASE" \
+    --argjson healing_verification_timeout_seconds "$HEAL_VERIFY_TIMEOUT_SECONDS" \
     --argjson suspicious_log_lines "$suspicious" --slurpfile operations "$OUT/metrics/summary.json" \
     --slurpfile monitor "$OUT/final-monitor.json" \
-    '{result:$result,cluster_id:$cluster_id,pool_id:$pool_id,fragment:$fragment,stable_fragment_id:$stable_fragment_id,topology:$topology,started_at_unix:$started_at,finished_at_unix:$finished_at,requested_seconds:$requested_seconds,elapsed_seconds:$elapsed_seconds,final_cycle:$final_cycle,cycle_counter_semantics:$cycle_counter_semantics,chaos_events:$chaos_events,availability_events:$availability_events,suspicious_log_lines:$suspicious_log_lines,operations:$operations[0],final_monitor:$monitor[0],hardware_cycle_counters:"unavailable when perf_event_paranoid blocks unprivileged counters"}' \
+    '{
+      result:$result,
+      cluster_id:$cluster_id,
+      pool_id:$pool_id,
+      fragment:$fragment,
+      stable_fragment_id:$stable_fragment_id,
+      topology:$topology,
+      started_at_unix:$started_at,
+      finished_at_unix:$finished_at,
+      requested_seconds:$requested_seconds,
+      elapsed_seconds:$elapsed_seconds,
+      final_cycle:$final_cycle,
+      cycle_counter_semantics:$cycle_counter_semantics,
+      chaos_events:$chaos_events,
+      chaos_start_phase:$chaos_start_phase,
+      healing_verification_timeout_seconds:$healing_verification_timeout_seconds,
+      availability_events:$availability_events,
+      suspicious_log_lines:$suspicious_log_lines,
+      operations:$operations[0],
+      final_monitor:$monitor[0],
+      hardware_cycle_counters:"unavailable when perf_event_paranoid blocks unprivileged counters"
+    }' \
     > "$OUT/summary.json"
   RESULT="PASS"
-  write_status PASS "12-hour soak and chaos invariants passed"
+  write_status PASS "requested soak and chaos invariants passed"
 }
 
 write_status RUNNING "initializing isolated four-node cluster"

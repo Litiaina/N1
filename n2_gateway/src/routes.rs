@@ -5,11 +5,13 @@ use axum::http::{HeaderMap, HeaderName, Method, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use futures_util::future::join_all;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message as UpstreamWsMessage;
 use tokio_util::io::ReaderStream;
@@ -51,6 +53,7 @@ pub fn router(state: GatewayState) -> Router {
             "/noa/v1/upload/multipart/init/{*object_key}",
             post(multipart_init),
         )
+        .route("/noa/v1/upload/multipart", get(multipart_list))
         .route(
             "/noa/v1/upload/multipart/{version_id}/{part_index}",
             put(multipart_put_part),
@@ -422,6 +425,209 @@ async fn multipart_init(
         });
     }
     json_response(status, body)
+}
+
+async fn multipart_list(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    let bearer = match bearer_from_headers(&headers) {
+        Ok(value) => value,
+        Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
+    };
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(100);
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let per_node_target = offset.saturating_add(limit);
+    let nodes = state.nodes.available_configs().await;
+    if nodes.is_empty() {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway has no available N2 nodes",
+        );
+    }
+
+    let results = join_all(nodes.into_iter().map(|node| {
+        let bearer = bearer.clone();
+        let http = state.http.clone();
+        async move {
+            let result =
+                list_multipart_sessions_on_node(&http, &node, &bearer, per_node_target).await;
+            (node, result)
+        }
+    }))
+    .await;
+
+    let mut sessions = Vec::new();
+    let mut total = 0usize;
+    let mut successful_nodes = 0usize;
+    let mut unavailable_nodes = Vec::new();
+    for (node, result) in results {
+        match result {
+            Ok((mut node_sessions, node_total)) => {
+                successful_nodes += 1;
+                total = total.saturating_add(node_total);
+                for session in &mut node_sessions {
+                    if let Some(object) = session.as_object_mut() {
+                        object.insert(
+                            "coordinator_node_id".to_string(),
+                            Value::String(node.id.clone()),
+                        );
+                    }
+                }
+                sessions.extend(node_sessions);
+            }
+            Err(MultipartListNodeError::Authorization(err)) => {
+                return text_response(StatusCode::UNAUTHORIZED, err);
+            }
+            Err(MultipartListNodeError::Unavailable(err)) => {
+                state.nodes.mark_failure(&node.id).await;
+                unavailable_nodes.push(json!({
+                    "node_id": node.id,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    if successful_nodes == 0 {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway could not query active uploads from any N2 node",
+        );
+    }
+
+    sessions.sort_by(|left, right| {
+        session_created_at(right)
+            .cmp(&session_created_at(left))
+            .then_with(|| {
+                session_string(left, "version_id").cmp(session_string(right, "version_id"))
+            })
+            .then_with(|| {
+                session_string(left, "session_id").cmp(session_string(right, "session_id"))
+            })
+            .then_with(|| {
+                session_string(left, "coordinator_node_id")
+                    .cmp(session_string(right, "coordinator_node_id"))
+            })
+    });
+    let sessions = sessions
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    json_response(
+        200,
+        json!({
+            "sessions": sessions,
+            "total": total,
+            "partial": !unavailable_nodes.is_empty(),
+            "queried_nodes": successful_nodes,
+            "unavailable_nodes": unavailable_nodes,
+        }),
+    )
+}
+
+enum MultipartListNodeError {
+    Authorization(String),
+    Unavailable(String),
+}
+
+async fn list_multipart_sessions_on_node(
+    http: &reqwest::Client,
+    node: &NodeConfig,
+    bearer: &str,
+    target: usize,
+) -> Result<(Vec<Value>, usize), MultipartListNodeError> {
+    let mut sessions = Vec::new();
+    let mut total = 0usize;
+    let mut node_offset = 0usize;
+
+    loop {
+        let remaining = target.saturating_sub(sessions.len());
+        let page_limit = remaining.min(100);
+        let response = http
+            .get(format!(
+                "{}/noa/v1/upload/multipart",
+                node.http_url.trim_end_matches('/')
+            ))
+            .bearer_auth(bearer)
+            .query(&[("limit", page_limit), ("offset", node_offset)])
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|err| {
+                MultipartListNodeError::Unavailable(format!(
+                    "node {} active-upload listing failed: {}",
+                    node.id, err
+                ))
+            })?;
+        let status = response.status();
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(MultipartListNodeError::Authorization(format!(
+                "node {} rejected the bearer token",
+                node.id
+            )));
+        }
+        if !status.is_success() {
+            return Err(MultipartListNodeError::Unavailable(format!(
+                "node {} active-upload listing returned HTTP {}",
+                node.id, status
+            )));
+        }
+        let body = response.json::<Value>().await.map_err(|err| {
+            MultipartListNodeError::Unavailable(format!(
+                "node {} returned an invalid active-upload response: {}",
+                node.id, err
+            ))
+        })?;
+
+        total = body
+            .get("total")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(total);
+        let page = body
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                MultipartListNodeError::Unavailable(format!(
+                    "node {} returned an invalid active-upload response",
+                    node.id
+                ))
+            })?;
+        let page_len = page.len();
+        sessions.extend(page.iter().cloned());
+        node_offset = node_offset.saturating_add(page_len);
+
+        if target == 0 || page_len == 0 || sessions.len() >= target || node_offset >= total {
+            break;
+        }
+    }
+
+    Ok((sessions, total))
+}
+
+fn session_created_at(session: &Value) -> i64 {
+    session
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+}
+
+fn session_string<'a>(session: &'a Value, field: &str) -> &'a str {
+    session
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 async fn cluster_rebalance_start(
@@ -979,11 +1185,37 @@ mod tests {
     use tower::ServiceExt;
 
     struct MockNativeNode {
+        http_url: String,
         native_url: String,
         operations: Arc<Mutex<Vec<String>>>,
     }
 
     async fn spawn_mock_native_node(node_id: &'static str) -> MockNativeNode {
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_url = format!("http://{}", http_listener.local_addr().unwrap());
+        let http_app = Router::new().route(
+            "/noa/v1/upload/multipart",
+            get(move || async move {
+                Json(json!({
+                    "sessions": [{
+                        "session_id": format!("session-{node_id}"),
+                        "version_id": format!("version-{node_id}"),
+                        "object_key": format!("uploads/{node_id}.bin"),
+                        "created_at": if node_id == "node-a" { 2 } else { 1 },
+                        "reserved_size": 0,
+                        "total_size_bytes": 1024,
+                        "expected_parts": 1,
+                        "committed_parts": 0,
+                        "committed_bytes": 0
+                    }],
+                    "total": 1
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(http_listener, http_app).await.unwrap();
+        });
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let native_url = format!("n2://{}", listener.local_addr().unwrap());
         let operations = Arc::new(Mutex::new(Vec::new()));
@@ -1000,6 +1232,7 @@ mod tests {
             }
         });
         MockNativeNode {
+            http_url,
             native_url,
             operations,
         }
@@ -1160,13 +1393,13 @@ mod tests {
         let state = GatewayState::new(gateway_config(vec![
             NodeConfig {
                 id: "node-a".to_string(),
-                http_url: "https://127.0.0.1:51001".to_string(),
+                http_url: node_a.http_url.clone(),
                 native_url: node_a.native_url.clone(),
                 weight: 1,
             },
             NodeConfig {
                 id: "node-b".to_string(),
-                http_url: "https://127.0.0.1:51003".to_string(),
+                http_url: node_b.http_url.clone(),
                 native_url: node_b.native_url.clone(),
                 weight: 1,
             },
@@ -1203,6 +1436,101 @@ mod tests {
         assert_eq!(body["coordinator_node_id"], "node-a");
         assert_eq!(body["gateway"]["route_only"], true);
         assert_eq!(body["gateway"]["resumability_owner"], "client");
+    }
+
+    #[tokio::test]
+    async fn multipart_list_aggregates_coordinators_with_global_pagination() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/noa/v1/upload/multipart?limit=100")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["queried_nodes"], 2);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(body["sessions"][0]["coordinator_node_id"], "node-a");
+        assert_eq!(body["sessions"][0]["object_key"], "uploads/node-a.bin");
+        assert_eq!(body["sessions"][1]["coordinator_node_id"], "node-b");
+        assert_eq!(body["sessions"][1]["object_key"], "uploads/node-b.bin");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/noa/v1/upload/multipart?limit=1&offset=1")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(body["sessions"][0]["coordinator_node_id"], "node-b");
+    }
+
+    #[tokio::test]
+    async fn multipart_list_returns_truthful_partial_result_when_one_node_is_unavailable() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_url = format!("http://{}", unavailable_listener.local_addr().unwrap());
+        drop(unavailable_listener);
+        let state = GatewayState::new(gateway_config(vec![
+            NodeConfig {
+                id: "node-a".to_string(),
+                http_url: node_a.http_url.clone(),
+                native_url: node_a.native_url.clone(),
+                weight: 1,
+            },
+            NodeConfig {
+                id: "node-b".to_string(),
+                http_url: unavailable_url,
+                native_url: node_b.native_url.clone(),
+                weight: 1,
+            },
+        ]))
+        .await
+        .unwrap();
+        state.nodes.mark_online_for_test("node-a", 1).await;
+        state.nodes.mark_online_for_test("node-b", 1).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/noa/v1/upload/multipart?limit=100")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["queried_nodes"], 1);
+        assert_eq!(body["partial"], true);
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(body["sessions"][0]["coordinator_node_id"], "node-a");
+        assert_eq!(body["unavailable_nodes"][0]["node_id"], "node-b");
     }
 
     #[tokio::test]

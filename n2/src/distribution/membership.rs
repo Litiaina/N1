@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
+use ulid::Ulid;
 
 const CLUSTER_NODE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
 pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 5;
@@ -718,6 +719,37 @@ fn physical_root_sets_match(configured: &[StorageRoot], bound: &[StorageRoot]) -
     configured == bound
 }
 
+fn resolve_startup_local_binding(
+    membership: &ClusterMembership,
+    instance_id: &str,
+) -> Result<(String, String, bool, Vec<StorageRoot>), AppError> {
+    if let Some(binding) = membership.node_for_instance(instance_id) {
+        let pool = membership.pool_for_node(&binding.id).ok_or_else(|| {
+            AppError::Conflict(format!(
+                "local logical slot '{}' is not assigned to a server pool",
+                binding.id
+            ))
+        })?;
+        return Ok((
+            binding.id.clone(),
+            pool.id.clone(),
+            false,
+            binding.storage_roots.clone(),
+        ));
+    }
+    if let Some(reserve) = membership.reserve(instance_id) {
+        return Ok((
+            instance_id.to_string(),
+            String::new(),
+            true,
+            reserve.storage_roots.clone(),
+        ));
+    }
+    Err(AppError::Conflict(format!(
+        "physical instance '{instance_id}' has no active or reserve membership"
+    )))
+}
+
 fn local_membership(
     node_id: &str,
     pool_id: &str,
@@ -871,7 +903,11 @@ pub fn write_membership(path: &Path, membership: &ClusterMembership) -> Result<(
     }
     let bytes = serde_json::to_vec_pretty(membership)
         .map_err(|e| AppError::InternalServerError(format!("encode N2 membership file: {e}")))?;
-    let temp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // Promotion/reconciliation tasks can publish the same local membership
+    // concurrently. A process-only suffix lets one task rename another task's
+    // temporary file. Keep each atomic publisher independent without adding a
+    // lock to the membership fast path.
+    let temp = path.with_extension(format!("tmp.{}.{}", std::process::id(), Ulid::new()));
     {
         use std::io::Write;
         let mut file = fs::OpenOptions::new()
@@ -993,29 +1029,18 @@ pub fn init_cluster_runtime(
         data_shards: write_policy.object_data_shards,
         parity_shards: write_policy.object_parity_shards,
     };
-    let (local_node_id, local_pool_id, local_is_reserve) =
-        if let Some(binding) = membership.node_for_instance(&node_id) {
-            let pool = membership.pool_for_node(&binding.id).ok_or_else(|| {
-                AppError::Conflict(format!(
-                    "local logical slot '{}' is not assigned to a server pool",
-                    binding.id
-                ))
-            })?;
-            (binding.id.clone(), pool.id.clone(), false)
-        } else if membership.reserve(&node_id).is_some() {
-            (node_id.clone(), String::new(), true)
-        } else {
-            return Err(AppError::Conflict(format!(
-                "physical instance '{}' has no active or reserve membership",
-                node_id
-            )));
-        };
+    let (local_node_id, local_pool_id, local_is_reserve, runtime_storage_roots) =
+        resolve_startup_local_binding(&membership, &node_id)?;
     let runtime = Arc::new(ClusterRuntime {
         local_node_id,
         local_instance_id: node_id,
         local_is_reserve,
         local_pool_id,
-        local_storage_roots: local_storage_roots.to_vec(),
+        // A promoted reserve keeps its physical device but inherits the
+        // replaced slot's logical root IDs. Reload those recorded IDs after a
+        // restart so peer placement validation remains identical to the live
+        // promotion path.
+        local_storage_roots: runtime_storage_roots,
         membership_path,
         layout_policy,
         membership,
@@ -1206,6 +1231,58 @@ mod tests {
     }
 
     #[test]
+    fn promoted_reserve_restart_restores_the_logical_slot_roots() {
+        let promoted_root = StorageRoot {
+            id: "logical-root-a".into(),
+            physical_id: Some("reserve-device".into()),
+            path: "/disk-reserve".into(),
+        };
+        let membership = ClusterMembership {
+            format_version: N2_MEMBERSHIP_FORMAT_VERSION,
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            binding_epoch: 2,
+            pools: vec![ServerPool {
+                id: "pool-a".into(),
+                generation: 1,
+                policy: ClusterPolicy {
+                    object_data_shards: 1,
+                    object_parity_shards: 1,
+                },
+                state: PoolState::Writable,
+                node_ids: vec!["slot-a".into(), "slot-b".into()],
+            }],
+            nodes: vec![
+                ClusterNode {
+                    id: "slot-a".into(),
+                    instance_id: "reserve-instance".into(),
+                    binding_epoch: 2,
+                    endpoint: "https://reserve:51001".into(),
+                    native_endpoint: Some("n2://reserve:51002".into()),
+                    state: Some(NodeState::Online),
+                    weight: 1,
+                    storage_roots: vec![promoted_root.clone()],
+                    joined_epoch: 1,
+                    capacity_bytes: None,
+                    used_bytes: None,
+                    last_seen_unix: None,
+                },
+                node("slot-b"),
+            ],
+            reserve_nodes: Vec::new(),
+            retired_instances: Vec::new(),
+        };
+
+        let (slot_id, pool_id, is_reserve, roots) =
+            resolve_startup_local_binding(&membership, "reserve-instance")
+                .expect("promoted reserve binding must resolve");
+        assert_eq!(slot_id, "slot-a");
+        assert_eq!(pool_id, "pool-a");
+        assert!(!is_reserve);
+        assert_eq!(roots, vec![promoted_root]);
+    }
+
+    #[test]
     fn rejects_node_assigned_to_two_pools() {
         let policy = ClusterPolicy {
             object_data_shards: 1,
@@ -1237,5 +1314,62 @@ mod tests {
             retired_instances: Vec::new(),
         };
         assert!(membership.validate().is_err());
+    }
+
+    #[test]
+    fn concurrent_membership_publishers_use_independent_atomic_files() {
+        let root = std::env::temp_dir().join(format!("n2-membership-concurrency-{}", Ulid::new()));
+        let path = Arc::new(root.join("n2_membership.json"));
+        let policy = ClusterPolicy {
+            object_data_shards: 1,
+            object_parity_shards: 1,
+        };
+        let membership = ClusterMembership {
+            format_version: N2_MEMBERSHIP_FORMAT_VERSION,
+            cluster_id: "concurrent-cluster".into(),
+            epoch: 1,
+            binding_epoch: 1,
+            pools: vec![ServerPool {
+                id: "pool-a".into(),
+                generation: 1,
+                policy,
+                state: PoolState::Writable,
+                node_ids: vec!["a".into(), "b".into()],
+            }],
+            nodes: vec![node("a"), node("b")],
+            reserve_nodes: Vec::new(),
+            retired_instances: Vec::new(),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let writers = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let membership = membership.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_membership(&path, &membership)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for writer in writers {
+            writer
+                .join()
+                .expect("membership writer must not panic")
+                .expect("concurrent membership publish must succeed");
+        }
+
+        let persisted: ClusterMembership =
+            serde_json::from_slice(&fs::read(&*path).expect("read published membership"))
+                .expect("decode published membership");
+        persisted.validate().expect("published membership is valid");
+        let leftovers = fs::read_dir(&root)
+            .expect("read membership directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != "n2_membership.json")
+            .count();
+        assert_eq!(leftovers, 0, "atomic membership temp files must not remain");
+        fs::remove_dir_all(root).expect("remove membership test directory");
     }
 }

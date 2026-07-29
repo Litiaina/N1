@@ -207,12 +207,20 @@ pub async fn scan_and_repair_fragment_objects(
                 continue;
             }
 
-            let healthy =
-                after.status == "healthy" && after.failed_repairs == 0 && metadata_repair.healthy;
+            let shards_healthy = after.status == "healthy" && after.failed_repairs == 0;
+            let metadata_verification_deferred =
+                shards_healthy && metadata_only_temporarily_unavailable(&metadata_repair);
+            let healthy = shards_healthy && metadata_repair.healthy;
             if healthy {
                 result.repaired_objects = result.repaired_objects.saturating_add(1);
                 result.repaired_shards =
                     result.repaired_shards.saturating_add(after.repaired_shards);
+            } else if metadata_verification_deferred {
+                // A peer disappearing during a scan is not evidence that its
+                // immutable NCDX replica disappeared. Leave the object for a
+                // later cycle without converting transport loss into a
+                // cluster-wide safety incident.
+                result.failed_objects = result.failed_objects.saturating_add(1);
             } else {
                 result.unrecoverable_objects = result.unrecoverable_objects.saturating_add(1);
             }
@@ -227,7 +235,12 @@ pub async fn scan_and_repair_fragment_objects(
                 Some(&after),
                 &metadata_repair,
                 (!healthy).then(|| {
-                    if !metadata_repair.healthy {
+                    if metadata_verification_deferred {
+                        "exact NCDX verification was deferred because a participant was \
+                         temporarily unavailable; transport unavailability is not proof of \
+                         metadata loss"
+                            .into()
+                    } else if !metadata_repair.healthy {
                         "one or more exact NCDX replicas remain missing or divergent".into()
                     } else {
                         format!("object remained {} after repair", after.status)
@@ -307,6 +320,20 @@ async fn object_reference_still_exists(
     Ok(false)
 }
 
+fn metadata_only_temporarily_unavailable(
+    metadata: &crate::distribution::peer::MetadataReplicaRepairOutcome,
+) -> bool {
+    let mut unavailable = false;
+    for observation in &metadata.observations {
+        match observation.status.as_str() {
+            "unavailable" => unavailable = true,
+            "missing" | "divergent" => return false,
+            _ => {}
+        }
+    }
+    !metadata.healthy && unavailable
+}
+
 fn object_repair_report(
     runtime: &ClusterRuntime,
     fragment: &str,
@@ -319,28 +346,41 @@ fn object_repair_report(
     metadata: &crate::distribution::peer::MetadataReplicaRepairOutcome,
     reason: Option<String>,
 ) -> AutoHealingReport {
-    let healthy = after.is_some_and(|after| after.status == "healthy" && after.failed_repairs == 0)
-        && metadata.healthy;
+    let shards_healthy =
+        after.is_some_and(|after| after.status == "healthy" && after.failed_repairs == 0);
+    let metadata_verification_deferred =
+        shards_healthy && metadata_only_temporarily_unavailable(metadata);
+    let healthy = shards_healthy && metadata.healthy;
     let mut report = AutoHealingReport::new(
         scan_id,
         runtime.membership.epoch,
         fragment,
         &runtime.local_node_id,
-        "object_degraded",
+        if metadata_verification_deferred {
+            "object_metadata_verification_incomplete"
+        } else {
+            "object_degraded"
+        },
         "object",
     );
     report.object_id = Some(object_id.into());
     report.version_id = Some(version_id.into());
     report.logical_path = logical_path;
-    report.initial_status = before.status.clone();
+    report.initial_status = if metadata_verification_deferred {
+        "incomplete".into()
+    } else {
+        before.status.clone()
+    };
     report.repair_attempted = true;
     report.repair_outcome = if healthy {
         "repair_succeeded"
+    } else if metadata_verification_deferred {
+        "deferred_topology_incomplete"
     } else {
         "repair_failed"
     }
     .into();
-    report.cluster_read_only_triggered = !healthy;
+    report.cluster_read_only_triggered = !healthy && !metadata_verification_deferred;
     report.object_health_before = Some(json!(before));
     report.object_health_after = after.map(|status| json!(status));
     report.observations = metadata
@@ -507,4 +547,47 @@ fn now_nanos() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or_else(|| chrono::Utc::now().timestamp().saturating_mul(1_000_000_000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distribution::peer::{MetadataReplicaObservation, MetadataReplicaRepairOutcome};
+
+    fn metadata_outcome(statuses: &[&str], healthy: bool) -> MetadataReplicaRepairOutcome {
+        MetadataReplicaRepairOutcome {
+            expected_replicas: statuses.len(),
+            repaired_replicas: 0,
+            healthy,
+            observations: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| MetadataReplicaObservation {
+                    node_id: format!("node-{index}"),
+                    status: (*status).into(),
+                    error: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn transient_metadata_transport_loss_is_not_immutable_loss() {
+        let outcome = metadata_outcome(&["healthy", "healthy", "healthy", "unavailable"], false);
+        assert!(metadata_only_temporarily_unavailable(&outcome));
+    }
+
+    #[test]
+    fn proven_missing_or_divergent_metadata_is_not_deferred() {
+        let missing = metadata_outcome(&["healthy", "healthy", "missing"], false);
+        let divergent = metadata_outcome(&["healthy", "unavailable", "divergent"], false);
+        assert!(!metadata_only_temporarily_unavailable(&missing));
+        assert!(!metadata_only_temporarily_unavailable(&divergent));
+    }
+
+    #[test]
+    fn healthy_metadata_is_not_deferred() {
+        let outcome = metadata_outcome(&["healthy", "healthy", "healthy"], true);
+        assert!(!metadata_only_temporarily_unavailable(&outcome));
+    }
 }

@@ -84,9 +84,13 @@ pub async fn scan_and_repair_fragment_namespace(
                                 .push(name.logical_key.clone());
                         }
                         if outcome.degraded {
+                            let verification_deferred = ncnx_only_temporarily_unavailable(&outcome);
                             if outcome.healthy {
                                 result.repaired_records = result.repaired_records.saturating_add(1);
-                            } else if !outcome.deferred_by_trash {
+                            } else if !outcome.deferred_by_trash || verification_deferred {
+                                // An incomplete transport view must prevent
+                                // headless classification, but it is not proof
+                                // that an immutable namespace replica is lost.
                                 result.complete = false;
                             }
                             result
@@ -127,6 +131,20 @@ pub async fn scan_and_repair_fragment_namespace(
         }
     }
     result
+}
+
+fn ncnx_only_temporarily_unavailable(
+    outcome: &crate::distribution::ncnx::NcnxRepairOutcome,
+) -> bool {
+    let mut unavailable = false;
+    for observation in &outcome.observations {
+        match observation.status.as_str() {
+            "unavailable" => unavailable = true,
+            "missing" | "divergent" | "corrupt" => return false,
+            _ => {}
+        }
+    }
+    !outcome.healthy && unavailable
 }
 
 fn is_all_replicas_unreadable(error: &AppError) -> bool {
@@ -171,12 +189,19 @@ fn repair_report(
     name: &PeerNcnxName,
     outcome: crate::distribution::ncnx::NcnxRepairOutcome,
 ) -> AutoHealingReport {
+    let verification_deferred = ncnx_only_temporarily_unavailable(&outcome);
     let mut report = AutoHealingReport::new(
         scan_id,
         runtime.membership.epoch,
         fragment,
         &runtime.local_node_id,
-        if name.trash.is_some() {
+        if verification_deferred {
+            if name.trash.is_some() {
+                "trash_ncnx_verification_incomplete"
+            } else {
+                "live_ncnx_verification_incomplete"
+            }
+        } else if name.trash.is_some() {
             "trash_ncnx_degraded"
         } else {
             "live_ncnx_degraded"
@@ -195,25 +220,44 @@ fn repair_report(
     report.logical_path = Some(name.logical_key.clone());
     report.expected_ncnx_layout = Some(outcome.layout);
     report.repair_attempted = !outcome.deferred_by_trash;
+    report.initial_status = if verification_deferred {
+        "incomplete".into()
+    } else {
+        "degraded".into()
+    };
     report.repair_outcome = if outcome.healthy {
         "repair_succeeded"
     } else if outcome.deferred_by_trash {
         "deferred_by_trash_tombstone"
+    } else if verification_deferred {
+        "deferred_topology_incomplete"
     } else {
         "repair_failed"
     }
     .into();
-    report.cluster_read_only_triggered = !outcome.healthy && !outcome.deferred_by_trash;
+    report.cluster_read_only_triggered =
+        !outcome.healthy && !outcome.deferred_by_trash && !verification_deferred;
     report.repaired_replicas = outcome.repaired_replicas;
     report.observations = outcome
         .observations
         .iter()
         .map(|observation| json!(observation))
         .collect();
-    report.reason = outcome.deferred_by_trash.then(|| {
-        "a matching trash tombstone exists; live replica repair was skipped to prevent deletion resurrection"
-            .into()
-    });
+    report.reason = if outcome.deferred_by_trash {
+        Some(
+            "a matching trash tombstone exists; live replica repair was skipped to prevent \
+             deletion resurrection"
+                .into(),
+        )
+    } else if verification_deferred {
+        Some(
+            "NCNX verification was deferred because a replica participant was temporarily \
+             unavailable; transport unavailability is not proof of namespace loss"
+                .into(),
+        )
+    } else {
+        None
+    };
     report.completed_at_unix_nanos = now_nanos();
     report
 }
@@ -283,6 +327,40 @@ fn now_nanos() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distribution::ncnx::{
+        NcnxLayout, NcnxRepairOutcome, NcnxReplica, NcnxReplicaObservation,
+    };
+
+    fn outcome(statuses: &[&str], healthy: bool) -> NcnxRepairOutcome {
+        NcnxRepairOutcome {
+            layout: NcnxLayout {
+                pool_id: "pool-a".into(),
+                pool_generation: 1,
+                replicas: vec![NcnxReplica {
+                    node_id: "node-a".into(),
+                    instance_id: "node-a".into(),
+                    binding_epoch: 1,
+                    root_id: "root-a".into(),
+                    endpoint: "https://node-a".into(),
+                }],
+            },
+            located: None,
+            observations: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| NcnxReplicaObservation {
+                    node_id: format!("node-{index}"),
+                    root_id: format!("root-{index}"),
+                    status: (*status).into(),
+                    error: None,
+                })
+                .collect(),
+            degraded: !healthy,
+            repaired_replicas: 0,
+            healthy,
+            deferred_by_trash: false,
+        }
+    }
 
     #[test]
     fn only_exact_all_replica_unreadable_conflicts_are_revalidated() {
@@ -295,5 +373,23 @@ mod tests {
         assert!(!is_all_replicas_unreadable(&AppError::ServiceUnavailable(
             "node unavailable".into()
         )));
+    }
+
+    #[test]
+    fn transient_ncnx_transport_loss_is_not_namespace_loss() {
+        assert!(ncnx_only_temporarily_unavailable(&outcome(
+            &["healthy", "healthy", "unavailable"],
+            false,
+        )));
+    }
+
+    #[test]
+    fn missing_divergent_or_corrupt_ncnx_is_not_deferred() {
+        for status in ["missing", "divergent", "corrupt"] {
+            assert!(!ncnx_only_temporarily_unavailable(&outcome(
+                &["healthy", status],
+                false,
+            )));
+        }
     }
 }

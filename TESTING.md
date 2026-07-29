@@ -29,7 +29,7 @@ The N2 3.3 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test -p n2 --all-targets`: 140 passed;
+- `cargo test -p n2 --all-targets`: 148 passed;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
@@ -39,6 +39,17 @@ capacity rejection, stale-target fencing, SHA-256 NCNX/object-NCDX/shard
 integrity, corrupted block reconstruction, canonical-list refill,
 replica-backed degraded listing, exact static placement, exact metadata
 visibility, copy/delete restart semantics, and object/healing invariants.
+
+The node-churn regression proof for the fixes released as N2 3.3.1 completed
+12 workload cycles and 11 bounded chaos events against one four-node `2 + 2`
+server pool. It exercised node restart, NCNX replica loss and healing, shard
+loss and healing, one-node and parity-count availability boundaries, and
+rolling restart. The result was `PASS` with zero availability failures, zero
+suspicious log lines, and no safety read-only marker:
+
+```text
+/home/administrator/DEV-TEST/n2-3.3-restart-healing-proof2-20260729-090038
+```
 
 The format-v5 installer dry-run passed node-only, gateway-only, and combined
 installation:
