@@ -59,7 +59,7 @@ use crate::distribution::upload::{
 };
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::io_control::upload_sha256_checksum;
+use crate::io_control::{record_io_latency, upload_sha256_checksum};
 use crate::middleware::auth_middleware::{
     authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
@@ -358,7 +358,15 @@ pub(crate) async fn commit_logical_upload_from_meta(
     physical_object_id: &str,
     metadata: &crate::core::disk_manager::ObjectMetadata,
 ) -> Result<String, AppError> {
-    commit_upload_pointer(fragment, logical_path, physical_object_id, metadata).await
+    let started = std::time::Instant::now();
+    let result = commit_upload_pointer(fragment, logical_path, physical_object_id, metadata).await;
+    record_io_latency(
+        "cluster.upload.publish_ncnx",
+        started.elapsed(),
+        metadata.total_size_bytes,
+        result.is_ok(),
+    );
+    result
 }
 
 pub(crate) fn emit_logical_file_uploaded(
@@ -1190,12 +1198,14 @@ async fn finalize_object_upload_scoped(
         .as_ref()
         .map(|value| value.logical_path.clone())
         .unwrap_or(key_query.object_key);
-    let committed_physical =
-        commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed)
-            .await?;
-    global_namespace_runtime()
-        .clear_pending_upload(&parsed.fragment, &parsed.version_id)
-        .await?;
+    let committed_physical = commit_logical_upload_from_meta(
+        &parsed.fragment,
+        &logical_path,
+        &parsed.object_key,
+        &parsed,
+    )
+    .await?;
+    index::remove_session(&parsed.fragment, &parsed.version_id, "finalized").await?;
     parsed.object_key = logical_path;
     emit_logical_file_uploaded(
         &state,

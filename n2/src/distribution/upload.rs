@@ -24,6 +24,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures_util::Stream;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -206,6 +207,24 @@ fn validate_pinned_upload_layout(
     Ok(())
 }
 
+fn configured_write_context() -> Result<
+    (
+        std::sync::Arc<crate::distribution::membership::ClusterRuntime>,
+        ClusterEcLayout,
+    ),
+    AppError,
+> {
+    crate::core::operation_gate::ensure_client_mutation_allowed()?;
+    let runtime = active_cluster_runtime()?;
+    if runtime.membership.newest_writable_pool().is_none() {
+        return Err(AppError::ServiceUnavailable(
+            "cluster has no writable server pool".into(),
+        ));
+    }
+    let layout = configured_layout(&runtime)?;
+    Ok((runtime, layout))
+}
+
 async fn current_write_context() -> Result<
     (
         std::sync::Arc<crate::distribution::membership::ClusterRuntime>,
@@ -214,15 +233,23 @@ async fn current_write_context() -> Result<
     ),
     AppError,
 > {
-    crate::core::operation_gate::ensure_client_mutation_allowed()?;
-    let runtime = active_cluster_runtime()?;
+    let (runtime, layout) = configured_write_context()?;
     let active = live_newest_pool_write_nodes(&runtime).await;
-    let layout = resolve_write_layout(
+    let live_layout = resolve_write_layout(
         active.len(),
         runtime.membership.active_newest_pool_nodes().len(),
         &runtime.layout_policy,
     )
     .map_err(AppError::ServiceUnavailable)?;
+    if live_layout != layout {
+        return Err(AppError::ServiceUnavailable(format!(
+            "live N2 layout {}+{} does not match configured {}+{}",
+            live_layout.data_shards,
+            live_layout.parity_shards,
+            layout.data_shards,
+            layout.parity_shards
+        )));
+    }
     validate_write_admission(&runtime, active.len(), active.len(), layout)?;
     Ok((runtime, active, layout))
 }
@@ -505,7 +532,14 @@ where
     let stripe_data_width = block_size as u64 * data_shards as u64;
     let stripe_count = content_length.div_ceil(stripe_data_width.max(1));
     let final_shard_len = stripe_count.saturating_mul(block_size as u64);
+    let open_started = Instant::now();
     let writers = open_writers_for_plan(&placement, part_index, final_shard_len).await?;
+    record_io_latency(
+        "cluster.upload.open_writers",
+        open_started.elapsed(),
+        0,
+        true,
+    );
     let mut stream_writer = ErasureStreamWriter::new(
         writers,
         data_shards,
@@ -547,20 +581,32 @@ where
     let shard_block_checksums = stream_writer.get_shard_block_checksums();
     let total_checksum = stream_writer.get_total_checksum();
     let writers = stream_writer.into_writers();
-    let mut shards = Vec::with_capacity(writers.len());
-    for (idx, writer) in writers.into_iter().enumerate() {
-        let writer = writer.ok_or_else(|| {
-            AppError::InternalServerError(format!("cluster shard writer {idx} failed"))
-        })?;
-        shards.push(
+    let finish_started = Instant::now();
+    let finish_tasks = writers.into_iter().enumerate().map(|(idx, writer)| {
+        let checksum = shard_checksums.get(idx).cloned().unwrap_or_default();
+        let block_checksums = shard_block_checksums.get(idx).cloned().unwrap_or_default();
+        async move {
+            let writer = writer.ok_or_else(|| {
+                AppError::InternalServerError(format!("cluster shard writer {idx} failed"))
+            })?;
             writer
-                .finish(
-                    shard_checksums.get(idx).cloned().unwrap_or_default(),
-                    shard_block_checksums.get(idx).cloned().unwrap_or_default(),
-                    block_size,
-                )
-                .await?,
-        );
+                .finish(checksum, block_checksums, block_size)
+                .await
+                .map(|shard| (idx, shard))
+        }
+    });
+    let finish_results = join_all(finish_tasks).await;
+    let finish_ok = finish_results.iter().all(Result::is_ok);
+    record_io_latency(
+        "cluster.upload.finish_shards",
+        finish_started.elapsed(),
+        content_length,
+        finish_ok,
+    );
+    let mut shards = Vec::with_capacity(finish_results.len());
+    for result in finish_results {
+        let (_, shard) = result?;
+        shards.push(shard);
     }
     shards.sort_by_key(|shard| shard.shard_index);
     Ok(DistributedPartWrite {
@@ -704,8 +750,15 @@ where
         part.is_ok(),
     );
     let part = part?;
+    let session_commit_started = Instant::now();
     index::commit_session_part(&fragment, &version_id, &part.part).await?;
     index::commit_session_part_receipt(&fragment, &version_id, &state.manifest, &part.part).await?;
+    record_io_latency(
+        "cluster.upload.commit_part",
+        session_commit_started.elapsed(),
+        content_length,
+        true,
+    );
     Ok(())
 }
 
@@ -729,7 +782,10 @@ where
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
     validate_cluster_one_shot_size(content_length)?;
-    let (runtime, _active, layout) = current_write_context().await?;
+    // write_cluster_part_from_stream performs the authoritative participant
+    // reachability check immediately before opening the exact shard writers.
+    // Avoid probing the same fixed server-pool layout twice for one-shot I/O.
+    let (runtime, layout) = configured_write_context()?;
     let write_pool = runtime
         .membership
         .newest_writable_pool()
@@ -789,7 +845,7 @@ pub async fn finalize_cluster_upload(
     fragment: String,
     version_id: String,
     session_id: String,
-    object_key: String,
+    _object_key: String,
     params: InitiateUploadParams,
 ) -> Result<FinalizeUploadResult, AppError> {
     if !claims.write {
@@ -825,7 +881,10 @@ pub async fn finalize_cluster_upload(
     parts.sort_by_key(|part| part.part_index);
     let total_size_bytes = parts.iter().map(|part| part.size_bytes).sum();
     let object_meta = ObjectMetadata {
-        object_key: object_key.clone(),
+        // The immutable upload manifest owns the physical object identity.
+        // Using it here makes a finalize retry independent of the temporary
+        // logical-path binding once NCDX has already been published.
+        object_key: state.manifest.object_key.clone(),
         packed_ext_u64: state.manifest.packed_ext_u64,
         fragment: fragment.clone(),
         version_id: version_id.clone(),
@@ -847,8 +906,15 @@ pub async fn finalize_cluster_upload(
         is_delete_marker: false,
         stripe_size_bytes: state.manifest.stripe_size_bytes,
     };
-    publish_cluster_object_metadata(&object_meta).await?;
-    let _ = index::remove_session(&fragment, &version_id, "finalized").await;
+    let ncdx_started = Instant::now();
+    let publication = publish_cluster_object_metadata(&object_meta).await;
+    record_io_latency(
+        "cluster.upload.publish_ncdx",
+        ncdx_started.elapsed(),
+        total_size_bytes,
+        publication.is_ok(),
+    );
+    publication?;
     Ok(FinalizeUploadResult::Complete(object_meta))
 }
 

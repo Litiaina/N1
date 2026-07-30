@@ -1,9 +1,9 @@
-use crate::core::checksum::{Sha256Digest, sha256_digest};
+use crate::core::checksum::{Sha256Digest, Sha256Stream, format_sha256, sha256_digest};
 use crate::enums::app_error_enum::AppError;
 use futures_util::future::join_all;
 use futures_util::future::poll_fn;
 use once_cell::sync::Lazy;
-use sha2::{Digest, Sha256};
+use rayon::prelude::*;
 use simd_erasure_core::ReedSolomonEncoder;
 use std::alloc::{Layout, alloc, dealloc};
 use std::mem::MaybeUninit;
@@ -16,10 +16,12 @@ use tracing::{info, warn};
 
 pub const ALIGNMENT: usize = 4096;
 const DEFAULT_EC_LOG_INTERVAL_SECS: u64 = 30;
+const PARALLEL_CHECKSUM_MIN_BYTES: usize = 256 * 1024;
 
 static EC_STRIPES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EC_BYTES_IN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EC_RS_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EC_CHECKSUM_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EC_WRITE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EC_FLUSH_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EC_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -59,20 +61,22 @@ fn maybe_log_ec_metrics() {
     let stripes = EC_STRIPES_TOTAL.load(Ordering::Relaxed);
     let bytes = EC_BYTES_IN_TOTAL.load(Ordering::Relaxed);
     let rs_ns = EC_RS_NS_TOTAL.load(Ordering::Relaxed);
+    let checksum_ns = EC_CHECKSUM_NS_TOTAL.load(Ordering::Relaxed);
     let write_ns = EC_WRITE_NS_TOTAL.load(Ordering::Relaxed);
     let flush_ns = EC_FLUSH_NS_TOTAL.load(Ordering::Relaxed);
     let errors = EC_ERRORS_TOTAL.load(Ordering::Relaxed);
 
     let mib = bytes as f64 / (1024.0 * 1024.0);
     let rs_ms = rs_ns as f64 / 1_000_000.0;
+    let checksum_ms = checksum_ns as f64 / 1_000_000.0;
     let write_ms = write_ns as f64 / 1_000_000.0;
     let flush_ms = flush_ns as f64 / 1_000_000.0;
     let total_io_s = ((write_ns + flush_ns) as f64 / 1_000_000_000.0).max(0.000_001);
     let effective_mib_s = mib / total_io_s;
 
     info!(
-        "EC metrics: stripes={}, input_mib={:.2}, rs_ms={:.2}, write_ms={:.2}, flush_ms={:.2}, effective_mib_s={:.2}, errors={}",
-        stripes, mib, rs_ms, write_ms, flush_ms, effective_mib_s, errors
+        "EC metrics: stripes={}, input_mib={:.2}, rs_ms={:.2}, checksum_ms={:.2}, write_ms={:.2}, flush_ms={:.2}, effective_mib_s={:.2}, errors={}",
+        stripes, mib, rs_ms, checksum_ms, write_ms, flush_ms, effective_mib_s, errors
     );
 }
 
@@ -183,8 +187,8 @@ pub struct ErasureStreamWriter<W: AsyncWrite + Unpin + Send> {
     shard_len_limit: usize,
     buffer: AlignedBuffer,
     bytes_written_to_shards: usize,
-    total_hasher: Option<Sha256>,
-    shard_hashers: Vec<Sha256>,
+    total_hasher: Option<Sha256Stream>,
+    shard_hashers: Vec<Sha256Stream>,
     shard_block_checksums: Vec<Vec<Sha256Digest>>,
     rs_encoder: Option<ReedSolomonEncoder>,
     block_size: usize,
@@ -226,12 +230,12 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         }
 
         let total_hasher = if calc_total_checksum {
-            Some(Sha256::new())
+            Some(Sha256Stream::new())
         } else {
             None
         };
         let shard_hashers = (0..(data_shards + parity_shards))
-            .map(|_| Sha256::new())
+            .map(|_| Sha256Stream::new())
             .collect();
         let shard_block_checksums = vec![Vec::new(); data_shards + parity_shards];
 
@@ -263,9 +267,14 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     pub async fn write(&mut self, data: &[u8]) -> Result<(), AppError> {
         EC_BYTES_IN_TOTAL.fetch_add(data.len() as u64, Ordering::Relaxed);
 
+        let checksum_started = Instant::now();
         if let Some(h) = self.total_hasher.as_mut() {
             h.update(data);
         }
+        EC_CHECKSUM_NS_TOTAL.fetch_add(
+            checksum_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
 
         let mut offset = 0;
         let stripe_capacity = self.buffer.capacity();
@@ -317,9 +326,14 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             }
 
             EC_BYTES_IN_TOTAL.fetch_add(read as u64, Ordering::Relaxed);
+            let checksum_started = Instant::now();
             if let Some(h) = self.total_hasher.as_mut() {
                 h.update(&self.buffer.as_slice()[before..before + read]);
             }
+            EC_CHECKSUM_NS_TOTAL.fetch_add(
+                checksum_started.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
             total_bytes_read += read as u64;
         }
 
@@ -391,56 +405,46 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 .map_err(|e| AppError::InternalServerError(format!("RS encode: {:?}", e)))?;
             EC_RS_NS_TOTAL.fetch_add(rs_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+            let mut shard_slices = Vec::with_capacity(self.data_shards + self.parity_shards);
             for i in 0..self.data_shards {
                 let start = i * block_size;
                 let end = start + block_size;
-                self.shard_hashers[i].update(&buffer_slice[start..end]);
-                self.shard_block_checksums[i].push(sha256_digest(&buffer_slice[start..end]));
+                shard_slices.push(&buffer_slice[start..end]);
             }
             for i in 0..self.parity_shards {
-                let slice = result.recovery(i).ok_or_else(|| {
+                shard_slices.push(result.recovery(i).ok_or_else(|| {
                     EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     AppError::InternalServerError("RS parity shard generation mismatch".into())
-                })?;
-                self.shard_hashers[self.data_shards + i].update(slice);
-                self.shard_block_checksums[self.data_shards + i].push(sha256_digest(slice));
+                })?);
             }
-            let mut shard_slices = Vec::with_capacity(self.data_shards + self.parity_shards);
+            update_shard_checksums(
+                &mut self.shard_hashers,
+                &mut self.shard_block_checksums,
+                &shard_slices,
+            );
             for (i, writer_opt) in self.writers.iter().enumerate() {
-                let slice = if i < self.data_shards {
-                    let start = i * block_size;
-                    let end = start + block_size;
-                    &self.buffer.as_full_slice()[start..end]
-                } else {
-                    let parity_idx = i - self.data_shards;
-                    result.recovery(parity_idx).ok_or_else(|| {
-                        EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        AppError::InternalServerError("RS parity shard access mismatch".into())
-                    })?
-                };
                 if writer_opt.is_some() {
-                    shard_slices.push(slice);
+                    continue;
                 } else {
-                    shard_slices.push(&[]);
+                    shard_slices[i] = &[];
                 }
             }
             write_slices_to_shards(&mut self.writers, &shard_slices, self.data_shards).await?;
         } else {
+            let mut shard_slices = Vec::with_capacity(self.data_shards);
             for i in 0..self.data_shards {
                 let start = i * block_size;
                 let end = start + block_size;
-                self.shard_hashers[i].update(&buffer_slice[start..end]);
-                self.shard_block_checksums[i].push(sha256_digest(&buffer_slice[start..end]));
+                shard_slices.push(&buffer_slice[start..end]);
             }
-
-            let mut shard_slices = Vec::with_capacity(self.data_shards);
+            update_shard_checksums(
+                &mut self.shard_hashers,
+                &mut self.shard_block_checksums,
+                &shard_slices,
+            );
             for (i, writer_opt) in self.writers.iter().enumerate() {
-                let start = i * block_size;
-                let end = start + block_size;
-                if writer_opt.is_some() {
-                    shard_slices.push(&self.buffer.as_full_slice()[start..end]);
-                } else {
-                    shard_slices.push(&[]);
+                if writer_opt.is_none() {
+                    shard_slices[i] = &[];
                 }
             }
             write_slices_to_shards(&mut self.writers, &shard_slices, self.data_shards).await?;
@@ -458,13 +462,13 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     pub fn get_total_checksum(&self) -> Option<String> {
         self.total_hasher
             .as_ref()
-            .map(|h| hex::encode(h.clone().finalize()))
+            .map(|h| format_sha256(&h.clone().finalize()))
     }
 
     pub fn get_shard_checksums(&self) -> Vec<String> {
         self.shard_hashers
             .iter()
-            .map(|h| hex::encode(h.clone().finalize()))
+            .map(|h| format_sha256(&h.clone().finalize()))
             .collect()
     }
 
@@ -477,6 +481,36 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     }
 }
 
+fn update_shard_checksums(
+    hashers: &mut [Sha256Stream],
+    block_checksums: &mut [Vec<Sha256Digest>],
+    shard_slices: &[&[u8]],
+) {
+    let started = Instant::now();
+    let total_bytes = shard_slices.iter().map(|slice| slice.len()).sum::<usize>();
+    if total_bytes < PARALLEL_CHECKSUM_MIN_BYTES || shard_slices.len() <= 1 {
+        for ((hasher, checksums), slice) in hashers
+            .iter_mut()
+            .zip(block_checksums.iter_mut())
+            .zip(shard_slices.iter())
+        {
+            hasher.update(slice);
+            checksums.push(sha256_digest(slice));
+        }
+    } else {
+        hashers
+            .par_iter_mut()
+            .zip(block_checksums.par_iter_mut())
+            .zip(shard_slices.par_iter())
+            .for_each(|((hasher, checksums), slice)| {
+                let (_, block_checksum) =
+                    rayon::join(|| hasher.update(slice), || sha256_digest(slice));
+                checksums.push(block_checksum);
+            });
+    }
+    EC_CHECKSUM_NS_TOTAL.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
 async fn write_slices_to_shards<W>(
     writers: &mut [Option<W>],
     slices: &[&[u8]],
@@ -485,6 +519,7 @@ async fn write_slices_to_shards<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
+    let write_started = Instant::now();
     let write_futs = writers
         .iter_mut()
         .enumerate()
@@ -492,18 +527,17 @@ where
             let writer = writer_opt.as_mut()?;
             let slice = *slices.get(idx)?;
             Some(async move {
-                let write_start = Instant::now();
                 let result = writer.write_all(slice).await;
-                (idx, result, write_start.elapsed().as_nanos() as u64)
+                (idx, result)
             })
         });
 
     let results = join_all(write_futs).await;
+    EC_WRITE_NS_TOTAL.fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let mut successful_writes = 0usize;
     let mut failed = Vec::new();
 
-    for (idx, result, elapsed_ns) in results {
-        EC_WRITE_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
+    for (idx, result) in results {
         match result {
             Ok(()) => successful_writes += 1,
             Err(err) => {
@@ -537,23 +571,23 @@ async fn flush_shard_writers<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
+    let flush_started = Instant::now();
     let flush_futs = writers
         .iter_mut()
         .enumerate()
         .filter_map(|(idx, writer_opt)| {
             let writer = writer_opt.as_mut()?;
             Some(async move {
-                let flush_start = Instant::now();
                 let result = writer.flush().await;
-                (idx, result, flush_start.elapsed().as_nanos() as u64)
+                (idx, result)
             })
         });
 
     let results = join_all(flush_futs).await;
+    EC_FLUSH_NS_TOTAL.fetch_add(flush_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let mut failed = Vec::new();
 
-    for (idx, result, elapsed_ns) in results {
-        EC_FLUSH_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
+    for (idx, result) in results {
         if let Err(err) = result {
             EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
             warn!("Failed to flush shard writer: {}", err);
@@ -580,7 +614,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::ErasureStreamWriter;
-    use crate::core::checksum::sha256_digest;
+    use crate::core::checksum::{format_sha256, sha256_digest};
 
     #[tokio::test]
     async fn stream_writer_records_checksums_for_every_immutable_shard_block() {
@@ -593,15 +627,28 @@ mod tests {
             Some(tokio::io::sink()),
             Some(tokio::io::sink()),
         ];
-        let mut writer = ErasureStreamWriter::new(writers, 2, 1, block_size, false, block_size)
+        let mut writer = ErasureStreamWriter::new(writers, 2, 1, block_size, true, block_size)
             .expect("create writer");
         writer.write(&input).await.expect("write stripe");
         writer.finalize().await.expect("finalize");
 
         let checksums = writer.get_shard_block_checksums();
+        let shard_checksums = writer.get_shard_checksums();
         assert_eq!(checksums.len(), 3);
         assert!(checksums.iter().all(|blocks| blocks.len() == 1));
         assert_eq!(checksums[0][0], sha256_digest(&input[..block_size]));
         assert_eq!(checksums[1][0], sha256_digest(&input[block_size..]));
+        assert_eq!(
+            shard_checksums[0],
+            format_sha256(&sha256_digest(&input[..block_size]))
+        );
+        assert_eq!(
+            shard_checksums[1],
+            format_sha256(&sha256_digest(&input[block_size..]))
+        );
+        assert_eq!(
+            writer.get_total_checksum(),
+            Some(format_sha256(&sha256_digest(&input)))
+        );
     }
 }

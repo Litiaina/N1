@@ -885,7 +885,10 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
             .map_err(|error| io_err(error, "create NCDX staging file"))?;
         file.write_all(bytes)
             .map_err(|error| io_err(error, "write NCDX staging file"))?;
-        file.sync_all()
+        // The immutable file contents and required inode metadata must reach
+        // stable storage before publication. The parent-directory fsync below
+        // is the durability boundary for the new hard link.
+        file.sync_data()
             .map_err(|error| io_err(error, "sync NCDX staging file"))?;
     }
     match fs::hard_link(&temporary, path) {

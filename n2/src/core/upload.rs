@@ -530,6 +530,7 @@ fn sync_file_direct(file: &fs::File) -> io::Result<()> {
     if *IO_URING_ENABLED {
         let mut ring = IoUring::new(8)?;
         let entry = opcode::Fsync::new(types::Fd(file.as_raw_fd()))
+            .flags(types::FsyncFlags::DATASYNC)
             .build()
             .user_data(1);
         unsafe {
@@ -548,13 +549,13 @@ fn sync_file_direct(file: &fs::File) -> io::Result<()> {
         }
         Ok(())
     } else {
-        file.sync_all()
+        file.sync_data()
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 fn sync_file_direct(file: &fs::File) -> io::Result<()> {
-    file.sync_all()
+    file.sync_data()
 }
 
 impl DirectWriter {

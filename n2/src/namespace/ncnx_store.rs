@@ -419,7 +419,9 @@ fn create_immutable(path: &Path, bytes: &[u8]) -> Result<bool, AppError> {
                 format!("create NCNX staging file {}", temporary.display()),
             )
         })?;
-    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+    // NCNX publication durably syncs the file data first, then the parent
+    // directory after creating the immutable hard link.
+    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_data()) {
         let _ = fs::remove_file(&temporary);
         return Err(AppError::Io(
             err,
@@ -553,7 +555,7 @@ fn replace_durable(path: &Path, bytes: &[u8]) -> Result<bool, AppError> {
         .create_new(true)
         .open(&temporary)
         .map_err(|err| AppError::Io(err, format!("create NCNX repair {}", temporary.display())))?;
-    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_data()) {
         let _ = fs::remove_file(&temporary);
         return Err(AppError::Io(
             err,

@@ -27,6 +27,8 @@ CHAOS_EVERY_CYCLES="${CHAOS_EVERY_CYCLES:-20}"
 ROLLING_LIVE_OBJECTS="${ROLLING_LIVE_OBJECTS:-100}"
 PAYLOAD_KIB="${PAYLOAD_KIB:-256}"
 ANCHOR_MIB="${ANCHOR_MIB:-8}"
+MULTIPART_PART_MIB="${MULTIPART_PART_MIB:-512}"
+STRIPE_BLOCK_KIB="${STRIPE_BLOCK_KIB:-4096}"
 FAULT_DWELL_SECONDS="${FAULT_DWELL_SECONDS:-2}"
 NORMAL_UPLOAD_ATTEMPTS="${NORMAL_UPLOAD_ATTEMPTS:-3}"
 HEAL_INITIAL_DELAY_SECONDS="${HEAL_INITIAL_DELAY_SECONDS:-10}"
@@ -101,6 +103,9 @@ fi
 [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]]
 [[ "$CHAOS_EVERY_CYCLES" =~ ^[0-9]+$ && "$CHAOS_EVERY_CYCLES" -gt 0 ]]
 [[ "$NORMAL_UPLOAD_ATTEMPTS" =~ ^[0-9]+$ && "$NORMAL_UPLOAD_ATTEMPTS" -gt 0 ]]
+[[ "$MULTIPART_PART_MIB" =~ ^[0-9]+$ && "$MULTIPART_PART_MIB" -gt 0 ]]
+[[ "$STRIPE_BLOCK_KIB" =~ ^[0-9]+$ && "$STRIPE_BLOCK_KIB" -gt 0 ]]
+(( STRIPE_BLOCK_KIB % 4 == 0 ))
 [[ "$HEAL_INITIAL_DELAY_SECONDS" =~ ^[0-9]+$ && "$HEAL_INITIAL_DELAY_SECONDS" -gt 0 ]]
 [[ "$HEAL_SCAN_INTERVAL_SECONDS" =~ ^[0-9]+$ && "$HEAL_SCAN_INTERVAL_SECONDS" -gt 0 ]]
 [[ "$HEAL_VERIFY_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$HEAL_VERIFY_TIMEOUT_SECONDS" -ge 180 ]]
@@ -218,10 +223,10 @@ upload_with_retry() {
 
 multipart_upload() {
   local operation="$1" base="$2" key="$3" file="$4" response="$5"
-  local bytes part_size expected_parts version session part part_file
+  local bytes part_size expected_parts version session part part_file part_offset part_bytes
   local started_ns finished_ns seconds
   bytes="$(stat -c%s "$file")"
-  part_size=67108864
+  part_size=$((MULTIPART_PART_MIB * 1024 * 1024))
   expected_parts=$(( (bytes + part_size - 1) / part_size ))
   part_file="$OUT/payloads/multipart-current.part"
   started_ns="$(date +%s%N)"
@@ -234,11 +239,19 @@ multipart_upload() {
   session="$(jq -er '.session_id' "$OUT/events/$operation-init.json")"
 
   for ((part = 0; part < expected_parts; part++)); do
-    dd if="$file" of="$part_file" bs="$part_size" skip="$part" count=1 status=none
+    if (( expected_parts == 1 )); then
+      part_file="$file"
+    else
+      part_offset=$((part * part_size))
+      part_bytes=$((bytes - part_offset))
+      (( part_bytes > part_size )) && part_bytes="$part_size"
+      dd if="$file" of="$part_file" bs=4M iflag=skip_bytes,count_bytes \
+        skip="$part_offset" count="$part_bytes" status=none
+    fi
     curl_auth -X PUT "$base/noa/v1/upload/multipart/$version/$part" \
       --data-binary @"$part_file" >"$OUT/events/$operation-part-$part.json"
   done
-  rm -f "$part_file"
+  (( expected_parts == 1 )) || rm -f "$part_file"
 
   curl_json -X POST \
     "$base/noa/v1/upload/multipart/$version/$session/finalize?object_key=$key" \
@@ -400,6 +413,34 @@ wait_gc() {
   return 1
 }
 
+start_or_join_gc() {
+  local output="$1" temporary="$1.tmp" status curl_code=0 detail
+  status="$(curl -k --http1.1 --connect-timeout 5 --max-time 120 -sS \
+    -o "$temporary" -w '%{http_code}' -X POST \
+    "$A_BASE/noa/v1/maintenance/fragments/$FRAGMENT/gc/start?mode=availability" \
+    -H "Authorization: Bearer $TOKEN")" || curl_code=$?
+  mv "$temporary" "$output" 2>/dev/null || true
+  detail="$(tr '\r\n' '  ' < "$output" 2>/dev/null | head -c 500 || true)"
+
+  if [[ "$curl_code" -ne 0 ]]; then
+    FAILURE_CLASS="gc_start_transport_failure"
+    FAILURE_DETAIL="GC start transport failed with curl code $curl_code and HTTP status $status: $detail"
+    return 1
+  fi
+  if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+    event gc started "manual availability GC accepted with HTTP $status"
+    return 0
+  fi
+  if [[ "$status" == "409" && "${detail,,}" == *"gc is already running"* ]]; then
+    event gc joined-existing "autonomous or earlier GC already owns the single-run gate"
+    return 0
+  fi
+
+  FAILURE_CLASS="gc_start_rejected"
+  FAILURE_DETAIL="GC start returned unexpected HTTP status $status: $detail"
+  return 1
+}
+
 write_env() {
   local path="$1"
   cat > "$path" <<EOF
@@ -486,10 +527,10 @@ stream_readahead_bytes=auto
 stream_locality_bias_enabled=true
 monitor_interval_seconds=60
 monitor_deep_scan_interval_seconds=300
-max_part_size=67108864
+max_part_size=$((MULTIPART_PART_MIB * 1024 * 1024))
 data_shards=2
 parity_shards=2
-stripe_block_size=1048576
+stripe_block_size=$((STRIPE_BLOCK_KIB * 1024))
 EOF
 }
 
@@ -924,7 +965,7 @@ run_cycle() {
 
   if (( CYCLE % 20 == 0 )); then
     LAST_OPERATION="cycle-gc"
-    curl_auth -X POST "$A_BASE/noa/v1/maintenance/fragments/$FRAGMENT/gc/start?mode=availability" > "$OUT/events/gc-start-current.json"
+    start_or_join_gc "$OUT/events/gc-start-current.json"
     wait_gc "$OUT/events/gc-current.json"
     jq -e '.total_errors == 0' "$OUT/events/gc-current.json" >/dev/null
   fi

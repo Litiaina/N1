@@ -2,6 +2,7 @@ use crate::core::capacity_manager::{
     FragmentBlobUsage, StorageRootUsage, StorageUsage, get_fragment_blob_usage,
     get_storage_root_usage, get_storage_usage,
 };
+use crate::core::checksum::{Sha256Stream, format_sha256};
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, ShardInfo};
 use crate::core::monitoring::system_health_snapshot;
@@ -33,7 +34,6 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind, SeekFrom};
@@ -2297,7 +2297,7 @@ pub async fn peer_put_shard(
     let file = create_direct_file(&tmp_path).await?;
     let mut file = DirectWriter::new(file);
     let mut stream = body.into_data_stream();
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha256Stream::new();
     let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
@@ -2349,7 +2349,7 @@ pub async fn peer_put_shard(
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
-        checksum: hex::encode(hasher.finalize()),
+        checksum: format_sha256(&hasher.finalize()),
         block_checksums: Vec::new(),
         checksum_block_size: 0,
         is_parity,
@@ -2518,7 +2518,7 @@ where
     let stable_path = dir.join(&file_name);
     let file = create_direct_file(&tmp_path).await?;
     let mut file = DirectWriter::new(file);
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha256Stream::new();
     let mut written = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
     while written < body_len {
@@ -2584,7 +2584,7 @@ where
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
-        checksum: hex::encode(hasher.finalize()),
+        checksum: format_sha256(&hasher.finalize()),
         block_checksums: Vec::new(),
         checksum_block_size: 0,
         is_parity: payload.parity,

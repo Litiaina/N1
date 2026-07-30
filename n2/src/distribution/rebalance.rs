@@ -574,6 +574,7 @@ pub async fn rewrite_object_to_current_layout(
         }
     };
     commit_upload_pointer(&fragment, &logical_path, &object_id, &rewritten).await?;
+    index::remove_session(&fragment, &rewritten.version_id, "finalized").await?;
     Ok(true)
 }
 
