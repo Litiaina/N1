@@ -29,7 +29,7 @@ The N2 3.3 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test -p n2 --all-targets`: 148 passed;
+- `cargo test -p n2 --release`: 153 passed;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
@@ -39,6 +39,43 @@ capacity rejection, stale-target fencing, SHA-256 NCNX/object-NCDX/shard
 integrity, corrupted block reconstruction, canonical-list refill,
 replica-backed degraded listing, exact static placement, exact metadata
 visibility, copy/delete restart semantics, and object/healing invariants.
+
+## Storage-Root Failure Gate
+
+The minimum `1 + 1` qualification now runs one node on an isolated 1 GiB XFS
+filesystem and tests both an application-inaccessible root and real XFS
+`ENOSPC`. It also requires cluster health to describe the data path truthfully;
+endpoint reachability alone is not accepted as storage health.
+
+Passing evidence:
+
+```text
+/home/administrator/DEV-TEST/n2-3.3.1-full-roots-24h-20260730-215615/minimum
+```
+
+| Fault or recovery | Required and observed result |
+| --- | --- |
+| Node B XFS root made inaccessible | New write rejected with HTTP 503; no NCNX/NCDX publication |
+| Lookup of the rejected key while a replica root is inaccessible | HTTP 503 because namespace absence is unproven |
+| Existing committed object during the inaccessible-root fault | Readable and SHA-256 exact |
+| Health during the inaccessible-root fault | `degraded`; data readable; client/data/NCNX write signals false |
+| Node B XFS root filled to 1 MiB free | New write rejected with HTTP 503 |
+| Lookup of the rejected key while the full root remains readable | HTTP 404 because all NCNX replicas prove absence |
+| Health during `ENOSPC` | `degraded`; data readable; client/data write signals false; NCNX remains readable |
+| Capacity restored | Health returned to `healthy`; a new object uploaded and downloaded byte-exactly |
+| Reserve during root pressure | Not consumed; the physical instance remained reachable |
+| Later complete node loss | Reserve promoted, stale instance fenced, historical layout healed, restart persisted |
+
+This gate models a destroyed or unusable device at the N2 process boundary by
+making its dedicated XFS root inaccessible. It does not claim laboratory
+coverage of every kernel, controller, cable, or media-specific `EIO` mode.
+Reserve promotion remains a physical-instance replacement protocol: a
+capacity-full but reachable node makes its exact-width pool safely read-only;
+it is not silently rebound merely to create more capacity.
+
+The same independent qualification run proceeds from this passed finite gate
+through standard `2 + 2`, multi-pool, and 24-hour bounded chaos stages. Those
+later stages are not recorded as passed until their own summaries complete.
 
 The node-churn regression proof for the fixes released as N2 3.3.1 completed
 12 workload cycles and 11 bounded chaos events against one four-node `2 + 2`

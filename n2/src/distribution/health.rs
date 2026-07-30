@@ -3,8 +3,10 @@ use crate::distribution::layout::resolve_configured_layout;
 use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
 };
+use crate::distribution::peer::{cluster_secret, peer_http_client};
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
 use crate::enums::app_error_enum::AppError;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -24,6 +26,10 @@ pub struct ClusterNodeHealth {
     pub state: NodeState,
     pub accepts_writes: bool,
     pub readable: bool,
+    pub storage_readable: bool,
+    pub storage_writable: bool,
+    pub storage_minimum_available_bytes: Option<u64>,
+    pub storage_issues: Vec<String>,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_endpoint: Option<String>,
@@ -68,15 +74,62 @@ pub struct ClusterHealthSnapshot {
 pub async fn cluster_health_snapshot(
     runtime: &ClusterRuntime,
 ) -> Result<ClusterHealthSnapshot, AppError> {
-    let active = live_active_write_nodes(runtime).await;
-    let readable = live_readable_nodes(runtime).await;
-    cluster_health_snapshot_with_live_nodes(runtime, active, readable)
+    let endpoint_active = live_active_write_nodes(runtime).await;
+    let endpoint_readable = live_readable_nodes(runtime).await;
+    let readiness = storage_readiness_by_node(runtime).await;
+    let active = endpoint_active
+        .into_iter()
+        .filter(|node| {
+            readiness
+                .iter()
+                .find(|(node_id, _)| node_id == &node.id)
+                .is_some_and(|(_, status)| status.writable)
+        })
+        .collect();
+    let readable = endpoint_readable
+        .into_iter()
+        .filter(|node| {
+            readiness
+                .iter()
+                .find(|(node_id, _)| node_id == &node.id)
+                .is_some_and(|(_, status)| status.readable)
+        })
+        .collect();
+    cluster_health_snapshot_with_readiness(runtime, active, readable, &readiness)
 }
 
 pub fn cluster_health_snapshot_with_live_nodes(
     runtime: &ClusterRuntime,
     active: Vec<ClusterNode>,
     readable: Vec<ClusterNode>,
+) -> Result<ClusterHealthSnapshot, AppError> {
+    let readiness = runtime
+        .membership
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.clone(),
+                crate::core::capacity_manager::StorageReadiness {
+                    readable: readable.iter().any(|candidate| candidate.id == node.id),
+                    writable: active.iter().any(|candidate| candidate.id == node.id),
+                    root_count: node.storage_roots.len(),
+                    readable_roots: node.storage_roots.len(),
+                    writable_roots: node.storage_roots.len(),
+                    minimum_available_bytes: None,
+                    issues: Vec::new(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    cluster_health_snapshot_with_readiness(runtime, active, readable, &readiness)
+}
+
+fn cluster_health_snapshot_with_readiness(
+    runtime: &ClusterRuntime,
+    active: Vec<ClusterNode>,
+    readable: Vec<ClusterNode>,
+    readiness: &[(String, crate::core::capacity_manager::StorageReadiness)],
 ) -> Result<ClusterHealthSnapshot, AppError> {
     let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
@@ -123,6 +176,10 @@ pub fn cluster_health_snapshot_with_live_nodes(
         .iter()
         .any(|node| node.effective_state() == NodeState::Degraded);
     let live_node_ids = readable
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<HashSet<_>>();
+    let writable_node_ids = active
         .iter()
         .map(|node| node.id.clone())
         .collect::<HashSet<_>>();
@@ -249,6 +306,10 @@ pub fn cluster_health_snapshot_with_live_nodes(
             .iter()
             .map(|node| {
                 let configured_state = node.effective_state();
+                let storage = readiness
+                    .iter()
+                    .find(|(node_id, _)| node_id == &node.id)
+                    .map(|(_, status)| status);
                 let state = if configured_state.is_readable()
                     && !node.is_local(&runtime.local_instance_id)
                     && !live_node_ids.contains(&node.id)
@@ -261,8 +322,17 @@ pub fn cluster_health_snapshot_with_live_nodes(
                     node_id: node.id.clone(),
                     instance_id: node.instance_id.clone(),
                     binding_epoch: node.binding_epoch,
-                    accepts_writes: state.accepts_new_writes() && effective_client_writable,
+                    accepts_writes: state.accepts_new_writes()
+                        && effective_client_writable
+                        && writable_node_ids.contains(&node.id),
                     readable: state.is_readable(),
+                    storage_readable: storage.is_some_and(|status| status.readable),
+                    storage_writable: storage.is_some_and(|status| status.writable),
+                    storage_minimum_available_bytes: storage
+                        .and_then(|status| status.minimum_available_bytes),
+                    storage_issues: storage
+                        .map(|status| status.issues.clone())
+                        .unwrap_or_else(|| vec!["storage readiness probe failed".to_string()]),
                     state,
                     endpoint: node.endpoint.clone(),
                     native_endpoint: node.native_endpoint.clone(),
@@ -282,6 +352,69 @@ pub fn cluster_health_snapshot_with_live_nodes(
             .collect(),
         notes,
     })
+}
+
+async fn storage_readiness_by_node(
+    runtime: &ClusterRuntime,
+) -> Vec<(String, crate::core::capacity_manager::StorageReadiness)> {
+    let probes = runtime.membership.nodes.iter().cloned().map(|node| {
+        let local_instance_id = runtime.local_instance_id.clone();
+        async move {
+            let result = async {
+                if node.is_local(&local_instance_id) {
+                    return crate::core::capacity_manager::get_storage_readiness().await;
+                }
+                let client = peer_http_client()?;
+                let mut request = client.get(format!(
+                    "{}/n2/peer/storage-readiness",
+                    node.endpoint.trim_end_matches('/')
+                ));
+                if let Some(secret) = cluster_secret() {
+                    request = request.header("x-n2-cluster-secret", secret);
+                }
+                let response = request
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        AppError::ServiceUnavailable(format!(
+                            "storage readiness probe for '{}' failed: {error}",
+                            node.id
+                        ))
+                    })?;
+                if !response.status().is_success() {
+                    return Err(AppError::ServiceUnavailable(format!(
+                        "storage readiness probe for '{}' returned {}",
+                        node.id,
+                        response.status()
+                    )));
+                }
+                response
+                    .json::<crate::core::capacity_manager::StorageReadiness>()
+                    .await
+                    .map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "decode storage readiness for '{}': {error}",
+                            node.id
+                        ))
+                    })
+            }
+            .await;
+            (
+                node.id,
+                result.unwrap_or_else(|error| crate::core::capacity_manager::StorageReadiness {
+                    readable: false,
+                    writable: false,
+                    root_count: node.storage_roots.len(),
+                    readable_roots: 0,
+                    writable_roots: 0,
+                    minimum_available_bytes: None,
+                    issues: vec![error.to_string()],
+                }),
+            )
+        }
+    });
+    join_all(probes).await
 }
 
 #[cfg(test)]

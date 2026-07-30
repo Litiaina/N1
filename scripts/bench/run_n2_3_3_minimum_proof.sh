@@ -38,6 +38,12 @@ MASTER="minimum-master-$TS"
 FRAGMENT_KEY="minimum-fragment-key-$TS"
 TOKEN=""
 RESULT="FAIL"
+ROOT_FAULTS="${N2_MIN_ROOT_FAULTS:-false}"
+ROOT_UNAVAILABLE_STATUS=""
+ROOT_UNAVAILABLE_OBJECT_STATUS=""
+ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS=""
+ROOT_FULL_STATUS=""
+ROOT_FULL_OBJECT_STATUS=""
 
 for tool in jq curl openssl pidstat sha256sum awk dd find; do
   command -v "$tool" >/dev/null || {
@@ -45,6 +51,14 @@ for tool in jq curl openssl pidstat sha256sum awk dd find; do
     exit 1
   }
 done
+if [[ "$ROOT_FAULTS" == "true" ]]; then
+  for tool in fallocate mountpoint stat df; do
+    command -v "$tool" >/dev/null || {
+      echo "missing root-fault proof tool: $tool" >&2
+      exit 1
+    }
+  done
+fi
 [[ -x "$BIN" ]] || {
   echo "N2 binary is missing or not executable: $BIN" >&2
   exit 1
@@ -96,6 +110,10 @@ kill_pidfile() {
 
 cleanup() {
   set +e
+  if [[ "$ROOT_FAULTS" == "true" ]]; then
+    chmod 0755 "$B_STORE" 2>/dev/null || true
+    rm -f "$B_STORE/.n2-proof-enospc" 2>/dev/null || true
+  fi
   for run in "$A_RUN" "$B_RUN" "$R_RUN"; do
     kill_pidfile "$run/pidstat.pid"
     kill_pidfile "$run/n2.pid"
@@ -422,6 +440,121 @@ curl_auth -X POST "$A_BASE/noa/v1/cluster/healing/cycle" >"$OUT/heal-object-a.js
 curl_auth -X POST "$B_BASE/noa/v1/cluster/healing/cycle" >"$OUT/heal-object-b.json" || true
 [[ -f "${SHARD_FILES[0]}" ]]
 
+if [[ "$ROOT_FAULTS" == "true" ]]; then
+  mountpoint -q "$B_STORE" || {
+    echo "refusing ENOSPC proof because node B root is not an isolated mount: $B_STORE" >&2
+    exit 1
+  }
+
+  chmod 0000 "$B_STORE"
+  ROOT_UNAVAILABLE_STATUS="$(
+    curl -k --http1.1 -sS -o "$OUT/root-unavailable-write.json" -w '%{http_code}' \
+      -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/root-unavailable-must-fail.bin" \
+      -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/source.bin"
+  )"
+  [[ "$ROOT_UNAVAILABLE_STATUS" != 2* ]]
+  ROOT_UNAVAILABLE_OBJECT_STATUS="$(
+    curl -k --http1.1 -sS -o "$OUT/root-unavailable-object.json" -w '%{http_code}' \
+      -G "$A_BASE/noa/v1/objects/download" -H "Authorization: Bearer $TOKEN" \
+      --data-urlencode 'object_key=minimum/root-unavailable-must-fail.bin'
+  )"
+  [[ "$ROOT_UNAVAILABLE_OBJECT_STATUS" == "503" ]]
+  curl_auth -G "$A_BASE/noa/v1/objects/download" \
+    --data-urlencode 'object_key=minimum/anchor.bin' \
+    -o "$OUT/download-root-unavailable.bin"
+  [[ "$(sha256sum "$OUT/download-root-unavailable.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+  sleep 3
+  curl_auth "$A_BASE/noa/v1/cluster/health" >"$OUT/health-root-unavailable.json"
+  jq -e '
+    .binding_epoch == 1
+    and (.reserve_nodes | length) == 1
+    and .state == "degraded"
+    and .effective_client_writable == false
+    and .data_plane_writable == false
+    and .ncnx_strictly_writable == false
+    and any(
+      .nodes[];
+      .node_id == "minimum-b"
+      and .storage_readable == false
+      and .storage_writable == false
+      and .accepts_writes == false
+    )
+  ' \
+    "$OUT/health-root-unavailable.json" >/dev/null
+  chmod 0755 "$B_STORE"
+  ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS="$(
+    curl -k --http1.1 -sS -o "$OUT/root-unavailable-object-after-restore.json" \
+      -w '%{http_code}' -G "$A_BASE/noa/v1/objects/download" \
+      -H "Authorization: Bearer $TOKEN" \
+      --data-urlencode 'object_key=minimum/root-unavailable-must-fail.bin'
+  )"
+  [[ "$ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS" == "404" ]]
+
+  ROOT_AVAILABLE_BYTES="$(df -B1 --output=avail "$B_STORE" | tail -n 1 | tr -d ' ')"
+  (( ROOT_AVAILABLE_BYTES > 16777216 ))
+  fallocate -l "$((ROOT_AVAILABLE_BYTES - 1048576))" "$B_STORE/.n2-proof-enospc"
+  ROOT_FULL_STATUS="$(
+    curl -k --http1.1 -sS -o "$OUT/root-full-write.json" -w '%{http_code}' \
+      -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/root-full-must-fail.bin" \
+      -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/source.bin"
+  )"
+  [[ "$ROOT_FULL_STATUS" != 2* ]]
+  ROOT_FULL_OBJECT_STATUS="$(
+    curl -k --http1.1 -sS -o "$OUT/root-full-object.json" -w '%{http_code}' \
+      -G "$A_BASE/noa/v1/objects/download" -H "Authorization: Bearer $TOKEN" \
+      --data-urlencode 'object_key=minimum/root-full-must-fail.bin'
+  )"
+  [[ "$ROOT_FULL_OBJECT_STATUS" == "404" ]]
+  curl_auth -G "$A_BASE/noa/v1/objects/download" \
+    --data-urlencode 'object_key=minimum/anchor.bin' \
+    -o "$OUT/download-root-full.bin"
+  [[ "$(sha256sum "$OUT/download-root-full.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+  curl_auth "$A_BASE/noa/v1/cluster/health" >"$OUT/health-root-full.json"
+  jq -e '
+    .binding_epoch == 1
+    and (.reserve_nodes | length) == 1
+    and .state == "degraded"
+    and .effective_client_writable == false
+    and .data_plane_writable == false
+    and .ncnx_strictly_writable == true
+    and any(
+      .nodes[];
+      .node_id == "minimum-b"
+      and .storage_readable == true
+      and .storage_writable == false
+      and .accepts_writes == false
+    )
+  ' "$OUT/health-root-full.json" >/dev/null
+  rm -f "$B_STORE/.n2-proof-enospc"
+
+  for _ in $(seq 1 30); do
+    curl_auth "$A_BASE/noa/v1/cluster/health" >"$OUT/health-root-restored.json"
+    if jq -e '
+      .state == "healthy"
+      and .effective_client_writable == true
+      and .data_plane_writable == true
+      and .ncnx_strictly_writable == true
+      and all(.nodes[]; .storage_readable == true and .storage_writable == true)
+    ' "$OUT/health-root-restored.json" >/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  jq -e '
+    .state == "healthy"
+    and .effective_client_writable == true
+    and .data_plane_writable == true
+    and .ncnx_strictly_writable == true
+    and all(.nodes[]; .storage_readable == true and .storage_writable == true)
+  ' "$OUT/health-root-restored.json" >/dev/null
+  curl_auth -X POST "$B_BASE/noa/v1/upload/one-shot/minimum/root-restored.bin" \
+    --data-binary @"$OUT/source.bin" >"$OUT/root-restored-write.json"
+  curl_auth -G "$A_BASE/noa/v1/objects/download" \
+    --data-urlencode 'object_key=minimum/root-restored.bin' \
+    -o "$OUT/download-root-restored.bin"
+  [[ "$(sha256sum "$OUT/download-root-restored.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+fi
+
 stop_node "$B_RUN"
 curl_auth -G "$A_BASE/noa/v1/objects/download" \
   --data-urlencode 'object_key=minimum/anchor.bin' -o "$OUT/download-one-loss.bin"
@@ -483,6 +616,12 @@ jq -n \
   --arg ec "1+1" \
   --arg pre_promotion_status "$PRE_PROMOTION_STATUS" \
   --arg stale_status "$STALE_STATUS" \
+  --arg root_faults "$ROOT_FAULTS" \
+  --arg root_unavailable_status "$ROOT_UNAVAILABLE_STATUS" \
+  --arg root_unavailable_object_status "$ROOT_UNAVAILABLE_OBJECT_STATUS" \
+  --arg root_unavailable_restored_object_status "$ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS" \
+  --arg root_full_status "$ROOT_FULL_STATUS" \
+  --arg root_full_object_status "$ROOT_FULL_OBJECT_STATUS" \
   --argjson suspicious_log_lines "$ERROR_LINES" \
   --slurpfile initial "$OUT/health-initial.json" \
   --slurpfile promoted "$OUT/health-after-promotion.json" \
@@ -496,6 +635,22 @@ jq -n \
     pagination_keys:4,
     namespace_healing:"missing NCNX replica restored",
     object_healing:"missing shard restored",
+    storage_root_faults:{
+      enabled:($root_faults == "true"),
+      inaccessible_root_write_http_status:
+        (if $root_unavailable_status == "" then null else ($root_unavailable_status|tonumber) end),
+      inaccessible_root_uncommitted_http_status:
+        (if $root_unavailable_object_status == "" then null else ($root_unavailable_object_status|tonumber) end),
+      restored_root_proven_absent_http_status:
+        (if $root_unavailable_restored_object_status == "" then null else ($root_unavailable_restored_object_status|tonumber) end),
+      full_root_write_http_status:
+        (if $root_full_status == "" then null else ($root_full_status|tonumber) end),
+      full_root_uncommitted_http_status:
+        (if $root_full_object_status == "" then null else ($root_full_object_status|tonumber) end),
+      existing_object_readable:true,
+      reserve_not_consumed_by_capacity_pressure:true,
+      write_after_root_restoration:true
+    },
     reserve:{
       one_node_read_survived:true,
       pre_promotion_http_status:($pre_promotion_status|tonumber),

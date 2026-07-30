@@ -29,6 +29,8 @@ PAYLOAD_KIB="${PAYLOAD_KIB:-256}"
 ANCHOR_MIB="${ANCHOR_MIB:-8}"
 MULTIPART_PART_MIB="${MULTIPART_PART_MIB:-512}"
 STRIPE_BLOCK_KIB="${STRIPE_BLOCK_KIB:-4096}"
+NATIVE_CLIENT="${N2_SOAK_NATIVE_CLIENT:-}"
+NATIVE_EVERY_CYCLES="${NATIVE_EVERY_CYCLES:-5}"
 FAULT_DWELL_SECONDS="${FAULT_DWELL_SECONDS:-2}"
 NORMAL_UPLOAD_ATTEMPTS="${NORMAL_UPLOAD_ATTEMPTS:-3}"
 HEAL_INITIAL_DELAY_SECONDS="${HEAL_INITIAL_DELAY_SECONDS:-10}"
@@ -66,6 +68,12 @@ B_BASE="https://$LOCAL_IP:$B_HTTPS"
 C_BASE="https://$REMOTE_IP:$C_HTTPS"
 D_BASE="https://$REMOTE_IP:$D_HTTPS"
 BASES=("$A_BASE" "$B_BASE" "$C_BASE" "$D_BASE")
+NATIVE_BASES=(
+  "n2://$LOCAL_IP:$A_NATIVE"
+  "n2://$LOCAL_IP:$B_NATIVE"
+  "n2://$REMOTE_IP:$C_NATIVE"
+  "n2://$REMOTE_IP:$D_NATIVE"
+)
 POOL_ID="pool-soak-$TS"
 CLUSTER_ID="cluster-soak-$TS"
 MASTER="n2-3.0-soak-master-$TS"
@@ -106,6 +114,13 @@ fi
 [[ "$MULTIPART_PART_MIB" =~ ^[0-9]+$ && "$MULTIPART_PART_MIB" -gt 0 ]]
 [[ "$STRIPE_BLOCK_KIB" =~ ^[0-9]+$ && "$STRIPE_BLOCK_KIB" -gt 0 ]]
 (( STRIPE_BLOCK_KIB % 4 == 0 ))
+[[ "$NATIVE_EVERY_CYCLES" =~ ^[0-9]+$ && "$NATIVE_EVERY_CYCLES" -gt 0 ]]
+if [[ -n "$NATIVE_CLIENT" ]]; then
+  [[ -x "$NATIVE_CLIENT" ]] || {
+    echo "native client is not executable: $NATIVE_CLIENT" >&2
+    exit 1
+  }
+fi
 [[ "$HEAL_INITIAL_DELAY_SECONDS" =~ ^[0-9]+$ && "$HEAL_INITIAL_DELAY_SECONDS" -gt 0 ]]
 [[ "$HEAL_SCAN_INTERVAL_SECONDS" =~ ^[0-9]+$ && "$HEAL_SCAN_INTERVAL_SECONDS" -gt 0 ]]
 [[ "$HEAL_VERIFY_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$HEAL_VERIFY_TIMEOUT_SECONDS" -ge 180 ]]
@@ -264,6 +279,38 @@ multipart_upload() {
   seconds="$(awk -v start="$started_ns" -v finish="$finished_ns" \
     'BEGIN { printf "%.9f", (finish - start) / 1000000000 }')"
   metric "$operation" "$base" "$seconds" "$bytes"
+}
+
+native_call() {
+  local endpoint="$1"
+  shift
+  "$NATIVE_CLIENT" \
+    --native-url "$endpoint" \
+    --fragment "$FRAGMENT" \
+    --secret "$FRAGMENT_KEY" \
+    --json \
+    "$@"
+}
+
+native_timed() {
+  local operation="$1" endpoint="$2" bytes="$3" output="$4"
+  shift 4
+  local started_ns finished_ns seconds
+  started_ns="$(date +%s%N)"
+  native_call "$endpoint" "$@" >"$output" 2>>"$OUT/native-client.log"
+  finished_ns="$(date +%s%N)"
+  seconds="$(awk -v start="$started_ns" -v finish="$finished_ns" \
+    'BEGIN { printf "%.9f", (finish - start) / 1000000000 }')"
+  metric "$operation" "$endpoint" "$seconds" "$bytes"
+}
+
+native_download_verify() {
+  local endpoint="$1" key="$2" expected_sha="$3" operation="$4"
+  local output="$OUT/payloads/native-download-current.bin"
+  native_timed "$operation" "$endpoint" 0 "$OUT/events/$operation.json" \
+    download --object-key "$key" --file "$output"
+  [[ "$(sha256sum "$output" | awk '{print $1}')" == "$expected_sha" ]]
+  rm -f "$output"
 }
 
 kill_pidfile() {
@@ -881,6 +928,23 @@ EOF
   ANCHOR_VERSION="$(jq -er '.version_id' "$OUT/anchor-upload.json")"
   download_verify "$D_BASE" soak/anchor.bin "$ANCHOR_SHA" anchor-download
 
+  if [[ -n "$NATIVE_CLIENT" ]]; then
+    for native_base in "${NATIVE_BASES[@]}"; do
+      "$NATIVE_CLIENT" --native-url "$native_base" --json ping \
+        >>"$OUT/events/native-ping.jsonl"
+    done
+    native_timed native-anchor-upload "${NATIVE_BASES[0]}" \
+      "$(stat -c%s "$OUT/payloads/anchor.bin")" "$OUT/native-anchor-upload.json" \
+      upload --object-key soak/native-anchor.bin \
+      --file "$OUT/payloads/anchor.bin" \
+      --part-size "$((MULTIPART_PART_MIB * 1024 * 1024))" \
+      --parallel-parts 1 --sha256
+    native_download_verify "${NATIVE_BASES[3]}" soak/native-anchor.bin \
+      "$ANCHOR_SHA" native-anchor-download
+    download_verify "$C_BASE" soak/native-anchor.bin "$ANCHOR_SHA" \
+      native-anchor-http-interoperability
+  fi
+
   for key in soak/lex/a soak/lex/a-previous soak/lex/a/child soak/lex/a/child/deep soak/lex/a0; do
     upload_with_retry setup-upload "$A_BASE" "$key" "$OUT/payloads/small.bin" \
       "$OUT/events/lex-$(printf '%s' "$key" | tr '/' '_').json"
@@ -902,6 +966,36 @@ verify_pagination() {
   done
 }
 
+run_native_cycle() {
+  local index="$1" current_sha="$2"
+  local key="soak/native/cycle-$(printf '%08d' "$CYCLE").bin"
+  local moved="$key.moved"
+  local bytes
+  bytes="$(stat -c%s "$OUT/payloads/current.bin")"
+
+  LAST_OPERATION="cycle-native-protocol"
+  native_timed native-upload "${NATIVE_BASES[$index]}" "$bytes" \
+    "$OUT/events/native-upload-current.json" \
+    upload --object-key "$key" --file "$OUT/payloads/current.bin" --sha256
+  native_download_verify "${NATIVE_BASES[$(((index + 1) % 4))]}" \
+    "$key" "$current_sha" native-download
+  native_timed native-rename "${NATIVE_BASES[$(((index + 2) % 4))]}" 0 \
+    "$OUT/events/native-rename-current.json" \
+    rename --source-path "$key" --destination-path "$moved"
+  download_verify "${BASES[$(((index + 3) % 4))]}" \
+    "$moved" "$current_sha" native-http-interoperability
+  native_timed native-stat "${NATIVE_BASES[$index]}" 0 \
+    "$OUT/events/native-stat-current.json" stat --path "$moved"
+  native_timed native-list "${NATIVE_BASES[$(((index + 1) % 4))]}" 0 \
+    "$OUT/events/native-list-current.json" list --path soak/native --limit 25
+  native_timed native-trash "${NATIVE_BASES[$(((index + 2) % 4))]}" 0 \
+    "$OUT/events/native-trash-current.json" trash --path "$moved"
+  native_timed native-recover "${NATIVE_BASES[$(((index + 3) % 4))]}" 0 \
+    "$OUT/events/native-recover-current.json" recover --path "$moved"
+  native_download_verify "${NATIVE_BASES[$index]}" \
+    "$moved" "$current_sha" native-recovered-download
+}
+
 run_cycle() {
   local index base key moved old old_key current_sha seconds trash_id
   index=$((CYCLE % 4))
@@ -913,6 +1007,9 @@ run_cycle() {
   current_sha="$(sha256sum "$OUT/payloads/current.bin" | awk '{print $1}')"
   upload_with_retry upload "$base" "$key" "$OUT/payloads/current.bin" "$OUT/events/upload-current.json"
   download_verify "${BASES[$(((index + 1) % 4))]}" "$key" "$current_sha" download
+  if [[ -n "$NATIVE_CLIENT" ]] && (( CYCLE % NATIVE_EVERY_CYCLES == 0 )); then
+    run_native_cycle "$index" "$current_sha"
+  fi
 
   LAST_OPERATION="cycle-namespace"
   rename_key "${BASES[$(((index + 2) % 4))]}" "$key" "$moved"

@@ -17,17 +17,18 @@ MINIMUM="$CONTROLLER/run_n2_3_3_minimum_proof.sh"
 STANDARD="$CONTROLLER/run_n2_3_0_release_proof.sh"
 MULTI="$CONTROLLER/run_n2_3_3_multi_pool_proof.sh"
 SOAK="$CONTROLLER/run_n2_3_0_soak_chaos.sh"
+NATIVE_CLIENT="$CONTROLLER/litiaina-n2-shell"
 STATUS="$BASE/status.json"
 STARTED="$(date +%s)"
 CURRENT_STAGE="preflight"
 
-for file in "$BIN" "$MINIMUM" "$STANDARD" "$MULTI" "$SOAK"; do
+for file in "$BIN" "$NATIVE_CLIENT" "$MINIMUM" "$STANDARD" "$MULTI" "$SOAK"; do
   [[ -f "$file" ]] || {
     echo "missing controller artifact: $file" >&2
     exit 1
   }
 done
-chmod +x "$BIN" "$MINIMUM" "$STANDARD" "$MULTI" "$SOAK"
+chmod +x "$BIN" "$NATIVE_CLIENT" "$MINIMUM" "$STANDARD" "$MULTI" "$SOAK"
 
 write_status() {
   local state="$1" message="$2" now temporary
@@ -102,6 +103,7 @@ N2_MIN_RUN_ID="$RUN_ID" \
 N2_MIN_A_STORE="/mnt/NDISK001/.n2-validation/$RUN_ID/minimum/a" \
 N2_MIN_B_STORE="/mnt/NDISK002/.n2-validation/$RUN_ID/minimum/b" \
 N2_MIN_R_STORE="/mnt/NDISK003/.n2-validation/$RUN_ID/minimum/reserve" \
+N2_MIN_ROOT_FAULTS=true \
   "$MINIMUM" >"$BASE/minimum-controller.log" 2>&1
 jq -e '.result == "PASS"' "$BASE/minimum/summary.json" >/dev/null
 assert_n1_untouched_boundary
@@ -143,16 +145,19 @@ jq -e '.result == "PASS"' "$BASE/multi-pool/summary.json" >/dev/null
 assert_n1_untouched_boundary
 write_status RUNNING "multi-pool proof passed"
 
-CURRENT_STAGE="five-day-soak-chaos"
-write_status RUNNING "five-day live workload and bounded chaos started"
+CURRENT_STAGE="twenty-four-hour-soak-chaos"
+write_status RUNNING "24-hour live workload, native protocol, and bounded chaos started"
 ALL_LOCAL=true \
 REMOTE_USER=administrator \
 N2_SOAK_BIN="$BIN" \
+N2_SOAK_NATIVE_CLIENT="$NATIVE_CLIENT" \
 N2_SOAK_OUT_ROOT="$BASE/soak" \
 SOAK_RUN_ID="$RUN_ID" \
-DURATION_SECONDS=432000 \
+DURATION_SECONDS=86400 \
+MAX_CYCLES=0 \
 CYCLE_PAUSE_SECONDS=2 \
 CHAOS_EVERY_CYCLES=20 \
+NATIVE_EVERY_CYCLES=5 \
 ROLLING_LIVE_OBJECTS=1000 \
 PAYLOAD_KIB=1024 \
 ANCHOR_MIB=256 \
@@ -192,7 +197,7 @@ jq -n \
       minimum:$minimum,
       standard:$standard,
       multi_pool:$multi,
-      five_day_soak:$soak
+      twenty_four_hour_soak:$soak
     },
     started_at_unix:$started_at,
     finished_at_unix:$finished_at

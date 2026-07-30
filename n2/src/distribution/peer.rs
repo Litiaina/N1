@@ -2432,6 +2432,13 @@ pub async fn peer_usage(
     ))
 }
 
+pub async fn peer_storage_readiness(headers: HeaderMap) -> Result<impl IntoResponse, AppError> {
+    authorize_peer(&headers)?;
+    Ok(Json(
+        crate::core::capacity_manager::get_storage_readiness().await?,
+    ))
+}
+
 pub async fn peer_monitor(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
@@ -2661,6 +2668,10 @@ pub fn native_peer_bytes_response(id: String, bytes: Vec<u8>) -> NativeResponse 
 pub fn build_peer_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/n2/peer/usage", axum::routing::get(peer_usage))
+        .route(
+            "/n2/peer/storage-readiness",
+            axum::routing::get(peer_storage_readiness),
+        )
         .route("/n2/peer/monitor", axum::routing::get(peer_monitor))
         .route(
             "/n2/peer/objects/publish",

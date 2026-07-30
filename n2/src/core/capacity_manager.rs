@@ -36,6 +36,19 @@ pub struct StorageRootUsage {
     pub usage_percent: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageReadiness {
+    pub readable: bool,
+    pub writable: bool,
+    pub root_count: usize,
+    pub readable_roots: usize,
+    pub writable_roots: usize,
+    pub minimum_available_bytes: Option<u64>,
+    pub issues: Vec<String>,
+}
+
+const MIN_STORAGE_WRITE_HEADROOM_BYTES: u64 = 8 * 1024 * 1024;
+
 #[cfg(unix)]
 fn statvfs_totals_sync(path: &Path) -> Result<(u64, u64, u64), AppError> {
     use std::ffi::CString;
@@ -59,6 +72,96 @@ fn statvfs_totals_sync(path: &Path) -> Result<(u64, u64, u64), AppError> {
     let total = (vfs.f_frsize as u64).saturating_mul(vfs.f_blocks as u64);
     let avail = (vfs.f_frsize as u64).saturating_mul(vfs.f_bavail as u64);
     Ok((device_id, total, avail))
+}
+
+#[cfg(unix)]
+fn path_accessible(path: &Path, mode: libc::c_int) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    CString::new(path.as_os_str().as_bytes())
+        .ok()
+        .is_some_and(|raw| unsafe { libc::access(raw.as_ptr(), mode) } == 0)
+}
+
+#[cfg(not(unix))]
+fn path_accessible(path: &Path, _mode: libc::c_int) -> bool {
+    path.is_dir()
+}
+
+fn classify_storage_readiness(roots: &[PathBuf]) -> StorageReadiness {
+    let mut readable_roots = 0usize;
+    let mut writable_roots = 0usize;
+    let mut minimum_available_bytes = None::<u64>;
+    let mut issues = Vec::new();
+
+    for root in roots {
+        match std::fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                issues.push(format!("{} is not a directory", root.display()));
+                continue;
+            }
+            Err(error) => {
+                issues.push(format!("{} is unavailable: {error}", root.display()));
+                continue;
+            }
+        }
+
+        let readable = path_accessible(root, libc::R_OK | libc::X_OK);
+        if readable {
+            readable_roots = readable_roots.saturating_add(1);
+        } else {
+            issues.push(format!("{} is not readable", root.display()));
+        }
+
+        let available_bytes = match statvfs_totals_sync(root) {
+            Ok((_, _, available_bytes)) => {
+                minimum_available_bytes = Some(
+                    minimum_available_bytes
+                        .map(|current| current.min(available_bytes))
+                        .unwrap_or(available_bytes),
+                );
+                available_bytes
+            }
+            Err(error) => {
+                issues.push(format!(
+                    "{} capacity is unavailable: {error}",
+                    root.display()
+                ));
+                continue;
+            }
+        };
+        let writable = path_accessible(root, libc::W_OK | libc::X_OK)
+            && available_bytes >= MIN_STORAGE_WRITE_HEADROOM_BYTES;
+        if writable {
+            writable_roots = writable_roots.saturating_add(1);
+        } else {
+            issues.push(format!(
+                "{} is not write-ready ({} bytes available; {} required headroom)",
+                root.display(),
+                available_bytes,
+                MIN_STORAGE_WRITE_HEADROOM_BYTES
+            ));
+        }
+    }
+
+    StorageReadiness {
+        readable: !roots.is_empty() && readable_roots == roots.len(),
+        writable: !roots.is_empty() && writable_roots == roots.len(),
+        root_count: roots.len(),
+        readable_roots,
+        writable_roots,
+        minimum_available_bytes,
+        issues,
+    }
+}
+
+pub async fn get_storage_readiness() -> Result<StorageReadiness, AppError> {
+    let roots = ObjectPathManager::new().get_storage_roots();
+    tokio::task::spawn_blocking(move || classify_storage_readiness(&roots))
+        .await
+        .map_err(|error| AppError::InternalServerError(format!("storage readiness task: {error}")))
 }
 
 #[cfg(not(unix))]
@@ -389,5 +492,50 @@ mod tests {
     fn placement_required_bytes_spreads_shards_by_part_and_root() {
         let required = placement_required_bytes_by_root(4, 0, &[1024, 1024], 2, 1, 512);
         assert_eq!(required, vec![512, 1024, 1024, 512]);
+    }
+
+    #[test]
+    fn storage_readiness_rejects_missing_and_non_directory_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "n2-storage-readiness-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not-a-root");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let missing = base.join("missing");
+
+        let readiness = classify_storage_readiness(&[file, missing]);
+        assert!(!readiness.readable);
+        assert!(!readiness.writable);
+        assert_eq!(readiness.root_count, 2);
+        assert_eq!(readiness.readable_roots, 0);
+        assert_eq!(readiness.writable_roots, 0);
+        assert_eq!(readiness.issues.len(), 2);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn storage_readiness_accepts_an_accessible_root_with_headroom() {
+        let root = std::env::temp_dir().join(format!(
+            "n2-storage-readiness-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let readiness = classify_storage_readiness(std::slice::from_ref(&root));
+        assert!(readiness.readable);
+        assert!(readiness.writable);
+        assert_eq!(readiness.readable_roots, 1);
+        assert_eq!(readiness.writable_roots, 1);
+        assert!(
+            readiness.minimum_available_bytes.unwrap_or_default()
+                >= MIN_STORAGE_WRITE_HEADROOM_BYTES
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
