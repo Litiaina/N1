@@ -1,13 +1,13 @@
-# N2 3.3 Testing
+# N2 3.4 Testing
 
 This document is the single correctness and resilience record for the current
-N2 3.3 engine. It covers test scope, procedures, results, failures, fixes, and
+N2 3.4 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Qualification Boundary
 
-N2 3.3 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
+N2 3.4 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
 server pools, immutable NCDX/object layouts, and healing model. Its lifecycle
 stores one delete mutation under
 `.trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx`. NCNX and object NCDX
@@ -15,7 +15,7 @@ use the 3.x SHA-256 format; server-pool membership and root enrollment use
 format version 5. Format v5 separates stable logical placement slots from
 replaceable physical instances, adds an independent binding epoch, and records
 reserve and retired instances. N2 1.x, 2.x, and earlier experimental 3.x
-results do not qualify the 3.3 disk format.
+results do not qualify the current 3.x disk format.
 
 The current finite release proof uses four logical nodes over two physical
 hosts plus one unassigned reserve process. It exercises the configured `2 + 2`
@@ -25,11 +25,11 @@ failure domains.
 
 ## Repository Gates
 
-The N2 3.3 implementation currently has passed:
+The N2 3.4.0 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test -p n2 --release`: 153 passed;
+- `cargo test -p n2 --release`: 161 passed;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
@@ -40,12 +40,64 @@ integrity, corrupted block reconstruction, canonical-list refill,
 replica-backed degraded listing, exact static placement, exact metadata
 visibility, copy/delete restart semantics, and object/healing invariants.
 
-## Storage-Root Failure Gate
+### Survival-write code gate
 
-The minimum `1 + 1` qualification now runs one node on an isolated 1 GiB XFS
-filesystem and tests both an application-inaccessible root and real XFS
-`ENOSPC`. It also requires cluster health to describe the data path truthfully;
-endpoint reachability alone is not accepted as storage health.
+The current survival-write branch has passed the complete debug and optimized
+release library suites: 161 passed, 0 failed in each profile. Its focused
+invariants include:
+
+- the configured `K + M` layout remains unchanged at full width and at `K`;
+- EC streaming persists and checksums every exact piece while only `K` writers
+  survive;
+- the same stream rejects `K - 1`;
+- `R = M + 1` NCNX placement intersects every possible `K`-node survivor set;
+- health reports exactly `K` as degraded/writable and `K - 1` as critical;
+- one failed storage root does not disable a node that retains another
+  readable/writable root;
+- object-local healing failures remain local reports instead of global
+  read-only incidents.
+
+The updated physical root-failure proof completed successfully:
+
+```text
+/home/administrator/DEV-TEST/n2-survival-minimum-20260731-005855/minimum
+```
+
+It proved HTTP 201 plus byte-exact GET while one `1 + 1` root was inaccessible,
+HTTP 201 plus byte-exact GET while that root was at the ENOSPC boundary,
+degraded/writable health at exactly `K`, no reserve consumption for root
+pressure, return to full protection after restoration, and another HTTP 201
+write after one complete node loss before reserve promotion. It also proved
+missing NCNX repair, missing shard repair, autonomous binding-epoch advance,
+historical-layout repair, HTTP 409 stale-instance fencing, and restart
+persistence. The retained summary reports `PASS` and zero suspicious log
+lines. N1 remained active throughout; all N2 storage paths were isolated below
+`.n2-validation/<run-id>`.
+
+### N2 3.4.0 survival soak
+
+The independent 24-hour four-node `2 + 2` survival soak started on
+2026-07-31 and is retained at:
+
+```text
+/home/administrator/DEV-TEST/n2-3.4.0-survival-soak-20260731-011941
+```
+
+It runs the exact optimized 3.4.0 server and native-shell binaries over four
+isolated HDD roots. Its workload covers one-shot and multipart upload,
+download verification, zero-decode paginated listing, copy/delete lifecycle,
+native protocol operations, healing, rolling node loss, writes at `K`,
+rejection below `K`, and rotating bounded chaos. Startup validation reached
+cycle 1 with all four 3.4.0 nodes and all HTTPS/native ports active. This is
+recorded as `RUNNING`, not as passing evidence, until its retained summary
+reports `PASS`.
+
+## Superseded Strict-Width Storage-Root Baseline
+
+The following retained `1 + 1` evidence predates the survival-write contract.
+It proved the older strict-width behavior and remains useful regression
+evidence for fault injection, but it does not qualify the new `K`-threshold
+publication path.
 
 Passing evidence:
 
@@ -66,16 +118,16 @@ Passing evidence:
 | Reserve during root pressure | Not consumed; the physical instance remained reachable |
 | Later complete node loss | Reserve promoted, stale instance fenced, historical layout healed, restart persisted |
 
-This gate models a destroyed or unusable device at the N2 process boundary by
+This historical gate models a destroyed or unusable device at the N2 process boundary by
 making its dedicated XFS root inaccessible. It does not claim laboratory
 coverage of every kernel, controller, cable, or media-specific `EIO` mode.
 Reserve promotion remains a physical-instance replacement protocol: a
 capacity-full but reachable node makes its exact-width pool safely read-only;
 it is not silently rebound merely to create more capacity.
 
-The same independent qualification run proceeds from this passed finite gate
-through standard `2 + 2`, multi-pool, and 24-hour bounded chaos stages. Those
-later stages are not recorded as passed until their own summaries complete.
+The replacement qualification must proceed through minimum `1 + 1`, standard
+`2 + 2`, multi-pool, and bounded chaos stages. Those stages are not recorded
+as survival-write passes until their own new summaries complete.
 
 The node-churn regression proof for the fixes released as N2 3.3.1 completed
 12 workload cycles and 11 bounded chaos events against one four-node `2 + 2`
@@ -296,10 +348,9 @@ Code and release tests exercise these flat-namespace laws:
 - A retry cannot remove a newer same-key generation.
 - Prefix rename/trash/recover applies the exact-key protocol with bounded
   concurrency and records recoverable mutation groups.
-- Listing emits canonical replicas and uses physical names without decoding
-  NCNX or NCDX.
-- A canonical listing-source failure retries physical replica streams, and
-  only within the pool's exact `M`-node namespace failure budget.
+- Listing merges physical replica names without decoding NCNX or NCDX.
+- Replica-page failures are tolerated only within the pool's exact `M`-node
+  namespace failure budget.
 - Exact-key and same-name-prefix order survives continuation pagination.
 - Root identity rejects in-place root-set changes after enrollment.
 - Upload `K + M` must equal the static pool contract.

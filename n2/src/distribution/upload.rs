@@ -16,7 +16,9 @@ use crate::distribution::peer::{
     publish_cluster_object_metadata,
 };
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
-use crate::distribution::{ClusterEcLayout, resolve_configured_layout, resolve_write_layout};
+use crate::distribution::{
+    ClusterEcLayout, resolve_configured_layout, resolve_survival_write_layout,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_io_latency;
 use crate::structs::auth_structs::Claims;
@@ -26,12 +28,14 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tracing::warn;
 use ulid::Ulid;
 
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
@@ -152,11 +156,11 @@ impl LocalShardWriter {
 fn configured_layout(
     runtime: &crate::distribution::membership::ClusterRuntime,
 ) -> Result<ClusterEcLayout, AppError> {
-    resolve_configured_layout(
-        runtime.membership.active_newest_pool_nodes().len(),
-        &runtime.layout_policy,
-    )
-    .map_err(AppError::BadRequest)
+    let pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+        AppError::ServiceUnavailable("cluster has no writable server pool".into())
+    })?;
+    resolve_configured_layout(pool.node_ids.len(), &runtime.layout_policy)
+        .map_err(AppError::BadRequest)
 }
 
 fn validate_write_admission(
@@ -168,26 +172,26 @@ fn validate_write_admission(
     let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
     })?;
-    let replica_count = write_pool.policy.namespace_replicas();
-    // NCNX publication is an all-replica durability gate. Reads may survive
-    // fewer replicas, but a new mutation is never acknowledged partially.
-    let required_pool_nodes = write_pool.node_ids.len();
-    if reachable_namespace_nodes < required_pool_nodes {
-        return Err(AppError::ServiceUnavailable(format!(
-            "N2 NCNX placement is not uniformly writable: {} of {} pool nodes reachable ({} replicas per key)",
-            reachable_namespace_nodes, required_pool_nodes, replica_count
-        )));
-    }
-
     let configured = configured_layout(runtime)?;
-    if write_layout != configured || reachable_blob_nodes < configured.total_shards() {
+    if write_layout != configured {
         return Err(AppError::ServiceUnavailable(format!(
-            "N2 object writes require the configured {}+{} layout on {} distinct writable server-pool nodes",
-            configured.data_shards,
-            configured.parity_shards,
-            configured.total_shards()
+            "N2 survival writes preserve the configured {}+{} layout",
+            configured.data_shards, configured.parity_shards
         )));
     }
+    if reachable_namespace_nodes < configured.data_shards {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 survival namespace publication requires at least K={} reachable pool nodes, but only {} are reachable",
+            configured.data_shards, reachable_namespace_nodes
+        )));
+    }
+    if reachable_blob_nodes < configured.data_shards {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 survival object writes preserve configured EC {}+{} and require at least K={} distinct writable server-pool nodes",
+            configured.data_shards, configured.parity_shards, configured.data_shards
+        )));
+    }
+    debug_assert_eq!(write_pool.policy.object_data_shards, configured.data_shards);
     Ok(())
 }
 
@@ -235,22 +239,16 @@ async fn current_write_context() -> Result<
 > {
     let (runtime, layout) = configured_write_context()?;
     let active = live_newest_pool_write_nodes(&runtime).await;
-    let live_layout = resolve_write_layout(
-        active.len(),
-        runtime.membership.active_newest_pool_nodes().len(),
-        &runtime.layout_policy,
-    )
-    .map_err(AppError::ServiceUnavailable)?;
-    if live_layout != layout {
-        return Err(AppError::ServiceUnavailable(format!(
-            "live N2 layout {}+{} does not match configured {}+{}",
-            live_layout.data_shards,
-            live_layout.parity_shards,
-            layout.data_shards,
-            layout.parity_shards
-        )));
-    }
+    let configured = runtime
+        .membership
+        .newest_writable_pool()
+        .map(|pool| pool.node_ids.len())
+        .unwrap_or_default();
+    let live_layout =
+        resolve_survival_write_layout(active.len(), configured, &runtime.layout_policy)
+            .map_err(AppError::ServiceUnavailable)?;
     validate_write_admission(&runtime, active.len(), active.len(), layout)?;
+    debug_assert_eq!(live_layout, layout);
     Ok((runtime, active, layout))
 }
 
@@ -374,6 +372,55 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
     format!("part_{part_index}_shard_{shard_index}{ext}")
 }
 
+fn target_for_placement(
+    plan: &ClusterPlacementPlan,
+    placement: &crate::distribution::placement::ClusterShardPlacement,
+    part_index: u64,
+    final_shard_len: u64,
+) -> PeerShardTarget {
+    let is_parity = matches!(
+        placement.role,
+        crate::distribution::placement::ClusterShardRole::Parity
+    );
+    PeerShardTarget {
+        pool_id: plan.pool_id.clone(),
+        pool_generation: plan.pool_generation,
+        node_id: placement.node_id.clone(),
+        instance_id: placement.instance_id.clone(),
+        binding_epoch: plan.binding_epoch,
+        root_id: placement.root_id.clone(),
+        endpoint: placement
+            .native_endpoint
+            .clone()
+            .unwrap_or_else(|| placement.endpoint.clone()),
+        fragment: plan.fragment.clone(),
+        object_id: plan.object_key.clone(),
+        version_id: plan.version_id.clone(),
+        part_index,
+        shard_index: placement.shard_index,
+        is_parity,
+        expected_len: final_shard_len,
+    }
+}
+
+fn planned_shard_info(
+    target: &PeerShardTarget,
+    checksum: String,
+    block_checksums: Vec<Sha256Digest>,
+    checksum_block_size: usize,
+) -> ShardInfo {
+    ShardInfo {
+        shard_index: target.shard_index,
+        file_name: stable_name(target.part_index, target.shard_index, target.is_parity),
+        absolute_path: encode_peer_shard_locator(target),
+        size_bytes: target.expected_len,
+        checksum,
+        block_checksums,
+        checksum_block_size,
+        is_parity: target.is_parity,
+    }
+}
+
 async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter, AppError> {
     let runtime = active_cluster_runtime()?;
     if runtime.local_is_reserve
@@ -426,39 +473,40 @@ async fn open_writers_for_plan(
     plan: &ClusterPlacementPlan,
     part_index: u64,
     final_shard_len: u64,
+    reachable: &BTreeSet<String>,
 ) -> Result<Vec<Option<ClusterShardWriter>>, AppError> {
     let runtime = active_cluster_runtime()?;
     let mut writers = Vec::with_capacity(plan.placements.len());
     for placement in &plan.placements {
-        let is_parity = matches!(
-            placement.role,
-            crate::distribution::placement::ClusterShardRole::Parity
-        );
-        let target = PeerShardTarget {
-            pool_id: plan.pool_id.clone(),
-            pool_generation: plan.pool_generation,
-            node_id: placement.node_id.clone(),
-            instance_id: placement.instance_id.clone(),
-            binding_epoch: plan.binding_epoch,
-            root_id: placement.root_id.clone(),
-            endpoint: placement
-                .native_endpoint
-                .clone()
-                .unwrap_or_else(|| placement.endpoint.clone()),
-            fragment: plan.fragment.clone(),
-            object_id: plan.object_key.clone(),
-            version_id: plan.version_id.clone(),
-            part_index,
-            shard_index: placement.shard_index,
-            is_parity,
-            expected_len: final_shard_len,
-        };
-        if placement.node_id == runtime.local_node_id {
-            writers.push(Some(open_local_writer(target).await?));
-        } else {
-            let remote = RemoteShardWriter::spawn(target)?;
-            writers.push(Some(ClusterShardWriter::Remote(remote)));
+        if !reachable.contains(&placement.node_id) {
+            writers.push(None);
+            continue;
         }
+        let target = target_for_placement(plan, placement, part_index, final_shard_len);
+        let writer = if placement.node_id == runtime.local_node_id {
+            open_local_writer(target).await
+        } else {
+            RemoteShardWriter::spawn(target).map(ClusterShardWriter::Remote)
+        };
+        match writer {
+            Ok(writer) => writers.push(Some(writer)),
+            Err(error) => {
+                warn!(
+                    node_id = %placement.node_id,
+                    root_id = %placement.root_id,
+                    shard_index = placement.shard_index,
+                    "N2 survival upload could not open an assigned shard writer: {error}"
+                );
+                writers.push(None);
+            }
+        }
+    }
+    if writers.iter().filter(|writer| writer.is_some()).count() < plan.data_shards {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 survival upload requires K={} shard writers, but only {} opened",
+            plan.data_shards,
+            writers.iter().filter(|writer| writer.is_some()).count()
+        )));
     }
     Ok(writers)
 }
@@ -516,16 +564,16 @@ where
         .await
         .into_iter()
         .map(|node| node.id)
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     let unavailable = placement
         .placements
         .iter()
         .filter(|placement| !reachable.contains(&placement.node_id))
         .map(|placement| placement.node_id.clone())
         .collect::<Vec<_>>();
-    if !unavailable.is_empty() {
+    if reachable.len() < data_shards {
         return Err(AppError::ServiceUnavailable(format!(
-            "exact server-pool placement for {fragment}/{object_key} cannot write safely; unavailable participant(s): {}",
+            "N2 survival placement for {fragment}/{object_key} requires K={data_shards} reachable participants; unavailable participant(s): {}",
             unavailable.join(", ")
         )));
     }
@@ -533,7 +581,8 @@ where
     let stripe_count = content_length.div_ceil(stripe_data_width.max(1));
     let final_shard_len = stripe_count.saturating_mul(block_size as u64);
     let open_started = Instant::now();
-    let writers = open_writers_for_plan(&placement, part_index, final_shard_len).await?;
+    let writers =
+        open_writers_for_plan(&placement, part_index, final_shard_len, &reachable).await?;
     record_io_latency(
         "cluster.upload.open_writers",
         open_started.elapsed(),
@@ -586,27 +635,75 @@ where
         let checksum = shard_checksums.get(idx).cloned().unwrap_or_default();
         let block_checksums = shard_block_checksums.get(idx).cloned().unwrap_or_default();
         async move {
-            let writer = writer.ok_or_else(|| {
-                AppError::InternalServerError(format!("cluster shard writer {idx} failed"))
-            })?;
-            writer
-                .finish(checksum, block_checksums, block_size)
-                .await
-                .map(|shard| (idx, shard))
+            match writer {
+                Some(writer) => writer
+                    .finish(checksum, block_checksums, block_size)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+            .map(|shard| (idx, shard))
         }
     });
     let finish_results = join_all(finish_tasks).await;
-    let finish_ok = finish_results.iter().all(Result::is_ok);
+    let successful_finishes = finish_results
+        .iter()
+        .filter(|result| matches!(result, Ok((_, Some(_)))))
+        .count();
+    let finish_ok = successful_finishes >= data_shards;
     record_io_latency(
         "cluster.upload.finish_shards",
         finish_started.elapsed(),
         content_length,
         finish_ok,
     );
-    let mut shards = Vec::with_capacity(finish_results.len());
+    let mut finished = vec![None; placement.placements.len()];
     for result in finish_results {
-        let (_, shard) = result?;
-        shards.push(shard);
+        match result {
+            Ok((index, shard)) => finished[index] = shard,
+            Err(error) => warn!(
+                fragment,
+                object_key,
+                part_index,
+                "N2 survival upload lost a shard during durable finish: {error}"
+            ),
+        }
+    }
+    let durable = finished.iter().filter(|shard| shard.is_some()).count();
+    if durable < data_shards {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 survival upload persisted {durable} of {} EC pieces; K={data_shards} is required",
+            layout.total_shards()
+        )));
+    }
+    if durable < layout.total_shards() {
+        warn!(
+            fragment,
+            object_key,
+            part_index,
+            durable_pieces = durable,
+            target_pieces = layout.total_shards(),
+            "N2 committed a reconstructable degraded part; autonomous repair owns the exact missing slots"
+        );
+    }
+    let mut shards = Vec::with_capacity(placement.placements.len());
+    for (index, assigned) in placement.placements.iter().enumerate() {
+        let checksum = shard_checksums.get(index).cloned().ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "N2 EC writer omitted checksum for shard {index}"
+            ))
+        })?;
+        let block_checksums = shard_block_checksums.get(index).cloned().ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "N2 EC writer omitted block checksums for shard {index}"
+            ))
+        })?;
+        let target = target_for_placement(&placement, assigned, part_index, final_shard_len);
+        shards.push(
+            finished[index].take().unwrap_or_else(|| {
+                planned_shard_info(&target, checksum, block_checksums, block_size)
+            }),
+        );
     }
     shards.sort_by_key(|shard| shard.shard_index);
     Ok(DistributedPartWrite {
@@ -1047,25 +1144,42 @@ mod tests {
     }
 
     #[test]
-    fn fixed_cluster_admits_only_the_complete_configured_object_width() {
+    fn fixed_cluster_admits_full_and_k_threshold_survival_writes() {
         let runtime = fixed_runtime();
-        let layout = resolve_write_layout(3, 3, &runtime.layout_policy).unwrap();
+        let layout = resolve_survival_write_layout(3, 3, &runtime.layout_policy).unwrap();
 
         assert_eq!(layout.data_shards, 2);
         assert_eq!(layout.parity_shards, 1);
         assert!(validate_write_admission(&runtime, 3, 3, layout).is_ok());
+        assert!(validate_write_admission(&runtime, 2, 2, layout).is_ok());
     }
 
     #[test]
-    fn fixed_cluster_rejects_an_under_width_blob_plane() {
-        let runtime = fixed_runtime();
-        assert!(resolve_write_layout(2, 3, &runtime.layout_policy).is_err());
+    fn offline_member_remains_part_of_the_static_layout_but_not_live_admission() {
+        let mut runtime = fixed_runtime();
+        runtime.membership.nodes[2].state = Some(NodeState::Offline);
+
+        let layout = configured_layout(&runtime).unwrap();
+        assert_eq!(layout.data_shards, 2);
+        assert_eq!(layout.parity_shards, 1);
+        assert_eq!(
+            runtime.membership.active_newest_pool_nodes().len(),
+            layout.data_shards
+        );
+        assert!(validate_write_admission(&runtime, 2, 2, layout).is_ok());
     }
 
     #[test]
-    fn strict_two_replica_ncnx_rejects_one_reachable_node() {
+    fn fixed_cluster_rejects_a_blob_plane_below_k() {
         let runtime = fixed_runtime();
-        let layout = resolve_write_layout(3, 3, &runtime.layout_policy).unwrap();
+        assert!(resolve_survival_write_layout(2, 3, &runtime.layout_policy).is_ok());
+        assert!(resolve_survival_write_layout(1, 3, &runtime.layout_policy).is_err());
+    }
+
+    #[test]
+    fn survival_admission_rejects_namespace_reachability_below_k() {
+        let runtime = fixed_runtime();
+        let layout = resolve_survival_write_layout(3, 3, &runtime.layout_policy).unwrap();
         assert!(validate_write_admission(&runtime, 1, 3, layout).is_err());
     }
 
@@ -1081,12 +1195,13 @@ mod tests {
     }
 
     #[test]
-    fn pinned_two_plus_one_session_stops_after_node_loss() {
+    fn pinned_layout_validates_immutable_pool_width_not_live_reachability() {
         let layout = ClusterEcLayout {
             data_shards: 2,
             parity_shards: 1,
         };
 
         assert!(validate_pinned_upload_layout(layout, 2).is_err());
+        assert!(validate_pinned_upload_layout(layout, 3).is_ok());
     }
 }

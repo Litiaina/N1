@@ -1,19 +1,19 @@
-# N2 3.3 Architecture
+# N2 3.4 Architecture
 
 ## Status
 
-This document is the locked implementation contract for N2 3.3, the current
+This document is the locked implementation contract for N2 3.4, the current
 release of the clean N2 3.x engine generation. It does not read, migrate, or
 maintain compatibility with the N2 2.0 inode namespace.
 
-N2 3.3 is a clean format. It accepts only the generation-directory trash
+N2 3.4 is a clean format. It accepts only the generation-directory trash
 layout and SHA-256 NCNX/object-NCDX/shard integrity defined here. Earlier
 experimental 3.x records are rejected rather than ignored or guessed.
 
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.3 combines:
+N2 3.4 combines:
 
 - immutable, object-level erasure sets;
 - flat physical-key namespace records;
@@ -37,8 +37,10 @@ cluster-wide mutation log, or implicit redistribution.
 4. Each pool has a static `K + M` object EC contract.
 5. A pool generation fixes its node IDs and each node's root-ID set. Expansion
    appends a new complete pool; it never remaps an enrolled pool in place.
-6. Each live `.ncnx` record has exactly `R = M + 1` replicas on distinct nodes
-   in its immutable namespace home pool.
+6. Each live `.ncnx` record has an exact target layout of `R = M + 1`
+   replicas on distinct nodes in its immutable namespace home pool. A
+   survival upload may initially publish fewer, never zero; healing restores
+   the same target layout.
 7. Every node in a server pool can store namespace records, NCDX, shards,
    parity, uploads, and fragment state. There are no namespace/blob roles.
 8. A namespace mutation operates only on NCNX records. It never opens or
@@ -52,8 +54,10 @@ cluster-wide mutation log, or implicit redistribution.
     decode NCNX or open NCDX.
 12. Adding a pool adds capacity for future objects. Existing objects are not
     redistributed unless an operator explicitly requests re-encoding.
-13. When a pool cannot satisfy its exact object EC or NCNX durability, unsafe
-    writes fail closed. Readable committed objects remain readable.
+13. A new object is acknowledged only after at least `K` exact EC pieces,
+    `K` immutable NCDX copies, and one NCNX copy are durable. N2 still records
+    the complete configured `K + M` shard/NCDX and `M + 1` NCNX repair layout.
+    Fewer than `K` writable pool nodes fails closed.
 14. SHA-256 is the only N2 integrity checksum for NCNX, object NCDX, upload
     bodies, immutable shards, and verified shard blocks.
 15. Placement is calculated from the immutable node membership of the selected
@@ -147,8 +151,8 @@ commits first, remote survivors commit next, and the coordinating survivor
 commits last. Membership is persisted with temporary-file write, file `fsync`,
 atomic rename, and parent-directory `fsync`.
 
-New exact-width writes may continue through the promoted degraded binding while
-bounded autonomous healing restores historical layouts. The slot returns to
+New writes use every available exact holder and may commit reconstructably at
+`K` while bounded autonomous healing restores missing exact slots. The slot returns to
 `online` only after healing completes with no incomplete, unrecoverable,
 failed, or errored objects. Only one missing slot in a pool is eligible for
 autonomous promotion. Multiple missing slots, incompatible reserve roots,
@@ -163,9 +167,9 @@ engine with `reserve_nodes: []`:
 - constrained, low-end, development, and lab deployments may run without a
   reserve;
 - without a reserve, committed objects remain readable within their recorded
-  parity budget, but loss of an active slot stops new writes to that exact
-  pool until the operator restores the slot or enrolls compatible replacement
-  capacity;
+  parity budget and reconstructable writes continue while at least `K` pool
+  nodes remain writable; the operator must restore capacity before the pool
+  drops below `K` or to regain full parity protection;
 - omitting a reserve does not reduce the EC recorded for existing objects, but
   it removes automatic physical-node replacement.
 
@@ -191,7 +195,7 @@ pool.
 
 ## Unified Nodes And Disks
 
-Every N2 3.3 node is bidirectional and unified. Any healthy node may receive a
+Every N2 3.4 node is bidirectional and unified. Any healthy node may receive a
 client operation and coordinate it. Every pool node may also persist the data
 assigned to it:
 
@@ -216,7 +220,7 @@ authority.
 
 ## Disk Layout
 
-Each enrolled storage root uses the same N2 3.3 format:
+Each enrolled storage root uses the same N2 3.4 format:
 
 ```text
 <storage_root>/
@@ -299,12 +303,16 @@ The replica set is selected by deterministic rendezvous scoring over:
 (cluster ID, pool ID, pool generation, fragment ID, logical key, node ID)
 ```
 
-One deterministic selected holder is canonical for listing. The remaining
-holders are durability replicas and read/healing fallbacks. Root selection is
-deterministic inside each selected node.
+One deterministic selected holder remains the canonical ownership coordinate
+for healing. Normal LIST merges bounded physical names from all replica
+holders because a survival upload's first durable copy may be noncanonical.
+Root selection is deterministic inside each selected node.
 
-All `R` NCNX replicas must be durably published before the namespace mutation
-reports success. N2 does not acknowledge a partially durable key.
+Upload commit attempts all `R` holders and requires at least one durable NCNX
+copy after the object reaches its `K` EC/NCDX threshold. Rename, move, trash,
+and recover retain their destination-first all-`R` copy/delete contract.
+The upload existence check uses the same reachable-replica survival boundary;
+it does not reintroduce an all-`R` admission barrier before the write.
 
 ## Static Object Placement
 
@@ -329,7 +337,7 @@ Adding disks, nodes, or pools cannot remap an existing object.
 
 ## Key Semantics
 
-N2 3.3 is a flat object-key namespace with prefix presentation:
+N2 3.4 is a flat object-key namespace with prefix presentation:
 
 ```text
 videos/a.mp4
@@ -351,16 +359,17 @@ truth and may use a newer pool.
 
 ## Zero-Decode Listing
 
-LIST scans physical `.namespace` paths, not NCNX bodies. A node returns only
-keys for which it is the deterministic canonical NCNX holder. Replica copies
-are skipped mathematically without opening them.
+LIST scans physical `.namespace` paths, not NCNX bodies. Because a survival
+commit may initially have only one noncanonical NCNX copy, every relevant
+pool node returns a bounded page of physical replica names. The coordinator
+merges and deduplicates those names without opening them.
 
 ```text
 coordinator
   -> request pages from all relevant pool nodes in parallel
   -> each node walks the requested physical prefix
-  -> node emits only its canonical filenames/common prefixes
-  -> coordinator performs a bounded ordered merge
+  -> each node emits replica filenames/common prefixes
+  -> coordinator performs a bounded ordered merge and deduplication
   -> opaque cursor records the last emitted global NCNX ordering key
 ```
 
@@ -369,14 +378,12 @@ Properties:
 - no NCNX decode;
 - no NCDX open;
 - no shard/parity IO;
-- no replica deduplication table on the healthy canonical path;
 - no full-cluster in-memory listing;
-- bounded work proportional to the requested page and traversed prefix.
+- bounded memory proportional to the requested page and NCNX replica factor.
 
-If a canonical source is unavailable, the coordinator retries the same page
-against physical replica streams. It deduplicates only that bounded page and
-returns a result only while each pool remains within its `M`-node NCNX
-failure budget. An unavailable source is never interpreted as an empty one.
+The coordinator returns a result only while each pool remains within its
+`M`-node NCNX failure budget. An unavailable source is never interpreted as
+an empty one.
 
 LIST returns key, name, prefix/type, and lifecycle state. Object size, content
 type, checksum, and current version require HEAD because they belong to NCDX.
@@ -390,15 +397,22 @@ idempotent and stale same-key operations fail rather than delete newer state.
 ### Upload commit
 
 ```text
-publish K + M shards/parity
--> publish immutable NCDX
--> create and fsync all R live NCNX replicas
+calculate the complete fixed K + M layout
+-> attempt every exact shard/parity holder in parallel
+-> require at least K durable EC pieces
+-> publish immutable NCDX to every available exact holder and require K
+-> publish to all R=M+1 NCNX holders and require at least one durable copy
 -> fsync their parent directories
 -> acknowledge
 ```
 
-If NCNX publication cannot complete, the immutable object is not live. N2
-reports that headless immutable data and preserves it; automatic GC never
+The NCDX retains descriptors and SHA-256 checksums for all `K + M` exact
+pieces, including an unavailable target, so healing has one deterministic
+destination rather than inventing a replacement layout. `R=M+1` guarantees
+that every possible `K`-node survivor set intersects the NCNX replica set.
+When all holders are available, publication remains full width. If the
+minimum NCNX publication cannot complete, the immutable object is not live.
+N2 reports that headless immutable data and preserves it; automatic GC never
 guesses that missing namespace authority makes an object disposable.
 
 ### Copy/move one key
@@ -461,7 +475,7 @@ Trash records use zero-decode expiry names:
 
 GC scans `.trash` only for normal lifecycle work. It reads expiry from the
 generation directory name and builds temporary live and unexpired-trash
-object-ID sets from canonical NCNX records.
+object-ID sets from bounded, deduplicated NCNX replica pages.
 
 For each expired trash record:
 
@@ -519,18 +533,23 @@ For each canonical live NCNX, the healer resolves NCDX and verifies its exact
 holders, checksums, shards, and parity. Recoverable loss is reconstructed only
 to the recorded layout. Redistribution is a separate explicit re-encode.
 
-### Safety state
+### Survival and safety state
 
-A pool rejects new writes when:
+A pool is:
 
-- fewer than `K + M` distinct writable pool nodes are available;
-- fewer than `M + 1` NCNX holders can be durably written;
-- membership/layout identities disagree;
-- healing proves that safe publication or repair is impossible.
+- fully protected when all `K + M` exact holders accept the new object;
+- degraded but writable when at least `K` exact holders, `K` NCDX copies, and
+  one NCNX copy can commit;
+- critical and write-rejecting below `K`.
 
-Reads continue for objects whose recorded layouts remain decodable. A
-catastrophic object emits a precise report containing fragment, logical key,
-object ID, pool, expected holders, observed loss, and repair result.
+This is the object EC reconstruction threshold, not a consensus quorum and not
+an adaptive EC layout. Missing pieces and NCNX replicas remain exact
+object-local repair work. An unrepairable object or namespace record emits a
+precise local report but does not stop unrelated reconstructable objects.
+Cluster-wide read-only protection is reserved for systemic control-authority
+failures such as membership or binding identity disagreement.
+
+Reads continue for objects whose recorded layouts remain decodable.
 
 Work is partitioned by fragment, pool, and canonical key ownership so multiple
 nodes heal concurrently without scanning or repairing the same record.
@@ -587,7 +606,7 @@ authentication databases or user-visible endpoints.
 
 ## Performance Contract
 
-Every N2 3.3 release proof records:
+Every N2 3.4 release proof records:
 
 - operation latency distributions in microseconds/milliseconds;
 - CPU utilization and cycles when host permissions support hardware counters;
@@ -600,10 +619,11 @@ Required namespace properties:
 
 ```text
 GET key       = bounded NCNX replica reads + bounded NCDX holder read
-PUT publish   = K+M object holders + M+1 NCNX holders
+PUT attempt   = K+M object/NCDX holders + M+1 NCNX holders
+PUT acknowledge = at least K EC pieces + K NCDX copies + 1 NCNX copy
 DELETE key    = M+1 NCNX holders, zero object data IO
 RENAME key    = source and destination NCNX holders, zero object data IO
-LIST page     = filename traversal only, zero NCNX/NCDX/shard decode
+LIST page     = bounded replica filename merge, zero NCNX/NCDX/shard decode
 ```
 
 A test passes correctness only when the measured IO matches these boundaries.
@@ -611,7 +631,7 @@ Fast output with hidden global scans or object-data reads is a failure.
 
 ## Release Gates
 
-N2 3.3 is not declared production-stable until the following are proven:
+N2 3.4 is not declared production-stable until the following are proven:
 
 - exact `K + M` shard placement and exact `M + 1` NCNX replication;
 - upload, GET, HEAD, LIST, copy/move, trash, recover, and prefix operations;
@@ -619,6 +639,8 @@ N2 3.3 is not declared production-stable until the following are proven:
 - same-key collision safety and independent-key parallelism;
 - crash/restart at every destination-first copy/delete stage;
 - one- and parity-count node loss behavior;
+- full-width protection, degraded writes at exactly `K`, rejection at `K-1`,
+  and healing back to the unchanged exact layout;
 - autonomous one-slot reserve promotion, retired-instance fencing, historical
   exact-layout healing, and restart continuation;
 - fail-closed writes beyond the configured failure budget;

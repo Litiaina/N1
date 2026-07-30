@@ -17,7 +17,7 @@ use crate::distribution::rebalance::{
 };
 use crate::distribution::repair::repair_policy;
 use crate::distribution::reserve_set::reserve_routes;
-use crate::distribution::{resolve_configured_layout, resolve_write_layout};
+use crate::distribution::{resolve_configured_layout, resolve_survival_write_layout};
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
 use axum::extract::{Query, State};
@@ -93,19 +93,25 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let runtime = active_cluster_runtime()?;
-    let active = live_newest_pool_write_nodes(&runtime).await;
-    let configured_nodes = runtime.membership.active_newest_pool_nodes().len();
+    let health = cluster_health_snapshot(&runtime).await?;
+    let configured_nodes = runtime
+        .membership
+        .newest_writable_pool()
+        .map(|pool| pool.node_ids.len())
+        .unwrap_or_default();
     let configured_layout = resolve_configured_layout(configured_nodes, &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
-    let layout = resolve_write_layout(active.len(), configured_nodes, &runtime.layout_policy)
-        .map_err(AppError::BadRequest)?;
+    let survival_writable = health.data_plane_writable && health.ncnx_survival_writable;
+    let fully_protected = health.data_plane_fully_protected && health.ncnx_strictly_writable;
     Ok(Json(serde_json::json!({
         "membership_epoch": runtime.membership.epoch,
         "policy": runtime.layout_policy,
-        "active_write_nodes": active.len(),
-        "layout": layout,
+        "active_write_nodes": health.active_write_nodes,
+        "layout": configured_layout,
         "configured_layout": configured_layout,
-        "degraded_write_layout": false,
+        "survival_writable": survival_writable,
+        "fully_protected": fully_protected,
+        "degraded_write_layout": survival_writable && !fully_protected,
         "bounded_object_erasure_set": true,
         "static_server_pool_ec": true,
         "old_object_layouts_remain_valid": true,
@@ -274,16 +280,14 @@ pub async fn placement_preview(
     }
     let runtime = active_cluster_runtime()?;
     let active = live_newest_pool_write_nodes(&runtime).await;
-    let layout = resolve_write_layout(
-        active.len(),
-        runtime.membership.active_newest_pool_nodes().len(),
-        &runtime.layout_policy,
-    )
-    .map_err(AppError::BadRequest)?;
-    let version = query.version_id.unwrap_or_else(|| "preview".to_string());
     let pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
     })?;
+    let configured_nodes = runtime.membership.nodes_for_pool(&pool.id);
+    let layout =
+        resolve_survival_write_layout(active.len(), configured_nodes.len(), &runtime.layout_policy)
+            .map_err(AppError::BadRequest)?;
+    let version = query.version_id.unwrap_or_else(|| "preview".to_string());
     let plan = build_placement_plan(
         &query.fragment,
         &query.object_key,
@@ -293,7 +297,7 @@ pub async fn placement_preview(
         runtime.membership.epoch,
         runtime.membership.binding_epoch,
         layout,
-        &active,
+        &configured_nodes,
     )?;
     Ok(Json(plan))
 }

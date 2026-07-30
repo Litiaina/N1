@@ -696,7 +696,7 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
     let runtime = active_cluster_runtime()?;
     let participant_ids = validate_metadata_pool_contract(&runtime, metadata)?;
 
-    let required_metadata_writes = participant_ids.len();
+    let required_metadata_writes = usize::from(metadata.data_shards);
     let mut tasks = futures_util::stream::FuturesUnordered::new();
     for node_id in participant_ids {
         let node = runtime
@@ -735,7 +735,7 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
     }
     if successes < required_metadata_writes {
         return Err(AppError::ServiceUnavailable(format!(
-            "strict NCDX publication failed for {}/{} version {}: {} successful, {} required; {}",
+            "survival NCDX publication failed for {}/{} version {}: {} successful, K={} required; {}",
             metadata.fragment,
             metadata.object_key,
             metadata.version_id,

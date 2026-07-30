@@ -147,8 +147,11 @@ fn classify_storage_readiness(roots: &[PathBuf]) -> StorageReadiness {
     }
 
     StorageReadiness {
-        readable: !roots.is_empty() && readable_roots == roots.len(),
-        writable: !roots.is_empty() && writable_roots == roots.len(),
+        // A node is a placement participant, not a single disk. Losing one
+        // configured root must remain a degraded node-level condition while
+        // any other root can still serve I/O.
+        readable: readable_roots > 0,
+        writable: writable_roots > 0,
         root_count: roots.len(),
         readable_roots,
         writable_roots,
@@ -537,5 +540,27 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_readiness_keeps_node_available_when_one_root_is_lost() {
+        let base = std::env::temp_dir().join(format!(
+            "n2-storage-readiness-degraded-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let healthy = base.join("healthy");
+        let missing = base.join("missing");
+        std::fs::create_dir_all(&healthy).unwrap();
+
+        let readiness = classify_storage_readiness(&[healthy, missing]);
+        assert!(readiness.readable);
+        assert!(readiness.writable);
+        assert_eq!(readiness.root_count, 2);
+        assert_eq!(readiness.readable_roots, 1);
+        assert_eq!(readiness.writable_roots, 1);
+        assert!(!readiness.issues.is_empty());
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

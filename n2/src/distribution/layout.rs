@@ -16,7 +16,7 @@ impl ClusterEcLayout {
             return Err("cluster data shards must be greater than zero".to_string());
         }
         if self.parity_shards == 0 {
-            return Err("N2 3.3 server pools require at least one parity shard".to_string());
+            return Err("N2 3.4 server pools require at least one parity shard".to_string());
         }
         Ok(self)
     }
@@ -94,6 +94,31 @@ pub fn resolve_write_layout(
     Ok(configured_layout)
 }
 
+/// Return the immutable configured EC layout while at least its reconstruction
+/// width remains writable. Survival writes never reinterpret K or M; they
+/// publish every reachable recorded piece and leave the exact missing slots
+/// for deterministic repair.
+pub fn resolve_survival_write_layout(
+    available_nodes: usize,
+    configured_nodes: usize,
+    policy: &ClusterLayoutPolicy,
+) -> Result<ClusterEcLayout, String> {
+    if available_nodes == 0 {
+        return Err("cluster has no writable nodes".to_string());
+    }
+    let configured_layout = resolve_configured_layout(configured_nodes, policy)?;
+    if available_nodes < configured_layout.data_shards {
+        return Err(format!(
+            "configured object EC {}+{} requires at least {} writable server-pool nodes for a reconstructable survival commit, but only {} are available",
+            configured_layout.data_shards,
+            configured_layout.parity_shards,
+            configured_layout.data_shards,
+            available_nodes
+        ));
+    }
+    Ok(configured_layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +152,30 @@ mod tests {
             .layout()
             .is_err()
         );
+    }
+
+    #[test]
+    fn survival_layout_preserves_static_ec_down_to_k() {
+        let policy = ClusterLayoutPolicy {
+            data_shards: 4,
+            parity_shards: 2,
+        };
+        let expected = ClusterEcLayout {
+            data_shards: 4,
+            parity_shards: 2,
+        };
+        assert_eq!(
+            resolve_survival_write_layout(6, 6, &policy).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_survival_write_layout(5, 6, &policy).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_survival_write_layout(4, 6, &policy).unwrap(),
+            expected
+        );
+        assert!(resolve_survival_write_layout(3, 6, &policy).is_err());
     }
 }

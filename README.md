@@ -19,7 +19,7 @@ namespace, and maintenance operations on any healthy node, places immutable
 erasure-coded object versions across static server pools, and keeps every
 user-visible mutation in a small flat namespace record.
 
-N2 `3.3.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.4.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the N2 2.x inode namespace with replicated flat NCNX key records
 while retaining
 immutable NCDX metadata, immutable shards and parity, per-object recorded
@@ -28,8 +28,9 @@ autonomous healing. N2 3.1 stores each delete mutation in one
 `<unix-nanos>.<mutation-ulid>` trash generation without changing server-pool
 or EC placement. N2 3.2 makes SHA-256 the only N2 integrity checksum, embeds
 SHA-256 integrity in NCNX and object NCDX, derives object placement from
-immutable server-pool membership, and uses replica-backed exact listing when a
-canonical listing source is unavailable. N2 3.x does not open or migrate N2
+immutable server-pool membership, and uses replica-backed exact listing.
+Survival publication uses the same bounded replica merge for every LIST page
+so a noncanonical surviving NCNX copy is immediately visible. N2 3.x does not open or migrate N2
 1.x, 2.x, or earlier experimental 3.x roots. N2 3.3 adds an autonomous
 cluster Reserve Set: an unassigned physical instance can replace one failed
 logical pool slot without changing the pool generation, EC width, logical
@@ -38,10 +39,18 @@ fences the retired physical instance while bounded healing restores the
 recorded NCNX, NCDX, shard, and parity layouts.
 
 N2 3.3.1 is the node-churn correctness patch for the 3.3 engine. Autonomous
-healing now distinguishes temporary NCNX/NCDX transport unavailability from
-proven missing, divergent, or corrupt immutable state. A node restarting
-during a scan defers verification instead of creating a false cluster
-read-only incident; proven immutable damage retains strict safety escalation.
+healing distinguishes temporary NCNX/NCDX transport unavailability from
+proven missing, divergent, or corrupt immutable state. The survival write path
+retains the configured layout and can acknowledge at the EC reconstruction
+threshold: `K` EC pieces, `K` NCDX copies, and one of `M + 1` NCNX replicas.
+Missing exact slots remain deterministic healing work; writes reject below
+`K`.
+
+N2 3.4.0 makes that survival path the release contract. It preserves each
+pool's exact static `K + M` layout, acknowledges new objects at `K`, keeps
+missing exact slots as deterministic healing targets, and reports degraded
+rather than falsely healthy until full protection returns. It does not add
+quorum consensus or adaptive placement.
 
 A key such as `videos/mhw.mp4` is stored as `videos/mhw.mp4.ncnx` on its
 deterministic replica holders. The `videos/` path is a key prefix, not a
@@ -67,7 +76,7 @@ for N2-native operators, peers, tools, and future internal systems.
 - [NOA.md](NOA.md): canonical NOA v1 routes and N2 cluster extensions.
 - [INSTALLATION.md](INSTALLATION.md): production setup, static server-pool
   membership, systemd deployment, gateway deployment, and validation.
-- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.3 storage, NCNX namespace,
+- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.4 storage, NCNX namespace,
   lifecycle, healing, expansion, and failure laws.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
@@ -119,8 +128,9 @@ The result is direct operational behavior:
 - redistribution explicitly re-encodes into a current layout;
 - autonomous healing repairs NCNX, NCDX, shard, and parity damage and writes
   disposable per-event JSON reports;
-- unsafe namespace authority or an unrepairable topology can engage the
-  fail-closed read-only safety state.
+- an object-local unrepairable condition is reported without stopping
+  unrelated reconstructable objects; systemic membership or binding authority
+  failure can still engage the fail-closed safety state.
 
 ## Coordination Model
 
@@ -340,7 +350,7 @@ cargo test --workspace --lib --bins --tests
 cargo build --workspace --release
 ```
 
-Run the finite N2 3.3 release proof (the retained script filename identifies
+Run the finite N2 3.4 release proof (the retained script filename identifies
 the flat-NCNX proof family):
 
 ```bash
@@ -367,7 +377,7 @@ the repository under `/home/wlzambo/DEV-TEST`.
 
 ## Operational Boundaries
 
-- N2 `3.3.1` is a clean 3.x engine format, not an in-place migration
+- N2 `3.4.0` is a clean 3.x engine format, not an in-place migration
   from N2 1.x or 2.x.
 - A server pool's `K + M`, node IDs, and root-ID set are static after
   enrollment. Expansion adds a new complete pool generation.

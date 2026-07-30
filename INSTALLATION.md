@@ -3,7 +3,7 @@
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.3 is a clean disk-format generation. Never point it at an earlier N2
+N2 3.4 is a clean disk-format generation. Never point it at an earlier N2
 root. Build a new format-v5 cluster, copy the same membership and shared
 cluster secrets to every active and reserve instance, and use stable root IDs
 for mounted devices.

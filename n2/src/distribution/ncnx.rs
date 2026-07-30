@@ -7,7 +7,7 @@ use crate::namespace::ncnx_store::{NcnxRecord, NcnxStore, TrashLocator, validate
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures_util::future::join_all;
@@ -573,6 +573,12 @@ async fn send_to_replica(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        if status == StatusCode::CONFLICT {
+            return Err(AppError::Conflict(format!(
+                "NCNX peer '{}' rejected a conflicting mutation: {body}",
+                replica.node_id
+            )));
+        }
         return Err(AppError::ServiceUnavailable(format!(
             "NCNX peer '{}' returned {status}: {body}",
             replica.node_id
@@ -618,6 +624,7 @@ async fn read_from_layout(
     fragment_id: &str,
     logical_key: &str,
     trash: Option<&TrashLocator>,
+    require_complete_absence: bool,
 ) -> Result<Option<(NcnxRecord, Vec<u8>)>, AppError> {
     let action = if trash.is_some() {
         PeerNcnxAction::ReadTrash
@@ -676,7 +683,7 @@ async fn read_from_layout(
             "no NCNX replica responded for key '{logical_key}'"
         )));
     }
-    if successful_responses != layout.replicas.len() {
+    if require_complete_absence && successful_responses != layout.replicas.len() {
         return Err(AppError::ServiceUnavailable(format!(
             "NCNX absence for key '{logical_key}' is unproven: {successful_responses} of {} replicas responded",
             layout.replicas.len()
@@ -694,6 +701,30 @@ async fn apply_all(
     trash: Option<&TrashLocator>,
     bytes: &[u8],
 ) -> Result<(), AppError> {
+    apply_at_least(
+        runtime,
+        layout,
+        action,
+        fragment_id,
+        logical_key,
+        trash,
+        bytes,
+        layout.replicas.len(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_at_least(
+    runtime: &ClusterRuntime,
+    layout: &NcnxLayout,
+    action: PeerNcnxAction,
+    fragment_id: &str,
+    logical_key: &str,
+    trash: Option<&TrashLocator>,
+    bytes: &[u8],
+    minimum_successes: usize,
+) -> Result<(), AppError> {
     let calls = layout.replicas.iter().map(|replica| {
         send_to_replica(
             runtime,
@@ -710,25 +741,30 @@ async fn apply_all(
         )
     });
     let results = join_all(calls).await;
-    let failures = results
-        .into_iter()
-        .filter_map(Result::err)
-        .map(|err| err.to_string())
-        .collect::<Vec<_>>();
-    if failures.is_empty() {
-        Ok(())
-    } else {
+    let mut successes = 0usize;
+    let mut failures = Vec::new();
+    for result in results {
+        match result {
+            Ok(_) => successes = successes.saturating_add(1),
+            Err(error @ AppError::Conflict(_)) => return Err(error),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    if successes < minimum_successes {
         Err(AppError::ServiceUnavailable(format!(
-            "strict NCNX {}-replica publication failed: {}",
+            "NCNX survival publication reached {successes} of {} replicas; {minimum_successes} required: {}",
             layout.replicas.len(),
             failures.join("; ")
         )))
+    } else {
+        Ok(())
     }
 }
 
-pub async fn find_live(
+async fn find_live_with_absence_mode(
     fragment_id: &str,
     logical_key: &str,
+    require_complete_absence: bool,
 ) -> Result<Option<LocatedNcnx>, AppError> {
     let logical_key = validate_logical_key(logical_key)?;
     let runtime = active_cluster_runtime()?;
@@ -737,8 +773,15 @@ pub async fn find_live(
     let mut found: Option<LocatedNcnx> = None;
     for pool in pools {
         let layout = build_ncnx_layout(&runtime, pool, fragment_id, &logical_key)?;
-        if let Some((record, bytes)) =
-            read_from_layout(&runtime, &layout, fragment_id, &logical_key, None).await?
+        if let Some((record, bytes)) = read_from_layout(
+            &runtime,
+            &layout,
+            fragment_id,
+            &logical_key,
+            None,
+            require_complete_absence,
+        )
+        .await?
         {
             if let Some(existing) = &found {
                 if existing.record.object_id != record.object_id {
@@ -760,44 +803,59 @@ pub async fn find_live(
     Ok(found)
 }
 
+pub async fn find_live(
+    fragment_id: &str,
+    logical_key: &str,
+) -> Result<Option<LocatedNcnx>, AppError> {
+    find_live_with_absence_mode(fragment_id, logical_key, true).await
+}
+
+pub async fn find_live_for_survival_write(
+    fragment_id: &str,
+    logical_key: &str,
+) -> Result<Option<LocatedNcnx>, AppError> {
+    find_live_with_absence_mode(fragment_id, logical_key, false).await
+}
+
 pub async fn publish_new(
     fragment_id: &str,
     logical_key: &str,
     record: &NcnxRecord,
 ) -> Result<LocatedNcnx, AppError> {
     let logical_key = validate_logical_key(logical_key)?;
-    if let Some(existing) = find_live(fragment_id, &logical_key).await? {
-        if existing.record.object_id == record.object_id {
-            // A previous strict publication may have reached only part of the
-            // exact replica layout before its coordinator returned an error.
-            // Reapplying the surviving immutable bytes completes that same
-            // publication without a lock, journal, or alternate record.
-            let runtime = active_cluster_runtime()?;
-            let pool = pool_for_located(&runtime, &existing)?;
-            let layout = build_ncnx_layout(&runtime, pool, fragment_id, &logical_key)?;
-            apply_all(
-                &runtime,
-                &layout,
-                PeerNcnxAction::CreateLive,
-                fragment_id,
-                &logical_key,
-                None,
-                &existing.bytes,
-            )
-            .await?;
-            return Ok(existing);
+    // R=M+1 intersects every surviving K-node set. Upload publication can
+    // therefore acknowledge one durable NCNX copy without changing the exact
+    // replica layout. The healer restores its missing deterministic copies.
+    if let Some(existing) = find_live_for_survival_write(fragment_id, &logical_key).await? {
+        if existing.record.object_id != record.object_id {
+            return Err(AppError::Conflict(format!(
+                "logical key '{logical_key}' already points to another object"
+            )));
         }
-        return Err(AppError::Conflict(format!(
-            "logical key '{logical_key}' already points to another object"
-        )));
+        let runtime = active_cluster_runtime()?;
+        let pool = pool_for_located(&runtime, &existing)?;
+        let layout = build_ncnx_layout(&runtime, pool, fragment_id, &logical_key)?;
+        apply_at_least(
+            &runtime,
+            &layout,
+            PeerNcnxAction::CreateLive,
+            fragment_id,
+            &logical_key,
+            None,
+            &existing.bytes,
+            1,
+        )
+        .await?;
+        return Ok(existing);
     }
+
     let runtime = active_cluster_runtime()?;
     let pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
     })?;
     let layout = build_ncnx_layout(&runtime, pool, fragment_id, &logical_key)?;
     let bytes = record.encode()?;
-    apply_all(
+    apply_at_least(
         &runtime,
         &layout,
         PeerNcnxAction::CreateLive,
@@ -805,6 +863,7 @@ pub async fn publish_new(
         &logical_key,
         None,
         &bytes,
+        1,
     )
     .await?;
     Ok(LocatedNcnx {
@@ -1143,21 +1202,10 @@ pub async fn list_canonical_names(
 ) -> Result<Vec<PeerNcnxName>, AppError> {
     let runtime = active_cluster_runtime()?;
     let limit = limit.clamp(1, 10_000);
-    let canonical = list_all_nodes(
-        runtime.as_ref(),
-        fragment_id,
-        prefix,
-        after,
-        limit,
-        trash,
-        true,
-    )
-    .await;
-    if canonical.iter().all(|page| page.result.is_ok()) {
-        return merge_node_pages(canonical, limit, false);
-    }
-
-    tracing::warn!("NCNX canonical listing lost a source; retrying surviving namespace replicas");
+    // A survival upload may initially have only one of its R=M+1 NCNX copies,
+    // and that copy is not necessarily the canonical holder. Merge bounded
+    // physical replica pages so every acknowledged key is immediately
+    // visible without opening NCNX or NCDX.
     let replicas = list_all_nodes(
         runtime.as_ref(),
         fragment_id,
@@ -1216,6 +1264,7 @@ pub async fn read_canonical_record(
             fragment_id,
             &name.logical_key,
             Some(locator),
+            true,
         )
         .await?
         {
@@ -1540,6 +1589,32 @@ mod tests {
     }
 
     #[test]
+    fn m_plus_one_ncnx_layout_intersects_every_k_survivor_set() {
+        let runtime = runtime();
+        let pool = runtime.membership.pool("pool-a").unwrap();
+        let layout = build_ncnx_layout(&runtime, pool, "fragment", "videos/a.mp4").unwrap();
+        let holders = layout
+            .replicas
+            .iter()
+            .map(|replica| replica.node_id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        // EC 4+2 permits any two failed pool nodes. R=M+1=3 guarantees that
+        // no such failure set can remove every namespace pointer.
+        for left in 0..6 {
+            for right in (left + 1)..6 {
+                let failed = [format!("n{left}"), format!("n{right}")];
+                assert!(
+                    holders
+                        .iter()
+                        .any(|holder| !failed.iter().any(|node| node == *holder)),
+                    "all NCNX holders were lost for failures {failed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ncnx_placement_is_stable_and_key_specific() {
         let runtime = runtime();
         let pool = runtime.membership.pool("pool-a").unwrap();
@@ -1653,7 +1728,7 @@ mod tests {
                 pool_id: "pool-a".into(),
                 node_id: "n1".into(),
                 allowed_failures: 2,
-                result: Err(AppError::ServiceUnavailable("offline".into())),
+                result: Ok(vec![name.clone()]),
             },
             NodeListPage {
                 pool_id: "pool-a".into(),
@@ -1661,7 +1736,15 @@ mod tests {
                 allowed_failures: 2,
                 result: Err(AppError::ServiceUnavailable("offline".into())),
             },
+            NodeListPage {
+                pool_id: "pool-a".into(),
+                node_id: "n3".into(),
+                allowed_failures: 2,
+                result: Err(AppError::ServiceUnavailable("offline".into())),
+            },
         ];
+        // The same NCNX filename from two physical replicas is one logical
+        // LIST result, and two failed pool nodes remain within M=2.
         assert_eq!(merge_node_pages(pages, 100, true).unwrap(), vec![name]);
 
         let pages = (0..3)

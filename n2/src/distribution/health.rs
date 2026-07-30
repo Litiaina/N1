@@ -54,9 +54,11 @@ pub struct ClusterHealthSnapshot {
     pub parity_shards: usize,
     pub data_plane_readable: bool,
     pub data_plane_writable: bool,
+    pub data_plane_fully_protected: bool,
     pub ncnx_replicas: usize,
     pub estimated_ncnx_replicas_reachable: usize,
     pub ncnx_replicas_required: usize,
+    pub ncnx_survival_writable: bool,
     pub ncnx_strictly_writable: bool,
     pub effective_client_writable: bool,
     pub safety_read_only: bool,
@@ -135,9 +137,7 @@ fn cluster_health_snapshot_with_readiness(
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
     })?;
     let pool_nodes = write_pool.node_ids.iter().collect::<HashSet<_>>();
-    let configured_blob = runtime
-        .membership
-        .active_write_nodes_for_pool(&write_pool.id);
+    let configured_blob = runtime.membership.nodes_for_pool(&write_pool.id);
     let active_blob = active
         .iter()
         .filter(|node| pool_nodes.contains(&node.id))
@@ -148,27 +148,46 @@ fn cluster_health_snapshot_with_readiness(
         .filter(|node| pool_nodes.contains(&node.id))
         .cloned()
         .collect::<Vec<_>>();
+    let fully_writable_blob = active_blob
+        .iter()
+        .filter(|node| {
+            readiness
+                .iter()
+                .find(|(node_id, _)| node_id == &node.id)
+                .is_some_and(|(_, status)| {
+                    status.writable
+                        && (status.root_count == 0 || status.writable_roots == status.root_count)
+                })
+        })
+        .count();
     let readable_namespace = readable_blob.len();
     let configured_layout =
         resolve_configured_layout(configured_blob.len(), &runtime.layout_policy)
             .map_err(AppError::BadRequest)?;
     let layout = configured_layout;
     let data_plane_readable = readable_blob.len() >= layout.data_shards;
-    let data_plane_writable = active_blob.len() >= layout.total_shards();
+    let data_plane_writable = fully_writable_blob >= layout.data_shards;
+    let data_plane_fully_protected = fully_writable_blob >= layout.total_shards();
     let configured_namespace_nodes = runtime.membership.nodes_for_pool(&write_pool.id).len();
     let ncnx_replicas = write_pool.policy.namespace_replicas();
     let ncnx_replicas_required = ncnx_replicas;
-    let estimated_ncnx_replicas_reachable = readable_namespace.min(ncnx_replicas);
-    // NCNX placement is deterministic across the static pool membership.
-    // Requiring every pool node here makes the cluster-wide writable signal
-    // truthful for every possible key; an individual existing key may remain
-    // readable with only its selected replicas.
-    let ncnx_strictly_writable = readable_namespace == configured_namespace_nodes;
+    // This is the minimum guaranteed reachable replica count for every key,
+    // not an optimistic average. Each missing pool node can remove at most one
+    // member of a key's deterministic R=M+1 replica set.
+    let estimated_ncnx_replicas_reachable =
+        ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(readable_namespace));
+    let writable_namespace = fully_writable_blob;
+    let guaranteed_writable_ncnx =
+        ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(writable_namespace));
+    let ncnx_survival_writable =
+        writable_namespace >= layout.data_shards && guaranteed_writable_ncnx >= 1;
+    let ncnx_strictly_writable = writable_namespace == configured_namespace_nodes;
     let safety_state = cluster_safety_read_only_state();
     let safety_read_only = safety_state.is_some();
     let effective_client_writable =
-        data_plane_writable && ncnx_strictly_writable && !safety_read_only;
+        data_plane_writable && ncnx_survival_writable && !safety_read_only;
     let missing_blob_writable = configured_blob.len().saturating_sub(active_blob.len());
+    let partially_writable_blob = active_blob.len().saturating_sub(fully_writable_blob);
     let missing_namespace_readable = configured_namespace_nodes.saturating_sub(readable_namespace);
     let historical_recovery_active = runtime
         .membership
@@ -185,9 +204,10 @@ fn cluster_health_snapshot_with_readiness(
         .collect::<HashSet<_>>();
     let state = if !data_plane_readable || safety_read_only {
         ClusterHealthState::Critical
-    } else if !effective_client_writable {
-        ClusterHealthState::Degraded
-    } else if missing_blob_writable > 0
+    } else if !effective_client_writable
+        || !data_plane_fully_protected
+        || !ncnx_strictly_writable
+        || missing_blob_writable > 0
         || missing_namespace_readable > 0
         || historical_recovery_active
     {
@@ -217,7 +237,7 @@ fn cluster_health_snapshot_with_readiness(
     }
     if historical_recovery_active {
         notes.push(
-            "a replacement logical slot is serving new full-width writes while historical NCNX/NCDX/shard layouts heal in the background"
+            "a replacement logical slot is serving new writes while historical NCNX/NCDX/shard layouts heal in the background"
                 .to_string(),
         );
     }
@@ -244,19 +264,28 @@ fn cluster_health_snapshot_with_readiness(
         ));
     }
     if missing_blob_writable > 0 {
-        if ncnx_strictly_writable {
+        if data_plane_writable && ncnx_survival_writable {
             notes.push(format!(
-                "{} configured pool node(s) are currently unreachable; NCNX placement remains readable for unaffected keys but new object writes stop until the fixed {}+{} width is available",
+                "{} configured pool node(s) are currently unreachable; survival writes remain enabled at K={} while every commit retains the fixed {}+{} repair layout",
                 missing_blob_writable,
+                configured_layout.data_shards,
                 configured_layout.data_shards,
                 configured_layout.parity_shards
             ));
         } else {
             notes.push(format!(
-                "{} configured server-pool node(s) are currently unreachable and strict NCNX publication is unavailable; existing reconstructable objects may still be read",
-                missing_blob_writable
+                "{} configured server-pool node(s) are currently unreachable; writes stop because only {} writable node(s) remain and K={} is required",
+                missing_blob_writable,
+                active_blob.len(),
+                configured_layout.data_shards
             ));
         }
+    }
+    if partially_writable_blob > 0 {
+        notes.push(format!(
+            "{} reachable pool node(s) retain writable capacity but have at least one unavailable/full configured root; the cluster remains writable only when {} fully writable nodes satisfy K={}",
+            partially_writable_blob, fully_writable_blob, configured_layout.data_shards
+        ));
     }
     if !data_plane_readable {
         notes.push(format!(
@@ -267,13 +296,13 @@ fn cluster_health_snapshot_with_readiness(
     }
     if !ncnx_strictly_writable {
         notes.push(format!(
-            "namespace NCNX placement is not uniformly writable: {} of {} server-pool nodes are reachable ({} replicas per key)",
-            readable_namespace, configured_namespace_nodes, ncnx_replicas_required
+            "namespace NCNX placement is degraded: {} of {} server-pool nodes are writable ({} target replicas per key); upload publication requires one surviving replica and retains the exact repair set",
+            writable_namespace, configured_namespace_nodes, ncnx_replicas_required
         ));
     }
-    if data_plane_writable && !ncnx_strictly_writable {
+    if data_plane_writable && !data_plane_fully_protected {
         notes.push(
-            "data-plane placement can accept shards, but client writes still require strict NCNX replica publication"
+            "new object writes are reconstructable but not fully parity-protected until autonomous repair restores the missing exact slots"
                 .to_string(),
         );
     }
@@ -288,9 +317,11 @@ fn cluster_health_snapshot_with_readiness(
         parity_shards: layout.parity_shards,
         data_plane_readable,
         data_plane_writable,
+        data_plane_fully_protected,
         ncnx_replicas,
         estimated_ncnx_replicas_reachable,
         ncnx_replicas_required,
+        ncnx_survival_writable,
         ncnx_strictly_writable,
         effective_client_writable,
         safety_read_only,
@@ -445,11 +476,7 @@ mod tests {
     }
 
     fn runtime(blob_nodes: Vec<ClusterNode>) -> ClusterRuntime {
-        let mut nodes = vec![
-            node("ns-a", NodeState::Online),
-            node("ns-b", NodeState::Online),
-        ];
-        nodes.extend(blob_nodes);
+        let nodes = blob_nodes;
         ClusterRuntime {
             local_node_id: "blob-a".into(),
             local_instance_id: "blob-a".into(),
@@ -505,12 +532,14 @@ mod tests {
         assert_eq!(snap.ncnx_replicas, 2);
         assert_eq!(snap.estimated_ncnx_replicas_reachable, 2);
         assert_eq!(snap.ncnx_replicas_required, 2);
+        assert!(snap.data_plane_fully_protected);
+        assert!(snap.ncnx_survival_writable);
         assert!(snap.ncnx_strictly_writable);
         assert!(snap.effective_client_writable);
         assert!(!snap.layout_drift_is_health_failure);
         assert_eq!(
             snap.nodes[0].native_endpoint.as_deref(),
-            Some("n2://ns-a:50002")
+            Some("n2://blob-a:50002")
         );
         assert!(!snap.repair_running);
         assert!(!snap.rebalance_running);
@@ -521,22 +550,71 @@ mod tests {
         let runtime = runtime(vec![
             node("blob-a", NodeState::Online),
             node("blob-b", NodeState::Online),
-            node("blob-c", NodeState::Online),
         ]);
-        let live = runtime.membership.nodes[..4].to_vec();
+        let live = runtime.membership.nodes[..1].to_vec();
         let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
         assert_eq!(snap.state, ClusterHealthState::Degraded);
-        assert_eq!(snap.active_write_nodes, 4);
+        assert_eq!(snap.active_write_nodes, 1);
         assert_eq!(snap.data_shards, 1);
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_fully_protected);
+        assert!(snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
-        assert!(!snap.effective_client_writable);
-        assert_eq!(snap.nodes[4].state, NodeState::Offline);
+        assert!(snap.effective_client_writable);
+        assert_eq!(snap.nodes[1].state, NodeState::Offline);
     }
 
     #[test]
-    fn fixed_two_plus_one_stops_writes_below_unified_pool_width() {
+    fn one_lost_disk_keeps_a_multi_disk_node_in_survival_service() {
+        let runtime = runtime(vec![
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
+        ]);
+        let active = runtime.membership.active_write_nodes();
+        let readable = runtime.membership.readable_nodes();
+        let readiness = vec![
+            (
+                "blob-a".to_string(),
+                crate::core::capacity_manager::StorageReadiness {
+                    readable: true,
+                    writable: true,
+                    root_count: 2,
+                    readable_roots: 2,
+                    writable_roots: 2,
+                    minimum_available_bytes: Some(1024 * 1024 * 1024),
+                    issues: Vec::new(),
+                },
+            ),
+            (
+                "blob-b".to_string(),
+                crate::core::capacity_manager::StorageReadiness {
+                    readable: true,
+                    writable: true,
+                    root_count: 2,
+                    readable_roots: 1,
+                    writable_roots: 1,
+                    minimum_available_bytes: Some(1024 * 1024 * 1024),
+                    issues: vec!["one configured root is unavailable".into()],
+                },
+            ),
+        ];
+
+        let snap =
+            cluster_health_snapshot_with_readiness(&runtime, active, readable, &readiness).unwrap();
+
+        assert_eq!(snap.state, ClusterHealthState::Degraded);
+        assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_fully_protected);
+        assert!(snap.ncnx_survival_writable);
+        assert!(!snap.ncnx_strictly_writable);
+        assert!(snap.effective_client_writable);
+        assert!(snap.nodes[1].storage_writable);
+        assert!(!snap.nodes[1].storage_issues.is_empty());
+    }
+
+    #[test]
+    fn fixed_two_plus_one_keeps_survival_writes_at_k() {
         let mut runtime = runtime(vec![
             node("blob-a", NodeState::Online),
             node("blob-b", NodeState::Online),
@@ -555,8 +633,34 @@ mod tests {
         assert_eq!(snap.data_shards, 2);
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_readable);
-        assert!(!snap.data_plane_writable);
+        assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_fully_protected);
+        assert!(snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
+        assert!(snap.effective_client_writable);
+    }
+
+    #[test]
+    fn fixed_two_plus_one_rejects_writes_below_k() {
+        let mut runtime = runtime(vec![
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
+            node("blob-c", NodeState::Online),
+        ]);
+        runtime.layout_policy = ClusterLayoutPolicy {
+            data_shards: 2,
+            parity_shards: 1,
+        };
+        runtime.membership.pools[0].policy.object_data_shards = 2;
+        let live = runtime.membership.nodes[..1].to_vec();
+
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
+
+        assert_eq!(snap.state, ClusterHealthState::Critical);
+        assert!(!snap.data_plane_readable);
+        assert!(!snap.data_plane_writable);
+        assert!(!snap.data_plane_fully_protected);
+        assert!(!snap.ncnx_survival_writable);
         assert!(!snap.effective_client_writable);
     }
 
@@ -581,6 +685,7 @@ mod tests {
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
+        assert!(snap.data_plane_fully_protected);
         assert!(snap.effective_client_writable);
     }
 
@@ -590,19 +695,20 @@ mod tests {
             node("blob-a", NodeState::Online),
             node("blob-b", NodeState::Online),
         ]);
-        let active = runtime.membership.active_write_nodes();
-        let readable = vec![runtime.membership.nodes[0].clone()];
-        let snap = cluster_health_snapshot_with_live_nodes(&runtime, active, readable).unwrap();
+        let live = vec![runtime.membership.nodes[0].clone()];
+        let snap = cluster_health_snapshot_with_live_nodes(&runtime, live.clone(), live).unwrap();
         assert_eq!(snap.state, ClusterHealthState::Degraded);
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_fully_protected);
+        assert!(snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
-        assert!(!snap.effective_client_writable);
-        assert!(snap.nodes.iter().all(|node| !node.accepts_writes));
+        assert!(snap.effective_client_writable);
+        assert!(snap.nodes[0].accepts_writes);
         assert!(
             snap.notes
                 .iter()
-                .any(|note| note.contains("namespace NCNX placement is not uniformly writable"))
+                .any(|note| note.contains("namespace NCNX placement is degraded"))
         );
     }
 }

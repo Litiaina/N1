@@ -10,7 +10,7 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.3.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.4.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
 plane. N2 3.1 adds collision-free per-mutation trash generation directories.
 N2 3.2 makes SHA-256 the only engine integrity checksum, adds SHA-256
@@ -30,14 +30,28 @@ NCDX, shard, and parity placement.
 N2 3.3.1 hardens autonomous maintenance under node churn. A temporarily
 unreachable NCNX or NCDX participant is recorded as incomplete verification
 and retried by a later healing cycle; it is not treated as proof of immutable
-loss. Confirmed missing, divergent, or corrupt replicas and unrepairable shard
-layouts retain strict safety read-only escalation.
+loss. Confirmed object-local missing, divergent, corrupt, or unrepairable state
+produces an exact report without globally latching unrelated keys read-only;
+systemic identity and membership failures retain the safety latch.
 
-N2 3.3 intentionally does not open or migrate N2 1.x, 2.x, or earlier
+The survival write path retains the configured layout and can acknowledge at
+the EC reconstruction threshold: `K` EC pieces, `K` NCDX copies, and one of
+`M + 1` NCNX replicas. Missing exact slots remain deterministic healing work;
+writes reject below `K`. The upload existence check follows that same
+reachable-replica boundary. Normal reads and destination-first rename, move,
+trash, and recover retain their stricter namespace rules.
+
+N2 3.4.0 makes this fixed-layout survival behavior the current release
+contract. It is not quorum consensus: the configured server-pool generation,
+logical slots, shard roles, NCDX holders, and NCNX repair targets remain
+unchanged while degraded writes acknowledge only at the reconstruction
+threshold.
+
+N2 3.4 intentionally does not open or migrate N2 1.x, 2.x, or earlier
 experimental 3.x roots. Static server-pool enrollment, root identity, and
 format-v5 membership prevent old layouts from being silently reinterpreted.
 
-N2 3.3 deliberately fails closed on retired NCNX, NCDX, and trash layouts
+N2 3.4 deliberately fails closed on retired NCNX, NCDX, and trash layouts
 instead of maintaining multiple integrity and lifecycle formats.
 
 The current qualification is bounded evidence, not an LTS declaration or an
@@ -114,7 +128,7 @@ than a mutable latest-pointer file.
 
 ### Namespace And Blob Layouts
 
-N2 3.3 uses unified server-pool roots rather than namespace-only and
+N2 3.4 uses unified server-pool roots rather than namespace-only and
 blob-only node roles. The namespace and payload remain separate logical
 planes even though they share enrolled storage roots:
 
@@ -479,7 +493,7 @@ Fields:
 - `fragment`: fragment name hash or stable fragment identifier accepted by N2.
 - `secret`: fragment key or `MASTER_KEY`.
 - `read`: allow list, read, status, health.
-- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.3 rejects empty-directory persistence.
+- `write`: allow upload, trash, and recover. The `mkdir` route is retained by NOA but N2 3.4 rejects empty-directory persistence.
 - `modify`: allow rename, repair, rebalance, maintenance mutations.
 - `delete`: allow soft delete and fragment administration. Object reclamation
   remains TTL lifecycle-only.
@@ -674,7 +688,7 @@ Query fields:
   uppercase hexadecimal characters, optionally prefixed with `sha256:`.
   Headers `x-litiaina-checksum`, `x-noa-checksum-sha256`, and
   `x-n2-checksum-sha256` are also accepted. CRC32 and S3 checksum headers are
-  not N2 3.3 contracts.
+  not N2 3.4 contracts.
 - `durability`: optional durability mode.
 - `strict_durability`: optional boolean.
 - `io_gate`: optional boolean.
@@ -1024,7 +1038,7 @@ Content-Type: application/json
 { "path": "videos" }
 ```
 
-The route is retained as part of the NOA v1 surface, but N2 3.3 returns
+The route is retained as part of the NOA v1 surface, but N2 3.4 returns
 `400 Bad Request`: the flat namespace does not persist empty directories.
 Uploading `videos/a.mp4` makes the `videos/` prefix visible automatically.
 
@@ -1101,7 +1115,7 @@ trash record.
 
 ### Trash Lifecycle
 
-N2 3.3 exposes no empty-trash or hard-delete namespace operation. Each delete
+N2 3.4 exposes no empty-trash or hard-delete namespace operation. Each delete
 uses one `.trash/<unix-nanos>.<mutation-ulid>/` generation across all affected
 logical keys and deterministic NCNX replicas. Normal GC reads TTL from that
 directory name, scans only `.trash`, proves live/unexpired reachability,
@@ -1181,7 +1195,7 @@ Response:
 
 ### Trash Lifecycle Boundary
 
-N2 3.3 intentionally has no empty-trash or recover-all namespace mutation.
+N2 3.4 intentionally has no empty-trash or recover-all namespace mutation.
 Recover explicit entries before their retention period expires. Expired trash
 is removed by lifecycle/GC after namespace reachability checks.
 
@@ -1400,7 +1414,11 @@ Response fields include:
 - static layout `policy` and `configured_layout`;
 - reachable `active_write_nodes` and effective `layout`;
 - `static_server_pool_ec: true`;
-- `degraded_write_layout: false`;
+- `survival_writable`, true while at least `K` configured pool nodes can
+  accept writes;
+- `fully_protected`, true only at the complete `K + M` width;
+- `degraded_write_layout`, true when survival writes are enabled below full
+  width;
 - `bounded_object_erasure_set: true`;
 - `old_object_layouts_remain_valid: true`;
 - `automatic_rebalance`, which should remain false for explicit movement.
@@ -1414,21 +1432,24 @@ GET /noa/v1/cluster/health
 Authorization: Bearer <token>
 ```
 
-Health separates data readability, strict new-write capability, NCNX
-replication, and the durable safety latch. Important fields are:
+Health separates data readability, survival-write capability, full protection,
+NCNX replication, and the durable safety latch. Important fields are:
 
 - `state`: `healthy`, `degraded`, or `critical`;
-- `data_plane_readable` and `data_plane_writable`;
+- `data_plane_readable`, `data_plane_writable`, and
+  `data_plane_fully_protected`;
 - `ncnx_replicas`, `ncnx_replicas_required`, and
   `estimated_ncnx_replicas_reachable`;
-- `ncnx_strictly_writable` and `effective_client_writable`;
+- `ncnx_survival_writable`, `ncnx_strictly_writable`, and
+  `effective_client_writable`;
 - `safety_read_only`;
 - `manual_rebalance_available` and `automatic_rebalance`;
 - per-node read/write/reachability state and explanatory `notes`.
 
-An existing object may remain readable with `K` valid shards even while new
-writes are rejected because the full static pool or strict NCNX publication
-is unavailable.
+At exactly `K` writable pool nodes the state is degraded, new objects remain
+reconstructable, and `effective_client_writable` remains true. The write keeps
+the configured `K + M` target layout; it does not shrink or substitute nodes.
+Below `K`, new writes are rejected.
 
 ### Detailed Cluster Monitor
 
@@ -1613,12 +1634,12 @@ the logical filename when known, object/version identity, component,
 observations, action, and outcome. They are local disposable evidence, never
 replicated and never used as storage authority.
 
-Ambiguous namespace authority, divergent immutable records, an unrepairable
-recorded layout, or impossible topology can activate the durable safety
-read-only latch. Unsafe mutation, GC, and redistribution stop; reconstructable
-reads and exact-layout repair remain available. Headless immutable objects
-are reported and preserved because missing namespace authority is not proof
-that payload bytes are disposable.
+Object-local NCNX, NCDX, shard, or parity loss is reported and remains scoped
+to that object; it does not stop unrelated reconstructable service.
+Systemic membership or binding-authority disagreement can activate the durable
+safety read-only latch. Headless immutable objects are reported and preserved
+because missing namespace authority is not proof that payload bytes are
+disposable.
 
 ### Cluster Repair Plan
 
@@ -2092,7 +2113,7 @@ Installer proof:
 scripts/proof/run_n2_installer_proof.sh
 ```
 
-Finite N2 3.3 multi-node proof (retained proof-family script name):
+Finite N2 3.4 multi-node proof (retained proof-family script name):
 
 ```bash
 REMOTE_PASS='operator-supplied' \
@@ -2105,7 +2126,7 @@ Inspect lifecycle/chaos options:
 scripts/bench/run_n2_3_0_soak_chaos.sh --help
 ```
 
-For N2 3.3 qualification, prove at minimum:
+For N2 3.4 qualification, prove at minimum:
 
 - identical format-v5 membership and static pool contracts on every node;
 - fragment creation and authentication;

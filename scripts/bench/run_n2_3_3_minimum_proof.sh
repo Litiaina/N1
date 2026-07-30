@@ -119,7 +119,12 @@ cleanup() {
     kill_pidfile "$run/n2.pid"
   done
   if [[ "$RESULT" == "PASS" ]]; then
-    rm -rf "$A_STORE" "$B_STORE" "$R_STORE"
+    rm -rf "$A_STORE" "$R_STORE"
+    if [[ "$ROOT_FAULTS" == "true" ]] && mountpoint -q "$B_STORE"; then
+      find "$B_STORE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    else
+      rm -rf "$B_STORE"
+    fi
   fi
 }
 trap cleanup EXIT
@@ -449,16 +454,17 @@ if [[ "$ROOT_FAULTS" == "true" ]]; then
   chmod 0000 "$B_STORE"
   ROOT_UNAVAILABLE_STATUS="$(
     curl -k --http1.1 -sS -o "$OUT/root-unavailable-write.json" -w '%{http_code}' \
-      -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/root-unavailable-must-fail.bin" \
+      -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/root-unavailable-survival.bin" \
       -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/source.bin"
   )"
-  [[ "$ROOT_UNAVAILABLE_STATUS" != 2* ]]
+  [[ "$ROOT_UNAVAILABLE_STATUS" == 2* ]]
   ROOT_UNAVAILABLE_OBJECT_STATUS="$(
     curl -k --http1.1 -sS -o "$OUT/root-unavailable-object.json" -w '%{http_code}' \
       -G "$A_BASE/noa/v1/objects/download" -H "Authorization: Bearer $TOKEN" \
-      --data-urlencode 'object_key=minimum/root-unavailable-must-fail.bin'
+      --data-urlencode 'object_key=minimum/root-unavailable-survival.bin'
   )"
-  [[ "$ROOT_UNAVAILABLE_OBJECT_STATUS" == "503" ]]
+  [[ "$ROOT_UNAVAILABLE_OBJECT_STATUS" == "200" ]]
+  [[ "$(sha256sum "$OUT/root-unavailable-object.json" | awk '{print $1}')" == "$SOURCE_SHA" ]]
   curl_auth -G "$A_BASE/noa/v1/objects/download" \
     --data-urlencode 'object_key=minimum/anchor.bin' \
     -o "$OUT/download-root-unavailable.bin"
@@ -469,8 +475,10 @@ if [[ "$ROOT_FAULTS" == "true" ]]; then
     .binding_epoch == 1
     and (.reserve_nodes | length) == 1
     and .state == "degraded"
-    and .effective_client_writable == false
-    and .data_plane_writable == false
+    and .effective_client_writable == true
+    and .data_plane_writable == true
+    and .data_plane_fully_protected == false
+    and .ncnx_survival_writable == true
     and .ncnx_strictly_writable == false
     and any(
       .nodes[];
@@ -486,25 +494,27 @@ if [[ "$ROOT_FAULTS" == "true" ]]; then
     curl -k --http1.1 -sS -o "$OUT/root-unavailable-object-after-restore.json" \
       -w '%{http_code}' -G "$A_BASE/noa/v1/objects/download" \
       -H "Authorization: Bearer $TOKEN" \
-      --data-urlencode 'object_key=minimum/root-unavailable-must-fail.bin'
+      --data-urlencode 'object_key=minimum/root-unavailable-survival.bin'
   )"
-  [[ "$ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS" == "404" ]]
+  [[ "$ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS" == "200" ]]
+  [[ "$(sha256sum "$OUT/root-unavailable-object-after-restore.json" | awk '{print $1}')" == "$SOURCE_SHA" ]]
 
   ROOT_AVAILABLE_BYTES="$(df -B1 --output=avail "$B_STORE" | tail -n 1 | tr -d ' ')"
   (( ROOT_AVAILABLE_BYTES > 16777216 ))
   fallocate -l "$((ROOT_AVAILABLE_BYTES - 1048576))" "$B_STORE/.n2-proof-enospc"
   ROOT_FULL_STATUS="$(
     curl -k --http1.1 -sS -o "$OUT/root-full-write.json" -w '%{http_code}' \
-      -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/root-full-must-fail.bin" \
+      -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/root-full-survival.bin" \
       -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/source.bin"
   )"
-  [[ "$ROOT_FULL_STATUS" != 2* ]]
+  [[ "$ROOT_FULL_STATUS" == 2* ]]
   ROOT_FULL_OBJECT_STATUS="$(
     curl -k --http1.1 -sS -o "$OUT/root-full-object.json" -w '%{http_code}' \
       -G "$A_BASE/noa/v1/objects/download" -H "Authorization: Bearer $TOKEN" \
-      --data-urlencode 'object_key=minimum/root-full-must-fail.bin'
+      --data-urlencode 'object_key=minimum/root-full-survival.bin'
   )"
-  [[ "$ROOT_FULL_OBJECT_STATUS" == "404" ]]
+  [[ "$ROOT_FULL_OBJECT_STATUS" == "200" ]]
+  [[ "$(sha256sum "$OUT/root-full-object.json" | awk '{print $1}')" == "$SOURCE_SHA" ]]
   curl_auth -G "$A_BASE/noa/v1/objects/download" \
     --data-urlencode 'object_key=minimum/anchor.bin' \
     -o "$OUT/download-root-full.bin"
@@ -514,9 +524,11 @@ if [[ "$ROOT_FAULTS" == "true" ]]; then
     .binding_epoch == 1
     and (.reserve_nodes | length) == 1
     and .state == "degraded"
-    and .effective_client_writable == false
-    and .data_plane_writable == false
-    and .ncnx_strictly_writable == true
+    and .effective_client_writable == true
+    and .data_plane_writable == true
+    and .data_plane_fully_protected == false
+    and .ncnx_survival_writable == true
+    and .ncnx_strictly_writable == false
     and any(
       .nodes[];
       .node_id == "minimum-b"
@@ -565,6 +577,11 @@ PRE_PROMOTION_STATUS="$(
     -X POST "$A_BASE/noa/v1/upload/one-shot/minimum/pre-promotion.bin" \
     -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/source.bin"
 )"
+[[ "$PRE_PROMOTION_STATUS" == 2* ]]
+curl_auth -G "$A_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=minimum/pre-promotion.bin' \
+  -o "$OUT/pre-promotion-download.bin"
+[[ "$(sha256sum "$OUT/pre-promotion-download.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
 wait_binding_epoch 2 "$OUT/health-after-promotion.json"
 jq -e '
   .effective_client_writable == true
@@ -639,13 +656,13 @@ jq -n \
       enabled:($root_faults == "true"),
       inaccessible_root_write_http_status:
         (if $root_unavailable_status == "" then null else ($root_unavailable_status|tonumber) end),
-      inaccessible_root_uncommitted_http_status:
+      inaccessible_root_object_read_http_status:
         (if $root_unavailable_object_status == "" then null else ($root_unavailable_object_status|tonumber) end),
-      restored_root_proven_absent_http_status:
+      inaccessible_root_object_after_restore_http_status:
         (if $root_unavailable_restored_object_status == "" then null else ($root_unavailable_restored_object_status|tonumber) end),
       full_root_write_http_status:
         (if $root_full_status == "" then null else ($root_full_status|tonumber) end),
-      full_root_uncommitted_http_status:
+      full_root_object_read_http_status:
         (if $root_full_object_status == "" then null else ($root_full_object_status|tonumber) end),
       existing_object_readable:true,
       reserve_not_consumed_by_capacity_pressure:true,

@@ -11,7 +11,7 @@ fn normalize_sha256(value: &str) -> Result<String, AppError> {
                 Ok(digest.trim())
             } else {
                 Err(AppError::BadRequest(
-                    "N2 3.3 supports SHA-256 as its only upload checksum algorithm".into(),
+                    "N2 3.4 supports SHA-256 as its only upload checksum algorithm".into(),
                 ))
             }
         })

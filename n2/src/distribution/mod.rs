@@ -22,7 +22,7 @@ pub mod upload;
 
 pub use layout::{
     ClusterEcLayout, ClusterLayoutPolicy, resolve_configured_layout, resolve_layout,
-    resolve_write_layout,
+    resolve_survival_write_layout, resolve_write_layout,
 };
 pub use membership::{
     ClusterMembership, ClusterNode, ClusterPolicy, ClusterRuntime, NodeState, PoolState,

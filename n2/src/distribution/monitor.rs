@@ -3,7 +3,7 @@ use crate::core::index;
 use crate::core::repair_manager::{ObjectLayoutStatus, ObjectRepairStatus, RepairCheckMode};
 use crate::distribution::auto_healing::{AutoHealingStatus, auto_healing_status_snapshot};
 use crate::distribution::health::{ClusterHealthSnapshot, cluster_health_snapshot};
-use crate::distribution::layout::resolve_write_layout;
+use crate::distribution::layout::resolve_configured_layout;
 use crate::distribution::membership::{
     ClusterNode, active_cluster_runtime, live_newest_pool_write_nodes, live_readable_nodes,
 };
@@ -244,12 +244,13 @@ pub async fn cluster_monitor_snapshot(
     let health = cluster_health_snapshot(&runtime).await?;
     let active = live_newest_pool_write_nodes(&runtime).await;
     let readable = live_readable_nodes(&runtime).await;
-    let layout = resolve_write_layout(
-        active.len(),
-        runtime.membership.active_newest_pool_nodes().len(),
-        &runtime.layout_policy,
-    )
-    .map_err(AppError::BadRequest)?;
+    let configured = runtime
+        .membership
+        .newest_writable_pool()
+        .map(|pool| pool.node_ids.len())
+        .unwrap_or_default();
+    let layout = resolve_configured_layout(configured, &runtime.layout_policy)
+        .map_err(AppError::BadRequest)?;
     let plan = plan_rebalance(&runtime)?;
     let fragment = query
         .fragment

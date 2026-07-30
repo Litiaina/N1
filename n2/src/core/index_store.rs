@@ -212,7 +212,7 @@ impl DiskObjectMetadata {
     fn validate_fields(&self) -> Result<(), AppError> {
         if self.format_version != NCDX_FORMAT_VERSION {
             return Err(AppError::Conflict(format!(
-                "NCDX format {} is not N2 3.3 format {}",
+                "NCDX format {} is not N2 3.4 format {}",
                 self.format_version, NCDX_FORMAT_VERSION
             )));
         }

@@ -136,13 +136,32 @@ impl NamespaceRuntime {
         fragment: &str,
         path: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
+        self.entry_with_kind(fragment, path, PeerNamespaceReadKind::Entry)
+            .await
+    }
+
+    pub(crate) async fn entry_for_write(
+        &self,
+        fragment: &str,
+        path: &str,
+    ) -> Result<Option<NamespaceEntry>, AppError> {
+        self.entry_with_kind(fragment, path, PeerNamespaceReadKind::EntryForWrite)
+            .await
+    }
+
+    async fn entry_with_kind(
+        &self,
+        fragment: &str,
+        path: &str,
+        kind: PeerNamespaceReadKind,
+    ) -> Result<Option<NamespaceEntry>, AppError> {
         let path = normalize_user_path(path)?;
         if path.is_empty() {
             return Ok(Some(root_entry(fragment)));
         }
         let response = distributed_read(PeerNamespaceReadRequest {
             fragment: fragment.to_string(),
-            kind: PeerNamespaceReadKind::Entry,
+            kind,
             path: Some(path),
             include_trashed: false,
             limit: None,
@@ -375,7 +394,7 @@ impl NamespaceRuntime {
                 "root cannot be written as a file".into(),
             ));
         }
-        let existing = match self.entry(fragment, &path).await {
+        let existing = match self.entry_for_write(fragment, &path).await {
             Ok(entry) => entry,
             Err(AppError::NotFound) => None,
             Err(err) => return Err(err),

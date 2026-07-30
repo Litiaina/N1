@@ -106,7 +106,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
 
     if !root_is_empty(root_path)? {
         return Err(AppError::Conflict(format!(
-            "unenrolled N2 3.3 root '{}' is not empty; use a new isolated directory",
+            "unenrolled N2 3.4 root '{}' is not empty; use a new isolated directory",
             root_path.display()
         )));
     }

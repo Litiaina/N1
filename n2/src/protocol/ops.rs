@@ -42,7 +42,7 @@ use crate::core::upload::{
 };
 use crate::distribution::download::part_has_remote_shards;
 use crate::distribution::health::cluster_health_snapshot;
-use crate::distribution::membership::{active_cluster_runtime, live_newest_pool_write_nodes};
+use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary,
@@ -53,7 +53,7 @@ use crate::distribution::rebalance::{
     stop_repair,
 };
 use crate::distribution::repair::repair_policy;
-use crate::distribution::resolve_write_layout;
+use crate::distribution::resolve_configured_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
@@ -852,15 +852,26 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_read(&claims)?;
             let runtime = active_cluster_runtime()?;
-            let active = live_newest_pool_write_nodes(&runtime).await;
-            let configured = runtime.membership.active_newest_pool_nodes().len();
-            let layout = resolve_write_layout(active.len(), configured, &runtime.layout_policy)
+            let health = cluster_health_snapshot(&runtime).await?;
+            let configured = runtime
+                .membership
+                .newest_writable_pool()
+                .map(|pool| pool.node_ids.len())
+                .unwrap_or_default();
+            let layout = resolve_configured_layout(configured, &runtime.layout_policy)
                 .map_err(AppError::BadRequest)?;
+            let survival_writable = health.data_plane_writable && health.ncnx_survival_writable;
+            let fully_protected =
+                health.data_plane_fully_protected && health.ncnx_strictly_writable;
             native_body(json!({
                 "membership_epoch": runtime.membership.epoch,
                 "policy": runtime.layout_policy,
-                "active_write_nodes": active.len(),
+                "active_write_nodes": health.active_write_nodes,
                 "layout": layout,
+                "configured_layout": layout,
+                "survival_writable": survival_writable,
+                "fully_protected": fully_protected,
+                "degraded_write_layout": survival_writable && !fully_protected,
                 "bounded_object_erasure_set": true,
                 "static_server_pool_ec": true,
                 "old_object_layouts_remain_valid": true,

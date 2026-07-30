@@ -8,8 +8,8 @@ use ulid::Ulid;
 use crate::core::disk_manager::ObjectMetadata;
 use crate::distribution::ncnx::{
     LocatedNcnx, PeerNcnxName, copy_live_to_key, copy_live_to_key_with_record, copy_live_to_trash,
-    find_live, list_canonical_names, ncnx_cursor, publish_new, read_canonical_record, remove_live,
-    remove_trash,
+    find_live, find_live_for_survival_write, list_canonical_names, ncnx_cursor, publish_new,
+    read_canonical_record, remove_live, remove_trash,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -27,6 +27,7 @@ const PREFIX_MUTATION_CONCURRENCY: usize = 32;
 pub enum PeerNamespaceReadKind {
     ListDir,
     Entry,
+    EntryForWrite,
     TrashedEntry,
     ResolveLiveObject,
     ObjectRefs,
@@ -121,7 +122,7 @@ pub struct PeerNamespaceApplyRequest {
     pub metadata: Option<ObjectMetadata>,
 }
 
-/// N2 3.3 namespace operations are already distributed by deterministic NCNX
+/// N2 3.4 namespace operations are already distributed by deterministic NCNX
 /// placement. This facade preserves the NOA/native protocol boundary without
 /// reintroducing a coordinator database or inode quorum.
 pub async fn namespace_read(
@@ -142,9 +143,16 @@ pub async fn namespace_read(
                 continuation_token,
             }
         }
-        PeerNamespaceReadKind::Entry => {
+        PeerNamespaceReadKind::Entry | PeerNamespaceReadKind::EntryForWrite => {
             let path = request.path.as_deref().unwrap_or_default();
-            PeerNamespaceReadResponse::Entry(namespace_entry(&request.fragment, path).await?)
+            PeerNamespaceReadResponse::Entry(
+                namespace_entry(
+                    &request.fragment,
+                    path,
+                    matches!(request.kind, PeerNamespaceReadKind::EntryForWrite),
+                )
+                .await?,
+            )
         }
         PeerNamespaceReadKind::TrashedEntry => {
             let requested = request.path.as_deref().unwrap_or_default();
@@ -226,7 +234,7 @@ pub async fn commit_namespace_mutation(
             let path = required(&request.source_path, "mkdir requires source_path")?;
             validate_logical_key(path)?;
             Err(AppError::BadRequest(
-                "N2 3.3 is a flat key namespace and does not persist empty directories".into(),
+                "N2 3.4 is a flat key namespace and does not persist empty directories".into(),
             ))
         }
         NamespaceMutationKind::Rename => {
@@ -346,13 +354,19 @@ pub async fn commit_namespace_summary(
 async fn namespace_entry(
     fragment: &str,
     requested_path: &str,
+    survival_write: bool,
 ) -> Result<Option<NamespaceEntry>, AppError> {
     let normalized =
         normalize_path(requested_path).map_err(|err| AppError::BadRequest(err.to_string()))?;
     if normalized.is_empty() {
         return Ok(Some(directory_entry(fragment, "", "")));
     }
-    if let Some(located) = find_live(fragment, &normalized).await? {
+    let located = if survival_write {
+        find_live_for_survival_write(fragment, &normalized).await?
+    } else {
+        find_live(fragment, &normalized).await?
+    };
+    if let Some(located) = located {
         return Ok(Some(live_file_entry(fragment, &normalized, &located)));
     }
     let prefix = format!("{normalized}/");

@@ -235,8 +235,9 @@ fn repair_report(
         "repair_failed"
     }
     .into();
-    report.cluster_read_only_triggered =
-        !outcome.healthy && !outcome.deferred_by_trash && !verification_deferred;
+    // NCNX damage is scoped to this key. Preserve and report the conflict;
+    // never convert one damaged namespace record into a global outage.
+    report.cluster_read_only_triggered = false;
     report.repaired_replicas = outcome.repaired_replicas;
     report.observations = outcome
         .observations
@@ -285,7 +286,7 @@ fn unreadable_record_report(
     report.logical_path = Some(name.logical_key.clone());
     report.initial_status = "critical".into();
     report.repair_outcome = "unrepairable".into();
-    report.cluster_read_only_triggered = true;
+    report.cluster_read_only_triggered = false;
     report.reason = Some(error.to_string());
     report.completed_at_unix_nanos = now_nanos();
     report

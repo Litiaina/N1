@@ -389,7 +389,10 @@ fn object_repair_report(
         "repair_failed"
     }
     .into();
-    report.cluster_read_only_triggered = !healthy && !verification_deferred;
+    // An object-local repair failure must not stop unrelated reconstructable
+    // objects. Survival admission is decided by the pool's K threshold; this
+    // report is the durable operator evidence for the affected object.
+    report.cluster_read_only_triggered = false;
     report.object_health_before = Some(json!(before));
     report.object_health_after = after.map(|status| json!(status));
     report.observations = metadata
@@ -427,7 +430,7 @@ fn object_error_report(
     report.initial_status = "critical".into();
     report.repair_attempted = true;
     report.repair_outcome = "repair_failed".into();
-    report.cluster_read_only_triggered = true;
+    report.cluster_read_only_triggered = false;
     report.reason = Some(reason.into());
     report.completed_at_unix_nanos = now_nanos();
     report
@@ -540,7 +543,7 @@ fn blob_inventory_report(
         "deferred"
     }
     .into();
-    report.cluster_read_only_triggered = immutable_divergence;
+    report.cluster_read_only_triggered = false;
     report.observations = errors
         .into_iter()
         .map(|error| json!({ "error": error }))

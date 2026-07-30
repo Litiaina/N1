@@ -63,7 +63,7 @@ pub fn parse_storage_roots(raw: &str) -> Result<Vec<StorageRoot>, AppError> {
     }
     if roots.is_empty() {
         return Err(AppError::BadRequest(
-            "N2 3.3 requires at least one storage_roots entry".into(),
+            "N2 3.4 requires at least one storage_roots entry".into(),
         ));
     }
     Ok(roots)
@@ -121,7 +121,7 @@ impl ClusterPolicy {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.object_data_shards == 0 || self.object_parity_shards == 0 {
             return Err(AppError::BadRequest(
-                "N2 3.3 pool EC requires at least 1 data and 1 parity shard".into(),
+                "N2 3.4 pool EC requires at least 1 data and 1 parity shard".into(),
             ));
         }
         Ok(())
@@ -323,7 +323,7 @@ impl ClusterMembership {
     pub fn validate(&self) -> Result<(), AppError> {
         if self.format_version != N2_MEMBERSHIP_FORMAT_VERSION {
             return Err(AppError::BadRequest(format!(
-                "membership format {} is not N2 3.3 format {}",
+                "membership format {} is not N2 3.4 format {}",
                 self.format_version, N2_MEMBERSHIP_FORMAT_VERSION
             )));
         }
@@ -335,7 +335,7 @@ impl ClusterMembership {
         }
         if self.pools.is_empty() {
             return Err(AppError::BadRequest(
-                "N2 3.3 membership requires at least one server pool".into(),
+                "N2 3.4 membership requires at least one server pool".into(),
             ));
         }
 
@@ -439,7 +439,7 @@ impl ClusterMembership {
         }
         if assigned_nodes.len() != node_ids.len() {
             return Err(AppError::BadRequest(
-                "every active N2 3.3 logical slot must belong to exactly one server pool".into(),
+                "every active N2 3.4 logical slot must belong to exactly one server pool".into(),
             ));
         }
         Ok(())
@@ -677,7 +677,7 @@ fn parse_usize(raw: Option<&str>, key: &str, default_value: usize) -> Result<usi
     match raw.map(str::trim) {
         None | Some("") => Ok(default_value),
         Some("auto") => Err(AppError::BadRequest(format!(
-            "{key}=auto is not valid in N2 3.3; pool EC is static"
+            "{key}=auto is not valid in N2 3.4; pool EC is static"
         ))),
         Some(value) => value
             .parse::<usize>()
@@ -805,7 +805,7 @@ fn load_or_create_membership(
             .map_err(|e| AppError::Io(e, format!("read N2 membership file {}", path.display())))?;
         let mut membership: ClusterMembership = serde_json::from_slice(&bytes).map_err(|e| {
             AppError::InternalServerError(format!(
-                "decode N2 3.3 membership file '{}': {e}",
+                "decode N2 3.4 membership file '{}': {e}",
                 path.display()
             ))
         })?;
@@ -945,7 +945,7 @@ pub fn init_cluster_runtime(
     let section = config.section(Some("cluster_config"));
     if section.and_then(|s| s.get("node_role")).is_some() {
         return Err(AppError::BadRequest(
-            "node_role was removed in N2 3.3; every server-pool node is unified".into(),
+            "node_role was removed in N2 3.4; every server-pool node is unified".into(),
         ));
     }
     if section
@@ -953,7 +953,7 @@ pub fn init_cluster_runtime(
         .is_some()
     {
         return Err(AppError::BadRequest(
-            "namespace_redundancy was removed in N2 3.3; NCNX replicas equal parity + one".into(),
+            "namespace_redundancy was removed in N2 3.4; NCNX replicas equal parity + one".into(),
         ));
     }
     let node_id = section

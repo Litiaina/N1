@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Finite N2 3.3 architectural and autonomous Reserve Set proof; the filename is
+# Finite N2 3.4 architectural and autonomous Reserve Set proof; the filename is
 # retained for the flat-NCNX proof family. This never installs a service, never
 # uses production ports, and only removes directories containing this run's
 # unique timestamp.
@@ -64,7 +64,7 @@ if [[ "$ALL_LOCAL" != "true" ]]; then
   SCP=(sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=8)
 fi
 
-for tool in jq curl openssl pidstat sha256sum awk; do
+for tool in jq curl openssl pidstat sha256sum awk cmp; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 if [[ "$ALL_LOCAL" != "true" ]]; then
@@ -641,20 +641,23 @@ stop_remote_node "$REMOTE_D"
 curl_auth -G "$A_BASE/noa/v1/objects/download" --data-urlencode 'object_key=videos/main.bin' -o "$OUT/download-node-loss.bin"
 [[ "$(sha256sum "$OUT/download-node-loss.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
 
-# The exact-width pool is temporarily fail-closed, then the autonomous Reserve
-# Set preserves logical slot node-d while replacing its physical binding.
+# The pool remains reconstructably writable above K while the autonomous
+# Reserve Set preserves logical slot node-d and restores full protection.
 printf 'reserve-write' > "$OUT/node-loss.bin"
 PRE_PROMOTION_STATUS="$(curl -k --http1.1 -sS -o "$OUT/pre-promotion-write.json" -w '%{http_code}' \
-  -X POST "$A_BASE/noa/v1/upload/one-shot/pre-promotion-must-not-commit.bin" \
+  -X POST "$A_BASE/noa/v1/upload/one-shot/pre-promotion-survival.bin" \
   -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/node-loss.bin")"
+[[ "$PRE_PROMOTION_STATUS" == 2* ]]
+curl_auth -G "$A_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=pre-promotion-survival.bin' \
+  -o "$OUT/pre-promotion-survival-download.bin"
+cmp "$OUT/node-loss.bin" "$OUT/pre-promotion-survival-download.bin"
 wait_binding_epoch 2 "$OUT/health-after-promotion.json"
 jq -e 'any(.nodes[]; .node_id == "node-d" and .instance_id == "reserve-r"
     and (.state == "degraded" or .state == "online"))
   and (.reserve_nodes | length) == 0
   and .effective_client_writable == true' "$OUT/health-after-promotion.json" >/dev/null
-if [[ "$PRE_PROMOTION_STATUS" == 2* ]]; then
-  jq -e '.binding_epoch == 2' "$OUT/health-after-promotion.json" >/dev/null
-fi
+jq -e '.binding_epoch == 2' "$OUT/health-after-promotion.json" >/dev/null
 for _ in $(seq 1 120); do
   curl_auth "$A_BASE/noa/v1/cluster/reserve" > "$OUT/reserve-after-promotion.json"
   if jq -e '.binding_epoch == 2 and .last_promoted_slot == "node-d"

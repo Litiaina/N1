@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Unattended, server-only N2 3.3 qualification controller. The caller supplies
+# Unattended, server-only N2 3.4 qualification controller. The caller supplies
 # one immutable run ID and a controller directory containing the exact N2
 # binary and stage scripts. Progress is written atomically to status.json;
 # no external poller is required.
@@ -89,7 +89,7 @@ assert_n1_untouched_boundary() {
 
 mkdir -p "$BASE"
 sha256sum "$BIN" >"$BASE/binary.sha256"
-printf 'N2 3.3.1\n' >"$BASE/binary-version.txt"
+printf 'N2 3.4.0\n' >"$BASE/binary-version.txt"
 systemctl is-active litiaina-n1 >"$BASE/n1-before.txt"
 df -hT /mnt/NDISK001 /mnt/NDISK002 /mnt/NDISK003 /mnt/NDISK004 >"$BASE/storage-before.txt"
 assert_n1_untouched_boundary
@@ -202,4 +202,4 @@ jq -n \
     started_at_unix:$started_at,
     finished_at_unix:$finished_at
   }' >"$BASE/summary.json"
-write_status PASS "all N2 3.3 hospital-readiness stages passed"
+write_status PASS "all N2 3.4 hospital-readiness stages passed"

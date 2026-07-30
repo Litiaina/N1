@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# N2 3.3 soak and bounded-chaos qualification; the filename is retained for
+# N2 3.4 soak and bounded-chaos qualification; the filename is retained for
 # the flat-NCNX proof family. The harness uses four logical nodes, static 2+2
 # EC, and NCNX R=3. It never installs a service or uses a pre-existing storage
 # directory.
@@ -798,7 +798,8 @@ delete_one_distributed_path() {
 }
 
 run_chaos() {
-  local phase=$(( ((CHAOS_START_PHASE - 1 + CHAOS_EVENTS) % 6) + 1 )) status
+  local phase=$(( ((CHAOS_START_PHASE - 1 + CHAOS_EVENTS) % 6) + 1 )) status small_sha
+  small_sha="$(sha256sum "$OUT/payloads/small.bin" | awk '{print $1}')"
   CHAOS_EVENTS=$((CHAOS_EVENTS + 1))
   LAST_OPERATION="chaos-$phase"
   event "phase-$phase" started "bounded failure injection"
@@ -807,10 +808,11 @@ run_chaos() {
       stop_remote_node "$REMOTE_D"
       sleep "$FAULT_DWELL_SECONDS"
       download_verify "$A_BASE" soak/anchor.bin "$ANCHOR_SHA" chaos-one-node-read
-      status="$(curl -k --http1.1 --connect-timeout 5 --max-time 30 -sS -o "$OUT/events/fail-closed-current.json" -w '%{http_code}' \
-        -X POST "$A_BASE/noa/v1/upload/one-shot/soak/must-fail-$CYCLE.bin" \
+      status="$(curl -k --http1.1 --connect-timeout 5 --max-time 30 -sS -o "$OUT/events/survival-one-node.json" -w '%{http_code}' \
+        -X POST "$A_BASE/noa/v1/upload/one-shot/soak/survival-one-$CYCLE.bin" \
         -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/payloads/small.bin")"
-      [[ "$status" == "503" ]]
+      [[ "$status" == 2* ]]
+      download_verify "$A_BASE" "soak/survival-one-$CYCLE.bin" "$small_sha" chaos-one-node-write
       start_remote_node "$REMOTE_D"; wait_ping "$D_BASE"
       ;;
     2)
@@ -818,6 +820,17 @@ run_chaos() {
       kill_pidfile "$LOCAL_B/pidstat.pid"; kill_pidfile "$LOCAL_B/n2.pid"
       sleep "$FAULT_DWELL_SECONDS"
       download_verify "$A_BASE" soak/anchor.bin "$ANCHOR_SHA" chaos-parity-count-read
+      status="$(curl -k --http1.1 --connect-timeout 5 --max-time 30 -sS -o "$OUT/events/survival-at-k.json" -w '%{http_code}' \
+        -X POST "$A_BASE/noa/v1/upload/one-shot/soak/survival-at-k-$CYCLE.bin" \
+        -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/payloads/small.bin")"
+      [[ "$status" == 2* ]]
+      download_verify "$A_BASE" "soak/survival-at-k-$CYCLE.bin" "$small_sha" chaos-at-k-write
+      stop_remote_node "$REMOTE_C"
+      status="$(curl -k --http1.1 --connect-timeout 5 --max-time 30 -sS -o "$OUT/events/reject-below-k.json" -w '%{http_code}' \
+        -X POST "$A_BASE/noa/v1/upload/one-shot/soak/reject-below-k-$CYCLE.bin" \
+        -H "Authorization: Bearer $TOKEN" --data-binary @"$OUT/payloads/small.bin")"
+      [[ "$status" == "503" ]]
+      start_remote_node "$REMOTE_C"; wait_ping "$C_BASE"
       start_local_node "$LOCAL_B"; wait_ping "$B_BASE"
       start_remote_node "$REMOTE_D"; wait_ping "$D_BASE"
       ;;

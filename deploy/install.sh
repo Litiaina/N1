@@ -359,7 +359,7 @@ write_membership() {
         log "keeping existing $membership"
         return
     fi
-    [[ -n "$MEMBERSHIP_SRC" ]] || die "fresh N2 3.3 instance install requires --membership-src"
+    [[ -n "$MEMBERSHIP_SRC" ]] || die "fresh N2 3.4 instance install requires --membership-src"
     [[ -f "$MEMBERSHIP_SRC" ]] || die "membership source is missing: $MEMBERSHIP_SRC"
     command -v jq >/dev/null || die "jq is required to validate membership"
     jq -e '

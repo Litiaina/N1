@@ -232,7 +232,7 @@ pub(crate) async fn resolve_logical_write_key(
 ) -> Result<String, AppError> {
     if looks_like_flat_storage_object_id(requested_path) {
         if let Some(entry) = global_namespace_runtime()
-            .entry(fragment, requested_path)
+            .entry_for_write(fragment, requested_path)
             .await?
         {
             if entry.kind != crate::namespace::models::NamespaceEntryKind::File {
