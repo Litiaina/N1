@@ -49,6 +49,20 @@ pub struct StorageReadiness {
 
 const MIN_STORAGE_WRITE_HEADROOM_BYTES: u64 = 8 * 1024 * 1024;
 
+pub(crate) fn storage_root_accepts_write(
+    path: &Path,
+    required_bytes: u64,
+) -> Result<bool, AppError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| AppError::Io(error, format!("inspect storage root {}", path.display())))?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    let (_, _, available_bytes) = statvfs_totals_sync(path)?;
+    Ok(path_accessible(path, libc::W_OK | libc::X_OK)
+        && available_bytes >= required_bytes.saturating_add(MIN_STORAGE_WRITE_HEADROOM_BYTES))
+}
+
 #[cfg(unix)]
 fn statvfs_totals_sync(path: &Path) -> Result<(u64, u64, u64), AppError> {
     use std::ffi::CString;

@@ -16,6 +16,7 @@ pub mod placement;
 pub mod rebalance;
 pub mod repair;
 pub mod reserve_set;
+pub(crate) mod root_routing;
 pub mod routes;
 pub mod status;
 pub mod upload;

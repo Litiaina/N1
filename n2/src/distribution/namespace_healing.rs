@@ -1,7 +1,8 @@
 use crate::distribution::healing_report::AutoHealingReport;
 use crate::distribution::membership::ClusterRuntime;
 use crate::distribution::ncnx::{
-    PeerNcnxName, inspect_and_repair_name, list_replica_names, ncnx_cursor, trash_is_expired,
+    PeerNcnxName, inspect_and_repair_name, list_replica_names, name_is_still_advertised,
+    ncnx_cursor, trash_is_expired,
 };
 use crate::enums::app_error_enum::AppError;
 use serde_json::json;
@@ -153,33 +154,6 @@ fn is_all_replicas_unreadable(error: &AppError) -> bool {
         AppError::Conflict(message)
             if message.starts_with("all NCNX replicas are unreadable for key '")
     )
-}
-
-async fn name_is_still_advertised(fragment: &str, target: &PeerNcnxName) -> Result<bool, AppError> {
-    let target_identity = ncnx_cursor(&target.logical_key, target.trash.as_ref());
-    let mut cursor = None;
-    loop {
-        let page = list_replica_names(
-            fragment,
-            &target.logical_key,
-            cursor.as_deref(),
-            HEALING_DISCOVERY_PAGE,
-            target.trash.is_some(),
-        )
-        .await?;
-        if page
-            .iter()
-            .any(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()) == target_identity)
-        {
-            return Ok(true);
-        }
-        if page.len() < HEALING_DISCOVERY_PAGE {
-            return Ok(false);
-        }
-        cursor = page
-            .last()
-            .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()));
-    }
 }
 
 fn repair_report(

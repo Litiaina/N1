@@ -14,6 +14,9 @@ pub struct RootIdentity {
     pub cluster_id: String,
     pub instance_id: String,
     pub physical_root_id: String,
+    /// Informational startup snapshot retained in the v5 marker. Root
+    /// ownership is independent, so adding/removing another disk does not
+    /// invalidate this device.
     pub instance_root_ids: Vec<String>,
 }
 
@@ -32,6 +35,13 @@ impl RootIdentity {
             physical_root_id: root.physical_id().to_string(),
             instance_root_ids,
         }
+    }
+
+    fn belongs_to(&self, runtime: &ClusterRuntime, root: &StorageRoot) -> bool {
+        self.format == ROOT_IDENTITY_FORMAT
+            && self.cluster_id == runtime.membership.cluster_id
+            && self.instance_id == runtime.local_instance_id
+            && self.physical_root_id == root.physical_id()
     }
 }
 
@@ -90,7 +100,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
     let marker_path = identity_path(root);
     let expected = RootIdentity::expected(runtime, root);
     match read_identity(&marker_path) {
-        Ok(actual) if actual == expected => return Ok(()),
+        Ok(actual) if actual.belongs_to(runtime, root) => return Ok(()),
         Ok(actual) => {
             return Err(AppError::Conflict(format!(
                 "root '{}' belongs to cluster='{}' instance='{}' physical_root='{}', not this physical instance",
@@ -136,7 +146,7 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let actual = read_identity(&marker_path)?;
-            if actual == expected {
+            if actual.belongs_to(runtime, root) {
                 Ok(())
             } else {
                 Err(AppError::Conflict(format!(
@@ -149,6 +159,22 @@ fn enroll_root(runtime: &ClusterRuntime, root: &StorageRoot) -> Result<(), AppEr
             error,
             format!("create N2 root identity {}", marker_path.display()),
         )),
+    }
+}
+
+pub(crate) fn verify_local_root_identity(
+    runtime: &ClusterRuntime,
+    root: &StorageRoot,
+) -> Result<(), AppError> {
+    let marker_path = identity_path(root);
+    let actual = read_identity(&marker_path)?;
+    if actual.belongs_to(runtime, root) {
+        Ok(())
+    } else {
+        Err(AppError::Conflict(format!(
+            "storage root '{}' is not enrolled to cluster '{}' instance '{}'",
+            root.path, runtime.membership.cluster_id, runtime.local_instance_id
+        )))
     }
 }
 
@@ -260,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn enrolled_pool_rejects_local_root_set_change() {
+    fn enrolled_roots_are_independent_and_allow_local_root_set_growth() {
         let first_root = std::env::temp_dir().join(format!("n2-root-v5-set-a-{}", Ulid::new()));
         let second_root = std::env::temp_dir().join(format!("n2-root-v5-set-b-{}", Ulid::new()));
         fs::create_dir_all(&first_root).expect("create first root");
@@ -276,7 +302,11 @@ mod tests {
         };
         changed.local_storage_roots.push(added.clone());
         changed.membership.nodes[0].storage_roots.push(added);
-        assert!(initialize_local_root_identities(&changed).is_err());
+        initialize_local_root_identities(&changed).expect("enroll added independent root");
+        verify_local_root_identity(&changed, &changed.local_storage_roots[0])
+            .expect("first root remains enrolled");
+        verify_local_root_identity(&changed, &changed.local_storage_roots[1])
+            .expect("second root is enrolled");
 
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);

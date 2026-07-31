@@ -13,6 +13,7 @@ use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, active_cluster_runtime, try_active_cluster_runtime,
 };
 use crate::distribution::placement::build_placement_plan;
+use crate::distribution::root_routing::{ordered_local_roots, writable_local_roots};
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::{
     PeerOperation, acquire_peer_operation, record_capacity_cache_failure,
@@ -1910,16 +1911,6 @@ pub fn resolve_peer_shard_locator(
                 locator.node_id
             ))
         })?;
-    if !binding
-        .storage_roots
-        .iter()
-        .any(|root| root.id == locator.root_id)
-    {
-        return Err(AppError::Conflict(format!(
-            "logical root '{}' is not present on slot '{}'",
-            locator.root_id, locator.node_id
-        )));
-    }
     let mut resolved = locator.clone();
     resolved.instance_id = binding.instance_id.clone();
     resolved.binding_epoch = runtime.membership.binding_epoch;
@@ -2182,30 +2173,86 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
     format!("part_{part_index}_shard_{shard_index}{ext}")
 }
 
-fn shard_dir(
-    root_id: &str,
+struct OpenLocalShard {
+    dir: std::path::PathBuf,
+    tmp_path: std::path::PathBuf,
+    stable_path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+async fn open_local_shard_for_write(
+    runtime: &ClusterRuntime,
+    preferred_root_id: &str,
     fragment: &str,
     object_id: &str,
     version_id: &str,
-) -> Result<std::path::PathBuf, AppError> {
-    let runtime = active_cluster_runtime()?;
-    let root = runtime
-        .local_storage_roots
-        .iter()
-        .find(|root| root.id == root_id)
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(format!(
-                "blob root '{}' is not configured on node '{}'",
-                root_id, runtime.local_node_id
-            ))
-        })?;
+    file_name: &str,
+    expected_len: u64,
+) -> Result<OpenLocalShard, AppError> {
     let pm = ObjectPathManager::new();
-    Ok(pm.get_shard_dir_on_disk(
-        &std::path::PathBuf::from(&root.path),
-        fragment,
-        object_id,
-        version_id,
-    ))
+    let mut failures = Vec::new();
+    for root in writable_local_roots(runtime, preferred_root_id, expected_len)? {
+        let dir = pm.get_shard_dir_on_disk(
+            &std::path::PathBuf::from(&root.path),
+            fragment,
+            object_id,
+            version_id,
+        );
+        if let Err(error) = fs::create_dir_all(&dir).await {
+            failures.push(format!("{}: create directory: {}", root.id, error));
+            continue;
+        }
+        let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
+        let stable_path = dir.join(file_name);
+        match create_direct_file(&tmp_path).await {
+            Ok(file) => {
+                return Ok(OpenLocalShard {
+                    dir,
+                    tmp_path,
+                    stable_path,
+                    file,
+                });
+            }
+            Err(error) => failures.push(format!("{}: {}", root.id, error)),
+        }
+    }
+    Err(AppError::ServiceUnavailable(format!(
+        "node '{}' could not open shard on any healthy disk: {}",
+        runtime.local_node_id,
+        failures.join("; ")
+    )))
+}
+
+async fn open_local_shard_for_read(
+    runtime: &ClusterRuntime,
+    preferred_root_id: &str,
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+    file_name: &str,
+) -> Result<(tokio::fs::File, std::path::PathBuf), AppError> {
+    let pm = ObjectPathManager::new();
+    let mut first_io_error = None;
+    for root in ordered_local_roots(runtime, preferred_root_id) {
+        let path = pm
+            .get_shard_dir_on_disk(
+                &std::path::PathBuf::from(&root.path),
+                fragment,
+                object_id,
+                version_id,
+            )
+            .join(file_name);
+        match fs::File::open(&path).await {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                first_io_error.get_or_insert_with(|| {
+                    AppError::Io(error, format!("open peer shard {}", path.display()))
+                });
+            }
+        }
+    }
+    Err(first_io_error.unwrap_or(AppError::NotFound))
 }
 
 fn validate_peer_binding(
@@ -2214,7 +2261,7 @@ fn validate_peer_binding(
     slot_id: &str,
     instance_id: &str,
     binding_epoch: u64,
-    root_id: &str,
+    _root_id: &str,
 ) -> Result<Arc<ClusterRuntime>, AppError> {
     let runtime = active_cluster_runtime()?;
     if runtime.local_is_reserve {
@@ -2255,11 +2302,6 @@ fn validate_peer_binding(
             "logical slot '{slot_id}' is not bound to physical instance '{instance_id}'"
         )));
     }
-    if !binding.storage_roots.iter().any(|root| root.id == root_id) {
-        return Err(AppError::Conflict(format!(
-            "logical root '{root_id}' is not bound on slot '{slot_id}'"
-        )));
-    }
     Ok(runtime)
 }
 
@@ -2276,7 +2318,7 @@ pub async fn peer_put_shard(
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
     authorize_peer(&headers)?;
-    validate_peer_binding(
+    let runtime = validate_peer_binding(
         &query.pool_id,
         query.pool_generation,
         &query.slot_id,
@@ -2287,15 +2329,21 @@ pub async fn peer_put_shard(
     let started = Instant::now();
     let is_parity = query.parity.unwrap_or(false);
     let expected_len = query.expected_len.unwrap_or(0);
-    let dir = shard_dir(&query.root_id, &fragment, &object_id, &version_id)?;
-    fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create peer shard dir {}", dir.display())))?;
     let file_name = stable_name(part_index, shard_index, is_parity);
-    let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
-    let stable_path = dir.join(&file_name);
-    let file = create_direct_file(&tmp_path).await?;
-    let mut file = DirectWriter::new(file);
+    let opened = open_local_shard_for_write(
+        &runtime,
+        &query.root_id,
+        &fragment,
+        &object_id,
+        &version_id,
+        &file_name,
+        expected_len,
+    )
+    .await?;
+    let dir = opened.dir;
+    let tmp_path = opened.tmp_path;
+    let stable_path = opened.stable_path;
+    let mut file = DirectWriter::new(opened.file);
     let mut stream = body.into_data_stream();
     let mut hasher = Sha256Stream::new();
     let mut written = 0u64;
@@ -2371,7 +2419,7 @@ pub async fn peer_get_shard(
     Query(query): Query<PeerShardQuery>,
 ) -> Result<Response, AppError> {
     authorize_peer(&headers)?;
-    validate_peer_binding(
+    let runtime = validate_peer_binding(
         &query.pool_id,
         query.pool_generation,
         &query.slot_id,
@@ -2379,16 +2427,16 @@ pub async fn peer_get_shard(
         query.binding_epoch,
         &query.root_id,
     )?;
-    let dir = shard_dir(&query.root_id, &fragment, &object_id, &version_id)?;
     let file_name = stable_name(part_index, shard_index, query.parity.unwrap_or(false));
-    let path = dir.join(file_name);
-    let mut file = fs::File::open(&path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AppError::NotFound
-        } else {
-            AppError::Io(e, format!("open peer shard {}", path.display()))
-        }
-    })?;
+    let (mut file, path) = open_local_shard_for_read(
+        &runtime,
+        &query.root_id,
+        &fragment,
+        &object_id,
+        &version_id,
+        &file_name,
+    )
+    .await?;
     if let Some(length) = query.length {
         let offset = query.offset.unwrap_or(0);
         file.seek(SeekFrom::Start(offset))
@@ -2502,7 +2550,7 @@ where
     R: AsyncRead + Unpin,
 {
     authorize_peer_secret(payload.secret.as_deref())?;
-    validate_peer_binding(
+    let runtime = validate_peer_binding(
         &payload.pool_id,
         payload.pool_generation,
         &payload.slot_id,
@@ -2511,20 +2559,21 @@ where
         &payload.root_id,
     )?;
     let expected_len = payload.expected_len.unwrap_or(body_len);
-    let dir = shard_dir(
+    let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
+    let opened = open_local_shard_for_write(
+        &runtime,
         &payload.root_id,
         &payload.fragment,
         &payload.object_id,
         &payload.version_id,
-    )?;
-    fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create native peer shard dir {}", dir.display())))?;
-    let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
-    let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
-    let stable_path = dir.join(&file_name);
-    let file = create_direct_file(&tmp_path).await?;
-    let mut file = DirectWriter::new(file);
+        &file_name,
+        expected_len,
+    )
+    .await?;
+    let dir = opened.dir;
+    let tmp_path = opened.tmp_path;
+    let stable_path = opened.stable_path;
+    let mut file = DirectWriter::new(opened.file);
     let mut hasher = Sha256Stream::new();
     let mut written = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
@@ -2602,7 +2651,7 @@ pub async fn native_peer_get_shard_bytes(
     payload: NativePeerShardPayload,
 ) -> Result<Vec<u8>, AppError> {
     authorize_peer_secret(payload.secret.as_deref())?;
-    validate_peer_binding(
+    let runtime = validate_peer_binding(
         &payload.pool_id,
         payload.pool_generation,
         &payload.slot_id,
@@ -2610,21 +2659,16 @@ pub async fn native_peer_get_shard_bytes(
         payload.binding_epoch,
         &payload.root_id,
     )?;
-    let dir = shard_dir(
+    let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
+    let (mut file, path) = open_local_shard_for_read(
+        &runtime,
         &payload.root_id,
         &payload.fragment,
         &payload.object_id,
         &payload.version_id,
-    )?;
-    let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
-    let path = dir.join(file_name);
-    let mut file = fs::File::open(&path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AppError::NotFound
-        } else {
-            AppError::Io(e, format!("open native peer shard {}", path.display()))
-        }
-    })?;
+        &file_name,
+    )
+    .await?;
     if let Some(length) = payload.length {
         file.seek(SeekFrom::Start(payload.offset.unwrap_or(0)))
             .await

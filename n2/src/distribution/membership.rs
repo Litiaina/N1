@@ -18,7 +18,9 @@ pub const N2_MEMBERSHIP_FORMAT_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageRoot {
-    /// Logical root ID recorded in immutable object placement.
+    /// Deterministic preferred local route recorded in immutable object
+    /// placement. The node may transparently satisfy I/O from another
+    /// enrolled root when this root is unavailable or full.
     pub id: String,
     /// Stable device/root identity. It remains unchanged when rebound to a
     /// logical root. If omitted, it is identical to `id`.

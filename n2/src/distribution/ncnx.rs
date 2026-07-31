@@ -2,6 +2,7 @@ use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, ServerPool, active_cluster_runtime,
 };
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
+use crate::distribution::root_routing::{ordered_local_roots, writable_local_roots};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::ncnx_store::{NcnxRecord, NcnxStore, TrashLocator, validate_logical_key};
 use crate::routes::storage_routes::AppState;
@@ -311,17 +312,59 @@ fn validate_pool_contract<'a>(
     Ok(pool)
 }
 
-fn local_store(runtime: &ClusterRuntime, root_id: &str) -> Result<NcnxStore, AppError> {
-    let root = runtime
-        .local_storage_roots
-        .iter()
-        .find(|root| root.id == root_id)
-        .ok_or_else(|| {
-            AppError::Forbidden(format!(
-                "NCNX request assigns unknown local root '{root_id}'"
-            ))
-        })?;
-    Ok(NcnxStore::new(&root.id, PathBuf::from(&root.path)))
+fn local_stores(runtime: &ClusterRuntime, preferred_root_id: &str) -> Vec<NcnxStore> {
+    ordered_local_roots(runtime, preferred_root_id)
+        .into_iter()
+        .map(|root| NcnxStore::new(root.id, PathBuf::from(root.path)))
+        .collect()
+}
+
+fn writable_local_stores(
+    runtime: &ClusterRuntime,
+    preferred_root_id: &str,
+) -> Result<Vec<NcnxStore>, AppError> {
+    Ok(writable_local_roots(runtime, preferred_root_id, 0)?
+        .into_iter()
+        .map(|root| NcnxStore::new(root.id, PathBuf::from(root.path)))
+        .collect())
+}
+
+fn apply_store_mutation(store: &NcnxStore, request: &PeerNcnxRequest) -> Result<bool, AppError> {
+    match request.action {
+        PeerNcnxAction::CreateLive => store.create_live(
+            &request.fragment_id,
+            &request.logical_key,
+            required_bytes(request)?,
+        ),
+        PeerNcnxAction::CreateTrash => store.create_trash(
+            &request.fragment_id,
+            required_trash(request)?,
+            required_bytes(request)?,
+        ),
+        PeerNcnxAction::RemoveLive => store.remove_live_if_exact(
+            &request.fragment_id,
+            &request.logical_key,
+            required_bytes(request)?,
+        ),
+        PeerNcnxAction::RemoveTrash => store.remove_trash_if_exact(
+            &request.fragment_id,
+            required_trash(request)?,
+            required_bytes(request)?,
+        ),
+        PeerNcnxAction::RepairLive => store.repair_live(
+            &request.fragment_id,
+            &request.logical_key,
+            required_bytes(request)?,
+        ),
+        PeerNcnxAction::RepairTrash => store.repair_trash(
+            &request.fragment_id,
+            required_trash(request)?,
+            required_bytes(request)?,
+        ),
+        _ => Err(AppError::BadRequest(
+            "NCNX read/list action is not a store mutation".into(),
+        )),
+    }
 }
 
 fn local_apply(
@@ -329,7 +372,6 @@ fn local_apply(
     request: &PeerNcnxRequest,
 ) -> Result<PeerNcnxResponse, AppError> {
     let pool = validate_pool_contract(runtime, request)?;
-    let store = local_store(runtime, &request.root_id)?;
     let expected_layout =
         build_ncnx_layout(runtime, pool, &request.fragment_id, &request.logical_key)?;
     let assigned = expected_layout
@@ -357,57 +399,84 @@ fn local_apply(
     };
     match request.action {
         PeerNcnxAction::ReadLive => {
-            response.bytes = store
-                .read_live(&request.fragment_id, &request.logical_key)?
-                .map(|(_, bytes)| ByteBuf::from(bytes));
+            let mut first_error = None;
+            for store in local_stores(runtime, &request.root_id) {
+                match store.read_live(&request.fragment_id, &request.logical_key) {
+                    Ok(Some((_, bytes))) => {
+                        response.root_id = store.root_id().to_string();
+                        response.bytes = Some(ByteBuf::from(bytes));
+                        return Ok(response);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
         PeerNcnxAction::ReadTrash => {
             let locator = required_trash(request)?;
-            response.bytes = store
-                .read_trash(&request.fragment_id, locator)?
-                .map(|(_, bytes)| ByteBuf::from(bytes));
+            let mut first_error = None;
+            for store in local_stores(runtime, &request.root_id) {
+                match store.read_trash(&request.fragment_id, locator) {
+                    Ok(Some((_, bytes))) => {
+                        response.root_id = store.root_id().to_string();
+                        response.bytes = Some(ByteBuf::from(bytes));
+                        return Ok(response);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
-        PeerNcnxAction::CreateLive => {
-            response.changed = store.create_live(
-                &request.fragment_id,
-                &request.logical_key,
-                required_bytes(request)?,
-            )?;
+        PeerNcnxAction::CreateLive
+        | PeerNcnxAction::CreateTrash
+        | PeerNcnxAction::RepairLive
+        | PeerNcnxAction::RepairTrash => {
+            let mut failures = Vec::new();
+            for store in writable_local_stores(runtime, &request.root_id)? {
+                match apply_store_mutation(&store, request) {
+                    Ok(changed) => {
+                        response.root_id = store.root_id().to_string();
+                        response.changed = changed;
+                        return Ok(response);
+                    }
+                    Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
+                }
+            }
+            return Err(AppError::ServiceUnavailable(format!(
+                "NCNX mutation could not use any healthy disk on node '{}': {}",
+                runtime.local_node_id,
+                failures.join("; ")
+            )));
         }
-        PeerNcnxAction::CreateTrash => {
-            response.changed = store.create_trash(
-                &request.fragment_id,
-                required_trash(request)?,
-                required_bytes(request)?,
-            )?;
-        }
-        PeerNcnxAction::RemoveLive => {
-            response.changed = store.remove_live_if_exact(
-                &request.fragment_id,
-                &request.logical_key,
-                required_bytes(request)?,
-            )?;
-        }
-        PeerNcnxAction::RemoveTrash => {
-            response.changed = store.remove_trash_if_exact(
-                &request.fragment_id,
-                required_trash(request)?,
-                required_bytes(request)?,
-            )?;
-        }
-        PeerNcnxAction::RepairLive => {
-            response.changed = store.repair_live(
-                &request.fragment_id,
-                &request.logical_key,
-                required_bytes(request)?,
-            )?;
-        }
-        PeerNcnxAction::RepairTrash => {
-            response.changed = store.repair_trash(
-                &request.fragment_id,
-                required_trash(request)?,
-                required_bytes(request)?,
-            )?;
+        PeerNcnxAction::RemoveLive | PeerNcnxAction::RemoveTrash => {
+            let mut successes = 0usize;
+            let mut failures = Vec::new();
+            for store in local_stores(runtime, &request.root_id) {
+                match apply_store_mutation(&store, request) {
+                    Ok(changed) => {
+                        successes = successes.saturating_add(1);
+                        response.changed |= changed;
+                    }
+                    Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
+                }
+            }
+            if successes == 0 {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "NCNX removal could not reach any local disk on node '{}': {}",
+                    runtime.local_node_id,
+                    failures.join("; ")
+                )));
+            }
         }
         PeerNcnxAction::ListLive
         | PeerNcnxAction::ListTrash
@@ -1241,6 +1310,39 @@ pub async fn list_replica_names(
     )
     .await;
     merge_node_pages(replicas, limit, true)
+}
+
+/// Revalidate an exact physical NCNX name after a lockless listing. A false
+/// result proves that another namespace/GC mutation already removed the
+/// generation; transport failures remain errors rather than false absence.
+pub async fn name_is_still_advertised(
+    fragment_id: &str,
+    target: &PeerNcnxName,
+) -> Result<bool, AppError> {
+    let target_identity = ncnx_cursor(&target.logical_key, target.trash.as_ref());
+    let mut cursor = None;
+    loop {
+        let page = list_replica_names(
+            fragment_id,
+            &target.logical_key,
+            cursor.as_deref(),
+            1_000,
+            target.trash.is_some(),
+        )
+        .await?;
+        if page
+            .iter()
+            .any(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()) == target_identity)
+        {
+            return Ok(true);
+        }
+        if page.len() < 1_000 {
+            return Ok(false);
+        }
+        cursor = page
+            .last()
+            .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()));
+    }
 }
 
 pub async fn read_canonical_record(

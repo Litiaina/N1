@@ -8,7 +8,8 @@ use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::distribution::lifecycle::purge_object_from_holders;
 use crate::distribution::ncnx::{
-    list_canonical_names, ncnx_cursor, read_canonical_record, remove_trash,
+    key_references_object, list_canonical_names, name_is_still_advertised, ncnx_cursor,
+    read_canonical_record, remove_trash,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::runtime::global_namespace_runtime;
@@ -257,12 +258,28 @@ async fn reclaim_expired_trash(
             if age < retention {
                 continue;
             }
-            let located = read_canonical_record(fragment, &name).await?;
+            let located = match read_canonical_record(fragment, &name).await {
+                Ok(located) => located,
+                Err(AppError::NotFound) if !name_is_still_advertised(fragment, &name).await? => {
+                    // Another node completed the same immutable trash
+                    // generation first. Reclaim is deliberately idempotent.
+                    continue;
+                }
+                Err(AppError::NotFound) => {
+                    return Err(AppError::Conflict(format!(
+                        "advertised trash NCNX for '{}' has no readable replica",
+                        name.logical_key
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
             let object_id = located.record.object_id.clone();
 
             // Any live key or any still-recoverable trash key protects the
             // immutable object. Only this expired pointer is then discarded.
-            if protected.contains(&object_id) {
+            if protected.contains(&object_id)
+                || key_references_object(fragment, &name.logical_key, &object_id).await?
+            {
                 remove_trash(&located, trash).await?;
                 continue;
             }

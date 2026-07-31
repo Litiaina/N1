@@ -16,6 +16,7 @@ use crate::distribution::peer::{
     publish_cluster_object_metadata,
 };
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
+use crate::distribution::root_routing::writable_local_roots;
 use crate::distribution::{
     ClusterEcLayout, resolve_configured_layout, resolve_survival_write_layout,
 };
@@ -433,40 +434,46 @@ async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter
             target.node_id
         )));
     }
-    let root = runtime
-        .local_storage_roots
-        .iter()
-        .find(|root| root.id == target.root_id)
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(format!(
-                "blob root '{}' is not configured on node '{}'",
-                target.root_id, runtime.local_node_id
-            ))
-        })?;
     let pm = ObjectPathManager::new();
-    let dir = pm.get_shard_dir_on_disk(
-        &PathBuf::from(&root.path),
-        &target.fragment,
-        &target.object_id,
-        &target.version_id,
-    );
-    fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create cluster shard dir {}", dir.display())))?;
     let file_name = stable_name(target.part_index, target.shard_index, target.is_parity);
-    let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
-    let stable_path = dir.join(&file_name);
-    let file = create_direct_file(&tmp_path).await?;
-    Ok(ClusterShardWriter::Local(LocalShardWriter {
-        file: DirectWriter::new(file),
-        tmp_path,
-        stable_path,
-        file_name,
-        shard_index: target.shard_index,
-        is_parity: target.is_parity,
-        expected_len: target.expected_len,
-        locator: target,
-    }))
+    let mut failures = Vec::new();
+    for root in writable_local_roots(&runtime, &target.root_id, target.expected_len)? {
+        let dir = pm.get_shard_dir_on_disk(
+            &PathBuf::from(&root.path),
+            &target.fragment,
+            &target.object_id,
+            &target.version_id,
+        );
+        if let Err(error) = fs::create_dir_all(&dir).await {
+            failures.push(format!("{}: create directory: {}", root.id, error));
+            continue;
+        }
+        let tmp_path = dir.join(format!("{file_name}.tmp.{}", Ulid::new()));
+        let stable_path = dir.join(&file_name);
+        match create_direct_file(&tmp_path).await {
+            Ok(file) => {
+                return Ok(ClusterShardWriter::Local(LocalShardWriter {
+                    file: DirectWriter::new(file),
+                    tmp_path,
+                    stable_path,
+                    file_name,
+                    shard_index: target.shard_index,
+                    is_parity: target.is_parity,
+                    expected_len: target.expected_len,
+                    // The immutable locator keeps the deterministic preferred
+                    // root. The node resolves it across current local disks.
+                    locator: target,
+                }));
+            }
+            Err(error) => failures.push(format!("{}: {}", root.id, error)),
+        }
+    }
+    Err(AppError::ServiceUnavailable(format!(
+        "node '{}' could not open shard {} on any healthy disk: {}",
+        runtime.local_node_id,
+        target.shard_index,
+        failures.join("; ")
+    )))
 }
 
 async fn open_writers_for_plan(

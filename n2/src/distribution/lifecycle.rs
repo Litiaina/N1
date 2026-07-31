@@ -36,7 +36,11 @@ pub async fn purge_object_from_holders(
     object_id: &str,
     lifecycle_mutation_id: &str,
 ) -> Result<(), AppError> {
-    let versions = index::list_live_object_versions_metadata(fragment, object_id).await?;
+    let versions = match index::list_live_object_versions_metadata(fragment, object_id).await {
+        Ok(versions) => versions,
+        Err(AppError::NotFound) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if versions.is_empty() {
         return Ok(());
     }
