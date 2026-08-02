@@ -636,22 +636,36 @@ fn directory_frame(
     include_after: bool,
 ) -> Result<LexicalFrame, AppError> {
     let mut entries = Vec::new();
-    let directory = fs::read_dir(physical_directory).map_err(|err| {
-        AppError::Io(
-            err,
-            format!("read NCNX directory {}", physical_directory.display()),
-        )
-    })?;
-    for entry in directory {
-        let entry = entry.map_err(|err| {
-            AppError::Io(
+    let directory = match fs::read_dir(physical_directory) {
+        Ok(directory) => directory,
+        // Namespace listing is deliberately lockless. Another coordinator
+        // may remove the last immutable NCNX and prune this branch after its
+        // parent was enumerated. That disappearance is an empty branch, not
+        // an I/O failure.
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(LexicalFrame { entries });
+        }
+        Err(err) => {
+            return Err(AppError::Io(
                 err,
-                format!(
-                    "read NCNX directory entry in {}",
-                    physical_directory.display()
-                ),
-            )
-        })?;
+                format!("read NCNX directory {}", physical_directory.display()),
+            ));
+        }
+    };
+    for entry in directory {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(AppError::Io(
+                    err,
+                    format!(
+                        "read NCNX directory entry in {}",
+                        physical_directory.display()
+                    ),
+                ));
+            }
+        };
         let file_name = entry.file_name().into_string().map_err(|name| {
             AppError::Conflict(format!(
                 "NCNX path component is not UTF-8: {}",
@@ -661,9 +675,16 @@ fn directory_frame(
         if file_name.starts_with(".n2-") {
             continue;
         }
-        let file_type = entry.file_type().map_err(|err| {
-            AppError::Io(err, format!("inspect NCNX path {}", entry.path().display()))
-        })?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(AppError::Io(
+                    err,
+                    format!("inspect NCNX path {}", entry.path().display()),
+                ));
+            }
+        };
         if file_type.is_dir() {
             let logical_prefix = format!("{logical_parent}{file_name}/");
             if prefixes_overlap(&logical_prefix, requested_prefix)
@@ -801,19 +822,29 @@ fn list_generation_trash_names(
     let after_cursor =
         after.map(|(key, nanos, mutation)| format!("{key}\0{nanos:020}\0{mutation}"));
     let mut selected = BTreeMap::<String, NcnxListItem>::new();
-    let generations = fs::read_dir(trash_root).map_err(|err| {
-        AppError::Io(
-            err,
-            format!("read NCNX trash root {}", trash_root.display()),
-        )
-    })?;
-    for entry in generations {
-        let entry = entry.map_err(|err| {
-            AppError::Io(
+    let generations = match fs::read_dir(trash_root) {
+        Ok(generations) => generations,
+        // The final generation may be reclaimed between the existence check
+        // above and opening the directory.
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(AppError::Io(
                 err,
-                format!("read NCNX trash entry in {}", trash_root.display()),
-            )
-        })?;
+                format!("read NCNX trash root {}", trash_root.display()),
+            ));
+        }
+    };
+    for entry in generations {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(AppError::Io(
+                    err,
+                    format!("read NCNX trash entry in {}", trash_root.display()),
+                ));
+            }
+        };
         let generation_name = entry.file_name().into_string().map_err(|name| {
             AppError::Conflict(format!(
                 "NCNX trash generation is not UTF-8: {}",
@@ -823,12 +854,16 @@ fn list_generation_trash_names(
         if generation_name.starts_with(".n2-") {
             continue;
         }
-        let file_type = entry.file_type().map_err(|err| {
-            AppError::Io(
-                err,
-                format!("inspect NCNX trash generation {}", entry.path().display()),
-            )
-        })?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(AppError::Io(
+                    err,
+                    format!("inspect NCNX trash generation {}", entry.path().display()),
+                ));
+            }
+        };
         let Some((deleted_at_unix_nanos, delete_mutation_id)) =
             parse_trash_generation_name(&generation_name)
         else {
@@ -1191,6 +1226,21 @@ mod tests {
             .unwrap();
         assert_eq!(listed[0].logical_key, "videos/broken.mp4");
         assert!(store.read_live("fragment-a", "videos/broken.mp4").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lockless_listing_treats_a_concurrently_pruned_branch_as_empty() {
+        let root = std::env::temp_dir().join(format!("n2-ncnx-pruned-{}", Ulid::new()));
+        let branch = root.join("generation/videos");
+        fs::create_dir_all(&branch).unwrap();
+
+        // The parent walk may already hold this path when another GC removes
+        // the final NCNX and prunes the branch.
+        fs::remove_dir_all(root.join("generation")).unwrap();
+        let frame = directory_frame(&branch, "videos/", "", None, false).unwrap();
+        assert!(frame.entries.is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 

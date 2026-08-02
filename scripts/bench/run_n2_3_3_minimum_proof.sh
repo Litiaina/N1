@@ -17,6 +17,9 @@ OUT="$N2_MIN_OUT"
 A_STORE="$N2_MIN_A_STORE"
 B_STORE="$N2_MIN_B_STORE"
 R_STORE="$N2_MIN_R_STORE"
+A_STORE_SECONDARY="${N2_MIN_A_STORE_SECONDARY:-}"
+B_STORE_SECONDARY="${N2_MIN_B_STORE_SECONDARY:-}"
+R_STORE_SECONDARY="${N2_MIN_R_STORE_SECONDARY:-}"
 RUN="$OUT/runtime"
 A_RUN="$RUN/node-a"
 B_RUN="$RUN/node-b"
@@ -39,11 +42,16 @@ FRAGMENT_KEY="minimum-fragment-key-$TS"
 TOKEN=""
 RESULT="FAIL"
 ROOT_FAULTS="${N2_MIN_ROOT_FAULTS:-false}"
+LOCAL_DISK_FALLBACK="${N2_MIN_LOCAL_DISK_FALLBACK:-false}"
 ROOT_UNAVAILABLE_STATUS=""
 ROOT_UNAVAILABLE_OBJECT_STATUS=""
 ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS=""
 ROOT_FULL_STATUS=""
 ROOT_FULL_OBJECT_STATUS=""
+DISK_FALLBACK_KEY=""
+DISK_FALLBACK_REPAIR_VERSION=""
+DISK_FALLBACK_WRITE_VERSION=""
+GC_CONCURRENCY_OBJECTS="0"
 
 for tool in jq curl openssl pidstat sha256sum awk dd find; do
   command -v "$tool" >/dev/null || {
@@ -73,9 +81,15 @@ assert_isolated_store() {
   [[ "$path" != *"/../"* && "$path" != *"/./"* ]]
 }
 
-for store in "$A_STORE" "$B_STORE" "$R_STORE"; do
+for store in "$A_STORE" "$B_STORE" "$R_STORE" "$A_STORE_SECONDARY" "$B_STORE_SECONDARY" "$R_STORE_SECONDARY"; do
+  [[ -z "$store" ]] && continue
   assert_isolated_store "$store"
 done
+
+if [[ "$LOCAL_DISK_FALLBACK" == "true" && -z "$A_STORE_SECONDARY" ]]; then
+  echo "N2_MIN_LOCAL_DISK_FALLBACK requires N2_MIN_A_STORE_SECONDARY" >&2
+  exit 1
+fi
 
 assert_ports_available() {
   local port
@@ -110,6 +124,7 @@ kill_pidfile() {
 
 cleanup() {
   set +e
+  chmod 0755 "$A_STORE" 2>/dev/null || true
   if [[ "$ROOT_FAULTS" == "true" ]]; then
     chmod 0755 "$B_STORE" 2>/dev/null || true
     rm -f "$B_STORE/.n2-proof-enospc" 2>/dev/null || true
@@ -120,6 +135,9 @@ cleanup() {
   done
   if [[ "$RESULT" == "PASS" ]]; then
     rm -rf "$A_STORE" "$R_STORE"
+    [[ -n "$A_STORE_SECONDARY" ]] && rm -rf "$A_STORE_SECONDARY"
+    [[ -n "$B_STORE_SECONDARY" ]] && rm -rf "$B_STORE_SECONDARY"
+    [[ -n "$R_STORE_SECONDARY" ]] && rm -rf "$R_STORE_SECONDARY"
     if [[ "$ROOT_FAULTS" == "true" ]] && mountpoint -q "$B_STORE"; then
       find "$B_STORE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     else
@@ -128,6 +146,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'status=$?; echo "N2 minimum proof failed: line=$LINENO status=$status command=$BASH_COMMAND" >&2' ERR
 
 write_env() {
   local path="$1"
@@ -144,7 +163,7 @@ EOF
 }
 
 write_config() {
-  local path="$1" instance="$2" https_port="$3" native_port="$4" store="$5" run="$6" root="$7"
+  local path="$1" instance="$2" https_port="$3" native_port="$4" roots="$5" run="$6"
   cat > "$path" <<EOF
 [server]
 host=127.0.0.1
@@ -154,7 +173,7 @@ cert_path=$run/cert.pem
 key_path=$run/key.pem
 
 [disk_config]
-storage_roots=$root=$store
+storage_roots=$roots
 runtime_path=$run/state
 
 [cluster_config]
@@ -267,6 +286,37 @@ curl_auth() {
   curl -k --http1.1 -fsS -H "Authorization: Bearer $TOKEN" "$@"
 }
 
+wait_gc_at() {
+  local base="$1" output="$2"
+  for _ in $(seq 1 240); do
+    if curl_auth "$base/noa/v1/maintenance/gc/status" >"$output" \
+      && [[ "$(jq -r '.is_running' "$output")" == "false" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "GC did not complete at $base" >&2
+  return 1
+}
+
+run_concurrent_gc() {
+  local round="$1" a_start="$OUT/gc-$round-a-start.txt" b_start="$OUT/gc-$round-b-start.txt"
+  curl_auth -X POST \
+    "$A_BASE/noa/v1/maintenance/fragments/$FRAGMENT/gc/start?mode=availability" \
+    >"$a_start" &
+  local a_pid=$!
+  curl_auth -X POST \
+    "$B_BASE/noa/v1/maintenance/fragments/$FRAGMENT/gc/start?mode=availability" \
+    >"$b_start" &
+  local b_pid=$!
+  wait "$a_pid"
+  wait "$b_pid"
+  wait_gc_at "$A_BASE" "$OUT/gc-$round-a-status.json"
+  wait_gc_at "$B_BASE" "$OUT/gc-$round-b-status.json"
+  jq -e '.total_errors == 0 and .phase == "Completed"' "$OUT/gc-$round-a-status.json" >/dev/null
+  jq -e '.total_errors == 0 and .phase == "Completed"' "$OUT/gc-$round-b-status.json" >/dev/null
+}
+
 wait_binding_epoch() {
   local epoch="$1" output="$2"
   for _ in $(seq 1 160); do
@@ -301,6 +351,34 @@ wait_replacement_online() {
 
 mkdir -p "$OUT" "$A_RUN/state" "$B_RUN/state" "$R_RUN/state"
 mkdir -p "$A_STORE" "$B_STORE" "$R_STORE"
+[[ -n "$A_STORE_SECONDARY" ]] && mkdir -p "$A_STORE_SECONDARY"
+[[ -n "$B_STORE_SECONDARY" ]] && mkdir -p "$B_STORE_SECONDARY"
+[[ -n "$R_STORE_SECONDARY" ]] && mkdir -p "$R_STORE_SECONDARY"
+
+A_ROOTS_INI="minimum-root-a=$A_STORE"
+B_ROOTS_INI="minimum-root-b=$B_STORE"
+R_ROOTS_INI="minimum-root-r=$R_STORE"
+A_ROOTS_JSON="$(jq -cn --arg path "$A_STORE" '[{id:"minimum-root-a",path:$path}]')"
+B_ROOTS_JSON="$(jq -cn --arg path "$B_STORE" '[{id:"minimum-root-b",path:$path}]')"
+R_ROOTS_JSON="$(jq -cn --arg path "$R_STORE" '[{id:"minimum-root-r",path:$path}]')"
+if [[ -n "$A_STORE_SECONDARY" ]]; then
+  A_ROOTS_INI+=",minimum-root-a-secondary=$A_STORE_SECONDARY"
+  A_ROOTS_JSON="$(jq -cn --arg primary "$A_STORE" --arg secondary "$A_STORE_SECONDARY" \
+    '[{id:"minimum-root-a",path:$primary},{id:"minimum-root-a-secondary",path:$secondary}]')"
+fi
+if [[ -n "$B_STORE_SECONDARY" ]]; then
+  B_ROOTS_INI+=",minimum-root-b-secondary=$B_STORE_SECONDARY"
+  B_ROOTS_JSON="$(jq -cn --arg primary "$B_STORE" --arg secondary "$B_STORE_SECONDARY" \
+    '[{id:"minimum-root-b",path:$primary},{id:"minimum-root-b-secondary",path:$secondary}]')"
+fi
+if [[ -n "$R_STORE_SECONDARY" ]]; then
+  R_ROOTS_INI+=",minimum-root-r-secondary=$R_STORE_SECONDARY"
+  R_ROOTS_JSON="$(jq -cn --arg primary "$R_STORE" --arg secondary "$R_STORE_SECONDARY" \
+    '[{id:"minimum-root-r",path:$primary},{id:"minimum-root-r-secondary",path:$secondary}]')"
+fi
+ACTIVE_STORES=("$A_STORE" "$B_STORE")
+[[ -n "$A_STORE_SECONDARY" ]] && ACTIVE_STORES+=("$A_STORE_SECONDARY")
+[[ -n "$B_STORE_SECONDARY" ]] && ACTIVE_STORES+=("$B_STORE_SECONDARY")
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=n2-minimum-proof' \
   -keyout "$OUT/key.pem" -out "$OUT/cert.pem" >/dev/null 2>&1
 
@@ -332,7 +410,7 @@ cat >"$OUT/n2_membership.json" <<EOF
       "native_endpoint":"n2://127.0.0.1:$A_NATIVE",
       "state":"online",
       "weight":1,
-      "storage_roots":[{"id":"minimum-root-a","path":"$A_STORE"}],
+      "storage_roots":$A_ROOTS_JSON,
       "joined_epoch":1
     },
     {
@@ -343,7 +421,7 @@ cat >"$OUT/n2_membership.json" <<EOF
       "native_endpoint":"n2://127.0.0.1:$B_NATIVE",
       "state":"online",
       "weight":1,
-      "storage_roots":[{"id":"minimum-root-b","path":"$B_STORE"}],
+      "storage_roots":$B_ROOTS_JSON,
       "joined_epoch":1
     }
   ],
@@ -352,7 +430,7 @@ cat >"$OUT/n2_membership.json" <<EOF
     "endpoint":"$R_BASE",
     "native_endpoint":"n2://127.0.0.1:$R_NATIVE",
     "state":"online",
-    "storage_roots":[{"id":"minimum-root-r","path":"$R_STORE"}]
+    "storage_roots":$R_ROOTS_JSON
   }],
   "retired_instances": []
 }
@@ -361,9 +439,9 @@ EOF
 for run in "$A_RUN" "$B_RUN" "$R_RUN"; do
   cp "$OUT/n2_membership.json" "$run/state/"
 done
-write_config "$A_RUN/n2_config.ini" minimum-a "$A_HTTPS" "$A_NATIVE" "$A_STORE" "$A_RUN" minimum-root-a
-write_config "$B_RUN/n2_config.ini" minimum-b "$B_HTTPS" "$B_NATIVE" "$B_STORE" "$B_RUN" minimum-root-b
-write_config "$R_RUN/n2_config.ini" minimum-r "$R_HTTPS" "$R_NATIVE" "$R_STORE" "$R_RUN" minimum-root-r
+write_config "$A_RUN/n2_config.ini" minimum-a "$A_HTTPS" "$A_NATIVE" "$A_ROOTS_INI" "$A_RUN"
+write_config "$B_RUN/n2_config.ini" minimum-b "$B_HTTPS" "$B_NATIVE" "$B_ROOTS_INI" "$B_RUN"
+write_config "$R_RUN/n2_config.ini" minimum-r "$R_HTTPS" "$R_NATIVE" "$R_ROOTS_INI" "$R_RUN"
 
 start_node "$A_RUN"
 start_node "$B_RUN"
@@ -427,7 +505,7 @@ curl_json -X POST "$B_BASE/noa/v1/posix/recover" \
 jq -e '.affected == 4' "$OUT/recover.json" >/dev/null
 
 mapfile -t NCNX_FILES < <(
-  find "$A_STORE" "$B_STORE" -path '*/.namespace/minimum/anchor.bin.ncnx' -type f | sort
+  find "${ACTIVE_STORES[@]}" -path '*/.namespace/minimum/anchor.bin.ncnx' -type f | sort
 )
 [[ "${#NCNX_FILES[@]}" -eq 2 ]]
 rm -f "${NCNX_FILES[0]}"
@@ -437,13 +515,94 @@ curl_auth -X POST "$B_BASE/noa/v1/cluster/healing/cycle" >"$OUT/heal-ncnx-b.json
 
 VERSION="$(jq -er '.version_id' "$OUT/upload.json")"
 mapfile -t SHARD_FILES < <(
-  find "$A_STORE" "$B_STORE" -path "*/$VERSION/part_0_*" -type f | sort
+  find "${ACTIVE_STORES[@]}" -path "*/$VERSION/part_0_*" -type f | sort
 )
 [[ "${#SHARD_FILES[@]}" -eq 2 ]]
 rm -f "${SHARD_FILES[0]}"
 curl_auth -X POST "$A_BASE/noa/v1/cluster/healing/cycle" >"$OUT/heal-object-a.json" || true
 curl_auth -X POST "$B_BASE/noa/v1/cluster/healing/cycle" >"$OUT/heal-object-b.json" || true
 [[ -f "${SHARD_FILES[0]}" ]]
+
+if [[ "$LOCAL_DISK_FALLBACK" == "true" ]]; then
+  # Select a deterministic key whose node-A shard prefers the primary disk.
+  # Reusing that key after the disk disappears proves actual fallback rather
+  # than accidentally selecting the secondary root in the normal layout.
+  for candidate in $(seq 1 64); do
+    key="minimum/disk-fallback-$candidate.bin"
+    output="$OUT/disk-fallback-candidate-$candidate.json"
+    curl_auth -X POST "$A_BASE/noa/v1/upload/one-shot/$key" \
+      --data-binary @"$OUT/source.bin" >"$output"
+    version="$(jq -er '.version_id' "$output")"
+    if find "$A_STORE" -path "*/$version/part_0_*" -type f -print -quit | grep -q .; then
+      DISK_FALLBACK_KEY="$key"
+      DISK_FALLBACK_REPAIR_VERSION="$version"
+      break
+    fi
+  done
+  [[ -n "$DISK_FALLBACK_KEY" ]]
+
+  chmod 0000 "$A_STORE"
+  sleep 1
+  curl_auth "$B_BASE/noa/v1/cluster/health" >"$OUT/health-primary-disk-lost.json"
+  jq -e '
+    .state == "degraded"
+    and .data_plane_writable == true
+    and .data_plane_fully_protected == true
+    and .ncnx_survival_writable == true
+    and .ncnx_strictly_writable == true
+    and .effective_client_writable == true
+    and any(.nodes[];
+      .node_id == "minimum-a"
+      and .accepts_writes == true
+      and .storage_writable == true
+      and (.storage_issues | length) > 0)
+  ' "$OUT/health-primary-disk-lost.json" >/dev/null
+
+  curl_auth -X POST "$A_BASE/noa/v1/cluster/healing/cycle" \
+    >"$OUT/heal-primary-disk-lost-a.json" || true
+  curl_auth -X POST "$B_BASE/noa/v1/cluster/healing/cycle" \
+    >"$OUT/heal-primary-disk-lost-b.json" || true
+  find "$A_STORE_SECONDARY" \
+    -path "*/$DISK_FALLBACK_REPAIR_VERSION/part_0_*" -type f -print -quit \
+    | grep -q .
+
+  curl_auth -X POST "$B_BASE/noa/v1/upload/one-shot/$DISK_FALLBACK_KEY" \
+    --data-binary @"$OUT/source.bin" >"$OUT/disk-fallback-write.json"
+  DISK_FALLBACK_WRITE_VERSION="$(jq -er '.version_id' "$OUT/disk-fallback-write.json")"
+  find "$A_STORE_SECONDARY" \
+    -path "*/$DISK_FALLBACK_WRITE_VERSION/part_0_*" -type f -print -quit \
+    | grep -q .
+  curl_auth -G "$A_BASE/noa/v1/objects/download" \
+    --data-urlencode "object_key=$DISK_FALLBACK_KEY" \
+    -o "$OUT/disk-fallback-download.bin"
+  [[ "$(sha256sum "$OUT/disk-fallback-download.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+
+  chmod 0755 "$A_STORE"
+  curl_auth -G "$B_BASE/noa/v1/objects/download" \
+    --data-urlencode "object_key=$DISK_FALLBACK_KEY" \
+    -o "$OUT/disk-fallback-after-return.bin"
+  [[ "$(sha256sum "$OUT/disk-fallback-after-return.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+fi
+
+# Repeated synchronized scans attack the exact multi-node GC race that ended
+# the earlier soak. Each round has fresh expired immutable trash generations.
+dd if="$OUT/source.bin" of="$OUT/gc-source.bin" bs=64K count=1 status=none
+for round in $(seq 1 8); do
+  for item in $(seq 1 8); do
+    key="minimum/gc-race/round-$round-object-$item.bin"
+    curl_auth -X POST "$A_BASE/noa/v1/upload/one-shot/$key" \
+      --data-binary @"$OUT/gc-source.bin" >"$OUT/gc-$round-$item-upload.json"
+    curl_auth -X DELETE "$B_BASE/noa/v1/objects/$key" \
+      >"$OUT/gc-$round-$item-trash.json"
+    GC_CONCURRENCY_OBJECTS=$((GC_CONCURRENCY_OBJECTS + 1))
+  done
+  sleep 3
+  run_concurrent_gc "$round"
+  status="$(curl -k --http1.1 -sS -o "$OUT/gc-$round-reclaimed.bin" -w '%{http_code}' \
+    -G "$A_BASE/noa/v1/objects/download" -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "object_key=minimum/gc-race/round-$round-object-1.bin")"
+  [[ "$status" == "404" ]]
+done
 
 if [[ "$ROOT_FAULTS" == "true" ]]; then
   mountpoint -q "$B_STORE" || {
@@ -639,6 +798,11 @@ jq -n \
   --arg root_unavailable_restored_object_status "$ROOT_UNAVAILABLE_RESTORED_OBJECT_STATUS" \
   --arg root_full_status "$ROOT_FULL_STATUS" \
   --arg root_full_object_status "$ROOT_FULL_OBJECT_STATUS" \
+  --arg local_disk_fallback "$LOCAL_DISK_FALLBACK" \
+  --arg disk_fallback_key "$DISK_FALLBACK_KEY" \
+  --arg disk_fallback_repair_version "$DISK_FALLBACK_REPAIR_VERSION" \
+  --arg disk_fallback_write_version "$DISK_FALLBACK_WRITE_VERSION" \
+  --argjson gc_concurrency_objects "$GC_CONCURRENCY_OBJECTS" \
   --argjson suspicious_log_lines "$ERROR_LINES" \
   --slurpfile initial "$OUT/health-initial.json" \
   --slurpfile promoted "$OUT/health-after-promotion.json" \
@@ -666,7 +830,21 @@ jq -n \
         (if $root_full_object_status == "" then null else ($root_full_object_status|tonumber) end),
       existing_object_readable:true,
       reserve_not_consumed_by_capacity_pressure:true,
-      write_after_root_restoration:true
+      write_after_root_restoration:true,
+      node_local_fallback:{
+        enabled:($local_disk_fallback == "true"),
+        deterministic_key:(if $disk_fallback_key == "" then null else $disk_fallback_key end),
+        repaired_version:(if $disk_fallback_repair_version == "" then null else $disk_fallback_repair_version end),
+        write_while_primary_absent_version:(if $disk_fallback_write_version == "" then null else $disk_fallback_write_version end),
+        full_ec_role_retained:true,
+        download_before_and_after_disk_return:true
+      }
+    },
+    concurrent_gc:{
+      rounds:8,
+      expired_objects:$gc_concurrency_objects,
+      both_nodes_completed_without_errors:true,
+      reclaimed_objects_returned_404:true
     },
     reserve:{
       one_node_read_survived:true,

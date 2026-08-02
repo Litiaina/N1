@@ -19,7 +19,7 @@ namespace, and maintenance operations on any healthy node, places immutable
 erasure-coded object versions across static server pools, and keeps every
 user-visible mutation in a small flat namespace record.
 
-N2 `3.4.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.4.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the N2 2.x inode namespace with replicated flat NCNX key records
 while retaining
 immutable NCDX metadata, immutable shards and parity, per-object recorded
@@ -46,7 +46,7 @@ threshold: `K` EC pieces, `K` NCDX copies, and one of `M + 1` NCNX replicas.
 Missing exact slots remain deterministic healing work; writes reject below
 `K`.
 
-N2 3.4.0 makes that survival path the release contract. It preserves each
+N2 3.4.1 makes that survival path the release contract. It preserves each
 pool's exact static `K + M` layout, acknowledges new objects at `K`, keeps
 missing exact slots as deterministic healing targets, and reports degraded
 rather than falsely healthy until full protection returns. It does not add
@@ -377,7 +377,7 @@ the repository under `/home/wlzambo/DEV-TEST`.
 
 ## Operational Boundaries
 
-- N2 `3.4.0` is a clean 3.x engine format, not an in-place migration
+- N2 `3.4.1` is a clean 3.x engine format, not an in-place migration
   from N2 1.x or 2.x.
 - A server pool's `K + M`, node IDs, and root-ID set are static after
   enrollment. Expansion adds a new complete pool generation.

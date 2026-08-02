@@ -2233,6 +2233,7 @@ async fn open_local_shard_for_read(
 ) -> Result<(tokio::fs::File, std::path::PathBuf), AppError> {
     let pm = ObjectPathManager::new();
     let mut first_io_error = None;
+    let mut checked_readable_root = false;
     for root in ordered_local_roots(runtime, preferred_root_id) {
         let path = pm
             .get_shard_dir_on_disk(
@@ -2244,13 +2245,23 @@ async fn open_local_shard_for_read(
             .join(file_name);
         match fs::File::open(&path).await {
             Ok(file) => return Ok((file, path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                checked_readable_root = true;
+            }
             Err(error) => {
                 first_io_error.get_or_insert_with(|| {
                     AppError::Io(error, format!("open peer shard {}", path.display()))
                 });
             }
         }
+    }
+    // The node is the EC failure domain. If at least one enrolled local root
+    // was readable, absence there is repairable local disk loss even when the
+    // preferred root returned an I/O error. Returning NotFound lets the
+    // recorded-layout healer reconstruct onto a healthy root on this same
+    // node. Preserve Unavailable only when no local root could be checked.
+    if checked_readable_root {
+        return Err(AppError::NotFound);
     }
     Err(first_io_error.unwrap_or(AppError::NotFound))
 }
@@ -2759,6 +2770,8 @@ mod tests {
         ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState, PoolState,
         ServerPool, StorageRoot,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn metadata_runtime() -> ClusterRuntime {
         let nodes = (0..3)
@@ -2864,6 +2877,49 @@ mod tests {
         let large = peer_transfer_timeout(1024 * 1024 * 1024);
         assert!(large > small);
         assert!(small >= PEER_WRITE_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lost_preferred_disk_is_repairable_when_another_local_root_is_readable() {
+        let base = std::env::temp_dir().join(format!("n2-peer-root-fallback-{}", Ulid::new()));
+        let unavailable = base.join("unavailable");
+        let healthy = base.join("healthy");
+        std::fs::create_dir_all(&unavailable).expect("create unavailable root");
+        std::fs::create_dir_all(&healthy).expect("create healthy root");
+        std::fs::set_permissions(&unavailable, std::fs::Permissions::from_mode(0o000))
+            .expect("deny preferred root");
+
+        let roots = vec![
+            StorageRoot {
+                id: "preferred".into(),
+                physical_id: None,
+                path: unavailable.display().to_string(),
+            },
+            StorageRoot {
+                id: "healthy".into(),
+                physical_id: None,
+                path: healthy.display().to_string(),
+            },
+        ];
+        let mut runtime = metadata_runtime();
+        runtime.local_storage_roots = roots.clone();
+        runtime.membership.nodes[0].storage_roots = roots;
+
+        let result = open_local_shard_for_read(
+            &runtime,
+            "preferred",
+            "fragment-a",
+            "object-a",
+            "version-a",
+            "part_0_shard_0.shard",
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::NotFound)));
+
+        std::fs::set_permissions(&unavailable, std::fs::Permissions::from_mode(0o755))
+            .expect("restore preferred root permissions");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

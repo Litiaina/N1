@@ -8,8 +8,7 @@ use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::distribution::lifecycle::purge_object_from_holders;
 use crate::distribution::ncnx::{
-    key_references_object, list_canonical_names, name_is_still_advertised, ncnx_cursor,
-    read_canonical_record, remove_trash,
+    key_references_object, list_canonical_names, ncnx_cursor, read_canonical_record, remove_trash,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::runtime::global_namespace_runtime;
@@ -28,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const PAGE_SIZE: usize = 1_000;
 
@@ -45,8 +44,10 @@ pub struct GcJobStatus {
     pub total_orphan_blob_dirs_deleted: u64,
     pub total_refund_bytes: u64,
     pub total_errors: u64,
+    pub total_deferred_runs: u64,
     pub current_fragment: String,
     pub last_error: Option<String>,
+    pub last_deferred: Option<String>,
     pub start_timestamp: i64,
     pub duration_seconds: u64,
 }
@@ -57,6 +58,26 @@ struct FragmentGcStats {
     trash_versions_expired: u64,
     sessions_deleted: u64,
     refund_bytes: u64,
+}
+
+fn is_retryable_gc_unavailability(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::ServiceUnavailable(_) | AppError::Timeout(_)
+    )
+}
+
+fn defer_if_namespace_changed(error: AppError, fragment: &str, phase: &str) -> AppError {
+    match error {
+        // Listing and opening an immutable NCNX are separate lockless reads.
+        // Rename, trash, recover, or a peer GC may validly remove the listed
+        // name between them. Restart the proof from page one: continuing from
+        // the old cursor could miss the destination and reclaim a live object.
+        AppError::NotFound => AppError::ServiceUnavailable(format!(
+            "namespace changed during GC {phase} for fragment '{fragment}'; retry from the beginning"
+        )),
+        error => error,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +201,8 @@ async fn collect_live_object_ids(fragment: &str) -> Result<BTreeSet<String>, App
     loop {
         let page = global_namespace_runtime()
             .list_live_object_refs_page(fragment, None, cursor.as_deref(), PAGE_SIZE)
-            .await?;
+            .await
+            .map_err(|error| defer_if_namespace_changed(error, fragment, "live-reference scan"))?;
         object_ids.extend(page.entries.into_iter().map(|entry| entry.object_id));
         let Some(next) = page.continuation_token else {
             break;
@@ -213,12 +235,19 @@ async fn collect_unexpired_trash_object_ids(
             let deleted_at = trash.deleted_at_unix_nanos / 1_000_000_000;
             let age = Duration::from_secs(now_unix.saturating_sub(deleted_at.max(0)).max(0) as u64);
             if age < retention {
-                protected.insert(
-                    read_canonical_record(fragment, &name)
-                        .await?
-                        .record
-                        .object_id,
-                );
+                match read_canonical_record(fragment, &name).await {
+                    Ok(located) => {
+                        protected.insert(located.record.object_id);
+                    }
+                    Err(AppError::NotFound) => {
+                        return Err(defer_if_namespace_changed(
+                            AppError::NotFound,
+                            fragment,
+                            "unexpired-trash scan",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         if !full {
@@ -260,16 +289,12 @@ async fn reclaim_expired_trash(
             }
             let located = match read_canonical_record(fragment, &name).await {
                 Ok(located) => located,
-                Err(AppError::NotFound) if !name_is_still_advertised(fragment, &name).await? => {
-                    // Another node completed the same immutable trash
-                    // generation first. Reclaim is deliberately idempotent.
-                    continue;
-                }
                 Err(AppError::NotFound) => {
-                    return Err(AppError::Conflict(format!(
-                        "advertised trash NCNX for '{}' has no readable replica",
-                        name.logical_key
-                    )));
+                    return Err(defer_if_namespace_changed(
+                        AppError::NotFound,
+                        fragment,
+                        "expired-trash scan",
+                    ));
                 }
                 Err(error) => return Err(error),
             };
@@ -278,9 +303,15 @@ async fn reclaim_expired_trash(
             // Any live key or any still-recoverable trash key protects the
             // immutable object. Only this expired pointer is then discarded.
             if protected.contains(&object_id)
-                || key_references_object(fragment, &name.logical_key, &object_id).await?
+                || key_references_object(fragment, &name.logical_key, &object_id)
+                    .await
+                    .map_err(|error| {
+                        defer_if_namespace_changed(error, fragment, "reference revalidation")
+                    })?
             {
-                remove_trash(&located, trash).await?;
+                remove_trash(&located, trash).await.map_err(|error| {
+                    defer_if_namespace_changed(error, fragment, "trash-pointer removal")
+                })?;
                 continue;
             }
 
@@ -305,7 +336,9 @@ async fn reclaim_expired_trash(
             }
             // Object holders are reclaimed first. Keeping NCNX on any failure
             // makes the entire operation retryable after restart.
-            remove_trash(&located, trash).await?;
+            remove_trash(&located, trash).await.map_err(|error| {
+                defer_if_namespace_changed(error, fragment, "final trash-pointer removal")
+            })?;
         }
         if !full {
             break;
@@ -440,6 +473,19 @@ fn finish_job(result: Result<(), AppError>) {
                 status.phase = "Completed".into();
             }
         }),
+        Err(error) if is_retryable_gc_unavailability(&error) => {
+            // GC must fail closed whenever the complete live/protected set
+            // cannot be proven. A transient node outage therefore defers the
+            // scan without classifying intact data as a GC failure. The next
+            // independent node-local cycle retries from durable NCNX/NCDX.
+            warn!("N2 3.4 NCNX generation garbage collection deferred: {error}");
+            update_status(|status| {
+                status.is_running = false;
+                status.phase = "Deferred".into();
+                status.total_deferred_runs = status.total_deferred_runs.saturating_add(1);
+                status.last_deferred = Some(error.to_string());
+            });
+        }
         Err(error) => {
             error!("N2 3.4 NCNX generation garbage collection failed: {error}");
             update_status(|status| {
@@ -552,5 +598,24 @@ mod tests {
         let future = 200i64;
         let age = Duration::from_secs(now.saturating_sub(future.max(0)).max(0) as u64);
         assert_eq!(age, Duration::ZERO);
+    }
+
+    #[test]
+    fn only_transient_topology_failures_defer_gc() {
+        assert!(is_retryable_gc_unavailability(
+            &AppError::ServiceUnavailable("peer offline".into())
+        ));
+        assert!(is_retryable_gc_unavailability(&AppError::Timeout(
+            "peer read".into()
+        )));
+        assert!(!is_retryable_gc_unavailability(&AppError::NotFound));
+        assert!(!is_retryable_gc_unavailability(&AppError::Conflict(
+            "replicas disagree".into()
+        )));
+
+        let deferred =
+            defer_if_namespace_changed(AppError::NotFound, "fragment-a", "live-reference scan");
+        assert!(is_retryable_gc_unavailability(&deferred));
+        assert!(deferred.to_string().contains("retry from the beginning"));
     }
 }

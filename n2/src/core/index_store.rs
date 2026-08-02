@@ -496,9 +496,21 @@ fn object_record_dirs_under_root(
 }
 
 fn ensure_fragment_dirs(fragment: &str) -> Result<(), AppError> {
-    for root in ObjectPathManager::new().get_all_namespace_roots(fragment) {
+    let roots = ObjectPathManager::new().get_all_namespace_roots(fragment);
+    let mut prepared = 0usize;
+    let mut failures = Vec::new();
+    for root in roots {
         let root = fragment_root_on(&root, fragment);
-        fs::create_dir_all(&root).map_err(|e| io_err(e, "create fragment storage root"))?;
+        match fs::create_dir_all(&root) {
+            Ok(()) => prepared = prepared.saturating_add(1),
+            Err(error) => failures.push(format!("{}: {}", root.display(), error)),
+        }
+    }
+    if prepared == 0 {
+        return Err(AppError::ServiceUnavailable(format!(
+            "no local fragment storage root is available for '{fragment}': {}",
+            failures.join("; ")
+        )));
     }
     Ok(())
 }
@@ -1633,10 +1645,18 @@ pub(crate) fn delete_unreferenced_object_record(
     let mut removed = false;
     for dir in object_dir_candidates(fragment, &object_id)? {
         if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "delete N2 object record dir"))?;
-            removed = true;
-            if let Some(parent) = dir.parent() {
-                sync_dir(parent);
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    removed = true;
+                    if let Some(parent) = dir.parent() {
+                        sync_dir(parent);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Another coordinator reclaimed the same immutable
+                    // object directory after the existence check.
+                }
+                Err(error) => return Err(io_err(error, "delete N2 object record dir")),
             }
         }
     }

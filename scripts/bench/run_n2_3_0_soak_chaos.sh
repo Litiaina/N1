@@ -21,6 +21,7 @@ else
   TOPOLOGY_LABEL="four logical nodes on two physical hosts; static EC 2+2; NCNX R=3"
 fi
 DURATION_SECONDS="${DURATION_SECONDS:-43200}"
+SOAK_TOKEN_TTL_SECONDS="${SOAK_TOKEN_TTL_SECONDS:-172800}"
 MAX_CYCLES="${MAX_CYCLES:-0}"
 CYCLE_PAUSE_SECONDS="${CYCLE_PAUSE_SECONDS:-8}"
 CHAOS_EVERY_CYCLES="${CHAOS_EVERY_CYCLES:-20}"
@@ -39,13 +40,15 @@ HEAL_VERIFY_TIMEOUT_SECONDS="${HEAL_VERIFY_TIMEOUT_SECONDS:-360}"
 HEAL_STATUS_POLL_SECONDS="${HEAL_STATUS_POLL_SECONDS:-1}"
 HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS="${HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS:-180}"
 CHAOS_START_PHASE="${CHAOS_START_PHASE:-1}"
+GC_CLEANUP_INTERVAL_SECONDS="${GC_CLEANUP_INTERVAL_SECONDS:-300}"
+GC_RETENTION_SECONDS="${GC_RETENTION_SECONDS:-10}"
 AUTHORIZED_KEY_TAG="${AUTHORIZED_KEY_TAG:-}"
 REMOVE_IDENTITY_ON_EXIT="${REMOVE_IDENTITY_ON_EXIT:-false}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${N2_SOAK_BIN:-$ROOT_DIR/target/release/litiaina-n2}"
 TS="${SOAK_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-OUT_ROOT="${N2_SOAK_OUT_ROOT:-/home/wlzambo/DEV-TEST}"
+OUT_ROOT="${N2_SOAK_OUT_ROOT:-/home/litiaina/DEV-TEST}"
 OUT="$OUT_ROOT/N2-3.0-soak-$TS"
 LOCAL_RUN="$OUT/runtime"
 LOCAL_A="$LOCAL_RUN/node-a"
@@ -108,6 +111,7 @@ if [[ "$ALL_LOCAL" != "true" ]]; then
 fi
 [[ -x "$BIN" ]] || { echo "release binary is missing: $BIN" >&2; exit 1; }
 [[ "$DURATION_SECONDS" =~ ^[0-9]+$ && "$DURATION_SECONDS" -gt 0 ]]
+[[ "$SOAK_TOKEN_TTL_SECONDS" =~ ^[0-9]+$ && "$SOAK_TOKEN_TTL_SECONDS" -ge "$DURATION_SECONDS" && "$SOAK_TOKEN_TTL_SECONDS" -le 172800 ]]
 [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]]
 [[ "$CHAOS_EVERY_CYCLES" =~ ^[0-9]+$ && "$CHAOS_EVERY_CYCLES" -gt 0 ]]
 [[ "$NORMAL_UPLOAD_ATTEMPTS" =~ ^[0-9]+$ && "$NORMAL_UPLOAD_ATTEMPTS" -gt 0 ]]
@@ -127,6 +131,8 @@ fi
 [[ "$HEAL_STATUS_POLL_SECONDS" =~ ^[0-9]+$ && "$HEAL_STATUS_POLL_SECONDS" -gt 0 ]]
 [[ "$HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS" -ge 120 ]]
 [[ "$CHAOS_START_PHASE" =~ ^[1-6]$ ]]
+[[ "$GC_CLEANUP_INTERVAL_SECONDS" =~ ^[0-9]+$ && "$GC_CLEANUP_INTERVAL_SECONDS" -gt 0 ]]
+[[ "$GC_RETENTION_SECONDS" =~ ^[0-9]+$ && "$GC_RETENTION_SECONDS" -gt 0 ]]
 
 assert_ports_available() {
   local port
@@ -449,22 +455,26 @@ wait_all_nodes() {
   wait_ping "$A_BASE"; wait_ping "$B_BASE"; wait_ping "$C_BASE"; wait_ping "$D_BASE"
 }
 
-wait_gc() {
-  local output="$1"
+wait_gc_at() {
+  local base="$1" output="$2"
   for _ in $(seq 1 240); do
-    curl_auth "$A_BASE/noa/v1/maintenance/gc/status" > "$output"
+    curl_auth "$base/noa/v1/maintenance/gc/status" > "$output"
     [[ "$(jq -r '.is_running' "$output")" == "false" ]] && return 0
     sleep 0.25
   done
-  echo "GC did not complete in the finite wait window" >&2
+  echo "GC did not complete at $base in the finite wait window" >&2
   return 1
 }
 
-start_or_join_gc() {
-  local output="$1" temporary="$1.tmp" status curl_code=0 detail
+wait_gc() {
+  wait_gc_at "$A_BASE" "$1"
+}
+
+start_or_join_gc_at() {
+  local base="$1" output="$2" temporary="$2.tmp" status curl_code=0 detail
   status="$(curl -k --http1.1 --connect-timeout 5 --max-time 120 -sS \
     -o "$temporary" -w '%{http_code}' -X POST \
-    "$A_BASE/noa/v1/maintenance/fragments/$FRAGMENT/gc/start?mode=availability" \
+    "$base/noa/v1/maintenance/fragments/$FRAGMENT/gc/start?mode=availability" \
     -H "Authorization: Bearer $TOKEN")" || curl_code=$?
   mv "$temporary" "$output" 2>/dev/null || true
   detail="$(tr '\r\n' '  ' < "$output" 2>/dev/null | head -c 500 || true)"
@@ -485,6 +495,32 @@ start_or_join_gc() {
 
   FAILURE_CLASS="gc_start_rejected"
   FAILURE_DETAIL="GC start returned unexpected HTTP status $status: $detail"
+  return 1
+}
+
+start_or_join_gc() {
+  start_or_join_gc_at "$A_BASE" "$1"
+}
+
+ensure_clean_gc_at() {
+  local base="$1" label="$2" attempt status_file start_file
+  for attempt in 1 2 3; do
+    start_file="$OUT/events/final-gc-$label-$attempt-start.txt"
+    status_file="$OUT/events/final-gc-$label-$attempt-status.json"
+    start_or_join_gc_at "$base" "$start_file"
+    wait_gc_at "$base" "$status_file"
+    if jq -e '
+      .phase == "Completed"
+      and .total_errors == 0
+      and (.total_deferred_runs // 0) == 0
+      and .last_error == null
+    ' "$status_file" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  FAILURE_CLASS="final_gc_not_clean"
+  FAILURE_DETAIL="node $label did not complete a clean GC after three bounded attempts"
   return 1
 }
 
@@ -528,9 +564,9 @@ object_parity_shards=2
 auto_rebalance=false
 
 [garbage_collector]
-cleanup_interval_seconds=300
+cleanup_interval_seconds=$GC_CLEANUP_INTERVAL_SECONDS
 file_ttl_seconds=10
-retention_seconds=10
+retention_seconds=$GC_RETENTION_SECONDS
 
 [auto_healing]
 enabled=true
@@ -928,7 +964,7 @@ EOF
   FRAGMENT="$(jq -er '.fragment_hash' "$OUT/fragment-create.json")"
   STABLE_FRAGMENT="$(jq -er '.stable_fragment_id' "$OUT/fragment-create.json")"
   curl_json -X POST "$B_BASE/noa/v1/auth/fragment" \
-    -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAGMENT_KEY\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":86400}" > "$OUT/auth.json"
+    -d "{\"fragment\":\"$FRAGMENT\",\"secret\":\"$FRAGMENT_KEY\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":$SOAK_TOKEN_TTL_SECONDS}" > "$OUT/auth.json"
   TOKEN="$(jq -er '.access_token' "$OUT/auth.json")"
   assert_writable
 
@@ -1114,6 +1150,12 @@ finish_success() {
   wait_all_nodes
   assert_writable
   download_verify "$C_BASE" soak/anchor.bin "$ANCHOR_SHA" final-anchor-download
+  # Prove that every independent node-local collector converges after fault
+  # injection stops. A PASS cannot depend on whichever node ran GC last.
+  ensure_clean_gc_at "$A_BASE" node-a
+  ensure_clean_gc_at "$B_BASE" node-b
+  ensure_clean_gc_at "$C_BASE" node-c
+  ensure_clean_gc_at "$D_BASE" node-d
   curl_auth "$A_BASE/noa/v1/cluster/monitor?deep_scan=true" > "$OUT/final-monitor.json"
   jq -e '.overview.state == "healthy" and .jobs.healing.safety_read_only == false' "$OUT/final-monitor.json" >/dev/null
   collect_remote_logs
@@ -1122,11 +1164,31 @@ finish_success() {
   cp "$LOCAL_A/pidstat.log" "$OUT/node-a-pidstat.log" 2>/dev/null || true
   cp "$LOCAL_B/pidstat.log" "$OUT/node-b-pidstat.log" 2>/dev/null || true
   summarize_metrics
-  local end elapsed suspicious availability_events
+  local end elapsed suspicious availability_events warning_lines deferred_gc_lines
   end="$(date +%s)"; elapsed=$((end - START_EPOCH))
-  suspicious="$({ grep -Eih 'panic|fatal|internal server error' "$OUT"/node-*.log 2>/dev/null || true; } | wc -l | tr -d ' ')"
+  : >"$OUT/metrics/engine-error-lines.log"
+  : >"$OUT/metrics/engine-warning-lines.log"
+  : >"$OUT/metrics/gc-deferred-lines.log"
+  grep -Eh 'ERROR|panicked|panic|fatal|segmentation fault|Internal Server Error|internal server error' \
+    "$OUT"/node-*.log >"$OUT/metrics/engine-error-lines.log" 2>/dev/null || true
+  grep -Eh 'WARN' "$OUT"/node-*.log \
+    >"$OUT/metrics/engine-warning-lines.log" 2>/dev/null || true
+  grep -Eh 'NCNX generation garbage collection deferred' "$OUT"/node-*.log \
+    >"$OUT/metrics/gc-deferred-lines.log" 2>/dev/null || true
+  suspicious="$(wc -l <"$OUT/metrics/engine-error-lines.log" | tr -d ' ')"
+  warning_lines="$(wc -l <"$OUT/metrics/engine-warning-lines.log" | tr -d ' ')"
+  deferred_gc_lines="$(wc -l <"$OUT/metrics/gc-deferred-lines.log" | tr -d ' ')"
   availability_events="$(wc -l < "$OUT/events/availability.jsonl" | tr -d ' ')"
-  [[ "$suspicious" -eq 0 ]]
+  if (( suspicious != 0 )); then
+    FAILURE_CLASS="engine_error_log_gate"
+    FAILURE_DETAIL="engine logs contain $suspicious error, panic, fatal, or internal-server-error line(s)"
+    return 1
+  fi
+  if (( availability_events != 0 )); then
+    FAILURE_CLASS="workload_availability_gate"
+    FAILURE_DETAIL="normal workload recorded $availability_events retry or availability event(s)"
+    return 1
+  fi
   jq -n \
     --arg result PASS --arg cluster_id "$CLUSTER_ID" --arg pool_id "$POOL_ID" \
     --arg fragment "$FRAGMENT" --arg stable_fragment_id "$STABLE_FRAGMENT" \
@@ -1137,7 +1199,9 @@ finish_success() {
     --argjson final_cycle "$CYCLE" --argjson chaos_events "$CHAOS_EVENTS" --argjson availability_events "$availability_events" \
     --argjson chaos_start_phase "$CHAOS_START_PHASE" \
     --argjson healing_verification_timeout_seconds "$HEAL_VERIFY_TIMEOUT_SECONDS" \
-    --argjson suspicious_log_lines "$suspicious" --slurpfile operations "$OUT/metrics/summary.json" \
+    --argjson suspicious_log_lines "$suspicious" --argjson engine_error_log_lines "$suspicious" \
+    --argjson engine_warning_log_lines "$warning_lines" --argjson gc_deferred_log_lines "$deferred_gc_lines" \
+    --slurpfile operations "$OUT/metrics/summary.json" \
     --slurpfile monitor "$OUT/final-monitor.json" \
     '{
       result:$result,
@@ -1157,6 +1221,10 @@ finish_success() {
       healing_verification_timeout_seconds:$healing_verification_timeout_seconds,
       availability_events:$availability_events,
       suspicious_log_lines:$suspicious_log_lines,
+      engine_error_log_lines:$engine_error_log_lines,
+      engine_warning_log_lines:$engine_warning_log_lines,
+      gc_deferred_log_lines:$gc_deferred_log_lines,
+      clean_log_gate:true,
       operations:$operations[0],
       final_monitor:$monitor[0],
       hardware_cycle_counters:"unavailable when perf_event_paranoid blocks unprivileged counters"

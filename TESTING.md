@@ -25,11 +25,11 @@ failure domains.
 
 ## Repository Gates
 
-The N2 3.4.0 implementation currently has passed:
+The N2 3.4.1 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test -p n2 --release`: 161 passed;
+- `cargo test -p n2 --release`: 164 passed;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
@@ -43,7 +43,7 @@ visibility, copy/delete restart semantics, and object/healing invariants.
 ### Survival-write code gate
 
 The current survival-write branch has passed the complete debug and optimized
-release library suites: 161 passed, 0 failed in each profile. Its focused
+release library suites: 164 passed, 0 failed in each profile. Its focused
 invariants include:
 
 - the configured `K + M` layout remains unchanged at full width and at `K`;
@@ -73,6 +73,49 @@ historical-layout repair, HTTP 409 stale-instance fencing, and restart
 persistence. The retained summary reports `PASS` and zero suspicious log
 lines. N1 remained active throughout; all N2 storage paths were isolated below
 `.n2-validation/<run-id>`.
+
+### Debian local-disk and concurrent-GC closure
+
+The final bounded closure run completed on 2026-08-01 with result `PASS`.
+Evidence copied off the server is retained at:
+
+```text
+/home/litiaina/DEV-TEST/n2-debian-resume-20260801-171816/server-full-closure/results
+```
+
+The run used the exact optimized binary with SHA-256
+`6139c2b51e566a4ea9bb5f02068b7044abccd252ee60b685a41bbfa7d46b0396`
+on four isolated HDD paths. It modeled one `1 + 1` pool with two active
+logical nodes, two enrolled roots per active instance, NCNX replication two,
+and one compatible reserve instance. It proved:
+
+- byte-exact upload/download, ordered pagination, trash/recover, restart, NCNX
+  replica repair, and shard repair;
+- loss of one preferred local disk left its node degraded but fully protected
+  and writable through the other enrolled disk;
+- exact-layout repair relocated the missing shard onto the healthy local disk,
+  a same-key overwrite succeeded while the preferred disk was absent, and both
+  versions remained readable after that disk returned;
+- eight synchronized two-coordinator GC rounds reclaimed 64 expired objects;
+  all 16 GC jobs completed with zero errors and every reclaimed key returned
+  404;
+- one complete active-node loss still allowed a survival write at `K`, reserve
+  promotion advanced binding epoch 1 to 2, historical layouts healed, and the
+  retired instance was fenced with HTTP 409;
+- the final post-restart monitor was healthy and found zero suspicious engine
+  log lines.
+
+This is single-host, multi-process fault-injection evidence. It closes the
+local multi-disk fallback and concurrent-GC correctness gates; it does not
+replace the independent-host, controller, network-partition, multi-pool, or
+long-duration qualification gates.
+
+The release soak additionally requires a clean-log gate: zero engine error or
+panic lines, zero availability failures, and a final sequential GC completion
+on every node with zero errors and zero deferred runs. Deferred GC during an
+intentional topology outage is safe and observable, but the topology must be
+restored and every final proof run must complete before a release result can be
+`PASS`.
 
 ### N2 3.4.0 survival soak
 

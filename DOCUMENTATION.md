@@ -10,7 +10,7 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.4.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.4.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
 plane. N2 3.1 adds collision-free per-mutation trash generation directories.
 N2 3.2 makes SHA-256 the only engine integrity checksum, adds SHA-256
@@ -41,7 +41,7 @@ writes reject below `K`. The upload existence check follows that same
 reachable-replica boundary. Normal reads and destination-first rename, move,
 trash, and recover retain their stricter namespace rules.
 
-N2 3.4.0 makes this fixed-layout survival behavior the current release
+N2 3.4.1 makes this fixed-layout survival behavior the current release
 contract. It is not quorum consensus: the configured server-pool generation,
 logical slots, shard roles, NCDX holders, and NCNX repair targets remain
 unchanged while degraded writes acknowledge only at the reconstruction
@@ -141,6 +141,13 @@ domains for safe new publication. N2 counts nodes, not disks. NCNX uses
 `M + 1` deterministic holders in its home pool. The smallest supported pool
 is `1 + 1`; production sizing must reflect the operator's required failure
 domain and current qualification uses `2 + 2`.
+
+Within one node, a recorded root ID is a deterministic preference rather than
+a permanent disk binding. Reads search the node's enrolled roots. If one disk
+is unavailable or full, writes and exact-layout healing fall back to another
+identity-verified writable root on the same node. The cluster reports degraded
+disk health without discarding that node's EC role; the node stops accepting
+writes only when none of its enrolled roots can safely accept them.
 
 Capacity expansion adds another complete pool generation. It does not add a
 node into an enrolled pool, remap existing NCNX, or rewrite old objects.
@@ -1562,7 +1569,12 @@ Authorization: Bearer <token>
 
 Normal GC scans flat `.trash` records, proves live and unexpired references, and
 reclaims expired object holders before deleting the final trash NCNX. It does
-not use a routine whole-object orphan scan.
+not use a routine whole-object orphan scan. GC is lockless and idempotent across
+coordinators: a branch concurrently pruned by another completed cleanup is not
+an error. Temporary topology unavailability defers the run without reclaiming
+data; corrupt, conflicting, or malformed records still fail the run. The status
+response distinguishes `Deferred` from `Failed` and exposes the latest job's
+deferred count separately from real errors.
 
 ### Repair
 
@@ -1573,6 +1585,10 @@ POST /noa/v1/maintenance/repair/stop
 GET  /noa/v1/maintenance/repair/status
 Authorization: Bearer <token>
 ```
+
+Manual, replacement, and scheduled autonomous healing share one node-local
+single-run gate. If the scheduler finds another cycle active, it skips that
+interval and leaves the running job's status untouched.
 
 Useful query fields:
 

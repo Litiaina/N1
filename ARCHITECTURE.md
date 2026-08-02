@@ -214,6 +214,14 @@ count as two NCNX replicas or two shards of one EC stripe. A node may have one
 or many roots; deterministic root selection distributes independent records
 while preserving a single host failure domain.
 
+The recorded root ID is a preferred local route, not a permanent disk binding.
+Reads probe every enrolled root on the selected node. If the preferred disk is
+unavailable or full, new writes and exact-layout repair use another verified
+writable root on that same node. Health remains degraded to expose the disk
+loss, but the node retains its complete EC and NCNX role while at least one
+enrolled root remains writable; only loss of every writable root removes the
+node from write admission.
+
 Bidirectionality does not weaken durability. A coordinator without enough
 reachable holders rejects the operation or routes it; it never invents local
 authority.
@@ -505,9 +513,23 @@ is disposable.
 GC keeps no persistent reference database, `.entries`, `.records`, or global
 transaction state.
 
+GC coordinators remain independent and lockless. A namespace branch or trash
+record that disappears after it was listed is treated as an idempotently
+completed concurrent cleanup, not as engine damage. If a coordinator cannot
+prove the complete live and unexpired reference set because the required
+topology is temporarily unavailable, it defers the entire run without
+reclaiming anything and retries on the next schedule. Malformed records,
+conflicting replicas, and integrity failures remain hard errors. A completed
+run therefore means that reachability was proven; a deferred run means that no
+destructive decision was made.
+
 ## Autonomous Healing
 
 Healing is deterministic and object scoped.
+
+Each node has one healing-cycle owner at a time. A scheduled cycle that
+overlaps a manual or replacement cycle skips that interval; it does not mark
+the active cycle failed and does not overwrite the active cycle's status.
 
 ### NCNX healing
 

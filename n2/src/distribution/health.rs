@@ -148,15 +148,24 @@ fn cluster_health_snapshot_with_readiness(
         .filter(|node| pool_nodes.contains(&node.id))
         .cloned()
         .collect::<Vec<_>>();
-    let fully_writable_blob = active_blob
+    let writable_blob = active_blob
+        .iter()
+        .filter(|node| {
+            readiness
+                .iter()
+                .find(|(node_id, _)| node_id == &node.id)
+                .is_some_and(|(_, status)| status.writable)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let fully_writable_blob = writable_blob
         .iter()
         .filter(|node| {
             readiness
                 .iter()
                 .find(|(node_id, _)| node_id == &node.id)
                 .is_some_and(|(_, status)| {
-                    status.writable
-                        && (status.root_count == 0 || status.writable_roots == status.root_count)
+                    status.root_count == 0 || status.writable_roots == status.root_count
                 })
         })
         .count();
@@ -166,8 +175,11 @@ fn cluster_health_snapshot_with_readiness(
             .map_err(AppError::BadRequest)?;
     let layout = configured_layout;
     let data_plane_readable = readable_blob.len() >= layout.data_shards;
-    let data_plane_writable = fully_writable_blob >= layout.data_shards;
-    let data_plane_fully_protected = fully_writable_blob >= layout.total_shards();
+    // The node, not an individual local disk, is the EC failure domain. A
+    // node with one healthy enrolled root can still commit its exact shard
+    // and NCNX role without weakening the object layout.
+    let data_plane_writable = writable_blob.len() >= layout.data_shards;
+    let data_plane_fully_protected = writable_blob.len() >= layout.total_shards();
     let configured_namespace_nodes = runtime.membership.nodes_for_pool(&write_pool.id).len();
     let ncnx_replicas = write_pool.policy.namespace_replicas();
     let ncnx_replicas_required = ncnx_replicas;
@@ -176,7 +188,7 @@ fn cluster_health_snapshot_with_readiness(
     // member of a key's deterministic R=M+1 replica set.
     let estimated_ncnx_replicas_reachable =
         ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(readable_namespace));
-    let writable_namespace = fully_writable_blob;
+    let writable_namespace = writable_blob.len();
     let guaranteed_writable_ncnx =
         ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(writable_namespace));
     let ncnx_survival_writable =
@@ -187,7 +199,8 @@ fn cluster_health_snapshot_with_readiness(
     let effective_client_writable =
         data_plane_writable && ncnx_survival_writable && !safety_read_only;
     let missing_blob_writable = configured_blob.len().saturating_sub(active_blob.len());
-    let partially_writable_blob = active_blob.len().saturating_sub(fully_writable_blob);
+    let unwritable_blob = active_blob.len().saturating_sub(writable_blob.len());
+    let partially_writable_blob = writable_blob.len().saturating_sub(fully_writable_blob);
     let missing_namespace_readable = configured_namespace_nodes.saturating_sub(readable_namespace);
     let historical_recovery_active = runtime
         .membership
@@ -198,7 +211,7 @@ fn cluster_health_snapshot_with_readiness(
         .iter()
         .map(|node| node.id.clone())
         .collect::<HashSet<_>>();
-    let writable_node_ids = active
+    let writable_node_ids = writable_blob
         .iter()
         .map(|node| node.id.clone())
         .collect::<HashSet<_>>();
@@ -208,6 +221,8 @@ fn cluster_health_snapshot_with_readiness(
         || !data_plane_fully_protected
         || !ncnx_strictly_writable
         || missing_blob_writable > 0
+        || unwritable_blob > 0
+        || partially_writable_blob > 0
         || missing_namespace_readable > 0
         || historical_recovery_active
     {
@@ -283,8 +298,14 @@ fn cluster_health_snapshot_with_readiness(
     }
     if partially_writable_blob > 0 {
         notes.push(format!(
-            "{} reachable pool node(s) retain writable capacity but have at least one unavailable/full configured root; the cluster remains writable only when {} fully writable nodes satisfy K={}",
-            partially_writable_blob, fully_writable_blob, configured_layout.data_shards
+            "{} reachable pool node(s) have an unavailable/full local root but retain their complete EC role through another healthy enrolled root",
+            partially_writable_blob
+        ));
+    }
+    if unwritable_blob > 0 {
+        notes.push(format!(
+            "{} reachable pool node(s) have no writable local root; survival writes require at least K={} remaining writable nodes",
+            unwritable_blob, configured_layout.data_shards
         ));
     }
     if !data_plane_readable {
@@ -605,12 +626,16 @@ mod tests {
 
         assert_eq!(snap.state, ClusterHealthState::Degraded);
         assert!(snap.data_plane_writable);
-        assert!(!snap.data_plane_fully_protected);
+        assert!(snap.data_plane_fully_protected);
         assert!(snap.ncnx_survival_writable);
-        assert!(!snap.ncnx_strictly_writable);
+        assert!(snap.ncnx_strictly_writable);
         assert!(snap.effective_client_writable);
+        assert!(snap.nodes[1].accepts_writes);
         assert!(snap.nodes[1].storage_writable);
         assert!(!snap.nodes[1].storage_issues.is_empty());
+        assert!(snap.notes.iter().any(|note| {
+            note.contains("retain their complete EC role through another healthy enrolled root")
+        }));
     }
 
     #[test]

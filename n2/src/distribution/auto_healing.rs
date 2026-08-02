@@ -35,6 +35,11 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep, timeout};
 
 const HEALING_LEASE_TIMEOUT: Duration = Duration::from_secs(5);
+const CYCLE_ALREADY_RUNNING: &str = "an N2 auto-healing cycle is already running on this node";
+
+fn cycle_is_already_running(error: &AppError) -> bool {
+    matches!(error, AppError::Conflict(message) if message == CYCLE_ALREADY_RUNNING)
+}
 
 fn full_topology_available(configured_nodes: usize, live_nodes: usize) -> bool {
     configured_nodes > 0 && live_nodes == configured_nodes
@@ -711,9 +716,7 @@ async fn run_auto_healing_cycle_with_mode(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return Err(AppError::Conflict(
-            "an N2 auto-healing cycle is already running on this node".into(),
-        ));
+        return Err(AppError::Conflict(CYCLE_ALREADY_RUNNING.into()));
     }
     let _cycle_guard = CycleGuard;
     let cfg = CONFIG.auto_healing.clone();
@@ -872,13 +875,22 @@ pub fn spawn_auto_healing_task() {
     tokio::spawn(async move {
         sleep(Duration::from_secs(cfg.initial_delay_seconds)).await;
         loop {
-            if let Err(err) = run_auto_healing_cycle().await {
-                tracing::warn!("N2 autonomous healing cycle failed: {err}");
-                let mut status = STATUS.write().await;
-                status.enabled = true;
-                status.running = false;
-                status.finished_at_unix = Some(Utc::now().timestamp());
-                status.last_error = Some(err.to_string());
+            match run_auto_healing_cycle().await {
+                Ok(_) => {}
+                Err(err) if cycle_is_already_running(&err) => {
+                    // A manual or replacement cycle owns the single-run gate
+                    // and STATUS. The scheduler must not report that normal
+                    // overlap as a failure or overwrite the running job.
+                    tracing::debug!("N2 autonomous healing schedule skipped an active cycle");
+                }
+                Err(err) => {
+                    tracing::warn!("N2 autonomous healing cycle failed: {err}");
+                    let mut status = STATUS.write().await;
+                    status.enabled = true;
+                    status.running = false;
+                    status.finished_at_unix = Some(Utc::now().timestamp());
+                    status.last_error = Some(err.to_string());
+                }
             }
             sleep(Duration::from_secs(cfg.scan_interval_seconds)).await;
         }
@@ -1030,6 +1042,19 @@ mod tests {
         assert!(!full_topology_available(4, 3));
         assert!(!full_topology_available(4, 2));
         assert!(!full_topology_available(0, 0));
+    }
+
+    #[test]
+    fn scheduled_overlap_is_not_a_healing_failure() {
+        assert!(cycle_is_already_running(&AppError::Conflict(
+            CYCLE_ALREADY_RUNNING.into()
+        )));
+        assert!(!cycle_is_already_running(&AppError::Conflict(
+            "replicas disagree".into()
+        )));
+        assert!(!cycle_is_already_running(&AppError::ServiceUnavailable(
+            "peer offline".into()
+        )));
     }
 
     #[test]
