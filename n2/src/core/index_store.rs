@@ -120,6 +120,12 @@ fn io_err(err: std::io::Error, context: &str) -> AppError {
     AppError::Io(err, context.to_string())
 }
 
+#[inline]
+fn is_not_found(error: &AppError) -> bool {
+    matches!(error, AppError::NotFound)
+        || matches!(error, AppError::Io(source, _) if source.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     Ok(rmp_serde::to_vec(value)?)
 }
@@ -591,7 +597,11 @@ pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
         Mode::empty(),
     )
     .map_err(|e| {
-        AppError::InternalServerError(format!("open N2 directory {}: {e}", path.display()))
+        if e == rustix::io::Errno::NOENT {
+            AppError::NotFound
+        } else {
+            AppError::InternalServerError(format!("open N2 directory {}: {e}", path.display()))
+        }
     })?;
     let mut dir = Dir::new(fd).map_err(|e| {
         AppError::InternalServerError(format!("scan N2 directory {}: {e}", path.display()))
@@ -614,7 +624,12 @@ fn latest_summary_in_object_dir(dir: &Path) -> Result<Option<NcdxSummary>, AppEr
         return Ok(None);
     }
     let mut latest = None::<NcdxSummary>;
-    for name in read_dir_names(dir)? {
+    let names = match read_dir_names(dir) {
+        Ok(names) => names,
+        Err(AppError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for name in names {
         let Some(summary) = parse_ncdx_file_name(&name) else {
             continue;
         };
@@ -632,7 +647,12 @@ fn ncdx_path_for_version(dir: &Path, version_id: &str) -> Result<Option<PathBuf>
     if !dir.is_dir() {
         return Ok(None);
     }
-    for name in read_dir_names(dir)? {
+    let names = match read_dir_names(dir) {
+        Ok(names) => names,
+        Err(AppError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for name in names {
         if !name.starts_with(version_id) {
             continue;
         }
@@ -789,6 +809,25 @@ fn decode_metadata_file_as(path: &Path, object_key: &str) -> Result<ObjectMetada
     let mut meta = decode_metadata_file(path)?;
     meta.object_key = object_key.to_string();
     Ok(meta)
+}
+
+fn decode_metadata_file_if_present(path: &Path) -> Result<Option<ObjectMetadata>, AppError> {
+    match decode_metadata_file(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_metadata_file_as_if_present(
+    path: &Path,
+    object_key: &str,
+) -> Result<Option<ObjectMetadata>, AppError> {
+    match decode_metadata_file_as(path, object_key) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn record_path(parent: &str, name: &str) -> String {
@@ -1015,7 +1054,12 @@ fn all_live_version_paths(fragment: &str, object_key: &str) -> Result<Vec<PathBu
         if !dir.is_dir() {
             continue;
         }
-        for name in read_dir_names(&dir)? {
+        let names = match read_dir_names(&dir) {
+            Ok(names) => names,
+            Err(AppError::NotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        for name in names {
             if parse_ncdx_file_name(&name).is_some() {
                 paths.push(dir.join(name));
             }
@@ -1038,7 +1082,7 @@ pub fn read_live_version(
     let object_key = normalize_object_key(object_key)?;
     for dir in object_dir_candidates(fragment, &object_key)? {
         if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
-            return decode_metadata_file_as(&path, &object_key).map(Some);
+            return decode_metadata_file_as_if_present(&path, &object_key);
         }
     }
     Ok(None)
@@ -1056,7 +1100,7 @@ pub fn find_live_version_by_id(
     for root in blob_roots() {
         for (dir, object_id) in object_record_dirs_under_root(&root, fragment)? {
             if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
-                return decode_metadata_file_as(&path, &object_id).map(Some);
+                return decode_metadata_file_as_if_present(&path, &object_id);
             }
         }
     }
@@ -1080,9 +1124,10 @@ pub fn read_current_live_head(
             latest = Some((dir, summary));
         }
     }
-    latest
-        .map(|(dir, summary)| decode_metadata_file_as(&dir.join(summary.file_name), &object_key))
-        .transpose()
+    let Some((dir, summary)) = latest else {
+        return Ok(None);
+    };
+    decode_metadata_file_as_if_present(&dir.join(summary.file_name), &object_key)
 }
 
 pub fn list_live_versions(
@@ -1093,7 +1138,9 @@ pub fn list_live_versions(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for path in all_live_version_paths(fragment, &object_key)? {
-        let meta = decode_metadata_file_as(&path, &object_key)?;
+        let Some(meta) = decode_metadata_file_as_if_present(&path, &object_key)? else {
+            continue;
+        };
         if seen.insert(meta.version_id.clone()) {
             out.push(meta);
         }
@@ -1271,10 +1318,11 @@ pub fn scan_live_full_metadata_page(
         let Some(summary) = latest_summary_in_object_dir(&dir)? else {
             continue;
         };
-        objects.push(decode_metadata_file_as(
-            &dir.join(summary.file_name),
-            &object_id,
-        )?);
+        if let Some(metadata) =
+            decode_metadata_file_as_if_present(&dir.join(summary.file_name), &object_id)?
+        {
+            objects.push(metadata);
+        }
     }
     Ok(ListObjectsResult {
         prefix: Some(prefix),
@@ -1298,7 +1346,7 @@ pub fn read_trash_version(
 ) -> Result<Option<ObjectMetadata>, AppError> {
     for dir in object_dir_candidates(fragment, object_id)? {
         if let Some(path) = ncdx_path_for_version(&dir, version_id)? {
-            return decode_metadata_file(&path).map(Some);
+            return decode_metadata_file_if_present(&path);
         }
     }
     Ok(None)
@@ -1324,9 +1372,16 @@ pub fn list_trash_versions(
         if !dir.is_dir() {
             continue;
         }
-        for name in read_dir_names(&dir)? {
+        let names = match read_dir_names(&dir) {
+            Ok(names) => names,
+            Err(AppError::NotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        for name in names {
             if parse_ncdx_file_name(&name).is_some() {
-                let meta = decode_metadata_file(&dir.join(name))?;
+                let Some(meta) = decode_metadata_file_if_present(&dir.join(name))? else {
+                    continue;
+                };
                 if seen.insert(meta.version_id.clone()) {
                     out.push(meta);
                 }
@@ -2287,5 +2342,34 @@ mod tests {
         assert_eq!(summary.version_id, metadata.version_id);
         assert_eq!(summary.size_bytes, metadata.total_size_bytes);
         assert_eq!(summary.packed_ext, metadata.packed_ext_u64);
+    }
+
+    #[test]
+    fn vanished_directory_is_reported_as_not_found() {
+        let path = std::env::temp_dir().join(format!("n2-vanished-dir-{}", Ulid::new()));
+        assert!(matches!(read_dir_names(&path), Err(AppError::NotFound)));
+    }
+
+    #[test]
+    fn metadata_removed_after_enumeration_is_already_absent() {
+        let dir = std::env::temp_dir().join(format!("n2-gc-idempotency-{}", Ulid::new()));
+        fs::create_dir_all(&dir).expect("create test object directory");
+        let path = dir.join(ncdx_file_name(&metadata()));
+        fs::write(
+            &path,
+            encode_disk_object_metadata(&metadata()).expect("encode metadata"),
+        )
+        .expect("write metadata");
+
+        let names = read_dir_names(&dir).expect("enumerate object directory");
+        assert_eq!(names, vec![path.file_name().unwrap().to_string_lossy()]);
+        fs::remove_file(&path).expect("simulate concurrent GC reclaim");
+        assert!(
+            decode_metadata_file_if_present(&path)
+                .expect("concurrent reclaim is idempotent")
+                .is_none()
+        );
+
+        fs::remove_dir_all(&dir).expect("remove test directory");
     }
 }

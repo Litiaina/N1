@@ -348,6 +348,25 @@ collect_remote_logs() {
   set -e
 }
 
+assert_no_engine_errors_so_far() {
+  local report="$OUT/metrics/live-engine-error-lines.log"
+  : >"$report"
+  grep -HnE 'ERROR|panicked|panic|fatal|segmentation fault|Internal Server Error|internal server error' \
+    "$LOCAL_A/server.log" "$LOCAL_B/server.log" >>"$report" 2>/dev/null || true
+  if [[ "$ALL_LOCAL" == "true" ]]; then
+    grep -HnE 'ERROR|panicked|panic|fatal|segmentation fault|Internal Server Error|internal server error' \
+      "$REMOTE_C/server.log" "$REMOTE_D/server.log" >>"$report" 2>/dev/null || true
+  else
+    remote "grep -HnE 'ERROR|panicked|panic|fatal|segmentation fault|Internal Server Error|internal server error' '$REMOTE_C/server.log' '$REMOTE_D/server.log' 2>/dev/null || true" \
+      >>"$report"
+  fi
+  if [[ -s "$report" ]]; then
+    FAILURE_CLASS="engine_error_log_gate"
+    FAILURE_DETAIL="engine log gate failed during active workload"
+    return 1
+  fi
+}
+
 remove_remote_authorized_key() {
   [[ "$ALL_LOCAL" != "true" ]] || return 0
   [[ -n "$AUTHORIZED_KEY_TAG" ]] || return 0
@@ -1236,6 +1255,7 @@ finish_success() {
 
 write_status RUNNING "initializing isolated four-node cluster"
 setup_cluster
+assert_no_engine_errors_so_far
 write_status RUNNING "cluster initialized; workload active"
 
 while (( $(date +%s) < DEADLINE )); do
@@ -1246,6 +1266,7 @@ while (( $(date +%s) < DEADLINE )); do
   if (( CYCLE > 0 && CYCLE % CHAOS_EVERY_CYCLES == 0 )); then
     run_chaos
   fi
+  assert_no_engine_errors_so_far
   LAST_OPERATION="cycle-complete"
   write_status RUNNING "workload cycle passed"
   CYCLE=$((CYCLE + 1))
