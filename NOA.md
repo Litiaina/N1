@@ -116,7 +116,20 @@ GET    /noa/v1/upload/multipart/{version_id}
 PUT    /noa/v1/upload/multipart/{version_id}/{part_index}
 POST   /noa/v1/upload/multipart/{version_id}/{session_id}/finalize
 DELETE /noa/v1/upload/multipart/{version_id}
+
+POST   /noa/v1/upload/multipart/durable/init/{object_key}
+GET    /noa/v1/upload/multipart/durable
+GET    /noa/v1/upload/multipart/durable/{version_id}
+PUT    /noa/v1/upload/multipart/durable/{version_id}/{part_index}
+POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/durable/{version_id}
 ```
+
+The standard multipart family is process-resumable and optimized for concurrent
+ingest: initialization/status/part completion are memory-resident and finalize
+is the only durability/publication boundary. The durable family retains
+restart-resumable manifests and part receipts. Both publish the same immutable
+N1 object and namespace representation after successful finalize.
 
 ## Maintenance And Object Health
 

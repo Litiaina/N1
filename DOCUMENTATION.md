@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 3.3.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.4.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, high-throughput and durable upload modes, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -10,7 +10,7 @@ notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Version And Release Status
 
-N1 `3.3.0` is the current development engine/package version. It is on the
+N1 `3.4.0` is the current development engine/package version. It is on the
 development release channel and is not a declaration that this engine line has
 reached its stable product milestone. Storage compatibility is tracked
 separately as engine format `3`; package updates within this development line
@@ -1051,6 +1051,15 @@ curl -k "$BASE/noa/v1/upload/one-shot/docs/readme.txt" \
 
 ### Multipart Initiate
 
+The standard multipart API is the high-throughput path. Initiation and part
+completion state live only in process memory. Parts may be uploaded concurrently;
+each part is streamed once through EC to its fixed K+M placement. N1 writes no
+session manifest, namespace pending record, or per-part receipt on this path.
+Finalize synchronizes the completed shard set and then publishes the immutable
+object index and namespace entry once. An unfinished standard session does not
+survive process restart; its unreferenced shards remain invisible and are
+reclaimed by the normal orphan TTL scan.
+
 ```http
 POST /noa/v1/upload/multipart/init/{object_key}
 ```
@@ -1084,11 +1093,11 @@ PUT /noa/v1/upload/multipart/{version_id}/{part_index}
 Query parameters:
 
 - `checksum` optional
-- `durability` optional
-- `strict_durability` optional boolean
 - `io_gate` optional boolean
 
-Request body is the raw bytes for that part. Parts may be retried. Uploaded part receipts are persistent and survive server restart.
+Request body is the raw bytes for that part. Distinct part indexes are accepted
+concurrently. Repeating a completed part index in the same live process is
+idempotent; a concurrent duplicate of an in-flight index returns conflict.
 
 Clients should use bounded in-flight parts for large files instead of increasing the one-shot size. Start with `2-4` concurrent parts and tune by disk count and disk quality. Very small multipart jobs may not benefit from part concurrency; large files with many parts usually do. N1 will apply upload backpressure when the disk scheduler is saturated.
 
@@ -1154,6 +1163,29 @@ DELETE /noa/v1/upload/multipart/{version_id}?object_key=videos/large.mp4
 ```
 
 Cancel removes the pending upload session. GC can later reclaim orphaned partial payloads.
+
+### Durable Multipart Upload
+
+Use the durable variant when unfinished-upload restart recovery matters more
+than maximum ingest throughput. Its existing replicated manifest, pending
+namespace binding, and compact part-receipt contract is unchanged in N1 3.4.0.
+The request and response bodies are identical to standard multipart; insert
+`/durable` after `/multipart`:
+
+```text
+POST   /noa/v1/upload/multipart/durable/init/{object_key}
+GET    /noa/v1/upload/multipart/durable
+GET    /noa/v1/upload/multipart/durable/{version_id}
+PUT    /noa/v1/upload/multipart/durable/{version_id}/{part_index}
+POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/durable/{version_id}
+```
+
+Durable part upload continues to accept the `durability`,
+`strict_durability`, and `io_gate` query controls documented for the previous
+multipart contract. Existing native `n1://` multipart operations retain this
+durable restart-resumable behavior; N1 3.4.0 does not silently change their
+established contract.
 
 ## Archive Download
 

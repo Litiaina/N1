@@ -2,7 +2,7 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.3.0` on the development channel, using
+The current package line is N1 `3.4.0` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
 line. Dated evidence names below remain unchanged because they identify the
 exact candidate binaries and runs that produced them.
@@ -35,6 +35,12 @@ Before an LTS release, N1 should pass:
 - blob-only roots contain no alias, upload, trash, or user namespace state
 - every shard-bearing placement has a colocated immutable `.ndx`
 - adaptive small-object stripe sizes do not create false topology drift
+- standard multipart init and part commits create no manifest, pending binding, or receipt
+- distinct standard multipart parts execute concurrently and remain invisible before finalize
+- standard finalize synchronizes K+M shard files before NDX and namespace publication
+- unfinished standard sessions vanish on restart and leave only TTL-reclaimable headless shards
+- durable multipart remains restart-resumable through its existing manifest and receipt contract
+- upload evidence separates server-local engine throughput from LAN client throughput
 
 ## Rust Release Proof Runner
 
@@ -50,9 +56,53 @@ DISK_ROOTS="/mnt/disk-00,/mnt/disk-01" \
 scripts/bench/run_n1_release_proof.sh
 ```
 
-For a large multipart proof, use a source file that exceeds the configured one-shot size. Large files must exercise multipart, persisted receipts, restart/resume, finalize, and download verification.
+For a large multipart proof, use a source file that exceeds the configured
+one-shot size. Test the standard and durable paths separately: the standard
+path proves concurrent ingest and finalize publication, while the durable path
+proves persisted receipts and restart/resume. Both require download hash
+verification.
 
 ## Focused Proof Evidence
+
+### N1 3.4.0 Standard Multipart Upload Proof
+
+The final optimized N1 3.4.0 candidate was exercised on August 8, 2026 in an
+isolated `3 + 1` topology backed by four distinct 1 TB HDDs. Production N1
+remained online on separate paths and ports. The exact release binary SHA-256
+was `48c352a794eb10b3485297e2a750b86236cebd0c1471f2ace396eacd82c117d0`.
+
+- Strict `RUSTFLAGS='-D warnings'` N1 all-target tests passed `134/134` library
+  tests plus the server binary target; strict workspace all-target compile,
+  formatting, release build, and diff validation passed.
+- The real `15,912,736,534` byte `mhw.mp4` source and every streamed download
+  matched SHA-256
+  `3bfa2816d5ee2d61506137fbabe119d1161e768983bdb924367f790b6223eeac`.
+- Server-local standard multipart with 256 MiB parts and concurrency four
+  ingested at `165.796 MiB/s`; the `2.927 s` finalize produced an end-to-end
+  upload rate of `160.443 MiB/s`.
+- LAN standard multipart ingested at `94.396 MiB/s`; the `0.557 s` finalize
+  produced an end-to-end upload rate of `93.984 MiB/s`, near the payload
+  ceiling of the tested 1 Gbit/s link.
+- Final-binary 256 MiB one-shot samples measured `36.765 MiB/s` server-local
+  and `48.479 MiB/s` over LAN. Earlier samples reached `96.803 MiB/s`, so this
+  path is explicitly recorded as variable rather than represented by a single
+  peak result.
+- A bounded 12-second `perf stat` operation window around a 1 GiB standard
+  upload observed `1,574,221,979` CPU cycles, `1,351,281,667` instructions,
+  `1,612.73 ms` task-clock, and `4,204` context switches. That run ingested at
+  `131.769 MiB/s` and finalized in `1.094751 s`.
+- Direct physical inspection found four part shard files and zero standard
+  multipart manifests, pending bindings, or receipts.
+- After forced process restart, the standard session identity was absent and
+  its committed-part count was zero. Fast orphan GC reclaimed every abandoned
+  shard while preserving and SHA-verifying a committed object.
+- The separate durable route retained its old behavior: one committed part
+  survived restart, the remaining parts finalized, and the download hash
+  matched.
+
+Complete machine-readable results and the human-readable report are under
+`/home/litiaina/DEV_TEST/n1-3.4`. This evidence proves the 3.4.0 upload redesign
+scope; it does not by itself replace the wider N1 LTS release matrix.
 
 Latest native protocol benchmark for N1 1.2.0:
 

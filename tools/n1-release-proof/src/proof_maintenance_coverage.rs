@@ -153,7 +153,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/noa/v1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/durable/init/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -176,7 +176,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/durable/{}/{}?durability=batched",
                     self.base_url, init.version_id, index
                 ))
                 .bearer_auth(&self.token)
@@ -196,7 +196,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/durable/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,
@@ -234,7 +234,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/noa/v1/upload/multipart/init/{}",
+                "{}/noa/v1/upload/multipart/durable/init/{}",
                 self.base_url,
                 encode_path(object_key)
             ))
@@ -255,7 +255,7 @@ impl Proof {
         let first = self
             .client
             .put(format!(
-                "{}/noa/v1/upload/multipart/{}/0?durability=batched",
+                "{}/noa/v1/upload/multipart/durable/{}/0?durability=batched",
                 self.base_url, init.version_id
             ))
             .bearer_auth(&self.token)
@@ -296,7 +296,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/durable/{}/{}?durability=batched",
                     self.base_url, init.version_id, index
                 ))
                 .bearer_auth(&self.token)
@@ -316,7 +316,7 @@ impl Proof {
         let response = self
             .client
             .post(format!(
-                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
+                "{}/noa/v1/upload/multipart/durable/{}/{}/finalize?object_key={}",
                 self.base_url,
                 init.version_id,
                 init.session_id,

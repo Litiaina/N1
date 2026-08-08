@@ -574,6 +574,19 @@ fn orphan_blob_age_expired(age: Duration, ttl: Duration) -> bool {
     ttl.is_zero() || age >= ttl
 }
 
+fn orphan_version_reclaimable(
+    version_id: &str,
+    is_committed: bool,
+    is_active: bool,
+    age: Duration,
+    ttl: Duration,
+) -> bool {
+    !is_committed
+        && !is_active
+        && ulid::Ulid::from_string(version_id).is_ok()
+        && orphan_blob_age_expired(age, ttl)
+}
+
 async fn perform_gc_scan(
     state: Arc<AppState>,
     is_manual_run: bool,
@@ -784,6 +797,24 @@ async fn process_fragment_gc(
     if let Some(snapshot) = &namespace_snapshot {
         protected_live_object_ids.extend(snapshot.referenced_object_ids.iter().cloned());
         live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
+        // The namespace snapshot names the visible version, while older
+        // immutable versions remain valid object history. Build complete
+        // version truth before reclaiming abandoned standard-upload dirs.
+        for object_id in &protected_live_object_ids {
+            match index::list_live_object_versions_metadata(fragment, object_id).await {
+                Ok(versions) => {
+                    live_versions.extend(versions.into_iter().map(|version| version.version_id));
+                }
+                Err(err) => {
+                    warn!(
+                        "GC: failed to load version history for protected object {}/{}: {}; preserving the fragment",
+                        fragment, object_id, err
+                    );
+                    stats.live_versions_seen = live_versions.len() as u64;
+                    return stats;
+                }
+            }
+        }
     } else {
         for meta in &physical_live_objects {
             io_progress.heartbeat();
@@ -858,9 +889,9 @@ async fn process_fragment_gc(
                         }
                     };
                 // Trash is reclaimed only by the targeted TTL lifecycle above.
-                // Reading the records here verifies they remain decodable; a
-                // manual GC run must never bypass the recovery window.
-                let _ = versions;
+                // Mark every retained trash version as committed so the orphan
+                // sweep can never bypass the recovery window.
+                live_versions.extend(versions.into_iter().map(|version| version.version_id));
             }
         }
         Err(err) => {
@@ -998,6 +1029,9 @@ async fn process_fragment_gc(
             }
         }
     }
+    active_session_versions.extend(crate::core::upload::active_standard_upload_versions(
+        fragment,
+    ));
 
     let total_session_refund: u64 = sessions_to_delete.iter().map(|(_, amount)| *amount).sum();
     stats.refund_bytes += total_session_refund;
@@ -1024,15 +1058,11 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            if protected_live_object_ids.contains(&object_id)
+            let object_is_referenced = protected_live_object_ids.contains(&object_id)
                 || namespace_snapshot
                     .as_ref()
-                    .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id))
-            {
-                continue;
-            }
-
-            let mut has_active_session = false;
+                    .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id));
+            let mut has_protected_version = false;
             if let Ok(entries) = std::fs::read_dir(&object_dir) {
                 for entry in entries.filter_map(Result::ok) {
                     if should_stop_gc() {
@@ -1044,13 +1074,35 @@ async fn process_fragment_gc(
                     }
                     gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
                     let version_id = entry.file_name().to_string_lossy().to_string();
-                    if active_session_versions.contains(&version_id) {
-                        has_active_session = true;
-                        break;
+                    let is_committed = live_versions.contains(&version_id);
+                    let is_active = active_session_versions.contains(&version_id);
+                    if is_committed || is_active {
+                        has_protected_version = true;
+                        continue;
+                    }
+                    if ulid::Ulid::from_string(&version_id).is_err() {
+                        // Unknown directories are not part of the upload
+                        // lifecycle contract and therefore fail closed.
+                        has_protected_version = true;
+                        continue;
+                    }
+                    let modified = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(now);
+                    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+                    if orphan_version_reclaimable(
+                        &version_id,
+                        is_committed,
+                        is_active,
+                        age,
+                        file_ttl,
+                    ) && std::fs::remove_dir_all(&path).is_ok()
+                    {
+                        stats.orphan_blob_dirs_deleted += 1;
                     }
                 }
             }
-            if has_active_session {
+            if object_is_referenced || has_protected_version {
                 continue;
             }
 
@@ -1071,7 +1123,10 @@ async fn process_fragment_gc(
 
 #[cfg(test)]
 mod tests {
-    use super::{GcExecutionMode, GcRunOptions, collect_gc_fragments, parse_gc_execution_mode};
+    use super::{
+        GcExecutionMode, GcRunOptions, collect_gc_fragments, orphan_version_reclaimable,
+        parse_gc_execution_mode,
+    };
     use crate::core::constants::FRAGMENT_METADATA_FILE;
     use crate::core::fragment_identity::{
         fragment_alias_dir, physical_fragment_dir_name, physical_fragment_root_on,
@@ -1080,6 +1135,47 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::Duration;
     use ulid::Ulid;
+
+    #[test]
+    fn orphan_version_reclaim_requires_valid_uncommitted_inactive_ulid_past_ttl() {
+        let version_id = Ulid::new().to_string();
+        let ttl = Duration::from_secs(60);
+        assert!(!orphan_version_reclaimable(
+            &version_id,
+            true,
+            false,
+            Duration::from_secs(120),
+            ttl,
+        ));
+        assert!(!orphan_version_reclaimable(
+            &version_id,
+            false,
+            true,
+            Duration::from_secs(120),
+            ttl,
+        ));
+        assert!(!orphan_version_reclaimable(
+            &version_id,
+            false,
+            false,
+            Duration::from_secs(59),
+            ttl,
+        ));
+        assert!(!orphan_version_reclaimable(
+            "not-a-version",
+            false,
+            false,
+            Duration::from_secs(120),
+            ttl,
+        ));
+        assert!(orphan_version_reclaimable(
+            &version_id,
+            false,
+            false,
+            Duration::from_secs(60),
+            ttl,
+        ));
+    }
 
     #[test]
     fn gc_execution_mode_parsing_and_fast_options_are_aggressive_only_when_requested() {

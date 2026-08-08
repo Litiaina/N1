@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File as StdFile;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock as StdOnceLock, RwLock};
 use std::task::{Context, Poll};
 
 use axum::Json as AxumJson;
@@ -46,6 +46,7 @@ use crate::core::operation_gate::ensure_user_mutations_allowed;
 use crate::core::root_identity::configured_root_identity_is_current;
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
+use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
 
 pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
@@ -66,6 +67,122 @@ const SMALL_BUFFERED_WRITE_LIMIT: u64 = 1024 * 1024;
 static MULTIPART_PART_LOCKS: LazyLock<
     Mutex<std::collections::HashMap<String, Weak<AsyncMutex<()>>>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+const STANDARD_SESSION_OPEN: u8 = 0;
+const STANDARD_SESSION_FINALIZING: u8 = 1;
+const STANDARD_SESSION_FINALIZED: u8 = 2;
+const STANDARD_SESSION_CANCELLED: u8 = 3;
+const STANDARD_PART_EMPTY: u8 = 0;
+const STANDARD_PART_UPLOADING: u8 = 1;
+const STANDARD_PART_COMPLETE: u8 = 2;
+
+/// Process-local state for the standard high-throughput multipart API.
+///
+/// The registry lock is held only long enough to clone an `Arc` or insert/remove
+/// a session. No request body, EC operation, disk I/O, or finalization work runs
+/// while it is held.
+static STANDARD_UPLOADS: LazyLock<RwLock<HashMap<String, Arc<StandardUploadSession>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Debug)]
+struct StandardPartSlot {
+    state: AtomicU8,
+    record: StdOnceLock<StandardPartRecord>,
+}
+
+impl StandardPartSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(STANDARD_PART_EMPTY),
+            record: StdOnceLock::new(),
+        }
+    }
+}
+
+/// Compact in-memory completion record. Paths and filenames are deterministic
+/// from the session manifest and are reconstructed only at finalization.
+#[derive(Debug)]
+struct StandardPartRecord {
+    size_bytes: u64,
+    created_at: i64,
+    checksum: Option<u32>,
+    shard_checksums: Box<[u32]>,
+}
+
+#[derive(Debug)]
+struct StandardUploadSession {
+    manifest: UploadSessionManifest,
+    logical_path: String,
+    lifecycle: AtomicU8,
+    in_flight_parts: AtomicUsize,
+    last_activity_at: AtomicI64,
+    directories_ready: tokio::sync::OnceCell<()>,
+    parts: Box<[StandardPartSlot]>,
+}
+
+fn standard_session_key(fragment: &str, version_id: &str) -> String {
+    format!("{fragment}\u{001f}{version_id}")
+}
+
+fn standard_registry_read() -> Result<
+    std::sync::RwLockReadGuard<'static, HashMap<String, Arc<StandardUploadSession>>>,
+    AppError,
+> {
+    STANDARD_UPLOADS.read().map_err(|_| {
+        AppError::InternalServerError("standard multipart registry poisoned".to_string())
+    })
+}
+
+fn standard_registry_write() -> Result<
+    std::sync::RwLockWriteGuard<'static, HashMap<String, Arc<StandardUploadSession>>>,
+    AppError,
+> {
+    STANDARD_UPLOADS.write().map_err(|_| {
+        AppError::InternalServerError("standard multipart registry poisoned".to_string())
+    })
+}
+
+fn standard_session(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<Arc<StandardUploadSession>>, AppError> {
+    Ok(standard_registry_read()?
+        .get(&standard_session_key(fragment, version_id))
+        .cloned())
+}
+
+struct StandardPartClaim<'a> {
+    session: &'a StandardUploadSession,
+    slot: &'a StandardPartSlot,
+    completed: bool,
+}
+
+impl StandardPartClaim<'_> {
+    fn complete(mut self, record: StandardPartRecord) -> Result<(), AppError> {
+        self.slot.record.set(record).map_err(|_| {
+            AppError::Conflict("Multipart part was completed concurrently".to_string())
+        })?;
+        self.session
+            .last_activity_at
+            .store(Utc::now().timestamp(), Ordering::Release);
+        self.slot
+            .state
+            .store(STANDARD_PART_COMPLETE, Ordering::Release);
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StandardPartClaim<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.slot
+                .state
+                .store(STANDARD_PART_EMPTY, Ordering::Release);
+        }
+        self.session.in_flight_parts.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 struct MultipartPartGuard {
     _guard: OwnedMutexGuard<()>,
@@ -230,15 +347,47 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 #[cfg(test)]
 mod tests {
     use super::{
+        STANDARD_PART_COMPLETE, STANDARD_PART_EMPTY, STANDARD_SESSION_OPEN,
+        StandardPartClaimResult, StandardPartRecord, StandardPartSlot, StandardUploadSession,
         UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode, UploadSessionManifest,
         acquire_upload_io_guard_with_timeout, choose_upload_stripe_size_for_len_with_ceiling,
-        parse_upload_durability_mode, shard_specs_for_part, target_stripe_size_for_metadata,
+        claim_standard_part, parse_upload_durability_mode, shard_specs_for_part,
+        target_stripe_size_for_metadata,
     };
     use crate::core::disk_manager::{
         INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, UploadPartQuery,
     };
     use std::path::Path;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+
+    fn standard_test_session(part_count: usize) -> StandardUploadSession {
+        StandardUploadSession {
+            manifest: UploadSessionManifest {
+                fragment: "01KFRAGMENT".to_string(),
+                object_key: "01KOBJECT".to_string(),
+                version_id: "01KVERSION".to_string(),
+                session_id: "01KSESSION".to_string(),
+                total_size_bytes: part_count as u64 * 4096,
+                expected_parts: part_count as u64,
+                part_size_bytes: 4096,
+                content_type: "application/octet-stream".to_string(),
+                created_at: 1,
+                stripe_size_bytes: 4096,
+                data_shards: 1,
+                parity_shards: 1,
+                placement_roots: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
+            },
+            logical_path: "test.bin".to_string(),
+            lifecycle: AtomicU8::new(STANDARD_SESSION_OPEN),
+            in_flight_parts: AtomicUsize::new(0),
+            last_activity_at: AtomicI64::new(1),
+            directories_ready: tokio::sync::OnceCell::new(),
+            parts: (0..part_count)
+                .map(|_| StandardPartSlot::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
 
     #[test]
     fn upload_durability_default_follows_runtime_config_or_batched_when_unset() {
@@ -394,6 +543,43 @@ mod tests {
             );
             assert_eq!(first[shard_index].0, second[shard_index].0);
         }
+    }
+
+    #[test]
+    fn standard_part_claim_is_write_once_and_duplicate_safe() {
+        let session = standard_test_session(2);
+        let first = match claim_standard_part(&session, 0).expect("first claim") {
+            StandardPartClaimResult::Claimed(claim) => claim,
+            StandardPartClaimResult::AlreadyComplete => panic!("part was not complete"),
+        };
+        assert!(claim_standard_part(&session, 0).is_err());
+        drop(first);
+        assert_eq!(
+            session.parts[0].state.load(Ordering::Acquire),
+            STANDARD_PART_EMPTY
+        );
+
+        let second = match claim_standard_part(&session, 0).expect("retry claim") {
+            StandardPartClaimResult::Claimed(claim) => claim,
+            StandardPartClaimResult::AlreadyComplete => panic!("part was not complete"),
+        };
+        second
+            .complete(StandardPartRecord {
+                size_bytes: 4096,
+                created_at: 1,
+                checksum: Some(1),
+                shard_checksums: vec![2, 3].into_boxed_slice(),
+            })
+            .expect("complete part");
+        assert_eq!(
+            session.parts[0].state.load(Ordering::Acquire),
+            STANDARD_PART_COMPLETE
+        );
+        assert!(matches!(
+            claim_standard_part(&session, 0).expect("idempotent retry"),
+            StandardPartClaimResult::AlreadyComplete
+        ));
+        assert_eq!(session.in_flight_parts.load(Ordering::Acquire), 0);
     }
 }
 
@@ -873,11 +1059,10 @@ async fn ensure_version_shard_dirs(
     manifest: &UploadSessionManifest,
 ) -> Result<(), AppError> {
     let mut shard_dirs = BTreeSet::new();
-    for part_index in 0..manifest.expected_parts {
-        for (_, _, shard_path, _) in shard_specs_for_part(path_manager, manifest, part_index)? {
-            if let Some(parent) = shard_path.parent() {
-                shard_dirs.insert(parent.to_path_buf());
-            }
+    // Every part of one immutable version shares these same K+M directories.
+    for (_, _, shard_path, _) in shard_specs_for_part(path_manager, manifest, 0)? {
+        if let Some(parent) = shard_path.parent() {
+            shard_dirs.insert(parent.to_path_buf());
         }
     }
 
@@ -1838,6 +2023,105 @@ pub async fn initiate_object_upload(
     Ok((StatusCode::CREATED, AxumJson(response)))
 }
 
+async fn prepare_upload_manifest(
+    fragment: &str,
+    object_key: &str,
+    params: &InitiateUploadParams,
+) -> Result<UploadSessionManifest, AppError> {
+    if params.expected_parts == 0 {
+        return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
+    }
+
+    let part_size_bytes = if params.expected_parts <= 1 {
+        params.part_size_bytes.unwrap_or(params.total_size_bytes)
+    } else {
+        params
+            .part_size_bytes
+            .filter(|value| *value > 0)
+            .ok_or(AppError::BadRequest(
+                "part_size_bytes is required for multipart uploads".into(),
+            ))?
+    };
+
+    let computed_parts = if params.total_size_bytes == 0 || part_size_bytes == 0 {
+        1
+    } else {
+        params.total_size_bytes.div_ceil(part_size_bytes)
+    };
+    if computed_parts != params.expected_parts {
+        return Err(AppError::BadRequest(
+            "expected_parts does not match total_size_bytes and part_size_bytes".into(),
+        ));
+    }
+
+    usize::try_from(params.expected_parts)
+        .map_err(|_| AppError::BadRequest("expected_parts is too large".into()))?;
+
+    preflight_upload_capacity(params.total_size_bytes).await?;
+
+    let version_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    let planned_sizes = planned_part_sizes(
+        params.total_size_bytes,
+        params.expected_parts,
+        part_size_bytes,
+    );
+    let stripe_size = choose_upload_stripe_size_for_parts(&planned_sizes);
+    let data_shards = configured_data_shards();
+    let parity_shards = configured_parity_shards();
+
+    let manifest = UploadSessionManifest {
+        fragment: fragment.to_string(),
+        object_key: object_key.to_string(),
+        version_id: version_id.clone(),
+        session_id,
+        total_size_bytes: params.total_size_bytes,
+        expected_parts: params.expected_parts,
+        part_size_bytes,
+        content_type: params
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        created_at: Utc::now().timestamp(),
+        stripe_size_bytes: stripe_size,
+        data_shards: data_shards as u16,
+        parity_shards: parity_shards as u16,
+        placement_roots: ObjectPathManager::new()
+            .select_blob_roots_for_object(
+                fragment,
+                object_key,
+                &version_id,
+                data_shards.saturating_add(parity_shards),
+            )?
+            .into_iter()
+            .map(|root| root.to_string_lossy().to_string())
+            .collect(),
+    };
+
+    ensure_registered_placement_roots(
+        &manifest
+            .placement_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    )?;
+    preflight_blob_placement_capacity_for_parts(
+        &manifest
+            .placement_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+        0,
+        &planned_sizes,
+        data_shards,
+        parity_shards,
+        manifest.stripe_size_bytes,
+    )
+    .await?;
+
+    Ok(manifest)
+}
+
 pub async fn initiate_object_upload_direct(
     claims: Claims,
     fragment: String,
@@ -1852,96 +2136,9 @@ pub async fn initiate_object_upload_direct(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    if params.expected_parts == 0 {
-        return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
-    }
-
-    let part_size_bytes = if params.expected_parts <= 1 {
-        params.part_size_bytes.unwrap_or(params.total_size_bytes)
-    } else {
-        params
-            .part_size_bytes
-            .filter(|v| *v > 0)
-            .ok_or(AppError::BadRequest(
-                "part_size_bytes is required for multipart uploads".into(),
-            ))?
-    };
-
-    let computed_parts = if params.total_size_bytes == 0 {
-        1
-    } else if part_size_bytes == 0 {
-        1
-    } else {
-        params.total_size_bytes.div_ceil(part_size_bytes)
-    };
-
-    if computed_parts != params.expected_parts.max(1) {
-        return Err(AppError::BadRequest(
-            "expected_parts does not match total_size_bytes and part_size_bytes".into(),
-        ));
-    }
-
-    preflight_upload_capacity(params.total_size_bytes).await?;
-
-    let version_id = Ulid::new().to_string();
-    let session_id = Ulid::new().to_string();
-
-    let planned_sizes = planned_part_sizes(
-        params.total_size_bytes,
-        params.expected_parts.max(1),
-        part_size_bytes,
-    );
-    let stripe_size = choose_upload_stripe_size_for_parts(&planned_sizes);
-
-    let manifest = UploadSessionManifest {
-        fragment: fragment.clone(),
-        object_key: object_key.clone(),
-        version_id: version_id.clone(),
-        session_id: session_id.clone(),
-        total_size_bytes: params.total_size_bytes,
-        expected_parts: params.expected_parts.max(1),
-        part_size_bytes,
-        content_type: params
-            .content_type
-            .clone()
-            .unwrap_or_else(|| "application/octet-stream".to_string()),
-        created_at: Utc::now().timestamp(),
-        stripe_size_bytes: stripe_size,
-        data_shards: configured_data_shards() as u16,
-        parity_shards: configured_parity_shards() as u16,
-        placement_roots: ObjectPathManager::new()
-            .select_blob_roots_for_object(
-                &fragment,
-                &object_key,
-                &version_id,
-                configured_data_shards().saturating_add(configured_parity_shards()),
-            )?
-            .into_iter()
-            .map(|root| root.to_string_lossy().to_string())
-            .collect(),
-    };
-
-    ensure_registered_placement_roots(
-        &manifest
-            .placement_roots
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>(),
-    )?;
-
-    preflight_blob_placement_capacity_for_parts(
-        &manifest
-            .placement_roots
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>(),
-        0,
-        &planned_sizes,
-        manifest_data_shards(&manifest),
-        manifest_parity_shards(&manifest),
-        manifest.stripe_size_bytes,
-    )
-    .await?;
+    let manifest = prepare_upload_manifest(&fragment, &object_key, &params).await?;
+    let version_id = manifest.version_id.clone();
+    let session_id = manifest.session_id.clone();
 
     let path_manager = ObjectPathManager::new();
     ensure_version_shard_dirs(&path_manager, &manifest).await?;
@@ -1957,6 +2154,744 @@ pub async fn initiate_object_upload_direct(
         session_id,
         version_id,
     })
+}
+
+fn standard_request_matches(
+    session: &StandardUploadSession,
+    logical_path: &str,
+    params: &InitiateUploadParams,
+) -> bool {
+    let manifest = &session.manifest;
+    let content_type_matches = params
+        .content_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|requested| requested == manifest.content_type)
+        .unwrap_or(true);
+    let part_size_matches = params
+        .part_size_bytes
+        .filter(|value| *value > 0)
+        .map(|requested| requested == manifest.part_size_bytes)
+        .unwrap_or(true);
+
+    session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_OPEN
+        && session.logical_path == logical_path.trim_start_matches('/')
+        && manifest.total_size_bytes == params.total_size_bytes
+        && manifest.expected_parts == params.expected_parts
+        && part_size_matches
+        && content_type_matches
+}
+
+pub fn find_reusable_standard_upload(
+    fragment: &str,
+    logical_path: &str,
+    params: &InitiateUploadParams,
+) -> Result<Option<InitiateUploadResponse>, AppError> {
+    let registry = standard_registry_read()?;
+    Ok(registry
+        .values()
+        .filter(|session| session.manifest.fragment == fragment)
+        .filter(|session| standard_request_matches(session, logical_path, params))
+        .max_by_key(|session| session.manifest.created_at)
+        .map(|session| InitiateUploadResponse {
+            session_id: session.manifest.session_id.clone(),
+            version_id: session.manifest.version_id.clone(),
+        }))
+}
+
+/// Starts the standard multipart upload entirely in memory. The first durable
+/// write is the first part's EC shard stream; no manifest, namespace binding,
+/// upload directory, or receipt is written here.
+pub async fn initiate_standard_upload_direct(
+    claims: Claims,
+    fragment: String,
+    physical_object_key: String,
+    logical_path: String,
+    params: InitiateUploadParams,
+) -> Result<InitiateUploadResponse, AppError> {
+    ensure_user_mutations_allowed()?;
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    if let Some(existing) = find_reusable_standard_upload(&fragment, &logical_path, &params)? {
+        return Ok(existing);
+    }
+
+    let manifest = prepare_upload_manifest(&fragment, &physical_object_key, &params).await?;
+    let expected_parts = usize::try_from(manifest.expected_parts)
+        .map_err(|_| AppError::BadRequest("expected_parts is too large".into()))?;
+    let mut parts = Vec::new();
+    parts
+        .try_reserve_exact(expected_parts)
+        .map_err(|_| AppError::BadRequest("expected_parts is too large".into()))?;
+    parts.resize_with(expected_parts, StandardPartSlot::new);
+
+    let response = InitiateUploadResponse {
+        session_id: manifest.session_id.clone(),
+        version_id: manifest.version_id.clone(),
+    };
+    let normalized_logical = logical_path.trim_start_matches('/').to_string();
+    let session = Arc::new(StandardUploadSession {
+        manifest,
+        logical_path: normalized_logical,
+        lifecycle: AtomicU8::new(STANDARD_SESSION_OPEN),
+        in_flight_parts: AtomicUsize::new(0),
+        last_activity_at: AtomicI64::new(Utc::now().timestamp()),
+        directories_ready: tokio::sync::OnceCell::new(),
+        parts: parts.into_boxed_slice(),
+    });
+
+    let mut registry = standard_registry_write()?;
+    if let Some(existing) = registry
+        .values()
+        .filter(|existing| existing.manifest.fragment == fragment)
+        .find(|existing| standard_request_matches(existing, &logical_path, &params))
+    {
+        return Ok(InitiateUploadResponse {
+            session_id: existing.manifest.session_id.clone(),
+            version_id: existing.manifest.version_id.clone(),
+        });
+    }
+    registry.insert(
+        standard_session_key(&fragment, &response.version_id),
+        session,
+    );
+    Ok(response)
+}
+
+fn standard_part_record(metadata: &PartMetadata) -> Result<StandardPartRecord, AppError> {
+    let checksum = metadata
+        .checksum
+        .as_deref()
+        .map(|value| u32::from_str_radix(value, 16))
+        .transpose()
+        .map_err(|_| AppError::InternalServerError("invalid part CRC32".to_string()))?;
+    let shard_checksums = metadata
+        .shards
+        .iter()
+        .map(|shard| u32::from_str_radix(&shard.checksum, 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| AppError::InternalServerError("invalid shard CRC32".to_string()))?
+        .into_boxed_slice();
+    Ok(StandardPartRecord {
+        size_bytes: metadata.size_bytes,
+        created_at: metadata.created_at,
+        checksum,
+        shard_checksums,
+    })
+}
+
+fn standard_part_metadata(
+    path_manager: &ObjectPathManager,
+    session: &StandardUploadSession,
+    part_index: u64,
+) -> Result<PartMetadata, AppError> {
+    let slot = session
+        .parts
+        .get(part_index as usize)
+        .ok_or_else(|| AppError::BadRequest("Part index out of range".into()))?;
+    let record = slot
+        .record
+        .get()
+        .ok_or_else(|| AppError::Conflict(format!("Multipart part {part_index} is incomplete")))?;
+    let expected_shard_len = final_shard_len_for_part(
+        record.size_bytes,
+        manifest_data_shards(&session.manifest),
+        session.manifest.stripe_size_bytes,
+    );
+    let specs = shard_specs_for_part(path_manager, &session.manifest, part_index)?;
+    if specs.len() != record.shard_checksums.len() {
+        return Err(AppError::InternalServerError(
+            "standard multipart shard record is incomplete".to_string(),
+        ));
+    }
+    let shards = specs
+        .into_iter()
+        .zip(record.shard_checksums.iter())
+        .map(
+            |((shard_index, is_parity, absolute_path, file_name), checksum)| ShardInfo {
+                shard_index,
+                file_name,
+                absolute_path: absolute_path.to_string_lossy().to_string(),
+                size_bytes: expected_shard_len,
+                checksum: format_crc32_u32(*checksum),
+                is_parity,
+            },
+        )
+        .collect();
+    Ok(PartMetadata {
+        part_index,
+        size_bytes: record.size_bytes,
+        created_at: record.created_at,
+        shards,
+        checksum: record.checksum.map(format_crc32_u32),
+    })
+}
+
+enum StandardPartClaimResult<'a> {
+    Claimed(StandardPartClaim<'a>),
+    AlreadyComplete,
+}
+
+fn claim_standard_part(
+    session: &StandardUploadSession,
+    part_index: u64,
+) -> Result<StandardPartClaimResult<'_>, AppError> {
+    if session.lifecycle.load(Ordering::Acquire) != STANDARD_SESSION_OPEN {
+        return Err(AppError::Conflict(
+            "Multipart session is not accepting parts".to_string(),
+        ));
+    }
+    let slot = session
+        .parts
+        .get(part_index as usize)
+        .ok_or_else(|| AppError::BadRequest("Part index out of range".into()))?;
+    match slot.state.compare_exchange(
+        STANDARD_PART_EMPTY,
+        STANDARD_PART_UPLOADING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            session.in_flight_parts.fetch_add(1, Ordering::AcqRel);
+            session
+                .last_activity_at
+                .store(Utc::now().timestamp(), Ordering::Release);
+            if session.lifecycle.load(Ordering::Acquire) != STANDARD_SESSION_OPEN {
+                slot.state.store(STANDARD_PART_EMPTY, Ordering::Release);
+                session.in_flight_parts.fetch_sub(1, Ordering::AcqRel);
+                return Err(AppError::Conflict(
+                    "Multipart session is finalizing".to_string(),
+                ));
+            }
+            Ok(StandardPartClaimResult::Claimed(StandardPartClaim {
+                session,
+                slot,
+                completed: false,
+            }))
+        }
+        Err(STANDARD_PART_COMPLETE) => Ok(StandardPartClaimResult::AlreadyComplete),
+        Err(STANDARD_PART_UPLOADING) => Err(AppError::Conflict(
+            "Multipart part is already uploading".to_string(),
+        )),
+        Err(_) => Err(AppError::Conflict(
+            "Multipart part is unavailable".to_string(),
+        )),
+    }
+}
+
+fn validate_standard_part_request(
+    session: &StandardUploadSession,
+    part_index: u64,
+    content_length: u64,
+) -> Result<(), AppError> {
+    let expected = expected_part_size_bytes(&session.manifest, part_index)
+        .ok_or_else(|| AppError::BadRequest("Part index out of range".into()))?;
+    if content_length != expected {
+        return Err(AppError::BadRequest(format!(
+            "Part size does not match upload session: got {content_length}, expected {expected}"
+        )));
+    }
+    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
+    if content_length > max_part_size {
+        return Err(AppError::PayloadTooLarge("Part too large".into()));
+    }
+    Ok(())
+}
+
+async fn prepare_standard_part(session: &StandardUploadSession) -> Result<(), AppError> {
+    // Every part in a version shares the same K+M parent directories.
+    session
+        .directories_ready
+        .get_or_try_init(|| async {
+            ensure_version_shard_dirs(&ObjectPathManager::new(), &session.manifest).await
+        })
+        .await
+        .map(|_| ())
+}
+
+pub async fn object_upload_part_standard_body_direct(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    body: Body,
+    content_length: u64,
+) -> Result<(), AppError> {
+    ensure_user_mutations_allowed()?;
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let session = standard_session(&fragment, &version_id)?
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    validate_standard_part_request(&session, part_index, content_length)?;
+    let claim = match claim_standard_part(&session, part_index)? {
+        StandardPartClaimResult::AlreadyComplete => return Ok(()),
+        StandardPartClaimResult::Claimed(claim) => claim,
+    };
+
+    prepare_standard_part(&session).await?;
+    let gate_context = format!(
+        "standard fragment={}, version={}, part={}",
+        fragment, version_id, part_index
+    );
+    let io_guard = acquire_upload_io_guard_for_size(
+        Some(query.io_gate.unwrap_or(false)),
+        &fragment,
+        &gate_context,
+        content_length,
+    )
+    .await?;
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let metadata = write_part_blob_to_disk(
+        &ObjectPathManager::new(),
+        &fragment,
+        &session.manifest.object_key,
+        &version_id,
+        part_index,
+        content_length,
+        manifest_data_shards(&session.manifest),
+        manifest_parity_shards(&session.manifest),
+        session.manifest.stripe_size_bytes,
+        Some(&session.manifest.placement_roots),
+        body,
+        expected_checksum,
+        false,
+        io_progress.as_ref(),
+    )
+    .await?;
+
+    if session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_CANCELLED {
+        cleanup_files_best_effort(
+            &metadata
+                .shards
+                .iter()
+                .map(|shard| PathBuf::from(&shard.absolute_path))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        return Err(AppError::Conflict("Upload session was cancelled".into()));
+    }
+    claim.complete(standard_part_record(&metadata)?)?;
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
+    Ok(())
+}
+
+pub async fn object_upload_part_standard_reader_direct<R>(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    reader: &mut R,
+    content_length: u64,
+) -> Result<(), AppError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    ensure_user_mutations_allowed()?;
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let session = standard_session(&fragment, &version_id)?
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    validate_standard_part_request(&session, part_index, content_length)?;
+    let claim = match claim_standard_part(&session, part_index)? {
+        StandardPartClaimResult::AlreadyComplete => return Ok(()),
+        StandardPartClaimResult::Claimed(claim) => claim,
+    };
+    prepare_standard_part(&session).await?;
+    let gate_context = format!(
+        "standard-native fragment={}, version={}, part={}",
+        fragment, version_id, part_index
+    );
+    let io_guard = acquire_upload_io_guard_for_size(
+        Some(query.io_gate.unwrap_or(false)),
+        &fragment,
+        &gate_context,
+        content_length,
+    )
+    .await?;
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let metadata = write_part_blob_to_disk_from_reader(
+        &ObjectPathManager::new(),
+        &fragment,
+        &session.manifest.object_key,
+        &version_id,
+        part_index,
+        content_length,
+        manifest_data_shards(&session.manifest),
+        manifest_parity_shards(&session.manifest),
+        session.manifest.stripe_size_bytes,
+        Some(&session.manifest.placement_roots),
+        reader,
+        expected_checksum,
+        false,
+        io_progress.as_ref(),
+    )
+    .await?;
+    if session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_CANCELLED {
+        cleanup_files_best_effort(
+            &metadata
+                .shards
+                .iter()
+                .map(|shard| PathBuf::from(&shard.absolute_path))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+        return Err(AppError::Conflict("Upload session was cancelled".into()));
+    }
+    claim.complete(standard_part_record(&metadata)?)?;
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
+    Ok(())
+}
+
+pub fn get_standard_upload_status_direct(
+    claims: &Claims,
+    fragment: &str,
+    version_id: &str,
+) -> Result<UploadStatusResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let Some(session) = standard_session(fragment, version_id)? else {
+        return Ok(UploadStatusResponse::default());
+    };
+    let uploaded_parts = session
+        .parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            (slot.state.load(Ordering::Acquire) == STANDARD_PART_COMPLETE).then_some(index as u64)
+        })
+        .collect::<Vec<_>>();
+    let committed_bytes = uploaded_parts
+        .iter()
+        .filter_map(|index| session.parts[*index as usize].record.get())
+        .map(|record| record.size_bytes)
+        .sum();
+    Ok(UploadStatusResponse {
+        committed_parts: uploaded_parts.len() as u64,
+        committed_bytes,
+        uploaded_parts,
+        expected_parts: Some(session.manifest.expected_parts),
+        total_size_bytes: Some(session.manifest.total_size_bytes),
+        created_at: Some(session.manifest.created_at),
+        session_id: Some(session.manifest.session_id.clone()),
+        version_id: Some(session.manifest.version_id.clone()),
+        object_key: Some(session.logical_path.clone()),
+        physical_object_key: Some(session.manifest.object_key.clone()),
+    })
+}
+
+pub fn list_standard_uploads_direct(
+    claims: &Claims,
+    fragment: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<ListUploadsResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let registry = standard_registry_read()?;
+    let mut sessions = registry
+        .values()
+        .filter(|session| session.manifest.fragment == fragment)
+        .filter(|session| session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_OPEN)
+        .map(|session| {
+            let committed_parts = session
+                .parts
+                .iter()
+                .filter(|slot| slot.state.load(Ordering::Acquire) == STANDARD_PART_COMPLETE)
+                .count() as u64;
+            let committed_bytes = session
+                .parts
+                .iter()
+                .filter_map(|slot| slot.record.get())
+                .map(|record| record.size_bytes)
+                .sum();
+            ActiveSessionInfo {
+                session_id: session.manifest.session_id.clone(),
+                version_id: session.manifest.version_id.clone(),
+                object_key: Some(session.logical_path.clone()),
+                physical_object_key: Some(session.manifest.object_key.clone()),
+                created_at: session.manifest.created_at,
+                reserved_size: session.manifest.total_size_bytes,
+                total_size_bytes: Some(session.manifest.total_size_bytes),
+                expected_parts: Some(session.manifest.expected_parts),
+                committed_parts,
+                committed_bytes,
+            }
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let total = sessions.len();
+    Ok(ListUploadsResponse {
+        sessions: sessions
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(100))
+            .collect(),
+        total,
+    })
+}
+
+async fn sync_standard_parts(parts: &[PartMetadata]) -> Result<(), AppError> {
+    let mut files_by_shard = BTreeMap::<usize, Vec<PathBuf>>::new();
+    let mut directories = BTreeSet::<PathBuf>::new();
+    for part in parts {
+        for shard in &part.shards {
+            let path = PathBuf::from(&shard.absolute_path);
+            let parent = path.parent().ok_or_else(|| {
+                AppError::InternalServerError("shard path has no parent".to_string())
+            })?;
+            directories.insert(parent.to_path_buf());
+            files_by_shard
+                .entry(shard.shard_index)
+                .or_default()
+                .push(path);
+        }
+    }
+
+    let tasks = files_by_shard.into_values().map(|files| {
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            for path in files {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|err| AppError::Io(err, format!("open shard {}", path.display())))?;
+                file.sync_data()
+                    .map_err(|err| AppError::Io(err, format!("sync shard {}", path.display())))?;
+            }
+            Ok(())
+        })
+    });
+    for result in join_all(tasks).await {
+        result.map_err(|err| {
+            AppError::InternalServerError(format!("standard upload sync task failed: {err}"))
+        })??;
+    }
+    for result in join_all(directories.iter().map(|path| sync_dir(path))).await {
+        result?;
+    }
+    Ok(())
+}
+
+pub async fn finalize_standard_upload_direct(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    session_id: String,
+) -> Result<FinalizeUploadResult, AppError> {
+    ensure_user_mutations_allowed()?;
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let session = standard_session(&fragment, &version_id)?
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    if session.manifest.session_id != session_id {
+        return Err(AppError::Forbidden("Session id mismatch".into()));
+    }
+    let physical_object_key = session.manifest.object_key.clone();
+    if session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_FINALIZED {
+        return Ok(FinalizeUploadResult::Complete(
+            index::read_object_version(&fragment, &physical_object_key, &version_id).await?,
+        ));
+    }
+    session
+        .lifecycle
+        .compare_exchange(
+            STANDARD_SESSION_OPEN,
+            STANDARD_SESSION_FINALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| AppError::Conflict("Multipart session is busy".to_string()))?;
+
+    let present = session
+        .parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            (slot.state.load(Ordering::Acquire) == STANDARD_PART_COMPLETE).then_some(index as u64)
+        })
+        .collect::<BTreeSet<_>>();
+    let missing = (0..session.manifest.expected_parts)
+        .filter(|index| !present.contains(index))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || session.in_flight_parts.load(Ordering::Acquire) != 0 {
+        session
+            .lifecycle
+            .store(STANDARD_SESSION_OPEN, Ordering::Release);
+        return Ok(FinalizeUploadResult::Incomplete(
+            FinalizeIncompleteResponse {
+                uploaded_parts: present.into_iter().collect(),
+                missing_parts: missing,
+                expected_parts: session.manifest.expected_parts,
+            },
+        ));
+    }
+
+    let path_manager = ObjectPathManager::new();
+    let finalize_result = async {
+        let mut parts = (0..session.manifest.expected_parts)
+            .map(|index| standard_part_metadata(&path_manager, &session, index))
+            .collect::<Result<Vec<_>, _>>()?;
+        parts.sort_by_key(|part| part.part_index);
+        sync_standard_parts(&parts).await?;
+        let total_size_bytes = parts.iter().map(|part| part.size_bytes).sum();
+        let metadata = ObjectMetadata {
+            object_key: physical_object_key.clone(),
+            fragment: fragment.clone(),
+            version_id: version_id.clone(),
+            upload_session_id: session_id.clone(),
+            owner_uid: fragment.clone(),
+            content_type: session.manifest.content_type.clone(),
+            total_size_bytes,
+            created_at: session.manifest.created_at,
+            data_shards: session.manifest.data_shards,
+            parity_shards: session.manifest.parity_shards,
+            placement_generation: 0,
+            parts,
+            is_delete_marker: false,
+            stripe_size_bytes: session.manifest.stripe_size_bytes,
+        };
+        let _object_lock =
+            index::acquire_object_operation_lock(&fragment, &physical_object_key).await?;
+        index::publish_object(&metadata).await?;
+        Ok::<_, AppError>(metadata)
+    }
+    .await;
+
+    match finalize_result {
+        Ok(metadata) => {
+            session
+                .last_activity_at
+                .store(Utc::now().timestamp(), Ordering::Release);
+            session
+                .lifecycle
+                .store(STANDARD_SESSION_FINALIZED, Ordering::Release);
+            Ok(FinalizeUploadResult::Complete(metadata))
+        }
+        Err(err) => {
+            session
+                .lifecycle
+                .store(STANDARD_SESSION_OPEN, Ordering::Release);
+            Err(err)
+        }
+    }
+}
+
+pub fn complete_standard_upload(fragment: &str, version_id: &str) -> Result<(), AppError> {
+    let key = standard_session_key(fragment, version_id);
+    let mut registry = standard_registry_write()?;
+    if registry.get(&key).is_some_and(|session| {
+        session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_FINALIZED
+    }) {
+        registry.remove(&key);
+    }
+    Ok(())
+}
+
+pub fn cancel_standard_upload_direct(
+    claims: &Claims,
+    fragment: &str,
+    version_id: &str,
+) -> Result<(), AppError> {
+    ensure_user_mutations_allowed()?;
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let key = standard_session_key(fragment, version_id);
+    let mut registry = standard_registry_write()?;
+    let session = registry
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    session
+        .lifecycle
+        .compare_exchange(
+            STANDARD_SESSION_OPEN,
+            STANDARD_SESSION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| AppError::Conflict("Multipart session is busy".to_string()))?;
+    registry.remove(&key);
+    Ok(())
+}
+
+pub fn active_standard_upload_versions(fragment: &str) -> HashSet<String> {
+    let Ok(mut registry) = STANDARD_UPLOADS.write() else {
+        return HashSet::new();
+    };
+    let now = Utc::now().timestamp();
+    let ttl = CONFIG.garbage_collector.file_ttl_seconds as i64;
+    registry.retain(|_, session| {
+        if session.manifest.fragment != fragment {
+            return true;
+        }
+        let lifecycle = session.lifecycle.load(Ordering::Acquire);
+        let idle = now.saturating_sub(session.last_activity_at.load(Ordering::Acquire));
+        let expired = idle >= ttl
+            && session.in_flight_parts.load(Ordering::Acquire) == 0
+            && lifecycle != STANDARD_SESSION_FINALIZING;
+        if expired {
+            session
+                .lifecycle
+                .store(STANDARD_SESSION_CANCELLED, Ordering::Release);
+        }
+        !expired
+    });
+    registry
+        .values()
+        .filter(|session| session.manifest.fragment == fragment)
+        .filter(|session| {
+            matches!(
+                session.lifecycle.load(Ordering::Acquire),
+                STANDARD_SESSION_OPEN | STANDARD_SESSION_FINALIZING
+            )
+        })
+        .map(|session| session.manifest.version_id.clone())
+        .collect()
 }
 
 pub async fn list_active_uploads(

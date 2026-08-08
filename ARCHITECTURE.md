@@ -1,15 +1,15 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.3.0 development-engine storage contract. It is the reference for
+This document defines the N1 3.4.0 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.3.0 uses engine format 3 and preserves N1's immutable-object and
+N1 3.4.0 uses engine format 3 and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle,
 per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
-Version `3.3.0` identifies the current development package line; it does not
+Version `3.4.0` identifies the current development package line; it does not
 declare stable-release status. Engine format `3` is the independent on-disk
 compatibility boundary defined by this document.
 
@@ -249,7 +249,21 @@ recover-on-read, archive operations, and GC.
 
 ## Upload And Commit
 
-Incomplete upload state lives only in the index/control plane:
+N1 has two multipart contracts that share the same streaming EC writer and the
+same immutable final object representation.
+
+The standard high-throughput contract keeps its manifest and compact part
+completion state in bounded process memory. Initialization performs no storage
+write. Distinct parts independently claim one memory slot and stream through EC
+to the fixed object placement in parallel. There is no persistent binding or
+receipt. Finalize verifies that every part slot is complete, synchronizes all
+K+M shard files and their directories, publishes the immutable `.ndx`, and then
+publishes the namespace entry. Restart discards unfinished sessions; their
+unreferenced shard versions remain invisible and the TTL orphan scan reclaims
+them. GC treats live in-memory version ids as active while the process exists.
+
+The durable restart-resumable contract keeps incomplete state in the
+index/control plane:
 
 ```text
 .uploads/<version-id>/
@@ -259,8 +273,10 @@ Incomplete upload state lives only in the index/control plane:
   shard_p<part-index>_s<shard-index>.<crc32>.receipt
 ```
 
-Multipart parts stream through EC into temporary shard files. Receipts record
-durable progress without retaining the object body in memory.
+Durable multipart parts stream through EC into temporary shard files. Receipts
+record restart-survivable progress without retaining the object body in memory.
+The established native `n1://` multipart operations continue to use this
+durable contract.
 
 Finalize:
 
@@ -271,7 +287,9 @@ Finalize:
 5. publishes or updates the namespace symlink
 6. retires upload-session state
 
-The namespace becomes visible only after immutable object truth is durable.
+Neither contract makes the namespace visible before immutable object truth is
+durable. Direct upload remains the bounded small-object path: one request body
+streams directly through EC and performs the same final publication boundary.
 
 ## Erasure Placement
 
@@ -491,7 +509,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.3.0 is correct only while all of these remain true:
+N1 3.4.0 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.

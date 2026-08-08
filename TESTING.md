@@ -22,7 +22,7 @@ Run the release drill harness before tagging or deploying:
 scripts/bench/run_release_drills.sh
 ```
 
-The drill runs high-value workflow cases repeatedly and can include the HA chaos harness. For this workspace, direct every output and Cargo target to `/home/wlzambo/DEV-TEST`.
+The drill runs high-value workflow cases repeatedly and can include the HA chaos harness. For this workspace, direct every output and Cargo target to `/home/litiaina/DEV_TEST`.
 
 For a real large-file multipart restart proof as part of the release drill:
 
@@ -107,9 +107,17 @@ SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_rele
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
 
-## N1 3.3.0 Development Release Requirement
+## N1 3.4.0 Development Release Requirement
 
-N1 3.3.0 must retain the engine-format-3 storage invariants and additionally prove:
+N1 3.4.0 must retain the engine-format-3 storage invariants and additionally prove:
+
+- standard multipart init performs no persistent session or namespace write
+- distinct standard multipart parts execute concurrently and publish nothing before finalize
+- duplicate part submission is idempotent after completion and conflict-safe while in flight
+- finalize synchronizes the complete K+M shard set before publishing NDX and namespace state
+- unfinished standard sessions disappear on restart and their headless shards remain TTL-reclaimable
+- `/upload/multipart/durable` retains restart-resumable manifest and part-receipt behavior
+- local-server and LAN benchmarks record direct and multipart throughput independently
 
 - delete is soft-only across HTTP, POSIX, native protocol, shell, and console
 - each deletion receives a unique trash entry id
@@ -123,7 +131,7 @@ N1 3.3.0 must retain the engine-format-3 storage invariants and additionally pro
 - strict recovery returns `409 Conflict` without consuming trash when the live destination exists
 - legacy 3.2 direct-path trash is migrated offline before a 3.3 binary starts; live namespace and blob data do not move
 
-Evidence for the current release belongs under `/home/wlzambo/DEV-TEST` and
+Evidence for the current release belongs under `/home/litiaina/DEV_TEST` and
 must record the exact binary hash, configuration, disk topology, commands,
 results, and any unproven boundaries.
 

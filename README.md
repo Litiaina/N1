@@ -24,7 +24,7 @@ through its supported APIs or through the native client crate.
 
 ## Development Status
 
-- **Current engine/package version:** `3.3.0`
+- **Current engine/package version:** `3.4.0`
 - **Release channel:** development
 - **Storage engine format:** `3`
 - **Stable release for this engine line:** not yet declared

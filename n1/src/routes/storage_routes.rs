@@ -37,11 +37,13 @@ use crate::core::storage_capacity_parser::{
 };
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
-    cancel_upload_session as cancel_upload_session_impl,
-    finalize_object_upload as finalize_object_upload_impl,
-    get_upload_status as get_upload_status_impl,
-    initiate_object_upload as initiate_object_upload_impl,
-    list_active_uploads as list_active_uploads_impl, object_upload_part as object_upload_part_impl,
+    cancel_standard_upload_direct, cancel_upload_session as durable_cancel_upload_session_impl,
+    complete_standard_upload, finalize_object_upload as durable_finalize_object_upload_impl,
+    finalize_standard_upload_direct, find_reusable_standard_upload,
+    get_standard_upload_status_direct, get_upload_status as durable_get_upload_status_impl,
+    initiate_object_upload as durable_initiate_object_upload_impl, initiate_standard_upload_direct,
+    list_active_uploads as durable_list_active_uploads_impl, list_standard_uploads_direct,
+    object_upload_part as durable_object_upload_part_impl, object_upload_part_standard_body_direct,
     upload_object_one_shot as upload_object_one_shot_impl,
 };
 use crate::core::{index, index_store};
@@ -798,11 +800,128 @@ async fn initiate_object_upload_scoped(
     AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
+    if let Some(existing) = find_reusable_standard_upload(&fragment, &object_key, &params)? {
+        return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
+    }
+    let physical = resolve_logical_write_key(&fragment, &object_key).await?;
+    let response =
+        initiate_standard_upload_direct(claims, fragment, physical, object_key, params).await?;
+    Ok((StatusCode::CREATED, AxumJson(response)).into_response())
+}
+
+async fn get_upload_status_scoped(
+    claims: Claims,
+    Path(version_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    Ok(AxumJson(get_standard_upload_status_direct(
+        &claims,
+        &fragment,
+        &version_id,
+    )?))
+}
+
+async fn list_active_uploads_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(100);
+    let offset = params
+        .get("offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let fragment = claims.fragment.clone();
+    Ok(AxumJson(list_standard_uploads_direct(
+        &claims, &fragment, limit, offset,
+    )?))
+}
+
+async fn object_upload_part_scoped(
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path((version_id, part_index)): Path<(String, u64)>,
+    Query(query): Query<crate::core::disk_manager::UploadPartQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| AppError::BadRequest("Content-Length header required".into()))?;
+    let fragment = claims.fragment.clone();
+    object_upload_part_standard_body_direct(
+        claims,
+        fragment,
+        version_id,
+        part_index,
+        query,
+        body,
+        content_length,
+    )
+    .await?;
+    Ok((StatusCode::OK, "Part uploaded"))
+}
+
+async fn finalize_object_upload_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, session_id)): Path<(String, String)>,
+    Query(key_query): Query<crate::core::disk_manager::ObjectKeyQuery>,
+    AxumJson(_params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    match finalize_standard_upload_direct(claims, fragment.clone(), version_id.clone(), session_id)
+        .await?
+    {
+        crate::core::upload::FinalizeUploadResult::Incomplete(incomplete) => {
+            Ok((StatusCode::CONFLICT, AxumJson(incomplete)).into_response())
+        }
+        crate::core::upload::FinalizeUploadResult::Complete(mut metadata) => {
+            let logical_path = key_query.object_key;
+            let physical = metadata.object_key.clone();
+            let committed_physical =
+                commit_logical_upload_from_meta(&fragment, &logical_path, &physical, &metadata)
+                    .await?;
+            complete_standard_upload(&fragment, &version_id)?;
+            metadata.object_key = logical_path;
+            emit_logical_file_uploaded(
+                &state,
+                &fragment,
+                &metadata.object_key,
+                &committed_physical,
+                &metadata,
+            );
+            metadata.strip_internal_layout();
+            Ok((StatusCode::OK, AxumJson(metadata)).into_response())
+        }
+    }
+}
+
+async fn cancel_upload_session_scoped(
+    claims: Claims,
+    Path(version_id): Path<String>,
+    Query(_key_query): Query<crate::core::disk_manager::ObjectKeyQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    cancel_standard_upload_direct(&claims, &fragment, &version_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn initiate_object_upload_durable_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
     if let Some(existing) = find_reusable_pending_upload(&fragment, &object_key, &params).await? {
         return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
     }
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
-    let response = initiate_object_upload_impl(
+    let response = durable_initiate_object_upload_impl(
         claims,
         Path((fragment.clone(), physical.clone())),
         AxumJson(params),
@@ -867,12 +986,12 @@ async fn upload_object_one_shot_scoped(
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
 
-async fn get_upload_status_scoped(
+async fn get_upload_status_durable_scoped(
     claims: Claims,
     Path(version_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let response = get_upload_status_impl(claims, Path((fragment.clone(), version_id)))
+    let response = durable_get_upload_status_impl(claims, Path((fragment.clone(), version_id)))
         .await?
         .into_response();
     let mut parsed: crate::core::disk_manager::UploadStatusResponse =
@@ -881,12 +1000,12 @@ async fn get_upload_status_scoped(
     Ok(AxumJson(parsed))
 }
 
-async fn list_active_uploads_scoped(
+async fn list_active_uploads_durable_scoped(
     claims: Claims,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let response = list_active_uploads_impl(claims, Path(fragment.clone()), Query(params))
+    let response = durable_list_active_uploads_impl(claims, Path(fragment.clone()), Query(params))
         .await?
         .into_response();
     let mut parsed: crate::core::upload::ListUploadsResponse =
@@ -895,7 +1014,7 @@ async fn list_active_uploads_scoped(
     Ok(AxumJson(parsed))
 }
 
-async fn object_upload_part_scoped(
+async fn object_upload_part_durable_scoped(
     claims: Claims,
     headers: axum::http::HeaderMap,
     Path((version_id, part_index)): Path<(String, u64)>,
@@ -903,7 +1022,7 @@ async fn object_upload_part_scoped(
     body: axum::body::Body,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    object_upload_part_impl(
+    durable_object_upload_part_impl(
         claims,
         headers,
         Path((fragment, version_id, part_index)),
@@ -913,7 +1032,7 @@ async fn object_upload_part_scoped(
     .await
 }
 
-async fn finalize_object_upload_scoped(
+async fn finalize_object_upload_durable_scoped(
     State(state): State<Arc<AppState>>,
     claims: Claims,
     Path((version_id, session_id)): Path<(String, String)>,
@@ -928,7 +1047,7 @@ async fn finalize_object_upload_scoped(
         .as_ref()
         .map(|value| value.physical_object_id.clone())
         .unwrap_or_else(|| key_query.object_key.clone());
-    let response = finalize_object_upload_impl(
+    let response = durable_finalize_object_upload_impl(
         State(state.clone()),
         claims,
         Path((fragment.clone(), version_id.clone(), session_id)),
@@ -967,7 +1086,7 @@ async fn finalize_object_upload_scoped(
     Ok((StatusCode::OK, AxumJson(parsed)).into_response())
 }
 
-async fn cancel_upload_session_scoped(
+async fn cancel_upload_session_durable_scoped(
     claims: Claims,
     Path(version_id): Path<String>,
     Query(key_query): Query<crate::core::disk_manager::ObjectKeyQuery>,
@@ -980,7 +1099,7 @@ async fn cancel_upload_session_scoped(
         .as_ref()
         .map(|value| value.physical_object_id.clone())
         .unwrap_or(key_query.object_key);
-    let response = cancel_upload_session_impl(
+    let response = durable_cancel_upload_session_impl(
         claims,
         Path((fragment.clone(), version_id.clone())),
         Query(crate::core::disk_manager::ObjectKeyQuery {
@@ -1188,6 +1307,30 @@ pub fn build_storage_routes_unbound_with_options(
             .route(
                 "/noa/v1/upload/multipart/{:version_id}",
                 delete(cancel_upload_session_scoped),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable/init/{*object_key}",
+                post(initiate_object_upload_durable_scoped),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable/{:version_id}",
+                get(get_upload_status_durable_scoped),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable",
+                get(list_active_uploads_durable_scoped),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable/{:version_id}/{:part_index}",
+                put(object_upload_part_durable_scoped),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable/{:version_id}/{:session_id}/finalize",
+                post(finalize_object_upload_durable_scoped),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable/{:version_id}",
+                delete(cancel_upload_session_durable_scoped),
             )
             .merge(build_posix_write_routes());
 
