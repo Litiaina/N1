@@ -160,6 +160,9 @@ pub struct PeerShardTarget {
     pub shard_index: usize,
     pub is_parity: bool,
     pub expected_len: u64,
+    /// Standard multipart publishes the stable shard name immediately but
+    /// defers file/directory fsync until the single finalize boundary.
+    pub deferred_durability: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +171,8 @@ pub struct PeerObjectMetadataRequest {
     pub target_instance_id: String,
     pub binding_epoch: u64,
     pub metadata: ObjectMetadata,
+    #[serde(default)]
+    pub sync_shards_before_publish: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +308,8 @@ pub struct PeerShardQuery {
     pub offset: Option<u64>,
     #[serde(default)]
     pub length: Option<usize>,
+    #[serde(default)]
+    pub deferred_durability: bool,
 }
 
 pub struct RemoteShardWriter {
@@ -443,6 +450,7 @@ async fn native_put_peer_shard(
         expected_len: Some(target.expected_len),
         offset: None,
         length: None,
+        deferred_durability: target.deferred_durability,
     };
     let request = NativeRequest {
         id: format!("peer-put-{}", Ulid::new()),
@@ -581,6 +589,7 @@ async fn post_object_metadata(
     node: &ClusterNode,
     binding_epoch: u64,
     metadata: &ObjectMetadata,
+    sync_shards_before_publish: bool,
 ) -> Result<(), AppError> {
     let client = peer_http_client()?;
     let url = format!(
@@ -592,6 +601,7 @@ async fn post_object_metadata(
         target_instance_id: node.instance_id.clone(),
         binding_epoch,
         metadata: metadata.clone(),
+        sync_shards_before_publish,
     });
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
@@ -693,7 +703,71 @@ fn validate_metadata_pool_contract(
     Ok(participant_ids)
 }
 
+async fn sync_local_object_shards(
+    runtime: &ClusterRuntime,
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
+    let mut directories = BTreeSet::new();
+    for shard in metadata.parts.iter().flat_map(|part| part.shards.iter()) {
+        let locator = parse_peer_shard_locator(&shard.absolute_path).ok_or_else(|| {
+            AppError::Conflict(format!(
+                "standard multipart shard '{}' has no exact N2 locator",
+                shard.file_name
+            ))
+        })?;
+        if locator.node_id != runtime.local_node_id {
+            continue;
+        }
+        let (file, path) = open_local_shard_for_read(
+            runtime,
+            &locator.root_id,
+            &locator.fragment,
+            &locator.object_id,
+            &locator.version_id,
+            &shard.file_name,
+        )
+        .await?;
+        let actual = file
+            .metadata()
+            .await
+            .map_err(|error| AppError::Io(error, format!("stat shard {}", path.display())))?
+            .len();
+        if actual != shard.size_bytes {
+            return Err(AppError::Conflict(format!(
+                "standard multipart shard '{}' has {} bytes, expected {}",
+                shard.file_name, actual, shard.size_bytes
+            )));
+        }
+        file.sync_data()
+            .await
+            .map_err(|error| AppError::Io(error, format!("sync shard {}", path.display())))?;
+        if let Some(parent) = path.parent() {
+            directories.insert(parent.to_path_buf());
+        }
+    }
+    for directory in directories {
+        crate::core::upload::sync_dir(&directory).await?;
+    }
+    Ok(())
+}
+
 pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Result<(), AppError> {
+    publish_cluster_object_metadata_mode(metadata, false).await
+}
+
+/// Standard multipart's single durable commit boundary. Every participant
+/// fsyncs its already-written shard files before it publishes the immutable
+/// NCDX replica. NCNX publication remains the caller's final visibility step.
+pub async fn publish_cluster_object_metadata_after_shard_sync(
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
+    publish_cluster_object_metadata_mode(metadata, true).await
+}
+
+async fn publish_cluster_object_metadata_mode(
+    metadata: &ObjectMetadata,
+    sync_shards_before_publish: bool,
+) -> Result<(), AppError> {
     let runtime = active_cluster_runtime()?;
     let participant_ids = validate_metadata_pool_contract(&runtime, metadata)?;
 
@@ -714,12 +788,16 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
         let metadata = metadata.clone();
         let local_node_id = runtime.local_node_id.clone();
         let binding_epoch = runtime.membership.binding_epoch;
+        let runtime = runtime.clone();
         tasks.push(async move {
             let participant = node_id.clone();
             if node_id == local_node_id {
+                if sync_shards_before_publish {
+                    sync_local_object_shards(&runtime, &metadata).await?;
+                }
                 index::publish_object(&metadata).await.map(|_| participant)
             } else {
-                post_object_metadata(&node, binding_epoch, &metadata)
+                post_object_metadata(&node, binding_epoch, &metadata, sync_shards_before_publish)
                     .await
                     .map(|_| participant)
             }
@@ -797,7 +875,7 @@ async fn repair_metadata_on_node(
     if node.id == runtime.local_node_id {
         index::publish_object(metadata).await.map(|_| ())
     } else {
-        post_object_metadata(node, runtime.membership.binding_epoch, metadata).await
+        post_object_metadata(node, runtime.membership.binding_epoch, metadata, false).await
     }
 }
 
@@ -1032,6 +1110,9 @@ pub async fn peer_publish_object_metadata(
         ));
     }
     validate_metadata_pool_contract(&runtime, &request.metadata)?;
+    if request.sync_shards_before_publish {
+        sync_local_object_shards(&runtime, &request.metadata).await?;
+    }
     index::publish_object(&request.metadata).await?;
     Ok(StatusCode::CREATED)
 }
@@ -1923,7 +2004,7 @@ pub fn resolve_peer_shard_locator(
 
 fn peer_shard_url(target: &PeerShardTarget) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}/{}?pool_id={}&pool_generation={}&slot_id={}&instance_id={}&binding_epoch={}&root_id={}&parity={}&expected_len={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?pool_id={}&pool_generation={}&slot_id={}&instance_id={}&binding_epoch={}&root_id={}&parity={}&expected_len={}&deferred_durability={}",
         target.endpoint.trim_end_matches('/'),
         encode_segment(&target.fragment),
         encode_segment(&target.object_id),
@@ -1937,7 +2018,8 @@ fn peer_shard_url(target: &PeerShardTarget) -> String {
         target.binding_epoch,
         encode_segment(&target.root_id),
         target.is_parity,
-        target.expected_len
+        target.expected_len,
+        target.deferred_durability
     )
 }
 
@@ -2069,6 +2151,7 @@ async fn native_get_peer_shard(
         expected_len: None,
         offset: Some(offset),
         length: Some(length),
+        deferred_durability: false,
     };
     let request = NativeRequest {
         id: format!("peer-get-{}", Ulid::new()),
@@ -2385,9 +2468,11 @@ pub async fn peer_put_shard(
             written, expected_len
         )));
     }
-    file.sync_data()
-        .await
-        .map_err(|e| AppError::Io(e, format!("sync peer shard {}", tmp_path.display())))?;
+    if !query.deferred_durability {
+        file.sync_data()
+            .await
+            .map_err(|e| AppError::Io(e, format!("sync peer shard {}", tmp_path.display())))?;
+    }
     drop(file);
     if fs::try_exists(&stable_path).await.unwrap_or(false) {
         let _ = fs::remove_file(&stable_path).await;
@@ -2402,7 +2487,9 @@ pub async fn peer_put_shard(
             ),
         )
     })?;
-    crate::core::upload::sync_dir(&dir).await?;
+    if !query.deferred_durability {
+        crate::core::upload::sync_dir(&dir).await?;
+    }
     let info = ShardInfo {
         shard_index,
         file_name,
@@ -2539,6 +2626,8 @@ pub struct NativePeerShardPayload {
     pub offset: Option<u64>,
     #[serde(default)]
     pub length: Option<usize>,
+    #[serde(default)]
+    pub deferred_durability: bool,
 }
 
 fn authorize_peer_secret(secret: Option<&str>) -> Result<(), AppError> {
@@ -2627,9 +2716,11 @@ where
             written, body_len, expected_len
         )));
     }
-    file.sync_data()
-        .await
-        .map_err(|e| AppError::Io(e, format!("sync native peer shard {}", tmp_path.display())))?;
+    if !payload.deferred_durability {
+        file.sync_data().await.map_err(|e| {
+            AppError::Io(e, format!("sync native peer shard {}", tmp_path.display()))
+        })?;
+    }
     drop(file);
     if fs::try_exists(&stable_path).await.unwrap_or(false) {
         let _ = fs::remove_file(&stable_path).await;
@@ -2644,7 +2735,9 @@ where
             ),
         )
     })?;
-    crate::core::upload::sync_dir(&dir).await?;
+    if !payload.deferred_durability {
+        crate::core::upload::sync_dir(&dir).await?;
+    }
     invalidate_local_usage_cache(Some(&payload.fragment));
     Ok(ShardInfo {
         shard_index: payload.shard_index,
@@ -2844,6 +2937,7 @@ mod tests {
             part_index: 7,
             shard_index: 2,
             is_parity: true,
+            deferred_durability: false,
             expected_len: 128,
         };
         let encoded = encode_peer_shard_locator(&target);
@@ -2859,6 +2953,29 @@ mod tests {
         assert_eq!(decoded.part_index, target.part_index);
         assert_eq!(decoded.shard_index, target.shard_index);
         assert_eq!(decoded.is_parity, target.is_parity);
+    }
+
+    #[test]
+    fn peer_shard_write_propagates_deferred_durability_explicitly() {
+        let target = PeerShardTarget {
+            pool_id: "pool-a".into(),
+            pool_generation: 1,
+            node_id: "node-a".into(),
+            instance_id: "instance-a".into(),
+            binding_epoch: 1,
+            root_id: "blob-root-a".into(),
+            endpoint: "https://node-a.local:50001".into(),
+            fragment: "frag".into(),
+            object_id: "object-1".into(),
+            version_id: "01KTEST".into(),
+            part_index: 7,
+            shard_index: 2,
+            is_parity: true,
+            deferred_durability: true,
+            expected_len: 128,
+        };
+
+        assert!(peer_shard_url(&target).contains("deferred_durability=true"));
     }
 
     #[test]

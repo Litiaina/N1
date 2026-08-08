@@ -117,6 +117,43 @@ intentional topology outage is safe and observable, but the topology must be
 restored and every final proof run must complete before a release result can be
 `PASS`.
 
+### N2 3.4.1 multipart contract proof
+
+The finite two-process `1 + 1` upload proof completed on 2026-08-08 and is
+retained at:
+
+```text
+/home/litiaina/DEV_TEST/n2-upload-modes-20260808-233108
+```
+
+It used the optimized release binary, one local storage root per N2 process,
+eight 16 MiB parts per 128 MiB object, and four concurrent client workers. It
+proved the API and commit contract rather than independent-disk or network
+capacity; both simulated nodes shared this machine's physical storage stack.
+
+| Invariant | Result |
+| --- | --- |
+| Standard init writes manifest, pending binding, or part receipts | PASS: `.uploads` file count did not change |
+| Independent standard parts execute concurrently | PASS: 8 parts, 4 client workers |
+| Object or NCDX visible before finalize | PASS: download returned 404 and version NCDX count was zero |
+| Standard finalize durability order | PASS: exact shard holders synced, NCDX published, then NCNX became visible |
+| Standard download after finalize | PASS: SHA-256/byte exact |
+| Standard coordinator restart | PASS: only unfinished in-memory resumability was lost; no object became live |
+| Durable coordinator restart | PASS: persisted part 0 was recovered and finalized byte-exactly |
+| Engine panic/internal-server-error log lines | PASS: zero |
+
+Observed on this same-host proof topology:
+
+- standard multipart: 128 MiB in 1.775637 seconds, 72.09 MiB/s;
+- durable multipart: 128 MiB in 1.951550 seconds, 65.59 MiB/s;
+- combined process CPU during the two measured uploads: 12.21 user seconds and
+  1.10 system seconds;
+- combined kernel-accounted writes: 537,010,176 bytes;
+- end-of-measurement combined RSS: 169,000,960 bytes.
+
+These figures compare the two contracts on this host. They are not an
+independent-device, multi-host, or maximum-throughput claim.
+
 ### N2 3.4.0 survival soak
 
 The independent 24-hour four-node `2 + 2` survival soak started on

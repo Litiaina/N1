@@ -71,6 +71,30 @@ pub fn router(state: GatewayState) -> Router {
             delete(multipart_cancel),
         )
         .route(
+            "/noa/v1/upload/multipart/durable/init/{*object_key}",
+            post(multipart_durable_init),
+        )
+        .route(
+            "/noa/v1/upload/multipart/durable",
+            get(multipart_durable_list),
+        )
+        .route(
+            "/noa/v1/upload/multipart/durable/{version_id}/{part_index}",
+            put(multipart_durable_put_part),
+        )
+        .route(
+            "/noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize",
+            post(multipart_durable_finalize),
+        )
+        .route(
+            "/noa/v1/upload/multipart/durable/{version_id}",
+            get(multipart_durable_status),
+        )
+        .route(
+            "/noa/v1/upload/multipart/durable/{version_id}",
+            delete(multipart_durable_cancel),
+        )
+        .route(
             "/noa/v1/upload/one-shot/{*object_key}",
             post(one_shot_upload),
         )
@@ -78,6 +102,56 @@ pub fn router(state: GatewayState) -> Router {
         .fallback(proxy_fallback)
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+#[derive(Clone, Copy)]
+enum MultipartMode {
+    Standard,
+    Durable,
+}
+
+impl MultipartMode {
+    fn init_op(self) -> &'static str {
+        match self {
+            Self::Standard => "upload.multipart.standard.init",
+            Self::Durable => "upload.multipart.durable.init",
+        }
+    }
+
+    fn put_part_op(self) -> &'static str {
+        match self {
+            Self::Standard => "upload.multipart.standard.put_part",
+            Self::Durable => "upload.multipart.durable.put_part",
+        }
+    }
+
+    fn status_op(self) -> &'static str {
+        match self {
+            Self::Standard => "uploads.standard.status",
+            Self::Durable => "uploads.durable.status",
+        }
+    }
+
+    fn finalize_op(self) -> &'static str {
+        match self {
+            Self::Standard => "upload.multipart.standard.finalize",
+            Self::Durable => "upload.multipart.durable.finalize",
+        }
+    }
+
+    fn cancel_op(self) -> &'static str {
+        match self {
+            Self::Standard => "upload.multipart.standard.cancel",
+            Self::Durable => "upload.multipart.durable.cancel",
+        }
+    }
+
+    fn http_path(self) -> &'static str {
+        match self {
+            Self::Standard => "/noa/v1/upload/multipart",
+            Self::Durable => "/noa/v1/upload/multipart/durable",
+        }
+    }
 }
 
 async fn websocket_proxy(
@@ -399,7 +473,26 @@ async fn multipart_init(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     Path(object_key): Path<String>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    multipart_init_mode(state, headers, object_key, payload, MultipartMode::Standard).await
+}
+
+async fn multipart_durable_init(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(object_key): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    multipart_init_mode(state, headers, object_key, payload, MultipartMode::Durable).await
+}
+
+async fn multipart_init_mode(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    object_key: String,
+    mut payload: Value,
+    mode: MultipartMode,
 ) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
@@ -411,11 +504,10 @@ async fn multipart_init(
         Err(response) => return response,
     };
     payload["object_key"] = Value::String(object_key.clone());
-    let (status, mut body) =
-        match native_json(&node, &bearer, "upload.multipart.init", payload).await {
-            Ok(value) => value,
-            Err(err) => return upstream_failed(&state, &node, err).await,
-        };
+    let (status, mut body) = match native_json(&node, &bearer, mode.init_op(), payload).await {
+        Ok(value) => value,
+        Err(err) => return upstream_failed(&state, &node, err).await,
+    };
     if status < 300 {
         body["coordinator_node_id"] = Value::String(node.id.clone());
         body["gateway"] = json!({
@@ -431,6 +523,23 @@ async fn multipart_list(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    multipart_list_mode(state, headers, query, MultipartMode::Standard).await
+}
+
+async fn multipart_durable_list(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    multipart_list_mode(state, headers, query, MultipartMode::Durable).await
+}
+
+async fn multipart_list_mode(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    query: HashMap<String, String>,
+    mode: MultipartMode,
 ) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
@@ -459,7 +568,7 @@ async fn multipart_list(
         let http = state.http.clone();
         async move {
             let result =
-                list_multipart_sessions_on_node(&http, &node, &bearer, per_node_target).await;
+                list_multipart_sessions_on_node(&http, &node, &bearer, per_node_target, mode).await;
             (node, result)
         }
     }))
@@ -546,6 +655,7 @@ async fn list_multipart_sessions_on_node(
     node: &NodeConfig,
     bearer: &str,
     target: usize,
+    mode: MultipartMode,
 ) -> Result<(Vec<Value>, usize), MultipartListNodeError> {
     let mut sessions = Vec::new();
     let mut total = 0usize;
@@ -556,8 +666,9 @@ async fn list_multipart_sessions_on_node(
         let page_limit = remaining.min(100);
         let response = http
             .get(format!(
-                "{}/noa/v1/upload/multipart",
-                node.http_url.trim_end_matches('/')
+                "{}{}",
+                node.http_url.trim_end_matches('/'),
+                mode.http_path()
             ))
             .bearer_auth(bearer)
             .query(&[("limit", page_limit), ("offset", node_offset)])
@@ -743,6 +854,46 @@ async fn multipart_put_part(
     Query(query): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response<Body> {
+    multipart_put_part_mode(
+        state,
+        headers,
+        version_id,
+        part_index,
+        query,
+        body,
+        MultipartMode::Standard,
+    )
+    .await
+}
+
+async fn multipart_durable_put_part(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path((version_id, part_index)): Path<(String, u64)>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Body,
+) -> Response<Body> {
+    multipart_put_part_mode(
+        state,
+        headers,
+        version_id,
+        part_index,
+        query,
+        body,
+        MultipartMode::Durable,
+    )
+    .await
+}
+
+async fn multipart_put_part_mode(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    version_id: String,
+    part_index: u64,
+    query: HashMap<String, String>,
+    body: Body,
+    mode: MultipartMode,
+) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
@@ -758,16 +909,7 @@ async fn multipart_put_part(
     let mut payload = query_to_json(query);
     payload["version_id"] = Value::String(version_id);
     payload["part_index"] = Value::Number(part_index.into());
-    match native_upload_body(
-        &node,
-        &bearer,
-        "upload.multipart.put_part",
-        payload,
-        body,
-        body_len,
-    )
-    .await
-    {
+    match native_upload_body(&node, &bearer, mode.put_part_op(), payload, body, body_len).await {
         Ok((status, value)) => json_response(status, value),
         Err(err) => upstream_failed(&state, &node, err).await,
     }
@@ -778,6 +920,25 @@ async fn multipart_status(
     headers: HeaderMap,
     Path(version_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    multipart_status_mode(state, headers, version_id, query, MultipartMode::Standard).await
+}
+
+async fn multipart_durable_status(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(version_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    multipart_status_mode(state, headers, version_id, query, MultipartMode::Durable).await
+}
+
+async fn multipart_status_mode(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    version_id: String,
+    query: HashMap<String, String>,
+    mode: MultipartMode,
 ) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
@@ -790,7 +951,7 @@ async fn multipart_status(
     match native_json(
         &node,
         &bearer,
-        "uploads.status",
+        mode.status_op(),
         json!({ "version_id": version_id }),
     )
     .await
@@ -805,7 +966,47 @@ async fn multipart_finalize(
     headers: HeaderMap,
     Path((version_id, session_id)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    multipart_finalize_mode(
+        state,
+        headers,
+        version_id,
+        session_id,
+        query,
+        payload,
+        MultipartMode::Standard,
+    )
+    .await
+}
+
+async fn multipart_durable_finalize(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path((version_id, session_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    multipart_finalize_mode(
+        state,
+        headers,
+        version_id,
+        session_id,
+        query,
+        payload,
+        MultipartMode::Durable,
+    )
+    .await
+}
+
+async fn multipart_finalize_mode(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    version_id: String,
+    session_id: String,
+    query: HashMap<String, String>,
+    mut payload: Value,
+    mode: MultipartMode,
 ) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
@@ -820,7 +1021,7 @@ async fn multipart_finalize(
     if let Some(object_key) = query.get("object_key") {
         payload["object_key"] = Value::String(object_key.clone());
     }
-    match native_json(&node, &bearer, "upload.multipart.finalize", payload).await {
+    match native_json(&node, &bearer, mode.finalize_op(), payload).await {
         Ok((status, value)) => json_response(status, value),
         Err(err) => upstream_failed(&state, &node, err).await,
     }
@@ -832,6 +1033,25 @@ async fn multipart_cancel(
     Path(version_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response<Body> {
+    multipart_cancel_mode(state, headers, version_id, query, MultipartMode::Standard).await
+}
+
+async fn multipart_durable_cancel(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Path(version_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    multipart_cancel_mode(state, headers, version_id, query, MultipartMode::Durable).await
+}
+
+async fn multipart_cancel_mode(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    version_id: String,
+    query: HashMap<String, String>,
+    mode: MultipartMode,
+) -> Response<Body> {
     let bearer = match bearer_from_headers(&headers) {
         Ok(value) => value,
         Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
@@ -842,7 +1062,7 @@ async fn multipart_cancel(
     };
     let mut payload = query_to_json(query);
     payload["version_id"] = Value::String(version_id.clone());
-    match native_json(&node, &bearer, "upload.multipart.cancel", payload).await {
+    match native_json(&node, &bearer, mode.cancel_op(), payload).await {
         Ok((status, value)) => json_response(status, value),
         Err(err) => upstream_failed(&state, &node, err).await,
     }
@@ -1193,25 +1413,25 @@ mod tests {
     async fn spawn_mock_native_node(node_id: &'static str) -> MockNativeNode {
         let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_url = format!("http://{}", http_listener.local_addr().unwrap());
-        let http_app = Router::new().route(
-            "/noa/v1/upload/multipart",
-            get(move || async move {
-                Json(json!({
-                    "sessions": [{
-                        "session_id": format!("session-{node_id}"),
-                        "version_id": format!("version-{node_id}"),
-                        "object_key": format!("uploads/{node_id}.bin"),
-                        "created_at": if node_id == "node-a" { 2 } else { 1 },
-                        "reserved_size": 0,
-                        "total_size_bytes": 1024,
-                        "expected_parts": 1,
-                        "committed_parts": 0,
-                        "committed_bytes": 0
-                    }],
-                    "total": 1
-                }))
-            }),
-        );
+        let multipart_listing = move || async move {
+            Json(json!({
+                "sessions": [{
+                    "session_id": format!("session-{node_id}"),
+                    "version_id": format!("version-{node_id}"),
+                    "object_key": format!("uploads/{node_id}.bin"),
+                    "created_at": if node_id == "node-a" { 2 } else { 1 },
+                    "reserved_size": 0,
+                    "total_size_bytes": 1024,
+                    "expected_parts": 1,
+                    "committed_parts": 0,
+                    "committed_bytes": 0
+                }],
+                "total": 1
+            }))
+        };
+        let http_app = Router::new()
+            .route("/noa/v1/upload/multipart", get(multipart_listing))
+            .route("/noa/v1/upload/multipart/durable", get(multipart_listing));
         tokio::spawn(async move {
             axum::serve(http_listener, http_app).await.unwrap();
         });
@@ -1291,14 +1511,24 @@ mod tests {
             }
             let (status, body) = match request.op.as_str() {
                 "auth.bearer" => (200, json!({ "node": node_id, "authenticated": true })),
-                "upload.multipart.init" => (
+                "upload.multipart.init"
+                | "upload.multipart.standard.init"
+                | "upload.multipart.durable.init" => (
                     201,
                     json!({ "session_id": "sess-a", "version_id": "ver-a" }),
                 ),
-                "upload.multipart.put_part" => (200, json!({ "stored": true })),
-                "uploads.status" => (200, json!({ "status": "open" })),
-                "upload.multipart.finalize" => (200, json!({ "finalized": true })),
-                "upload.multipart.cancel" => (204, json!({})),
+                "upload.multipart.put_part"
+                | "upload.multipart.standard.put_part"
+                | "upload.multipart.durable.put_part" => (200, json!({ "stored": true })),
+                "uploads.status" | "uploads.standard.status" | "uploads.durable.status" => {
+                    (200, json!({ "status": "open" }))
+                }
+                "upload.multipart.finalize"
+                | "upload.multipart.standard.finalize"
+                | "upload.multipart.durable.finalize" => (200, json!({ "finalized": true })),
+                "upload.multipart.cancel"
+                | "upload.multipart.standard.cancel"
+                | "upload.multipart.durable.cancel" => (204, json!({})),
                 "upload.one_shot" => (201, json!({ "version_id": "one-shot" })),
                 "ping" => (200, json!({ "status": "ok" })),
                 other => (200, json!({ "op": other, "node": node_id })),
@@ -1653,11 +1883,88 @@ mod tests {
 
         let ops_a = node_a.operations.lock().await.clone();
         let ops_b = node_b.operations.lock().await.clone();
-        assert!(ops_a.contains(&"upload.multipart.put_part".to_string()));
-        assert!(ops_a.contains(&"uploads.status".to_string()));
-        assert!(ops_a.contains(&"upload.multipart.finalize".to_string()));
-        assert!(ops_a.contains(&"upload.multipart.cancel".to_string()));
-        assert!(!ops_b.contains(&"upload.multipart.put_part".to_string()));
+        assert!(ops_a.contains(&"upload.multipart.standard.put_part".to_string()));
+        assert!(ops_a.contains(&"uploads.standard.status".to_string()));
+        assert!(ops_a.contains(&"upload.multipart.standard.finalize".to_string()));
+        assert!(ops_a.contains(&"upload.multipart.standard.cancel".to_string()));
+        assert!(!ops_b.contains(&"upload.multipart.standard.put_part".to_string()));
+    }
+
+    #[tokio::test]
+    async fn durable_multipart_followups_remain_on_the_selected_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(
+                        "/noa/v1/upload/multipart/durable/ver-a/0?sha256=123&coordinator_node_id=node-a",
+                    )
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .header(header::CONTENT_LENGTH, "5")
+                    .body(Body::from("hello"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/noa/v1/upload/multipart/durable/ver-a?coordinator_node_id=node-a")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/noa/v1/upload/multipart/durable/ver-a/sess-a/finalize?coordinator_node_id=node-a",
+                    )
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/noa/v1/upload/multipart/durable/ver-a?coordinator_node_id=node-a")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let ops_a = node_a.operations.lock().await.clone();
+        let ops_b = node_b.operations.lock().await.clone();
+        assert!(ops_a.contains(&"upload.multipart.durable.put_part".to_string()));
+        assert!(ops_a.contains(&"uploads.durable.status".to_string()));
+        assert!(ops_a.contains(&"upload.multipart.durable.finalize".to_string()));
+        assert!(ops_a.contains(&"upload.multipart.durable.cancel".to_string()));
+        assert!(!ops_b.contains(&"upload.multipart.durable.put_part".to_string()));
     }
 
     #[tokio::test]

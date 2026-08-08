@@ -233,8 +233,12 @@ impl N2NativeClient {
         write_control_frame(&mut self.stream, &request).await?;
         self.stream.flush().await?;
 
-        let response = read_response(&mut self.stream).await?;
+        let mut response = read_response(&mut self.stream).await?;
         ensure_response_id(&response, &id)?;
+        if !response.ok {
+            read_response_body(&mut self.stream, &mut response).await?;
+            return Ok((response, 0));
+        }
         let body_len = response.body_len.unwrap_or(0);
         let bytes =
             stream_response_body(&mut self.stream, body_len, |chunk| on_chunk(chunk)).await?;
@@ -367,6 +371,29 @@ mod tests {
             err,
             NativeClientError::Native { code, message }
                 if code == "status_400" && message == "Fragment not found"
+        ));
+    }
+
+    #[test]
+    fn ensure_native_ok_reports_control_frame_error() {
+        let response = NativeResponse {
+            id: "test".to_string(),
+            ok: false,
+            status: Some(404),
+            payload: None,
+            body: None,
+            body_len: None,
+            error: Some(crate::types::NativeError {
+                code: "status_404".to_string(),
+                message: "Not found".to_string(),
+            }),
+        };
+
+        let err = ensure_native_ok(&response).expect_err("response should fail");
+        assert!(matches!(
+            err,
+            NativeClientError::Native { code, message }
+                if code == "status_404" && message == "Not found"
         ));
     }
 }

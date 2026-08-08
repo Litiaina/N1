@@ -1099,6 +1099,7 @@ mod tests {
                         shard_index: placement.shard_index,
                         is_parity,
                         expected_len: 1,
+                        deferred_durability: false,
                     })
                 };
                 ShardInfo {

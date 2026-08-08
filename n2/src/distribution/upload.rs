@@ -1,19 +1,21 @@
 use crate::core::checksum::Sha256Digest;
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
-    InitiateUploadParams, InitiateUploadResponse, ObjectMetadata, ObjectPathManager, PartMetadata,
-    ShardInfo, UploadPartQuery,
+    FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectMetadata,
+    ObjectPathManager, PartMetadata, ShardInfo, UploadPartQuery, UploadStatusResponse,
 };
 use crate::core::ec::ErasureStreamWriter;
 use crate::core::index;
+use crate::core::upload::{
+    ActiveSessionInfo, FinalizeUploadResult, ListUploadsResponse, UploadSessionManifest,
+};
 use crate::core::upload::{DirectWriter, create_direct_file};
-use crate::core::upload::{FinalizeUploadResult, UploadSessionManifest};
 use crate::distribution::membership::{
     active_cluster_runtime, live_active_write_nodes_for_pool, live_newest_pool_write_nodes,
 };
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
-    publish_cluster_object_metadata,
+    publish_cluster_object_metadata, publish_cluster_object_metadata_after_shard_sync,
 };
 use crate::distribution::placement::{ClusterPlacementPlan, build_placement_plan};
 use crate::distribution::root_routing::writable_local_roots;
@@ -22,9 +24,11 @@ use crate::distribution::{
 };
 use crate::enums::app_error_enum::AppError;
 use crate::io_control::record_io_latency;
+use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
 use bytes::Bytes;
 use chrono::Utc;
+use dashmap::DashMap;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
@@ -32,6 +36,8 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::fs;
@@ -43,6 +49,171 @@ const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
 pub const CLUSTER_ONE_SHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+const STANDARD_SESSION_OPEN: u8 = 0;
+const STANDARD_SESSION_FINALIZING: u8 = 1;
+const STANDARD_SESSION_FINALIZED: u8 = 2;
+const STANDARD_SESSION_CANCELLED: u8 = 3;
+const STANDARD_PART_EMPTY: u8 = 0;
+const STANDARD_PART_UPLOADING: u8 = 1;
+const STANDARD_PART_COMPLETE: u8 = 2;
+
+/// Coordinator-local state for N2's speed-first multipart family. DashMap
+/// shards only the tiny registry/part maps; no request body, EC work, peer I/O,
+/// fsync, NCDX publication, or NCNX publication runs under a map guard.
+static STANDARD_UPLOADS: LazyLock<DashMap<String, Arc<StandardUploadSession>>> =
+    LazyLock::new(DashMap::new);
+
+#[derive(Debug)]
+struct StandardPartSlot {
+    state: AtomicU8,
+    record: OnceLock<PartMetadata>,
+}
+
+impl StandardPartSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(STANDARD_PART_EMPTY),
+            record: OnceLock::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StandardUploadSession {
+    manifest: UploadSessionManifest,
+    logical_path: String,
+    lifecycle: AtomicU8,
+    in_flight_parts: AtomicUsize,
+    last_activity_at: AtomicI64,
+    parts: DashMap<u64, Arc<StandardPartSlot>>,
+    finalized_metadata: OnceLock<ObjectMetadata>,
+}
+
+fn standard_session_key(fragment: &str, version_id: &str) -> String {
+    format!("{fragment}\u{001f}{version_id}")
+}
+
+fn standard_session(fragment: &str, version_id: &str) -> Option<Arc<StandardUploadSession>> {
+    STANDARD_UPLOADS
+        .get(&standard_session_key(fragment, version_id))
+        .map(|entry| Arc::clone(entry.value()))
+}
+
+struct StandardPartClaim {
+    session: Arc<StandardUploadSession>,
+    slot: Arc<StandardPartSlot>,
+    completed: bool,
+}
+
+impl StandardPartClaim {
+    fn complete(mut self, part: PartMetadata) -> Result<(), AppError> {
+        if self.session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_CANCELLED {
+            return Err(AppError::Conflict("Upload session was cancelled".into()));
+        }
+        self.slot
+            .record
+            .set(part)
+            .map_err(|_| AppError::Conflict("Multipart part was completed concurrently".into()))?;
+        self.session
+            .last_activity_at
+            .store(Utc::now().timestamp(), Ordering::Release);
+        self.slot
+            .state
+            .store(STANDARD_PART_COMPLETE, Ordering::Release);
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StandardPartClaim {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.slot
+                .state
+                .store(STANDARD_PART_EMPTY, Ordering::Release);
+        }
+        self.session.in_flight_parts.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum StandardPartClaimResult {
+    Claimed(StandardPartClaim),
+    AlreadyComplete,
+}
+
+fn standard_request_matches(
+    session: &StandardUploadSession,
+    logical_path: &str,
+    params: &InitiateUploadParams,
+) -> bool {
+    let content_type_matches = params
+        .content_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|requested| requested == session.manifest.content_type)
+        .unwrap_or(true);
+    let part_size_matches = params
+        .part_size_bytes
+        .filter(|value| *value > 0)
+        .map(|requested| requested == session.manifest.part_size_bytes)
+        .unwrap_or(true);
+
+    session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_OPEN
+        && session.logical_path == logical_path.trim_start_matches('/')
+        && session.manifest.total_size_bytes == params.total_size_bytes
+        && session.manifest.expected_parts == params.expected_parts
+        && part_size_matches
+        && content_type_matches
+}
+
+fn claim_standard_part(
+    session: Arc<StandardUploadSession>,
+    part_index: u64,
+) -> Result<StandardPartClaimResult, AppError> {
+    if part_index >= session.manifest.expected_parts {
+        return Err(AppError::BadRequest("Part index out of range".into()));
+    }
+    if session.lifecycle.load(Ordering::Acquire) != STANDARD_SESSION_OPEN {
+        return Err(AppError::Conflict(
+            "Multipart session is not accepting parts".into(),
+        ));
+    }
+    let slot = session
+        .parts
+        .entry(part_index)
+        .or_insert_with(|| Arc::new(StandardPartSlot::new()))
+        .clone();
+    match slot.state.compare_exchange(
+        STANDARD_PART_EMPTY,
+        STANDARD_PART_UPLOADING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            session.in_flight_parts.fetch_add(1, Ordering::AcqRel);
+            session
+                .last_activity_at
+                .store(Utc::now().timestamp(), Ordering::Release);
+            if session.lifecycle.load(Ordering::Acquire) != STANDARD_SESSION_OPEN {
+                slot.state.store(STANDARD_PART_EMPTY, Ordering::Release);
+                session.in_flight_parts.fetch_sub(1, Ordering::AcqRel);
+                return Err(AppError::Conflict("Multipart session is finalizing".into()));
+            }
+            Ok(StandardPartClaimResult::Claimed(StandardPartClaim {
+                session,
+                slot,
+                completed: false,
+            }))
+        }
+        Err(STANDARD_PART_COMPLETE) => Ok(StandardPartClaimResult::AlreadyComplete),
+        Err(STANDARD_PART_UPLOADING) => Err(AppError::Conflict(
+            "Multipart part is already uploading".into(),
+        )),
+        Err(_) => Err(AppError::Conflict("Multipart part is unavailable".into())),
+    }
+}
 
 fn validate_cluster_one_shot_size(content_length: u64) -> Result<(), AppError> {
     if content_length > CLUSTER_ONE_SHOT_MAX_BYTES {
@@ -78,6 +249,7 @@ struct LocalShardWriter {
     is_parity: bool,
     expected_len: u64,
     locator: PeerShardTarget,
+    deferred_durability: bool,
 }
 
 impl AsyncWrite for LocalShardWriter {
@@ -117,9 +289,11 @@ impl LocalShardWriter {
                 format!("flush cluster shard {}", self.tmp_path.display()),
             )
         })?;
-        self.file.sync_data().await.map_err(|e| {
-            AppError::Io(e, format!("sync cluster shard {}", self.tmp_path.display()))
-        })?;
+        if !self.deferred_durability {
+            self.file.sync_data().await.map_err(|e| {
+                AppError::Io(e, format!("sync cluster shard {}", self.tmp_path.display()))
+            })?;
+        }
         drop(self.file);
         if fs::try_exists(&self.stable_path).await.unwrap_or(false) {
             let _ = fs::remove_file(&self.stable_path).await;
@@ -136,10 +310,12 @@ impl LocalShardWriter {
                     ),
                 )
             })?;
-        crate::core::upload::sync_dir(self.stable_path.parent().ok_or_else(|| {
-            AppError::InternalServerError("cluster shard path has no parent".into())
-        })?)
-        .await?;
+        if !self.deferred_durability {
+            crate::core::upload::sync_dir(self.stable_path.parent().ok_or_else(|| {
+                AppError::InternalServerError("cluster shard path has no parent".into())
+            })?)
+            .await?;
+        }
         invalidate_local_usage_cache(Some(&self.locator.fragment));
         Ok(ShardInfo {
             shard_index: self.shard_index,
@@ -378,6 +554,7 @@ fn target_for_placement(
     placement: &crate::distribution::placement::ClusterShardPlacement,
     part_index: u64,
     final_shard_len: u64,
+    deferred_durability: bool,
 ) -> PeerShardTarget {
     let is_parity = matches!(
         placement.role,
@@ -401,6 +578,7 @@ fn target_for_placement(
         shard_index: placement.shard_index,
         is_parity,
         expected_len: final_shard_len,
+        deferred_durability,
     }
 }
 
@@ -460,6 +638,7 @@ async fn open_local_writer(target: PeerShardTarget) -> Result<ClusterShardWriter
                     shard_index: target.shard_index,
                     is_parity: target.is_parity,
                     expected_len: target.expected_len,
+                    deferred_durability: target.deferred_durability,
                     // The immutable locator keeps the deterministic preferred
                     // root. The node resolves it across current local disks.
                     locator: target,
@@ -481,6 +660,7 @@ async fn open_writers_for_plan(
     part_index: u64,
     final_shard_len: u64,
     reachable: &BTreeSet<String>,
+    deferred_durability: bool,
 ) -> Result<Vec<Option<ClusterShardWriter>>, AppError> {
     let runtime = active_cluster_runtime()?;
     let mut writers = Vec::with_capacity(plan.placements.len());
@@ -489,7 +669,13 @@ async fn open_writers_for_plan(
             writers.push(None);
             continue;
         }
-        let target = target_for_placement(plan, placement, part_index, final_shard_len);
+        let target = target_for_placement(
+            plan,
+            placement,
+            part_index,
+            final_shard_len,
+            deferred_durability,
+        );
         let writer = if placement.node_id == runtime.local_node_id {
             open_local_writer(target).await
         } else {
@@ -532,6 +718,7 @@ pub async fn write_cluster_part_from_stream<S>(
     block_size: usize,
     body_stream: S,
     expected_checksum: Option<&str>,
+    deferred_durability: bool,
 ) -> Result<DistributedPartWrite, AppError>
 where
     S: Stream<Item = Result<Bytes, AppError>>,
@@ -588,8 +775,14 @@ where
     let stripe_count = content_length.div_ceil(stripe_data_width.max(1));
     let final_shard_len = stripe_count.saturating_mul(block_size as u64);
     let open_started = Instant::now();
-    let writers =
-        open_writers_for_plan(&placement, part_index, final_shard_len, &reachable).await?;
+    let writers = open_writers_for_plan(
+        &placement,
+        part_index,
+        final_shard_len,
+        &reachable,
+        deferred_durability,
+    )
+    .await?;
     record_io_latency(
         "cluster.upload.open_writers",
         open_started.elapsed(),
@@ -672,23 +865,23 @@ where
                 fragment,
                 object_key,
                 part_index,
-                "N2 survival upload lost a shard during durable finish: {error}"
+                "N2 survival upload lost a shard while finishing the part: {error}"
             ),
         }
     }
-    let durable = finished.iter().filter(|shard| shard.is_some()).count();
-    if durable < data_shards {
+    let written = finished.iter().filter(|shard| shard.is_some()).count();
+    if written < data_shards {
         return Err(AppError::ServiceUnavailable(format!(
-            "N2 survival upload persisted {durable} of {} EC pieces; K={data_shards} is required",
+            "N2 survival upload wrote {written} of {} EC pieces; K={data_shards} is required",
             layout.total_shards()
         )));
     }
-    if durable < layout.total_shards() {
+    if written < layout.total_shards() {
         warn!(
             fragment,
             object_key,
             part_index,
-            durable_pieces = durable,
+            written_pieces = written,
             target_pieces = layout.total_shards(),
             "N2 committed a reconstructable degraded part; autonomous repair owns the exact missing slots"
         );
@@ -705,7 +898,13 @@ where
                 "N2 EC writer omitted block checksums for shard {index}"
             ))
         })?;
-        let target = target_for_placement(&placement, assigned, part_index, final_shard_len);
+        let target = target_for_placement(
+            &placement,
+            assigned,
+            part_index,
+            final_shard_len,
+            deferred_durability,
+        );
         shards.push(
             finished[index].take().unwrap_or_else(|| {
                 planned_shard_info(&target, checksum, block_checksums, block_size)
@@ -729,18 +928,11 @@ where
     })
 }
 
-pub async fn initiate_cluster_upload(
-    claims: Claims,
-    fragment: String,
+async fn prepare_cluster_upload_manifest(
+    fragment: &str,
     object_key: String,
-    params: InitiateUploadParams,
-) -> Result<InitiateUploadResponse, AppError> {
-    if !claims.write {
-        return Err(AppError::Forbidden("Write permission required".into()));
-    }
-    if claims.fragment != fragment {
-        return Err(AppError::Forbidden("Access denied to this fragment".into()));
-    }
+    params: &InitiateUploadParams,
+) -> Result<UploadSessionManifest, AppError> {
     if params.expected_parts == 0 {
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
     }
@@ -770,8 +962,8 @@ pub async fn initiate_cluster_upload(
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(params.total_size_bytes);
-    let manifest = UploadSessionManifest {
-        fragment: fragment.clone(),
+    Ok(UploadSessionManifest {
+        fragment: fragment.to_string(),
         object_key,
         packed_ext_u64: params.packed_ext_u64,
         version_id: version_id.clone(),
@@ -781,6 +973,7 @@ pub async fn initiate_cluster_upload(
         part_size_bytes,
         content_type: params
             .content_type
+            .clone()
             .unwrap_or_else(|| "application/octet-stream".into()),
         created_at: Utc::now().timestamp(),
         pool_id: write_pool.id.clone(),
@@ -789,12 +982,496 @@ pub async fn initiate_cluster_upload(
         membership_epoch: runtime.membership.epoch,
         data_shards: layout.data_shards as u16,
         parity_shards: layout.parity_shards as u16,
-    };
+    })
+}
+
+pub async fn initiate_cluster_upload(
+    claims: Claims,
+    fragment: String,
+    object_key: String,
+    params: InitiateUploadParams,
+) -> Result<InitiateUploadResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let manifest = prepare_cluster_upload_manifest(&fragment, object_key, &params).await?;
+    let version_id = manifest.version_id.clone();
+    let session_id = manifest.session_id.clone();
     index::open_session(&manifest, None).await?;
     Ok(InitiateUploadResponse {
         session_id,
         version_id,
     })
+}
+
+pub fn find_reusable_standard_cluster_upload(
+    fragment: &str,
+    logical_path: &str,
+    params: &InitiateUploadParams,
+) -> Option<InitiateUploadResponse> {
+    STANDARD_UPLOADS
+        .iter()
+        .filter(|entry| entry.value().manifest.fragment == fragment)
+        .filter(|entry| standard_request_matches(entry.value(), logical_path, params))
+        .max_by_key(|entry| entry.value().manifest.created_at)
+        .map(|entry| InitiateUploadResponse {
+            session_id: entry.value().manifest.session_id.clone(),
+            version_id: entry.value().manifest.version_id.clone(),
+        })
+}
+
+/// Start the high-throughput multipart family without writing a session
+/// manifest, pending NCNX binding, or per-part receipt. The coordinator owns
+/// this compact state until finalize or restart.
+pub async fn initiate_standard_cluster_upload(
+    claims: Claims,
+    fragment: String,
+    physical_object_key: String,
+    logical_path: String,
+    params: InitiateUploadParams,
+) -> Result<InitiateUploadResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    prune_standard_cluster_uploads(&fragment);
+    if let Some(existing) = find_reusable_standard_cluster_upload(&fragment, &logical_path, &params)
+    {
+        return Ok(existing);
+    }
+    let manifest = prepare_cluster_upload_manifest(&fragment, physical_object_key, &params).await?;
+    let response = InitiateUploadResponse {
+        session_id: manifest.session_id.clone(),
+        version_id: manifest.version_id.clone(),
+    };
+    let session = Arc::new(StandardUploadSession {
+        manifest,
+        logical_path: logical_path.trim_start_matches('/').to_string(),
+        lifecycle: AtomicU8::new(STANDARD_SESSION_OPEN),
+        in_flight_parts: AtomicUsize::new(0),
+        last_activity_at: AtomicI64::new(Utc::now().timestamp()),
+        parts: DashMap::new(),
+        finalized_metadata: OnceLock::new(),
+    });
+    let key = standard_session_key(&fragment, &response.version_id);
+    match STANDARD_UPLOADS.entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(existing) => Ok(InitiateUploadResponse {
+            session_id: existing.get().manifest.session_id.clone(),
+            version_id: existing.get().manifest.version_id.clone(),
+        }),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(session);
+            Ok(response)
+        }
+    }
+}
+
+pub fn standard_upload_binding(fragment: &str, version_id: &str) -> Option<(String, String)> {
+    standard_session(fragment, version_id).map(|session| {
+        (
+            session.logical_path.clone(),
+            session.manifest.object_key.clone(),
+        )
+    })
+}
+
+pub async fn put_standard_cluster_part<S>(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    body_stream: S,
+    content_length: u64,
+) -> Result<(), AppError>
+where
+    S: Stream<Item = Result<Bytes, AppError>>,
+{
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let session = standard_session(&fragment, &version_id)
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    let expected = expected_part_size(&session.manifest, part_index);
+    if part_index >= session.manifest.expected_parts {
+        return Err(AppError::BadRequest("Part index out of range".into()));
+    }
+    if expected != content_length {
+        return Err(AppError::BadRequest(format!(
+            "Part size does not match upload session: got {content_length}, expected {expected}"
+        )));
+    }
+    let claim = match claim_standard_part(Arc::clone(&session), part_index)? {
+        StandardPartClaimResult::AlreadyComplete => return Ok(()),
+        StandardPartClaimResult::Claimed(claim) => claim,
+    };
+    let started = Instant::now();
+    let part = write_cluster_part_from_stream(
+        &fragment,
+        &session.manifest.object_key,
+        &version_id,
+        part_index,
+        content_length,
+        usize::from(session.manifest.data_shards),
+        usize::from(session.manifest.parity_shards),
+        &session.manifest.pool_id,
+        session.manifest.pool_generation,
+        session.manifest.membership_epoch,
+        session.manifest.stripe_size_bytes,
+        body_stream,
+        query.checksum.as_deref(),
+        true,
+    )
+    .await;
+    record_io_latency(
+        "cluster.upload.standard_part",
+        started.elapsed(),
+        content_length,
+        part.is_ok(),
+    );
+    claim.complete(part?.part)
+}
+
+pub fn get_standard_cluster_upload_status(
+    claims: &Claims,
+    fragment: &str,
+    version_id: &str,
+) -> Result<UploadStatusResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let Some(session) = standard_session(fragment, version_id) else {
+        return Ok(UploadStatusResponse::default());
+    };
+    let mut uploaded_parts = session
+        .parts
+        .iter()
+        .filter_map(|entry| {
+            (entry.value().state.load(Ordering::Acquire) == STANDARD_PART_COMPLETE)
+                .then_some(*entry.key())
+        })
+        .collect::<Vec<_>>();
+    uploaded_parts.sort_unstable();
+    let committed_bytes = uploaded_parts
+        .iter()
+        .filter_map(|index| session.parts.get(index))
+        .filter_map(|slot| slot.record.get().map(|part| part.size_bytes))
+        .sum();
+    Ok(UploadStatusResponse {
+        committed_parts: uploaded_parts.len() as u64,
+        committed_bytes,
+        uploaded_parts,
+        expected_parts: Some(session.manifest.expected_parts),
+        total_size_bytes: Some(session.manifest.total_size_bytes),
+        created_at: Some(session.manifest.created_at),
+        session_id: Some(session.manifest.session_id.clone()),
+        version_id: Some(session.manifest.version_id.clone()),
+        object_key: Some(session.logical_path.clone()),
+        physical_object_key: Some(session.manifest.object_key.clone()),
+    })
+}
+
+fn standard_session_is_expired(session: &StandardUploadSession, now: i64, ttl: i64) -> bool {
+    let lifecycle = session.lifecycle.load(Ordering::Acquire);
+    let idle = now.saturating_sub(session.last_activity_at.load(Ordering::Acquire));
+    // A finalized session can mean NCDX is durable while NCNX publication
+    // is awaiting an idempotent retry. Never prune away that binding.
+    lifecycle == STANDARD_SESSION_OPEN
+        && idle >= ttl
+        && session.in_flight_parts.load(Ordering::Acquire) == 0
+}
+
+fn prune_standard_cluster_uploads(fragment: &str) {
+    let now = Utc::now().timestamp();
+    let ttl = CONFIG.garbage_collector.file_ttl_seconds as i64;
+    STANDARD_UPLOADS.retain(|_, session| {
+        if session.manifest.fragment != fragment {
+            return true;
+        }
+        let expired = standard_session_is_expired(session, now, ttl);
+        if expired {
+            session
+                .lifecycle
+                .store(STANDARD_SESSION_CANCELLED, Ordering::Release);
+        }
+        !expired
+    });
+}
+
+pub fn list_standard_cluster_uploads(
+    claims: &Claims,
+    fragment: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<ListUploadsResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    prune_standard_cluster_uploads(fragment);
+    let mut sessions = STANDARD_UPLOADS
+        .iter()
+        .filter(|entry| entry.value().manifest.fragment == fragment)
+        .filter(|entry| entry.value().lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_OPEN)
+        .map(|entry| {
+            let session = entry.value();
+            let (committed_parts, committed_bytes) =
+                session
+                    .parts
+                    .iter()
+                    .fold((0u64, 0u64), |(count, bytes), slot| {
+                        if slot.value().state.load(Ordering::Acquire) != STANDARD_PART_COMPLETE {
+                            return (count, bytes);
+                        }
+                        match slot.value().record.get() {
+                            Some(part) => (
+                                count.saturating_add(1),
+                                bytes.saturating_add(part.size_bytes),
+                            ),
+                            None => (count, bytes),
+                        }
+                    });
+            ActiveSessionInfo {
+                session_id: session.manifest.session_id.clone(),
+                version_id: session.manifest.version_id.clone(),
+                object_key: Some(session.logical_path.clone()),
+                physical_object_key: Some(session.manifest.object_key.clone()),
+                created_at: session.manifest.created_at,
+                reserved_size: session.manifest.total_size_bytes,
+                total_size_bytes: Some(session.manifest.total_size_bytes),
+                expected_parts: Some(session.manifest.expected_parts),
+                committed_parts,
+                committed_bytes,
+            }
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    let total = sessions.len();
+    Ok(ListUploadsResponse {
+        sessions: sessions
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(100))
+            .collect(),
+        total,
+    })
+}
+
+pub async fn finalize_standard_cluster_upload(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    session_id: String,
+) -> Result<FinalizeUploadResult, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let session = standard_session(&fragment, &version_id)
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    if session.manifest.session_id != session_id {
+        return Err(AppError::Forbidden("Session id mismatch".into()));
+    }
+    if session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_FINALIZED {
+        return session
+            .finalized_metadata
+            .get()
+            .cloned()
+            .map(FinalizeUploadResult::Complete)
+            .ok_or_else(|| {
+                AppError::InternalServerError(
+                    "finalized standard upload is missing in-memory metadata".into(),
+                )
+            });
+    }
+    session
+        .lifecycle
+        .compare_exchange(
+            STANDARD_SESSION_OPEN,
+            STANDARD_SESSION_FINALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| AppError::Conflict("Multipart session is busy".into()))?;
+
+    let mut uploaded_parts = session
+        .parts
+        .iter()
+        .filter_map(|entry| {
+            (entry.value().state.load(Ordering::Acquire) == STANDARD_PART_COMPLETE)
+                .then_some(*entry.key())
+        })
+        .collect::<Vec<_>>();
+    uploaded_parts.sort_unstable();
+    let present = uploaded_parts.iter().copied().collect::<BTreeSet<_>>();
+    let missing_parts = (0..session.manifest.expected_parts)
+        .filter(|part| !present.contains(part))
+        .collect::<Vec<_>>();
+    if !missing_parts.is_empty() || session.in_flight_parts.load(Ordering::Acquire) != 0 {
+        session
+            .lifecycle
+            .store(STANDARD_SESSION_OPEN, Ordering::Release);
+        return Ok(FinalizeUploadResult::Incomplete(
+            FinalizeIncompleteResponse {
+                uploaded_parts,
+                missing_parts,
+                expected_parts: session.manifest.expected_parts,
+            },
+        ));
+    }
+
+    let finalize_result = async {
+        let mut parts = Vec::with_capacity(uploaded_parts.len());
+        for part_index in uploaded_parts {
+            let slot = session.parts.get(&part_index).ok_or_else(|| {
+                AppError::Conflict(format!("Multipart part {part_index} disappeared"))
+            })?;
+            let part = slot.record.get().cloned().ok_or_else(|| {
+                AppError::Conflict(format!("Multipart part {part_index} is incomplete"))
+            })?;
+            parts.push(part);
+        }
+        parts.sort_by_key(|part| part.part_index);
+        let total_size_bytes = parts.iter().map(|part| part.size_bytes).sum::<u64>();
+        if total_size_bytes != session.manifest.total_size_bytes {
+            return Err(AppError::Conflict(format!(
+                "Multipart byte total is {total_size_bytes}, expected {}",
+                session.manifest.total_size_bytes
+            )));
+        }
+        let metadata = ObjectMetadata {
+            object_key: session.manifest.object_key.clone(),
+            packed_ext_u64: session.manifest.packed_ext_u64,
+            fragment: fragment.clone(),
+            version_id: version_id.clone(),
+            upload_session_id: session_id.clone(),
+            owner_uid: fragment.clone(),
+            content_type: session.manifest.content_type.clone(),
+            total_size_bytes,
+            created_at: session.manifest.created_at,
+            pool_id: session.manifest.pool_id.clone(),
+            pool_generation: session.manifest.pool_generation,
+            membership_epoch: session.manifest.membership_epoch,
+            data_shards: session.manifest.data_shards,
+            parity_shards: session.manifest.parity_shards,
+            parts,
+            is_delete_marker: false,
+            stripe_size_bytes: session.manifest.stripe_size_bytes,
+        };
+        let started = Instant::now();
+        let publication = publish_cluster_object_metadata_after_shard_sync(&metadata).await;
+        record_io_latency(
+            "cluster.upload.standard_finalize",
+            started.elapsed(),
+            total_size_bytes,
+            publication.is_ok(),
+        );
+        publication?;
+        Ok::<_, AppError>(metadata)
+    }
+    .await;
+
+    match finalize_result {
+        Ok(metadata) => {
+            session
+                .finalized_metadata
+                .set(metadata.clone())
+                .map_err(|_| {
+                    AppError::InternalServerError(
+                        "standard multipart finalized metadata was set twice".into(),
+                    )
+                })?;
+            session
+                .last_activity_at
+                .store(Utc::now().timestamp(), Ordering::Release);
+            session
+                .lifecycle
+                .store(STANDARD_SESSION_FINALIZED, Ordering::Release);
+            Ok(FinalizeUploadResult::Complete(metadata))
+        }
+        Err(error) => {
+            session
+                .lifecycle
+                .store(STANDARD_SESSION_OPEN, Ordering::Release);
+            Err(error)
+        }
+    }
+}
+
+pub fn complete_standard_cluster_upload(fragment: &str, version_id: &str) {
+    let key = standard_session_key(fragment, version_id);
+    if STANDARD_UPLOADS.get(&key).is_some_and(|session| {
+        session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_FINALIZED
+    }) {
+        STANDARD_UPLOADS.remove(&key);
+    }
+}
+
+pub fn cancel_standard_cluster_upload(
+    claims: &Claims,
+    fragment: &str,
+    version_id: &str,
+) -> Result<(), AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+    let key = standard_session_key(fragment, version_id);
+    let session = STANDARD_UPLOADS
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    session
+        .lifecycle
+        .compare_exchange(
+            STANDARD_SESSION_OPEN,
+            STANDARD_SESSION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| AppError::Conflict("Multipart session is busy".into()))?;
+    if session.in_flight_parts.load(Ordering::Acquire) != 0 {
+        session
+            .lifecycle
+            .store(STANDARD_SESSION_OPEN, Ordering::Release);
+        return Err(AppError::Conflict(
+            "Multipart session has an in-flight part".into(),
+        ));
+    }
+    STANDARD_UPLOADS.remove(&key);
+    Ok(())
+}
+
+pub fn active_standard_cluster_upload_versions(fragment: &str) -> BTreeSet<String> {
+    prune_standard_cluster_uploads(fragment);
+    STANDARD_UPLOADS
+        .iter()
+        .filter(|entry| entry.value().manifest.fragment == fragment)
+        .filter(|entry| {
+            matches!(
+                entry.value().lifecycle.load(Ordering::Acquire),
+                STANDARD_SESSION_OPEN | STANDARD_SESSION_FINALIZING
+            )
+        })
+        .map(|entry| entry.value().manifest.version_id.clone())
+        .collect()
 }
 
 pub async fn put_cluster_part<S>(
@@ -845,6 +1522,7 @@ where
         state.manifest.stripe_size_bytes,
         body_stream,
         query.checksum.as_deref(),
+        false,
     )
     .await;
     record_io_latency(
@@ -912,6 +1590,7 @@ where
         stripe_size,
         body_stream,
         query.checksum.as_deref(),
+        false,
     )
     .await;
     record_io_latency(
@@ -1069,6 +1748,107 @@ mod tests {
             data_shards: 1,
             parity_shards: 1,
         }
+    }
+
+    fn standard_test_session() -> Arc<StandardUploadSession> {
+        Arc::new(StandardUploadSession {
+            manifest: manifest(128, 2, 64),
+            logical_path: "videos/video.bin".into(),
+            lifecycle: AtomicU8::new(STANDARD_SESSION_OPEN),
+            in_flight_parts: AtomicUsize::new(0),
+            last_activity_at: AtomicI64::new(0),
+            parts: DashMap::new(),
+            finalized_metadata: OnceLock::new(),
+        })
+    }
+
+    #[test]
+    fn standard_multipart_claims_distinct_parts_without_a_session_lock() {
+        let session = standard_test_session();
+        let first = match claim_standard_part(Arc::clone(&session), 0).unwrap() {
+            StandardPartClaimResult::Claimed(claim) => claim,
+            StandardPartClaimResult::AlreadyComplete => panic!("part was unexpectedly complete"),
+        };
+        let second = match claim_standard_part(Arc::clone(&session), 1).unwrap() {
+            StandardPartClaimResult::Claimed(claim) => claim,
+            StandardPartClaimResult::AlreadyComplete => panic!("part was unexpectedly complete"),
+        };
+
+        assert_eq!(session.in_flight_parts.load(Ordering::Acquire), 2);
+        assert!(claim_standard_part(Arc::clone(&session), 0).is_err());
+
+        drop(first);
+        drop(second);
+        assert_eq!(session.in_flight_parts.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            claim_standard_part(session, 0),
+            Ok(StandardPartClaimResult::Claimed(_))
+        ));
+    }
+
+    #[test]
+    fn completed_standard_part_retry_is_idempotent() {
+        let session = standard_test_session();
+        let claim = match claim_standard_part(Arc::clone(&session), 0).unwrap() {
+            StandardPartClaimResult::Claimed(claim) => claim,
+            StandardPartClaimResult::AlreadyComplete => panic!("part was unexpectedly complete"),
+        };
+        claim
+            .complete(PartMetadata {
+                part_index: 0,
+                size_bytes: 64,
+                created_at: 1,
+                shards: Vec::new(),
+                checksum: Some("sha256:test".into()),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            claim_standard_part(session, 0),
+            Ok(StandardPartClaimResult::AlreadyComplete)
+        ));
+    }
+
+    #[test]
+    fn standard_upload_reuse_requires_the_exact_upload_shape() {
+        let session = standard_test_session();
+        let exact = InitiateUploadParams {
+            total_size_bytes: 128,
+            expected_parts: 2,
+            part_size_bytes: Some(64),
+            content_type: Some("application/octet-stream".into()),
+            packed_ext_u64: 0,
+        };
+        assert!(standard_request_matches(
+            &session,
+            "videos/video.bin",
+            &exact
+        ));
+
+        let changed_size = InitiateUploadParams {
+            total_size_bytes: 129,
+            ..exact.clone()
+        };
+        assert!(!standard_request_matches(
+            &session,
+            "videos/video.bin",
+            &changed_size
+        ));
+        assert!(!standard_request_matches(
+            &session,
+            "videos/other.bin",
+            &exact
+        ));
+    }
+
+    #[test]
+    fn finalized_standard_session_is_retained_for_ncnx_retry() {
+        let session = standard_test_session();
+        session
+            .lifecycle
+            .store(STANDARD_SESSION_FINALIZED, Ordering::Release);
+        session.last_activity_at.store(0, Ordering::Release);
+        assert!(!standard_session_is_expired(&session, i64::MAX, 1));
     }
 
     #[test]

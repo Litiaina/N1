@@ -2345,6 +2345,81 @@ mod tests {
     }
 
     #[test]
+    fn head_selection_is_max_ulid_under_clock_skew_and_restart() {
+        let dir = std::env::temp_dir().join(format!("n2-head-ulid-{}", Ulid::new()));
+        fs::create_dir_all(&dir).expect("create object directory");
+        let rollback = Ulid::from_parts(1_000, 7).to_string();
+        let present = Ulid::from_parts(2_000, 3).to_string();
+        let future = Ulid::from_parts(9_000, 1).to_string();
+
+        // Deliberately publish out of timestamp order. Directory enumeration,
+        // restart, and peer response order must not influence HEAD.
+        for version_id in [&future, &rollback, &present] {
+            let mut metadata = metadata();
+            metadata.version_id = version_id.clone();
+            fs::write(
+                dir.join(ncdx_file_name(&metadata)),
+                encode_disk_object_metadata(&metadata).expect("encode metadata"),
+            )
+            .expect("write immutable metadata fixture");
+        }
+
+        for _ in 0..3 {
+            let head = latest_summary_in_object_dir(&dir)
+                .expect("resolve HEAD")
+                .expect("HEAD exists");
+            assert_eq!(head.version_id, future);
+        }
+        fs::remove_dir_all(&dir).expect("remove object directory");
+    }
+
+    #[test]
+    fn concurrent_ulid_version_identities_are_unique_in_stress_sample() {
+        let generated = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..5_000)
+                            .map(|_| Ulid::new().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("ULID worker"))
+                .collect::<Vec<_>>()
+        });
+        let total = generated.len();
+        let unique = generated.into_iter().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), total);
+    }
+
+    #[test]
+    fn duplicate_version_id_with_divergent_metadata_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("n2-ncdx-conflict-{}", Ulid::new()));
+        fs::create_dir_all(&dir).expect("create object directory");
+        let mut original = metadata();
+        original.version_id = Ulid::new().to_string();
+        let path = dir.join(ncdx_file_name(&original));
+        write_immutable(
+            &path,
+            &encode_disk_object_metadata(&original).expect("encode original"),
+        )
+        .expect("publish original");
+
+        let mut divergent = original;
+        divergent.content_type = "application/divergent".into();
+        let error = write_immutable(
+            &path,
+            &encode_disk_object_metadata(&divergent).expect("encode divergent"),
+        )
+        .expect_err("divergent immutable identity must fail");
+        assert!(matches!(error, AppError::Conflict(_)));
+        fs::remove_dir_all(&dir).expect("remove object directory");
+    }
+
+    #[test]
     fn vanished_directory_is_reported_as_not_found() {
         let path = std::env::temp_dir().join(format!("n2-vanished-dir-{}", Ulid::new()));
         assert!(matches!(read_dir_names(&path), Err(AppError::NotFound)));

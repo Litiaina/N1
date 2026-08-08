@@ -9,7 +9,7 @@ use crate::core::disk_manager::ObjectMetadata;
 use crate::distribution::ncnx::{
     LocatedNcnx, PeerNcnxName, copy_live_to_key, copy_live_to_key_with_record, copy_live_to_trash,
     find_live, find_live_for_survival_write, list_canonical_names, ncnx_cursor, publish_new,
-    read_canonical_record, remove_live, remove_trash,
+    read_canonical_record, remove_live, remove_trash, trash_is_expired,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -572,6 +572,9 @@ async fn find_trash_recovery_set(
             let Some(locator) = name.trash.as_ref() else {
                 return false;
             };
+            if trash_is_expired(locator) {
+                return false;
+            }
             if by_id {
                 locator.delete_mutation_id == requested
             } else {

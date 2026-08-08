@@ -95,6 +95,7 @@ async fn repair_cluster_part_after_read(
             shard_index: locator.shard_index,
             is_parity: locator.is_parity,
             expected_len: shard.size_bytes,
+            deferred_durability: false,
         };
         let repaired = put_peer_shard_bytes(target, &reconstructed).await?;
         if !repaired.checksum.eq_ignore_ascii_case(&shard.checksum) {
@@ -189,6 +190,7 @@ pub async fn repair_cluster_object_shards(
                 shard_index: locator.shard_index,
                 is_parity: locator.is_parity,
                 expected_len: shard.size_bytes,
+                deferred_durability: false,
             };
 
             match put_peer_shard_bytes(target, &reconstructed).await {

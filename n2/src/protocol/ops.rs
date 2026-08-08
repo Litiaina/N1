@@ -57,7 +57,11 @@ use crate::distribution::resolve_configured_layout;
 use crate::distribution::routes::cluster_usage_snapshot;
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::distribution::upload::{
-    finalize_cluster_upload, initiate_cluster_upload, put_cluster_part, upload_cluster_one_shot,
+    cancel_standard_cluster_upload, complete_standard_cluster_upload, finalize_cluster_upload,
+    finalize_standard_cluster_upload, find_reusable_standard_cluster_upload,
+    get_standard_cluster_upload_status, initiate_cluster_upload, initiate_standard_cluster_upload,
+    list_standard_cluster_uploads, put_cluster_part, put_standard_cluster_part,
+    standard_upload_binding, upload_cluster_one_shot,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
@@ -202,7 +206,10 @@ where
             metadata.strip_internal_layout();
             Some((op_response(201), native_body_bytes(&metadata)))
         }
-        "multipart.put_part" | "upload.multipart.put_part" => {
+        "multipart.put_part"
+        | "upload.multipart.put_part"
+        | "upload.multipart.durable.put_part"
+        | "upload.multipart.standard.put_part" => {
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
@@ -211,16 +218,29 @@ where
             let body_stream = ReaderStream::new(reader).map(|chunk| {
                 chunk.map_err(|err| AppError::Io(err, "native cluster multipart body read".into()))
             });
-            put_cluster_part(
-                claims,
-                fragment,
-                version_id.clone(),
-                part_index,
-                upload_part_query_from_payload(&payload)?,
-                body_stream,
-                body_len,
-            )
-            .await?;
+            if op == "upload.multipart.standard.put_part" {
+                put_standard_cluster_part(
+                    claims,
+                    fragment,
+                    version_id.clone(),
+                    part_index,
+                    upload_part_query_from_payload(&payload)?,
+                    body_stream,
+                    body_len,
+                )
+                .await?;
+            } else {
+                put_cluster_part(
+                    claims,
+                    fragment,
+                    version_id.clone(),
+                    part_index,
+                    upload_part_query_from_payload(&payload)?,
+                    body_stream,
+                    body_len,
+                )
+                .await?;
+            }
             Some(native_body(json!({
                 "version_id": version_id,
                 "part_index": part_index,
@@ -279,22 +299,38 @@ where
             metadata.strip_internal_layout();
             Some((op_response(201), native_body_bytes(&metadata)))
         }
-        "multipart.put_part" | "upload.multipart.put_part" => {
+        "multipart.put_part"
+        | "upload.multipart.put_part"
+        | "upload.multipart.durable.put_part"
+        | "upload.multipart.standard.put_part" => {
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
             let part_index = u64_field(&payload, "part_index")
                 .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
-            put_cluster_part(
-                claims,
-                fragment,
-                version_id.clone(),
-                part_index,
-                upload_part_query_from_payload(&payload)?,
-                body_stream,
-                body_len,
-            )
-            .await?;
+            if op == "upload.multipart.standard.put_part" {
+                put_standard_cluster_part(
+                    claims,
+                    fragment,
+                    version_id.clone(),
+                    part_index,
+                    upload_part_query_from_payload(&payload)?,
+                    body_stream,
+                    body_len,
+                )
+                .await?;
+            } else {
+                put_cluster_part(
+                    claims,
+                    fragment,
+                    version_id.clone(),
+                    part_index,
+                    upload_part_query_from_payload(&payload)?,
+                    body_stream,
+                    body_len,
+                )
+                .await?;
+            }
             Some(native_body(json!({
                 "version_id": version_id,
                 "part_index": part_index,
@@ -667,7 +703,26 @@ async fn execute_native_op_inner(
             metadata.strip_internal_layout();
             (op_response(201), native_body_bytes(&metadata))
         }
-        "multipart.init" | "upload.multipart.init" => {
+        "upload.multipart.standard.init" => {
+            let claims = claims_required(claims)?;
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let mut params: InitiateUploadParams = typed_payload(&payload)?;
+            if let Some(existing) =
+                find_reusable_standard_cluster_upload(&fragment, &logical, &params)
+            {
+                (op_response(201), native_body_bytes(&existing))
+            } else {
+                params.packed_ext_u64 = crate::core::index_store::packed_extension_key(&logical);
+                let physical = resolve_logical_write_key(&fragment, &logical).await?;
+                let response =
+                    initiate_standard_cluster_upload(claims, fragment, physical, logical, params)
+                        .await?;
+                (op_response(201), native_body_bytes(&response))
+            }
+        }
+        "multipart.init" | "upload.multipart.init" | "upload.multipart.durable.init" => {
             let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
@@ -695,7 +750,10 @@ async fn execute_native_op_inner(
                 (op_response(201), native_body_bytes(&response))
             }
         }
-        "multipart.put_part" | "upload.multipart.put_part" => {
+        "multipart.put_part"
+        | "upload.multipart.put_part"
+        | "upload.multipart.durable.put_part"
+        | "upload.multipart.standard.put_part" => {
             let claims = claims_required(claims)?;
             require_write(&claims)?;
             let body = _body.ok_or_else(|| AppError::BadRequest("part body is required".into()))?;
@@ -706,23 +764,79 @@ async fn execute_native_op_inner(
             let body_len = body.len() as u64;
             let body_stream =
                 futures_util::stream::once(async move { Ok::<Bytes, AppError>(Bytes::from(body)) });
-            put_cluster_part(
-                claims,
-                fragment,
-                version_id.clone(),
-                part_index,
-                upload_part_query_from_payload(&payload)?,
-                body_stream,
-                body_len,
-            )
-            .await?;
+            if op == "upload.multipart.standard.put_part" {
+                put_standard_cluster_part(
+                    claims,
+                    fragment,
+                    version_id.clone(),
+                    part_index,
+                    upload_part_query_from_payload(&payload)?,
+                    body_stream,
+                    body_len,
+                )
+                .await?;
+            } else {
+                put_cluster_part(
+                    claims,
+                    fragment,
+                    version_id.clone(),
+                    part_index,
+                    upload_part_query_from_payload(&payload)?,
+                    body_stream,
+                    body_len,
+                )
+                .await?;
+            }
             native_body(json!({
                 "version_id": version_id,
                 "part_index": part_index,
                 "uploaded": true,
             }))
         }
-        "multipart.finalize" | "upload.multipart.finalize" => {
+        "upload.multipart.standard.finalize" => {
+            let claims = claims_required(claims)?;
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            let session_id = required_string(&payload, "session_id")?;
+            let (logical_path, physical) = standard_upload_binding(&fragment, &version_id)
+                .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+            match finalize_standard_cluster_upload(
+                claims,
+                fragment.clone(),
+                version_id.clone(),
+                session_id,
+            )
+            .await?
+            {
+                FinalizeUploadResult::Complete(mut metadata) => {
+                    let committed_physical = commit_logical_upload_from_meta(
+                        &fragment,
+                        &logical_path,
+                        &physical,
+                        &metadata,
+                    )
+                    .await?;
+                    complete_standard_cluster_upload(&fragment, &version_id);
+                    metadata.object_key = logical_path;
+                    emit_logical_file_uploaded(
+                        &state,
+                        &fragment,
+                        &metadata.object_key,
+                        &committed_physical,
+                        &metadata,
+                    );
+                    metadata.strip_internal_layout();
+                    (op_response(200), native_body_bytes(&metadata))
+                }
+                FinalizeUploadResult::Incomplete(incomplete) => {
+                    (op_response(409), native_body_bytes(&incomplete))
+                }
+            }
+        }
+        "multipart.finalize"
+        | "upload.multipart.finalize"
+        | "upload.multipart.durable.finalize" => {
             let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
@@ -776,7 +890,15 @@ async fn execute_native_op_inner(
                 }
             }
         }
-        "multipart.cancel" | "upload.multipart.cancel" => {
+        "upload.multipart.standard.cancel" => {
+            let claims = claims_required(claims)?;
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            cancel_standard_cluster_upload(&claims, &fragment, &version_id)?;
+            (op_response(204), Vec::new())
+        }
+        "multipart.cancel" | "upload.multipart.cancel" | "upload.multipart.durable.cancel" => {
             let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
@@ -1035,7 +1157,24 @@ async fn execute_native_op_inner(
             let fragment = claims.fragment.clone();
             native_from_response(get_capacity_usage(claims, Path(fragment)).await?).await
         }
-        "uploads.list" | "multipart.list" => {
+        "uploads.standard.list" | "multipart.standard.list" => {
+            let claims = claims_required(claims)?;
+            let fragment = claims.fragment.clone();
+            let params = params_from_payload(&payload);
+            let limit = params
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50)
+                .min(100);
+            let offset = params
+                .get("offset")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            native_body(list_standard_cluster_uploads(
+                &claims, &fragment, limit, offset,
+            )?)
+        }
+        "uploads.list" | "multipart.list" | "uploads.durable.list" => {
             let claims = claims_required(claims)?;
             let fragment = claims.fragment.clone();
             native_from_response(
@@ -1044,7 +1183,17 @@ async fn execute_native_op_inner(
             )
             .await
         }
-        "uploads.status" | "multipart.status" => {
+        "uploads.standard.status" | "multipart.standard.status" => {
+            let claims = claims_required(claims)?;
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            native_body(get_standard_cluster_upload_status(
+                &claims,
+                &fragment,
+                &version_id,
+            )?)
+        }
+        "uploads.status" | "multipart.status" | "uploads.durable.status" => {
             let claims = claims_required(claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;

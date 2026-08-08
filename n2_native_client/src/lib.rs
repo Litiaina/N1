@@ -4,7 +4,7 @@ mod frame;
 mod types;
 mod url;
 
-pub use client::{N2NativeClient, NativeOperationResponse};
+pub use client::{N2NativeClient, NativeOperationResponse, ensure_native_ok};
 pub use error::{NativeClientError, NativeClientResult};
 pub use types::{
     MAX_NATIVE_BODY_BYTES, MAX_NATIVE_FRAME_BYTES, NativeAuthFragmentRequest, NativeBearerRequest,

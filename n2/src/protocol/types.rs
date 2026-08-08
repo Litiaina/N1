@@ -101,6 +101,21 @@ impl NativeResponse {
         }
     }
 
+    pub fn operation_error(id: impl Into<String>, status: u16, message: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            ok: false,
+            status: Some(status),
+            payload: None,
+            body: None,
+            body_len: None,
+            error: Some(NativeError {
+                code: format!("status_{status}"),
+                message: message.into(),
+            }),
+        }
+    }
+
     pub fn err(id: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             id: id.into(),

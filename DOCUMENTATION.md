@@ -154,7 +154,15 @@ node into an enrolled pool, remap existing NCNX, or rewrite old objects.
 
 ### Coordinator-Owned Multipart
 
-Multipart resumability is intentionally local to the coordinator node:
+N2 exposes two coordinator-owned multipart contracts:
+
+- Standard multipart is the default high-throughput path. Its compact session
+  and completed-part map live only in coordinator memory. Parts are independent
+  and may be processed concurrently. Restart loses unfinished resumability.
+- Durable multipart uses the same EC data path while retaining the existing
+  restart-proof manifest, pending binding, and per-part receipts.
+
+Both contracts remain sticky to one coordinator until finalize:
 
 ```text
 new multipart init  -> any healthy node
@@ -162,10 +170,12 @@ same upload session -> same coordinator until finalize
 finalized object    -> readable through any healthy node
 ```
 
-This avoids cluster-wide consensus for temporary part receipts. Each part is
-still erasure-coded onto the pinned pool layout. Finalization publishes NCDX
-and then NCNX, converting coordinator-owned temporary state into cluster
-object truth.
+Standard multipart writes no temporary receipt replicas and defers shard sync
+until finalize. Finalize synchronizes the exact shard holders before publishing
+NCDX, then publishes NCNX, converting temporary parts into cluster object
+truth. Durable multipart keeps per-part durability for clients that explicitly
+prefer restart-proof progress over maximum ingest speed. Neither path changes
+the object's immutable EC layout or publication order.
 
 ## Install And Build
 
@@ -727,9 +737,11 @@ Response is object metadata:
 }
 ```
 
-### Multipart Init
+### Standard Multipart Init
 
-Use for large files and resumable uploads.
+Use for large files and maximum ingest throughput. Progress is resumable while
+the selected coordinator process remains alive; a coordinator restart requires
+a new standard session.
 
 ```http
 POST /noa/v1/upload/multipart/init/{object_key}
@@ -779,8 +791,6 @@ Query fields:
   `x-litiaina-checksum`, `x-noa-checksum-sha256`, and
   `x-n2-checksum-sha256` are also accepted.
 - `coordinator_node_id`: required when this request goes through N2 Gateway.
-- `durability`: optional durability mode.
-- `strict_durability`: optional boolean.
 - `io_gate`: optional boolean.
 
 Example:
@@ -826,7 +836,7 @@ Authorization: Bearer <token>
 ### Multipart Finalize
 
 ```http
-POST /noa/v1/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/mhw.mp4&coordinator_node_id=node-a
+POST /noa/v1/upload/multipart/{version_id}/{session_id}/finalize?coordinator_node_id=node-a
 Authorization: Bearer <token>
 Content-Type: application/json
 ```
@@ -851,18 +861,39 @@ If parts are missing, N2 returns `409 Conflict`:
 }
 ```
 
-If complete, N2 returns committed object metadata and clears the pending upload
-binding.
+If complete, N2 synchronizes every exact shard holder used by the upload,
+publishes NCDX, publishes NCNX, returns committed object metadata, and removes
+the coordinator-memory session.
 
 ### Multipart Cancel
 
 ```http
-DELETE /noa/v1/upload/multipart/{version_id}?object_key=videos/mhw.mp4&coordinator_node_id=node-a
+DELETE /noa/v1/upload/multipart/{version_id}?coordinator_node_id=node-a
 Authorization: Bearer <token>
 ```
 
-Cancels the coordinator-owned upload session and clears the pending namespace
-binding when possible.
+Cancels the coordinator-memory session. Already-written, unpublished immutable
+parts remain headless and are never mistaken for a live object.
+
+### Durable Multipart
+
+Use the durable family when unfinished upload progress must survive a
+coordinator restart. Request and response bodies are the same as standard
+multipart; insert `/durable` after `/multipart` in every route:
+
+```text
+POST   /noa/v1/upload/multipart/durable/init/{object_key}
+GET    /noa/v1/upload/multipart/durable
+GET    /noa/v1/upload/multipart/durable/{version_id}
+PUT    /noa/v1/upload/multipart/durable/{version_id}/{part_index}
+POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/durable/{version_id}
+```
+
+Durable init persists the upload manifest and pending logical binding. Each
+accepted part persists its compact receipt. Finalize keeps the same immutable
+commit boundary as standard multipart: NCDX first, NCNX last. Gateway clients
+must preserve `coordinator_node_id` for this family as well.
 
 ## Object Read API
 
@@ -1884,6 +1915,9 @@ target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 \
   gc status --fragment n2-test --secret fragment-key
 ```
 
+Large shell uploads use standard multipart by default. Add `--durable` when
+unfinished multipart progress must survive a coordinator restart.
+
 The shell supports raw native operation calls:
 
 ```bash
@@ -1909,12 +1943,18 @@ object.redistribute
 object.delete
 object.recover
 upload.one_shot
-multipart.init
-multipart.put_part
-multipart.finalize
-multipart.cancel
-multipart.status
-uploads.list
+upload.multipart.standard.init
+upload.multipart.standard.put_part
+upload.multipart.standard.finalize
+upload.multipart.standard.cancel
+uploads.standard.status
+uploads.standard.list
+upload.multipart.durable.init
+upload.multipart.durable.put_part
+upload.multipart.durable.finalize
+upload.multipart.durable.cancel
+uploads.durable.status
+uploads.durable.list
 cluster.membership
 cluster.layout
 cluster.health
@@ -1941,6 +1981,9 @@ fragment.update
 fragment.delete
 capacity.usage
 ```
+
+The older `multipart.*` and `uploads.*` native aliases remain mapped to the
+durable contract for existing native clients.
 
 ## Peer Routes
 

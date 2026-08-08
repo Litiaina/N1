@@ -92,10 +92,21 @@ GET    /noa/v1/upload/multipart/{version_id}
 PUT    /noa/v1/upload/multipart/{version_id}/{part_index}
 POST   /noa/v1/upload/multipart/{version_id}/{session_id}/finalize
 DELETE /noa/v1/upload/multipart/{version_id}
+
+POST   /noa/v1/upload/multipart/durable/init/{object_key}
+GET    /noa/v1/upload/multipart/durable
+GET    /noa/v1/upload/multipart/durable/{version_id}
+PUT    /noa/v1/upload/multipart/durable/{version_id}/{part_index}
+POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/durable/{version_id}
 ```
 
-Multipart responses expose N2's coordinator identity. That is an N2 extension
-to the shared upload result, not a different upload meaning.
+The standard multipart family is speed-first: temporary progress is held in
+coordinator memory and independent parts may arrive concurrently. The durable
+family persists restart-proof manifests and part receipts. Both publish NCDX
+and then NCNX only at finalize. Multipart responses expose N2's coordinator
+identity. That is an N2 extension to the shared upload result, not a different
+upload meaning.
 
 ### POSIX-Like Namespace
 

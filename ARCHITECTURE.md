@@ -404,10 +404,18 @@ idempotent and stale same-key operations fail rather than delete newer state.
 
 ### Upload commit
 
+N2 has two staging lanes before this shared commit boundary. Standard
+multipart keeps only a sparse coordinator-memory part map, permits independent
+parts to execute concurrently, writes no session/receipt replicas, and defers
+shard sync to finalize. Durable multipart persists the existing manifest,
+pending binding, and per-part receipts so progress survives restart. Standard
+restart loss is an explicit API contract, not loss of a committed object.
+
 ```text
 calculate the complete fixed K + M layout
 -> attempt every exact shard/parity holder in parallel
--> require at least K durable EC pieces
+-> require at least K successfully written EC pieces
+-> for standard multipart, each participating node syncs its exact shards
 -> publish immutable NCDX to every available exact holder and require K
 -> publish to all R=M+1 NCNX holders and require at least one durable copy
 -> fsync their parent directories

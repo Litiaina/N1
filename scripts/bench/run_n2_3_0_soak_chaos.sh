@@ -20,7 +20,7 @@ else
   REMOTE_IP="${REMOTE_IP:-$REMOTE_HOST}"
   TOPOLOGY_LABEL="four logical nodes on two physical hosts; static EC 2+2; NCNX R=3"
 fi
-DURATION_SECONDS="${DURATION_SECONDS:-43200}"
+DURATION_SECONDS="${DURATION_SECONDS:-86400}"
 SOAK_TOKEN_TTL_SECONDS="${SOAK_TOKEN_TTL_SECONDS:-172800}"
 MAX_CYCLES="${MAX_CYCLES:-0}"
 CYCLE_PAUSE_SECONDS="${CYCLE_PAUSE_SECONDS:-8}"
@@ -28,7 +28,10 @@ CHAOS_EVERY_CYCLES="${CHAOS_EVERY_CYCLES:-20}"
 ROLLING_LIVE_OBJECTS="${ROLLING_LIVE_OBJECTS:-100}"
 PAYLOAD_KIB="${PAYLOAD_KIB:-256}"
 ANCHOR_MIB="${ANCHOR_MIB:-8}"
-MULTIPART_PART_MIB="${MULTIPART_PART_MIB:-512}"
+MULTIPART_PART_MIB="${MULTIPART_PART_MIB:-16}"
+MULTIPART_PARALLEL_PARTS="${MULTIPART_PARALLEL_PARTS:-4}"
+MULTIPART_SOAK_MIB="${MULTIPART_SOAK_MIB:-64}"
+MULTIPART_EVERY_CYCLES="${MULTIPART_EVERY_CYCLES:-25}"
 STRIPE_BLOCK_KIB="${STRIPE_BLOCK_KIB:-4096}"
 NATIVE_CLIENT="${N2_SOAK_NATIVE_CLIENT:-}"
 NATIVE_EVERY_CYCLES="${NATIVE_EVERY_CYCLES:-5}"
@@ -41,21 +44,27 @@ HEAL_STATUS_POLL_SECONDS="${HEAL_STATUS_POLL_SECONDS:-1}"
 HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS="${HEAL_TRIGGER_REQUEST_TIMEOUT_SECONDS:-180}"
 CHAOS_START_PHASE="${CHAOS_START_PHASE:-1}"
 GC_CLEANUP_INTERVAL_SECONDS="${GC_CLEANUP_INTERVAL_SECONDS:-300}"
-GC_RETENTION_SECONDS="${GC_RETENTION_SECONDS:-10}"
+# Keep ordinary trash/recover cycles well inside their recovery contract.
+# Expiry is still exercised by older generations during every long run.
+GC_RETENTION_SECONDS="${GC_RETENTION_SECONDS:-60}"
 AUTHORIZED_KEY_TAG="${AUTHORIZED_KEY_TAG:-}"
 REMOVE_IDENTITY_ON_EXIT="${REMOVE_IDENTITY_ON_EXIT:-false}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${N2_SOAK_BIN:-$ROOT_DIR/target/release/litiaina-n2}"
 TS="${SOAK_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-OUT_ROOT="${N2_SOAK_OUT_ROOT:-/home/litiaina/DEV-TEST}"
+OUT_ROOT="${N2_SOAK_OUT_ROOT:-/home/litiaina/DEV_TEST}"
 OUT="$OUT_ROOT/N2-3.0-soak-$TS"
 LOCAL_RUN="$OUT/runtime"
 LOCAL_A="$LOCAL_RUN/node-a"
 LOCAL_B="$LOCAL_RUN/node-b"
 LOCAL_A_STORE="${N2_SOAK_A_STORE:-$OUT/storage/node-a}"
 LOCAL_B_STORE="${N2_SOAK_B_STORE:-$OUT/storage/node-b}"
-REMOTE_RUN_BASE="/home/$REMOTE_USER/.cache/N2-3.0-soak-$TS"
+if [[ "$ALL_LOCAL" == "true" ]]; then
+  REMOTE_RUN_BASE="${N2_SOAK_REMOTE_RUN_BASE:-$LOCAL_RUN}"
+else
+  REMOTE_RUN_BASE="${N2_SOAK_REMOTE_RUN_BASE:-/home/$REMOTE_USER/.cache/N2-3.0-soak-$TS}"
+fi
 REMOTE_C="$REMOTE_RUN_BASE/node-c"
 REMOTE_D="$REMOTE_RUN_BASE/node-d"
 REMOTE_STORE_BASE=".n2-3.0-soak-$TS"
@@ -87,6 +96,7 @@ FRAGMENT=""
 STABLE_FRAGMENT=""
 ANCHOR_VERSION=""
 ANCHOR_SHA=""
+MULTIPART_SOAK_SHA=""
 START_EPOCH="$(date +%s)"
 DEADLINE=$((START_EPOCH + DURATION_SECONDS))
 CYCLE=0
@@ -116,6 +126,9 @@ fi
 [[ "$CHAOS_EVERY_CYCLES" =~ ^[0-9]+$ && "$CHAOS_EVERY_CYCLES" -gt 0 ]]
 [[ "$NORMAL_UPLOAD_ATTEMPTS" =~ ^[0-9]+$ && "$NORMAL_UPLOAD_ATTEMPTS" -gt 0 ]]
 [[ "$MULTIPART_PART_MIB" =~ ^[0-9]+$ && "$MULTIPART_PART_MIB" -gt 0 ]]
+[[ "$MULTIPART_PARALLEL_PARTS" =~ ^[0-9]+$ && "$MULTIPART_PARALLEL_PARTS" -gt 0 ]]
+[[ "$MULTIPART_SOAK_MIB" =~ ^[0-9]+$ && "$MULTIPART_SOAK_MIB" -gt 0 ]]
+[[ "$MULTIPART_EVERY_CYCLES" =~ ^[0-9]+$ && "$MULTIPART_EVERY_CYCLES" -gt 0 ]]
 [[ "$STRIPE_BLOCK_KIB" =~ ^[0-9]+$ && "$STRIPE_BLOCK_KIB" -gt 0 ]]
 (( STRIPE_BLOCK_KIB % 4 == 0 ))
 [[ "$NATIVE_EVERY_CYCLES" =~ ^[0-9]+$ && "$NATIVE_EVERY_CYCLES" -gt 0 ]]
@@ -243,39 +256,55 @@ upload_with_retry() {
 }
 
 multipart_upload() {
-  local operation="$1" base="$2" key="$3" file="$4" response="$5"
+  local mode="$1" operation="$2" base="$3" key="$4" file="$5" response="$6"
   local bytes part_size expected_parts version session part part_file part_offset part_bytes
-  local started_ns finished_ns seconds
+  local prefix started_ns finished_ns seconds pid failed=0
+  local pids=()
   bytes="$(stat -c%s "$file")"
   part_size=$((MULTIPART_PART_MIB * 1024 * 1024))
   expected_parts=$(( (bytes + part_size - 1) / part_size ))
-  part_file="$OUT/payloads/multipart-current.part"
-  started_ns="$(date +%s%N)"
+  case "$mode" in
+    standard) prefix="$base/noa/v1/upload/multipart" ;;
+    durable) prefix="$base/noa/v1/upload/multipart/durable" ;;
+    *) echo "unknown multipart mode: $mode" >&2; return 1 ;;
+  esac
 
-  curl_json -X POST "$base/noa/v1/upload/multipart/init/$key" \
+  curl_json -X POST "$prefix/init/$key" \
     -H "Authorization: Bearer $TOKEN" \
     -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":$bytes,\"expected_parts\":$expected_parts,\"part_size_bytes\":$part_size}" \
     >"$OUT/events/$operation-init.json"
   version="$(jq -er '.version_id' "$OUT/events/$operation-init.json")"
   session="$(jq -er '.session_id' "$OUT/events/$operation-init.json")"
 
+  rm -rf -- "$OUT/payloads/$operation-parts"
+  mkdir -p "$OUT/payloads/$operation-parts"
   for ((part = 0; part < expected_parts; part++)); do
-    if (( expected_parts == 1 )); then
-      part_file="$file"
-    else
-      part_offset=$((part * part_size))
-      part_bytes=$((bytes - part_offset))
-      (( part_bytes > part_size )) && part_bytes="$part_size"
-      dd if="$file" of="$part_file" bs=4M iflag=skip_bytes,count_bytes \
-        skip="$part_offset" count="$part_bytes" status=none
-    fi
-    curl_auth -X PUT "$base/noa/v1/upload/multipart/$version/$part" \
-      --data-binary @"$part_file" >"$OUT/events/$operation-part-$part.json"
+    part_file="$OUT/payloads/$operation-parts/part-$part.bin"
+    part_offset=$((part * part_size))
+    part_bytes=$((bytes - part_offset))
+    (( part_bytes > part_size )) && part_bytes="$part_size"
+    dd if="$file" of="$part_file" bs=4M iflag=skip_bytes,count_bytes \
+      skip="$part_offset" count="$part_bytes" status=none
   done
-  (( expected_parts == 1 )) || rm -f "$part_file"
+
+  started_ns="$(date +%s%N)"
+  for ((part = 0; part < expected_parts; part++)); do
+    part_file="$OUT/payloads/$operation-parts/part-$part.bin"
+    curl_auth -X PUT "$prefix/$version/$part" \
+      --data-binary @"$part_file" >"$OUT/events/$operation-part-$part.json" &
+    pids+=("$!")
+    if (( ${#pids[@]} >= MULTIPART_PARALLEL_PARTS )); then
+      for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+      pids=()
+      (( failed == 0 )) || return 1
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+  (( failed == 0 )) || return 1
+  rm -rf -- "$OUT/payloads/$operation-parts"
 
   curl_json -X POST \
-    "$base/noa/v1/upload/multipart/$version/$session/finalize?object_key=$key" \
+    "$prefix/$version/$session/finalize?object_key=$key" \
     -H "Authorization: Bearer $TOKEN" \
     -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":$bytes,\"expected_parts\":$expected_parts,\"part_size_bytes\":$part_size}" \
     >"$response"
@@ -988,13 +1017,19 @@ EOF
   assert_writable
 
   dd if=/dev/urandom of="$OUT/payloads/anchor.bin" bs=1M count="$ANCHOR_MIB" status=none
+  dd if=/dev/urandom of="$OUT/payloads/multipart-soak.bin" bs=1M count="$MULTIPART_SOAK_MIB" status=none
   dd if=/dev/urandom of="$OUT/payloads/current.bin" bs=1K count="$PAYLOAD_KIB" status=none
   dd if=/dev/urandom of="$OUT/payloads/small.bin" bs=4K count=1 status=none
   ANCHOR_SHA="$(sha256sum "$OUT/payloads/anchor.bin" | awk '{print $1}')"
-  multipart_upload anchor-upload "$A_BASE" soak/anchor.bin \
+  MULTIPART_SOAK_SHA="$(sha256sum "$OUT/payloads/multipart-soak.bin" | awk '{print $1}')"
+  multipart_upload standard anchor-upload "$A_BASE" soak/anchor.bin \
     "$OUT/payloads/anchor.bin" "$OUT/anchor-upload.json"
   ANCHOR_VERSION="$(jq -er '.version_id' "$OUT/anchor-upload.json")"
   download_verify "$D_BASE" soak/anchor.bin "$ANCHOR_SHA" anchor-download
+
+  multipart_upload durable durable-anchor-upload "$B_BASE" soak/durable-anchor.bin \
+    "$OUT/payloads/anchor.bin" "$OUT/durable-anchor-upload.json"
+  download_verify "$C_BASE" soak/durable-anchor.bin "$ANCHOR_SHA" durable-anchor-download
 
   if [[ -n "$NATIVE_CLIENT" ]]; then
     for native_base in "${NATIVE_BASES[@]}"; do
@@ -1065,7 +1100,7 @@ run_native_cycle() {
 }
 
 run_cycle() {
-  local index base key moved old old_key current_sha seconds trash_id
+  local index base key moved old old_key current_sha seconds trash_id multipart_mode multipart_key
   index=$((CYCLE % 4))
   base="${BASES[$index]}"
   key="soak/live/object-$(printf '%08d' "$CYCLE").bin"
@@ -1120,6 +1155,23 @@ run_cycle() {
   if (( CYCLE % 20 == 0 )); then
     LAST_OPERATION="cycle-pagination"
     verify_pagination
+  fi
+
+  if (( CYCLE > 0 && CYCLE % MULTIPART_EVERY_CYCLES == 0 )); then
+    LAST_OPERATION="cycle-multipart"
+    if (( (CYCLE / MULTIPART_EVERY_CYCLES) % 2 == 0 )); then
+      multipart_mode="standard"
+    else
+      multipart_mode="durable"
+    fi
+    multipart_key="soak/multipart/$multipart_mode-$(printf '%08d' "$CYCLE").bin"
+    multipart_upload "$multipart_mode" "multipart-$multipart_mode-$CYCLE" "$base" \
+      "$multipart_key" "$OUT/payloads/multipart-soak.bin" \
+      "$OUT/events/multipart-$multipart_mode-current.json"
+    download_verify "${BASES[$(((index + 1) % 4))]}" "$multipart_key" \
+      "$MULTIPART_SOAK_SHA" "multipart-$multipart_mode-download"
+    curl_auth -X DELETE "$A_BASE/noa/v1/objects/$multipart_key" \
+      > "$OUT/events/multipart-$multipart_mode-retire-current.json"
   fi
 
   if (( CYCLE > ROLLING_LIVE_OBJECTS )); then

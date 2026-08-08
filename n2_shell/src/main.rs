@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use n2_native_client::{N2NativeClient, NativeClientError, NativeClientResult};
+use n2_native_client::{N2NativeClient, NativeClientError, NativeClientResult, ensure_native_ok};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -311,6 +311,12 @@ struct UploadArgs {
         help = "Calculate and send SHA-256 for each uploaded body/part."
     )]
     sha256: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Use restart-proof receipt-backed multipart instead of speed-first standard multipart."
+    )]
+    durable: bool,
 }
 
 #[derive(Args)]
@@ -328,16 +334,22 @@ enum UploadsCommand {
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[arg(long, default_value_t = false)]
+        durable: bool,
     },
     Status {
         #[arg(long)]
         version_id: String,
+        #[arg(long, default_value_t = false)]
+        durable: bool,
     },
     Cancel {
         #[arg(long)]
         version_id: String,
         #[arg(long)]
         object_key: Option<String>,
+        #[arg(long, default_value_t = false)]
+        durable: bool,
     },
 }
 
@@ -869,19 +881,30 @@ async fn run_uploads_command(
     json_output: bool,
 ) -> NativeClientResult<()> {
     match command {
-        UploadsCommand::List { limit } => {
+        UploadsCommand::List { limit, durable } => {
             print_op(
                 client,
-                "uploads.list",
+                if durable {
+                    "uploads.durable.list"
+                } else {
+                    "uploads.standard.list"
+                },
                 json!({ "limit": limit }),
                 json_output,
             )
             .await
         }
-        UploadsCommand::Status { version_id } => {
+        UploadsCommand::Status {
+            version_id,
+            durable,
+        } => {
             print_op(
                 client,
-                "uploads.status",
+                if durable {
+                    "uploads.durable.status"
+                } else {
+                    "uploads.standard.status"
+                },
                 json!({ "version_id": version_id }),
                 json_output,
             )
@@ -890,10 +913,15 @@ async fn run_uploads_command(
         UploadsCommand::Cancel {
             version_id,
             object_key,
+            durable,
         } => {
             print_op(
                 client,
-                "multipart.cancel",
+                if durable {
+                    "upload.multipart.durable.cancel"
+                } else {
+                    "upload.multipart.standard.cancel"
+                },
                 json!({ "version_id": version_id, "object_key": object_key }),
                 json_output,
             )
@@ -1076,9 +1104,24 @@ async fn upload_file(
         .parallel_parts
         .max(1)
         .min(expected_parts.max(1) as usize);
+    let multipart_init_op = if args.durable {
+        "upload.multipart.durable.init"
+    } else {
+        "upload.multipart.standard.init"
+    };
+    let multipart_part_op = if args.durable {
+        "upload.multipart.durable.put_part"
+    } else {
+        "upload.multipart.standard.put_part"
+    };
+    let multipart_finalize_op = if args.durable {
+        "upload.multipart.durable.finalize"
+    } else {
+        "upload.multipart.standard.finalize"
+    };
     let init: Value = client
         .operation_json(
-            "multipart.init",
+            multipart_init_op,
             &json!({
                 "object_key": args.object_key,
                 "content_type": content_type,
@@ -1105,7 +1148,7 @@ async fn upload_file(
             let mut part_reader = (&mut file).take(part_len);
             client
                 .operation_reader(
-                    "multipart.put_part",
+                    multipart_part_op,
                     &json!({
                         "version_id": version_id,
                         "part_index": part_index,
@@ -1153,6 +1196,7 @@ async fn upload_file(
                     size,
                     args.sha256,
                     !args.no_io_gate,
+                    multipart_part_op,
                 ));
             }
 
@@ -1180,7 +1224,7 @@ async fn upload_file(
 
     let finalized = client
         .operation(
-            "multipart.finalize",
+            multipart_finalize_op,
             &json!({
                 "object_key": args.object_key,
                 "content_type": content_type,
@@ -1207,6 +1251,7 @@ async fn upload_part_with_new_client(
     total_size: u64,
     sha256: bool,
     io_gate: bool,
+    multipart_part_op: &'static str,
 ) -> NativeClientResult<(u64, u64)> {
     let mut client = N2NativeClient::connect(&native_url)
         .await?
@@ -1225,7 +1270,7 @@ async fn upload_part_with_new_client(
     let mut part_reader = (&mut file).take(part_len);
     client
         .operation_reader(
-            "multipart.put_part",
+            multipart_part_op,
             &json!({
                 "version_id": version_id,
                 "part_index": part_index,
@@ -1270,18 +1315,7 @@ async fn download_file(client: &mut N2NativeClient, args: DownloadArgs) -> Nativ
             Ok(())
         })
         .await?;
-    if !response.ok {
-        let (code, message) = response
-            .error
-            .map(|err| (err.code, err.message))
-            .unwrap_or_else(|| {
-                (
-                    "native_error".to_string(),
-                    "unknown native error".to_string(),
-                )
-            });
-        return Err(NativeClientError::Native { code, message });
-    }
+    ensure_native_ok(&response)?;
     eprintln!(
         "downloaded {} to {}",
         human_bytes(bytes),

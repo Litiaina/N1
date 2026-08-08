@@ -7,8 +7,8 @@ use crate::enums::app_error_enum::AppError;
 use crate::protocol::auth::NativeSession;
 use crate::protocol::frame::{read_request_body, read_request_control, write_response};
 use crate::protocol::ops::{
-    NativeExecutionError, execute_native_op, execute_native_streaming_reader, native_body_bytes,
-    op_response, prepare_native_download_stream, stream_native_download_plan,
+    NativeExecutionError, execute_native_op, execute_native_streaming_reader,
+    prepare_native_download_stream, stream_native_download_plan,
 };
 use crate::protocol::types::{
     MAX_NATIVE_BODY_BYTES, N2_NATIVE_PROTOCOL_VERSION, NativeAuthFragmentRequest,
@@ -166,9 +166,9 @@ async fn handle_request(
                     .await
                     {
                         Ok(()) => NativeRequestOutcome::Written,
-                        Err(err) => NativeRequestOutcome::Response(NativeResponse::operation(
-                            id, err.0, err.1,
-                        )),
+                        Err(err) => {
+                            NativeRequestOutcome::Response(native_execution_error_response(id, err))
+                        }
                     };
                 }
 
@@ -211,7 +211,7 @@ async fn handle_request(
                     Ok(None) => {
                         NativeResponse::err(id, "unknown_op", format!("unsupported op '{op}'"))
                     }
-                    Err(err) => NativeResponse::operation(id, err.0, err.1),
+                    Err(err) => native_execution_error_response(id, err),
                 }
             }
             Err(err) => NativeResponse::err(id, "bad_request", err),
@@ -266,11 +266,22 @@ async fn handle_peer_shard_get(id: String, request: NativeRequest) -> NativeRequ
 }
 
 fn native_app_error_response(id: String, err: AppError) -> NativeResponse {
-    NativeResponse::operation(
-        id,
-        op_response(native_app_error_status(&err)),
-        native_body_bytes(&json!({ "error": err.to_string() })),
-    )
+    NativeResponse::operation_error(id, native_app_error_status(&err), err.to_string())
+}
+
+fn native_execution_error_response(id: String, err: NativeExecutionError) -> NativeResponse {
+    let status = err.0.status;
+    let message = rmp_serde::from_slice::<Value>(&err.1)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("native operation failed with status {status}"));
+    NativeResponse::operation_error(id, status, message)
 }
 
 fn native_app_error_status(err: &AppError) -> u16 {
@@ -460,6 +471,8 @@ fn native_op_accepts_streaming_body(op: &str) -> bool {
             | "object.upload.one_shot"
             | "multipart.put_part"
             | "upload.multipart.put_part"
+            | "upload.multipart.durable.put_part"
+            | "upload.multipart.standard.put_part"
     )
 }
 
@@ -499,7 +512,10 @@ async fn acquire_native_upload_continue_gate(
                 claims.fragment, object_key
             )
         }
-        "multipart.put_part" | "upload.multipart.put_part" => {
+        "multipart.put_part"
+        | "upload.multipart.put_part"
+        | "upload.multipart.durable.put_part"
+        | "upload.multipart.standard.put_part" => {
             let version_id =
                 string_value(payload.get("version_id")).unwrap_or_else(|| "<missing>".to_string());
             let part_index = payload
