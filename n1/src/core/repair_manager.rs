@@ -1643,6 +1643,38 @@ async fn run_repair_job_inner(
     );
 
     let shard_repair_sem = Arc::new(Semaphore::new(cfg.shard_repair_concurrency));
+    let alias_roots = index_roots.clone();
+    let alias_dry_run = cfg.dry_run;
+    let alias_report = tokio::task::spawn_blocking(move || {
+        index_store::reconcile_fragment_alias_replicas(&alias_roots, alias_dry_run)
+    })
+    .await
+    .map_err(|error| {
+        AppError::InternalServerError(format!("fragment alias reconciliation join error: {error}"))
+    })??;
+    if alias_report.repaired_aliases > 0 || alias_report.missing_aliases > 0 {
+        info!(
+            "N1 fragment alias reconciliation: discovered={} missing={} repaired={} ambiguous={}",
+            alias_report.discovered_fragments,
+            alias_report.missing_aliases,
+            alias_report.repaired_aliases,
+            alias_report.ambiguous_fragments
+        );
+        let mut status = REPAIR_STATUS.write().await;
+        status.missing_meta_repaired = status
+            .missing_meta_repaired
+            .saturating_add(alias_report.repaired_aliases);
+        status.total_repaired = status
+            .total_repaired
+            .saturating_add(alias_report.repaired_aliases);
+        status.last_repaired = (alias_report.repaired_aliases > 0).then(|| {
+            format!(
+                "{} fragment alias replica(s)",
+                alias_report.repaired_aliases
+            )
+        });
+        ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+    }
     let fragments = match cfg.target_fragment.as_ref() {
         Some(fragment) => vec![fragment.clone()],
         None => list_all_fragments(&index_roots).await,

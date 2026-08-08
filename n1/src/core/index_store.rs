@@ -8,8 +8,10 @@ use super::index::{
 use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_OBJECTS_DIR;
 use crate::core::fragment_identity::{
-    FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_root_on as resolved_fragment_root_on,
-    physical_fragment_root_on, stable_fragment_id_for_root,
+    FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_alias_dir, fragment_alias_path,
+    fragment_alias_target_stable_id, fragment_root_on as resolved_fragment_root_on,
+    list_fragment_aliases, physical_fragment_dir_name, physical_fragment_root_on,
+    stable_fragment_id_for_root,
 };
 use crate::core::linux_io;
 use crate::enums::app_error_enum::AppError;
@@ -64,6 +66,14 @@ pub struct FragmentMeta {
     #[serde(default)]
     pub nt_hash_hex: Option<String>,
     pub index_partition_count: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FragmentAliasReconciliation {
+    pub discovered_fragments: u64,
+    pub missing_aliases: u64,
+    pub repaired_aliases: u64,
+    pub ambiguous_fragments: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +198,171 @@ fn decode_fragment_meta(bytes: &[u8]) -> Result<FragmentMeta, AppError> {
         )));
     }
     Ok(meta)
+}
+
+fn read_physical_fragment_meta(
+    root: &Path,
+    stable_fragment_id: &str,
+) -> Result<Option<FragmentMeta>, AppError> {
+    let path = physical_fragment_root_on(root, stable_fragment_id).join(FRAGMENT_META_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Io(
+                error,
+                format!("read fragment identity metadata {}", path.display()),
+            ));
+        }
+    };
+    decode_fragment_meta(&bytes).map(Some)
+}
+
+fn validate_physical_fragment_identity(
+    root: &Path,
+    stable_fragment_id: &str,
+) -> Result<bool, AppError> {
+    let Some(meta) = read_physical_fragment_meta(root, stable_fragment_id)? else {
+        return Ok(false);
+    };
+    if meta.stable_fragment_id != stable_fragment_id {
+        return Err(AppError::Conflict(format!(
+            "fragment identity mismatch on {}: directory={}, metadata={}",
+            root.display(),
+            stable_fragment_id,
+            meta.stable_fragment_id
+        )));
+    }
+    Ok(meta.state == "active")
+}
+
+/// Restores a missing alias only when surviving replicas unanimously map one
+/// alias to one stable physical fragment and the destination already contains
+/// matching active fragment metadata. It never creates, copies, or rewrites a
+/// physical fragment directory.
+pub(crate) fn reconcile_fragment_alias_replicas(
+    roots: &[PathBuf],
+    dry_run: bool,
+) -> Result<FragmentAliasReconciliation, AppError> {
+    let mut aliases_by_stable = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut stable_ids_by_alias = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for root in roots {
+        for alias in list_fragment_aliases(root) {
+            let Some(stable_fragment_id) = fragment_alias_target_stable_id(root, &alias) else {
+                continue;
+            };
+            if !validate_physical_fragment_identity(root, &stable_fragment_id)? {
+                continue;
+            }
+            aliases_by_stable
+                .entry(stable_fragment_id.clone())
+                .or_default()
+                .insert(alias.clone());
+            stable_ids_by_alias
+                .entry(alias)
+                .or_default()
+                .insert(stable_fragment_id);
+        }
+    }
+
+    if let Some((alias, stable_ids)) = stable_ids_by_alias
+        .iter()
+        .find(|(_, stable_ids)| stable_ids.len() > 1)
+    {
+        return Err(AppError::Conflict(format!(
+            "fragment alias '{}' points to multiple stable fragment identities: {}",
+            alias,
+            stable_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
+
+    let mut report = FragmentAliasReconciliation {
+        discovered_fragments: aliases_by_stable.len() as u64,
+        ..FragmentAliasReconciliation::default()
+    };
+
+    for (stable_fragment_id, aliases) in aliases_by_stable {
+        if aliases.len() != 1 {
+            report.ambiguous_fragments = report.ambiguous_fragments.saturating_add(1);
+            continue;
+        }
+        let alias = aliases.into_iter().next().expect("one alias was checked");
+        let expected_target =
+            PathBuf::from("..").join(physical_fragment_dir_name(&stable_fragment_id));
+
+        for root in roots {
+            if !validate_physical_fragment_identity(root, &stable_fragment_id)? {
+                continue;
+            }
+            let alias_path = fragment_alias_path(root, &alias);
+            match fs::symlink_metadata(&alias_path) {
+                Ok(_) => {
+                    if fs::read_link(&alias_path).ok().as_deref() != Some(expected_target.as_path())
+                    {
+                        return Err(AppError::Conflict(format!(
+                            "fragment alias {} does not point to {}",
+                            alias_path.display(),
+                            expected_target.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    report.missing_aliases = report.missing_aliases.saturating_add(1);
+                    if dry_run {
+                        continue;
+                    }
+                    let alias_dir = fragment_alias_dir(root);
+                    fs::create_dir_all(&alias_dir).map_err(|error| {
+                        AppError::Io(
+                            error,
+                            format!("create fragment alias directory {}", alias_dir.display()),
+                        )
+                    })?;
+                    match unix_fs::symlink(&expected_target, &alias_path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            if fs::read_link(&alias_path).ok().as_deref()
+                                != Some(expected_target.as_path())
+                            {
+                                return Err(AppError::Conflict(format!(
+                                    "fragment alias {} changed during automatic reconciliation",
+                                    alias_path.display()
+                                )));
+                            }
+                        }
+                        Err(error) => {
+                            return Err(AppError::Io(
+                                error,
+                                format!(
+                                    "restore fragment alias {} -> {}",
+                                    alias_path.display(),
+                                    expected_target.display()
+                                ),
+                            ));
+                        }
+                    }
+                    File::open(&alias_dir)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| {
+                            AppError::Io(
+                                error,
+                                format!("sync fragment alias directory {}", alias_dir.display()),
+                            )
+                        })?;
+                    report.repaired_aliases = report.repaired_aliases.saturating_add(1);
+                }
+                Err(error) => {
+                    return Err(AppError::Io(
+                        error,
+                        format!("inspect fragment alias {}", alias_path.display()),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 fn index_roots() -> Vec<PathBuf> {
@@ -3069,6 +3244,65 @@ mod tests {
 
         let err = decode_fragment_meta(&raw).expect_err("N1 2 engine must fail closed");
         assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[test]
+    fn automatic_repair_restores_only_the_missing_fragment_alias() {
+        let base = std::env::temp_dir().join(format!("n1-alias-repair-{}", Ulid::new()));
+        let roots = vec![base.join("index-0"), base.join("index-1")];
+        let stable_fragment_id = Ulid::new().to_string();
+        let alias = "d5a6b749356bda56a23882d8d75e0dca1f268616bba4cc28622916180ae193ca";
+        let meta = FragmentMeta {
+            engine_format_version: N1_ENGINE_FORMAT_VERSION,
+            stable_fragment_id: stable_fragment_id.clone(),
+            state: "active".to_string(),
+            committed_bytes: 0,
+            reserved_bytes: 0,
+            trash_bytes: 0,
+            created_at_unix: 1,
+            updated_at_unix: 1,
+            key_phc: None,
+            nt_hash_hex: None,
+            index_partition_count: 64,
+        };
+        let bytes = rmp_serde::to_vec_named(&meta).expect("encode fragment metadata");
+
+        for root in &roots {
+            let physical = physical_fragment_root_on(root, &stable_fragment_id);
+            fs::create_dir_all(&physical).expect("create physical fragment");
+            fs::write(physical.join(FRAGMENT_META_FILE), &bytes).expect("write fragment metadata");
+            fs::create_dir_all(fragment_alias_dir(root)).expect("create alias directory");
+        }
+        unix_fs::symlink(
+            PathBuf::from("..").join(physical_fragment_dir_name(&stable_fragment_id)),
+            fragment_alias_path(&roots[0], alias),
+        )
+        .expect("create surviving alias");
+
+        let report = reconcile_fragment_alias_replicas(&roots, false)
+            .expect("reconcile missing fragment alias");
+        assert_eq!(report.discovered_fragments, 1);
+        assert_eq!(report.missing_aliases, 1);
+        assert_eq!(report.repaired_aliases, 1);
+        assert_eq!(report.ambiguous_fragments, 0);
+        assert_eq!(
+            fs::read_link(fragment_alias_path(&roots[1], alias)).expect("read repaired alias"),
+            PathBuf::from("..").join(physical_fragment_dir_name(&stable_fragment_id))
+        );
+        assert_eq!(
+            fs::read(
+                physical_fragment_root_on(&roots[1], &stable_fragment_id).join(FRAGMENT_META_FILE)
+            )
+            .expect("read destination metadata"),
+            bytes,
+            "alias repair must not rewrite fragment metadata or namespace content"
+        );
+
+        let second = reconcile_fragment_alias_replicas(&roots, false)
+            .expect("repeat alias reconciliation idempotently");
+        assert_eq!(second.missing_aliases, 0);
+        assert_eq!(second.repaired_aliases, 0);
+        fs::remove_dir_all(base).expect("remove alias repair fixture");
     }
 
     #[test]

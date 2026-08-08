@@ -22,6 +22,7 @@ Before an LTS release, N1 should pass:
 - repair after simulated disk loss or reformat
 - autonomous repair after recoverable data- and parity-shard loss
 - automatic read-only entry/recovery for missing and identity-mismatched roots
+- automatic restoration of a missing fragment alias when a surviving alias and matching physical fragment metadata provide unambiguous authority
 - healer-fault read-only persistence until an unresolved repair succeeds
 - old and new per-object EC layouts remain valid across an EC configuration change
 - redistribution `2 roots -> 1 root -> 2 roots`
@@ -63,6 +64,19 @@ proves persisted receipts and restart/resume. Both require download hash
 verification.
 
 ## Focused Proof Evidence
+
+### N1 3.4.0 Fragment-Alias Self-Healing Proof
+
+On August 8, 2026, an isolated two-index-root N1 instance created a real
+fragment, then lost the alias symlink on one root while its physical
+`@f_<stable-id>` directory and `.fragment.ndx` remained intact. The next
+automatic availability scan reported `discovered=1 missing=1 repaired=1
+ambiguous=0` and recreated the exact relative alias. A following scan repaired
+nothing, proving idempotence. The focused unit regression independently
+verifies that reconciliation does not rewrite fragment metadata or namespace
+content. Conflicting or ambiguous alias authority is not guessed and remains a
+fail-closed condition. Evidence is retained under
+`/home/litiaina/DEV_TEST/n1-alias-self-heal`.
 
 ### N1 3.4.0 Standard Multipart Upload Proof
 
