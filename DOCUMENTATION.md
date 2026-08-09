@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 3.4.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, high-throughput and durable upload modes, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.5.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, high-throughput and durable upload modes, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -10,7 +10,7 @@ notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Version And Release Status
 
-N1 `3.4.0` is the current development engine/package version. It is on the
+N1 `3.5.0` is the current development engine/package version. It is on the
 development release channel and is not a declaration that this engine line has
 reached its stable product milestone. Storage compatibility is tracked
 separately as engine format `3`; package updates within this development line
@@ -1049,6 +1049,42 @@ curl -k "$BASE/noa/v1/upload/one-shot/docs/readme.txt" \
   --data-binary @readme.txt
 ```
 
+### Standard Small-Object Batch Upload
+
+Use the standard batch route when one client must ingest many independent
+small files. It removes one HTTP authentication/request cycle per object while
+preserving a separate object id, EC layout, NDX, namespace entry, result, and
+failure boundary for every file.
+
+```http
+POST /noa/v1/upload/batch?concurrency=32
+Content-Type: multipart/form-data
+```
+
+Each file field must be named `object`, and its multipart filename must be the
+percent-encoded object key. Each object is limited to one MiB; use ordinary
+one-shot or multipart for larger files.
+The server consumes the multipart body incrementally and bounds in-flight
+memory. `concurrency` is optional and clamped to the engine safety limit.
+
+```bash
+curl -k "$BASE/noa/v1/upload/batch?concurrency=32" \
+  "${AUTH[@]}" \
+  -F 'object=@a.txt;filename=docs%2Fa.txt;type=text/plain' \
+  -F 'object=@icon.png;filename=images%2Ficon.png;type=image/png'
+```
+
+All-success responses use `201 Created`. A mixed batch uses `207 Multi-Status`
+and reports `status`, `version_id`, `size_bytes`, and any error separately for
+each object. Batch upload is standard-only: it creates no durable session,
+manifest, binding, or receipt and cannot resume after process restart.
+
+N1 performs no synchronous free-space scan before one-shot, batch, standard
+multipart, or durable multipart writes. Actual writes to the selected K+M
+roots are authoritative. Kernel capacity exhaustion returns `507`, publishes
+no namespace entry, and leaves only cleanup/TTL-reclaimable unpublished data.
+Capacity reporting remains available asynchronously through monitoring.
+
 ### Multipart Initiate
 
 The standard multipart API is the high-throughput path. Initiation and part
@@ -1168,7 +1204,7 @@ Cancel removes the pending upload session. GC can later reclaim orphaned partial
 
 Use the durable variant when unfinished-upload restart recovery matters more
 than maximum ingest throughput. Its existing replicated manifest, pending
-namespace binding, and compact part-receipt contract is unchanged in N1 3.4.0.
+namespace binding, and compact part-receipt contract is unchanged in N1 3.5.0.
 The request and response bodies are identical to standard multipart; insert
 `/durable` after `/multipart`:
 
@@ -1184,7 +1220,7 @@ DELETE /noa/v1/upload/multipart/durable/{version_id}
 Durable part upload continues to accept the `durability`,
 `strict_durability`, and `io_gate` query controls documented for the previous
 multipart contract. Existing native `n1://` multipart operations retain this
-durable restart-resumable behavior; N1 3.4.0 does not silently change their
+durable restart-resumable behavior; N1 3.5.0 does not silently change their
 established contract.
 
 ## Archive Download

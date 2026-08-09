@@ -110,6 +110,7 @@ not add empty-trash, hard-delete, or per-version-delete semantics.
 
 ```text
 POST   /noa/v1/upload/one-shot/{object_key}
+POST   /noa/v1/upload/batch
 POST   /noa/v1/upload/multipart/init/{object_key}
 GET    /noa/v1/upload/multipart
 GET    /noa/v1/upload/multipart/{version_id}
@@ -130,6 +131,14 @@ ingest: initialization/status/part completion are memory-resident and finalize
 is the only durability/publication boundary. The durable family retains
 restart-resumable manifests and part receipts. Both publish the same immutable
 N1 object and namespace representation after successful finalize.
+
+The standard batch route accepts `multipart/form-data` for high-volume small
+objects. Every file field is named `object`, carries its percent-encoded object
+key as the multipart filename, is limited to one MiB, and remains an
+independent object operation. The optional `concurrency` query is bounded by
+the server. A complete batch returns `201`; mixed per-object results return
+`207`. There is deliberately no durable batch route: clients requiring
+restart-proof progress use durable multipart for each object.
 
 ## Maintenance And Object Health
 

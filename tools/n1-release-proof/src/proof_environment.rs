@@ -17,8 +17,15 @@ impl Proof {
         }
         let roots = self.disk_roots()?;
         self.active_disk_count = roots.len();
-        if roots.len() < 2 {
-            return Err("release proof requires at least two disk roots".into());
+        let focused_single_root_noa = self.args.noa_api_proof
+            && self.data_shards == 1
+            && self.parity_shards == 0
+            && roots.len() == 1;
+        if roots.len() < 2 && !focused_single_root_noa {
+            return Err(
+                "release proof requires at least two roots; only the focused NOA API proof permits an explicit 1+0 functional topology"
+                    .into(),
+            );
         }
         if self.args.large_copies == 0 {
             return Err("large_copies must be at least 1".into());

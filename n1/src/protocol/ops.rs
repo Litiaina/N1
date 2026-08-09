@@ -1092,20 +1092,7 @@ fn auth_error_status(err: &AuthError) -> StatusCode {
 }
 
 fn app_error_status(err: &AppError) -> StatusCode {
-    match err {
-        AppError::NotFound => StatusCode::NOT_FOUND,
-        AppError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
-        AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
-        AppError::Conflict(_) => StatusCode::CONFLICT,
-        AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-        AppError::Unauthorized => StatusCode::UNAUTHORIZED,
-        AppError::Forbidden(_) => StatusCode::FORBIDDEN,
-        AppError::Multipart(_) => StatusCode::BAD_REQUEST,
-        AppError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
-        AppError::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
-        AppError::Io(_, _) | AppError::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
+    err.status_code()
 }
 
 fn require_claims(session: &NativeSession) -> Result<Claims, AppError> {

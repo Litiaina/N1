@@ -135,6 +135,22 @@ Evidence for the current release belongs under `/home/litiaina/DEV_TEST` and
 must record the exact binary hash, configuration, disk topology, commands,
 results, and any unproven boundaries.
 
+## N1 3.5.0 Upload Release Requirement
+
+N1 3.5.0 must retain every engine-format-3 and 3.4.0 upload invariant and also
+prove:
+
+- one-shot, standard multipart, and durable multipart execute without any synchronous physical-capacity probe
+- a real kernel `ENOSPC`/quota failure returns `507` and publishes no NDX or namespace entry
+- cleanup removes partial shards after a capacity failure, with orphan GC as the crash fallback
+- standard batch upload accepts many independent one-MiB-or-smaller objects through one bounded multipart request
+- a batch entry receives its own object identity, K+M layout, NDX, namespace entry, and response
+- one failed or conflicting batch entry does not corrupt or cancel successful independent entries
+- batch concurrency remains bounded in memory and can be selected independently of total configured disk count
+- no durable batch route exists; durable multipart retains replicated restart-proof manifests and receipts
+- small-object evidence records objects/second, MiB/second, CPU cycles, latency percentiles, RSS, and disk I/O
+- scale analysis demonstrates no O(total configured disks) capacity work in any upload hot path
+
 The reusable release runner has one bounded API gate and three focused
 autonomous-maintenance gates:
 

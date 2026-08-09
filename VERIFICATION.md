@@ -2,7 +2,7 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.4.0` on the development channel, using
+The current package line is N1 `3.5.0` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
 line. Dated evidence names below remain unchanged because they identify the
 exact candidate binaries and runs that produced them.
@@ -42,6 +42,9 @@ Before an LTS release, N1 should pass:
 - unfinished standard sessions vanish on restart and leave only TTL-reclaimable headless shards
 - durable multipart remains restart-resumable through its existing manifest and receipt contract
 - upload evidence separates server-local engine throughput from LAN client throughput
+- no upload path performs synchronous topology-wide or selected-root free-space probes
+- kernel `ENOSPC`/quota failures return `507` and publish no object or namespace truth
+- standard small-object batch upload proves bounded concurrency, mixed-result isolation, and per-object EC/namespace identity
 
 ## Rust Release Proof Runner
 
@@ -64,6 +67,47 @@ proves persisted receipts and restart/resume. Both require download hash
 verification.
 
 ## Focused Proof Evidence
+
+### N1 3.5.0 Capacity-Free Standard Batch Proof
+
+On August 10, 2026, the N1 3.5.0 candidate passed a focused real-process
+NOA proof using the release binary with SHA-256
+`715d040e03a77dac6741564b80f0a37b1532ae9bb14bcfc5323c156b0a642b6d`.
+The proof used an explicit local `1 + 0` functional topology so it could run
+without touching the independent N2 test or pretending that two directories on
+one physical device were a durable multi-disk topology.
+
+- Strict N1 all-target tests passed `143/143` library tests plus the server
+  binary target with warnings denied.
+- Static call-site inspection confirmed that one-shot, standard multipart, and
+  durable multipart no longer call the synchronous global or selected-root
+  free-space probes. Kernel writes are authoritative; `ENOSPC` and `EDQUOT`
+  map to HTTP/native status `507`, while publication remains after successful
+  EC and metadata completion.
+- A real 128 MiB loopback ext4 filesystem was reduced to `2,093,056` free
+  bytes before an 8 MiB one-shot upload. The kernel `ENOSPC` returned `507`
+  without hanging; afterward there were zero matching namespace entries,
+  temporary shards, published shards, or object NDX files.
+- The individual baseline uploaded `256` independent 8 KiB objects at
+  `228.522 objects/s` (`1.785 MiB/s`) with client concurrency `32`.
+- The standard batch route uploaded the same `256` independent 8 KiB objects
+  in one request at `549.702 objects/s` (`4.295 MiB/s`) with bounded engine
+  concurrency `32`, a `2.41x` object-rate improvement in this proof.
+- The batch included one deliberate directory conflict. The response returned
+  `207 Multi-Status`, committed all `256` valid objects, isolated the conflict
+  as `409`, and did not collapse the batch into one failure domain.
+- Listing, sampled SHA-256 downloads, per-object health, physical index
+  inspection, restart persistence, POSIX/CRUD/lifecycle checks, and maintenance
+  status checks all passed.
+- Both pre-restart and post-restart server logs passed with no warning, error,
+  panic, or failed lines.
+
+Machine-readable evidence is retained at
+`/home/litiaina/DEV_TEST/n1-3.5/results/noa-batch-proof-4/summary.json` and
+`/home/litiaina/DEV_TEST/n1-3.5/enospc-proof/summary.json`. This focused proof
+establishes the 3.5.0 upload-contract change and functional publication
+invariants; its single-device `1 + 0` topology is not evidence of multi-disk EC
+fault tolerance.
 
 ### N1 3.4.0 Fragment-Alias Self-Healing Proof
 

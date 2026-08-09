@@ -44,7 +44,7 @@ use crate::core::upload::{
     initiate_object_upload as durable_initiate_object_upload_impl, initiate_standard_upload_direct,
     list_active_uploads as durable_list_active_uploads_impl, list_standard_uploads_direct,
     object_upload_part as durable_object_upload_part_impl, object_upload_part_standard_body_direct,
-    upload_object_one_shot as upload_object_one_shot_impl,
+    upload_object_one_shot as upload_object_one_shot_impl, upload_object_one_shot_body_direct,
 };
 use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
@@ -62,19 +62,22 @@ use crate::url::signed_read::{
 use crate::websocket::handler::ws_handler;
 use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager};
 use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
-use axum::body::to_bytes;
+use axum::body::{Body, to_bytes};
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{
     Json as AxumJson, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
 };
-use serde::de::DeserializeOwned;
+use bytes::BytesMut;
+use percent_encoding::percent_decode_str;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinSet;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct AppState {
@@ -986,6 +989,309 @@ async fn upload_object_one_shot_scoped(
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
 
+const STANDARD_BATCH_OBJECT_MAX_BYTES: usize = 1024 * 1024;
+const STANDARD_BATCH_MAX_CONCURRENCY: usize = 128;
+
+#[derive(Debug, Deserialize)]
+struct StandardBatchUploadQuery {
+    #[serde(default)]
+    concurrency: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct StandardBatchUploadEntryResult {
+    object_key: String,
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct IndexedStandardBatchUploadResult {
+    index: usize,
+    result: StandardBatchUploadEntryResult,
+}
+
+#[derive(Debug, Serialize)]
+struct StandardBatchUploadResponse {
+    requested: usize,
+    succeeded: usize,
+    failed: usize,
+    results: Vec<StandardBatchUploadEntryResult>,
+}
+
+fn default_standard_batch_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get().saturating_mul(4))
+        .unwrap_or(16)
+        .clamp(1, STANDARD_BATCH_MAX_CONCURRENCY)
+}
+
+fn decode_standard_batch_object_key(
+    field_name: Option<&str>,
+    file_name: Option<&str>,
+) -> Result<String, AppError> {
+    if field_name != Some("object") {
+        return Err(AppError::BadRequest(
+            "batch file fields must be named 'object'".to_string(),
+        ));
+    }
+    let encoded = file_name.ok_or_else(|| {
+        AppError::BadRequest(
+            "batch object fields require a percent-encoded object key as filename".to_string(),
+        )
+    })?;
+    let decoded = percent_decode_str(encoded)
+        .decode_utf8()
+        .map_err(|_| AppError::BadRequest("batch object key is not valid UTF-8".to_string()))?;
+    let key = decoded.trim_start_matches('/').trim();
+    if key.is_empty() {
+        return Err(AppError::BadRequest(
+            "batch object key cannot be empty".to_string(),
+        ));
+    }
+    Ok(key.to_string())
+}
+
+fn batch_error_status(error: &AppError) -> StatusCode {
+    error.status_code()
+}
+
+fn batch_error_message(error: &AppError) -> String {
+    if error.is_capacity_error() {
+        return "Insufficient storage capacity".to_string();
+    }
+    match error {
+        AppError::Io(_, _) => "Object storage I/O failed".to_string(),
+        AppError::InternalServerError(_) => "Internal object storage failure".to_string(),
+        _ => error.to_string(),
+    }
+}
+
+async fn upload_standard_batch_object(
+    state: Arc<AppState>,
+    claims: Claims,
+    logical_path: String,
+    content_type: String,
+    bytes: bytes::Bytes,
+) -> StandardBatchUploadEntryResult {
+    let size_bytes = bytes.len() as u64;
+    let operation = async {
+        let fragment = claims.fragment.clone();
+        let physical = resolve_logical_write_key(&fragment, &logical_path).await?;
+        let query = crate::core::disk_manager::UploadPartQuery {
+            checksum: None,
+            durability: Some("batched".to_string()),
+            strict_durability: Some(false),
+            io_gate: Some(false),
+        };
+        let mut metadata = upload_object_one_shot_body_direct(
+            claims,
+            fragment.clone(),
+            physical.clone(),
+            query,
+            Some(content_type),
+            Body::from(bytes),
+            size_bytes,
+            false,
+        )
+        .await?;
+        let committed_physical =
+            commit_logical_upload_from_meta(&fragment, &logical_path, &physical, &metadata).await?;
+        metadata.object_key = logical_path.clone();
+        emit_logical_file_uploaded(
+            &state,
+            &fragment,
+            &logical_path,
+            &committed_physical,
+            &metadata,
+        );
+        Ok::<_, AppError>(metadata)
+    }
+    .await;
+
+    match operation {
+        Ok(metadata) => StandardBatchUploadEntryResult {
+            object_key: logical_path,
+            status: StatusCode::CREATED.as_u16(),
+            version_id: Some(metadata.version_id),
+            size_bytes: Some(size_bytes),
+            error: None,
+        },
+        Err(error) => {
+            let status = batch_error_status(&error);
+            StandardBatchUploadEntryResult {
+                object_key: logical_path,
+                status: status.as_u16(),
+                version_id: None,
+                size_bytes: Some(size_bytes),
+                error: Some(batch_error_message(&error)),
+            }
+        }
+    }
+}
+
+async fn collect_standard_batch_result(
+    workers: &mut JoinSet<IndexedStandardBatchUploadResult>,
+    results: &mut Vec<IndexedStandardBatchUploadResult>,
+) {
+    if let Some(joined) = workers.join_next().await {
+        match joined {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(IndexedStandardBatchUploadResult {
+                index: usize::MAX,
+                result: StandardBatchUploadEntryResult {
+                    object_key: "<batch-worker>".to_string(),
+                    status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    version_id: None,
+                    size_bytes: None,
+                    error: Some(format!("Batch worker failed: {error}")),
+                },
+            }),
+        }
+    }
+}
+
+/// Streams a bounded set of small objects through the standard one-shot path.
+/// Each multipart field is named `object`; its filename is the percent-encoded
+/// logical object key. Objects commit independently; one failure never
+/// publishes an incomplete object and does not cancel unrelated entries.
+async fn upload_standard_batch_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Query(query): Query<StandardBatchUploadQuery>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+
+    let concurrency = query
+        .concurrency
+        .unwrap_or_else(default_standard_batch_concurrency)
+        .clamp(1, STANDARD_BATCH_MAX_CONCURRENCY);
+    let mut workers = JoinSet::new();
+    let mut results = Vec::<IndexedStandardBatchUploadResult>::new();
+    let mut requested = 0usize;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::Multipart(error.to_string()))?
+    {
+        let index = requested;
+        requested = requested.saturating_add(1);
+        let logical_path = match decode_standard_batch_object_key(field.name(), field.file_name()) {
+            Ok(path) => path,
+            Err(error) => {
+                results.push(IndexedStandardBatchUploadResult {
+                    index,
+                    result: StandardBatchUploadEntryResult {
+                        object_key: "<invalid>".to_string(),
+                        status: batch_error_status(&error).as_u16(),
+                        version_id: None,
+                        size_bytes: None,
+                        error: Some(batch_error_message(&error)),
+                    },
+                });
+                continue;
+            }
+        };
+        let content_type = field
+            .content_type()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let mut body = BytesMut::new();
+        let mut too_large = false;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|error| AppError::Multipart(error.to_string()))?
+        {
+            if body.len().saturating_add(chunk.len()) > STANDARD_BATCH_OBJECT_MAX_BYTES {
+                too_large = true;
+                continue;
+            }
+            if !too_large {
+                body.extend_from_slice(&chunk);
+            }
+        }
+        if too_large {
+            results.push(IndexedStandardBatchUploadResult {
+                index,
+                result: StandardBatchUploadEntryResult {
+                    object_key: logical_path,
+                    status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                    version_id: None,
+                    size_bytes: None,
+                    error: Some(format!(
+                        "Standard batch objects are limited to {} bytes; use one-shot or multipart for larger files",
+                        STANDARD_BATCH_OBJECT_MAX_BYTES
+                    )),
+                },
+            });
+            continue;
+        }
+
+        while workers.len() >= concurrency {
+            collect_standard_batch_result(&mut workers, &mut results).await;
+        }
+        let task_state = Arc::clone(&state);
+        let task_claims = claims.clone();
+        workers.spawn(async move {
+            IndexedStandardBatchUploadResult {
+                index,
+                result: upload_standard_batch_object(
+                    task_state,
+                    task_claims,
+                    logical_path,
+                    content_type,
+                    body.freeze(),
+                )
+                .await,
+            }
+        });
+    }
+
+    while !workers.is_empty() {
+        collect_standard_batch_result(&mut workers, &mut results).await;
+    }
+    if requested == 0 {
+        return Err(AppError::BadRequest(
+            "standard batch upload contained no object fields".to_string(),
+        ));
+    }
+
+    results.sort_by_key(|entry| entry.index);
+    let results = results
+        .into_iter()
+        .map(|entry| entry.result)
+        .collect::<Vec<_>>();
+    let succeeded = results
+        .iter()
+        .filter(|entry| entry.status == StatusCode::CREATED.as_u16())
+        .count();
+    let failed = results.len().saturating_sub(succeeded);
+    let status = if failed == 0 {
+        StatusCode::CREATED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    Ok((
+        status,
+        AxumJson(StandardBatchUploadResponse {
+            requested,
+            succeeded,
+            failed,
+            results,
+        }),
+    ))
+}
+
 async fn get_upload_status_durable_scoped(
     claims: Claims,
     Path(version_id): Path<String>,
@@ -1291,6 +1597,7 @@ pub fn build_storage_routes_unbound_with_options(
                 "/noa/v1/upload/one-shot/{*object_key}",
                 post(upload_object_one_shot_scoped),
             )
+            .route("/noa/v1/upload/batch", post(upload_standard_batch_scoped))
             .route(
                 "/noa/v1/upload/multipart/{:version_id}",
                 get(get_upload_status_scoped),
@@ -1474,6 +1781,43 @@ async fn removed_manual_reclamation_route() -> impl IntoResponse {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn standard_batch_object_keys_are_explicit_and_percent_decoded() {
+        assert_eq!(
+            decode_standard_batch_object_key(
+                Some("object"),
+                Some("records%2F2026%2Fscan%2001.dcm")
+            )
+            .expect("decode batch object key"),
+            "records/2026/scan 01.dcm"
+        );
+        assert!(decode_standard_batch_object_key(Some("files"), Some("a.bin")).is_err());
+        assert!(decode_standard_batch_object_key(Some("object"), Some("%2F")).is_err());
+        assert!(decode_standard_batch_object_key(Some("object"), None).is_err());
+    }
+
+    #[test]
+    fn standard_batch_concurrency_is_bounded_independently_of_topology_size() {
+        assert!(
+            (1..=STANDARD_BATCH_MAX_CONCURRENCY).contains(&default_standard_batch_concurrency())
+        );
+        assert_eq!(0usize.clamp(1, STANDARD_BATCH_MAX_CONCURRENCY), 1);
+        assert_eq!(
+            usize::MAX.clamp(1, STANDARD_BATCH_MAX_CONCURRENCY),
+            STANDARD_BATCH_MAX_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn standard_batch_reports_kernel_capacity_failure_as_507() {
+        let error = AppError::Io(
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+            "write batch shard".to_string(),
+        );
+        assert_eq!(batch_error_status(&error), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(batch_error_message(&error), "Insufficient storage capacity");
+    }
 
     #[test]
     fn object_redistribution_route_places_catch_all_last() {

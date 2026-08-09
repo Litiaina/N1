@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "n1"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "argon2",
  "async_zip",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "n1_native_client"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -2031,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "n1_shell"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -2820,6 +2820,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "native-tls",
  "percent-encoding",
  "pin-project-lite",

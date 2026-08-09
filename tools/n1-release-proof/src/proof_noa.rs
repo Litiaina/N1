@@ -24,6 +24,10 @@ impl Proof {
             .await?;
 
         let mut expected = BTreeSet::from([object_key.clone()]);
+        let individual_small_objects = self
+            .concurrent_object_storm(&mut expected, "noa-individual-small", 256)
+            .await?;
+        let standard_batch = self.standard_batch_upload_proof(&mut expected).await?;
         let websocket = self.websocket_namespace_delta_proof(&mut expected).await?;
         let crud = self.posix_crud_gc_proof(&mut expected).await?;
         let maintenance_status = self.noa_maintenance_status_smoke().await?;
@@ -61,6 +65,8 @@ impl Proof {
             "object_key": object_key,
             "object_version_id": version_id,
             "payload_sha256": payload_sha256,
+            "individual_small_objects": individual_small_objects,
+            "standard_batch": standard_batch,
             "legacy_http_status_before_restart": legacy_status_before,
             "legacy_http_status_after_restart": legacy_status_after,
             "websocket": websocket,

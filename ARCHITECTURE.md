@@ -1,15 +1,15 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.4.0 development-engine storage contract. It is the reference for
+This document defines the N1 3.5.0 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.4.0 uses engine format 3 and preserves N1's immutable-object and
+N1 3.5.0 uses engine format 3 and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle,
 per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
-Version `3.4.0` identifies the current development package line; it does not
+Version `3.5.0` identifies the current development package line; it does not
 declare stable-release status. Engine format `3` is the independent on-disk
 compatibility boundary defined by this document.
 
@@ -262,6 +262,15 @@ publishes the namespace entry. Restart discards unfinished sessions; their
 unreferenced shard versions remain invisible and the TTL orphan scan reclaims
 them. GC treats live in-memory version ids as active while the process exists.
 
+The standard small-object batch endpoint amortizes authentication and HTTP
+request overhead without combining object identities. Every multipart field
+is named `object` and carries its percent-encoded logical key as its filename.
+It consumes the request incrementally and keeps at most a bounded number of one-megabyte-or-smaller
+objects in flight, and sends every entry through the ordinary standard
+one-shot EC and namespace commit boundary. Each result succeeds or fails
+independently. There is no batch manifest, shared object, packed payload,
+durable upload receipt, or batch-wide rollback contract.
+
 The durable restart-resumable contract keeps incomplete state in the
 index/control plane:
 
@@ -290,6 +299,15 @@ Finalize:
 Neither contract makes the namespace visible before immutable object truth is
 durable. Direct upload remains the bounded small-object path: one request body
 streams directly through EC and performs the same final publication boundary.
+
+No upload performs synchronous `statvfs` or free-space prediction. Such a
+check races every concurrent writer and would add O(total roots) or O(K+M)
+work to each object without guaranteeing capacity. The selected K+M writes are
+the authority: a kernel `ENOSPC` or quota error aborts the unpublished attempt,
+returns `507 Insufficient Storage`, and triggers immediate best-effort cleanup.
+The TTL orphan collector is the crash fallback. Capacity remains asynchronously
+observable through monitoring and the Console, never a foreground correctness
+gate.
 
 ## Erasure Placement
 
@@ -509,7 +527,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.4.0 is correct only while all of these remain true:
+N1 3.5.0 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -552,3 +570,6 @@ N1 3.4.0 is correct only while all of these remain true:
 39. Healthy automatic availability and checksum scans preserve foreground availability; unresolved repair debt is reported as failure and keeps user mutations read-only until a successful retry.
 40. Recover-on-read may repair a recorded live root in the background, but only the scheduled healer may relocate a shard and change placement metadata.
 41. Automatic healing never performs or requires redistribution of a healthy recorded object layout.
+42. Upload correctness relies on actual K+M kernel writes, not synchronous free-space prediction; no upload hot path scans total configured roots for capacity.
+43. Kernel capacity exhaustion publishes neither immutable object metadata nor a namespace entry and is reported as `507 Insufficient Storage` over HTTP and native transports.
+44. Standard batch upload preserves one independent EC set and commit boundary per object; durable multipart has no batch variant.

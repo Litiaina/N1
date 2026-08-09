@@ -21,6 +21,38 @@ pub enum AppError {
     NotFound,
 }
 
+impl AppError {
+    pub fn is_capacity_error(&self) -> bool {
+        match self {
+            Self::InsufficientStorage => true,
+            Self::Io(error, _) => matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSPC) | Some(libc::EDQUOT)
+            ),
+            _ => false,
+        }
+    }
+
+    pub fn status_code(&self) -> StatusCode {
+        if self.is_capacity_error() {
+            return StatusCode::INSUFFICIENT_STORAGE;
+        }
+        match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::BadRequest(_) | Self::Multipart(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::Io(_, _) | Self::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
+        }
+    }
+}
+
 impl From<rmp_serde::encode::Error> for AppError {
     fn from(err: rmp_serde::encode::Error) -> Self {
         AppError::InternalServerError(format!("MessagePack serialization error: {}", err))
@@ -70,6 +102,13 @@ impl IntoResponse for AppError {
             }
             AppError::Io(e, context) => {
                 tracing::error!("IO error during '{}': {}", context, e);
+                if matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT)) {
+                    return (
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        format!("Insufficient storage capacity during {context}."),
+                    )
+                        .into_response();
+                }
                 let message = format!("IO operation failed: {}", context);
                 (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
             }
@@ -125,5 +164,17 @@ mod tests {
     fn service_unavailable_maps_to_503() {
         let response = AppError::ServiceUnavailable("busy".to_string()).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn kernel_capacity_errors_map_to_507() {
+        for errno in [libc::ENOSPC, libc::EDQUOT] {
+            let response = AppError::Io(
+                std::io::Error::from_raw_os_error(errno),
+                "write object shard".to_string(),
+            )
+            .into_response();
+            assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        }
     }
 }

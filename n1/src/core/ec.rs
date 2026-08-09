@@ -482,6 +482,7 @@ where
     let results = join_all(write_futs).await;
     let mut successful_writes = 0usize;
     let mut failed = Vec::new();
+    let mut capacity_error = None;
 
     for (idx, result, elapsed_ns) in results {
         EC_WRITE_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
@@ -490,6 +491,11 @@ where
             Err(err) => {
                 EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 warn!("Failed to write stripe to shard: {}", err);
+                if capacity_error.is_none()
+                    && matches!(err.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+                {
+                    capacity_error = Some(err);
+                }
                 failed.push(idx);
             }
         }
@@ -499,6 +505,10 @@ where
         if let Some(slot) = writers.get_mut(idx) {
             *slot = None;
         }
+    }
+
+    if let Some(error) = capacity_error {
+        return Err(AppError::Io(error, "write object shard".to_string()));
     }
 
     if successful_writes < data_shards {
@@ -532,12 +542,18 @@ where
 
     let results = join_all(flush_futs).await;
     let mut failed = Vec::new();
+    let mut capacity_error = None;
 
     for (idx, result, elapsed_ns) in results {
         EC_FLUSH_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
         if let Err(err) = result {
             EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
             warn!("Failed to flush shard writer: {}", err);
+            if capacity_error.is_none()
+                && matches!(err.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT))
+            {
+                capacity_error = Some(err);
+            }
             failed.push(idx);
         }
     }
@@ -548,6 +564,10 @@ where
         }
     }
 
+    if let Some(error) = capacity_error {
+        return Err(AppError::Io(error, "flush object shard".to_string()));
+    }
+
     if writers.iter().filter(|w| w.is_some()).count() < data_shards {
         EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Err(AppError::InternalServerError(
@@ -556,4 +576,67 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flush_shard_writers, write_slices_to_shards};
+    use crate::enums::app_error_enum::AppError;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    struct CapacityFailureWriter {
+        fail_on_flush: bool,
+    }
+
+    impl AsyncWrite for CapacityFailureWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail_on_flush {
+                Poll::Ready(Ok(buf.len()))
+            } else {
+                Poll::Ready(Err(std::io::Error::from_raw_os_error(libc::ENOSPC)))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.fail_on_flush {
+                Poll::Ready(Err(std::io::Error::from_raw_os_error(libc::EDQUOT)))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_write_preserves_kernel_capacity_error() {
+        let mut writers = vec![Some(CapacityFailureWriter {
+            fail_on_flush: false,
+        })];
+        let error = write_slices_to_shards(&mut writers, &[b"data"], 1)
+            .await
+            .expect_err("ENOSPC must fail the write");
+        assert!(error.is_capacity_error());
+        assert!(matches!(error, AppError::Io(_, _)));
+    }
+
+    #[tokio::test]
+    async fn shard_flush_preserves_kernel_capacity_error() {
+        let mut writers = vec![Some(CapacityFailureWriter {
+            fail_on_flush: true,
+        })];
+        let error = flush_shard_writers(&mut writers, 1)
+            .await
+            .expect_err("EDQUOT must fail the flush");
+        assert!(error.is_capacity_error());
+        assert!(matches!(error, AppError::Io(_, _)));
+    }
 }

@@ -28,6 +28,7 @@ include!("proof_workloads.rs");
 include!("proof_client.rs");
 include!("proof_native.rs");
 include!("proof_noa.rs");
+include!("proof_batch.rs");
 include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
 include!("proof_multipart_resume.rs");

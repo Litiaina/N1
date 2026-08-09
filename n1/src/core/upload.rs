@@ -28,9 +28,6 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use crate::core::capacity_manager::{
-    ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
-};
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
@@ -347,18 +344,32 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 #[cfg(test)]
 mod tests {
     use super::{
-        STANDARD_PART_COMPLETE, STANDARD_PART_EMPTY, STANDARD_SESSION_OPEN,
-        StandardPartClaimResult, StandardPartRecord, StandardPartSlot, StandardUploadSession,
-        UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode, UploadSessionManifest,
-        acquire_upload_io_guard_with_timeout, choose_upload_stripe_size_for_len_with_ceiling,
-        claim_standard_part, parse_upload_durability_mode, shard_specs_for_part,
-        target_stripe_size_for_metadata,
+        AlignedBuffer, DirectWriter, STANDARD_PART_COMPLETE, STANDARD_PART_EMPTY,
+        STANDARD_SESSION_OPEN, StandardPartClaimResult, StandardPartRecord, StandardPartSlot,
+        StandardUploadSession, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode,
+        UploadSessionManifest, acquire_upload_io_guard_with_timeout,
+        choose_upload_stripe_size_for_len_with_ceiling, claim_standard_part,
+        parse_upload_durability_mode, shard_specs_for_part, target_stripe_size_for_metadata,
     };
     use crate::core::disk_manager::{
         INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, UploadPartQuery,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    fn direct_writer_with_failed_task(errno: i32) -> DirectWriter {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        let mut writer = DirectWriter::new(file);
+        writer.write_task = Some(tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            Err::<AlignedBuffer, _>(std::io::Error::from_raw_os_error(errno))
+        }));
+        writer
+    }
 
     fn standard_test_session(part_count: usize) -> StandardUploadSession {
         StandardUploadSession {
@@ -440,6 +451,26 @@ mod tests {
             .await
             .expect("gate bypass succeeds");
         assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_writer_propagates_background_write_failure() {
+        let mut writer = direct_writer_with_failed_task(libc::ENOSPC);
+        let error = writer
+            .write_all(b"x")
+            .await
+            .expect_err("background ENOSPC must reach the caller");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    #[tokio::test]
+    async fn direct_writer_propagates_background_flush_failure() {
+        let mut writer = direct_writer_with_failed_task(libc::EDQUOT);
+        let error = writer
+            .flush()
+            .await
+            .expect_err("background EDQUOT must reach the caller");
+        assert_eq!(error.raw_os_error(), Some(libc::EDQUOT));
     }
 
     #[test]
@@ -758,8 +789,10 @@ impl AsyncWrite for DirectWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        if matches!(self.poll_write_task(cx), Poll::Pending) {
-            return Poll::Pending;
+        match self.poll_write_task(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
         }
 
         if self.write_buffer.len() == self.write_buffer.capacity() {
@@ -787,10 +820,10 @@ impl AsyncWrite for DirectWriter {
             self.spawn_buffer_flush();
         }
 
-        if matches!(self.poll_write_task(cx), Poll::Ready(Ok(()))) {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
+        match self.poll_write_task(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
         }
     }
 
@@ -891,29 +924,6 @@ pub(crate) fn target_stripe_size_for_metadata(
 fn choose_upload_stripe_size_for_parts(part_sizes: &[u64]) -> usize {
     let largest_part = part_sizes.iter().copied().max().unwrap_or(0);
     choose_upload_stripe_size_for_len(largest_part)
-}
-
-async fn preflight_upload_capacity(required_bytes: u64) -> Result<(), AppError> {
-    ensure_capacity_available(required_bytes).await
-}
-
-async fn preflight_blob_placement_capacity_for_parts(
-    placement_roots: &[PathBuf],
-    start_part_index: u64,
-    part_sizes: &[u64],
-    data_shards: usize,
-    parity_shards: usize,
-    block_size: usize,
-) -> Result<(), AppError> {
-    ensure_blob_placement_capacity_available_for_parts(
-        placement_roots,
-        start_part_index,
-        part_sizes,
-        data_shards,
-        parity_shards,
-        block_size,
-    )
-    .await
 }
 
 fn ensure_registered_placement_roots(placement_roots: &[PathBuf]) -> Result<(), AppError> {
@@ -1348,16 +1358,6 @@ where
         )));
     }
     ensure_registered_placement_roots(&blob_roots)?;
-    preflight_blob_placement_capacity_for_parts(
-        &blob_roots,
-        part_index,
-        &[content_length],
-        data_shards,
-        parity_shards,
-        block_size,
-    )
-    .await?;
-
     let use_buffered_small_write =
         !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
     let mut writers: Vec<Option<UploadShardWriter>> = Vec::with_capacity(total_shards);
@@ -1365,6 +1365,7 @@ where
     let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
     let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
     let mut successful_opens = 0usize;
+    let mut capacity_open_error = None;
 
     for i in 0..total_shards {
         let is_parity = i >= data_shards;
@@ -1396,6 +1397,9 @@ where
                         target_disk.display(),
                         err
                     );
+                    if capacity_open_error.is_none() && err.is_capacity_error() {
+                        capacity_open_error = Some(err);
+                    }
                     writers.push(None);
                 }
             }
@@ -1411,16 +1415,41 @@ where
                         })
                         .await;
 
-                        if let Ok(Ok(_)) = prealloc_result {
-                            writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
-                            successful_opens += 1;
-                        } else {
-                            warn!(
-                                "blob shard preallocation failed for {} on {}",
-                                stable_name,
-                                target_disk.display()
-                            );
-                            writers.push(None);
+                        match prealloc_result {
+                            Ok(Ok(())) => {
+                                writers
+                                    .push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
+                                successful_opens += 1;
+                            }
+                            Ok(Err(err)) => {
+                                warn!(
+                                    "blob shard preallocation failed for {} on {}: {}",
+                                    stable_name,
+                                    target_disk.display(),
+                                    err
+                                );
+                                if capacity_open_error.is_none()
+                                    && matches!(
+                                        err.raw_os_error(),
+                                        Some(libc::ENOSPC) | Some(libc::EDQUOT)
+                                    )
+                                {
+                                    capacity_open_error = Some(AppError::Io(
+                                        err,
+                                        format!("preallocate shard {}", tmp_path.display()),
+                                    ));
+                                }
+                                writers.push(None);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "blob shard preallocation task failed for {} on {}: {}",
+                                    stable_name,
+                                    target_disk.display(),
+                                    err
+                                );
+                                writers.push(None);
+                            }
                         }
                     } else {
                         writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
@@ -1434,6 +1463,9 @@ where
                         target_disk.display(),
                         err
                     );
+                    if capacity_open_error.is_none() && err.is_capacity_error() {
+                        capacity_open_error = Some(err);
+                    }
                     writers.push(None);
                 }
             }
@@ -1446,6 +1478,9 @@ where
 
     if successful_opens < total_shards {
         cleanup_files_best_effort(&tmp_paths).await;
+        if let Some(error) = capacity_open_error {
+            return Err(error);
+        }
         return Err(AppError::ServiceUnavailable(format!(
             "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
             data_shards, parity_shards, total_shards, successful_opens
@@ -1650,16 +1685,6 @@ where
         )));
     }
     ensure_registered_placement_roots(&blob_roots)?;
-    preflight_blob_placement_capacity_for_parts(
-        &blob_roots,
-        part_index,
-        &[content_length],
-        data_shards,
-        parity_shards,
-        block_size,
-    )
-    .await?;
-
     let use_buffered_small_write =
         !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
     let mut writers: Vec<Option<UploadShardWriter>> = Vec::with_capacity(total_shards);
@@ -1667,6 +1692,7 @@ where
     let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
     let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
     let mut successful_opens = 0usize;
+    let mut capacity_open_error = None;
 
     for i in 0..total_shards {
         let is_parity = i >= data_shards;
@@ -1698,6 +1724,9 @@ where
                         target_disk.display(),
                         err
                     );
+                    if capacity_open_error.is_none() && err.is_capacity_error() {
+                        capacity_open_error = Some(err);
+                    }
                     writers.push(None);
                 }
             }
@@ -1713,16 +1742,41 @@ where
                         })
                         .await;
 
-                        if let Ok(Ok(_)) = prealloc_result {
-                            writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
-                            successful_opens += 1;
-                        } else {
-                            warn!(
-                                "blob shard preallocation failed for {} on {}",
-                                stable_name,
-                                target_disk.display()
-                            );
-                            writers.push(None);
+                        match prealloc_result {
+                            Ok(Ok(())) => {
+                                writers
+                                    .push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
+                                successful_opens += 1;
+                            }
+                            Ok(Err(err)) => {
+                                warn!(
+                                    "blob shard preallocation failed for {} on {}: {}",
+                                    stable_name,
+                                    target_disk.display(),
+                                    err
+                                );
+                                if capacity_open_error.is_none()
+                                    && matches!(
+                                        err.raw_os_error(),
+                                        Some(libc::ENOSPC) | Some(libc::EDQUOT)
+                                    )
+                                {
+                                    capacity_open_error = Some(AppError::Io(
+                                        err,
+                                        format!("preallocate shard {}", tmp_path.display()),
+                                    ));
+                                }
+                                writers.push(None);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "blob shard preallocation task failed for {} on {}: {}",
+                                    stable_name,
+                                    target_disk.display(),
+                                    err
+                                );
+                                writers.push(None);
+                            }
                         }
                     } else {
                         writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
@@ -1736,6 +1790,9 @@ where
                         target_disk.display(),
                         err
                     );
+                    if capacity_open_error.is_none() && err.is_capacity_error() {
+                        capacity_open_error = Some(err);
+                    }
                     writers.push(None);
                 }
             }
@@ -1748,6 +1805,9 @@ where
 
     if successful_opens < total_shards {
         cleanup_files_best_effort(&tmp_paths).await;
+        if let Some(error) = capacity_open_error {
+            return Err(error);
+        }
         return Err(AppError::ServiceUnavailable(format!(
             "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
             data_shards, parity_shards, total_shards, successful_opens
@@ -2057,8 +2117,6 @@ async fn prepare_upload_manifest(
     usize::try_from(params.expected_parts)
         .map_err(|_| AppError::BadRequest("expected_parts is too large".into()))?;
 
-    preflight_upload_capacity(params.total_size_bytes).await?;
-
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let planned_sizes = planned_part_sizes(
@@ -2105,20 +2163,6 @@ async fn prepare_upload_manifest(
             .map(PathBuf::from)
             .collect::<Vec<_>>(),
     )?;
-    preflight_blob_placement_capacity_for_parts(
-        &manifest
-            .placement_roots
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>(),
-        0,
-        &planned_sizes,
-        data_shards,
-        parity_shards,
-        manifest.stripe_size_bytes,
-    )
-    .await?;
-
     Ok(manifest)
 }
 
@@ -3527,7 +3571,6 @@ async fn upload_object_one_shot_inner(
             .into_response());
     }
 
-    preflight_upload_capacity(content_length).await?;
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
@@ -3717,7 +3760,6 @@ where
         ));
     }
 
-    preflight_upload_capacity(content_length).await?;
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
@@ -3837,7 +3879,6 @@ where
         ));
     }
 
-    preflight_upload_capacity(content_length).await?;
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
