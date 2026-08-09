@@ -253,6 +253,7 @@ These routes have gateway-specific routing rules:
 POST /noa/v1/fragments                         fan out fragment creation to all available nodes
 POST /noa/v1/auth/fragment                     try available nodes until auth succeeds
 POST /noa/v1/upload/one-shot/{object_key}      stream through native N2 to a selected coordinator
+POST /noa/v1/upload/batch                      stream one bounded batch to a selected coordinator
 POST /noa/v1/upload/multipart/init/{object_key} select coordinator and return coordinator_node_id
 PUT  /noa/v1/upload/multipart/{version}/{part} route to client-supplied coordinator_node_id
 GET  /noa/v1/upload/multipart/{version}        route to client-supplied coordinator_node_id
@@ -268,6 +269,10 @@ GET  /noa/v1/objects/download                  stream through native N2 from a s
 ```
 
 All other `/noa/v1/...` routes are proxied to an available N2 node.
+
+Batch upload uses that streaming HTTP proxy path. The selected node coordinates
+each object independently; the gateway stores no batch route, session, object
+metadata, or retry body.
 
 These endpoints expose gateway routing health only.
 

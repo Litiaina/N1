@@ -232,6 +232,55 @@ curl -kfsS -X POST "$A_BASE/noa/v1/auth/fragment" \
   >"$OUT/auth.json"
 TOKEN="$(jq -er '.access_token' "$OUT/auth.json")"
 
+# NOA standard batch is one transport envelope over independent one-shot
+# commits. Prove all-success, mixed-result, byte-exact readback, and restart
+# persistence without involving the durable multipart family.
+BATCH_COUNT=64
+BATCH_DIR="$OUT/batch-payloads"
+mkdir -p "$BATCH_DIR"
+BATCH_FORM=()
+for index in $(seq 0 $((BATCH_COUNT - 1))); do
+  name="item-$(printf '%03d' "$index").bin"
+  dd if=/dev/urandom of="$BATCH_DIR/$name" bs=8192 count=1 status=none
+  BATCH_FORM+=(
+    -F "object=@$BATCH_DIR/$name;filename=proof%2Fbatch%2F$name;type=application/octet-stream"
+  )
+done
+BATCH_STARTED="$(date +%s%N)"
+BATCH_STATUS="$(curl -ksS -o "$OUT/batch-response.json" -w '%{http_code}' \
+  -X POST "$A_BASE/noa/v1/upload/batch?concurrency=8" \
+  -H "Authorization: Bearer $TOKEN" "${BATCH_FORM[@]}")"
+BATCH_ELAPSED="$(awk -v ns="$(( $(date +%s%N) - BATCH_STARTED ))" 'BEGIN {printf "%.6f",ns/1000000000}')"
+[[ "$BATCH_STATUS" == "201" ]]
+jq -e --argjson expected "$BATCH_COUNT" \
+  '.requested == $expected and .succeeded == $expected and .failed == 0 and (.results | length) == $expected and all(.results[]; .status == 201 and (.version_id | length) == 26)' \
+  "$OUT/batch-response.json" >/dev/null
+for index in 0 $((BATCH_COUNT - 1)); do
+  name="item-$(printf '%03d' "$index").bin"
+  curl -kfsS -G "$B_BASE/noa/v1/objects/download" \
+    -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "object_key=proof/batch/$name" \
+    -o "$OUT/batch-download-$name"
+  cmp -s "$BATCH_DIR/$name" "$OUT/batch-download-$name"
+done
+
+dd if=/dev/zero of="$OUT/batch-too-large.bin" bs=1048577 count=1 status=none
+dd if=/dev/urandom of="$OUT/batch-mixed-valid.bin" bs=4096 count=1 status=none
+MIXED_STATUS="$(curl -ksS -o "$OUT/batch-mixed-response.json" -w '%{http_code}' \
+  -X POST "$A_BASE/noa/v1/upload/batch?concurrency=2" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "object=@$OUT/batch-mixed-valid.bin;filename=proof%2Fbatch%2Fmixed-valid.bin;type=application/octet-stream" \
+  -F "object=@$OUT/batch-too-large.bin;filename=proof%2Fbatch%2Ftoo-large.bin;type=application/octet-stream")"
+[[ "$MIXED_STATUS" == "207" ]]
+jq -e \
+  '.requested == 2 and .succeeded == 1 and .failed == 1 and .results[0].status == 201 and .results[1].status == 413' \
+  "$OUT/batch-mixed-response.json" >/dev/null
+curl -kfsS -G "$B_BASE/noa/v1/objects/download" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'object_key=proof/batch/mixed-valid.bin' \
+  -o "$OUT/batch-mixed-valid-download.bin"
+cmp -s "$OUT/batch-mixed-valid.bin" "$OUT/batch-mixed-valid-download.bin"
+
 dd if=/dev/urandom of="$OUT/source.bin" bs=1M count="$PROOF_MIB" status=none
 SOURCE_BYTES="$(stat -c%s "$OUT/source.bin")"
 PART_BYTES=$((PART_MIB * 1024 * 1024))
@@ -362,6 +411,17 @@ curl -kfsS -G "$B_BASE/noa/v1/objects/download" \
   -o "$OUT/durable-restart-download.bin"
 cmp -s "$OUT/part-00000" "$OUT/durable-restart-download.bin"
 
+# The independently committed batch remains readable after coordinator
+# restarts; there is no batch session or shared recovery record.
+for index in 0 $((BATCH_COUNT - 1)); do
+  name="item-$(printf '%03d' "$index").bin"
+  curl -kfsS -G "$A_BASE/noa/v1/objects/download" \
+    -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "object_key=proof/batch/$name" \
+    -o "$OUT/batch-restart-download-$name"
+  cmp -s "$BATCH_DIR/$name" "$OUT/batch-restart-download-$name"
+done
+
 HZ="$(getconf CLK_TCK)"
 PAGESIZE="$(getconf PAGESIZE)"
 awk -v before="$BEFORE" -v after="$AFTER" -v hz="$HZ" -v pagesize="$PAGESIZE" 'BEGIN {
@@ -373,10 +433,11 @@ SUSPICIOUS="$(grep -Eih 'panic|thread .* panicked|internal server error|fatal' "
 jq -n \
   --arg result PASS --arg out "$OUT" --argjson parts "$EXPECTED_PARTS" \
   --argjson parallel "$PARALLEL_PARTS" --argjson suspicious "$SUSPICIOUS" \
+  --argjson batch_count "$BATCH_COUNT" --argjson batch_seconds "$BATCH_ELAPSED" \
   --slurpfile standard "$OUT/standard-metric.json" \
   --slurpfile durable "$OUT/durable-metric.json" \
   --slurpfile process "$OUT/process-metric.json" \
-  '{result:$result,out:$out,topology:"two local N2 processes, one 1+1 server pool",parts:$parts,parallel_parts:$parallel,standard:$standard[0],durable:$durable[0],standard_restart_loses_uncommitted_progress:true,durable_restart_restores_progress:true,ncdx_before_finalize:0,ncnx_visibility_before_finalize:false,process:$process[0],suspicious_log_lines:$suspicious}' \
+  '{result:$result,out:$out,topology:"two local N2 processes, one 1+1 server pool",parts:$parts,parallel_parts:$parallel,standard_batch:{objects:$batch_count,seconds:$batch_seconds,objects_per_second:($batch_count/$batch_seconds),all_success_status:201,mixed_status:207,restart_readback:true},standard:$standard[0],durable:$durable[0],standard_restart_loses_uncommitted_progress:true,durable_restart_restores_progress:true,ncdx_before_finalize:0,ncnx_visibility_before_finalize:false,process:$process[0],suspicious_log_lines:$suspicious}' \
   >"$OUT/summary.json"
 
 cat "$OUT/summary.json"

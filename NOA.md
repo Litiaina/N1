@@ -86,6 +86,7 @@ define empty-trash or hard-delete operations.
 
 ```text
 POST   /noa/v1/upload/one-shot/{object_key}
+POST   /noa/v1/upload/batch
 POST   /noa/v1/upload/multipart/init/{object_key}
 GET    /noa/v1/upload/multipart
 GET    /noa/v1/upload/multipart/{version_id}
@@ -107,6 +108,14 @@ family persists restart-proof manifests and part receipts. Both publish NCDX
 and then NCNX only at finalize. Multipart responses expose N2's coordinator
 identity. That is an N2 extension to the shared upload result, not a different
 upload meaning.
+
+Standard batch upload is a transport envelope for up to 256 independent
+objects of at most 1 MiB each. Every multipart field is named `object`; its
+filename is the percent-encoded logical object key. Each entry uses the normal
+one-shot EC/NCDX/NCNX commit path and returns its own result. HTTP `201` means
+every object committed; `207 Multi-Status` reports mixed independent results.
+Batch upload has no shared object transaction, session, or durable-resume
+record.
 
 ### POSIX-Like Namespace
 

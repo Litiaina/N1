@@ -1429,9 +1429,26 @@ mod tests {
                 "total": 1
             }))
         };
+        let batch_upload = move || async move {
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "requested": 1,
+                    "succeeded": 1,
+                    "failed": 0,
+                    "results": [{
+                        "object_key": "proof/batch.bin",
+                        "status": 201,
+                        "version_id": format!("batch-{node_id}"),
+                        "size_bytes": 4
+                    }]
+                })),
+            )
+        };
         let http_app = Router::new()
             .route("/noa/v1/upload/multipart", get(multipart_listing))
-            .route("/noa/v1/upload/multipart/durable", get(multipart_listing));
+            .route("/noa/v1/upload/multipart/durable", get(multipart_listing))
+            .route("/noa/v1/upload/batch", post(batch_upload));
         tokio::spawn(async move {
             axum::serve(http_listener, http_app).await.unwrap();
         });
@@ -1666,6 +1683,38 @@ mod tests {
         assert_eq!(body["coordinator_node_id"], "node-a");
         assert_eq!(body["gateway"]["route_only"], true);
         assert_eq!(body["gateway"]["resumability_owner"], "client");
+    }
+
+    #[tokio::test]
+    async fn standard_batch_streams_through_gateway_without_route_state() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let boundary = "n2-batch-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"object\"; filename=\"proof%2Fbatch.bin\"\r\nContent-Type: application/octet-stream\r\n\r\ndata\r\n--{boundary}--\r\n"
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/noa/v1/upload/batch?concurrency=8")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response_json(response).await;
+        assert_eq!(body["requested"], 1);
+        assert_eq!(body["succeeded"], 1);
+        assert_eq!(body["failed"], 0);
     }
 
     #[tokio::test]

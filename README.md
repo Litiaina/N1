@@ -138,6 +138,7 @@ N2 is bidirectional at the node level. Any healthy node can coordinate:
 
 - authentication and fragment access;
 - one-shot and multipart upload;
+- standard small-object batch upload with independent per-object results;
 - object read, download, metadata, status, repair, and redistribution;
 - flat namespace list, stat, rename, move, trash, and recover;
 - fragment administration;

@@ -177,6 +177,11 @@ truth. Durable multipart keeps per-part durability for clients that explicitly
 prefer restart-proof progress over maximum ingest speed. Neither path changes
 the object's immutable EC layout or publication order.
 
+Standard batch upload is stateless at the batch level. It amortizes HTTP and
+authentication overhead for many small objects while sending every entry
+through the ordinary distributed one-shot commit. There is no batch manifest,
+shared EC set, shared NCNX transaction, or gateway route record.
+
 ## Install And Build
 
 Build the complete workspace:
@@ -736,6 +741,48 @@ Response is object metadata:
   "stripe_size_bytes": 262144
 }
 ```
+
+### Standard Small-Object Batch
+
+Use one request to ingest up to 256 independent objects of at most 1 MiB each:
+
+```http
+POST /noa/v1/upload/batch?concurrency=8
+Authorization: Bearer <token>
+Content-Type: multipart/form-data; boundary=...
+```
+
+Every file field must be named `object`. Set its multipart filename to the
+percent-encoded logical key:
+
+```bash
+curl -k -X POST "https://127.0.0.1:50001/noa/v1/upload/batch?concurrency=8" \
+  -H "$AUTH_HEADER" \
+  -F 'object=@scan-001.png;filename=images%2Fscan-001.png;type=image/png' \
+  -F 'object=@scan-002.png;filename=images%2Fscan-002.png;type=image/png'
+```
+
+The optional concurrency value is clamped to `1..128` and also constrained by
+the coordinator-wide batch gate. Each object independently calculates its
+server-pool layout, writes its EC pieces, publishes NCDX, then publishes NCNX.
+The response is `201 Created` when all entries commit or `207 Multi-Status`
+when only some commit:
+
+```json
+{
+  "requested": 2,
+  "succeeded": 1,
+  "failed": 1,
+  "results": [
+    {"object_key":"images/scan-001.png","status":201,"version_id":"01K...","size_bytes":8192},
+    {"object_key":"images/scan-002.png","status":503,"size_bytes":8192,"error":"Service unavailable: fewer than K participants are writable"}
+  ]
+}
+```
+
+A failed entry cannot publish incomplete NCNX state and does not cancel an
+unrelated successful entry. Durable multipart remains the contract for
+restart-resumable unfinished uploads.
 
 ### Standard Multipart Init
 

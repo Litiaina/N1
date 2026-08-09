@@ -119,6 +119,21 @@ restored and every final proof run must complete before a release result can be
 
 ### N2 3.4.1 multipart contract proof
 
+The same finite proof was extended on 2026-08-10 for the NOA standard batch
+contract and is retained at:
+
+```text
+/home/litiaina/DEV_TEST/n2-upload-modes-20260810-020903
+```
+
+On a real two-process `1 + 1` pool, 64 independent 8 KiB objects committed in
+one request in 0.603790 seconds (105.997 objects/s). All 64 downloaded
+byte-exactly through the other node and remained readable after coordinator
+restart. A second request containing one valid object and one object above the
+1 MiB limit returned `207`, committed only the valid object, and reported the
+oversized object as `413`. Engine panic/internal-error log matches remained
+zero.
+
 The finite two-process `1 + 1` upload proof completed on 2026-08-08 and is
 retained at:
 

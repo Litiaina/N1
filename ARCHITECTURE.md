@@ -411,6 +411,12 @@ shard sync to finalize. Durable multipart persists the existing manifest,
 pending binding, and per-part receipts so progress survives restart. Standard
 restart loss is an explicit API contract, not loss of a committed object.
 
+One-shot upload and every entry in a standard batch enter this same object
+commit path directly. A batch is only one bounded HTTP transport envelope;
+its objects never share EC state, NCDX, NCNX, failure fate, or a transaction.
+Coordinator-wide backpressure bounds aggregate batch work across concurrent
+requests without adding cluster state.
+
 ```text
 calculate the complete fixed K + M layout
 -> attempt every exact shard/parity holder in parallel
