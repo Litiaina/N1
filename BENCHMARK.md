@@ -222,8 +222,9 @@ no cycle count is claimed.
 
 This is a finite baseline on four logical nodes hosted by two machines. It
 does not establish a disk ceiling, WAN behavior, four-host isolation, NVMe
-saturation, exabyte scale, or long-duration stability. Correctness, chaos,
-and the incomplete 12-hour soak status are documented in TESTING.md.
+saturation, or exabyte scale. The completed N2 3.4.1 24-hour correctness and
+chaos soak, including its single-host scope boundary, is documented in
+TESTING.md.
 
 ## N2 1.0.0 Four-Node Proof
 

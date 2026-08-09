@@ -17,11 +17,12 @@ replaceable physical instances, adds an independent binding epoch, and records
 reserve and retired instances. N2 1.x, 2.x, and earlier experimental 3.x
 results do not qualify the current 3.x disk format.
 
-The current finite release proof uses four logical nodes over two physical
-hosts plus one unassigned reserve process. It exercises the configured `2 + 2`
-EC loss boundary and autonomous replacement of one failed physical binding,
-but those processes are not five independent host, power, network, or rack
-failure domains.
+The finite release proof uses four logical nodes over two physical hosts plus
+one unassigned reserve process. The completed release soak uses four logical
+nodes and four isolated XFS HDD roots on one physical host. Together they
+exercise the configured `2 + 2` EC loss boundary, autonomous replacement of
+one failed physical binding, sustained mixed workload, and bounded chaos, but
+they are not five independent host, power, network, or rack failure domains.
 
 ## Repository Gates
 
@@ -29,7 +30,10 @@ The N2 3.4.1 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test -p n2 --release`: 164 passed;
+- `cargo test --workspace --lib --bins --tests`: N2 180/180, gateway 20/20,
+  native client 2/2, and shell 4/4 passed;
+- SIMD erasure core: 107 passed with 6 intentionally ignored; integration:
+  5 passed with 2 intentionally ignored;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
@@ -117,6 +121,44 @@ intentional topology outage is safe and observable, but the topology must be
 restored and every final proof run must complete before a release result can be
 `PASS`.
 
+### N2 3.4.1 24-hour release soak — PASS
+
+The full release soak completed on 2026-08-09 with result `PASS`. The retained
+evidence copied off the production server is stored at:
+
+```text
+/home/litiaina/DEV_TEST/n2-production-deploy-20260810-030409/soak-status.json
+/home/litiaina/DEV_TEST/n2-production-deploy-20260810-030409/soak-summary.json
+/home/litiaina/DEV_TEST/n2-production-deploy-20260810-030409/soak-metrics-summary.json
+```
+
+The run used four logical N2 nodes, four isolated real HDD roots, one static
+`2 + 2` server pool, and NCNX replication `R = 3` on one physical host. It ran
+for 86,438 seconds against a requested 86,400 seconds and completed:
+
+| Release-soak gate | Result |
+| --- | --- |
+| Final result | PASS |
+| Workload cycles | 6,326 |
+| Chaos events | 316 |
+| Availability events | 0 |
+| Suspicious log lines | 0 |
+| Engine error lines | 0 |
+| Clean-log gate | PASS |
+| Final operation | `final-verification` |
+
+The workload continuously exercised upload, download, zero-decode paginated
+listing, lifecycle operations, multipart standard and durable contracts,
+native operations, restart reads, writes at the `K` survival boundary, NCNX
+repair, shard repair, rolling restarts, and final GC verification. It observed
+101 safe GC deferrals while namespace mutations were concurrent; every
+deferred run was retried, the final verification completed, and no deferral
+became an engine or availability error.
+
+This is a completed long-duration engine qualification, not a claim of
+independent-host fault tolerance. Four-host power, controller, rack, and
+network-partition testing remain separate production gates.
+
 ### N2 3.4.1 multipart contract proof
 
 The same finite proof was extended on 2026-08-10 for the NOA standard batch
@@ -169,7 +211,7 @@ Observed on this same-host proof topology:
 These figures compare the two contracts on this host. They are not an
 independent-device, multi-host, or maximum-throughput claim.
 
-### N2 3.4.0 survival soak
+### Historical N2 3.4.0 survival soak
 
 The independent 24-hour four-node `2 + 2` survival soak started on
 2026-07-31 and is retained at:
@@ -178,14 +220,14 @@ The independent 24-hour four-node `2 + 2` survival soak started on
 /home/administrator/DEV-TEST/n2-3.4.0-survival-soak-20260731-011941
 ```
 
-It runs the exact optimized 3.4.0 server and native-shell binaries over four
+It ran the exact optimized 3.4.0 server and native-shell binaries over four
 isolated HDD roots. Its workload covers one-shot and multipart upload,
 download verification, zero-decode paginated listing, copy/delete lifecycle,
 native protocol operations, healing, rolling node loss, writes at `K`,
 rejection below `K`, and rotating bounded chaos. Startup validation reached
-cycle 1 with all four 3.4.0 nodes and all HTTPS/native ports active. This is
-recorded as `RUNNING`, not as passing evidence, until its retained summary
-reports `PASS`.
+cycle 1 with all four 3.4.0 nodes and all HTTPS/native ports active. This
+historical incomplete run is not release evidence; it is superseded by the
+completed N2 3.4.1 24-hour release soak above.
 
 ## Superseded Strict-Width Storage-Root Baseline
 
@@ -490,10 +532,9 @@ Post-fix targeted engine tests passed 117/117.
 The lifecycle regression ran for 168 seconds. The chaos regression ran for
 180 seconds and ended healthy with `safety_read_only=false`.
 
-These regression runs prove the reproduced race no longer appears in the
-bounded scenarios. They do not replace a completed 12-hour post-fix soak.
-A full 12-hour post-fix run remains pending and must not be reported as
-passed.
+These regression runs proved the reproduced race no longer appeared in the
+bounded scenarios. The later N2 3.4.1 24-hour release soak completed with a
+clean `PASS` and supersedes the former pending 12-hour gate.
 
 ## Test Procedure
 
@@ -531,7 +572,6 @@ Every real-machine run must:
 
 ## Remaining Release Gates
 
-- Complete the full 12-hour post-fix soak/chaos run.
 - Repeat on four independent physical nodes for independent failure domains.
 - Exercise network partitions, not only stopped processes.
 - Exercise sustained disk-full and media replacement on isolated test roots.

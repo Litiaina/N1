@@ -80,7 +80,8 @@ for N2-native operators, peers, tools, and future internal systems.
   lifecycle, healing, expansion, and failure laws.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
-  soak procedures with the currently qualified evidence.
+  soak procedures with the currently qualified evidence, including the clean
+  N2 3.4.1 24-hour release-soak pass.
 - [BENCHMARK.md](BENCHMARK.md): measured performance, topology, methodology,
   limitations, and reproduction guidance.
 
