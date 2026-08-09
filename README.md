@@ -78,6 +78,8 @@ for N2-native operators, peers, tools, and future internal systems.
   membership, systemd deployment, gateway deployment, and validation.
 - [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.4 storage, NCNX namespace,
   lifecycle, healing, expansion, and failure laws.
+- [MULTI_CLUSTER.md](MULTI_CLUSTER.md): future geographic federation,
+  asynchronous replication, authority, fencing, failover, and release gates.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
   soak procedures with the currently qualified evidence, including the clean
