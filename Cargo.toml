@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "cli_core",
-    "n1",
-    "n1_shell",
-    "n1_native_client",
+    "engine",
+    "shell",
+    "native_client",
     "simd-erasure-core",
     "tools/n1-release-proof",
 ]

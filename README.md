@@ -36,9 +36,9 @@ unversioned storage roots rather than adopting or migrating them.
 
 ## What Is Included
 
-- `n1/` - N1 server and storage engine.
-- `n1_shell/` - operator shell for N1 inspection and maintenance.
-- `n1_native_client/` - canonical Rust client for the `n1://` protocol.
+- `engine/` - N1 server and storage engine.
+- `shell/` - operator shell for N1 inspection and maintenance.
+- `native_client/` - canonical Rust client for the `n1://` protocol.
 - `simd-erasure-core/` - internal erasure-coding core used by N1.
 - `cli_core/` - small shared shell support crate used by `n1_shell`.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling.
