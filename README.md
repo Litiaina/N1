@@ -63,11 +63,20 @@ for N2-native operators, peers, tools, and future internal systems.
 
 ## What Ships Here
 
-- `litiaina-n2`: the N2 distributed object storage server.
-- `litiaina-n2-shell`: native N2 operator shell.
-- `litiaina-n2-gateway`: route-only N2 front door for user-facing traffic.
-- `n2_native_client`: reusable Rust client for `n2://`.
-- `simd-erasure-core`: SIMD erasure implementation used by N2.
+- `engine/` - N2 distributed object storage engine; Cargo package `n2`,
+  executable `litiaina-n2`.
+- `shell/` - native N2 operator shell; Cargo package `n2_shell`, executable
+  `litiaina-n2-shell`.
+- `gateway/` - route-only N2 front door for user-facing traffic; Cargo package
+  `n2_gateway`, executable `litiaina-n2-gateway`.
+- `native_client/` - reusable Rust client for `n2://`; Cargo package
+  `n2_native_client`.
+- `simd-erasure-core/` - SIMD erasure implementation used by N2; Cargo package
+  `simd-erasure-core`.
+
+The generic directory names describe repository structure. Product-specific
+Cargo packages, executables, systemd services, configuration, and protocol
+identities remain unchanged so installed components are unambiguous.
 
 ## Documentation
 
