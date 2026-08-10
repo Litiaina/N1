@@ -343,7 +343,11 @@ pub fn ensure_native_ok(response: &NativeResponse) -> NativeClientResult<()> {
                 "unknown native error".to_string(),
             )
         });
-    Err(NativeClientError::Native { code, message })
+    Err(NativeClientError::Native {
+        status: response.status,
+        code,
+        message,
+    })
 }
 
 #[cfg(test)]
@@ -369,7 +373,11 @@ mod tests {
         let err = ensure_native_ok(&response).expect_err("response should fail");
         assert!(matches!(
             err,
-            NativeClientError::Native { code, message }
+            NativeClientError::Native {
+                status: Some(400),
+                code,
+                message
+            }
                 if code == "status_400" && message == "Fragment not found"
         ));
     }
@@ -392,7 +400,11 @@ mod tests {
         let err = ensure_native_ok(&response).expect_err("response should fail");
         assert!(matches!(
             err,
-            NativeClientError::Native { code, message }
+            NativeClientError::Native {
+                status: Some(404),
+                code,
+                message
+            }
                 if code == "status_404" && message == "Not found"
         ));
     }

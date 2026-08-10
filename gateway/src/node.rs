@@ -173,36 +173,46 @@ impl NodeTable {
         }
     }
 
+    /// Re-check one configured node before treating a request transport failure as
+    /// node failure. A cancelled client upload can tear down that request's native
+    /// stream while the N2 node itself remains healthy; only a failed independent
+    /// ping is authoritative evidence that the node is currently unavailable.
+    pub async fn probe_node(&self, id: &str) -> bool {
+        let Some(config) = self.get(id).await else {
+            return false;
+        };
+        let started = Instant::now();
+        let result = async {
+            let mut client = N2NativeClient::connect(&config.native_url).await?;
+            client.raw_json("ping", &json!({}), None).await?;
+            Ok::<(), n2_native_client::NativeClientError>(())
+        }
+        .await;
+        let mut nodes = self.nodes.write().await;
+        let Some(node) = nodes.get_mut(id) else {
+            return false;
+        };
+        match result {
+            Ok(()) => {
+                node.status = NodeStatus::Online;
+                node.last_seen_at = Some(now_unix());
+                node.rtt_ms = Some(started.elapsed().as_millis() as u64);
+                debug!("N2 gateway node {} online", id);
+                true
+            }
+            Err(err) => {
+                node.status = NodeStatus::Offline;
+                node.failure_count = node.failure_count.saturating_add(1);
+                warn!("N2 gateway node {} offline: {}", id, err);
+                false
+            }
+        }
+    }
+
     pub async fn probe_once(&self) {
         let ids = self.nodes.read().await.keys().cloned().collect::<Vec<_>>();
         for id in ids {
-            let Some(config) = self.get(&id).await else {
-                continue;
-            };
-            let started = Instant::now();
-            let result = async {
-                let mut client = N2NativeClient::connect(&config.native_url).await?;
-                client.raw_json("ping", &json!({}), None).await?;
-                Ok::<(), n2_native_client::NativeClientError>(())
-            }
-            .await;
-            let mut nodes = self.nodes.write().await;
-            let Some(node) = nodes.get_mut(&id) else {
-                continue;
-            };
-            match result {
-                Ok(()) => {
-                    node.status = NodeStatus::Online;
-                    node.last_seen_at = Some(now_unix());
-                    node.rtt_ms = Some(started.elapsed().as_millis() as u64);
-                    debug!("N2 gateway node {} online", id);
-                }
-                Err(err) => {
-                    node.status = NodeStatus::Offline;
-                    node.failure_count = node.failure_count.saturating_add(1);
-                    warn!("N2 gateway node {} offline: {}", id, err);
-                }
-            }
+            self.probe_node(&id).await;
         }
     }
 }

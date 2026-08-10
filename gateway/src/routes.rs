@@ -19,8 +19,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::NodeConfig;
 use crate::native::{
-    bearer_from_headers, begin_native_download, content_length, content_type, native_json,
-    native_upload_body,
+    NativeCallError, bearer_from_headers, begin_native_download, content_length, content_type,
+    native_json, native_upload_body,
 };
 use crate::node::NodeStatus;
 use crate::proxy::{proxy_http, text_response};
@@ -506,7 +506,7 @@ async fn multipart_init_mode(
     payload["object_key"] = Value::String(object_key.clone());
     let (status, mut body) = match native_json(&node, &bearer, mode.init_op(), payload).await {
         Ok(value) => value,
-        Err(err) => return upstream_failed(&state, &node, err).await,
+        Err(err) => return native_call_failed(&state, &node, err).await,
     };
     if status < 300 {
         body["coordinator_node_id"] = Value::String(node.id.clone());
@@ -805,7 +805,7 @@ async fn cluster_job_start(
     };
     let (status, mut body) = match native_json(&node, &bearer, op, payload).await {
         Ok(value) => value,
-        Err(err) => return upstream_failed(&state, &node, err).await,
+        Err(err) => return native_call_failed(&state, &node, err).await,
     };
     if status < 300 {
         body["coordinator_node_id"] = Value::String(node.id.clone());
@@ -834,7 +834,7 @@ async fn cluster_job_followup(
     };
     let (status, mut body) = match native_json(&node, &bearer, op, json!({})).await {
         Ok(value) => value,
-        Err(err) => return upstream_failed(&state, &node, err).await,
+        Err(err) => return native_call_failed(&state, &node, err).await,
     };
     if status < 300 {
         body["coordinator_node_id"] = Value::String(node.id.clone());
@@ -911,7 +911,7 @@ async fn multipart_put_part_mode(
     payload["part_index"] = Value::Number(part_index.into());
     match native_upload_body(&node, &bearer, mode.put_part_op(), payload, body, body_len).await {
         Ok((status, value)) => json_response(status, value),
-        Err(err) => upstream_failed(&state, &node, err).await,
+        Err(err) => native_call_failed(&state, &node, err).await,
     }
 }
 
@@ -957,7 +957,7 @@ async fn multipart_status_mode(
     .await
     {
         Ok((status, value)) => json_response(status, value),
-        Err(err) => upstream_failed(&state, &node, err).await,
+        Err(err) => native_call_failed(&state, &node, err).await,
     }
 }
 
@@ -1023,7 +1023,7 @@ async fn multipart_finalize_mode(
     }
     match native_json(&node, &bearer, mode.finalize_op(), payload).await {
         Ok((status, value)) => json_response(status, value),
-        Err(err) => upstream_failed(&state, &node, err).await,
+        Err(err) => native_call_failed(&state, &node, err).await,
     }
 }
 
@@ -1064,7 +1064,7 @@ async fn multipart_cancel_mode(
     payload["version_id"] = Value::String(version_id.clone());
     match native_json(&node, &bearer, mode.cancel_op(), payload).await {
         Ok((status, value)) => json_response(status, value),
-        Err(err) => upstream_failed(&state, &node, err).await,
+        Err(err) => native_call_failed(&state, &node, err).await,
     }
 }
 
@@ -1094,7 +1094,7 @@ async fn one_shot_upload(
     }
     match native_upload_body(&node, &bearer, "upload.one_shot", payload, body, body_len).await {
         Ok((status, value)) => json_response(status, value),
-        Err(err) => upstream_failed(&state, &node, err).await,
+        Err(err) => native_call_failed(&state, &node, err).await,
     }
 }
 
@@ -1276,18 +1276,21 @@ async fn coordinator_node(
         )
     })?;
     state.nodes.mark_route(&coordinator_node_id).await;
-    if !state.nodes.is_available(&coordinator_node_id).await {
+    let configured = state.nodes.get(&coordinator_node_id).await.ok_or_else(|| {
+        text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coordinator node is not configured",
+        )
+    })?;
+    if !state.nodes.is_available(&coordinator_node_id).await
+        && !state.nodes.probe_node(&coordinator_node_id).await
+    {
         return Err(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "coordinator node is unavailable",
         ));
     }
-    state.nodes.get(&coordinator_node_id).await.ok_or_else(|| {
-        text_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "coordinator node is not configured",
-        )
-    })
+    Ok(configured)
 }
 
 fn coordinator_node_id(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
@@ -1312,11 +1315,28 @@ fn coordinator_node_id(headers: &HeaderMap, query: &HashMap<String, String>) -> 
 }
 
 async fn upstream_failed(state: &GatewayState, node: &NodeConfig, err: String) -> Response<Body> {
-    state.nodes.mark_failure(&node.id).await;
+    // A failed upload stream is not proof that its coordinator died: browser
+    // cancellation closes the request body intentionally. Confirm node liveness
+    // through an independent native ping before changing gateway availability.
+    state.nodes.probe_node(&node.id).await;
     text_response(
         StatusCode::SERVICE_UNAVAILABLE,
         format!("gateway upstream {} failed: {err}", node.id),
     )
+}
+
+async fn native_call_failed(
+    state: &GatewayState,
+    node: &NodeConfig,
+    error: NativeCallError,
+) -> Response<Body> {
+    if let Some(status) = error.status {
+        return text_response(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            error.message,
+        );
+    }
+    upstream_failed(state, node, error.message).await
 }
 
 fn query_to_json(query: HashMap<String, String>) -> Value {
@@ -1491,6 +1511,29 @@ mod tests {
                 }
             }
             operations.lock().await.push(request.op.clone());
+            let missing_cancel_session = matches!(
+                request.op.as_str(),
+                "upload.multipart.cancel"
+                    | "upload.multipart.standard.cancel"
+                    | "upload.multipart.durable.cancel"
+            ) && request
+                .payload
+                .as_deref()
+                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                .and_then(|payload| payload["version_id"].as_str().map(str::to_string))
+                .is_some_and(|version_id| version_id == "missing-session");
+            if missing_cancel_session {
+                write_native_error_response(
+                    &mut stream,
+                    request.id,
+                    400,
+                    "bad_request",
+                    "Standard upload session not found",
+                )
+                .await
+                .unwrap();
+                continue;
+            }
             if request.op == "object.download_stream" {
                 let object_key = request
                     .payload
@@ -1581,6 +1624,33 @@ mod tests {
             body: Some(ByteBuf::from(rmp_serde::to_vec(&body).unwrap())),
             body_len: None,
             error: None,
+        };
+        let frame = rmp_serde::to_vec(&response).unwrap();
+        stream
+            .write_all(&(frame.len() as u32).to_be_bytes())
+            .await?;
+        stream.write_all(&frame).await?;
+        stream.flush().await
+    }
+
+    async fn write_native_error_response(
+        stream: &mut TcpStream,
+        id: String,
+        status: u16,
+        code: &str,
+        message: &str,
+    ) -> std::io::Result<()> {
+        let response = NativeResponse {
+            id,
+            ok: false,
+            status: Some(status),
+            payload: None,
+            body: None,
+            body_len: None,
+            error: Some(NativeError {
+                code: code.to_string(),
+                message: message.to_string(),
+            }),
         };
         let frame = rmp_serde::to_vec(&response).unwrap();
         stream
@@ -2060,6 +2130,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn stale_offline_coordinator_is_reprobed_before_multipart_cancel() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        state.nodes.mark_offline_for_test("node-a").await;
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/noa/v1/upload/multipart/ver-a?object_key=videos%2Ftest.mp4&coordinator_node_id=node-a")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let node_a_snapshot = state
+            .nodes
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|node| node.id == "node-a")
+            .unwrap();
+        assert!(matches!(node_a_snapshot.status, NodeStatus::Online));
+        assert!(
+            node_a
+                .operations
+                .lock()
+                .await
+                .contains(&"upload.multipart.standard.cancel".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_cancel_preserves_native_session_not_found_status() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/noa/v1/upload/multipart/missing-session?object_key=videos%2Ftest.mp4&coordinator_node_id=node-a")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "bad_request: Standard upload session not found"
+        );
+        let node_a_snapshot = state
+            .nodes
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|node| node.id == "node-a")
+            .unwrap();
+        assert!(matches!(node_a_snapshot.status, NodeStatus::Online));
+        assert_eq!(node_a_snapshot.failure_count, 0);
     }
 
     #[tokio::test]

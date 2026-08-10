@@ -7,6 +7,36 @@ use tokio_util::io::StreamReader;
 
 use crate::config::NodeConfig;
 
+#[derive(Debug)]
+pub struct NativeCallError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl NativeCallError {
+    fn contextual(context: String, error: NativeClientError) -> Self {
+        let status = match &error {
+            NativeClientError::Native { status, .. } => *status,
+            _ => None,
+        };
+        Self {
+            status,
+            message: format!("{context}: {error}"),
+        }
+    }
+
+    fn direct(error: NativeClientError) -> Self {
+        let status = match &error {
+            NativeClientError::Native { status, .. } => *status,
+            _ => None,
+        };
+        Self {
+            status,
+            message: error.to_string(),
+        }
+    }
+}
+
 pub struct NativeDownload {
     client: N2NativeClient,
     pub status: u16,
@@ -33,15 +63,14 @@ impl NativeDownload {
 pub async fn connect_with_bearer(
     node: &NodeConfig,
     bearer: &str,
-) -> Result<N2NativeClient, String> {
+) -> Result<N2NativeClient, NativeCallError> {
     let mut client = N2NativeClient::connect(&node.native_url)
         .await
-        .map_err(|err| format!("connect {}: {err}", node.native_url))?
+        .map_err(|err| NativeCallError::contextual(format!("connect {}", node.native_url), err))?
         .with_request_prefix("n2-gateway");
-    client
-        .auth_bearer(bearer)
-        .await
-        .map_err(|err| format!("native bearer auth on {}: {err}", node.id))?;
+    client.auth_bearer(bearer).await.map_err(|err| {
+        NativeCallError::contextual(format!("native bearer auth on {}", node.id), err)
+    })?;
     Ok(client)
 }
 
@@ -50,13 +79,16 @@ pub async fn native_json(
     bearer: &str,
     op: &str,
     payload: Value,
-) -> Result<(u16, Value), String> {
+) -> Result<(u16, Value), NativeCallError> {
     let mut client = connect_with_bearer(node, bearer).await?;
     let response = client
         .operation(op, &payload, None)
         .await
-        .map_err(native_error)?;
-    Ok(decode_operation_response(response)?)
+        .map_err(NativeCallError::direct)?;
+    decode_operation_response(response).map_err(|message| NativeCallError {
+        status: None,
+        message,
+    })
 }
 
 pub async fn native_upload_body(
@@ -66,7 +98,7 @@ pub async fn native_upload_body(
     payload: Value,
     body: Body,
     body_len: u64,
-) -> Result<(u16, Value), String> {
+) -> Result<(u16, Value), NativeCallError> {
     let mut client = connect_with_bearer(node, bearer).await?;
     let stream = body
         .into_data_stream()
@@ -75,8 +107,11 @@ pub async fn native_upload_body(
     let response = client
         .operation_reader(op, &payload, &mut reader, body_len)
         .await
-        .map_err(native_error)?;
-    Ok(decode_operation_response(response)?)
+        .map_err(NativeCallError::direct)?;
+    decode_operation_response(response).map_err(|message| NativeCallError {
+        status: None,
+        message,
+    })
 }
 
 pub async fn begin_native_download(
@@ -87,9 +122,9 @@ pub async fn begin_native_download(
     let mut client =
         connect_with_bearer(node, bearer)
             .await
-            .map_err(|message| NativeDownloadError {
-                status: None,
-                message,
+            .map_err(|error| NativeDownloadError {
+                status: error.status,
+                message: error.message,
             })?;
     let response = client
         .begin_stream_response("object.download_stream", &payload)

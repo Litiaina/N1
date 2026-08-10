@@ -8,7 +8,11 @@ pub enum NativeClientError {
     Decode(rmp_serde::decode::Error),
     Json(serde_json::Error),
     Protocol(String),
-    Native { code: String, message: String },
+    Native {
+        status: Option<u16>,
+        code: String,
+        message: String,
+    },
 }
 
 pub type NativeClientResult<T> = Result<T, NativeClientError>;
@@ -27,7 +31,11 @@ impl fmt::Display for NativeClientError {
             Self::Decode(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "{err}"),
             Self::Protocol(message) => write!(f, "{message}"),
-            Self::Native { code, message } => write!(f, "{code}: {message}"),
+            Self::Native {
+                status: _,
+                code,
+                message,
+            } => write!(f, "{code}: {message}"),
         }
     }
 }
