@@ -36,17 +36,26 @@ unversioned storage roots rather than adopting or migrating them.
 
 ## What Is Included
 
-- `engine/` - N1 server and storage engine.
-- `shell/` - operator shell for N1 inspection and maintenance.
-- `native_client/` - canonical Rust client for the `n1://` protocol.
-- `simd-erasure-core/` - internal erasure-coding core used by N1.
-- `cli_core/` - small shared shell support crate used by `n1_shell`.
-- `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling.
+- `engine/` - N1 server and storage engine; Cargo package `n1`, executable
+  `litiaina-n1`.
+- `shell/` - operator shell and future embedded management server; Cargo
+  package `n1_shell`, executable `litiaina-n1-shell`.
+- `native_client/` - canonical Rust client for the `n1://` protocol; Cargo
+  package `n1_native_client`.
+- `simd-erasure-core/` - internal erasure-coding core used by N1; Cargo package
+  `simd-erasure-core`.
+- `cli_core/` - shared shell support; Cargo package `cli_core`.
+- `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling;
+  Cargo package and executable `n1-release-proof`.
 - `DOCUMENTATION.md` - user-facing N1 documentation.
 - `NOA.md` - canonical NOA v1 transport contract implemented by N1 3.2.0.
 - `ARCHITECTURE.md` - storage architecture and invariants.
 - `TESTING.md` / `VERIFICATION.md` - validation and release evidence.
 - `deploy/systemd/` and `scripts/install-n1-systemd.sh` - production service installation.
+
+The generic directory names describe repository structure. Product-specific
+Cargo packages, executables, systemd services, configuration, and protocol
+identities remain unchanged so installed components are unambiguous.
 
 ## Storage Identity
 
