@@ -14,7 +14,7 @@ bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
-n2_native_client = { path = "../n2_native_client" }
+n2_native_client = { path = "../native_client" }
 percent-encoding.workspace = true
 reqwest.workspace = true
 rmp-serde.workspace = true

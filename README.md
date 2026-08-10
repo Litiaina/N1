@@ -164,13 +164,13 @@ it can be read through any healthy node.
 ## Repository Layout
 
 ```text
-n2/
+engine/
   src/                  server, object engine, flat namespace, distribution
-n2_shell/
+shell/
   src/                  N2 native operator shell
-n2_native_client/
+native_client/
   src/                  reusable Rust client for n2://
-n2_gateway/
+gateway/
   src/                  optional route-only N2 gateway
 deploy/systemd/
   litiaina-n2*.service.in

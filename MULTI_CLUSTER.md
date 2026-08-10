@@ -1113,7 +1113,7 @@ derived from configuration list order.
 The implementation belongs under a separate cluster subsystem:
 
 ```text
-n2/src/cluster/
+engine/src/cluster/
 ├── manifest.rs        signed fragment policies, writer sets, and fencing
 ├── federation.rs      cluster identity and peer configuration
 ├── routing.rs         fragment-to-cluster resolution

@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "n2_gateway",
-    "n2_shell",
-    "n2_native_client",
-    "n2",
+    "gateway",
+    "shell",
+    "native_client",
+    "engine",
     "simd-erasure-core",
 ]
 resolver = "2"
