@@ -1793,7 +1793,7 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
         if !trash_root.is_dir() {
             continue;
         }
-        for generation in read_dir_names(&trash_root)? {
+        'generation: for generation in read_dir_names(&trash_root)? {
             let Some((unix_nanos, path_depth)) = parse_trash_generation_name(&generation) else {
                 return Err(AppError::InternalServerError(format!(
                     "N1 trash entry '{}' uses the pre-3.3 layout; migrate it before starting N1 3.3",
@@ -1804,15 +1804,45 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                 continue;
             }
             let generation_root = trash_root.join(&generation);
-            if !generation_root.is_dir() {
-                return Err(AppError::InternalServerError(format!(
-                    "N1 trash generation '{}' is not a directory",
-                    generation_root.display()
-                )));
+            match fs::symlink_metadata(&generation_root) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => {
+                    return Err(AppError::InternalServerError(format!(
+                        "N1 trash generation '{}' is not a directory",
+                        generation_root.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(io_err(error, "inspect N1 trash generation"));
+                }
             }
-            let (anchor, original_path) = trash_generation_anchor(&generation_root, path_depth)?;
-            let metadata = fs::symlink_metadata(&anchor)
-                .map_err(|err| io_err(err, "inspect N1 trash generation anchor"))?;
+            let (anchor, original_path) =
+                match trash_generation_anchor(&generation_root, path_depth) {
+                    Ok(anchor) => anchor,
+                    Err(error) => {
+                        match fs::symlink_metadata(&generation_root) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                                continue;
+                            }
+                            Ok(metadata)
+                                if metadata.is_dir()
+                                    && read_dir_names(&generation_root)
+                                        .is_ok_and(|names| names.is_empty()) =>
+                            {
+                                // A concurrent recover/TTL removal has already moved the
+                                // only anchor and is pruning this now-empty generation.
+                                continue;
+                            }
+                            _ => return Err(error),
+                        }
+                    }
+                };
+            let metadata = match fs::symlink_metadata(&anchor) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_err(error, "inspect N1 trash generation anchor")),
+            };
             let (kind, object_keys, version_ids) = if let Some(object_id) =
                 read_namespace_symlink_object_id(&index_root, fragment, &anchor)?
             {
@@ -1825,7 +1855,15 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                 (TrashKind::File, vec![object_id], versions)
             } else if metadata.is_dir() {
                 let (objects, versions) =
-                    collect_trash_object_refs(&index_root, fragment, &anchor)?;
+                    match collect_trash_object_refs(&index_root, fragment, &anchor) {
+                        Ok(references) => references,
+                        Err(error) => match fs::symlink_metadata(&anchor) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                                continue 'generation;
+                            }
+                            _ => return Err(error),
+                        },
+                    };
                 (TrashKind::Directory, objects, versions)
             } else if metadata.is_file() {
                 (TrashKind::File, Vec::new(), Vec::new())

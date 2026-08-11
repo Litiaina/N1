@@ -14,6 +14,34 @@ RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 
 This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, object-level repair/status, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, capacity/placement behavior, or real disk behavior.
 
+### N1 Shell Provisioning Gate
+
+The embedded installation terminal has an additional non-destructive gate:
+
+```bash
+cargo test -p n1_shell
+cargo clippy -p n1_shell --all-targets -- \
+  -D warnings -A clippy::too_many_arguments
+node --check shell/web/shell.js
+```
+
+The Shell unit suite uses simulated block inventories and proves:
+
+- a root/boot disk is classified as protected and cannot reach confirmation;
+- formatting requires an exact NDISK label plus the currently observed serial;
+- four independently mounted disks can be assigned as index and blob roots;
+- `3 + 1` validates only after four distinct physical blob disks exist;
+- initialization is repeatable, preserves generated secrets, and leaves the
+  service disabled;
+- storage and EC configuration changes are rejected while N1 is active;
+- setup tokens require exact comparison and are independently generated.
+
+The browser transport proof must additionally show an unauthorized WebSocket
+receives `401`, the valid setup token receives `101 Switching Protocols`, and
+read-only `version` plus `lsblk` commands complete through the same embedded UI
+protocol. This transport proof never invokes `disk format` on the development
+machine.
+
 ## Gate 2: Release Drills
 
 Run the release drill harness before tagging or deploying:

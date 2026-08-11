@@ -2038,13 +2038,18 @@ dependencies = [
  "chrono",
  "clap",
  "cli_core",
+ "futures-util",
+ "hostname",
  "n1_native_client",
  "percent-encoding",
+ "rand 0.8.5",
  "reqwest",
  "rmp-serde",
+ "rust-ini",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>N1 Shell</title>
+    <link rel="stylesheet" href="/shell.css" />
+    <script src="/shell.js" defer></script>
+  </head>
+  <body>
+    <main class="shell" aria-label="N1 installation shell">
+      <header class="shell-header">
+        <div class="identity"><span class="mark">N1</span><span>N1 Shell</span></div>
+        <div class="connection"><span id="connection-dot" class="dot offline"></span><span id="connection-label">Disconnected</span></div>
+      </header>
+      <section id="terminal" class="terminal" tabindex="-1" aria-live="polite" aria-label="Terminal output">
+        <div id="output" class="output"></div>
+        <form id="prompt" class="prompt" autocomplete="off">
+          <label id="prompt-label" for="command">n1@localhost:disconnected$</label>
+          <input id="command" name="command" type="text" autocapitalize="none" autocomplete="off" autocorrect="off" spellcheck="false" disabled />
+        </form>
+      </section>
+    </main>
+
+    <section id="login" class="login" aria-labelledby="login-title">
+      <form id="login-form" class="login-panel" autocomplete="off">
+        <div class="login-mark">N1</div>
+        <h1 id="login-title">N1 Installation Shell</h1>
+        <p>Enter the setup token printed by <code>litiaina-n1-shell serve</code>.</p>
+        <label for="setup-token">Setup token</label>
+        <input id="setup-token" type="password" autocomplete="one-time-code" required minlength="16" autofocus />
+        <button type="submit">Connect</button>
+        <p id="login-error" class="login-error" role="alert"></p>
+      </form>
+    </section>
+  </body>
+</html>

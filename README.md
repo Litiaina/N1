@@ -48,6 +48,7 @@ unversioned storage roots rather than adopting or migrating them.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling;
   Cargo package and executable `n1-release-proof`.
 - `DOCUMENTATION.md` - user-facing N1 documentation.
+- `N1_SHELL_SETUP.md` - embedded browser-terminal installation and four-disk provisioning guide.
 - `NOA.md` - canonical NOA v1 transport contract implemented by N1 3.2.0.
 - `ARCHITECTURE.md` - storage architecture and invariants.
 - `TESTING.md` / `VERIFICATION.md` - validation and release evidence.
@@ -119,6 +120,8 @@ directory. Those files are machine-local and intentionally ignored by this repo.
 ```
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for setup, runtime files, and production service installation.
+For a fresh Debian server provisioned through the embedded N1 Shell terminal,
+follow [N1_SHELL_SETUP.md](N1_SHELL_SETUP.md).
 
 ## Validation
 

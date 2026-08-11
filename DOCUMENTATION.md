@@ -33,6 +33,15 @@ the current package version advances to `3.2.0`.
 
 ## Installation
 
+N1 provides two explicit installation paths:
+
+- The embedded N1 Shell browser terminal performs disk discovery, guarded XFS
+  formatting, persistent mounts, index/blob assignment, atomic configuration,
+  systemd installation, validation, and service activation. Follow the
+  complete [N1 Shell Installation Guide](N1_SHELL_SETUP.md).
+- The manual path below remains supported for existing deployments and
+  package-management automation.
+
 Build N1:
 
 ```bash

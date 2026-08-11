@@ -104,6 +104,7 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
     let client = build_client(cli.insecure)?;
 
     match &cli.command {
+        Commands::Serve(_) => unreachable!("serve is handled before client dispatch"),
         Commands::Fragment {
             command: command @ FragmentCommands::Create(_),
         } => {
@@ -294,6 +295,7 @@ async fn handle_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
+        Commands::Serve(_) => unreachable!("serve is handled before authenticated dispatch"),
         Commands::Shell => Err(io::Error::other(
             "shell requires native n1:// transport; omit --url or pass --native-url.",
         )

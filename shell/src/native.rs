@@ -38,6 +38,7 @@ pub async fn run_native(cli: Cli) -> Result<(), DynError> {
         .with_request_prefix("n1-cli");
 
     match &cli.command {
+        Commands::Serve(_) => unreachable!("serve is handled before native dispatch"),
         Commands::Shell => {
             authenticate_native_cli(&mut client, &cli, &secret).await?;
             native_shell(&mut client, &cli).await
@@ -178,6 +179,7 @@ async fn handle_native_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
+        Commands::Serve(_) => unreachable!("serve is handled before native dispatch"),
         Commands::Shell => native_shell(client, cli).await,
         Commands::Fragment { command } => {
             handle_native_fragment_command(client, cli, command).await

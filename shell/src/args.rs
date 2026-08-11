@@ -111,6 +111,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
     #[command(
+        about = "Serve the embedded N1 installation terminal.",
+        long_about = "Serve the self-contained browser terminal used to discover, format, assign, configure, validate, and start a fresh N1 installation. The setup token is required for every terminal session."
+    )]
+    Serve(ServeArgs),
+
+    #[command(
         about = "Open a stateful native N1 operator shell.",
         long_about = "Open a persistent n1:// session for monitoring, listing, object status/repair, GC, repair, redistribution, and usage checks."
     )]
@@ -188,6 +194,79 @@ pub enum Commands {
         long_about = "Direct redistribution control. Use --none for whole-N1 redistribution or --fragment <name-or-hash> for one fragment. Redistribution is for placement realignment after disk or policy changes."
     )]
     Redistribute(RedistributeArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServeArgs {
+    #[arg(
+        long,
+        default_value = "0.0.0.0:50901",
+        help = "Management address for the embedded HTTP terminal."
+    )]
+    pub bind: String,
+
+    #[arg(
+        long,
+        default_value = "/opt/litiaina/n1",
+        help = "N1 installation directory containing the engine binary and runtime configuration."
+    )]
+    pub install_dir: String,
+
+    #[arg(
+        long,
+        default_value = "",
+        help = "N1 engine binary. Defaults to <install-dir>/litiaina-n1."
+    )]
+    pub engine_binary: String,
+
+    #[arg(
+        long,
+        default_value = "/mnt",
+        help = "Parent directory for NDISKxxx mounts."
+    )]
+    pub mount_root: String,
+
+    #[arg(
+        long,
+        default_value = "/etc/fstab",
+        help = "fstab file managed for persistent N1 disk mounts."
+    )]
+    pub fstab: String,
+
+    #[arg(
+        long,
+        default_value = "litiaina-n1",
+        help = "systemd service name without the .service suffix."
+    )]
+    pub service_name: String,
+
+    #[arg(
+        long,
+        default_value = "/etc/systemd/system",
+        hide = true,
+        help = "systemd unit directory. Intended for packaging tests; production uses /etc/systemd/system."
+    )]
+    pub systemd_unit_dir: String,
+
+    #[arg(
+        long,
+        default_value = "administrator",
+        help = "Operating-system user that owns N1 mounts and runs the engine."
+    )]
+    pub run_user: String,
+
+    #[arg(
+        long,
+        default_value = "administrator",
+        help = "Operating-system group that owns N1 mounts and runs the engine."
+    )]
+    pub run_group: String,
+
+    #[arg(
+        long,
+        help = "Setup token. A random token is generated and printed when omitted."
+    )]
+    pub setup_token: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
