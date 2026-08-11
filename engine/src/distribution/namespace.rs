@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::Utc;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::core::disk_manager::ObjectMetadata;
@@ -21,6 +23,91 @@ use crate::namespace::runtime::{NamespaceObjectRef, NamespaceObjectRefPage};
 
 const LIST_BATCH_MAX: usize = 1_000;
 const PREFIX_MUTATION_CONCURRENCY: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceMutationPhase {
+    Planning,
+    Executing,
+}
+
+#[derive(Clone, Debug)]
+pub struct NamespaceMutationProgress {
+    pub phase: NamespaceMutationPhase,
+    pub discovered: usize,
+    pub total: Option<usize>,
+    pub completed: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub current_path: Option<String>,
+}
+
+pub type NamespaceProgressObserver = Arc<dyn Fn(NamespaceMutationProgress) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct NamespaceMutationControl {
+    observer: Option<NamespaceProgressObserver>,
+    cancel: Option<CancellationToken>,
+}
+
+impl NamespaceMutationControl {
+    pub fn new(observer: NamespaceProgressObserver, cancel: CancellationToken) -> Self {
+        Self {
+            observer: Some(observer),
+            cancel: Some(cancel),
+        }
+    }
+
+    fn ensure_running(&self) -> Result<(), AppError> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(AppError::Conflict(
+                "namespace operation was cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn report(&self, progress: NamespaceMutationProgress) {
+        if let Some(observer) = &self.observer {
+            observer(progress);
+        }
+    }
+
+    fn planning(&self, discovered: usize, current_path: Option<String>) {
+        self.report(NamespaceMutationProgress {
+            phase: NamespaceMutationPhase::Planning,
+            discovered,
+            total: None,
+            completed: 0,
+            succeeded: 0,
+            failed: 0,
+            current_path,
+        });
+    }
+
+    fn executing(
+        &self,
+        total: usize,
+        completed: usize,
+        succeeded: usize,
+        failed: usize,
+        current_path: Option<String>,
+    ) {
+        self.report(NamespaceMutationProgress {
+            phase: NamespaceMutationPhase::Executing,
+            discovered: total,
+            total: Some(total),
+            completed,
+            succeeded,
+            failed,
+            current_path,
+        });
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -218,6 +305,14 @@ pub async fn commit_upload_pointer(
 pub async fn commit_namespace_mutation(
     request: PeerNamespaceApplyRequest,
 ) -> Result<NamespaceApplyOutcome, AppError> {
+    commit_namespace_mutation_controlled(request, NamespaceMutationControl::default(), None).await
+}
+
+pub async fn commit_namespace_mutation_controlled(
+    request: PeerNamespaceApplyRequest,
+    control: NamespaceMutationControl,
+    mutation_unix_nanos: Option<i64>,
+) -> Result<NamespaceApplyOutcome, AppError> {
     let mutation_id = request
         .mutation_id
         .unwrap_or_else(|| Ulid::new().to_string());
@@ -226,9 +321,13 @@ pub async fn commit_namespace_mutation(
             "namespace mutation_id must be a ULID".into(),
         ));
     }
-    let now_nanos = Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or_else(|| AppError::InternalServerError("system time exceeds nanoseconds".into()))?;
+    let now_nanos = match mutation_unix_nanos {
+        Some(value) => value,
+        None => Utc::now().timestamp_nanos_opt().ok_or_else(|| {
+            AppError::InternalServerError("system time exceeds nanoseconds".into())
+        })?,
+    };
+    control.ensure_running()?;
     match request.kind {
         NamespaceMutationKind::Mkdir => {
             let path = required(&request.source_path, "mkdir requires source_path")?;
@@ -249,6 +348,7 @@ pub async fn commit_namespace_mutation(
                 destination,
                 &mutation_id,
                 now_nanos,
+                &control,
             )
             .await?;
             Ok(NamespaceApplyOutcome::Summary(summary))
@@ -256,12 +356,14 @@ pub async fn commit_namespace_mutation(
         NamespaceMutationKind::Trash => {
             let source = required(&request.source_path, "trash requires source_path")?;
             let summary =
-                trash_key_or_prefix(&request.fragment, source, &mutation_id, now_nanos).await?;
+                trash_key_or_prefix(&request.fragment, source, &mutation_id, now_nanos, &control)
+                    .await?;
             Ok(NamespaceApplyOutcome::Summary(summary))
         }
         NamespaceMutationKind::Recover => {
             let requested = required(&request.source_path, "recover requires path or trash id")?;
-            let recovery = find_trash_recovery_set(&request.fragment, requested).await?;
+            let recovery =
+                find_trash_recovery_set_controlled(&request.fragment, requested, &control).await?;
             if recovery.is_empty() {
                 return Err(AppError::NotFound);
             }
@@ -280,6 +382,7 @@ pub async fn commit_namespace_mutation(
                 }
             }
             let affected = recovery.len();
+            control.executing(affected, 0, 0, 0, None);
             let first_name = recovery.first().expect("non-empty recovery set").0.clone();
             let first_locator = first_name
                 .trash
@@ -292,15 +395,30 @@ pub async fn commit_namespace_mutation(
             };
             let mut pending = recovery.into_iter();
             let mut running = FuturesUnordered::new();
+            let mut completed = 0usize;
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
             loop {
+                control.ensure_running()?;
                 while running.len() < PREFIX_MUTATION_CONCURRENCY {
                     let Some((name, located)) = pending.next() else {
                         break;
                     };
-                    running.push(async move { recover_one(&name, &located).await });
+                    let path = name.logical_key.clone();
+                    running.push(async move { (path, recover_one(&name, &located).await) });
                 }
                 match running.next().await {
-                    Some(result) => result?,
+                    Some((path, Ok(()))) => {
+                        completed = completed.saturating_add(1);
+                        succeeded = succeeded.saturating_add(1);
+                        control.executing(affected, completed, succeeded, failed, Some(path));
+                    }
+                    Some((path, Err(error))) => {
+                        completed = completed.saturating_add(1);
+                        failed = failed.saturating_add(1);
+                        control.executing(affected, completed, succeeded, failed, Some(path));
+                        return Err(error);
+                    }
                     None => break,
                 }
             }
@@ -349,6 +467,56 @@ pub async fn commit_namespace_summary(
         .ok_or_else(|| {
             AppError::InternalServerError("namespace mutation did not return a summary".into())
         })
+}
+
+pub async fn commit_namespace_summary_controlled(
+    request: PeerNamespaceApplyRequest,
+    control: NamespaceMutationControl,
+    mutation_unix_nanos: i64,
+) -> Result<NamespaceMutationSummary, AppError> {
+    commit_namespace_mutation_controlled(request, control, Some(mutation_unix_nanos))
+        .await?
+        .summary()
+        .ok_or_else(|| {
+            AppError::InternalServerError("namespace mutation did not return a summary".into())
+        })
+}
+
+/// Classify only the mutation boundary. Exact live/trash keys remain the
+/// synchronous fast path; virtual prefixes are handed to the background
+/// operation runner without touching object payloads.
+pub async fn namespace_mutation_target_kind(
+    fragment: &str,
+    kind: NamespaceMutationKind,
+    requested: &str,
+) -> Result<NamespaceEntryKind, AppError> {
+    match kind {
+        NamespaceMutationKind::Rename | NamespaceMutationKind::Trash => {
+            let requested = validate_logical_key(requested)?;
+            if find_live(fragment, &requested).await?.is_some() {
+                return Ok(NamespaceEntryKind::File);
+            }
+            let prefix = format!("{requested}/");
+            if list_canonical_names(fragment, &prefix, None, 1, false)
+                .await?
+                .is_empty()
+            {
+                return Err(AppError::NotFound);
+            }
+            Ok(NamespaceEntryKind::Directory)
+        }
+        NamespaceMutationKind::Recover => {
+            let recovery = find_trash_recovery_set(fragment, requested).await?;
+            match recovery.len() {
+                0 => Err(AppError::NotFound),
+                1 => Ok(NamespaceEntryKind::File),
+                _ => Ok(NamespaceEntryKind::Directory),
+            }
+        }
+        NamespaceMutationKind::Mkdir | NamespaceMutationKind::UploadCommit => Err(
+            AppError::BadRequest("mutation kind does not have a file-or-prefix target".into()),
+        ),
+    }
 }
 
 async fn namespace_entry(
@@ -487,9 +655,25 @@ async fn all_names(
     prefix: &str,
     trash: bool,
 ) -> Result<Vec<PeerNcnxName>, AppError> {
+    all_names_controlled(
+        fragment,
+        prefix,
+        trash,
+        &NamespaceMutationControl::default(),
+    )
+    .await
+}
+
+async fn all_names_controlled(
+    fragment: &str,
+    prefix: &str,
+    trash: bool,
+    control: &NamespaceMutationControl,
+) -> Result<Vec<PeerNcnxName>, AppError> {
     let mut names = Vec::new();
     let mut cursor = None;
     loop {
+        control.ensure_running()?;
         let page = list_canonical_names(fragment, prefix, cursor.as_deref(), LIST_BATCH_MAX, trash)
             .await?;
         if page.is_empty() {
@@ -500,6 +684,10 @@ async fn all_names(
             .map(|name| ncnx_cursor(&name.logical_key, name.trash.as_ref()));
         let full = page.len() == LIST_BATCH_MAX;
         names.extend(page);
+        control.planning(
+            names.len(),
+            names.last().map(|name| name.logical_key.clone()),
+        );
         if !full {
             break;
         }
@@ -558,6 +746,15 @@ async fn find_trash_recovery_set(
     fragment: &str,
     requested: &str,
 ) -> Result<Vec<(PeerNcnxName, LocatedNcnx)>, AppError> {
+    find_trash_recovery_set_controlled(fragment, requested, &NamespaceMutationControl::default())
+        .await
+}
+
+async fn find_trash_recovery_set_controlled(
+    fragment: &str,
+    requested: &str,
+    control: &NamespaceMutationControl,
+) -> Result<Vec<(PeerNcnxName, LocatedNcnx)>, AppError> {
     let by_id = Ulid::from_string(requested).is_ok();
     let requested_key = if by_id {
         String::new()
@@ -565,7 +762,7 @@ async fn find_trash_recovery_set(
         validate_logical_key(requested)?
     };
     let scan_prefix = if by_id { "" } else { requested_key.as_str() };
-    let mut candidates = all_names(fragment, scan_prefix, true)
+    let mut candidates = all_names_controlled(fragment, scan_prefix, true, control)
         .await?
         .into_iter()
         .filter(|name| {
@@ -613,8 +810,13 @@ async fn find_trash_recovery_set(
     candidates.sort_by(|left, right| left.logical_key.cmp(&right.logical_key));
     let mut recovery = Vec::with_capacity(candidates.len());
     for name in candidates {
+        control.ensure_running()?;
         let located = read_canonical_record(fragment, &name).await?;
         recovery.push((name, located));
+        control.planning(
+            recovery.len(),
+            recovery.last().map(|(name, _)| name.logical_key.clone()),
+        );
     }
     Ok(recovery)
 }
@@ -646,6 +848,7 @@ async fn rename_key_or_prefix(
     destination: &str,
     mutation_id: &str,
     now_nanos: i64,
+    control: &NamespaceMutationControl,
 ) -> Result<NamespaceMutationSummary, AppError> {
     let source = validate_logical_key(source)?;
     let destination = validate_logical_key(destination)?;
@@ -673,13 +876,14 @@ async fn rename_key_or_prefix(
     }
 
     let source_prefix = format!("{source}/");
-    let names = all_names(fragment, &source_prefix, false).await?;
+    let names = all_names_controlled(fragment, &source_prefix, false, control).await?;
     if names.is_empty() {
         return Err(AppError::NotFound);
     }
     let affected = names.len();
     let mut work = Vec::with_capacity(affected);
     for name in names {
+        control.ensure_running()?;
         let destination_key = rename_prefix(&name.logical_key, &source, &destination)
             .map_err(|err| AppError::BadRequest(err.to_string()))?;
         let source_record = read_canonical_record(fragment, &name).await?;
@@ -691,8 +895,12 @@ async fn rename_key_or_prefix(
             )));
         }
         work.push((source_record, destination_key));
+        control.planning(
+            work.len(),
+            work.last().map(|(record, _)| record.logical_key.clone()),
+        );
     }
-    run_prefix_rename(work, mutation_id, now_nanos).await?;
+    run_prefix_rename(work, mutation_id, now_nanos, control).await?;
     Ok(mutation_summary(
         "rename",
         NamespaceEntryKind::Directory,
@@ -708,21 +916,42 @@ async fn run_prefix_rename(
     work: Vec<(LocatedNcnx, String)>,
     mutation_id: &str,
     now_nanos: i64,
+    control: &NamespaceMutationControl,
 ) -> Result<(), AppError> {
+    let total = work.len();
+    control.executing(total, 0, 0, 0, None);
     let mut pending = work.into_iter();
     let mut running = FuturesUnordered::new();
+    let mut completed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
     loop {
+        control.ensure_running()?;
         while running.len() < PREFIX_MUTATION_CONCURRENCY {
             let Some((located, destination)) = pending.next() else {
                 break;
             };
             let mutation_id = mutation_id.to_string();
+            let path = located.logical_key.clone();
             running.push(async move {
-                rename_one(&located, &destination, &mutation_id, now_nanos).await
+                (
+                    path,
+                    rename_one(&located, &destination, &mutation_id, now_nanos).await,
+                )
             });
         }
         match running.next().await {
-            Some(result) => result?,
+            Some((path, Ok(()))) => {
+                completed = completed.saturating_add(1);
+                succeeded = succeeded.saturating_add(1);
+                control.executing(total, completed, succeeded, failed, Some(path));
+            }
+            Some((path, Err(error))) => {
+                completed = completed.saturating_add(1);
+                failed = failed.saturating_add(1);
+                control.executing(total, completed, succeeded, failed, Some(path));
+                return Err(error);
+            }
             None => break,
         }
     }
@@ -753,6 +982,7 @@ async fn trash_key_or_prefix(
     source: &str,
     mutation_id: &str,
     now_nanos: i64,
+    control: &NamespaceMutationControl,
 ) -> Result<NamespaceMutationSummary, AppError> {
     let source = validate_logical_key(source)?;
     if let Some(located) = find_live(fragment, &source).await? {
@@ -767,7 +997,7 @@ async fn trash_key_or_prefix(
             Some(now_nanos),
         ));
     }
-    let names = all_names(fragment, &format!("{source}/"), false).await?;
+    let names = all_names_controlled(fragment, &format!("{source}/"), false, control).await?;
     if names.is_empty() {
         // Repeated user deletion is safe and does not become an internal
         // server error. Report the already-trashed key when present.
@@ -788,20 +1018,41 @@ async fn trash_key_or_prefix(
     let affected = names.len();
     let mut work = Vec::with_capacity(affected);
     for name in names {
+        control.ensure_running()?;
         work.push(read_canonical_record(fragment, &name).await?);
+        control.planning(
+            work.len(),
+            work.last().map(|record| record.logical_key.clone()),
+        );
     }
+    control.executing(affected, 0, 0, 0, None);
     let mut pending = work.into_iter();
     let mut running = FuturesUnordered::new();
+    let mut completed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
     loop {
+        control.ensure_running()?;
         while running.len() < PREFIX_MUTATION_CONCURRENCY {
             let Some(located) = pending.next() else {
                 break;
             };
             let mutation_id = mutation_id.to_string();
-            running.push(async move { trash_one(&located, &mutation_id, now_nanos).await });
+            let path = located.logical_key.clone();
+            running.push(async move { (path, trash_one(&located, &mutation_id, now_nanos).await) });
         }
         match running.next().await {
-            Some(result) => result?,
+            Some((path, Ok(()))) => {
+                completed = completed.saturating_add(1);
+                succeeded = succeeded.saturating_add(1);
+                control.executing(affected, completed, succeeded, failed, Some(path));
+            }
+            Some((path, Err(error))) => {
+                completed = completed.saturating_add(1);
+                failed = failed.saturating_add(1);
+                control.executing(affected, completed, succeeded, failed, Some(path));
+                return Err(error);
+            }
             None => break,
         }
     }

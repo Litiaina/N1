@@ -149,6 +149,33 @@ trap cleanup EXIT
 curl_json() { curl -k --http1.1 -fsS -H 'Content-Type: application/json' "$@"; }
 curl_auth() { curl -k --http1.1 -fsS -H "Authorization: Bearer $TOKEN" "$@"; }
 
+await_namespace_operation() {
+  local base="$1" response_file="$2" operation_id coordinator endpoint poll_file state
+  operation_id="$(jq -r '.operation_id // empty' "$response_file")"
+  [[ -n "$operation_id" ]] || return 0
+  coordinator="$(jq -er '.coordinator_node_id' "$response_file")"
+  endpoint="$(jq -er '.status_endpoint' "$response_file")"
+  cp "$response_file" "$response_file.accepted.json"
+  poll_file="$response_file.poll.tmp"
+  for _ in $(seq 1 480); do
+    curl_auth -G "$base$endpoint" \
+      -H "x-n2-coordinator-node: $coordinator" \
+      --data-urlencode "coordinator_node_id=$coordinator" >"$poll_file"
+    state="$(jq -er '.state' "$poll_file")"
+    case "$state" in
+      completed) mv "$poll_file" "$response_file"; return 0 ;;
+      partial|failed|cancelled)
+        mv "$poll_file" "$response_file"
+        echo "namespace operation $operation_id ended in state $state" >&2
+        return 1
+        ;;
+    esac
+    sleep 0.25
+  done
+  echo "namespace operation $operation_id did not finish" >&2
+  return 1
+}
+
 wait_ping() {
   local base="$1"
   for _ in $(seq 1 80); do
@@ -472,11 +499,13 @@ curl_auth -X POST "$C_BASE/noa/v1/upload/one-shot/group/a.txt" --data-binary @"$
 curl_auth -X POST "$D_BASE/noa/v1/upload/one-shot/group/b.txt" --data-binary @"$OUT/small-b.bin" > "$OUT/upload-b.json"
 curl_json -X POST "$B_BASE/noa/v1/posix/trash" -H "Authorization: Bearer $TOKEN" \
   -d '{"path":"group"}' > "$OUT/group-trash.json"
+await_namespace_operation "$B_BASE" "$OUT/group-trash.json"
 TRASH_ID="$(jq -er '.trash_entry_id' "$OUT/group-trash.json")"
-jq -e '.affected == 2' "$OUT/group-trash.json" >/dev/null
+jq -e '(.affected // .affected_paths) == 2' "$OUT/group-trash.json" >/dev/null
 curl_json -X POST "$C_BASE/noa/v1/posix/recover" -H "Authorization: Bearer $TOKEN" \
   -d "{\"path\":\"group\",\"trash_entry_id\":\"$TRASH_ID\"}" > "$OUT/group-recover.json"
-jq -e '.affected == 2 and .kind == "directory"' "$OUT/group-recover.json" >/dev/null
+await_namespace_operation "$C_BASE" "$OUT/group-recover.json"
+jq -e '(.affected // .affected_paths) == 2 and .kind == "directory"' "$OUT/group-recover.json" >/dev/null
 
 # N2 3.1 generational trash: a new live object makes recovery conflict, the
 # old trash generation remains intact, and deleting the same key again creates

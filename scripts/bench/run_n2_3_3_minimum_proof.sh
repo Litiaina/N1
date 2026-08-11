@@ -52,8 +52,9 @@ DISK_FALLBACK_KEY=""
 DISK_FALLBACK_REPAIR_VERSION=""
 DISK_FALLBACK_WRITE_VERSION=""
 GC_CONCURRENCY_OBJECTS="0"
+SAFE_ROOT="${N2_MIN_SAFE_ROOT:-/mnt}"
 
-for tool in jq curl openssl pidstat sha256sum awk dd find; do
+for tool in jq curl openssl sha256sum awk dd find; do
   command -v "$tool" >/dev/null || {
     echo "missing required tool: $tool" >&2
     exit 1
@@ -74,7 +75,8 @@ fi
 
 assert_isolated_store() {
   local path="$1"
-  [[ "$path" == /mnt/NDISK*/.n2-validation/* ]] || {
+  [[ -n "$SAFE_ROOT" && "$SAFE_ROOT" != "/" ]]
+  [[ "$path/" == "$SAFE_ROOT/"* ]] || {
     echo "refusing unsafe N2 test store: $path" >&2
     exit 1
   }
@@ -258,8 +260,10 @@ start_node() {
   )
   local pid
   pid="$(<"$run/n2.pid")"
-  pidstat -h -u -r -d -w -p "$pid" 1 >>"$run/pidstat.log" 2>&1 &
-  echo $! >"$run/pidstat.pid"
+  if command -v pidstat >/dev/null; then
+    pidstat -h -u -r -d -w -p "$pid" 1 >>"$run/pidstat.log" 2>&1 &
+    echo $! >"$run/pidstat.pid"
+  fi
 }
 
 stop_node() {
@@ -284,6 +288,37 @@ curl_json() {
 
 curl_auth() {
   curl -k --http1.1 -fsS -H "Authorization: Bearer $TOKEN" "$@"
+}
+
+await_namespace_operation() {
+  local base="$1" response_file="$2"
+  local operation_id coordinator endpoint poll_file state
+  operation_id="$(jq -r '.operation_id // empty' "$response_file")"
+  [[ -n "$operation_id" ]] || return 0
+  coordinator="$(jq -er '.coordinator_node_id' "$response_file")"
+  endpoint="$(jq -er '.status_endpoint' "$response_file")"
+  cp "$response_file" "$response_file.accepted.json"
+  poll_file="$response_file.poll.tmp"
+  for _ in $(seq 1 480); do
+    curl_auth -G "$base$endpoint" \
+      -H "x-n2-coordinator-node: $coordinator" \
+      --data-urlencode "coordinator_node_id=$coordinator" >"$poll_file"
+    state="$(jq -er '.state' "$poll_file")"
+    case "$state" in
+      completed)
+        mv "$poll_file" "$response_file"
+        return 0
+        ;;
+      partial|failed|cancelled)
+        mv "$poll_file" "$response_file"
+        echo "namespace operation $operation_id ended in state $state" >&2
+        return 1
+        ;;
+    esac
+    sleep 0.25
+  done
+  echo "namespace operation $operation_id did not finish" >&2
+  return 1
 }
 
 wait_gc_at() {
@@ -476,6 +511,20 @@ curl_auth -G "$B_BASE/noa/v1/objects/download" \
   --data-urlencode 'object_key=minimum/anchor.bin' -o "$OUT/download.bin"
 [[ "$(sha256sum "$OUT/download.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
 
+curl_json -X POST "$A_BASE/noa/v1/posix/rename" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"source_path":"minimum/anchor.bin","destination_path":"minimum/anchor-moved.bin"}' \
+  >"$OUT/rename-exact.json"
+jq -e '.affected == 1 and (has("operation_id") | not)' "$OUT/rename-exact.json" >/dev/null
+curl_auth -G "$B_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=minimum/anchor-moved.bin' -o "$OUT/download-exact-renamed.bin"
+[[ "$(sha256sum "$OUT/download-exact-renamed.bin" | awk '{print $1}')" == "$SOURCE_SHA" ]]
+curl_json -X POST "$B_BASE/noa/v1/posix/rename" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"source_path":"minimum/anchor-moved.bin","destination_path":"minimum/anchor.bin"}' \
+  >"$OUT/rename-exact-back.json"
+jq -e '.affected == 1 and (has("operation_id") | not)' "$OUT/rename-exact-back.json" >/dev/null
+
 for key in minimum/page/a minimum/page/a-previous minimum/page/a/child minimum/page/a0; do
   curl_auth -X POST "$A_BASE/noa/v1/upload/one-shot/$key" \
     --data-binary @"$OUT/source.bin" >"$OUT/upload-$(echo "$key" | tr '/' '_').json"
@@ -495,14 +544,33 @@ for expected in minimum/page/a minimum/page/a-previous minimum/page/a/child mini
   CURSOR="$(jq -r '.continuation_token // empty' "$OUT/page.json")"
 done
 
+curl_json -X POST "$A_BASE/noa/v1/posix/rename" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"source_path":"minimum/page","destination_path":"minimum/page-renamed"}' \
+  >"$OUT/rename-prefix.json"
+await_namespace_operation "$A_BASE" "$OUT/rename-prefix.json"
+jq -e '(.affected // .affected_paths) == 4' "$OUT/rename-prefix.json" >/dev/null
+curl_auth -G "$B_BASE/noa/v1/objects" --data-urlencode 'prefix=minimum/page-renamed/' \
+  --data-urlencode 'limit=10' >"$OUT/rename-prefix-list.json"
+jq -e '(.entries | length) == 4' "$OUT/rename-prefix-list.json" >/dev/null
+
+curl_json -X POST "$B_BASE/noa/v1/posix/rename" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"source_path":"minimum/page-renamed","destination_path":"minimum/page"}' \
+  >"$OUT/rename-prefix-back.json"
+await_namespace_operation "$B_BASE" "$OUT/rename-prefix-back.json"
+jq -e '(.affected // .affected_paths) == 4' "$OUT/rename-prefix-back.json" >/dev/null
+
 curl_json -X POST "$A_BASE/noa/v1/posix/trash" \
   -H "Authorization: Bearer $TOKEN" -d '{"path":"minimum/page"}' >"$OUT/trash.json"
+await_namespace_operation "$A_BASE" "$OUT/trash.json"
 TRASH_ID="$(jq -er '.trash_entry_id' "$OUT/trash.json")"
-jq -e '.affected == 4' "$OUT/trash.json" >/dev/null
+jq -e '(.affected // .affected_paths) == 4' "$OUT/trash.json" >/dev/null
 curl_json -X POST "$B_BASE/noa/v1/posix/recover" \
   -H "Authorization: Bearer $TOKEN" \
   -d "{\"path\":\"minimum/page\",\"trash_entry_id\":\"$TRASH_ID\"}" >"$OUT/recover.json"
-jq -e '.affected == 4' "$OUT/recover.json" >/dev/null
+await_namespace_operation "$B_BASE" "$OUT/recover.json"
+jq -e '(.affected // .affected_paths) == 4' "$OUT/recover.json" >/dev/null
 
 mapfile -t NCNX_FILES < <(
   find "${ACTIVE_STORES[@]}" -path '*/.namespace/minimum/anchor.bin.ncnx' -type f | sort

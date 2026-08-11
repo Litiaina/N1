@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{redistribution::RedistributionJobStatus, repair_manager::RepairJobStatus};
 use crate::namespace::models::{LifecycleState, NamespaceEntryKind, NamespaceMutationSummary};
+use crate::posix::models::NamespaceOperationStatus;
 
 #[derive(Deserialize)]
 pub struct WsAuthParams {
@@ -33,6 +34,9 @@ pub enum ClientMessage {
 pub enum StorageEventPayload {
     #[serde(rename = "NAMESPACE_CHANGED")]
     NamespaceChanged(NamespaceChangeEvent),
+
+    #[serde(rename = "NAMESPACE_OPERATION_UPDATED")]
+    NamespaceOperationUpdated(NamespaceOperationStatus),
 
     #[serde(rename = "FRAGMENT_DELETED")]
     FragmentDeleted { fragment: String },

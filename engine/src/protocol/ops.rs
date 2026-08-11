@@ -389,7 +389,7 @@ async fn execute_native_op_inner(
         "namespace.rename" | "posix.rename" | "posix.move" => {
             let claims = claims_required(claims)?;
             native_body(
-                posix_service::rename_path(
+                posix_service::rename_path_or_start(
                     state,
                     claims,
                     required_string(&payload, "source_path")?,
@@ -401,15 +401,57 @@ async fn execute_native_op_inner(
         "namespace.trash" | "posix.trash" => {
             let claims = claims_required(claims)?;
             native_body(
-                posix_service::trash_path(state, claims, required_string(&payload, "path")?)
-                    .await?,
+                posix_service::trash_path_or_start(
+                    state,
+                    claims,
+                    required_string(&payload, "path")?,
+                )
+                .await?,
             )
         }
         "namespace.recover" | "posix.recover" => {
             let claims = claims_required(claims)?;
             native_body(
-                posix_service::recover_path(state, claims, required_string(&payload, "path")?)
-                    .await?,
+                posix_service::recover_path_or_start(
+                    state,
+                    claims,
+                    required_string(&payload, "path")?,
+                )
+                .await?,
+            )
+        }
+        "namespace.operation.status" => {
+            let claims = claims_required(claims)?;
+            require_read(&claims)?;
+            native_body(
+                crate::posix::operations::namespace_operation_status(
+                    &claims.fragment,
+                    &required_string(&payload, "operation_id")?,
+                )
+                .await?,
+            )
+        }
+        "namespace.operation.cancel" => {
+            let claims = claims_required(claims)?;
+            let operation_id = required_string(&payload, "operation_id")?;
+            let operation = crate::posix::operations::namespace_operation_status(
+                &claims.fragment,
+                &operation_id,
+            )
+            .await?;
+            if operation.operation == "rename" {
+                if !claims.modify {
+                    return Err(AppError::Forbidden("Modify permission required".into()));
+                }
+            } else {
+                require_write(&claims)?;
+            }
+            native_body(
+                crate::posix::operations::cancel_namespace_operation(
+                    &claims.fragment,
+                    &operation_id,
+                )
+                .await?,
             )
         }
         "object.list" => {
@@ -545,12 +587,12 @@ async fn execute_native_op_inner(
         "object.delete" => {
             let claims = claims_required(claims)?;
             let path = required_string(&payload, "object_key")?;
-            native_body(posix_service::trash_path(state, claims, path).await?)
+            native_body(posix_service::trash_path_or_start(state, claims, path).await?)
         }
         "object.recover" => {
             let claims = claims_required(claims)?;
             let path = required_string(&payload, "object_key")?;
-            native_body(posix_service::recover_path(state, claims, path).await?)
+            native_body(posix_service::recover_path_or_start(state, claims, path).await?)
         }
         "object.rename" => {
             let claims = claims_required(claims)?;
@@ -561,7 +603,9 @@ async fn execute_native_op_inner(
             let destination = string_field(&payload, "destination_key")
                 .or_else(|| string_field(&payload, "destination_path"))
                 .ok_or_else(|| AppError::BadRequest("destination_key is required".into()))?;
-            native_body(posix_service::rename_path(state, claims, source, destination).await?)
+            native_body(
+                posix_service::rename_path_or_start(state, claims, source, destination).await?,
+            )
         }
         "object.meta" | "object.get" => {
             let claims = claims_required(claims)?;

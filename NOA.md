@@ -127,6 +127,8 @@ POST /noa/v1/posix/rename
 POST /noa/v1/posix/move
 POST /noa/v1/posix/trash
 POST /noa/v1/posix/recover
+GET  /noa/v1/namespace/operations/{operation_id}
+DELETE /noa/v1/namespace/operations/{operation_id}
 ```
 
 N2 implements these operations over independent flat NCNX key records.
@@ -134,7 +136,11 @@ Directories are derived common prefixes, so N2 rejects `mkdir` rather than
 pretending an empty directory was persisted. Exact-key rename/move is
 destination-first copy/delete. Folder
 operations enumerate the prefix and apply that same restart-safe protocol per
-key with bounded concurrency; they never rewrite NCDX or object data.
+key with bounded concurrency; they never rewrite NCDX or object data. Exact-key
+mutations return synchronously. Prefix mutations return `202 Accepted` with an
+operation ULID and coordinator node, then expose authoritative planning and
+per-NCNX execution progress through the operation endpoint. Cancellation is
+best-effort and never rolls back keys already committed by copy/delete.
 
 ### Health And Maintenance
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PosixNodeKind {
     File,
@@ -108,4 +108,85 @@ pub struct PosixMutationResponse {
     pub trash_entry_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceOperationState {
+    Planning,
+    Running,
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+impl NamespaceOperationState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Partial | Self::Failed | Self::Cancelled
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamespaceOperationStatus {
+    pub operation_id: String,
+    pub mutation_id: String,
+    pub coordinator_node_id: String,
+    pub fragment: String,
+    pub operation: String,
+    pub kind: PosixNodeKind,
+    pub state: NamespaceOperationState,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_path: Option<String>,
+    pub discovered: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    pub completed: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub affected_paths: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
+    pub cancel_requested: bool,
+    pub created_at_unix_nanos: i64,
+    pub updated_at_unix_nanos: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_nanos: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamespaceOperationAccepted {
+    pub accepted: bool,
+    pub operation_id: String,
+    pub mutation_id: String,
+    pub coordinator_node_id: String,
+    pub operation: String,
+    pub kind: PosixNodeKind,
+    pub state: NamespaceOperationState,
+    pub phase: String,
+    pub status_endpoint: String,
+    pub cancel_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum PosixMutationResult {
+    Completed(PosixMutationResponse),
+    Accepted(NamespaceOperationAccepted),
 }

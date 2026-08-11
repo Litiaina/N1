@@ -1,20 +1,22 @@
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
-use axum::routing::{get, post};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created,
-    commit_namespace_summary,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::posix::models::{
-    PosixEntry, PosixListQuery, PosixListResponse, PosixMutationResponse, PosixNodeKind,
-    PosixPathRequest, PosixRenameRequest, PosixStatQuery, PosixStatResponse,
+    PosixEntry, PosixListQuery, PosixListResponse, PosixMutationResponse, PosixMutationResult,
+    PosixNodeKind, PosixPathRequest, PosixRenameRequest, PosixStatQuery, PosixStatResponse,
 };
+use crate::posix::operations::{cancel_namespace_operation, namespace_operation_status};
+use crate::posix::service as posix_service;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
@@ -167,130 +169,87 @@ async fn posix_rename(
     State(state): State<Arc<AppState>>,
     claims: Claims,
     Json(req): Json<PosixRenameRequest>,
-) -> Result<Json<PosixMutationResponse>, AppError> {
-    if !claims.modify {
-        return Err(AppError::Forbidden("Modify permission required".into()));
-    }
-    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::Rename,
-        fragment: claims.fragment.clone(),
-        source_path: Some(req.source_path.clone()),
-        destination_path: Some(req.destination_path.clone()),
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &claims.fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &claims.fragment,
-            summary.clone(),
-        )),
-    );
-    Ok(Json(PosixMutationResponse {
-        operation: summary.operation,
-        kind: match summary.kind {
-            NamespaceEntryKind::File => PosixNodeKind::File,
-            NamespaceEntryKind::Directory => PosixNodeKind::Directory,
-        },
-        affected: summary.affected_paths,
-        path: None,
-        source_path: summary.source_path,
-        destination_path: summary.destination_path,
-        created: None,
-        trash_entry_id: summary.trash_entry_id,
-        deleted_at_unix: summary.deleted_at_unix,
-    }))
+) -> Result<(StatusCode, Json<PosixMutationResult>), AppError> {
+    let result =
+        posix_service::rename_path_or_start(state, claims, req.source_path, req.destination_path)
+            .await?;
+    let status = if matches!(&result, PosixMutationResult::Accepted(_)) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(result)))
 }
 
 async fn posix_trash(
     State(state): State<Arc<AppState>>,
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
-) -> Result<Json<PosixMutationResponse>, AppError> {
-    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::Trash,
-        fragment: claims.fragment.clone(),
-        source_path: Some(req.path.clone()),
-        destination_path: None,
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &claims.fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &claims.fragment,
-            summary.clone(),
-        )),
-    );
-    Ok(Json(PosixMutationResponse {
-        operation: summary.operation,
-        kind: match summary.kind {
-            NamespaceEntryKind::File => PosixNodeKind::File,
-            NamespaceEntryKind::Directory => PosixNodeKind::Directory,
-        },
-        affected: summary.affected_paths,
-        path: summary.source_path,
-        source_path: None,
-        destination_path: None,
-        created: None,
-        trash_entry_id: summary.trash_entry_id,
-        deleted_at_unix: summary.deleted_at_unix,
-    }))
+) -> Result<(StatusCode, Json<PosixMutationResult>), AppError> {
+    let result = posix_service::trash_path_or_start(state, claims, req.path).await?;
+    let status = if matches!(&result, PosixMutationResult::Accepted(_)) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(result)))
 }
 
 async fn posix_recover(
     State(state): State<Arc<AppState>>,
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
-) -> Result<Json<PosixMutationResponse>, AppError> {
+) -> Result<(StatusCode, Json<PosixMutationResult>), AppError> {
     let requested = req
         .trash_entry_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(req.path);
-    let summary = commit_namespace_summary(PeerNamespaceApplyRequest {
-        mutation_id: None,
-        kind: NamespaceMutationKind::Recover,
-        fragment: claims.fragment.clone(),
-        source_path: Some(requested.clone()),
-        destination_path: None,
-        object_id: None,
-        version_id: None,
-        metadata: None,
-    })
-    .await?;
-    state.emit(
-        &claims.fragment,
-        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
-            &claims.fragment,
-            summary.clone(),
-        )),
-    );
-    Ok(Json(PosixMutationResponse {
-        operation: summary.operation,
-        kind: match summary.kind {
-            NamespaceEntryKind::File => PosixNodeKind::File,
-            NamespaceEntryKind::Directory => PosixNodeKind::Directory,
-        },
-        affected: summary.affected_paths,
-        path: summary.source_path,
-        source_path: None,
-        destination_path: None,
-        created: None,
-        trash_entry_id: summary.trash_entry_id,
-        deleted_at_unix: summary.deleted_at_unix,
-    }))
+    let result = posix_service::recover_path_or_start(state, claims, requested).await?;
+    let status = if matches!(&result, PosixMutationResult::Accepted(_)) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(result)))
+}
+
+async fn namespace_operation_get(
+    claims: Claims,
+    Path(operation_id): Path<String>,
+) -> Result<Json<crate::posix::models::NamespaceOperationStatus>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    Ok(Json(
+        namespace_operation_status(&claims.fragment, &operation_id).await?,
+    ))
+}
+
+async fn namespace_operation_cancel(
+    claims: Claims,
+    Path(operation_id): Path<String>,
+) -> Result<Json<crate::posix::models::NamespaceOperationStatus>, AppError> {
+    let status = namespace_operation_status(&claims.fragment, &operation_id).await?;
+    if status.operation == "rename" {
+        if !claims.modify {
+            return Err(AppError::Forbidden("Modify permission required".into()));
+        }
+    } else if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    Ok(Json(
+        cancel_namespace_operation(&claims.fragment, &operation_id).await?,
+    ))
 }
 
 pub fn build_posix_read_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/noa/v1/posix/list", get(posix_list))
         .route("/noa/v1/posix/stat", get(posix_stat))
+        .route(
+            "/noa/v1/namespace/operations/{operation_id}",
+            get(namespace_operation_get),
+        )
 }
 
 pub fn build_posix_write_routes() -> Router<Arc<AppState>> {
@@ -300,4 +259,8 @@ pub fn build_posix_write_routes() -> Router<Arc<AppState>> {
         .route("/noa/v1/posix/move", post(posix_rename))
         .route("/noa/v1/posix/trash", post(posix_trash))
         .route("/noa/v1/posix/recover", post(posix_recover))
+        .route(
+            "/noa/v1/namespace/operations/{operation_id}",
+            delete(namespace_operation_cancel),
+        )
 }

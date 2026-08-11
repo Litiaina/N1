@@ -2,14 +2,16 @@ use std::sync::Arc;
 
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_created,
-    commit_namespace_summary,
+    commit_namespace_summary, namespace_mutation_target_kind,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::NamespaceEntryKind;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::posix::models::{
-    PosixEntry, PosixListResponse, PosixMutationResponse, PosixNodeKind, PosixStatResponse,
+    PosixEntry, PosixListResponse, PosixMutationResponse, PosixMutationResult, PosixNodeKind,
+    PosixStatResponse,
 };
+use crate::posix::operations::start_namespace_operation;
 use crate::posix::paths::normalize_posix_path;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -267,6 +269,50 @@ pub async fn rename_path(
     })
 }
 
+pub async fn rename_path_or_start(
+    state: Arc<AppState>,
+    claims: Claims,
+    source_path: String,
+    destination_path: String,
+) -> Result<PosixMutationResult, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden("Modify permission required".into()));
+    }
+    let source_path = normalize_posix_path(Some(source_path.as_str()))?;
+    let destination_path = normalize_posix_path(Some(destination_path.as_str()))?;
+    if source_path.is_empty() || destination_path.is_empty() {
+        return Err(AppError::BadRequest(
+            "root path cannot be renamed".to_string(),
+        ));
+    }
+    if source_path == destination_path {
+        return Ok(PosixMutationResult::Completed(
+            rename_path(state, claims, source_path, destination_path).await?,
+        ));
+    }
+    let kind = namespace_mutation_target_kind(
+        &claims.fragment,
+        NamespaceMutationKind::Rename,
+        &source_path,
+    )
+    .await?;
+    if kind == NamespaceEntryKind::Directory {
+        return Ok(PosixMutationResult::Accepted(
+            start_namespace_operation(
+                state,
+                claims.fragment,
+                NamespaceMutationKind::Rename,
+                source_path,
+                Some(destination_path),
+            )
+            .await?,
+        ));
+    }
+    Ok(PosixMutationResult::Completed(
+        rename_path(state, claims, source_path, destination_path).await?,
+    ))
+}
+
 pub async fn trash_path(
     state: Arc<AppState>,
     claims: Claims,
@@ -310,6 +356,40 @@ pub async fn trash_path(
     })
 }
 
+pub async fn trash_path_or_start(
+    state: Arc<AppState>,
+    claims: Claims,
+    path: String,
+) -> Result<PosixMutationResult, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    let path = normalize_posix_path(Some(path.as_str()))?;
+    if path.is_empty() {
+        return Err(AppError::BadRequest(
+            "root path cannot be trashed".to_string(),
+        ));
+    }
+    let kind =
+        namespace_mutation_target_kind(&claims.fragment, NamespaceMutationKind::Trash, &path)
+            .await?;
+    if kind == NamespaceEntryKind::Directory {
+        return Ok(PosixMutationResult::Accepted(
+            start_namespace_operation(
+                state,
+                claims.fragment,
+                NamespaceMutationKind::Trash,
+                path,
+                None,
+            )
+            .await?,
+        ));
+    }
+    Ok(PosixMutationResult::Completed(
+        trash_path(state, claims, path).await?,
+    ))
+}
+
 pub async fn recover_path(
     state: Arc<AppState>,
     claims: Claims,
@@ -351,4 +431,41 @@ pub async fn recover_path(
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
     })
+}
+
+pub async fn recover_path_or_start(
+    state: Arc<AppState>,
+    claims: Claims,
+    requested: String,
+) -> Result<PosixMutationResult, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    let requested = normalize_posix_path(Some(requested.as_str()))?;
+    if requested.is_empty() {
+        return Err(AppError::BadRequest(
+            "root path cannot be recovered".to_string(),
+        ));
+    }
+    let kind = namespace_mutation_target_kind(
+        &claims.fragment,
+        NamespaceMutationKind::Recover,
+        &requested,
+    )
+    .await?;
+    if kind == NamespaceEntryKind::Directory {
+        return Ok(PosixMutationResult::Accepted(
+            start_namespace_operation(
+                state,
+                claims.fragment,
+                NamespaceMutationKind::Recover,
+                requested,
+                None,
+            )
+            .await?,
+        ));
+    }
+    Ok(PosixMutationResult::Completed(
+        recover_path(state, claims, requested).await?,
+    ))
 }

@@ -501,6 +501,24 @@ Code and release tests exercise these flat-namespace laws:
 - Removed dynamic EC, node-role, hard-delete, and empty-trash contracts are
   rejected.
 
+### Coordinator-Owned Prefix Operation Proof — 2026-08-11
+
+Local loopback evidence is retained at:
+
+```text
+/home/litiaina/DEV_TEST/n2-namespace-operations-final-20260811-150320/report
+```
+
+The proof ran two active processes as one exact EC `1 + 1` server pool plus
+one reserve process. Exact-key rename remained synchronous (`200`, one NCNX
+path, no operation ID). Both forward and reverse folder rename, folder trash,
+and folder recovery returned `202 Accepted`, exposed coordinator-owned
+operation ULIDs, and completed `4/4` exact NCNX paths with zero failures. The
+same finite proof also passed cross-node readback, pagination, NCNX repair,
+shard repair, restart persistence, reserve promotion and historical-layout
+healing. The final result was `PASS` with zero suspicious selected engine log
+lines.
+
 ## Lifecycle and Healing Race Regression
 
 The first requested 12-hour soak did not pass. It failed after 1,287 seconds

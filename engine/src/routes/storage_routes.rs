@@ -1735,6 +1735,7 @@ fn build_cors_layer() -> CorsLayer {
             HeaderName::from_static("x-litiaina-checksum"),
             HeaderName::from_static("x-noa-checksum-sha256"),
             HeaderName::from_static("x-n2-checksum-sha256"),
+            HeaderName::from_static("x-n2-coordinator-node"),
             HeaderName::from_static("buffer"),
             HeaderName::from_static("range"),
             HeaderName::from_static("upgrade"),
@@ -1781,6 +1782,12 @@ pub fn build_storage_routes_unbound_with_options(
     register_global_ws_manager(ws_manager.clone());
 
     let app_state = Arc::new(AppState { ws_manager });
+
+    let namespace_operation_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        crate::posix::operations::recover_pending_namespace_operations(namespace_operation_state)
+            .await;
+    });
 
     let lifecycle_state = Arc::clone(&app_state);
     tokio::spawn(async move {

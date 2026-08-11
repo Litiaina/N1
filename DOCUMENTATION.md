@@ -1152,7 +1152,8 @@ durable.
 When `source_path` is a prefix, N2 enumerates matching exact keys and applies
 the same protocol with bounded concurrency. The operation is restart-safe
 per key and intentionally not atomic across an unbounded prefix. NCDX and
-object payloads are not opened or rewritten.
+object payloads are not opened or rewritten. Exact-key mutation returns `200`
+synchronously; prefix mutation returns `202` and the operation contract below.
 
 ### Trash
 
@@ -1197,6 +1198,73 @@ Recover publishes live NCNX first, then removes the expected trash NCNX.
 Folder recovery restores the selected mutation group. If any selected logical
 key already exists live, recovery returns `409 Conflict` and preserves the
 trash record.
+
+### Prefix Mutation Operations
+
+Folder rename/move, folder trash, and folder recovery are coordinator-owned
+background operations. The initial response is `202 Accepted`:
+
+```json
+{
+  "accepted": true,
+  "operation_id": "01KZ...",
+  "mutation_id": "01KZ...",
+  "coordinator_node_id": "node-002",
+  "operation": "rename",
+  "kind": "directory",
+  "state": "planning",
+  "phase": "planning",
+  "status_endpoint": "/noa/v1/namespace/operations/01KZ...",
+  "cancel_endpoint": "/noa/v1/namespace/operations/01KZ..."
+}
+```
+
+Read authoritative progress:
+
+```http
+GET /noa/v1/namespace/operations/{operation_id}?coordinator_node_id=node-002
+Authorization: Bearer <token>
+X-N2-Coordinator-Node: node-002
+```
+
+```json
+{
+  "operation_id": "01KZ...",
+  "coordinator_node_id": "node-002",
+  "operation": "rename",
+  "state": "running",
+  "phase": "executing",
+  "discovered": 240,
+  "total": 240,
+  "completed": 173,
+  "succeeded": 173,
+  "failed": 0,
+  "affected_paths": 0,
+  "current_path": "videos/0173.mp4"
+}
+```
+
+During `planning`, `total` is absent because N2 has not completed its
+prefix-pruned namespace walk. During `executing`, `total` is fixed and
+`completed`, `succeeded`, and `failed` count exact NCNX paths. Terminal states
+are `completed`, `partial`, `failed`, and `cancelled`.
+
+Cancel future work with:
+
+```http
+DELETE /noa/v1/namespace/operations/{operation_id}?coordinator_node_id=node-002
+Authorization: Bearer <token>
+X-N2-Coordinator-Node: node-002
+```
+
+Cancellation is best-effort. Already committed exact-key copy/delete steps
+remain committed; N2 does not attempt an unsafe operation-wide rollback. The
+coordinator persists one atomically replaced operation record—not per-object
+receipts or a database. It writes the initial identity and terminal result;
+live counters remain memory/WebSocket state so progress does not add periodic
+filesystem writes. Nonterminal records resume after restart using the same
+mutation ULID and timestamp. The Gateway is route-only and uses the returned
+coordinator identity for status and cancellation.
 
 ### Trash Lifecycle
 

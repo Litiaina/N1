@@ -1259,7 +1259,14 @@ async fn proxy_fallback(
 ) -> Response<Body> {
     let path = request.uri().path().to_string();
     let retry_template = replay_safe_proxy_template(&request);
-    let mut node = match node_for_proxy_path(&state, &path).await {
+    let query = proxy_query_parameters(request.uri().query());
+    let mut node = match if path.starts_with("/noa/v1/namespace/operations/")
+        && coordinator_node_id(request.headers(), &query).is_some()
+    {
+        coordinator_node(&state, request.headers(), &query).await
+    } else {
+        node_for_proxy_path(&state, &path).await
+    } {
         Ok(node) => node,
         Err(response) => return response,
     };
@@ -1280,6 +1287,19 @@ async fn proxy_fallback(
             }
         }
     }
+}
+
+fn proxy_query_parameters(query: Option<&str>) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for pair in query.unwrap_or_default().split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = percent_decode_str(key).decode_utf8_lossy().to_string();
+        let value = percent_decode_str(value).decode_utf8_lossy().to_string();
+        values.insert(key, value);
+    }
+    values
 }
 
 #[derive(Clone)]
@@ -1601,13 +1621,24 @@ mod tests {
                 })),
             )
         };
+        let namespace_operation = move |Path(operation_id): Path<String>| async move {
+            Json(json!({
+                "operation_id": operation_id,
+                "coordinator_node_id": node_id,
+                "state": "running"
+            }))
+        };
         let http_app = Router::new()
             .route("/noa/v1/auth/fragment", post(auth_fragment))
             .route("/noa/v1/auth/refresh", post(auth_refresh))
             .route("/noa/v1/auth/logout", post(auth_logout))
             .route("/noa/v1/upload/multipart", get(multipart_listing))
             .route("/noa/v1/upload/multipart/durable", get(multipart_listing))
-            .route("/noa/v1/upload/batch", post(batch_upload));
+            .route("/noa/v1/upload/batch", post(batch_upload))
+            .route(
+                "/noa/v1/namespace/operations/{operation_id}",
+                get(namespace_operation),
+            );
         tokio::spawn(async move {
             axum::serve(http_listener, http_app).await.unwrap();
         });
@@ -2151,6 +2182,45 @@ mod tests {
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
             "not_found: object not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_operation_status_uses_client_supplied_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/noa/v1/namespace/operations/01K00000000000000000000000?coordinator_node_id=node-b")
+                    .header(header::AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["operation_id"], "01K00000000000000000000000");
+        assert_eq!(body["coordinator_node_id"], "node-b");
+    }
+
+    #[test]
+    fn proxy_query_parameters_decodes_coordinator_identity() {
+        let query = proxy_query_parameters(Some(
+            "coordinator_node_id=node%2Db&ignored=value%2Fwith%2Fslashes",
+        ));
+        assert_eq!(
+            query.get("coordinator_node_id").map(String::as_str),
+            Some("node-b")
+        );
+        assert_eq!(
+            query.get("ignored").map(String::as_str),
+            Some("value/with/slashes")
         );
     }
 
