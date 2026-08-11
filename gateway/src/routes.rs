@@ -33,6 +33,8 @@ pub fn router(state: GatewayState) -> Router {
         .route("/gateway/nodes", get(gateway_nodes))
         .route("/noa/v1/ws", get(websocket_proxy))
         .route("/noa/v1/auth/fragment", post(auth_fragment))
+        .route("/noa/v1/auth/refresh", post(auth_refresh))
+        .route("/noa/v1/auth/logout", post(auth_logout))
         .route("/noa/v1/fragments", post(create_fragment))
         .route(
             "/noa/v1/cluster/rebalance/start",
@@ -422,8 +424,9 @@ async fn auth_fragment(
 
     for node in nodes {
         match post_json_to_node(&state, &node, "/noa/v1/auth/fragment", &payload).await {
-            Ok((status, body)) if status.is_success() => {
+            Ok((status, mut body)) if status.is_success() => {
                 state.nodes.mark_route(&node.id).await;
+                body["coordinator_node_id"] = Value::String(node.id.clone());
                 return json_response_value(status, body);
             }
             Ok((status, body)) if status.is_client_error() => {
@@ -445,6 +448,103 @@ async fn auth_fragment(
 
     first_client_error.or(last_error).unwrap_or_else(|| {
         text_response(StatusCode::UNAUTHORIZED, "fragment authentication failed")
+    })
+}
+
+async fn auth_refresh(
+    State(state): State<Arc<GatewayState>>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    route_auth_session_request(&state, "/noa/v1/auth/refresh", payload, true).await
+}
+
+async fn auth_logout(
+    State(state): State<Arc<GatewayState>>,
+    Json(payload): Json<Value>,
+) -> Response<Body> {
+    route_auth_session_request(&state, "/noa/v1/auth/logout", payload, false).await
+}
+
+/// Refresh sessions are intentionally owned by the node that minted them. The
+/// gateway returns that node ID with the authentication response and routes all
+/// later refresh/logout operations back to the same owner. For sessions issued
+/// before coordinator ownership was exposed, probe the configured nodes once so
+/// an upgrade does not force every active Console session to log in again.
+async fn route_auth_session_request(
+    state: &GatewayState,
+    path: &str,
+    mut payload: Value,
+    return_coordinator: bool,
+) -> Response<Body> {
+    let requested_coordinator = payload
+        .get("coordinator_node_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("coordinator_node_id");
+    }
+
+    let nodes = if let Some(coordinator_id) = requested_coordinator.as_deref() {
+        let Some(node) = state.nodes.get(coordinator_id).await else {
+            return text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication coordinator node is not configured",
+            );
+        };
+        if !state.nodes.is_available(coordinator_id).await
+            && !state.nodes.probe_node(coordinator_id).await
+        {
+            return text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication coordinator node is unavailable",
+            );
+        }
+        vec![node]
+    } else {
+        state.nodes.available_configs().await
+    };
+
+    if nodes.is_empty() {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway has no available N2 nodes",
+        );
+    }
+
+    let mut first_client_error: Option<Response<Body>> = None;
+    let mut last_error: Option<Response<Body>> = None;
+    for node in nodes {
+        match post_json_to_node(state, &node, path, &payload).await {
+            Ok((status, mut body)) if status.is_success() => {
+                state.nodes.mark_route(&node.id).await;
+                if return_coordinator {
+                    body["coordinator_node_id"] = Value::String(node.id.clone());
+                }
+                return json_response_value(status, body);
+            }
+            Ok((status, body)) if status.is_client_error() => {
+                first_client_error.get_or_insert_with(|| json_response_value(status, body));
+            }
+            Ok((status, body)) => {
+                last_error = Some(json_response_value(status, body));
+            }
+            Err(err) => {
+                state.nodes.probe_node(&node.id).await;
+                last_error = Some(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("gateway authentication upstream {} failed: {err}", node.id),
+                ));
+            }
+        }
+    }
+
+    first_client_error.or(last_error).unwrap_or_else(|| {
+        text_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication session was not found",
+        )
     })
 }
 
@@ -1433,6 +1533,42 @@ mod tests {
     async fn spawn_mock_native_node(node_id: &'static str) -> MockNativeNode {
         let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_url = format!("http://{}", http_listener.local_addr().unwrap());
+        let auth_fragment = move || async move {
+            Json(json!({
+                "access_token": format!("access-{node_id}"),
+                "refresh_token": format!("refresh-{node_id}"),
+                "expires_in": 900,
+                "refresh_expires_in": 604800
+            }))
+        };
+        let auth_refresh = move |Json(payload): Json<Value>| async move {
+            if payload["refresh_token"] == format!("refresh-{node_id}") {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "access_token": format!("rotated-access-{node_id}"),
+                        "refresh_token": format!("rotated-refresh-{node_id}"),
+                        "expires_in": 900,
+                        "refresh_expires_in": 603900
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "refresh session not found" })),
+                )
+            }
+        };
+        let auth_logout = move |Json(payload): Json<Value>| async move {
+            if payload["refresh_token"] == format!("refresh-{node_id}") {
+                (StatusCode::NO_CONTENT, Json(json!({})))
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "refresh session not found" })),
+                )
+            }
+        };
         let multipart_listing = move || async move {
             Json(json!({
                 "sessions": [{
@@ -1466,6 +1602,9 @@ mod tests {
             )
         };
         let http_app = Router::new()
+            .route("/noa/v1/auth/fragment", post(auth_fragment))
+            .route("/noa/v1/auth/refresh", post(auth_refresh))
+            .route("/noa/v1/auth/logout", post(auth_logout))
             .route("/noa/v1/upload/multipart", get(multipart_listing))
             .route("/noa/v1/upload/multipart/durable", get(multipart_listing))
             .route("/noa/v1/upload/batch", post(batch_upload));
@@ -1753,6 +1892,96 @@ mod tests {
         assert_eq!(body["coordinator_node_id"], "node-a");
         assert_eq!(body["gateway"]["route_only"], true);
         assert_eq!(body["gateway"]["resumability_owner"], "client");
+    }
+
+    #[tokio::test]
+    async fn fragment_auth_returns_the_refresh_session_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/noa/v1/auth/fragment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"fragment":"test","secret":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["refresh_token"], "refresh-node-a");
+        assert_eq!(body["coordinator_node_id"], "node-a");
+    }
+
+    #[tokio::test]
+    async fn refresh_and_logout_route_to_the_authentication_coordinator() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+        let app = router(state);
+
+        let refresh = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/noa/v1/auth/refresh")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"refresh_token":"refresh-node-b","coordinator_node_id":"node-b"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh.status(), StatusCode::OK);
+        let body = response_json(refresh).await;
+        assert_eq!(body["access_token"], "rotated-access-node-b");
+        assert_eq!(body["coordinator_node_id"], "node-b");
+
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/noa/v1/auth/logout")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"refresh_token":"refresh-node-b","coordinator_node_id":"node-b"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn legacy_refresh_without_coordinator_finds_its_owning_node_once() {
+        let node_a = spawn_mock_native_node("node-a").await;
+        let node_b = spawn_mock_native_node("node-b").await;
+        let state = two_node_gateway_state(&node_a, &node_b).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/noa/v1/auth/refresh")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"refresh_token":"refresh-node-b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["access_token"], "rotated-access-node-b");
+        assert_eq!(body["coordinator_node_id"], "node-b");
     }
 
     #[tokio::test]
