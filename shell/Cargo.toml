@@ -8,11 +8,18 @@ name = "litiaina-n2-shell"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 hex.workspace = true
+hostname.workspace = true
 n2_native_client = { path = "../native_client" }
+rand.workspace = true
+rayon.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+uuid.workspace = true

@@ -1,3 +1,7 @@
+mod install;
+mod provision;
+mod web;
+
 use clap::{Args, Parser, Subcommand};
 use n2_native_client::{N2NativeClient, NativeClientError, NativeClientResult, ensure_native_ok};
 use serde::{Deserialize, Serialize};
@@ -16,6 +20,48 @@ use tokio::time::{Duration, sleep};
 const DEFAULT_NATIVE_URL: &str = "n2://127.0.0.1:50002";
 const ONE_SHOT_LIMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_PART_SIZE: u64 = 64 * 1024 * 1024;
+
+#[derive(Args, Clone)]
+pub struct ServeArgs {
+    #[arg(long, default_value = "0.0.0.0:50902")]
+    pub bind: String,
+    #[arg(long, default_value = "/opt/litiaina/n2")]
+    pub install_dir: String,
+    #[arg(long, default_value = "/usr/local/bin/litiaina-n2")]
+    pub engine_binary: String,
+    #[arg(long, default_value = "/usr/local/bin/litiaina-n2-gateway")]
+    pub gateway_binary: String,
+    #[arg(long, default_value = "/var/lib/litiaina/n2")]
+    pub runtime_root: String,
+    #[arg(long, default_value = "/var/lib/litiaina/n2-gateway")]
+    pub gateway_runtime: String,
+    #[arg(long, default_value = "/etc/litiaina/n2/n2.env")]
+    pub env_file: String,
+    #[arg(long, default_value = "/var/lib/litiaina/n2-setup")]
+    pub setup_root: String,
+    #[arg(long, default_value = "/mnt")]
+    pub mount_root: String,
+    #[arg(long, default_value = "/etc/fstab")]
+    pub fstab: String,
+    #[arg(long, default_value = "litiaina-n2")]
+    pub service_name: String,
+    #[arg(long, default_value = "litiaina-n2-gateway")]
+    pub gateway_service_name: String,
+    #[arg(long, default_value = "/etc/systemd/system", hide = true)]
+    pub systemd_unit_dir: String,
+    #[arg(long, default_value = "litiaina")]
+    pub run_user: String,
+    #[arg(long, default_value = "litiaina")]
+    pub run_group: String,
+    #[arg(long)]
+    pub setup_token: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Laboratory only: permit multiple N2 nodes with the same machine fingerprint."
+    )]
+    pub allow_shared_failure_domain: bool,
+}
 
 #[derive(Parser)]
 #[command(name = "litiaina-n2-shell", version)]
@@ -65,6 +111,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Serve the guarded browser installation terminal.")]
+    Serve(Box<ServeArgs>),
     #[command(about = "Ping the native N2 endpoint.")]
     Ping,
     #[command(about = "Open a persistent operator shell.")]
@@ -405,14 +453,21 @@ struct ShellProfile {
 
 #[tokio::main]
 async fn main() {
-    if let Err(err) = run().await {
+    let mut cli = Cli::parse();
+    if let Some(Command::Serve(args)) = cli.command.take() {
+        if let Err(error) = web::run(*args).await {
+            eprintln!("n2 setup shell error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Err(err) = run(cli).await {
         eprintln!("n2 shell error: {err}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> NativeClientResult<()> {
-    let mut cli = Cli::parse();
+async fn run(mut cli: Cli) -> NativeClientResult<()> {
     if let Some(command) = take_profile_command(&mut cli) {
         return run_profile_command(command, &cli);
     }
@@ -423,6 +478,7 @@ async fn run() -> NativeClientResult<()> {
         .with_request_prefix("n2-shell");
 
     match command {
+        Command::Serve(_) => unreachable!("serve is handled before native connection"),
         Command::Ping => print_value(client.raw_json("ping", &json!({}), None).await?, cli.json),
         Command::Shell => {
             authenticate_from_cli(&mut client, &cli).await?;
@@ -480,6 +536,7 @@ async fn run_authenticated_command(
     command: Command,
 ) -> NativeClientResult<()> {
     match command {
+        Command::Serve(_) => unreachable!("serve is handled before native connection"),
         Command::Health => print_op(client, "maintenance.health", json!({}), cli.json).await,
         Command::Monitor(args) => {
             print_op(
@@ -490,7 +547,7 @@ async fn run_authenticated_command(
             )
             .await
         }
-        Command::Dashboard(args) => print_dashboard(client, args, &cli).await,
+        Command::Dashboard(args) => print_dashboard(client, args, cli).await,
         Command::Membership => print_op(client, "cluster.membership", json!({}), cli.json).await,
         Command::Layout => print_op(client, "cluster.layout", json!({}), cli.json).await,
         Command::Usage {
@@ -566,71 +623,6 @@ async fn run_authenticated_command(
         | Command::Auth(_)
         | Command::Session
         | Command::Raw { .. } => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_precheck_does_not_discard_normal_commands() {
-        let mut cli = Cli::try_parse_from([
-            "litiaina-n2-shell",
-            "--native-url",
-            "n2://127.0.0.1:50002",
-            "--fragment",
-            "frag",
-            "--secret",
-            "secret",
-            "upload",
-            "--object-key",
-            "bench/test.bin",
-            "--file",
-            "/tmp/test.bin",
-        ])
-        .expect("upload command parses");
-
-        assert!(take_profile_command(&mut cli).is_none());
-        assert!(matches!(cli.command, Some(Command::Upload(_))));
-    }
-
-    #[test]
-    fn profile_precheck_takes_profile_commands_only() {
-        let mut cli = Cli::try_parse_from(["litiaina-n2-shell", "profile", "path"])
-            .expect("profile command parses");
-
-        assert!(matches!(
-            take_profile_command(&mut cli),
-            Some(ProfileCommand::Path)
-        ));
-        assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn fragment_create_check_and_hash_are_public_commands() {
-        assert!(is_public_fragment_command(&FragmentCommand::Create {
-            name: "frag".to_string(),
-            key: "key".to_string(),
-            master_key: "master".to_string(),
-        }));
-        assert!(is_public_fragment_command(&FragmentCommand::Check {
-            fragment: "frag".to_string(),
-        }));
-        assert!(is_public_fragment_command(&FragmentCommand::Hash {
-            fragment: "frag".to_string(),
-        }));
-        assert!(!is_public_fragment_command(&FragmentCommand::List));
-    }
-
-    #[test]
-    fn flat_namespace_shell_has_no_manual_purge_or_empty_directory_commands() {
-        for command in ["mkdir", "purge", "empty-trash"] {
-            assert!(
-                Cli::try_parse_from(["litiaina-n2-shell", command]).is_err(),
-                "retired command '{command}' unexpectedly parsed"
-            );
-        }
     }
 }
 
@@ -1240,6 +1232,7 @@ async fn upload_file(
     print_response(finalized, json_output)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_part_with_new_client(
     native_url: String,
     fragment: String,
@@ -1864,5 +1857,70 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_precheck_does_not_discard_normal_commands() {
+        let mut cli = Cli::try_parse_from([
+            "litiaina-n2-shell",
+            "--native-url",
+            "n2://127.0.0.1:50002",
+            "--fragment",
+            "frag",
+            "--secret",
+            "secret",
+            "upload",
+            "--object-key",
+            "bench/test.bin",
+            "--file",
+            "/tmp/test.bin",
+        ])
+        .expect("upload command parses");
+
+        assert!(take_profile_command(&mut cli).is_none());
+        assert!(matches!(cli.command, Some(Command::Upload(_))));
+    }
+
+    #[test]
+    fn profile_precheck_takes_profile_commands_only() {
+        let mut cli = Cli::try_parse_from(["litiaina-n2-shell", "profile", "path"])
+            .expect("profile command parses");
+
+        assert!(matches!(
+            take_profile_command(&mut cli),
+            Some(ProfileCommand::Path)
+        ));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn fragment_create_check_and_hash_are_public_commands() {
+        assert!(is_public_fragment_command(&FragmentCommand::Create {
+            name: "frag".to_string(),
+            key: "key".to_string(),
+            master_key: "master".to_string(),
+        }));
+        assert!(is_public_fragment_command(&FragmentCommand::Check {
+            fragment: "frag".to_string(),
+        }));
+        assert!(is_public_fragment_command(&FragmentCommand::Hash {
+            fragment: "frag".to_string(),
+        }));
+        assert!(!is_public_fragment_command(&FragmentCommand::List));
+    }
+
+    #[test]
+    fn flat_namespace_shell_has_no_manual_purge_or_empty_directory_commands() {
+        for command in ["mkdir", "purge", "empty-trash"] {
+            assert!(
+                Cli::try_parse_from(["litiaina-n2-shell", command]).is_err(),
+                "retired command '{command}' unexpectedly parsed"
+            );
+        }
     }
 }

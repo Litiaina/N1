@@ -85,6 +85,9 @@ identities remain unchanged so installed components are unambiguous.
 - [NOA.md](NOA.md): canonical NOA v1 routes and N2 cluster extensions.
 - [INSTALLATION.md](INSTALLATION.md): production setup, static server-pool
   membership, systemd deployment, gateway deployment, and validation.
+- [N2_SHELL_SETUP.md](N2_SHELL_SETUP.md): distributed physical-node
+  commissioning, remote disk ownership, canonical prepare/commit, and
+  controlled topology evolution.
 - [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.4 storage, NCNX namespace,
   lifecycle, healing, expansion, and failure laws.
 - [MULTI_CLUSTER.md](MULTI_CLUSTER.md): proposed regional active-active and
@@ -322,6 +325,11 @@ See [DOCUMENTATION.md](DOCUMENTATION.md) for full route bodies, query fields,
 and examples.
 
 ## Native Shell
+
+For fresh browser-assisted disk and cluster commissioning, follow
+[N2_SHELL_SETUP.md](N2_SHELL_SETUP.md). The setup terminal is temporary and
+keeps all engine and gateway services disabled until explicit validation,
+commit, and start.
 
 ```bash
 target/release/litiaina-n2-shell --native-url n2://127.0.0.1:50002 ping

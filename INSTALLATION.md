@@ -10,6 +10,10 @@ for mounted devices.
 
 ## Install Shape
 
+For a guarded fresh installation through the embedded browser terminal, see
+[N2_SHELL_SETUP.md](N2_SHELL_SETUP.md). The browser flow produces the same
+format-v5 engine and gateway artifacts described in this document.
+
 ```text
 users / UI / operators
         |

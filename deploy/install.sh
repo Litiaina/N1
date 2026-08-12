@@ -196,7 +196,7 @@ ensure_service_user() {
 install_docs() {
     log "installing release documentation into $N2_HOME"
     run install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$N2_HOME"
-    for file in README.md DOCUMENTATION.md ARCHITECTURE.md GATEWAY.md INSTALLATION.md LICENSE; do
+    for file in README.md DOCUMENTATION.md ARCHITECTURE.md GATEWAY.md INSTALLATION.md N2_SHELL_SETUP.md LICENSE; do
         [[ -f "$REPO_ROOT/$file" ]] || continue
         run install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$REPO_ROOT/$file" "$N2_HOME/$file"
     done

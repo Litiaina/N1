@@ -1045,6 +1045,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -2002,14 +2003,21 @@ dependencies = [
 name = "n2_shell"
 version = "3.4.1"
 dependencies = [
+ "axum",
  "clap",
+ "futures-util",
  "hex",
+ "hostname",
  "n2_native_client",
+ "rand 0.8.5",
+ "rayon",
+ "reqwest",
  "rmp-serde",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2745,6 +2753,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

@@ -565,6 +565,18 @@ cargo test --workspace --lib --bins --tests
 cargo build --workspace --release
 ```
 
+The N2 Shell commissioning gate additionally proves protected-system-disk
+rejection, agent/serial-bound format confirmation, UUID-and-serial disk
+pinning, exact-width pool validation, active/reserve role exclusion,
+credential-independent canonical hashing, staged-content tamper rejection,
+node-local service fencing, idempotent commit, draft evolution/restore, and a
+real HTTP two-agent prepare/commit that leaves byte-identical membership on
+both agents while every engine and gateway remains stopped. Run it with:
+
+```bash
+N2_TEST_ROOT=/home/litiaina/DEV_TEST/n2-shell-tests cargo test -p n2_shell
+```
+
 Run the finite multi-node proof with isolated roots:
 
 ```bash
