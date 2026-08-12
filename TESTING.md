@@ -519,6 +519,32 @@ shard repair, restart persistence, reserve promotion and historical-layout
 healing. The final result was `PASS` with zero suspicious selected engine log
 lines.
 
+### Bounded Prefix-Rename Regression — 2026-08-12
+
+Local evidence copied from the isolated four-HDD host proof is retained at:
+
+```text
+/home/litiaina/DEV_TEST/n2-prefix-rename-optimization-20260812/remote-evidence
+```
+
+The optimized N2 3.4.1 release binary passed four complete 245-object
+forward/reverse rename cycles on a four-node EC `3 + 1` pool. Exact final
+replica counts were verified from disk. Additional gates passed:
+
+- destination publication remained durable-before-source-removal;
+- an unavailable NCNX holder caused a truthful failed operation, and retry
+  converged both replicas to byte-identical immutable bytes;
+- four simultaneous independent prefix jobs completed 256/256 entries under
+  global bounded admission;
+- an existing destination failed as a conflict, not service unavailable, and
+  caused zero source mutation;
+- the full workspace suite passed 347 tests with zero failures; eight declared
+  long/random SIMD cases remained ignored.
+
+Strict workspace Clippy remains blocked by pre-existing metadata omissions and
+existing lints outside this change. No unrelated manifest, legacy module, or
+SIMD implementation was modified as part of this optimization.
+
 ## Lifecycle and Healing Race Regression
 
 The first requested 12-hour soak did not pass. It failed after 1,287 seconds

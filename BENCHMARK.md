@@ -5,6 +5,45 @@ hardware, topology, and methodology boundaries. Correctness and failure
 qualification are kept in [TESTING.md](TESTING.md) so benchmark results are
 not mistaken for a second verification record.
 
+## N2 3.4.1 Bounded Prefix-Rename Optimization
+
+Evidence directory:
+`/home/litiaina/DEV_TEST/n2-prefix-rename-optimization-20260812`.
+
+The controlled comparison used four isolated N2 processes as one exact EC
+`3 + 1` pool, one test root on each of four physical XFS HDDs, 245 objects,
+and two deterministic NCNX replicas. Both binaries used the same host,
+topology, paths, object set, and benchmark procedure. The hospital N1 services
+and their data were not modified.
+
+| Binary | Four complete rename samples | Mean |
+| --- | --- | ---: |
+| Unchanged N2 3.4.1 baseline | `6.026`, `6.810`, `6.590`, `7.782` s | `6.802` s |
+| Optimized N2 3.4.1 | `2.071`, `1.989`, `2.570`, `2.004` s | `2.158` s |
+
+The optimized path was `3.15x` faster, a `68.27%` mean latency reduction.
+Every run finished with exactly 490 source NCNX replicas and zero stale
+destination replicas after the final reverse rename.
+
+The optimization preserves the copy/delete contract. It batches at most 128
+logical keys per request, publishes and syncs every immutable destination
+record before exact source removal, and admits at most four prefix batches and
+128 planning reads globally per process. For this single-directory proof,
+peer mutation envelopes fell from 980 per-replica calls to at most 16
+node-batch calls. The required 490 file-data syncs remain; parent-directory
+syncs are coalesced from 980 to at most 16. The remaining measured latency is
+therefore the deliberately retained physical durability work, not planning:
+the four operation traces spent only `0.03` to `0.08` seconds before entering
+the running phase.
+
+An injected holder outage after the operation entered `running` produced a
+truthful failed first attempt without source deletion. After the holder
+returned, retry converged all 245 keys to 490 byte-identical destination
+replicas; reverse rename restored all 490 source replicas. Four simultaneous,
+independent 64-object prefix renames also completed with 256 successes, 512
+destination replicas, and zero stale sources. A pre-existing destination
+returned a conflict rather than `503` and left all 490 source replicas intact.
+
 The current N2 3.3 measurement is listed first. Earlier N2 results remain
 below as historical hardware and engine evidence; they do not qualify the
 format-v5 logical-slot binding and autonomous Reserve Set contract.

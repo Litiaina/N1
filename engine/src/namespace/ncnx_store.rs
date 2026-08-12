@@ -2,8 +2,9 @@ use crate::core::checksum::{Sha256Digest, format_sha256, sha256_digest};
 use crate::core::fragment_identity::physical_fragment_root_on;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path, parent_path};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -209,6 +210,150 @@ impl NcnxStore {
         create_immutable(&self.live_path(fragment_id, logical_key)?, bytes)
     }
 
+    /// Publishes a bounded group of live NCNX records with one durability
+    /// barrier per affected directory. Every file body is still fdatasync'd
+    /// before its immutable link becomes visible. Existing byte-identical
+    /// records make a retry idempotent; any other generation is a hard
+    /// conflict so replicas can never silently diverge.
+    pub fn create_live_batch(
+        &self,
+        fragment_id: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<usize, AppError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut keys = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(entries.len());
+        let mut parents = BTreeSet::new();
+        for (logical_key, bytes) in entries {
+            if !keys.insert(logical_key.as_str()) {
+                return Err(AppError::Conflict(format!(
+                    "duplicate NCNX key '{logical_key}' in one publication batch"
+                )));
+            }
+            let desired = NcnxRecord::decode(bytes)?;
+            if desired.fragment_id != fragment_id {
+                return Err(AppError::Conflict(
+                    "NCNX fragment identity differs from publication target".into(),
+                ));
+            }
+            let path = self.live_path(fragment_id, logical_key)?;
+            if let Some((_, existing_bytes)) = read_record_if_present(&path)? {
+                if existing_bytes == *bytes {
+                    continue;
+                }
+                return Err(AppError::Conflict(format!(
+                    "NCNX key already exists with a different immutable pointer at {}",
+                    path.display()
+                )));
+            }
+            let parent = path.parent().ok_or_else(|| {
+                AppError::InternalServerError("NCNX publication path has no parent".into())
+            })?;
+            parents.insert(parent.to_path_buf());
+            prepared.push((path, bytes.clone()));
+        }
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+
+        for parent in &parents {
+            fs::create_dir_all(parent).map_err(|err| {
+                AppError::Io(err, format!("create NCNX directory {}", parent.display()))
+            })?;
+        }
+
+        let mut staged = Vec::with_capacity(prepared.len());
+        for (path, bytes) in prepared {
+            let parent = path.parent().expect("validated NCNX parent");
+            let temporary = parent.join(format!(".n2-publish-{}", Ulid::new()));
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => file,
+                Err(err) => {
+                    cleanup_staged_creates(&staged);
+                    return Err(AppError::Io(
+                        err,
+                        format!("create NCNX staging file {}", temporary.display()),
+                    ));
+                }
+            };
+            if let Err(err) = file.write_all(&bytes) {
+                let _ = fs::remove_file(&temporary);
+                cleanup_staged_creates(&staged);
+                return Err(AppError::Io(
+                    err,
+                    format!("write NCNX staging file {}", temporary.display()),
+                ));
+            }
+            staged.push(StagedCreate {
+                path,
+                temporary,
+                file,
+                bytes,
+            });
+        }
+
+        if let Some((path, err)) = staged.par_iter().find_map_any(|entry| {
+            entry
+                .file
+                .sync_data()
+                .err()
+                .map(|error| (entry.temporary.clone(), error))
+        }) {
+            cleanup_staged_creates(&staged);
+            return Err(AppError::Io(
+                err,
+                format!("sync NCNX staging file {}", path.display()),
+            ));
+        }
+
+        let mut changed_parents = BTreeSet::new();
+        let mut changed = 0usize;
+        for entry in &staged {
+            match fs::hard_link(&entry.temporary, &entry.path) {
+                Ok(()) => {
+                    changed = changed.saturating_add(1);
+                    if let Some(parent) = entry.path.parent() {
+                        changed_parents.insert(parent.to_path_buf());
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    let existing = read_record_if_present(&entry.path)?.ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "NCNX destination disappeared during batch publication at {}",
+                            entry.path.display()
+                        ))
+                    })?;
+                    if existing.1 != entry.bytes {
+                        cleanup_staged_creates(&staged);
+                        sync_directories(&changed_parents)?;
+                        return Err(AppError::Conflict(format!(
+                            "NCNX key already exists with a different immutable pointer at {}",
+                            entry.path.display()
+                        )));
+                    }
+                }
+                Err(err) => {
+                    cleanup_staged_creates(&staged);
+                    sync_directories(&changed_parents)?;
+                    return Err(AppError::Io(
+                        err,
+                        format!("publish immutable NCNX {}", entry.path.display()),
+                    ));
+                }
+            }
+        }
+        cleanup_staged_creates(&staged);
+        sync_directories(&changed_parents)?;
+        Ok(changed)
+    }
+
     pub fn create_trash(
         &self,
         fragment_id: &str,
@@ -239,6 +384,50 @@ impl NcnxStore {
         expected_bytes: &[u8],
     ) -> Result<bool, AppError> {
         remove_if_exact(&self.live_path(fragment_id, logical_key)?, expected_bytes)
+    }
+
+    /// Removes exact live pointers in parallel and coalesces parent-directory
+    /// durability. A changed pointer is never removed.
+    pub fn remove_live_batch_if_exact(
+        &self,
+        fragment_id: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<usize, AppError> {
+        let mut keys = BTreeSet::new();
+        let mut paths = Vec::with_capacity(entries.len());
+        for (logical_key, expected) in entries {
+            if !keys.insert(logical_key.as_str()) {
+                return Err(AppError::Conflict(format!(
+                    "duplicate NCNX key '{logical_key}' in one removal batch"
+                )));
+            }
+            paths.push((self.live_path(fragment_id, logical_key)?, expected));
+        }
+
+        let results = paths
+            .par_iter()
+            .map(|(path, expected)| remove_if_exact_deferred(path, expected))
+            .collect::<Vec<_>>();
+        let mut parents = BTreeSet::new();
+        let mut changed = 0usize;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok((true, Some(parent))) => {
+                    changed = changed.saturating_add(1);
+                    parents.insert(parent);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        sync_directories(&parents)?;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(changed),
+        }
     }
 
     pub fn remove_trash_if_exact(
@@ -399,6 +588,34 @@ fn read_record_if_present(path: &Path) -> Result<Option<(NcnxRecord, Vec<u8>)>, 
     Ok(Some((record, bytes)))
 }
 
+struct StagedCreate {
+    path: PathBuf,
+    temporary: PathBuf,
+    file: File,
+    bytes: Vec<u8>,
+}
+
+fn cleanup_staged_creates(staged: &[StagedCreate]) {
+    for entry in staged {
+        let _ = fs::remove_file(&entry.temporary);
+    }
+}
+
+fn sync_directories(directories: &BTreeSet<PathBuf>) -> Result<(), AppError> {
+    if let Some((path, err)) = directories.par_iter().find_map_any(|path| {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .err()
+            .map(|error| (path.clone(), error))
+    }) {
+        return Err(AppError::Io(
+            err,
+            format!("sync NCNX directory {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn create_immutable(path: &Path, bytes: &[u8]) -> Result<bool, AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
@@ -460,9 +677,20 @@ fn create_immutable(path: &Path, bytes: &[u8]) -> Result<bool, AppError> {
 }
 
 fn remove_if_exact(path: &Path, expected_bytes: &[u8]) -> Result<bool, AppError> {
+    let (removed, parent) = remove_if_exact_deferred(path, expected_bytes)?;
+    if let Some(parent) = parent {
+        sync_directories(&BTreeSet::from([parent]))?;
+    }
+    Ok(removed)
+}
+
+fn remove_if_exact_deferred(
+    path: &Path,
+    expected_bytes: &[u8],
+) -> Result<(bool, Option<PathBuf>), AppError> {
     let mut opened = match File::open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((false, None)),
         Err(err) => return Err(AppError::Io(err, format!("read NCNX {}", path.display()))),
     };
     let opened_metadata = opened
@@ -484,7 +712,7 @@ fn remove_if_exact(path: &Path, expected_bytes: &[u8]) -> Result<bool, AppError>
     let removed = parent.join(format!(".n2-remove-{}", Ulid::new()));
     match fs::rename(path, &removed) {
         Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((false, None)),
         Err(err) => {
             return Err(AppError::Io(
                 err,
@@ -530,8 +758,7 @@ fn remove_if_exact(path: &Path, expected_bytes: &[u8]) -> Result<bool, AppError>
     }
     fs::remove_file(&removed)
         .map_err(|err| AppError::Io(err, format!("remove isolated NCNX {}", removed.display())))?;
-    sync_parent(path)?;
-    Ok(true)
+    Ok((true, Some(parent.to_path_buf())))
 }
 
 fn replace_durable(path: &Path, bytes: &[u8]) -> Result<bool, AppError> {
@@ -991,6 +1218,93 @@ mod tests {
             store
                 .create_live("fragment-a", "videos/a.mp4", &second)
                 .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batched_live_create_requires_exact_idempotence_and_preflights_conflicts() {
+        let (root, store) = store();
+        let first = record("fragment-a", "object-a");
+        let same_object_new_generation = record("fragment-a", "object-a");
+        let conflicting = record("fragment-a", "object-b");
+        let entries = vec![
+            ("new/a.mp4".to_string(), first.encode().unwrap()),
+            (
+                "new/b.mp4".to_string(),
+                record("fragment-a", "object-c").encode().unwrap(),
+            ),
+        ];
+        assert_eq!(store.create_live_batch("fragment-a", &entries).unwrap(), 2);
+        assert_eq!(store.create_live_batch("fragment-a", &entries).unwrap(), 0);
+        assert!(
+            store
+                .create_live_batch(
+                    "fragment-a",
+                    &[(
+                        "new/a.mp4".to_string(),
+                        same_object_new_generation.encode().unwrap(),
+                    )],
+                )
+                .is_err()
+        );
+
+        let rejected = vec![
+            ("new/a.mp4".to_string(), conflicting.encode().unwrap()),
+            (
+                "new/never-published.mp4".to_string(),
+                record("fragment-a", "object-d").encode().unwrap(),
+            ),
+        ];
+        assert!(store.create_live_batch("fragment-a", &rejected).is_err());
+        assert!(
+            store
+                .read_live("fragment-a", "new/never-published.mp4")
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batched_exact_remove_never_removes_a_changed_pointer() {
+        let (root, store) = store();
+        let first = record("fragment-a", "object-a").encode().unwrap();
+        let second = record("fragment-a", "object-b").encode().unwrap();
+        store
+            .create_live_batch(
+                "fragment-a",
+                &[
+                    ("old/a.mp4".to_string(), first.clone()),
+                    ("old/b.mp4".to_string(), second.clone()),
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .remove_live_batch_if_exact(
+                    "fragment-a",
+                    &[
+                        ("old/a.mp4".to_string(), first.clone()),
+                        ("old/b.mp4".to_string(), first.clone()),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .read_live("fragment-a", "old/a.mp4")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .read_live("fragment-a", "old/b.mp4")
+                .unwrap()
+                .unwrap()
+                .1,
+            second
         );
         let _ = fs::remove_dir_all(root);
     }

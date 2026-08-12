@@ -18,10 +18,17 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::time::Duration;
 
 const PEER_NCNX_PATH: &str = "/n2/peer/ncnx-v4";
+const PEER_NCNX_BATCH_PATH: &str = "/n2/peer/ncnx-v4/batch";
 const PEER_NCNX_TIMEOUT: Duration = Duration::from_secs(20);
+pub const PEER_NCNX_BATCH_MAX: usize = 128;
+const LOCAL_NCNX_BATCH_CONCURRENCY: usize = 4;
+
+static LOCAL_NCNX_BATCH_BUDGET: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(LOCAL_NCNX_BATCH_CONCURRENCY)));
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NcnxReplica {
@@ -104,6 +111,46 @@ pub struct PeerNcnxResponse {
     pub bytes: Option<ByteBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<PeerNcnxName>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PeerNcnxBatchAction {
+    CreateLive,
+    RemoveLive,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PeerNcnxBatchItem {
+    logical_key: String,
+    bytes: ByteBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PeerNcnxBatchRequest {
+    action: PeerNcnxBatchAction,
+    pool_id: String,
+    pool_generation: u64,
+    target_slot_id: String,
+    target_instance_id: String,
+    binding_epoch: u64,
+    fragment_id: String,
+    root_id: String,
+    items: Vec<PeerNcnxBatchItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PeerNcnxBatchResponse {
+    node_id: String,
+    root_id: String,
+    changed: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct NcnxRenameBatchItem {
+    pub located: LocatedNcnx,
+    pub destination_key: String,
+    pub destination_record: NcnxRecord,
 }
 
 #[derive(Clone, Debug)]
@@ -449,6 +496,7 @@ fn local_apply(
                         response.changed = changed;
                         return Ok(response);
                     }
+                    Err(error @ AppError::Conflict(_)) => return Err(error),
                     Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
                 }
             }
@@ -467,6 +515,7 @@ fn local_apply(
                         successes = successes.saturating_add(1);
                         response.changed |= changed;
                     }
+                    Err(error @ AppError::Conflict(_)) => return Err(error),
                     Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
                 }
             }
@@ -488,6 +537,143 @@ fn local_apply(
         }
     }
     Ok(response)
+}
+
+fn validate_batch_contract<'a>(
+    runtime: &'a ClusterRuntime,
+    request: &PeerNcnxBatchRequest,
+) -> Result<&'a ServerPool, AppError> {
+    if request.items.is_empty() || request.items.len() > PEER_NCNX_BATCH_MAX {
+        return Err(AppError::BadRequest(format!(
+            "NCNX batch requires 1..={PEER_NCNX_BATCH_MAX} entries"
+        )));
+    }
+    let pool = runtime
+        .membership
+        .pool(&request.pool_id)
+        .ok_or_else(|| AppError::Conflict(format!("unknown NCNX pool '{}'", request.pool_id)))?;
+    if pool.generation != request.pool_generation
+        || runtime.local_is_reserve
+        || request.binding_epoch != runtime.membership.binding_epoch
+        || request.target_slot_id != runtime.local_node_id
+        || request.target_instance_id != runtime.local_instance_id
+        || !pool.node_ids.iter().any(|id| id == &runtime.local_node_id)
+    {
+        return Err(AppError::Conflict(
+            "stale, misbound, or non-member NCNX batch request".into(),
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    for item in &request.items {
+        if !keys.insert(item.logical_key.as_str()) {
+            return Err(AppError::Conflict(format!(
+                "duplicate NCNX key '{}' in peer batch",
+                item.logical_key
+            )));
+        }
+        let layout = build_ncnx_layout(runtime, pool, &request.fragment_id, &item.logical_key)?;
+        let assigned = layout
+            .replicas
+            .iter()
+            .find(|replica| replica.node_id == runtime.local_node_id)
+            .ok_or_else(|| {
+                AppError::Forbidden(format!(
+                    "node '{}' is not an NCNX holder for key '{}'",
+                    runtime.local_node_id, item.logical_key
+                ))
+            })?;
+        if assigned.root_id != request.root_id {
+            return Err(AppError::Conflict(format!(
+                "NCNX key '{}' belongs on root '{}', not '{}'",
+                item.logical_key, assigned.root_id, request.root_id
+            )));
+        }
+    }
+    Ok(pool)
+}
+
+fn local_apply_batch(
+    runtime: &ClusterRuntime,
+    request: &PeerNcnxBatchRequest,
+) -> Result<PeerNcnxBatchResponse, AppError> {
+    validate_batch_contract(runtime, request)?;
+    let entries = request
+        .items
+        .iter()
+        .map(|item| (item.logical_key.clone(), item.bytes.clone().into_vec()))
+        .collect::<Vec<_>>();
+    let mut changed = 0usize;
+    let mut selected_root = request.root_id.clone();
+    match request.action {
+        PeerNcnxBatchAction::CreateLive => {
+            let mut failures = Vec::new();
+            for store in writable_local_stores(runtime, &request.root_id)? {
+                match store.create_live_batch(&request.fragment_id, &entries) {
+                    Ok(count) => {
+                        changed = count;
+                        selected_root = store.root_id().to_string();
+                        failures.clear();
+                        break;
+                    }
+                    Err(error @ AppError::Conflict(_)) => return Err(error),
+                    Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
+                }
+            }
+            if !failures.is_empty() {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "NCNX batch publication could not use any healthy disk on node '{}': {}",
+                    runtime.local_node_id,
+                    failures.join("; ")
+                )));
+            }
+        }
+        PeerNcnxBatchAction::RemoveLive => {
+            let mut successes = 0usize;
+            let mut failures = Vec::new();
+            for store in local_stores(runtime, &request.root_id) {
+                match store.remove_live_batch_if_exact(&request.fragment_id, &entries) {
+                    Ok(count) => {
+                        successes = successes.saturating_add(1);
+                        changed = changed.saturating_add(count);
+                        if count > 0 {
+                            selected_root = store.root_id().to_string();
+                        }
+                    }
+                    Err(error @ AppError::Conflict(_)) => return Err(error),
+                    Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
+                }
+            }
+            if successes == 0 {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "NCNX batch removal could not reach any local disk on node '{}': {}",
+                    runtime.local_node_id,
+                    failures.join("; ")
+                )));
+            }
+        }
+    }
+    Ok(PeerNcnxBatchResponse {
+        node_id: runtime.local_node_id.clone(),
+        root_id: selected_root,
+        changed,
+    })
+}
+
+async fn run_local_batch(
+    runtime: Arc<ClusterRuntime>,
+    request: PeerNcnxBatchRequest,
+) -> Result<PeerNcnxBatchResponse, AppError> {
+    let permit = LOCAL_NCNX_BATCH_BUDGET
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("NCNX batch budget is closed".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        local_apply_batch(&runtime, &request)
+    })
+    .await
+    .map_err(|error| AppError::InternalServerError(format!("NCNX batch worker failed: {error}")))?
 }
 
 fn local_list(
@@ -609,8 +795,21 @@ async fn peer_handler(
     Ok(Json(response))
 }
 
+async fn peer_batch_handler(
+    headers: HeaderMap,
+    State(_state): State<Arc<AppState>>,
+    Json(request): Json<PeerNcnxBatchRequest>,
+) -> Result<Json<PeerNcnxBatchResponse>, AppError> {
+    authorize_peer(&headers)?;
+    let runtime = active_cluster_runtime()?;
+    let response = run_local_batch(runtime, request).await?;
+    Ok(Json(response))
+}
+
 pub fn build_ncnx_peer_routes() -> Router<Arc<AppState>> {
-    Router::new().route(PEER_NCNX_PATH, post(peer_handler))
+    Router::new()
+        .route(PEER_NCNX_PATH, post(peer_handler))
+        .route(PEER_NCNX_BATCH_PATH, post(peer_batch_handler))
 }
 
 async fn send_to_replica(
@@ -659,6 +858,163 @@ async fn send_to_replica(
             replica.node_id
         ))
     })
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PeerNcnxBatchTarget {
+    pool_id: String,
+    pool_generation: u64,
+    node_id: String,
+    instance_id: String,
+    binding_epoch: u64,
+    root_id: String,
+    endpoint: String,
+}
+
+async fn send_batch_to_target(
+    runtime: &ClusterRuntime,
+    target: &PeerNcnxBatchTarget,
+    action: PeerNcnxBatchAction,
+    fragment_id: &str,
+    items: Vec<PeerNcnxBatchItem>,
+) -> Result<PeerNcnxBatchResponse, AppError> {
+    let request = PeerNcnxBatchRequest {
+        action,
+        pool_id: target.pool_id.clone(),
+        pool_generation: target.pool_generation,
+        target_slot_id: target.node_id.clone(),
+        target_instance_id: target.instance_id.clone(),
+        binding_epoch: target.binding_epoch,
+        fragment_id: fragment_id.to_string(),
+        root_id: target.root_id.clone(),
+        items,
+    };
+    if target.node_id == runtime.local_node_id {
+        return run_local_batch(Arc::new(runtime.clone()), request).await;
+    }
+
+    let client = peer_http_client()?;
+    let mut call = client
+        .post(format!(
+            "{}{}",
+            target.endpoint.trim_end_matches('/'),
+            PEER_NCNX_BATCH_PATH
+        ))
+        .timeout(PEER_NCNX_TIMEOUT)
+        .json(&request);
+    if let Some(secret) = cluster_secret() {
+        call = call.header("x-n2-cluster-secret", secret);
+    }
+    let response = call.send().await.map_err(|error| {
+        AppError::ServiceUnavailable(format!(
+            "NCNX peer '{}' batch request failed: {error}",
+            target.node_id
+        ))
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        if status == StatusCode::CONFLICT {
+            return Err(AppError::Conflict(format!(
+                "NCNX peer '{}' rejected a conflicting batch mutation: {body}",
+                target.node_id
+            )));
+        }
+        return Err(AppError::ServiceUnavailable(format!(
+            "NCNX peer '{}' returned {status} for batch mutation: {body}",
+            target.node_id
+        )));
+    }
+    response.json().await.map_err(|error| {
+        AppError::InternalServerError(format!(
+            "decode NCNX peer '{}' batch response: {error}",
+            target.node_id
+        ))
+    })
+}
+
+async fn apply_rename_batch_stage(
+    items: &[NcnxRenameBatchItem],
+    action: PeerNcnxBatchAction,
+) -> Result<(), AppError> {
+    if items.is_empty() || items.len() > PEER_NCNX_BATCH_MAX {
+        return Err(AppError::BadRequest(format!(
+            "rename batch requires 1..={PEER_NCNX_BATCH_MAX} entries"
+        )));
+    }
+    let fragment_id = items[0].located.record.fragment_id.clone();
+    let runtime = active_cluster_runtime()?;
+    let mut groups = BTreeMap::<PeerNcnxBatchTarget, Vec<PeerNcnxBatchItem>>::new();
+    for item in items {
+        if item.located.record.fragment_id != fragment_id
+            || item.destination_record.fragment_id != fragment_id
+            || item.destination_record.object_id != item.located.record.object_id
+        {
+            return Err(AppError::Conflict(
+                "rename batch must preserve one fragment and every object identity".into(),
+            ));
+        }
+        let pool = pool_for_located(&runtime, &item.located)?;
+        let (logical_key, bytes) = match action {
+            PeerNcnxBatchAction::CreateLive => (
+                item.destination_key.as_str(),
+                item.destination_record.encode()?,
+            ),
+            PeerNcnxBatchAction::RemoveLive => (
+                item.located.logical_key.as_str(),
+                item.located.bytes.clone(),
+            ),
+        };
+        let layout = build_ncnx_layout(&runtime, pool, &fragment_id, logical_key)?;
+        for replica in layout.replicas {
+            groups
+                .entry(PeerNcnxBatchTarget {
+                    pool_id: layout.pool_id.clone(),
+                    pool_generation: layout.pool_generation,
+                    node_id: replica.node_id,
+                    instance_id: replica.instance_id,
+                    binding_epoch: replica.binding_epoch,
+                    root_id: replica.root_id,
+                    endpoint: replica.endpoint,
+                })
+                .or_default()
+                .push(PeerNcnxBatchItem {
+                    logical_key: logical_key.to_string(),
+                    bytes: ByteBuf::from(bytes.clone()),
+                });
+        }
+    }
+
+    let calls = groups.into_iter().map(|(target, entries)| {
+        let runtime = runtime.clone();
+        let action = action.clone();
+        let fragment_id = fragment_id.clone();
+        async move { send_batch_to_target(&runtime, &target, action, &fragment_id, entries).await }
+    });
+    let results = join_all(calls).await;
+    let mut failures = Vec::new();
+    for result in results {
+        match result {
+            Ok(_) => {}
+            Err(error @ AppError::Conflict(_)) => return Err(error),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::ServiceUnavailable(format!(
+            "NCNX rename batch did not reach every exact replica: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+/// Fast path for a bounded prefix-rename slice. Destination replicas become
+/// durable before any exact source pointer is removed.
+pub async fn rename_live_batch(items: &[NcnxRenameBatchItem]) -> Result<(), AppError> {
+    apply_rename_batch_stage(items, PeerNcnxBatchAction::CreateLive).await?;
+    apply_rename_batch_stage(items, PeerNcnxBatchAction::RemoveLive).await
 }
 
 fn request_for_replica(

@@ -2,16 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::core::disk_manager::ObjectMetadata;
 use crate::distribution::ncnx::{
-    LocatedNcnx, PeerNcnxName, copy_live_to_key, copy_live_to_key_with_record, copy_live_to_trash,
-    find_live, find_live_for_survival_write, list_canonical_names, ncnx_cursor, publish_new,
-    read_canonical_record, remove_live, remove_trash, trash_is_expired,
+    LocatedNcnx, NcnxRenameBatchItem, PEER_NCNX_BATCH_MAX, PeerNcnxName, copy_live_to_key,
+    copy_live_to_key_with_record, copy_live_to_trash, find_live, find_live_for_survival_write,
+    list_canonical_names, ncnx_cursor, publish_new, read_canonical_record, remove_live,
+    remove_trash, rename_live_batch, trash_is_expired,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -23,6 +26,13 @@ use crate::namespace::runtime::{NamespaceObjectRef, NamespaceObjectRefPage};
 
 const LIST_BATCH_MAX: usize = 1_000;
 const PREFIX_MUTATION_CONCURRENCY: usize = 32;
+const PREFIX_PLANNING_GLOBAL_CONCURRENCY: usize = 128;
+const PREFIX_BATCH_GLOBAL_CONCURRENCY: usize = 4;
+
+static PREFIX_PLANNING_BUDGET: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(PREFIX_PLANNING_GLOBAL_CONCURRENCY)));
+static PREFIX_BATCH_BUDGET: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(PREFIX_BATCH_GLOBAL_CONCURRENCY)));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -881,24 +891,67 @@ async fn rename_key_or_prefix(
         return Err(AppError::NotFound);
     }
     let affected = names.len();
+    let mut pending = names.into_iter();
+    let mut planning = FuturesUnordered::new();
     let mut work = Vec::with_capacity(affected);
-    for name in names {
+    loop {
         control.ensure_running()?;
-        let destination_key = rename_prefix(&name.logical_key, &source, &destination)
-            .map_err(|err| AppError::BadRequest(err.to_string()))?;
-        let source_record = read_canonical_record(fragment, &name).await?;
-        if let Some(existing) = find_live(fragment, &destination_key).await?
-            && existing.record.object_id != source_record.record.object_id
-        {
-            return Err(AppError::Conflict(format!(
-                "rename destination '{destination_key}' already exists"
-            )));
+        while planning.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some(name) = pending.next() else {
+                break;
+            };
+            let fragment = fragment.to_string();
+            let source = source.clone();
+            let destination = destination.clone();
+            let mutation_id = mutation_id.to_string();
+            planning.push(async move {
+                let _permit = PREFIX_PLANNING_BUDGET
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        AppError::ServiceUnavailable("namespace planning budget is closed".into())
+                    })?;
+                let destination_key = rename_prefix(&name.logical_key, &source, &destination)
+                    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+                let source_record = read_canonical_record(&fragment, &name).await?;
+                let destination_record = match find_live(&fragment, &destination_key).await? {
+                    Some(existing)
+                        if existing.record.object_id == source_record.record.object_id =>
+                    {
+                        // A retry may observe only part of an earlier destination
+                        // publication. Reuse that exact immutable generation so
+                        // missing replicas converge byte-for-byte.
+                        existing.record
+                    }
+                    Some(_) => {
+                        return Err(AppError::Conflict(format!(
+                            "rename destination '{destination_key}' already exists"
+                        )));
+                    }
+                    None => NcnxRecord::new(
+                        &source_record.record.fragment_id,
+                        &source_record.record.object_id,
+                        mutation_id,
+                        now_nanos,
+                    )?,
+                };
+                Ok::<_, AppError>(NcnxRenameBatchItem {
+                    located: source_record,
+                    destination_key,
+                    destination_record,
+                })
+            });
         }
-        work.push((source_record, destination_key));
-        control.planning(
-            work.len(),
-            work.last().map(|(record, _)| record.logical_key.clone()),
-        );
+        match planning.next().await {
+            Some(Ok(item)) => {
+                let current = item.located.logical_key.clone();
+                work.push(item);
+                control.planning(work.len(), Some(current));
+            }
+            Some(Err(error)) => return Err(error),
+            None => break,
+        }
     }
     run_prefix_rename(work, mutation_id, now_nanos, control).await?;
     Ok(mutation_summary(
@@ -913,46 +966,62 @@ async fn rename_key_or_prefix(
 }
 
 async fn run_prefix_rename(
-    work: Vec<(LocatedNcnx, String)>,
+    work: Vec<NcnxRenameBatchItem>,
     mutation_id: &str,
     now_nanos: i64,
     control: &NamespaceMutationControl,
 ) -> Result<(), AppError> {
     let total = work.len();
     control.executing(total, 0, 0, 0, None);
-    let mut pending = work.into_iter();
-    let mut running = FuturesUnordered::new();
     let mut completed = 0usize;
     let mut succeeded = 0usize;
     let mut failed = 0usize;
-    loop {
+    for batch in work.chunks(PEER_NCNX_BATCH_MAX) {
         control.ensure_running()?;
-        while running.len() < PREFIX_MUTATION_CONCURRENCY {
-            let Some((located, destination)) = pending.next() else {
-                break;
-            };
-            let mutation_id = mutation_id.to_string();
-            let path = located.logical_key.clone();
-            running.push(async move {
-                (
-                    path,
-                    rename_one(&located, &destination, &mutation_id, now_nanos).await,
-                )
-            });
-        }
-        match running.next().await {
-            Some((path, Ok(()))) => {
-                completed = completed.saturating_add(1);
-                succeeded = succeeded.saturating_add(1);
-                control.executing(total, completed, succeeded, failed, Some(path));
+        let _batch_permit = PREFIX_BATCH_BUDGET
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable("namespace mutation budget is closed".into())
+            })?;
+        match rename_live_batch(batch).await {
+            Ok(()) => {
+                completed = completed.saturating_add(batch.len());
+                succeeded = succeeded.saturating_add(batch.len());
+                control.executing(
+                    total,
+                    completed,
+                    succeeded,
+                    failed,
+                    batch.last().map(|item| item.located.logical_key.clone()),
+                );
             }
-            Some((path, Err(error))) => {
-                completed = completed.saturating_add(1);
-                failed = failed.saturating_add(1);
-                control.executing(total, completed, succeeded, failed, Some(path));
-                return Err(error);
+            Err(_batch_error) => {
+                // A rare conflict or transport failure can leave safe,
+                // destination-first partial publication. Re-enter the proven
+                // per-entry path to classify exact progress and converge every
+                // idempotent entry before returning the first real failure.
+                for item in batch {
+                    control.ensure_running()?;
+                    let path = item.located.logical_key.clone();
+                    match rename_one(&item.located, &item.destination_key, mutation_id, now_nanos)
+                        .await
+                    {
+                        Ok(()) => {
+                            completed = completed.saturating_add(1);
+                            succeeded = succeeded.saturating_add(1);
+                            control.executing(total, completed, succeeded, failed, Some(path));
+                        }
+                        Err(error) => {
+                            completed = completed.saturating_add(1);
+                            failed = failed.saturating_add(1);
+                            control.executing(total, completed, succeeded, failed, Some(path));
+                            return Err(error);
+                        }
+                    }
+                }
             }
-            None => break,
         }
     }
     Ok(())
