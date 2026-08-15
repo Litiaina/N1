@@ -226,7 +226,6 @@ impl NcnxStore {
 
         let mut keys = BTreeSet::new();
         let mut prepared = Vec::with_capacity(entries.len());
-        let mut parents = BTreeSet::new();
         for (logical_key, bytes) in entries {
             if !keys.insert(logical_key.as_str()) {
                 return Err(AppError::Conflict(format!(
@@ -239,119 +238,9 @@ impl NcnxStore {
                     "NCNX fragment identity differs from publication target".into(),
                 ));
             }
-            let path = self.live_path(fragment_id, logical_key)?;
-            if let Some((_, existing_bytes)) = read_record_if_present(&path)? {
-                if existing_bytes == *bytes {
-                    continue;
-                }
-                return Err(AppError::Conflict(format!(
-                    "NCNX key already exists with a different immutable pointer at {}",
-                    path.display()
-                )));
-            }
-            let parent = path.parent().ok_or_else(|| {
-                AppError::InternalServerError("NCNX publication path has no parent".into())
-            })?;
-            parents.insert(parent.to_path_buf());
-            prepared.push((path, bytes.clone()));
+            prepared.push((self.live_path(fragment_id, logical_key)?, bytes.clone()));
         }
-        if prepared.is_empty() {
-            return Ok(0);
-        }
-
-        for parent in &parents {
-            fs::create_dir_all(parent).map_err(|err| {
-                AppError::Io(err, format!("create NCNX directory {}", parent.display()))
-            })?;
-        }
-
-        let mut staged = Vec::with_capacity(prepared.len());
-        for (path, bytes) in prepared {
-            let parent = path.parent().expect("validated NCNX parent");
-            let temporary = parent.join(format!(".n2-publish-{}", Ulid::new()));
-            let mut file = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-            {
-                Ok(file) => file,
-                Err(err) => {
-                    cleanup_staged_creates(&staged);
-                    return Err(AppError::Io(
-                        err,
-                        format!("create NCNX staging file {}", temporary.display()),
-                    ));
-                }
-            };
-            if let Err(err) = file.write_all(&bytes) {
-                let _ = fs::remove_file(&temporary);
-                cleanup_staged_creates(&staged);
-                return Err(AppError::Io(
-                    err,
-                    format!("write NCNX staging file {}", temporary.display()),
-                ));
-            }
-            staged.push(StagedCreate {
-                path,
-                temporary,
-                file,
-                bytes,
-            });
-        }
-
-        if let Some((path, err)) = staged.par_iter().find_map_any(|entry| {
-            entry
-                .file
-                .sync_data()
-                .err()
-                .map(|error| (entry.temporary.clone(), error))
-        }) {
-            cleanup_staged_creates(&staged);
-            return Err(AppError::Io(
-                err,
-                format!("sync NCNX staging file {}", path.display()),
-            ));
-        }
-
-        let mut changed_parents = BTreeSet::new();
-        let mut changed = 0usize;
-        for entry in &staged {
-            match fs::hard_link(&entry.temporary, &entry.path) {
-                Ok(()) => {
-                    changed = changed.saturating_add(1);
-                    if let Some(parent) = entry.path.parent() {
-                        changed_parents.insert(parent.to_path_buf());
-                    }
-                }
-                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                    let existing = read_record_if_present(&entry.path)?.ok_or_else(|| {
-                        AppError::Conflict(format!(
-                            "NCNX destination disappeared during batch publication at {}",
-                            entry.path.display()
-                        ))
-                    })?;
-                    if existing.1 != entry.bytes {
-                        cleanup_staged_creates(&staged);
-                        sync_directories(&changed_parents)?;
-                        return Err(AppError::Conflict(format!(
-                            "NCNX key already exists with a different immutable pointer at {}",
-                            entry.path.display()
-                        )));
-                    }
-                }
-                Err(err) => {
-                    cleanup_staged_creates(&staged);
-                    sync_directories(&changed_parents)?;
-                    return Err(AppError::Io(
-                        err,
-                        format!("publish immutable NCNX {}", entry.path.display()),
-                    ));
-                }
-            }
-        }
-        cleanup_staged_creates(&staged);
-        sync_directories(&changed_parents)?;
-        Ok(changed)
+        create_immutable_batch(prepared)
     }
 
     pub fn create_trash(
@@ -375,6 +264,47 @@ impl NcnxStore {
             )?,
             bytes,
         )
+    }
+
+    /// Publishes independent trash generations as one bounded durability
+    /// group. Trash remains immutable and each logical key keeps its own
+    /// deletion timestamp and mutation identity.
+    pub fn create_trash_batch(
+        &self,
+        fragment_id: &str,
+        entries: &[(TrashLocator, Vec<u8>)],
+    ) -> Result<usize, AppError> {
+        let mut identities = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(entries.len());
+        for (locator, bytes) in entries {
+            let identity = (
+                locator.logical_key.as_str(),
+                locator.deleted_at_unix_nanos,
+                locator.delete_mutation_id.as_str(),
+            );
+            if !identities.insert(identity) {
+                return Err(AppError::Conflict(format!(
+                    "duplicate trash generation for '{}' in one publication batch",
+                    locator.logical_key
+                )));
+            }
+            let record = NcnxRecord::decode(bytes)?;
+            if record.fragment_id != fragment_id {
+                return Err(AppError::Conflict(
+                    "NCNX fragment identity differs from trash target".into(),
+                ));
+            }
+            prepared.push((
+                self.trash_path(
+                    fragment_id,
+                    &locator.logical_key,
+                    locator.deleted_at_unix_nanos,
+                    &locator.delete_mutation_id,
+                )?,
+                bytes.clone(),
+            ));
+        }
+        create_immutable_batch(prepared)
     }
 
     pub fn remove_live_if_exact(
@@ -448,6 +378,71 @@ impl NcnxStore {
             prune_empty_trash_parents(&path, &trash_root)?;
         }
         Ok(removed)
+    }
+
+    /// Removes exact trash generations in parallel, then coalesces the
+    /// directory durability barriers and prunes only empty generation paths.
+    pub fn remove_trash_batch_if_exact(
+        &self,
+        fragment_id: &str,
+        entries: &[(TrashLocator, Vec<u8>)],
+    ) -> Result<usize, AppError> {
+        let trash_root = self.trash_root(fragment_id);
+        let mut identities = BTreeSet::new();
+        let mut paths = Vec::with_capacity(entries.len());
+        for (locator, expected) in entries {
+            let identity = (
+                locator.logical_key.as_str(),
+                locator.deleted_at_unix_nanos,
+                locator.delete_mutation_id.as_str(),
+            );
+            if !identities.insert(identity) {
+                return Err(AppError::Conflict(format!(
+                    "duplicate trash generation for '{}' in one removal batch",
+                    locator.logical_key
+                )));
+            }
+            paths.push((
+                self.trash_path(
+                    fragment_id,
+                    &locator.logical_key,
+                    locator.deleted_at_unix_nanos,
+                    &locator.delete_mutation_id,
+                )?,
+                expected,
+            ));
+        }
+
+        let results = paths
+            .par_iter()
+            .map(|(path, expected)| {
+                remove_if_exact_deferred(path, expected)
+                    .map(|(changed, parent)| (path.clone(), changed, parent))
+            })
+            .collect::<Vec<_>>();
+        let mut parents = BTreeSet::new();
+        let mut removed_paths = Vec::new();
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok((path, true, Some(parent))) => {
+                    parents.insert(parent);
+                    removed_paths.push(path);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        sync_directories(&parents)?;
+        for path in &removed_paths {
+            prune_empty_trash_parents(path, &trash_root)?;
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(removed_paths.len()),
+        }
     }
 
     pub fn repair_live(
@@ -599,6 +594,128 @@ fn cleanup_staged_creates(staged: &[StagedCreate]) {
     for entry in staged {
         let _ = fs::remove_file(&entry.temporary);
     }
+}
+
+fn create_immutable_batch(entries: Vec<(PathBuf, Vec<u8>)>) -> Result<usize, AppError> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut prepared = Vec::with_capacity(entries.len());
+    let mut parents = BTreeSet::new();
+    for (path, bytes) in entries {
+        if let Some((_, existing_bytes)) = read_record_if_present(&path)? {
+            if existing_bytes == bytes {
+                continue;
+            }
+            return Err(AppError::Conflict(format!(
+                "NCNX key already exists with a different immutable pointer at {}",
+                path.display()
+            )));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            AppError::InternalServerError("NCNX publication path has no parent".into())
+        })?;
+        parents.insert(parent.to_path_buf());
+        prepared.push((path, bytes));
+    }
+    if prepared.is_empty() {
+        return Ok(0);
+    }
+
+    for parent in &parents {
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::Io(err, format!("create NCNX directory {}", parent.display()))
+        })?;
+    }
+
+    let mut staged = Vec::with_capacity(prepared.len());
+    for (path, bytes) in prepared {
+        let parent = path.parent().expect("validated NCNX parent");
+        let temporary = parent.join(format!(".n2-publish-{}", Ulid::new()));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                cleanup_staged_creates(&staged);
+                return Err(AppError::Io(
+                    err,
+                    format!("create NCNX staging file {}", temporary.display()),
+                ));
+            }
+        };
+        if let Err(err) = file.write_all(&bytes) {
+            let _ = fs::remove_file(&temporary);
+            cleanup_staged_creates(&staged);
+            return Err(AppError::Io(
+                err,
+                format!("write NCNX staging file {}", temporary.display()),
+            ));
+        }
+        staged.push(StagedCreate {
+            path,
+            temporary,
+            file,
+            bytes,
+        });
+    }
+
+    if let Some((path, err)) = staged.par_iter().find_map_any(|entry| {
+        entry
+            .file
+            .sync_data()
+            .err()
+            .map(|error| (entry.temporary.clone(), error))
+    }) {
+        cleanup_staged_creates(&staged);
+        return Err(AppError::Io(
+            err,
+            format!("sync NCNX staging file {}", path.display()),
+        ));
+    }
+
+    let mut changed_parents = BTreeSet::new();
+    let mut changed = 0usize;
+    for entry in &staged {
+        match fs::hard_link(&entry.temporary, &entry.path) {
+            Ok(()) => {
+                changed = changed.saturating_add(1);
+                if let Some(parent) = entry.path.parent() {
+                    changed_parents.insert(parent.to_path_buf());
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                let existing = read_record_if_present(&entry.path)?.ok_or_else(|| {
+                    AppError::Conflict(format!(
+                        "NCNX destination disappeared during batch publication at {}",
+                        entry.path.display()
+                    ))
+                })?;
+                if existing.1 != entry.bytes {
+                    cleanup_staged_creates(&staged);
+                    sync_directories(&changed_parents)?;
+                    return Err(AppError::Conflict(format!(
+                        "NCNX key already exists with a different immutable pointer at {}",
+                        entry.path.display()
+                    )));
+                }
+            }
+            Err(err) => {
+                cleanup_staged_creates(&staged);
+                sync_directories(&changed_parents)?;
+                return Err(AppError::Io(
+                    err,
+                    format!("publish immutable NCNX {}", entry.path.display()),
+                ));
+            }
+        }
+    }
+    cleanup_staged_creates(&staged);
+    sync_directories(&changed_parents)?;
+    Ok(changed)
 }
 
 fn sync_directories(directories: &BTreeSet<PathBuf>) -> Result<(), AppError> {
@@ -1379,6 +1496,141 @@ mod tests {
                 .is_some()
         );
         assert!(store.read_trash("fragment-a", &trash).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batched_trash_and_recovery_keep_copy_before_delete_invariants() {
+        let (root, store) = store();
+        let first = record("fragment-a", "object-a").encode().unwrap();
+        let second = record("fragment-a", "object-b").encode().unwrap();
+        let first_trash = TrashLocator {
+            logical_key: "photos/a.jpg".into(),
+            deleted_at_unix_nanos: 10_000,
+            delete_mutation_id: Ulid::new().to_string(),
+        };
+        let second_trash = TrashLocator {
+            logical_key: "photos/b.jpg".into(),
+            deleted_at_unix_nanos: 10_000,
+            delete_mutation_id: Ulid::new().to_string(),
+        };
+        let live = vec![
+            (first_trash.logical_key.clone(), first.clone()),
+            (second_trash.logical_key.clone(), second.clone()),
+        ];
+        let trash = vec![
+            (first_trash.clone(), first.clone()),
+            (second_trash.clone(), second.clone()),
+        ];
+        store.create_live_batch("fragment-a", &live).unwrap();
+
+        // Destination publication is independently durable and idempotent;
+        // a restart here leaves both names rather than losing either object.
+        assert_eq!(store.create_trash_batch("fragment-a", &trash).unwrap(), 2);
+        assert_eq!(store.create_trash_batch("fragment-a", &trash).unwrap(), 0);
+        assert!(
+            store
+                .read_live("fragment-a", &first_trash.logical_key)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .read_trash("fragment-a", &first_trash)
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .remove_live_batch_if_exact("fragment-a", &live)
+            .unwrap();
+        assert!(
+            store
+                .read_live("fragment-a", &first_trash.logical_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .read_trash("fragment-a", &first_trash)
+                .unwrap()
+                .is_some()
+        );
+
+        // Recovery uses the same invariant in reverse: recreate all live
+        // pointers first, then remove only the exact trash generations.
+        store.create_live_batch("fragment-a", &live).unwrap();
+        store
+            .remove_trash_batch_if_exact("fragment-a", &trash)
+            .unwrap();
+        assert!(
+            store
+                .read_live("fragment-a", &second_trash.logical_key)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .read_trash("fragment-a", &second_trash)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batched_trash_remove_never_deletes_a_changed_generation() {
+        let (root, store) = store();
+        let first = record("fragment-a", "object-a").encode().unwrap();
+        let second = record("fragment-a", "object-b").encode().unwrap();
+        let locator_a = TrashLocator {
+            logical_key: "trash/a.bin".into(),
+            deleted_at_unix_nanos: 20_000,
+            delete_mutation_id: Ulid::new().to_string(),
+        };
+        let locator_b = TrashLocator {
+            logical_key: "trash/b.bin".into(),
+            deleted_at_unix_nanos: 20_000,
+            delete_mutation_id: Ulid::new().to_string(),
+        };
+        store
+            .create_trash_batch(
+                "fragment-a",
+                &[
+                    (locator_a.clone(), first.clone()),
+                    (locator_b.clone(), second.clone()),
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .remove_trash_batch_if_exact(
+                    "fragment-a",
+                    &[
+                        (locator_a.clone(), first),
+                        (
+                            locator_b.clone(),
+                            record("fragment-a", "other").encode().unwrap()
+                        ),
+                    ],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .read_trash("fragment-a", &locator_a)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .read_trash("fragment-a", &locator_b)
+                .unwrap()
+                .unwrap()
+                .1,
+            second
+        );
         let _ = fs::remove_dir_all(root);
     }
 

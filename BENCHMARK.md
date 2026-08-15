@@ -5,6 +5,104 @@ hardware, topology, and methodology boundaries. Correctness and failure
 qualification are kept in [TESTING.md](TESTING.md) so benchmark results are
 not mistaken for a second verification record.
 
+## N2 3.4.1 Metal Data-Path and Namespace Optimization
+
+Evidence directory:
+`/home/litiaina/DEV_TEST/n2-metal-optimization-20260815`.
+
+This controlled run used four isolated N2 processes, four physical XFS HDDs,
+one exact EC `3 + 1` server pool, and loopback HTTPS on the i7-6700K test
+server. The baseline and final build used the same host, roots, object sizes,
+and benchmark procedure. The final build passed all 1,536 batched uploads,
+both 256-object prefix renames, bulk delete, bulk recovery, and a SHA-256
+verified 2 GiB download.
+
+| Workload | Baseline | Optimized | Change |
+| --- | ---: | ---: | ---: |
+| Direct multipart, 4 parts in flight | 201.651 MiB/s | 210.925 MiB/s | +4.6% |
+| Direct multipart, 8 parts in flight | 198.873 MiB/s | 240.010 MiB/s | +20.7% |
+| Gateway multipart, 4 parts in flight | 80.742 MiB/s | 89.737 MiB/s | +11.1% |
+| Gateway warm-download p50 | 144.015 MiB/s | 240.195 MiB/s | +66.8% |
+| Gateway cold download | 70.768 MiB/s | 69.287 MiB/s | -2.1% |
+| 64 KiB batch, concurrency 32 | 15.476 objects/s | 18.541 objects/s | +19.8% |
+| 64 KiB batch, concurrency 16 | 3.262 objects/s | 4.745 objects/s | +45.5% |
+| 64 KiB batch, concurrency 8 | 2.022 objects/s | 2.585 objects/s | +27.8% |
+| 1 MiB batch, concurrency 32 | 6.498 objects/s | 5.359 objects/s | -17.5% |
+| 1 MiB batch, concurrency 16 | 3.083 objects/s | 3.939 objects/s | +27.8% |
+| 1 MiB batch, concurrency 8 | 1.843 objects/s | 2.509 objects/s | +36.1% |
+| Prefix rename forward | 18.848 objects/s | 19.703 objects/s | +4.5% |
+| Prefix rename reverse | 17.153 objects/s | 19.230 objects/s | +12.1% |
+| Bulk delete | not previously measured | 19.717 objects/s | clean pass |
+| Bulk recovery | not previously measured | 18.844 objects/s | clean pass |
+
+The optimization moves blocking NCNX filesystem work onto bounded blocking
+workers, groups independent object publication by exact holder/root, and
+coalesces parent-directory durability barriers. Destination-first copy/delete,
+per-file data sync, immutable NCDX/NCNX publication, independent object
+results, and restart-safe convergence are unchanged. No database, global
+namespace lock, quorum protocol, or mutable record was added.
+
+The cold-download and 1 MiB/concurrency-32 regressions are retained in the
+record. These are single-run rotational-media results, so they do not support
+a universal speedup claim. The full method, binary identities, physical
+namespace proof, and raw evidence are in the evidence directory's `REPORT.md`.
+
+## N2 3.4.1 Two-Host Hybrid Cluster and Universal Shell Proof
+
+Evidence directory:
+`/home/litiaina/DEV_TEST/n2-hybrid-cluster-20260815`.
+
+The universal Shell commissioned one cluster across two physical Shell agents.
+The local host ran one logical node with two XFS roots; the remote host ran two
+logical nodes with two XFS roots each. The resulting exact server pool was EC
+`2 + 1`: three logical nodes, six storage roots, and two real networked physical
+hosts. Shared-host logical nodes were admitted only with the explicit lab
+override; production validation still requires one active logical N2 node per
+physical failure domain.
+
+| Operation | Result |
+| --- | ---: |
+| Parallel standard multipart upload, 256 MiB / 4 parts | 72.15 MiB/s |
+| Download through node 001 | 36.95 MiB/s; SHA-256 match |
+| Download through node 002 | 107.62 MiB/s; SHA-256 match |
+| Download through node 003 | 107.84 MiB/s; SHA-256 match |
+| Download through gateway | 107.62 MiB/s; SHA-256 match |
+| Standard batch upload, 240 objects / concurrency 32 | 23.10 objects/s; 240/240 |
+| Prefix rename, 240 objects | 4.799 s |
+| Prefix trash, 240 objects | 3.842 s |
+| Prefix recovery, 240 objects | 5.164 s |
+| Direct exact-operation latency | p50 5.255 ms; p95 7.940 ms; p99 8.555 ms |
+| Gateway exact-operation latency | p50 5.257 ms; p95 7.541 ms; p99 11.815 ms |
+
+Every logical node accepted a coordinator-owned write. A 50-entry first page
+was identical through all three nodes and the gateway. The Shell stopped and
+restarted the complete cluster across both agents; all nodes and the gateway
+returned active, and the post-restart gateway download remained byte-exact.
+Post-start membership differed only in each runtime's local observational
+`last_seen_unix` field; after excluding that field, all nodes resolved the same
+canonical topology SHA-256:
+`13dce8b322827701075e2c6a35a104c62d4c78e46d05faf8662205809da58234`.
+
+N2 distributed regular files across all six roots: 329 and 380 files on the
+local host, and 349, 364, 345, and 359 files on the remote host. Logs contained
+no panic, fatal, corruption, checksum-mismatch, or internal-server-error event.
+
+A server-local secondary sample measured 512 MiB gateway multipart upload at
+71.68 MiB/s and a SHA-256 verified download at 39.32 MiB/s. The smaller
+8 MiB one-shot samples varied from 2.25 to 10.35 MiB/s because each request
+includes immutable publication and rotational-disk durability barriers; those
+values are recorded rather than treated as a large-object ceiling.
+
+The real proof exposed two Shell integration defects: staged gateway
+configuration used a filename the gateway binary did not load, and the Shell's
+serve-mode precheck discarded non-serve native commands. Both were patched and
+are covered by the 18-test Shell suite. The proof does not claim three
+independent host failure domains: node 002 and node 003 share one kernel, power
+supply, NIC, and physical host. It does prove physical host enrollment,
+multi-node host staging, disk assignment, cluster commit/control, real network
+EC traffic, all-coordinator access, gateway access, pagination, batch upload,
+copy/delete namespace mutation, disk spreading, and restart persistence.
+
 ## N2 3.4.1 Bounded Prefix-Rename Optimization
 
 Evidence directory:

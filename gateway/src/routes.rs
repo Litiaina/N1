@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{HeaderMap, HeaderName, Method, Response, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, Method, Response, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -14,14 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message as UpstreamWsMessage;
-use tokio_util::io::ReaderStream;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::NodeConfig;
-use crate::native::{
-    NativeCallError, bearer_from_headers, begin_native_download, content_length, content_type,
-    native_json, native_upload_body,
-};
+use crate::native::{NativeCallError, bearer_from_headers, native_json};
 use crate::node::NodeStatus;
 use crate::proxy::{proxy_http, text_response};
 use crate::state::GatewayState;
@@ -117,13 +113,6 @@ impl MultipartMode {
         match self {
             Self::Standard => "upload.multipart.standard.init",
             Self::Durable => "upload.multipart.durable.init",
-        }
-    }
-
-    fn put_part_op(self) -> &'static str {
-        match self {
-            Self::Standard => "upload.multipart.standard.put_part",
-            Self::Durable => "upload.multipart.durable.put_part",
         }
     }
 
@@ -949,70 +938,38 @@ async fn cluster_job_followup(
 
 async fn multipart_put_part(
     State(state): State<Arc<GatewayState>>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Path((version_id, part_index)): Path<(String, u64)>,
+    Path((_version_id, _part_index)): Path<(String, u64)>,
     Query(query): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response<Body> {
-    multipart_put_part_mode(
-        state,
-        headers,
-        version_id,
-        part_index,
-        query,
-        body,
-        MultipartMode::Standard,
-    )
-    .await
+    multipart_put_part_mode(state, uri, headers, query, body).await
 }
 
 async fn multipart_durable_put_part(
     State(state): State<Arc<GatewayState>>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Path((version_id, part_index)): Path<(String, u64)>,
+    Path((_version_id, _part_index)): Path<(String, u64)>,
     Query(query): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response<Body> {
-    multipart_put_part_mode(
-        state,
-        headers,
-        version_id,
-        part_index,
-        query,
-        body,
-        MultipartMode::Durable,
-    )
-    .await
+    multipart_put_part_mode(state, uri, headers, query, body).await
 }
 
 async fn multipart_put_part_mode(
     state: Arc<GatewayState>,
+    uri: Uri,
     headers: HeaderMap,
-    version_id: String,
-    part_index: u64,
     query: HashMap<String, String>,
     body: Body,
-    mode: MultipartMode,
 ) -> Response<Body> {
-    let bearer = match bearer_from_headers(&headers) {
-        Ok(value) => value,
-        Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
-    };
     let node = match coordinator_node(&state, &headers, &query).await {
         Ok(node) => node,
         Err(response) => return response,
     };
-    let body_len = match content_length(&headers) {
-        Ok(value) => value,
-        Err(err) => return text_response(StatusCode::BAD_REQUEST, err),
-    };
-    let mut payload = query_to_json(query);
-    payload["version_id"] = Value::String(version_id);
-    payload["part_index"] = Value::Number(part_index.into());
-    match native_upload_body(&node, &bearer, mode.put_part_op(), payload, body, body_len).await {
-        Ok((status, value)) => json_response(status, value),
-        Err(err) => native_call_failed(&state, &node, err).await,
-    }
+    proxy_selected_http(&state, node, Method::PUT, uri, headers, body).await
 }
 
 async fn multipart_status(
@@ -1170,87 +1127,59 @@ async fn multipart_cancel_mode(
 
 async fn one_shot_upload(
     State(state): State<Arc<GatewayState>>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    Path(object_key): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response<Body> {
-    let bearer = match bearer_from_headers(&headers) {
-        Ok(value) => value,
-        Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
-    };
     let node = match best_node(&state).await {
         Ok(node) => node,
         Err(response) => return response,
     };
-    let body_len = match content_length(&headers) {
-        Ok(value) => value,
-        Err(err) => return text_response(StatusCode::BAD_REQUEST, err),
-    };
-    let mut payload = query_to_json(query);
-    payload["object_key"] = Value::String(decode_path(&object_key));
-    if let Some(content_type) = content_type(&headers) {
-        payload["content_type"] = Value::String(content_type);
-    }
-    match native_upload_body(&node, &bearer, "upload.one_shot", payload, body, body_len).await {
-        Ok((status, value)) => json_response(status, value),
-        Err(err) => native_call_failed(&state, &node, err).await,
-    }
+    proxy_selected_http(&state, node, Method::POST, uri, headers, body).await
 }
 
 #[derive(Debug, Deserialize)]
 struct DownloadQuery {
-    object_key: String,
+    #[serde(rename = "object_key")]
+    _object_key: String,
     #[serde(default)]
     version_id: Option<String>,
 }
 
 async fn download_object(
     State(state): State<Arc<GatewayState>>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Query(query): Query<DownloadQuery>,
 ) -> Response<Body> {
-    let bearer = match bearer_from_headers(&headers) {
-        Ok(value) => value,
-        Err(err) => return text_response(StatusCode::UNAUTHORIZED, err),
-    };
     let node = match node_for_download(&state, query.version_id.as_deref()).await {
         Ok(node) => node,
         Err(response) => return response,
     };
-    let payload = json!({
-        "object_key": query.object_key,
-        "version_id": query.version_id,
-    });
-    let download = match begin_native_download(&node, &bearer, payload).await {
-        Ok(download) => download,
-        Err(err) => {
-            if let Some(status) = err.status {
-                return text_response(
-                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    err.message,
-                );
-            }
-            return upstream_failed(&state, &node, err.message).await;
+    proxy_selected_http(&state, node, Method::GET, uri, headers, Body::empty()).await
+}
+
+async fn proxy_selected_http(
+    state: &GatewayState,
+    node: NodeConfig,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response<Body> {
+    let mut request = axum::extract::Request::new(body);
+    *request.method_mut() = method;
+    *request.uri_mut() = uri;
+    *request.headers_mut() = headers;
+    match proxy_http(state, node.clone(), request).await {
+        Ok(response) => response,
+        Err(response) => {
+            // Client cancellation is not node failure. Probe independently so
+            // the coordinator does not get fenced by an abandoned body.
+            state.nodes.probe_node(&node.id).await;
+            response
         }
-    };
-    let response_status = StatusCode::from_u16(download.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let response_length = download.body_len;
-    let (mut writer, reader) = tokio::io::duplex(1024 * 1024);
-    let failed_state = state.clone();
-    let failed_node = node.clone();
-    tokio::spawn(async move {
-        if let Err(err) = download.stream_to_writer(&mut writer).await {
-            failed_state.nodes.mark_failure(&failed_node.id).await;
-            tracing::warn!("gateway native download failed: {}", err);
-        }
-    });
-    Response::builder()
-        .status(response_status)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, response_length.to_string())
-        .body(Body::from_stream(ReaderStream::new(reader)))
-        .expect("valid download response")
+    }
 }
 
 async fn proxy_fallback(
@@ -1553,6 +1482,7 @@ mod tests {
     async fn spawn_mock_native_node(node_id: &'static str) -> MockNativeNode {
         let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_url = format!("http://{}", http_listener.local_addr().unwrap());
+        let operations = Arc::new(Mutex::new(Vec::new()));
         let auth_fragment = move || async move {
             Json(json!({
                 "access_token": format!("access-{node_id}"),
@@ -1628,12 +1558,68 @@ mod tests {
                 "state": "running"
             }))
         };
+        let standard_put_operations = operations.clone();
+        let standard_put = move |body: Body| {
+            let operations = standard_put_operations.clone();
+            async move {
+                let _ = body.collect().await;
+                operations
+                    .lock()
+                    .await
+                    .push("upload.multipart.standard.put_part".to_string());
+                Json(json!({ "stored": true }))
+            }
+        };
+        let durable_put_operations = operations.clone();
+        let durable_put = move |body: Body| {
+            let operations = durable_put_operations.clone();
+            async move {
+                let _ = body.collect().await;
+                operations
+                    .lock()
+                    .await
+                    .push("upload.multipart.durable.put_part".to_string());
+                Json(json!({ "stored": true }))
+            }
+        };
+        let one_shot_operations = operations.clone();
+        let one_shot = move |body: Body| {
+            let operations = one_shot_operations.clone();
+            async move {
+                let _ = body.collect().await;
+                operations.lock().await.push("upload.one_shot".to_string());
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "version_id": "one-shot" })),
+                )
+            }
+        };
+        let download = |Query(query): Query<DownloadQuery>| async move {
+            if query._object_key == "missing" {
+                (
+                    StatusCode::NOT_FOUND,
+                    Body::from("not_found: object not found"),
+                )
+            } else {
+                (StatusCode::OK, Body::from("download-bytes"))
+            }
+        };
         let http_app = Router::new()
             .route("/noa/v1/auth/fragment", post(auth_fragment))
             .route("/noa/v1/auth/refresh", post(auth_refresh))
             .route("/noa/v1/auth/logout", post(auth_logout))
             .route("/noa/v1/upload/multipart", get(multipart_listing))
             .route("/noa/v1/upload/multipart/durable", get(multipart_listing))
+            .route(
+                "/noa/v1/upload/multipart/{version_id}/{part_index}",
+                put(standard_put),
+            )
+            .route(
+                "/noa/v1/upload/multipart/durable/{version_id}/{part_index}",
+                put(durable_put),
+            )
+            .route("/noa/v1/upload/one-shot/{*object_key}", post(one_shot))
+            .route("/noa/v1/objects/download", get(download))
             .route("/noa/v1/upload/batch", post(batch_upload))
             .route(
                 "/noa/v1/namespace/operations/{operation_id}",
@@ -1645,7 +1631,6 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let native_url = format!("n2://{}", listener.local_addr().unwrap());
-        let operations = Arc::new(Mutex::new(Vec::new()));
         let recorded = operations.clone();
         tokio::spawn(async move {
             loop {

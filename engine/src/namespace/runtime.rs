@@ -9,8 +9,8 @@ use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
 use crate::core::{index, index_store};
 use crate::distribution::namespace::{
     NamespaceMutationKind, PeerNamespaceApplyRequest, PeerNamespaceReadKind,
-    PeerNamespaceReadRequest, PeerNamespaceReadResponse, commit_namespace_created,
-    commit_namespace_summary, namespace_read,
+    PeerNamespaceReadRequest, PeerNamespaceReadResponse, commit_namespace_bulk,
+    commit_namespace_created, commit_namespace_summary, namespace_read,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -305,12 +305,7 @@ impl NamespaceRuntime {
         fragment: &str,
         paths: Vec<String>,
     ) -> Result<Vec<(String, Result<NamespaceMutationSummary, AppError>)>, AppError> {
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
-            let result = self.recover(fragment, &path).await;
-            out.push((path, result));
-        }
-        Ok(out)
+        Ok(commit_namespace_bulk(fragment, NamespaceMutationKind::Recover, paths).await)
     }
 
     pub async fn recover_trash_entry_id(

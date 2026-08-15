@@ -11,10 +11,11 @@ use ulid::Ulid;
 
 use crate::core::disk_manager::ObjectMetadata;
 use crate::distribution::ncnx::{
-    LocatedNcnx, NcnxRenameBatchItem, PEER_NCNX_BATCH_MAX, PeerNcnxName, copy_live_to_key,
-    copy_live_to_key_with_record, copy_live_to_trash, find_live, find_live_for_survival_write,
-    list_canonical_names, ncnx_cursor, publish_new, read_canonical_record, remove_live,
-    remove_trash, rename_live_batch, trash_is_expired,
+    LocatedNcnx, NcnxRecoverBatchItem, NcnxRenameBatchItem, NcnxTrashBatchItem,
+    PEER_NCNX_BATCH_MAX, PeerNcnxName, copy_live_to_key, copy_live_to_key_with_record,
+    copy_live_to_trash, find_live, find_live_for_survival_write, list_canonical_names, ncnx_cursor,
+    publish_new, read_canonical_record, recover_trash_batch, remove_live, remove_trash,
+    rename_live_batch, trash_is_expired, trash_live_batch,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -380,15 +381,41 @@ pub async fn commit_namespace_mutation_controlled(
             // Prove every destination before publishing any live pointer.
             // Recovery is strict: any live destination rejects the whole
             // selected generation, even when it points to the same object.
-            for (name, _) in &recovery {
-                if find_live(&request.fragment, &name.logical_key)
-                    .await?
-                    .is_some()
-                {
-                    return Err(AppError::Conflict(format!(
-                        "cannot recover '{}': live key already exists",
-                        name.logical_key
-                    )));
+            let mut destinations = FuturesUnordered::new();
+            let mut pending_destinations = recovery.iter();
+            loop {
+                control.ensure_running()?;
+                while destinations.len() < PREFIX_MUTATION_CONCURRENCY {
+                    let Some((name, _)) = pending_destinations.next() else {
+                        break;
+                    };
+                    let fragment = request.fragment.clone();
+                    let logical_key = name.logical_key.clone();
+                    destinations.push(async move {
+                        let _permit = PREFIX_PLANNING_BUDGET
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| {
+                                AppError::ServiceUnavailable(
+                                    "namespace planning budget is closed".into(),
+                                )
+                            })?;
+                        Ok::<_, AppError>((
+                            logical_key.clone(),
+                            find_live(&fragment, &logical_key).await?.is_some(),
+                        ))
+                    });
+                }
+                match destinations.next().await {
+                    Some(Ok((logical_key, true))) => {
+                        return Err(AppError::Conflict(format!(
+                            "cannot recover '{logical_key}': live key already exists"
+                        )));
+                    }
+                    Some(Ok((_, false))) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => break,
                 }
             }
             let affected = recovery.len();
@@ -403,35 +430,14 @@ pub async fn commit_namespace_mutation_controlled(
             } else {
                 common_parent_for_keys(recovery.iter().map(|(name, _)| name.logical_key.as_str()))
             };
-            let mut pending = recovery.into_iter();
-            let mut running = FuturesUnordered::new();
-            let mut completed = 0usize;
-            let mut succeeded = 0usize;
-            let mut failed = 0usize;
-            loop {
-                control.ensure_running()?;
-                while running.len() < PREFIX_MUTATION_CONCURRENCY {
-                    let Some((name, located)) = pending.next() else {
-                        break;
-                    };
-                    let path = name.logical_key.clone();
-                    running.push(async move { (path, recover_one(&name, &located).await) });
-                }
-                match running.next().await {
-                    Some((path, Ok(()))) => {
-                        completed = completed.saturating_add(1);
-                        succeeded = succeeded.saturating_add(1);
-                        control.executing(affected, completed, succeeded, failed, Some(path));
-                    }
-                    Some((path, Err(error))) => {
-                        completed = completed.saturating_add(1);
-                        failed = failed.saturating_add(1);
-                        control.executing(affected, completed, succeeded, failed, Some(path));
-                        return Err(error);
-                    }
-                    None => break,
-                }
-            }
+            let work = recovery
+                .into_iter()
+                .map(|(name, located)| NcnxRecoverBatchItem {
+                    locator: name.trash.expect("trash recovery name has a locator"),
+                    located,
+                })
+                .collect::<Vec<_>>();
+            run_prefix_recover(work, &control).await?;
             Ok(NamespaceApplyOutcome::Summary(NamespaceMutationSummary {
                 operation: "recover".into(),
                 kind: if affected == 1 {
@@ -490,6 +496,345 @@ pub async fn commit_namespace_summary_controlled(
         .ok_or_else(|| {
             AppError::InternalServerError("namespace mutation did not return a summary".into())
         })
+}
+
+/// Executes independent exact-key trash/recover requests as bounded NCNX
+/// durability groups. Prefixes and retry edge cases retain the full mutation
+/// path, so batching changes syscall shape rather than namespace semantics.
+pub async fn commit_namespace_bulk(
+    fragment: &str,
+    kind: NamespaceMutationKind,
+    keys: Vec<String>,
+) -> Vec<(String, Result<NamespaceMutationSummary, AppError>)> {
+    match kind {
+        NamespaceMutationKind::Trash => bulk_trash_exact(fragment, keys).await,
+        NamespaceMutationKind::Recover => bulk_recover_exact(fragment, keys).await,
+        _ => keys
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    Err(AppError::BadRequest(
+                        "namespace bulk supports trash or recover".into(),
+                    )),
+                )
+            })
+            .collect(),
+    }
+}
+
+async fn bulk_trash_exact(
+    fragment: &str,
+    keys: Vec<String>,
+) -> Vec<(String, Result<NamespaceMutationSummary, AppError>)> {
+    let total = keys.len();
+    let mut slots = (0..total).map(|_| None).collect::<Vec<_>>();
+    let mut pending = keys.iter().cloned().enumerate();
+    let mut planning = FuturesUnordered::new();
+    let mut work = Vec::new();
+    let mutation_id = Ulid::new().to_string();
+    let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(1);
+    loop {
+        while planning.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some((index, key)) = pending.next() else {
+                break;
+            };
+            let fragment = fragment.to_string();
+            planning.push(async move {
+                let result = async {
+                    let _permit = PREFIX_PLANNING_BUDGET
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            AppError::ServiceUnavailable(
+                                "namespace planning budget is closed".into(),
+                            )
+                        })?;
+                    let key = validate_logical_key(&key)?;
+                    Ok::<_, AppError>((key.clone(), find_live(&fragment, &key).await?))
+                }
+                .await;
+                (index, key, result)
+            });
+        }
+        match planning.next().await {
+            Some((index, _, Ok((key, Some(located))))) => {
+                let locator = TrashLocator {
+                    logical_key: key.clone(),
+                    deleted_at_unix_nanos: now_nanos,
+                    delete_mutation_id: mutation_id.clone(),
+                };
+                let summary = mutation_summary(
+                    "trash",
+                    NamespaceEntryKind::File,
+                    1,
+                    Some(key.clone()),
+                    None,
+                    Some(mutation_id.clone()),
+                    Some(now_nanos),
+                );
+                work.push((index, NcnxTrashBatchItem { located, locator }, summary));
+            }
+            Some((index, _, Ok((key, None)))) => {
+                slots[index] = Some(
+                    commit_namespace_summary(PeerNamespaceApplyRequest {
+                        mutation_id: None,
+                        kind: NamespaceMutationKind::Trash,
+                        fragment: fragment.to_string(),
+                        source_path: Some(key),
+                        destination_path: None,
+                        object_id: None,
+                        version_id: None,
+                        metadata: None,
+                    })
+                    .await,
+                );
+            }
+            Some((index, _, Err(error))) => slots[index] = Some(Err(error)),
+            None => break,
+        }
+    }
+    work.sort_by_key(|(index, _, _)| *index);
+    for chunk in work.chunks(PEER_NCNX_BATCH_MAX) {
+        let batch = chunk
+            .iter()
+            .map(|(_, item, _)| item.clone())
+            .collect::<Vec<_>>();
+        if trash_live_batch(&batch).await.is_ok() {
+            for (index, _, summary) in chunk {
+                slots[*index] = Some(Ok(summary.clone()));
+            }
+        } else {
+            for (index, item, summary) in chunk {
+                slots[*index] = Some(
+                    trash_one(
+                        &item.located,
+                        &item.locator.delete_mutation_id,
+                        item.locator.deleted_at_unix_nanos,
+                    )
+                    .await
+                    .map(|_| summary.clone()),
+                );
+            }
+        }
+    }
+    keys.into_iter()
+        .enumerate()
+        .map(|(index, key)| {
+            (
+                key,
+                slots[index].take().unwrap_or_else(|| {
+                    Err(AppError::InternalServerError(
+                        "bulk trash did not classify an input".into(),
+                    ))
+                }),
+            )
+        })
+        .collect()
+}
+
+async fn bulk_recover_exact(
+    fragment: &str,
+    keys: Vec<String>,
+) -> Vec<(String, Result<NamespaceMutationSummary, AppError>)> {
+    let total = keys.len();
+    let mut slots = (0..total).map(|_| None).collect::<Vec<_>>();
+    let mut parent_groups = BTreeMap::<String, Vec<(usize, String)>>::new();
+    for (index, requested) in keys.iter().enumerate() {
+        match validate_logical_key(requested) {
+            Ok(key) => parent_groups
+                .entry(parent_path(&key))
+                .or_default()
+                .push((index, key)),
+            Err(error) => slots[index] = Some(Err(error)),
+        }
+    }
+
+    // One ordered trash scan per parent replaces one distributed scan per
+    // object. A 256-file selection from one directory therefore traverses the
+    // namespace once while preserving newest-generation selection per key.
+    let mut pending_groups = parent_groups.into_iter();
+    let mut listings = FuturesUnordered::new();
+    let mut candidates = BTreeMap::<String, PeerNcnxName>::new();
+    loop {
+        while listings.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some((parent, requested)) = pending_groups.next() else {
+                break;
+            };
+            let fragment = fragment.to_string();
+            listings.push(async move {
+                let result = async {
+                    let _permit = PREFIX_PLANNING_BUDGET
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            AppError::ServiceUnavailable(
+                                "namespace planning budget is closed".into(),
+                            )
+                        })?;
+                    let prefix = if parent.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{parent}/")
+                    };
+                    all_names(&fragment, &prefix, true).await
+                }
+                .await;
+                (requested, result)
+            });
+        }
+        match listings.next().await {
+            Some((requested, Ok(names))) => {
+                let wanted = requested
+                    .iter()
+                    .map(|(_, key)| key.as_str())
+                    .collect::<BTreeSet<_>>();
+                for name in names.into_iter().filter(|name| {
+                    wanted.contains(name.logical_key.as_str())
+                        && name
+                            .trash
+                            .as_ref()
+                            .is_some_and(|trash| !trash_is_expired(trash))
+                }) {
+                    let replace = candidates.get(&name.logical_key).is_none_or(|current| {
+                        current.trash.as_ref().zip(name.trash.as_ref()).is_none_or(
+                            |(current, proposed)| {
+                                proposed.deleted_at_unix_nanos > current.deleted_at_unix_nanos
+                            },
+                        )
+                    });
+                    if replace {
+                        candidates.insert(name.logical_key.clone(), name);
+                    }
+                }
+                for (index, key) in requested {
+                    if !candidates.contains_key(&key) {
+                        slots[index] = Some(
+                            commit_namespace_summary(PeerNamespaceApplyRequest {
+                                mutation_id: None,
+                                kind: NamespaceMutationKind::Recover,
+                                fragment: fragment.to_string(),
+                                source_path: Some(key),
+                                destination_path: None,
+                                object_id: None,
+                                version_id: None,
+                                metadata: None,
+                            })
+                            .await,
+                        );
+                    }
+                }
+            }
+            Some((requested, Err(error))) => {
+                let message = error.to_string();
+                for (index, _) in requested {
+                    slots[index] = Some(Err(AppError::ServiceUnavailable(message.clone())));
+                }
+            }
+            None => break,
+        }
+    }
+
+    let pending_items = keys
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            (slots[index].is_none())
+                .then(|| candidates.get(&key).cloned().map(|name| (index, key, name)))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    let mut pending = pending_items.into_iter();
+    let mut planning = FuturesUnordered::new();
+    let mut work = Vec::new();
+    loop {
+        while planning.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some((index, requested, name)) = pending.next() else {
+                break;
+            };
+            let fragment = fragment.to_string();
+            planning.push(async move {
+                let result = async {
+                    let _permit = PREFIX_PLANNING_BUDGET
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            AppError::ServiceUnavailable(
+                                "namespace planning budget is closed".into(),
+                            )
+                        })?;
+                    let located = read_canonical_record(&fragment, &name).await?;
+                    let live = find_live(&fragment, &name.logical_key).await?;
+                    Ok::<_, AppError>((name, located, live))
+                }
+                .await;
+                (index, requested, result)
+            });
+        }
+        match planning.next().await {
+            Some((index, _, Ok((name, located, None)))) => {
+                let locator = name.trash.expect("trash recovery has locator");
+                let summary = mutation_summary(
+                    "recover",
+                    NamespaceEntryKind::File,
+                    1,
+                    Some(name.logical_key.clone()),
+                    Some(name.logical_key),
+                    Some(locator.delete_mutation_id.clone()),
+                    Some(locator.deleted_at_unix_nanos),
+                );
+                work.push((index, NcnxRecoverBatchItem { located, locator }, summary));
+            }
+            Some((index, requested, Ok((_, _, Some(_))))) => {
+                slots[index] = Some(Err(AppError::Conflict(format!(
+                    "cannot recover '{requested}': live key already exists"
+                ))));
+            }
+            Some((index, _, Err(error))) => slots[index] = Some(Err(error)),
+            None => break,
+        }
+    }
+    work.sort_by_key(|(index, _, _)| *index);
+    for chunk in work.chunks(PEER_NCNX_BATCH_MAX) {
+        let batch = chunk
+            .iter()
+            .map(|(_, item, _)| item.clone())
+            .collect::<Vec<_>>();
+        if recover_trash_batch(&batch).await.is_ok() {
+            for (index, _, summary) in chunk {
+                slots[*index] = Some(Ok(summary.clone()));
+            }
+        } else {
+            for (index, item, summary) in chunk {
+                let name = PeerNcnxName {
+                    logical_key: item.located.logical_key.clone(),
+                    trash: Some(item.locator.clone()),
+                };
+                slots[*index] = Some(
+                    recover_one(&name, &item.located)
+                        .await
+                        .map(|_| summary.clone()),
+                );
+            }
+        }
+    }
+    keys.into_iter()
+        .enumerate()
+        .map(|(index, key)| {
+            (
+                key,
+                slots[index].take().unwrap_or_else(|| {
+                    Err(AppError::InternalServerError(
+                        "bulk recover did not classify an input".into(),
+                    ))
+                }),
+            )
+        })
+        .collect()
 }
 
 /// Classify only the mutation boundary. Exact live/trash keys remain the
@@ -819,15 +1164,38 @@ async fn find_trash_recovery_set_controlled(
     }
     candidates.sort_by(|left, right| left.logical_key.cmp(&right.logical_key));
     let mut recovery = Vec::with_capacity(candidates.len());
-    for name in candidates {
+    let mut pending = candidates.into_iter();
+    let mut reads = FuturesUnordered::new();
+    loop {
         control.ensure_running()?;
-        let located = read_canonical_record(fragment, &name).await?;
-        recovery.push((name, located));
-        control.planning(
-            recovery.len(),
-            recovery.last().map(|(name, _)| name.logical_key.clone()),
-        );
+        while reads.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some(name) = pending.next() else {
+                break;
+            };
+            let fragment = fragment.to_string();
+            reads.push(async move {
+                let _permit = PREFIX_PLANNING_BUDGET
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        AppError::ServiceUnavailable("namespace planning budget is closed".into())
+                    })?;
+                let located = read_canonical_record(&fragment, &name).await?;
+                Ok::<_, AppError>((name, located))
+            });
+        }
+        match reads.next().await {
+            Some(Ok(item)) => {
+                let current = item.0.logical_key.clone();
+                recovery.push(item);
+                control.planning(recovery.len(), Some(current));
+            }
+            Some(Err(error)) => return Err(error),
+            None => break,
+        }
     }
+    recovery.sort_by(|left, right| left.0.logical_key.cmp(&right.0.logical_key));
     Ok(recovery)
 }
 
@@ -1086,45 +1454,45 @@ async fn trash_key_or_prefix(
     }
     let affected = names.len();
     let mut work = Vec::with_capacity(affected);
-    for name in names {
-        control.ensure_running()?;
-        work.push(read_canonical_record(fragment, &name).await?);
-        control.planning(
-            work.len(),
-            work.last().map(|record| record.logical_key.clone()),
-        );
-    }
-    control.executing(affected, 0, 0, 0, None);
-    let mut pending = work.into_iter();
-    let mut running = FuturesUnordered::new();
-    let mut completed = 0usize;
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
+    let mut pending = names.into_iter();
+    let mut planning = FuturesUnordered::new();
     loop {
         control.ensure_running()?;
-        while running.len() < PREFIX_MUTATION_CONCURRENCY {
-            let Some(located) = pending.next() else {
+        while planning.len() < PREFIX_MUTATION_CONCURRENCY {
+            let Some(name) = pending.next() else {
                 break;
             };
+            let fragment = fragment.to_string();
             let mutation_id = mutation_id.to_string();
-            let path = located.logical_key.clone();
-            running.push(async move { (path, trash_one(&located, &mutation_id, now_nanos).await) });
+            planning.push(async move {
+                let _permit = PREFIX_PLANNING_BUDGET
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        AppError::ServiceUnavailable("namespace planning budget is closed".into())
+                    })?;
+                let located = read_canonical_record(&fragment, &name).await?;
+                let locator = TrashLocator {
+                    logical_key: located.logical_key.clone(),
+                    deleted_at_unix_nanos: now_nanos,
+                    delete_mutation_id: mutation_id,
+                };
+                Ok::<_, AppError>(NcnxTrashBatchItem { located, locator })
+            });
         }
-        match running.next().await {
-            Some((path, Ok(()))) => {
-                completed = completed.saturating_add(1);
-                succeeded = succeeded.saturating_add(1);
-                control.executing(affected, completed, succeeded, failed, Some(path));
+        match planning.next().await {
+            Some(Ok(item)) => {
+                let current = item.located.logical_key.clone();
+                work.push(item);
+                control.planning(work.len(), Some(current));
             }
-            Some((path, Err(error))) => {
-                completed = completed.saturating_add(1);
-                failed = failed.saturating_add(1);
-                control.executing(affected, completed, succeeded, failed, Some(path));
-                return Err(error);
-            }
+            Some(Err(error)) => return Err(error),
             None => break,
         }
     }
+    work.sort_by(|left, right| left.located.logical_key.cmp(&right.located.logical_key));
+    run_prefix_trash(work, mutation_id, now_nanos, control).await?;
     Ok(mutation_summary(
         "trash",
         NamespaceEntryKind::Directory,
@@ -1134,6 +1502,120 @@ async fn trash_key_or_prefix(
         Some(mutation_id.to_string()),
         Some(now_nanos),
     ))
+}
+
+async fn run_prefix_trash(
+    work: Vec<NcnxTrashBatchItem>,
+    mutation_id: &str,
+    now_nanos: i64,
+    control: &NamespaceMutationControl,
+) -> Result<(), AppError> {
+    let total = work.len();
+    control.executing(total, 0, 0, 0, None);
+    let mut completed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for batch in work.chunks(PEER_NCNX_BATCH_MAX) {
+        control.ensure_running()?;
+        let _batch_permit = PREFIX_BATCH_BUDGET
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable("namespace mutation budget is closed".into())
+            })?;
+        match trash_live_batch(batch).await {
+            Ok(()) => {
+                completed = completed.saturating_add(batch.len());
+                succeeded = succeeded.saturating_add(batch.len());
+                control.executing(
+                    total,
+                    completed,
+                    succeeded,
+                    failed,
+                    batch.last().map(|item| item.located.logical_key.clone()),
+                );
+            }
+            Err(_) => {
+                for item in batch {
+                    control.ensure_running()?;
+                    let path = item.located.logical_key.clone();
+                    match trash_one(&item.located, mutation_id, now_nanos).await {
+                        Ok(()) => {
+                            completed = completed.saturating_add(1);
+                            succeeded = succeeded.saturating_add(1);
+                            control.executing(total, completed, succeeded, failed, Some(path));
+                        }
+                        Err(error) => {
+                            completed = completed.saturating_add(1);
+                            failed = failed.saturating_add(1);
+                            control.executing(total, completed, succeeded, failed, Some(path));
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_prefix_recover(
+    work: Vec<NcnxRecoverBatchItem>,
+    control: &NamespaceMutationControl,
+) -> Result<(), AppError> {
+    let total = work.len();
+    control.executing(total, 0, 0, 0, None);
+    let mut completed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for batch in work.chunks(PEER_NCNX_BATCH_MAX) {
+        control.ensure_running()?;
+        let _batch_permit = PREFIX_BATCH_BUDGET
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable("namespace mutation budget is closed".into())
+            })?;
+        match recover_trash_batch(batch).await {
+            Ok(()) => {
+                completed = completed.saturating_add(batch.len());
+                succeeded = succeeded.saturating_add(batch.len());
+                control.executing(
+                    total,
+                    completed,
+                    succeeded,
+                    failed,
+                    batch.last().map(|item| item.located.logical_key.clone()),
+                );
+            }
+            Err(_) => {
+                for item in batch {
+                    control.ensure_running()?;
+                    let path = item.located.logical_key.clone();
+                    let name = PeerNcnxName {
+                        logical_key: path.clone(),
+                        trash: Some(item.locator.clone()),
+                    };
+                    match recover_one(&name, &item.located).await {
+                        Ok(()) => {
+                            completed = completed.saturating_add(1);
+                            succeeded = succeeded.saturating_add(1);
+                            control.executing(total, completed, succeeded, failed, Some(path));
+                        }
+                        Err(error) => {
+                            completed = completed.saturating_add(1);
+                            failed = failed.saturating_add(1);
+                            control.executing(total, completed, succeeded, failed, Some(path));
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn trash_one(

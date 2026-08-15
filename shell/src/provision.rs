@@ -20,8 +20,8 @@ use crate::install::{
     render_node_unit, valid_ndisk_label,
 };
 
-const AGENT_PROTOCOL_VERSION: u32 = 1;
-const PLAN_FORMAT_VERSION: u32 = 2;
+const AGENT_PROTOCOL_VERSION: u32 = 2;
+const PLAN_FORMAT_VERSION: u32 = 3;
 const MEMBERSHIP_FORMAT_VERSION: u32 = 5;
 
 static PROVISION_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
@@ -110,7 +110,7 @@ pub enum AgentCommand {
     },
     Prepare {
         envelope: DeploymentEnvelope,
-        node_id: String,
+        host_id: String,
     },
     Commit {
         plan_hash: String,
@@ -180,7 +180,8 @@ struct LocalIdentity {
 struct StageManifest {
     format_version: u32,
     cluster_id: String,
-    node_id: String,
+    host_id: String,
+    node_ids: Vec<String>,
     plan_hash: String,
     env_sha256: String,
     certificate_sha256: String,
@@ -398,14 +399,14 @@ impl AgentController {
                     data: json!({"label": result.label, "uuid": result.uuid}),
                 })
             }
-            AgentCommand::Prepare { envelope, node_id } => {
+            AgentCommand::Prepare { envelope, host_id } => {
                 if envelope.spec.cluster_id != pair.cluster_id {
                     return Err("deployment cluster does not match paired cluster".into());
                 }
-                self.prepare(&envelope, &node_id)?;
+                self.prepare(&envelope, &host_id)?;
                 Ok(AgentResponse::success(
-                    format!("node {node_id} prepared at hash {}", envelope.plan_hash),
-                    json!({"plan_hash": envelope.plan_hash, "node_id": node_id}),
+                    format!("host {host_id} prepared at hash {}", envelope.plan_hash),
+                    json!({"plan_hash": envelope.plan_hash, "host_id": host_id}),
                 ))
             }
             AgentCommand::Commit { plan_hash } => {
@@ -464,7 +465,7 @@ impl AgentController {
         }
     }
 
-    fn prepare(&self, envelope: &DeploymentEnvelope, node_id: &str) -> Result<(), String> {
+    fn prepare(&self, envelope: &DeploymentEnvelope, host_id: &str) -> Result<(), String> {
         self.host.require_privileged()?;
         self.host
             .identity_exists(&self.settings.run_user, &self.settings.run_group)?;
@@ -472,27 +473,34 @@ impl AgentController {
         self.ensure_local_services_stopped()?;
         envelope.validate_hash()?;
         envelope.spec.validate()?;
-        let node = envelope
+        let host = envelope
             .spec
-            .nodes
-            .get(node_id)
-            .ok_or_else(|| format!("node '{node_id}' is not in the deployment"))?;
-        if node.agent.agent_id != self.identity.agent_id
-            || node.agent.machine_fingerprint != self.identity.machine_fingerprint
+            .hosts
+            .get(host_id)
+            .ok_or_else(|| format!("host '{host_id}' is not in the deployment"))?;
+        if host.agent.agent_id != self.identity.agent_id
+            || host.agent.machine_fingerprint != self.identity.machine_fingerprint
         {
             return Err(format!(
-                "node '{node_id}' is bound to a different physical provisioning agent"
+                "host '{host_id}' is bound to a different physical provisioning agent"
             ));
         }
-        if self.host.service_is_active(&self.node_service(node_id)) {
-            return Err(format!(
-                "local N2 node '{node_id}' must be stopped before prepare"
-            ));
+        let local_nodes = envelope.spec.nodes_for_host(host_id);
+        if local_nodes.is_empty() {
+            return Err(format!("host '{host_id}' owns no N2 node instances"));
         }
-        if node.agent.mount_root != self.settings.mount_root.to_string_lossy() {
+        for node in &local_nodes {
+            if self.host.service_is_active(&self.node_service(&node.id)) {
+                return Err(format!(
+                    "local N2 node '{}' must be stopped before prepare",
+                    node.id
+                ));
+            }
+        }
+        if host.agent.mount_root != self.settings.mount_root.to_string_lossy() {
             return Err("the committed mount root differs from this agent's mount root".into());
         }
-        self.validate_local_disks(&envelope.spec, node_id)?;
+        self.validate_local_disks(&envelope.spec, host_id)?;
         if envelope.certificate.is_empty() || envelope.private_key.is_empty() {
             return Err("TLS certificate and private key cannot be empty".into());
         }
@@ -503,27 +511,28 @@ impl AgentController {
             fs::remove_dir_all(&stage)
                 .map_err(|error| format!("clear staged deployment {}: {error}", stage.display()))?;
         }
-        let node_stage = stage.join("node");
-        let state_stage = node_stage.join("state");
-        let cert_stage = node_stage.join("certificates");
-        fs::create_dir_all(&state_stage).map_err(|error| error.to_string())?;
-        fs::create_dir_all(&cert_stage).map_err(|error| error.to_string())?;
-
         let membership = render_membership(&envelope.spec)?;
         let membership_bytes = serde_json::to_vec_pretty(&membership)
             .map_err(|error| format!("serialize membership: {error}"))?;
-        atomic_write(
-            &node_stage.join("n2_config.ini"),
-            render_node_config(&envelope.spec, node_id, &self.settings)?.as_bytes(),
-            0o640,
-        )?;
-        atomic_write(
-            &state_stage.join("n2_membership.json"),
-            &membership_bytes,
-            0o640,
-        )?;
-        atomic_write(&cert_stage.join("cert.pem"), &envelope.certificate, 0o640)?;
-        atomic_write(&cert_stage.join("key.pem"), &envelope.private_key, 0o600)?;
+        for node in &local_nodes {
+            let node_stage = stage.join("nodes").join(&node.id);
+            let state_stage = node_stage.join("state");
+            let cert_stage = node_stage.join("certificates");
+            fs::create_dir_all(&state_stage).map_err(|error| error.to_string())?;
+            fs::create_dir_all(&cert_stage).map_err(|error| error.to_string())?;
+            atomic_write(
+                &node_stage.join("n2_config.ini"),
+                render_node_config(&envelope.spec, &node.id, &self.settings)?.as_bytes(),
+                0o640,
+            )?;
+            atomic_write(
+                &state_stage.join("n2_membership.json"),
+                &membership_bytes,
+                0o640,
+            )?;
+            atomic_write(&cert_stage.join("cert.pem"), &envelope.certificate, 0o640)?;
+            atomic_write(&cert_stage.join("key.pem"), &envelope.private_key, 0o600)?;
+        }
         atomic_write(&stage.join("n2.env"), envelope.env.as_bytes(), 0o600)?;
         atomic_write(
             &stage.join("node.service"),
@@ -531,18 +540,13 @@ impl AgentController {
             0o644,
         )?;
 
-        if envelope
-            .spec
-            .gateway_for_agent(&self.identity.agent_id)
-            .is_some()
-        {
+        if envelope.spec.gateway_for_host(host_id).is_some() {
             let gateway_stage = stage.join("gateway");
             fs::create_dir_all(gateway_stage.join("certificates"))
                 .map_err(|error| error.to_string())?;
             atomic_write(
-                &gateway_stage.join("gateway.ini"),
-                render_gateway_config(&envelope.spec, &self.identity.agent_id, &self.settings)?
-                    .as_bytes(),
+                &gateway_stage.join("n2_gateway_config.ini"),
+                render_gateway_config(&envelope.spec, host_id, &self.settings)?.as_bytes(),
                 0o640,
             )?;
             atomic_write(
@@ -567,12 +571,16 @@ impl AgentController {
         let manifest = StageManifest {
             format_version: AGENT_PROTOCOL_VERSION,
             cluster_id: envelope.spec.cluster_id.clone(),
-            node_id: node_id.to_string(),
+            host_id: host_id.to_string(),
+            node_ids: local_nodes.iter().map(|node| node.id.clone()).collect(),
             plan_hash: envelope.plan_hash.clone(),
             env_sha256: sha256_hex(envelope.env.as_bytes()),
             certificate_sha256: sha256_hex(&envelope.certificate),
             private_key_sha256: sha256_hex(&envelope.private_key),
-            disks: node.disks.values().cloned().collect(),
+            disks: local_nodes
+                .iter()
+                .flat_map(|node| node.disks.values().cloned())
+                .collect(),
             staged_content_sha256,
         };
         write_json(&stage.join("manifest.json"), &manifest, 0o600)
@@ -596,7 +604,6 @@ impl AgentController {
             ensure_executable(&self.settings.gateway_binary, "N2 gateway binary")?;
         }
 
-        let live_node = self.settings.node_dir(&manifest.node_id);
         for disk in &manifest.disks {
             let storage = self.settings.mount_path(&disk.label).join("n2");
             fs::create_dir_all(&storage)
@@ -607,28 +614,38 @@ impl AgentController {
                 &self.settings.run_group,
             )?;
         }
-        fs::create_dir_all(live_node.join("state")).map_err(|error| error.to_string())?;
-        fs::create_dir_all(live_node.join("certificates")).map_err(|error| error.to_string())?;
-        copy_atomic(
-            &stage.join("node/n2_config.ini"),
-            &live_node.join("n2_config.ini"),
-            0o640,
-        )?;
-        copy_atomic(
-            &stage.join("node/state/n2_membership.json"),
-            &live_node.join("state/n2_membership.json"),
-            0o640,
-        )?;
-        copy_atomic(
-            &stage.join("node/certificates/cert.pem"),
-            &live_node.join("certificates/cert.pem"),
-            0o640,
-        )?;
-        copy_atomic(
-            &stage.join("node/certificates/key.pem"),
-            &live_node.join("certificates/key.pem"),
-            0o600,
-        )?;
+        for node_id in &manifest.node_ids {
+            let live_node = self.settings.node_dir(node_id);
+            let staged_node = stage.join("nodes").join(node_id);
+            fs::create_dir_all(live_node.join("state")).map_err(|error| error.to_string())?;
+            fs::create_dir_all(live_node.join("certificates"))
+                .map_err(|error| error.to_string())?;
+            copy_atomic(
+                &staged_node.join("n2_config.ini"),
+                &live_node.join("n2_config.ini"),
+                0o640,
+            )?;
+            copy_atomic(
+                &staged_node.join("state/n2_membership.json"),
+                &live_node.join("state/n2_membership.json"),
+                0o640,
+            )?;
+            copy_atomic(
+                &staged_node.join("certificates/cert.pem"),
+                &live_node.join("certificates/cert.pem"),
+                0o640,
+            )?;
+            copy_atomic(
+                &staged_node.join("certificates/key.pem"),
+                &live_node.join("certificates/key.pem"),
+                0o600,
+            )?;
+            self.host.apply_ownership(
+                &live_node,
+                &self.settings.run_user,
+                &self.settings.run_group,
+            )?;
+        }
         copy_atomic(&stage.join("n2.env"), &self.settings.env_path, 0o600)?;
         copy_atomic(
             &stage.join("node.service"),
@@ -641,8 +658,8 @@ impl AgentController {
             fs::create_dir_all(self.settings.gateway_runtime.join("certificates"))
                 .map_err(|error| error.to_string())?;
             copy_atomic(
-                &gateway_stage.join("gateway.ini"),
-                &self.settings.gateway_runtime.join("gateway.ini"),
+                &gateway_stage.join("n2_gateway_config.ini"),
+                &self.settings.gateway_runtime.join("n2_gateway_config.ini"),
                 0o640,
             )?;
             copy_atomic(
@@ -666,11 +683,6 @@ impl AgentController {
                 &self.settings.run_group,
             )?;
         }
-        self.host.apply_ownership(
-            &live_node,
-            &self.settings.run_user,
-            &self.settings.run_group,
-        )?;
         self.host.reload_systemd()?;
         atomic_write(&self.committed_hash_path(), plan_hash.as_bytes(), 0o600)?;
         Ok(())
@@ -689,38 +701,41 @@ impl AgentController {
         Ok(())
     }
 
-    fn validate_local_disks(&self, spec: &ClusterSpec, node_id: &str) -> Result<(), String> {
-        let node = spec.nodes.get(node_id).expect("validated node");
+    fn validate_local_disks(&self, spec: &ClusterSpec, host_id: &str) -> Result<(), String> {
+        let local_nodes = spec.nodes_for_host(host_id);
         let disks = self.host.list_disks()?;
-        if node.disks.is_empty() {
-            return Err(format!("node '{node_id}' owns no storage disks"));
-        }
-        for (label, binding) in &node.disks {
-            let disk = find_disk(&disks, label)
-                .ok_or_else(|| format!("{label} is not visible on physical node '{node_id}'"))?;
-            let expected_mount = self.settings.mount_path(label);
-            if disk.filesystem.as_deref() != Some("xfs")
-                || !disk
-                    .mountpoints
-                    .iter()
-                    .any(|mount| Path::new(mount) == expected_mount)
-            {
-                return Err(format!(
-                    "{label} must be mounted XFS at {} on physical node '{node_id}'",
-                    expected_mount.display()
-                ));
+        for node in local_nodes {
+            if node.disks.is_empty() {
+                return Err(format!("node '{}' owns no storage disks", node.id));
             }
-            if disk.uuid.as_deref() != Some(binding.filesystem_uuid.as_str()) {
-                return Err(format!(
-                    "{label} UUID changed on physical node '{node_id}'; expected {}, observed {}",
-                    binding.filesystem_uuid,
-                    disk.uuid.as_deref().unwrap_or("none")
-                ));
-            }
-            if !binding.serial.is_empty() && disk.serial != binding.serial {
-                return Err(format!(
-                    "{label} hardware serial changed on physical node '{node_id}'"
-                ));
+            for (label, binding) in &node.disks {
+                let disk = find_disk(&disks, label).ok_or_else(|| {
+                    format!("{label} is not visible on physical host '{host_id}'")
+                })?;
+                let expected_mount = self.settings.mount_path(label);
+                if disk.filesystem.as_deref() != Some("xfs")
+                    || !disk
+                        .mountpoints
+                        .iter()
+                        .any(|mount| Path::new(mount) == expected_mount)
+                {
+                    return Err(format!(
+                        "{label} must be mounted XFS at {} on physical host '{host_id}'",
+                        expected_mount.display()
+                    ));
+                }
+                if disk.uuid.as_deref() != Some(binding.filesystem_uuid.as_str()) {
+                    return Err(format!(
+                        "{label} UUID changed on physical host '{host_id}'; expected {}, observed {}",
+                        binding.filesystem_uuid,
+                        disk.uuid.as_deref().unwrap_or("none")
+                    ));
+                }
+                if !binding.serial.is_empty() && disk.serial != binding.serial {
+                    return Err(format!(
+                        "{label} hardware serial changed on physical host '{host_id}'"
+                    ));
+                }
             }
         }
         Ok(())
@@ -762,10 +777,10 @@ impl AgentController {
             "stage manifest",
         )?;
         match target {
-            ServiceTarget::Node { node_id } if node_id == &manifest.node_id => Ok(()),
+            ServiceTarget::Node { node_id } if manifest.node_ids.contains(node_id) => Ok(()),
             ServiceTarget::Node { node_id } => Err(format!(
-                "physical agent owns node '{}', not '{node_id}'",
-                manifest.node_id
+                "physical agent owns nodes [{}], not '{node_id}'",
+                manifest.node_ids.join(", ")
             )),
             ServiceTarget::Gateway if self.stage_path(&hash).join("gateway").exists() => Ok(()),
             ServiceTarget::Gateway => {
@@ -815,12 +830,18 @@ pub struct AgentBinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostSpec {
+    pub id: String,
+    pub agent: AgentBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeSpec {
     pub id: String,
+    pub host_id: String,
     pub advertised_host: String,
     pub https_port: u16,
     pub native_port: u16,
-    pub agent: AgentBinding,
     pub disks: BTreeMap<String, DiskSpec>,
 }
 
@@ -862,6 +883,7 @@ pub struct ClusterSpec {
     pub format_version: u32,
     pub cluster_id: String,
     pub topology_epoch: u64,
+    pub hosts: BTreeMap<String, HostSpec>,
     pub nodes: BTreeMap<String, NodeSpec>,
     pub pools: BTreeMap<String, PoolSpec>,
     pub reserve_nodes: BTreeSet<String>,
@@ -882,6 +904,25 @@ impl ClusterSpec {
         }
         if self.pools.is_empty() {
             return Err("at least one server pool is required".into());
+        }
+        if self.hosts.is_empty() {
+            return Err("at least one physical host is required".into());
+        }
+        let mut agent_ids = BTreeSet::new();
+        for (host_key, host) in &self.hosts {
+            if host_key != &host.id {
+                return Err(format!(
+                    "host map key '{host_key}' does not match host ID '{}'",
+                    host.id
+                ));
+            }
+            validate_id(&host.id, "host ID")?;
+            if !agent_ids.insert(host.agent.agent_id.clone()) {
+                return Err(format!(
+                    "physical provisioning agent '{}' is enrolled more than once",
+                    host.agent.agent_id
+                ));
+            }
         }
         let mut claimed = BTreeSet::new();
         let mut generations = BTreeSet::new();
@@ -944,7 +985,6 @@ impl ClusterSpec {
             ));
         }
         let mut labels = BTreeSet::new();
-        let mut agent_ids = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         for (node_key, node) in &self.nodes {
             if node_key != &node.id {
@@ -955,10 +995,10 @@ impl ClusterSpec {
             }
             validate_id(&node.id, "node ID")?;
             validate_host(&node.advertised_host)?;
-            if !agent_ids.insert(node.agent.agent_id.clone()) {
+            if !self.hosts.contains_key(&node.host_id) {
                 return Err(format!(
-                    "physical provisioning agent '{}' is assigned to more than one N2 node",
-                    node.agent.agent_id
+                    "node '{}' references unknown physical host '{}'",
+                    node.id, node.host_id
                 ));
             }
             for port in [node.https_port, node.native_port] {
@@ -983,7 +1023,7 @@ impl ClusterSpec {
                 }
             }
         }
-        let mut gateway_agents = BTreeSet::new();
+        let mut gateway_hosts = BTreeSet::new();
         for (gateway_key, gateway) in &self.gateways {
             if gateway_key != &gateway.id {
                 return Err(format!(
@@ -1000,36 +1040,49 @@ impl ClusterSpec {
             validate_host(&gateway.bind_host)?;
             let node = &self.nodes[&gateway.node_id];
             if gateway.https_port == 0
-                || gateway.https_port == node.https_port
-                || gateway.https_port == node.native_port
+                || self.nodes_for_host(&node.host_id).iter().any(|local| {
+                    gateway.https_port == local.https_port
+                        || gateway.https_port == local.native_port
+                })
             {
                 return Err(format!(
-                    "gateway '{}' port collides with its local node",
+                    "gateway '{}' port collides with a node on its physical host",
                     gateway.id
                 ));
             }
-            if !gateway_agents.insert(node.agent.agent_id.clone()) {
+            if !gateway_hosts.insert(node.host_id.clone()) {
                 return Err(format!(
-                    "physical agent '{}' hosts more than one gateway",
-                    node.agent.agent_id
+                    "physical host '{}' owns more than one gateway",
+                    node.host_id
                 ));
             }
         }
         Ok(())
     }
 
-    fn gateway_for_agent(&self, agent_id: &str) -> Option<&GatewaySpec> {
+    fn nodes_for_host(&self, host_id: &str) -> Vec<&NodeSpec> {
+        self.nodes
+            .values()
+            .filter(|node| node.host_id == host_id)
+            .collect()
+    }
+
+    fn host_for_node(&self, node: &NodeSpec) -> &HostSpec {
+        self.hosts.get(&node.host_id).expect("validated node host")
+    }
+
+    fn gateway_for_host(&self, host_id: &str) -> Option<&GatewaySpec> {
         self.gateways.values().find(|gateway| {
             self.nodes
                 .get(&gateway.node_id)
-                .is_some_and(|node| node.agent.agent_id == agent_id)
+                .is_some_and(|node| node.host_id == host_id)
         })
     }
 
     fn sanitized(&self) -> Self {
         let mut clone = self.clone();
-        for node in clone.nodes.values_mut() {
-            node.agent.credential.clear();
+        for host in clone.hosts.values_mut() {
+            host.agent.credential.clear();
         }
         clone
     }
@@ -1161,6 +1214,7 @@ impl ProvisionShell {
                 Ok(success_outcome())
             }
             "cluster" => self.cluster_command(&arguments[1..], confirmation, emit),
+            "host" => self.host_command(&arguments[1..], emit),
             "node" => self.node_command(&arguments[1..], emit),
             "pool" => self.pool_command(&arguments[1..], emit),
             "reserve" => self.reserve_command(&arguments[1..], emit),
@@ -1192,6 +1246,7 @@ impl ProvisionShell {
                         format_version: PLAN_FORMAT_VERSION,
                         cluster_id: cluster_id.clone(),
                         topology_epoch: 1,
+                        hosts: BTreeMap::new(),
                         nodes: BTreeMap::new(),
                         pools: BTreeMap::new(),
                         reserve_nodes: BTreeSet::new(),
@@ -1206,7 +1261,7 @@ impl ProvisionShell {
                 self.save_plan(&plan)?;
                 emit(
                     OutputKind::Success,
-                    format!("cluster '{cluster_id}' draft initialized; pair every physical node agent next"),
+                    format!("cluster '{cluster_id}' draft initialized; enroll every physical host agent next"),
                 );
                 Ok(success_outcome())
             }
@@ -1230,7 +1285,7 @@ impl ProvisionShell {
                             prompt: format!(
                                 "Prepare and commit topology {} to {} independent physical agents. Services remain stopped.\nType '{}' to continue:",
                                 envelope.plan_hash,
-                                plan.spec.nodes.len(),
+                                plan.spec.hosts.len(),
                                 expected
                             ),
                             expected,
@@ -1332,26 +1387,19 @@ impl ProvisionShell {
         }
     }
 
-    fn node_command(&self, arguments: &[String], emit: Emit<'_>) -> Result<CommandOutcome, String> {
+    fn host_command(&self, arguments: &[String], emit: Emit<'_>) -> Result<CommandOutcome, String> {
         match arguments.first().map(String::as_str).unwrap_or("") {
             "pair" => {
-                let usage = "usage: node pair <node-id> <agent-url> <agent-setup-token> <advertised-host> <https-port> <native-port>";
-                let node_id = arguments.get(1).ok_or(usage)?;
+                let usage = "usage: host pair <host-id> <agent-url> <agent-setup-token>";
+                let host_id = arguments.get(1).ok_or(usage)?;
                 let agent_url = normalize_agent_url(arguments.get(2).ok_or(usage)?)?;
                 let pair_token = arguments.get(3).ok_or(usage)?;
-                let advertised_host = arguments.get(4).ok_or(usage)?;
-                let https_port = parse_port(arguments.get(5), usage)?;
-                let native_port = parse_port(arguments.get(6), usage)?;
-                validate_id(node_id, "node ID")?;
-                validate_host(advertised_host)?;
-                if https_port == native_port {
-                    return Err("HTTPS and native ports must differ".into());
-                }
+                validate_id(host_id, "host ID")?;
                 let mut plan = self.load_plan()?;
                 self.ensure_draft(&plan)?;
-                if plan.spec.nodes.contains_key(node_id) {
+                if plan.spec.hosts.contains_key(host_id) {
                     return Err(format!(
-                        "node '{node_id}' is already paired; node identity cannot be overwritten"
+                        "host '{host_id}' is already paired; physical identity cannot be overwritten"
                     ));
                 }
                 let response = self.pair_agent(
@@ -1368,21 +1416,92 @@ impl ProvisionShell {
                         response.identity.protocol_version, AGENT_PROTOCOL_VERSION
                     ));
                 }
-                if !self.allow_shared_failure_domain
-                    && plan.spec.nodes.values().any(|existing| {
-                        existing.id != *node_id
+                if plan.spec.hosts.values().any(|existing| {
+                    existing.agent.agent_id == response.identity.agent_id
+                        || (!self.allow_shared_failure_domain
                             && existing.agent.machine_fingerprint
-                                == response.identity.machine_fingerprint
-                    })
-                {
+                                == response.identity.machine_fingerprint)
+                }) {
                     return Err(
-                        "another paired node has the same machine fingerprint; one physical host is one failure domain (use --allow-shared-failure-domain only for laboratory simulation)"
-                            .into(),
+                        "this physical agent or machine fingerprint is already enrolled".into(),
                     );
                 }
+                plan.spec.hosts.insert(
+                    host_id.clone(),
+                    HostSpec {
+                        id: host_id.clone(),
+                        agent: AgentBinding {
+                            url: agent_url,
+                            agent_id: response.identity.agent_id,
+                            machine_fingerprint: response.identity.machine_fingerprint,
+                            mount_root: response.identity.mount_root,
+                            credential: response.credential,
+                        },
+                    },
+                );
+                plan.committed_hash = None;
+                self.save_plan(&plan)?;
+                emit(
+                    OutputKind::Success,
+                    format!(
+                        "enrolled physical host {host_id} ({}) through {}",
+                        response.identity.hostname, plan.spec.hosts[host_id].agent.url
+                    ),
+                );
+                Ok(success_outcome())
+            }
+            "list" => {
+                let plan = self.load_plan()?;
+                for host in plan.spec.hosts.values() {
+                    let nodes = plan
+                        .spec
+                        .nodes_for_host(&host.id)
+                        .iter()
+                        .map(|node| node.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    emit(
+                        OutputKind::Normal,
+                        format!(
+                            "{}  agent={}  nodes=[{}]  failure-domain={}",
+                            host.id,
+                            host.agent.url,
+                            nodes,
+                            &host.agent.machine_fingerprint
+                                [..16.min(host.agent.machine_fingerprint.len())]
+                        ),
+                    );
+                }
+                Ok(success_outcome())
+            }
+            _ => Err("usage: host <pair|list> ...".into()),
+        }
+    }
+
+    fn node_command(&self, arguments: &[String], emit: Emit<'_>) -> Result<CommandOutcome, String> {
+        match arguments.first().map(String::as_str).unwrap_or("") {
+            "create" => {
+                let usage = "usage: node create <node-id> <host-id> <advertised-host> <https-port> <native-port>";
+                let node_id = arguments.get(1).ok_or(usage)?;
+                let host_id = arguments.get(2).ok_or(usage)?;
+                let advertised_host = arguments.get(3).ok_or(usage)?;
+                let https_port = parse_port(arguments.get(4), usage)?;
+                let native_port = parse_port(arguments.get(5), usage)?;
+                validate_id(node_id, "node ID")?;
+                validate_host(advertised_host)?;
+                if https_port == native_port {
+                    return Err("HTTPS and native ports must differ".into());
+                }
+                let mut plan = self.load_plan()?;
+                self.ensure_draft(&plan)?;
+                if !plan.spec.hosts.contains_key(host_id) {
+                    return Err(format!("physical host '{host_id}' is not enrolled"));
+                }
+                if plan.spec.nodes.contains_key(node_id) {
+                    return Err(format!("node '{node_id}' already exists"));
+                }
                 for existing in plan.spec.nodes.values() {
-                    if existing.id != *node_id
-                        && existing.advertised_host == *advertised_host
+                    if existing.advertised_host == *advertised_host
                         && [existing.https_port, existing.native_port]
                             .iter()
                             .any(|port| *port == https_port || *port == native_port)
@@ -1394,26 +1513,18 @@ impl ProvisionShell {
                     node_id.clone(),
                     NodeSpec {
                         id: node_id.clone(),
+                        host_id: host_id.clone(),
                         advertised_host: advertised_host.clone(),
                         https_port,
                         native_port,
-                        agent: AgentBinding {
-                            url: agent_url,
-                            agent_id: response.identity.agent_id,
-                            machine_fingerprint: response.identity.machine_fingerprint,
-                            mount_root: response.identity.mount_root,
-                            credential: response.credential,
-                        },
                         disks: BTreeMap::new(),
                     },
                 );
-                plan.committed_hash = None;
                 self.save_plan(&plan)?;
                 emit(
                     OutputKind::Success,
                     format!(
-                        "paired physical {node_id} ({}) at https://{}:{https_port} / n2://{}:{native_port}",
-                        response.identity.hostname, advertised_host, advertised_host
+                        "created node {node_id} on {host_id} at https://{advertised_host}:{https_port} / n2://{advertised_host}:{native_port}"
                     ),
                 );
                 Ok(success_outcome())
@@ -1424,23 +1535,20 @@ impl ProvisionShell {
                     emit(
                         OutputKind::Normal,
                         format!(
-                            "{}  agent={}  host={}  disks={}  failure-domain={}",
+                            "{}  physical-host={}  endpoint={}:{}  native={}:{}  disks=[{}]",
                             node.id,
-                            node.agent.url,
+                            node.host_id,
                             node.advertised_host,
-                            if node.disks.is_empty() {
-                                "—".into()
-                            } else {
-                                node.disks.keys().cloned().collect::<Vec<_>>().join(",")
-                            },
-                            &node.agent.machine_fingerprint
-                                [..16.min(node.agent.machine_fingerprint.len())]
+                            node.https_port,
+                            node.advertised_host,
+                            node.native_port,
+                            node.disks.keys().cloned().collect::<Vec<_>>().join(",")
                         ),
                     );
                 }
                 Ok(success_outcome())
             }
-            _ => Err("usage: node <pair|list> ...".into()),
+            _ => Err("usage: node <create|list> ...".into()),
         }
     }
 
@@ -1580,20 +1688,20 @@ impl ProvisionShell {
         arguments: &[String],
         emit: Emit<'_>,
     ) -> Result<CommandOutcome, String> {
-        let node_id = arguments.first().ok_or("usage: lsblk <node-id>")?;
+        let host_id = arguments.first().ok_or("usage: lsblk <host-id>")?;
         let plan = self.load_plan()?;
-        let node = plan
+        let host = plan
             .spec
-            .nodes
-            .get(node_id)
-            .ok_or_else(|| format!("node '{node_id}' is not paired"))?;
-        let response = self.agent_call(&node.agent, &AgentCommand::Inventory)?;
+            .hosts
+            .get(host_id)
+            .ok_or_else(|| format!("physical host '{host_id}' is not enrolled"))?;
+        let response = self.agent_call(&host.agent, &AgentCommand::Inventory)?;
         ensure_agent_success(&response)?;
         let disks: Vec<BlockDisk> = serde_json::from_value(response.data)
-            .map_err(|error| format!("decode {node_id} inventory: {error}"))?;
+            .map_err(|error| format!("decode {host_id} inventory: {error}"))?;
         emit(
             OutputKind::Info,
-            format!("PHYSICAL NODE {node_id} / {}", node.agent.url),
+            format!("PHYSICAL HOST {host_id} / {}", host.agent.url),
         );
         emit(
             OutputKind::Normal,
@@ -1637,15 +1745,15 @@ impl ProvisionShell {
         self.ensure_draft(&plan)?;
         match arguments.first().map(String::as_str).unwrap_or("") {
             "inspect" => {
-                let usage = "usage: disk inspect <node-id> <device-or-label>";
-                let node = plan
+                let usage = "usage: disk inspect <host-id> <device-or-label>";
+                let host = plan
                     .spec
-                    .nodes
+                    .hosts
                     .get(arguments.get(1).ok_or(usage)?)
-                    .ok_or_else(|| "physical node is not paired".to_string())?;
+                    .ok_or_else(|| "physical host is not enrolled".to_string())?;
                 let target = arguments.get(2).ok_or(usage)?;
                 let response = self.agent_call(
-                    &node.agent,
+                    &host.agent,
                     &AgentCommand::InspectDisk {
                         target: target.clone(),
                     },
@@ -1655,13 +1763,13 @@ impl ProvisionShell {
                 Ok(success_outcome())
             }
             "format" => {
-                let usage = "usage: disk format <node-id> <device> <N2DISKxxx>";
-                let node_id = arguments.get(1).ok_or(usage)?;
-                let node = plan
+                let usage = "usage: disk format <host-id> <device> <N2DISKxxx>";
+                let host_id = arguments.get(1).ok_or(usage)?;
+                let host = plan
                     .spec
-                    .nodes
-                    .get(node_id)
-                    .ok_or_else(|| format!("node '{node_id}' is not paired"))?;
+                    .hosts
+                    .get(host_id)
+                    .ok_or_else(|| format!("physical host '{host_id}' is not enrolled"))?;
                 let target = arguments.get(2).ok_or(usage)?;
                 let label = arguments.get(3).ok_or(usage)?;
                 if !valid_ndisk_label(label) {
@@ -1677,22 +1785,22 @@ impl ProvisionShell {
                         "disk label {label} is already assigned in this cluster draft"
                     ));
                 }
-                let inventory = self.inventory(node)?;
+                let inventory = self.inventory(&host.agent)?;
                 let disk = find_disk(&inventory, target)
-                    .ok_or_else(|| format!("disk '{target}' was not found on {node_id}"))?;
+                    .ok_or_else(|| format!("disk '{target}' was not found on {host_id}"))?;
                 if disk.system || disk.read_only || !disk.mountpoints.is_empty() {
                     return Err(format!("{} is not a safe formatting candidate", disk.path));
                 }
                 let expected = format!(
                     "FORMAT {} {label} {}",
-                    node.agent.agent_id,
+                    host.agent.agent_id,
                     disk_serial(disk)
                 );
                 if confirmation != Some(expected.as_str()) {
                     return Ok(CommandOutcome {
                         confirmation: Some(Confirmation {
                             prompt: format!(
-                                "WARNING: destroy signatures on physical node {node_id}, device {}, model '{}', serial '{}'.\nType '{}' to continue:",
+                                "WARNING: destroy signatures on physical host {host_id}, device {}, model '{}', serial '{}'.\nType '{}' to continue:",
                                 disk.path,
                                 disk.model,
                                 disk_serial(disk),
@@ -1704,7 +1812,7 @@ impl ProvisionShell {
                     });
                 }
                 let response = self.agent_call(
-                    &node.agent,
+                    &host.agent,
                     &AgentCommand::FormatDisk {
                         target: target.clone(),
                         label: label.clone(),
@@ -1715,16 +1823,16 @@ impl ProvisionShell {
                 Ok(success_outcome())
             }
             "mount" => {
-                let usage = "usage: disk mount <node-id> <N2DISKxxx>";
-                let node_id = arguments.get(1).ok_or(usage)?;
-                let node = plan
+                let usage = "usage: disk mount <host-id> <N2DISKxxx>";
+                let host_id = arguments.get(1).ok_or(usage)?;
+                let host = plan
                     .spec
-                    .nodes
-                    .get(node_id)
-                    .ok_or_else(|| format!("node '{node_id}' is not paired"))?;
+                    .hosts
+                    .get(host_id)
+                    .ok_or_else(|| format!("physical host '{host_id}' is not enrolled"))?;
                 let label = arguments.get(2).ok_or(usage)?;
                 let response = self.agent_call(
-                    &node.agent,
+                    &host.agent,
                     &AgentCommand::MountDisk {
                         label: label.clone(),
                     },
@@ -1751,11 +1859,12 @@ impl ProvisionShell {
                     .spec
                     .nodes
                     .get(node_id)
-                    .ok_or_else(|| format!("node '{node_id}' is not paired"))?;
-                let inventory = self.inventory(node)?;
+                    .ok_or_else(|| format!("node '{node_id}' does not exist"))?;
+                let host = plan.spec.host_for_node(node);
+                let inventory = self.inventory(&host.agent)?;
                 let disk = find_disk(&inventory, label)
-                    .ok_or_else(|| format!("{label} is not visible on {node_id}"))?;
-                let expected_mount = Path::new(&node.agent.mount_root).join(label);
+                    .ok_or_else(|| format!("{label} is not visible on host '{}'", host.id))?;
+                let expected_mount = Path::new(&host.agent.mount_root).join(label);
                 if disk.filesystem.as_deref() != Some("xfs")
                     || !disk
                         .mountpoints
@@ -1763,8 +1872,9 @@ impl ProvisionShell {
                         .any(|mount| Path::new(mount) == expected_mount)
                 {
                     return Err(format!(
-                        "{label} is not mounted XFS at {} on {node_id}",
-                        expected_mount.display()
+                        "{label} is not mounted XFS at {} on host '{}'",
+                        expected_mount.display(),
+                        host.id
                     ));
                 }
                 let mut plan = plan;
@@ -1790,7 +1900,7 @@ impl ProvisionShell {
                 self.save_plan(&plan)?;
                 emit(
                     OutputKind::Success,
-                    format!("{label} assigned to physical node {node_id}"),
+                    format!("{label} assigned to node {node_id}"),
                 );
                 Ok(success_outcome())
             }
@@ -1871,16 +1981,22 @@ impl ProvisionShell {
                         "gateway '{id}' already exists; remove it from this draft before redefining it"
                     ));
                 }
-                if !plan.spec.nodes.contains_key(node_id) {
-                    return Err(format!("node '{node_id}' is not paired"));
-                }
+                let host_id = plan
+                    .spec
+                    .nodes
+                    .get(node_id)
+                    .ok_or_else(|| format!("node '{node_id}' is not enrolled"))?
+                    .host_id
+                    .clone();
                 if plan
                     .spec
                     .gateways
                     .values()
-                    .any(|gateway| gateway.node_id == *node_id && gateway.id != *id)
+                    .filter(|gateway| gateway.id != *id)
+                    .filter_map(|gateway| plan.spec.nodes.get(&gateway.node_id))
+                    .any(|node| node.host_id == host_id)
                 {
-                    return Err(format!("physical node '{node_id}' already hosts a gateway"));
+                    return Err(format!("physical host '{host_id}' already owns a gateway"));
                 }
                 plan.spec.gateways.insert(
                     id.clone(),
@@ -1944,8 +2060,9 @@ impl ProvisionShell {
         } else {
             return Err(format!("unknown node or gateway '{target}'"));
         };
+        let host = plan.spec.host_for_node(node);
         let response = self.agent_call(
-            &node.agent,
+            &host.agent,
             &AgentCommand::Logs {
                 target: service_target,
                 lines,
@@ -1958,14 +2075,27 @@ impl ProvisionShell {
     fn validate_remote_plan(&self, plan: &CommissionerPlan, emit: Emit<'_>) -> Result<(), String> {
         plan.spec.validate()?;
         if !self.allow_shared_failure_domain {
-            let distinct = plan
+            let distinct_fingerprints = plan
                 .spec
-                .nodes
+                .hosts
                 .values()
-                .map(|node| &node.agent.machine_fingerprint)
+                .map(|host| &host.agent.machine_fingerprint)
                 .collect::<BTreeSet<_>>();
-            if distinct.len() != plan.spec.nodes.len() {
-                return Err("multiple N2 nodes share one physical machine fingerprint; this is not an independent failure-domain topology".into());
+            if distinct_fingerprints.len() != plan.spec.hosts.len() {
+                return Err("multiple enrolled hosts share one physical machine fingerprint; this is not an independent failure-domain topology".into());
+            }
+            let shared = plan
+                .spec
+                .hosts
+                .values()
+                .filter(|host| plan.spec.nodes_for_host(&host.id).len() != 1)
+                .map(|host| host.id.clone())
+                .collect::<Vec<_>>();
+            if !shared.is_empty() {
+                return Err(format!(
+                    "production commissioning requires exactly one N2 node per physical host; laboratory multi-instance hosts: {} (use --allow-shared-failure-domain only for simulation)",
+                    shared.join(", ")
+                ));
             }
         }
         let certificate = plan
@@ -1982,40 +2112,42 @@ impl ProvisionShell {
 
         let results = plan
             .spec
-            .nodes
+            .hosts
             .par_iter()
-            .map(|(node_id, node)| {
+            .map(|(host_id, host)| {
                 let result = self
-                    .agent_call(&node.agent, &AgentCommand::Inventory)
+                    .agent_call(&host.agent, &AgentCommand::Inventory)
                     .and_then(|response| {
                         ensure_agent_success(&response)?;
                         let disks: Vec<BlockDisk> = serde_json::from_value(response.data)
                             .map_err(|error| format!("decode inventory: {error}"))?;
-                        for (label, binding) in &node.disks {
-                            let disk = find_disk(&disks, label)
-                                .ok_or_else(|| format!("{label} is absent"))?;
-                            let expected = Path::new(&node.agent.mount_root).join(label);
-                            if disk.filesystem.as_deref() != Some("xfs")
-                                || !disk
-                                    .mountpoints
-                                    .iter()
-                                    .any(|mount| Path::new(mount) == expected)
-                            {
-                                return Err(format!(
-                                    "{label} is not mounted XFS at {}",
-                                    expected.display()
-                                ));
-                            }
-                            if disk.uuid.as_deref() != Some(binding.filesystem_uuid.as_str()) {
-                                return Err(format!("{label} filesystem UUID changed"));
-                            }
-                            if !binding.serial.is_empty() && disk.serial != binding.serial {
-                                return Err(format!("{label} hardware serial changed"));
+                        for node in plan.spec.nodes_for_host(host_id) {
+                            for (label, binding) in &node.disks {
+                                let disk = find_disk(&disks, label)
+                                    .ok_or_else(|| format!("{label} is absent"))?;
+                                let expected = Path::new(&host.agent.mount_root).join(label);
+                                if disk.filesystem.as_deref() != Some("xfs")
+                                    || !disk
+                                        .mountpoints
+                                        .iter()
+                                        .any(|mount| Path::new(mount) == expected)
+                                {
+                                    return Err(format!(
+                                        "{label} is not mounted XFS at {}",
+                                        expected.display()
+                                    ));
+                                }
+                                if disk.uuid.as_deref() != Some(binding.filesystem_uuid.as_str()) {
+                                    return Err(format!("{label} filesystem UUID changed"));
+                                }
+                                if !binding.serial.is_empty() && disk.serial != binding.serial {
+                                    return Err(format!("{label} hardware serial changed"));
+                                }
                             }
                         }
                         Ok(())
                     });
-                (node_id.clone(), result)
+                (host_id.clone(), result)
             })
             .collect::<Vec<_>>();
         let failures = results
@@ -2024,7 +2156,7 @@ impl ProvisionShell {
             .collect::<Vec<_>>();
         if !failures.is_empty() {
             return Err(format!(
-                "physical-node validation failed:\n  {}",
+                "physical-host validation failed:\n  {}",
                 failures.join("\n  ")
             ));
         }
@@ -2032,15 +2164,16 @@ impl ProvisionShell {
         emit(
             OutputKind::Success,
             format!(
-                "Validation: PASS\nCluster: {}\nTopology hash: {}\nServer pools: {}\nPhysical nodes: {}\nPhysical failure domains: {}\nStorage disks: {}\nReserve nodes: {}\nGateways: {}",
+                "Validation: PASS\nCluster: {}\nTopology hash: {}\nServer pools: {}\nPhysical hosts: {}\nLogical N2 nodes: {}\nPhysical failure domains: {}\nStorage disks: {}\nReserve nodes: {}\nGateways: {}",
                 plan.spec.cluster_id,
                 envelope.plan_hash,
                 plan.spec.pools.len(),
+                plan.spec.hosts.len(),
                 plan.spec.nodes.len(),
                 plan.spec
-                    .nodes
+                    .hosts
                     .values()
-                    .map(|node| &node.agent.machine_fingerprint)
+                    .map(|host| &host.agent.machine_fingerprint)
                     .collect::<BTreeSet<_>>()
                     .len(),
                 plan.spec
@@ -2064,25 +2197,25 @@ impl ProvisionShell {
         emit(
             OutputKind::Info,
             format!(
-                "[1/2] Preparing {} physical nodes in parallel",
-                plan.spec.nodes.len()
+                "[1/2] Preparing {} physical hosts in parallel",
+                plan.spec.hosts.len()
             ),
         );
         let prepared = plan
             .spec
-            .nodes
+            .hosts
             .par_iter()
-            .map(|(node_id, node)| {
+            .map(|(host_id, host)| {
                 let result = self
                     .agent_call(
-                        &node.agent,
+                        &host.agent,
                         &AgentCommand::Prepare {
                             envelope: envelope.clone(),
-                            node_id: node_id.clone(),
+                            host_id: host_id.clone(),
                         },
                     )
                     .and_then(|response| ensure_agent_success(&response));
-                (node_id.clone(), result)
+                (host_id.clone(), result)
             })
             .collect::<Vec<_>>();
         let failures = prepared
@@ -2095,9 +2228,9 @@ impl ProvisionShell {
             })
             .collect::<Vec<_>>();
         if !failures.is_empty() {
-            plan.spec.nodes.par_iter().for_each(|(_, node)| {
+            plan.spec.hosts.par_iter().for_each(|(_, host)| {
                 let _ = self.agent_call(
-                    &node.agent,
+                    &host.agent,
                     &AgentCommand::Abort {
                         plan_hash: envelope.plan_hash.clone(),
                     },
@@ -2110,7 +2243,7 @@ impl ProvisionShell {
         }
         emit(
             OutputKind::Success,
-            "[1/2] Every physical node acknowledged the same topology hash".into(),
+            "[1/2] Every physical host acknowledged the same topology hash".into(),
         );
 
         emit(
@@ -2119,18 +2252,18 @@ impl ProvisionShell {
         );
         let committed = plan
             .spec
-            .nodes
+            .hosts
             .par_iter()
-            .map(|(node_id, node)| {
+            .map(|(host_id, host)| {
                 let result = self
                     .agent_call(
-                        &node.agent,
+                        &host.agent,
                         &AgentCommand::Commit {
                             plan_hash: envelope.plan_hash.clone(),
                         },
                     )
                     .and_then(|response| ensure_agent_success(&response));
-                (node_id.clone(), result)
+                (host_id.clone(), result)
             })
             .collect::<Vec<_>>();
         let failures = committed
@@ -2145,7 +2278,7 @@ impl ProvisionShell {
         }
         emit(
             OutputKind::Success,
-            "[2/2] Every physical node committed; activation remains separate".into(),
+            "[2/2] Every physical host committed; activation remains separate".into(),
         );
         Ok(())
     }
@@ -2177,8 +2310,9 @@ impl ProvisionShell {
                 .nodes
                 .get(&gateway.node_id)
                 .expect("validated gateway");
+            let host = plan.spec.host_for_node(node);
             let response = self.agent_call(
-                &node.agent,
+                &host.agent,
                 &AgentCommand::Service {
                     target: ServiceTarget::Gateway,
                     action: AgentServiceAction::Start,
@@ -2212,8 +2346,9 @@ impl ProvisionShell {
                     .nodes
                     .get(&gateway.node_id)
                     .expect("validated gateway");
+                let host = plan.spec.host_for_node(node);
                 let response = self.agent_call(
-                    &node.agent,
+                    &host.agent,
                     &AgentCommand::Service {
                         target: ServiceTarget::Gateway,
                         action: action.clone(),
@@ -2227,9 +2362,10 @@ impl ProvisionShell {
             .nodes
             .par_iter()
             .map(|(node_id, node)| {
+                let host = plan.spec.host_for_node(node);
                 let result = self
                     .agent_call(
-                        &node.agent,
+                        &host.agent,
                         &AgentCommand::Service {
                             target: ServiceTarget::Node {
                                 node_id: node_id.clone(),
@@ -2265,8 +2401,9 @@ impl ProvisionShell {
                     .nodes
                     .get(&gateway.node_id)
                     .expect("validated gateway");
+                let host = plan.spec.host_for_node(node);
                 let response = self.agent_call(
-                    &node.agent,
+                    &host.agent,
                     &AgentCommand::Service {
                         target: ServiceTarget::Gateway,
                         action: action.clone(),
@@ -2278,9 +2415,9 @@ impl ProvisionShell {
         emit(
             OutputKind::Success,
             format!(
-                "{} completed across {} physical nodes",
+                "{} completed across {} physical hosts",
                 service_action_name(&action),
-                plan.spec.nodes.len()
+                plan.spec.hosts.len()
             ),
         );
         Ok(())
@@ -2311,8 +2448,9 @@ impl ProvisionShell {
         }
         for gateway in plan.spec.gateways.values() {
             let node = plan.spec.nodes.get(&gateway.node_id).expect("gateway node");
+            let host = plan.spec.host_for_node(node);
             let response = self.agent_call(
-                &node.agent,
+                &host.agent,
                 &AgentCommand::Status {
                     node_id: node.id.clone(),
                     gateway: true,
@@ -2357,6 +2495,7 @@ impl ProvisionShell {
             .nodes
             .par_iter()
             .map(|(node_id, node)| {
+                let host = plan.spec.host_for_node(node);
                 let gateway = plan
                     .spec
                     .gateways
@@ -2364,7 +2503,7 @@ impl ProvisionShell {
                     .any(|item| item.node_id == *node_id);
                 let result = self
                     .agent_call(
-                        &node.agent,
+                        &host.agent,
                         &AgentCommand::Status {
                             node_id: node_id.clone(),
                             gateway,
@@ -2379,8 +2518,8 @@ impl ProvisionShell {
             .collect()
     }
 
-    fn inventory(&self, node: &NodeSpec) -> Result<Vec<BlockDisk>, String> {
-        let response = self.agent_call(&node.agent, &AgentCommand::Inventory)?;
+    fn inventory(&self, agent: &AgentBinding) -> Result<Vec<BlockDisk>, String> {
+        let response = self.agent_call(agent, &AgentCommand::Inventory)?;
         ensure_agent_success(&response)?;
         serde_json::from_value(response.data).map_err(|error| format!("decode inventory: {error}"))
     }
@@ -2457,7 +2596,7 @@ impl ProvisionShell {
     fn plan_summary(&self) -> Result<String, String> {
         let plan = self.load_plan()?;
         let mut output = format!(
-            "N2 DISTRIBUTED CLUSTER PLAN\n  cluster: {} / epoch {}\n  commissioner: {}\n  state: {}\n  physical nodes: {}\n  server pools: {}\n  reserve nodes: {}\n  gateways: {}",
+            "N2 DISTRIBUTED CLUSTER PLAN\n  cluster: {} / epoch {}\n  commissioner: {}\n  state: {}\n  physical hosts: {}\n  logical N2 nodes: {}\n  server pools: {}\n  reserve nodes: {}\n  gateways: {}",
             plan.spec.cluster_id,
             plan.spec.topology_epoch,
             plan.commissioner_id,
@@ -2466,11 +2605,25 @@ impl ProvisionShell {
             } else {
                 "draft"
             },
+            plan.spec.hosts.len(),
             plan.spec.nodes.len(),
             plan.spec.pools.len(),
             plan.spec.reserve_nodes.len(),
             plan.spec.gateways.len(),
         );
+        for host in plan.spec.hosts.values() {
+            output.push_str(&format!(
+                "\n  host {}  agent={}  nodes=[{}]",
+                host.id,
+                host.agent.url,
+                plan.spec
+                    .nodes_for_host(&host.id)
+                    .iter()
+                    .map(|node| node.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         for pool in plan.spec.pools.values() {
             output.push_str(&format!(
                 "\n  pool {} generation {} / EC {}+{} / {}/{} nodes / {}",
@@ -2485,9 +2638,9 @@ impl ProvisionShell {
         }
         for node in plan.spec.nodes.values() {
             output.push_str(&format!(
-                "\n  {}  agent={}  https://{}:{}  n2://{}:{}  disks=[{}]",
+                "\n  {}  physical-host={}  https://{}:{}  n2://{}:{}  disks=[{}]",
                 node.id,
-                node.agent.url,
+                node.host_id,
                 node.advertised_host,
                 node.https_port,
                 node.advertised_host,
@@ -2572,6 +2725,7 @@ fn render_membership(spec: &ClusterSpec) -> Result<Value, String> {
         .into_iter()
         .map(|node_id| {
             let node = spec.nodes.get(node_id).expect("validated active node");
+            let host = spec.host_for_node(node);
             json!({
                 "slot_id": node.id,
                 "instance_id": node.id,
@@ -2582,7 +2736,7 @@ fn render_membership(spec: &ClusterSpec) -> Result<Value, String> {
                 "weight": 1,
             "storage_roots": node.disks.keys().map(|label| json!({
                     "id": root_id(&node.id, label),
-                    "path": Path::new(&node.agent.mount_root).join(label).join("n2"),
+                    "path": Path::new(&host.agent.mount_root).join(label).join("n2"),
                 })).collect::<Vec<_>>(),
                 "joined_epoch": 1,
             })
@@ -2593,6 +2747,7 @@ fn render_membership(spec: &ClusterSpec) -> Result<Value, String> {
         .iter()
         .map(|node_id| {
             let node = spec.nodes.get(node_id).expect("validated reserve");
+            let host = spec.host_for_node(node);
             json!({
                 "instance_id": node.id,
                 "endpoint": format!("https://{}:{}", node.advertised_host, node.https_port),
@@ -2600,7 +2755,7 @@ fn render_membership(spec: &ClusterSpec) -> Result<Value, String> {
                 "state": "online",
             "storage_roots": node.disks.keys().map(|label| json!({
                     "id": root_id(&node.id, label),
-                    "path": Path::new(&node.agent.mount_root).join(label).join("n2"),
+                    "path": Path::new(&host.agent.mount_root).join(label).join("n2"),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -2687,11 +2842,11 @@ fn render_node_config(
 
 fn render_gateway_config(
     spec: &ClusterSpec,
-    agent_id: &str,
+    host_id: &str,
     settings: &InstallSettings,
 ) -> Result<String, String> {
     let gateway = spec
-        .gateway_for_agent(agent_id)
+        .gateway_for_host(host_id)
         .ok_or("gateway is not assigned")?;
     let mut output = format!(
         "[server]\nhost={}\nhttps_port={}\ncert_path={}\nkey_path={}\n\n[routing]\nhealth_interval_seconds=5\nrequest_timeout_seconds=300\n\n",
@@ -2803,32 +2958,45 @@ fn copy_atomic(source: &Path, target: &Path, mode: u32) -> Result<(), String> {
 }
 
 fn stage_content_hash(stage: &Path) -> Result<String, String> {
-    let mut relative_paths = vec![
-        "n2.env",
-        "node.service",
-        "node/n2_config.ini",
-        "node/state/n2_membership.json",
-        "node/certificates/cert.pem",
-        "node/certificates/key.pem",
-    ];
-    if stage.join("gateway").exists() {
-        relative_paths.extend([
-            "gateway.service",
-            "gateway/gateway.ini",
-            "gateway/certificates/cert.pem",
-            "gateway/certificates/key.pem",
-        ]);
-    }
+    let mut relative_paths = Vec::new();
+    collect_stage_files(stage, stage, &mut relative_paths)?;
+    relative_paths.sort();
     let mut hasher = Sha256::new();
     for relative in relative_paths {
-        hasher.update(relative.as_bytes());
+        hasher.update(relative.as_os_str().as_encoded_bytes());
         hasher.update([0]);
-        let bytes = fs::read(stage.join(relative))
-            .map_err(|error| format!("read staged {relative}: {error}"))?;
+        let bytes = fs::read(stage.join(&relative))
+            .map_err(|error| format!("read staged {}: {error}", relative.display()))?;
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn collect_stage_files(
+    root: &Path,
+    directory: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("read staged directory {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read staged entry: {error}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("inspect staged entry {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            collect_stage_files(root, &path, output)?;
+        } else if file_type.is_file() && entry.file_name() != "manifest.json" {
+            output.push(
+                path.strip_prefix(root)
+                    .map_err(|error| format!("resolve staged path {}: {error}", path.display()))?
+                    .to_path_buf(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn read_trimmed(path: &Path) -> Result<String, String> {
@@ -3064,12 +3232,14 @@ const HELP_TEXT: &str = "COMMANDS
   clear
   version
   cluster init <cluster-id>
-  node pair <node-id> <agent-url> <token> <advertised-host> <https-port> <native-port>
+  host pair <host-id> <agent-url> <token>
+  host list
+  node create <node-id> <host-id> <advertised-host> <https-port> <native-port>
   node list
-  lsblk <node-id>
-  disk inspect <node-id> <device-or-label>
-  disk format <node-id> <device> <N2DISKxxx>
-  disk mount <node-id> <N2DISKxxx>
+  lsblk <host-id>
+  disk inspect <host-id> <device-or-label>
+  disk format <host-id> <device> <N2DISKxxx>
+  disk mount <host-id> <N2DISKxxx>
   disk assign <node-id> <N2DISKxxx>
   disk unassign <node-id> <N2DISKxxx>
   pool create <pool-id> <generation> <data> <parity>
@@ -3085,7 +3255,8 @@ const HELP_TEXT: &str = "COMMANDS
   cluster start|stop|restart|enable|disable|status
   logs <node-id|gateway-id> [count]
 
-Every disk command executes only on its owning physical agent. Cluster commit
+Disk discovery, formatting, and mounting execute only on the selected physical
+host agent. Assignment binds a prepared disk to one logical N2 node. Cluster commit
 uses canonical SHA-256 identity, parallel prepare, and idempotent local commit.
 The commissioner and Shell are not part of the N2 data path after activation.";
 
@@ -3172,7 +3343,7 @@ mod tests {
     fn canonical_hash_excludes_agent_credentials() {
         let mut spec = sample_spec();
         let first = deployment_hash(&spec, "A=1", b"cert", b"key").unwrap();
-        spec.nodes.get_mut("node-001").unwrap().agent.credential = "different".into();
+        spec.hosts.get_mut("host-001").unwrap().agent.credential = "different".into();
         let second = deployment_hash(&spec, "A=1", b"cert", b"key").unwrap();
         assert_eq!(first, second);
     }
@@ -3210,10 +3381,8 @@ mod tests {
         );
         let root = test_root("gateway-binding");
         let settings = test_settings(&root);
-        let node_one_agent = &spec.nodes["node-001"].agent.agent_id;
-        let node_two_agent = &spec.nodes["node-002"].agent.agent_id;
-        assert!(render_gateway_config(&spec, node_one_agent, &settings).is_err());
-        let rendered = render_gateway_config(&spec, node_two_agent, &settings).unwrap();
+        assert!(render_gateway_config(&spec, "host-001", &settings).is_err());
+        let rendered = render_gateway_config(&spec, "host-002", &settings).unwrap();
         assert!(rendered.contains("host=0.0.0.0"));
         assert!(rendered.contains("https_port=50111"));
         assert!(rendered.contains("[node.node-001]"));
@@ -3276,7 +3445,7 @@ mod tests {
             &record,
             AgentCommand::Prepare {
                 envelope: envelope.clone(),
-                node_id: "node-001".into(),
+                host_id: "host-001".into(),
             },
         );
         assert!(prepared.success, "{}", prepared.message);
@@ -3285,7 +3454,7 @@ mod tests {
                 .setup_root
                 .join("staged")
                 .join(&envelope.plan_hash)
-                .join("node/n2_config.ini"),
+                .join("nodes/node-001/n2_config.ini"),
             b"tampered",
         )
         .unwrap();
@@ -3329,7 +3498,7 @@ mod tests {
                     &record,
                     AgentCommand::Prepare {
                         envelope: envelope.clone(),
-                        node_id: "node-001".into(),
+                        host_id: "host-001".into(),
                     }
                 )
                 .success
@@ -3353,7 +3522,7 @@ mod tests {
             },
         );
         assert!(!wrong.success);
-        assert!(wrong.message.contains("owns node 'node-001'"));
+        assert!(wrong.message.contains("owns nodes [node-001]"));
         let own = agent.execute(
             &record,
             AgentCommand::Service {
@@ -3367,17 +3536,110 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn one_physical_agent_commits_and_controls_multiple_lab_nodes() {
+        let root = test_root("multi-node-host");
+        let settings = test_settings(&root);
+        prepare_test_files(&settings);
+        let host = Arc::new(FakeHost {
+            disks: Mutex::new(vec![
+                test_disk(&settings, "N2DISK001", "uuid-1", "serial-1"),
+                test_disk(&settings, "N2DISK002", "uuid-2", "serial-2"),
+            ]),
+            ..FakeHost::default()
+        });
+        let agent = AgentController::new(settings.clone(), "0123456789abcdef", host).unwrap();
+        let pair = agent
+            .pair(
+                "0123456789abcdef",
+                PairRequest {
+                    cluster_id: "cluster-test".into(),
+                    commissioner_id: "commissioner-test".into(),
+                },
+            )
+            .unwrap();
+        let record = agent.authenticate(&pair.credential).unwrap();
+        let mut spec = sample_spec();
+        spec.hosts.remove("host-002");
+        let local_host = spec.hosts.get_mut("host-001").unwrap();
+        local_host.agent.agent_id = agent.identity().agent_id;
+        local_host.agent.machine_fingerprint = agent.identity().machine_fingerprint;
+        local_host.agent.mount_root = settings.mount_root.to_string_lossy().into_owned();
+        spec.nodes.get_mut("node-002").unwrap().host_id = "host-001".into();
+        spec.nodes.get_mut("node-002").unwrap().disks = BTreeMap::from([(
+            "N2DISK002".into(),
+            DiskSpec {
+                label: "N2DISK002".into(),
+                filesystem_uuid: "uuid-2".into(),
+                stable_id: "/dev/disk/by-id/test-sdb".into(),
+                serial: "serial-2".into(),
+                size_bytes: 1024,
+            },
+        )]);
+        spec.gateways.insert(
+            "gateway-001".into(),
+            GatewaySpec {
+                id: "gateway-001".into(),
+                node_id: "node-001".into(),
+                bind_host: "0.0.0.0".into(),
+                https_port: 50111,
+            },
+        );
+        let envelope =
+            DeploymentEnvelope::new(spec, generated_env(), b"cert".to_vec(), b"key".to_vec())
+                .unwrap();
+        assert!(
+            agent
+                .execute(
+                    &record,
+                    AgentCommand::Prepare {
+                        envelope: envelope.clone(),
+                        host_id: "host-001".into(),
+                    },
+                )
+                .success
+        );
+        assert!(
+            agent
+                .execute(
+                    &record,
+                    AgentCommand::Commit {
+                        plan_hash: envelope.plan_hash,
+                    },
+                )
+                .success
+        );
+        for node_id in ["node-001", "node-002"] {
+            assert!(settings.node_dir(node_id).join("n2_config.ini").exists());
+            let started = agent.execute(
+                &record,
+                AgentCommand::Service {
+                    target: ServiceTarget::Node {
+                        node_id: node_id.into(),
+                    },
+                    action: AgentServiceAction::Start,
+                },
+            );
+            assert!(started.success, "{}", started.message);
+        }
+        assert!(
+            settings
+                .gateway_runtime
+                .join("n2_gateway_config.ini")
+                .exists()
+        );
+        assert!(!settings.gateway_runtime.join("gateway.ini").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn sample_spec() -> ClusterSpec {
-        let nodes = (1..=2)
+        let hosts = (1..=2)
             .map(|index| {
-                let id = format!("node-{index:03}");
+                let id = format!("host-{index:03}");
                 (
                     id.clone(),
-                    NodeSpec {
+                    HostSpec {
                         id,
-                        advertised_host: format!("10.0.0.{index}"),
-                        https_port: 50001,
-                        native_port: 50002,
                         agent: AgentBinding {
                             url: format!("http://10.0.0.{index}:50902"),
                             agent_id: format!("agent-{index}"),
@@ -3385,6 +3647,21 @@ mod tests {
                             mount_root: "/mnt".into(),
                             credential: format!("secret-{index}"),
                         },
+                    },
+                )
+            })
+            .collect();
+        let nodes = (1..=2)
+            .map(|index| {
+                let id = format!("node-{index:03}");
+                (
+                    id.clone(),
+                    NodeSpec {
+                        id,
+                        host_id: format!("host-{index:03}"),
+                        advertised_host: format!("10.0.0.{index}"),
+                        https_port: 50001,
+                        native_port: 50002,
                         disks: BTreeMap::from([(
                             format!("N2DISK{index:03}"),
                             DiskSpec {
@@ -3403,6 +3680,7 @@ mod tests {
             format_version: PLAN_FORMAT_VERSION,
             cluster_id: "cluster-test".into(),
             topology_epoch: 1,
+            hosts,
             nodes,
             pools: BTreeMap::from([(
                 "pool-001".into(),
@@ -3484,10 +3762,11 @@ mod tests {
 
     fn test_envelope(identity: &AgentIdentity, settings: &InstallSettings) -> DeploymentEnvelope {
         let mut spec = sample_spec();
+        let host = spec.hosts.get_mut("host-001").unwrap();
+        host.agent.agent_id = identity.agent_id.clone();
+        host.agent.machine_fingerprint = identity.machine_fingerprint.clone();
+        host.agent.mount_root = settings.mount_root.to_string_lossy().into_owned();
         let node = spec.nodes.get_mut("node-001").unwrap();
-        node.agent.agent_id = identity.agent_id.clone();
-        node.agent.machine_fingerprint = identity.machine_fingerprint.clone();
-        node.agent.mount_root = settings.mount_root.to_string_lossy().into_owned();
         node.disks = BTreeMap::from([(
             "N2DISK001".into(),
             DiskSpec {

@@ -45,7 +45,8 @@ use crate::distribution::health::cluster_health_snapshot;
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::monitor::{ClusterMonitorQuery, cluster_monitor_snapshot};
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_bulk,
+    commit_namespace_summary,
 };
 use crate::distribution::rebalance::{
     ClusterRebalanceRequest, metadata_matches_current_layout, plan_rebalance, rebalance_status,
@@ -1370,22 +1371,11 @@ async fn native_bulk_namespace_operation(
     let mut succeeded = 0usize;
     let mut not_found = 0usize;
     let mut failed = Vec::new();
-    for object_key in &unique_keys {
-        let kind = match mode {
-            BulkNamespaceMode::Trash => NamespaceMutationKind::Trash,
-            BulkNamespaceMode::Recover => NamespaceMutationKind::Recover,
-        };
-        let result = commit_namespace_summary(PeerNamespaceApplyRequest {
-            mutation_id: None,
-            kind,
-            fragment: fragment.to_string(),
-            source_path: Some(object_key.clone()),
-            destination_path: None,
-            object_id: None,
-            version_id: None,
-            metadata: None,
-        })
-        .await;
+    let kind = match mode {
+        BulkNamespaceMode::Trash => NamespaceMutationKind::Trash,
+        BulkNamespaceMode::Recover => NamespaceMutationKind::Recover,
+    };
+    for (object_key, result) in commit_namespace_bulk(fragment, kind, unique_keys.clone()).await {
         match result {
             Ok(_) => succeeded = succeeded.saturating_add(1),
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),

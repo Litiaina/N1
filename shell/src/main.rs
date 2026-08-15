@@ -454,7 +454,7 @@ struct ShellProfile {
 #[tokio::main]
 async fn main() {
     let mut cli = Cli::parse();
-    if let Some(Command::Serve(args)) = cli.command.take() {
+    if let Some(args) = take_serve_command(&mut cli) {
         if let Err(error) = web::run(*args).await {
             eprintln!("n2 setup shell error: {error}");
             std::process::exit(1);
@@ -465,6 +465,16 @@ async fn main() {
         eprintln!("n2 shell error: {err}");
         std::process::exit(1);
     }
+}
+
+fn take_serve_command(cli: &mut Cli) -> Option<Box<ServeArgs>> {
+    if !matches!(cli.command, Some(Command::Serve(_))) {
+        return None;
+    }
+    let Some(Command::Serve(args)) = cli.command.take() else {
+        unreachable!("serve command was already matched");
+    };
+    Some(args)
 }
 
 async fn run(mut cli: Cli) -> NativeClientResult<()> {
@@ -1884,6 +1894,20 @@ mod tests {
 
         assert!(take_profile_command(&mut cli).is_none());
         assert!(matches!(cli.command, Some(Command::Upload(_))));
+    }
+
+    #[test]
+    fn serve_precheck_does_not_discard_native_commands() {
+        let mut cli = Cli::try_parse_from([
+            "litiaina-n2-shell",
+            "--native-url",
+            "n2://127.0.0.1:50002",
+            "ping",
+        ])
+        .expect("ping command parses");
+
+        assert!(take_serve_command(&mut cli).is_none());
+        assert!(matches!(cli.command, Some(Command::Ping)));
     }
 
     #[test]

@@ -43,10 +43,12 @@ use crate::distribution::lifecycle::build_lifecycle_peer_routes;
 use crate::distribution::maintenance::build_distributed_maintenance_peer_routes;
 use crate::distribution::membership::active_cluster_runtime;
 use crate::distribution::namespace::{
-    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_summary,
-    commit_upload_pointer,
+    NamespaceMutationKind, PeerNamespaceApplyRequest, commit_namespace_bulk,
+    commit_namespace_summary, commit_upload_pointer,
 };
-use crate::distribution::ncnx::build_ncnx_peer_routes;
+use crate::distribution::ncnx::{
+    NcnxPublishBatchItem, PEER_NCNX_BATCH_MAX, build_ncnx_peer_routes, publish_new_batch,
+};
 use crate::distribution::peer::build_peer_routes;
 use crate::distribution::rebalance::{
     metadata_matches_current_layout, rewrite_object_to_current_layout,
@@ -68,6 +70,7 @@ use crate::middleware::auth_middleware::{
     authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
+use crate::namespace::ncnx_store::NcnxRecord;
 use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
 use crate::posix::routes::{build_posix_read_routes, build_posix_write_routes};
 use crate::structs::auth_structs::Claims;
@@ -96,6 +99,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tower_http::cors::{Any, CorsLayer};
+use ulid::Ulid;
 
 fn request_content_length(headers: &axum::http::HeaderMap) -> Result<u64, AppError> {
     headers
@@ -891,25 +895,16 @@ async fn bulk_delete_objects_scoped(
     let mut succeeded = 0usize;
     let mut not_found = 0usize;
     let mut failed = Vec::new();
-    for object_key in &unique_keys {
-        match commit_namespace_summary(PeerNamespaceApplyRequest {
-            mutation_id: None,
-            kind: NamespaceMutationKind::Trash,
-            fragment: fragment.clone(),
-            source_path: Some(object_key.clone()),
-            destination_path: None,
-            object_id: None,
-            version_id: None,
-            metadata: None,
-        })
-        .await
-        {
+    for (object_key, result) in
+        commit_namespace_bulk(&fragment, NamespaceMutationKind::Trash, unique_keys.clone()).await
+    {
+        match result {
             Ok(_) => {
                 succeeded = succeeded.saturating_add(1);
             }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
             Err(err) => failed.push(BulkObjectFailure {
-                object_key: object_key.clone(),
+                object_key,
                 error: err.to_string(),
             }),
         }
@@ -962,25 +957,20 @@ async fn bulk_recover_objects_scoped(
     let mut succeeded = 0usize;
     let mut not_found = 0usize;
     let mut failed = Vec::new();
-    for object_key in &unique_keys {
-        match commit_namespace_summary(PeerNamespaceApplyRequest {
-            mutation_id: None,
-            kind: NamespaceMutationKind::Recover,
-            fragment: fragment.clone(),
-            source_path: Some(object_key.clone()),
-            destination_path: None,
-            object_id: None,
-            version_id: None,
-            metadata: None,
-        })
-        .await
-        {
+    for (object_key, result) in commit_namespace_bulk(
+        &fragment,
+        NamespaceMutationKind::Recover,
+        unique_keys.clone(),
+    )
+    .await
+    {
+        match result {
             Ok(_) => {
                 succeeded = succeeded.saturating_add(1);
             }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
             Err(err) => failed.push(BulkObjectFailure {
-                object_key: object_key.clone(),
+                object_key,
                 error: err.to_string(),
             }),
         }
@@ -1157,7 +1147,15 @@ struct StandardBatchUploadEntryResult {
 #[derive(Debug)]
 struct IndexedStandardBatchUploadResult {
     index: usize,
-    result: StandardBatchUploadEntryResult,
+    result: Result<StandardBatchStagedUpload, StandardBatchUploadEntryResult>,
+}
+
+#[derive(Debug)]
+struct StandardBatchStagedUpload {
+    logical_path: String,
+    physical_object_id: String,
+    size_bytes: u64,
+    metadata: crate::core::disk_manager::ObjectMetadata,
 }
 
 #[derive(Debug, Serialize)]
@@ -1234,12 +1232,11 @@ fn batch_error_message(error: &AppError) -> String {
 }
 
 async fn upload_standard_batch_object(
-    state: Arc<AppState>,
     claims: Claims,
     logical_path: String,
     content_type: String,
     bytes: bytes::Bytes,
-) -> StandardBatchUploadEntryResult {
+) -> Result<StandardBatchStagedUpload, StandardBatchUploadEntryResult> {
     let size_bytes = bytes.len() as u64;
     let operation = async {
         let _batch_permit = Arc::clone(&STANDARD_BATCH_GLOBAL_GATE)
@@ -1269,34 +1266,24 @@ async fn upload_standard_batch_object(
             size_bytes,
         )
         .await?;
-        let committed_physical =
-            commit_logical_upload_from_meta(&fragment, &logical_path, &physical, &metadata).await?;
-        emit_logical_file_uploaded(
-            &state,
-            &fragment,
-            &logical_path,
-            &committed_physical,
-            &metadata,
-        );
-        Ok::<_, AppError>(metadata)
+        Ok::<_, AppError>((physical, metadata))
     }
     .await;
 
     match operation {
-        Ok(metadata) => StandardBatchUploadEntryResult {
-            object_key: logical_path,
-            status: StatusCode::CREATED.as_u16(),
-            version_id: Some(metadata.version_id),
-            size_bytes: Some(size_bytes),
-            error: None,
-        },
-        Err(error) => StandardBatchUploadEntryResult {
+        Ok((physical_object_id, metadata)) => Ok(StandardBatchStagedUpload {
+            logical_path,
+            physical_object_id,
+            size_bytes,
+            metadata,
+        }),
+        Err(error) => Err(StandardBatchUploadEntryResult {
             object_key: logical_path,
             status: batch_error_status(&error).as_u16(),
             version_id: None,
             size_bytes: Some(size_bytes),
             error: Some(batch_error_message(&error)),
-        },
+        }),
     }
 }
 
@@ -1309,13 +1296,13 @@ async fn collect_standard_batch_result(
             Ok(result) => results.push(result),
             Err(error) => results.push(IndexedStandardBatchUploadResult {
                 index: usize::MAX,
-                result: StandardBatchUploadEntryResult {
+                result: Err(StandardBatchUploadEntryResult {
                     object_key: "<batch-worker>".to_string(),
                     status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     version_id: None,
                     size_bytes: None,
                     error: Some(format!("Batch worker failed: {error}")),
-                },
+                }),
             }),
         }
     }
@@ -1354,13 +1341,13 @@ async fn upload_standard_batch_scoped(
             Err(error) => {
                 results.push(IndexedStandardBatchUploadResult {
                     index,
-                    result: StandardBatchUploadEntryResult {
+                    result: Err(StandardBatchUploadEntryResult {
                         object_key: "<invalid>".to_string(),
                         status: batch_error_status(&error).as_u16(),
                         version_id: None,
                         size_bytes: None,
                         error: Some(batch_error_message(&error)),
-                    },
+                    }),
                 });
                 continue;
             }
@@ -1398,13 +1385,13 @@ async fn upload_standard_batch_scoped(
             };
             results.push(IndexedStandardBatchUploadResult {
                 index,
-                result: StandardBatchUploadEntryResult {
+                result: Err(StandardBatchUploadEntryResult {
                     object_key: logical_path,
                     status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
                     version_id: None,
                     size_bytes: None,
                     error: Some(error),
-                },
+                }),
             });
             continue;
         }
@@ -1412,13 +1399,11 @@ async fn upload_standard_batch_scoped(
         while workers.len() >= concurrency {
             collect_standard_batch_result(&mut workers, &mut results).await;
         }
-        let task_state = Arc::clone(&state);
         let task_claims = claims.clone();
         workers.spawn(async move {
             IndexedStandardBatchUploadResult {
                 index,
                 result: upload_standard_batch_object(
-                    task_state,
                     task_claims,
                     logical_path,
                     content_type,
@@ -1438,10 +1423,103 @@ async fn upload_standard_batch_scoped(
         ));
     }
 
-    results.sort_by_key(|entry| entry.index);
-    let results = results
+    let mut completed = Vec::new();
+    let mut staged = Vec::new();
+    for entry in results {
+        match entry.result {
+            Ok(upload) => staged.push((entry.index, upload)),
+            Err(result) => completed.push((entry.index, result)),
+        }
+    }
+    staged.sort_by_key(|entry| entry.0);
+    for chunk in staged.chunks(PEER_NCNX_BATCH_MAX) {
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(1);
+        let mut publications = Vec::with_capacity(chunk.len());
+        let mut record_errors = Vec::with_capacity(chunk.len());
+        for (_, upload) in chunk {
+            match NcnxRecord::new(
+                &claims.fragment,
+                &upload.physical_object_id,
+                Ulid::new().to_string(),
+                now_nanos,
+            ) {
+                Ok(record) => {
+                    publications.push(Some(NcnxPublishBatchItem {
+                        logical_key: upload.logical_path.clone(),
+                        record,
+                    }));
+                    record_errors.push(None);
+                }
+                Err(error) => {
+                    publications.push(None);
+                    record_errors.push(Some(error));
+                }
+            }
+        }
+        let valid = publications
+            .iter()
+            .filter_map(Clone::clone)
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let mut published = publish_new_batch(&claims.fragment, &valid)
+            .await
+            .into_iter();
+        let mut all_ok = true;
+        for ((index, upload), record_error) in chunk.iter().zip(record_errors) {
+            let outcome = match record_error {
+                Some(error) => Err(error),
+                None => published.next().unwrap_or_else(|| {
+                    Err(AppError::InternalServerError(
+                        "batch NCNX publication omitted a result".into(),
+                    ))
+                }),
+            };
+            match outcome {
+                Ok(located) => {
+                    emit_logical_file_uploaded(
+                        &state,
+                        &claims.fragment,
+                        &upload.logical_path,
+                        &located.record.object_id,
+                        &upload.metadata,
+                    );
+                    completed.push((
+                        *index,
+                        StandardBatchUploadEntryResult {
+                            object_key: upload.logical_path.clone(),
+                            status: StatusCode::CREATED.as_u16(),
+                            version_id: Some(upload.metadata.version_id.clone()),
+                            size_bytes: Some(upload.size_bytes),
+                            error: None,
+                        },
+                    ));
+                }
+                Err(error) => {
+                    all_ok = false;
+                    completed.push((
+                        *index,
+                        StandardBatchUploadEntryResult {
+                            object_key: upload.logical_path.clone(),
+                            status: batch_error_status(&error).as_u16(),
+                            version_id: None,
+                            size_bytes: Some(upload.size_bytes),
+                            error: Some(batch_error_message(&error)),
+                        },
+                    ));
+                }
+            }
+        }
+        record_io_latency(
+            "cluster.upload.publish_ncnx_batch",
+            started.elapsed(),
+            chunk.iter().map(|(_, upload)| upload.size_bytes).sum(),
+            all_ok,
+        );
+    }
+    completed.sort_by_key(|entry| entry.0);
+    let results = completed
         .into_iter()
-        .map(|entry| entry.result)
+        .map(|(_, result)| result)
         .collect::<Vec<_>>();
     let succeeded = results
         .iter()

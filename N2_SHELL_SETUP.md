@@ -1,8 +1,8 @@
 # N2 Shell Distributed Commissioning
 
 N2 Shell commissions a physical N2 cluster without turning any machine into
-a permanent controller. The same `litiaina-n2-shell serve` process runs
-temporarily on every physical node. One browser session becomes the temporary
+a permanent controller. One `litiaina-n2-shell serve` agent runs temporarily
+on every physical host. One browser session becomes the temporary
 commissioner and sends typed provisioning requests to the other Shell agents.
 
 N2 Shell is not Bash, namespace authority, membership consensus, or part of
@@ -12,16 +12,17 @@ then operate from the identical committed membership.
 
 ## Physical Model
 
-For a four-node EC `3 + 1` pool:
+The Shell keeps physical hosts, logical N2 nodes, and disks as separate
+identities:
 
 ```text
 operator browser
   |
-  `-- temporary commissioner on node-001:50902
-        |-- typed agent API -> node-001:50902 -> local disk/service only
-        |-- typed agent API -> node-002:50902 -> local disk/service only
-        |-- typed agent API -> node-003:50902 -> local disk/service only
-        `-- typed agent API -> node-004:50902 -> local disk/service only
+  `-- universal temporary commissioner
+        |-- host-001 agent -> local disks -> node-001
+        |-- host-002 agent -> local disks -> node-002
+        |-- host-003 agent -> local disks -> node-003
+        `-- host-004 agent -> local disks -> node-004
 
 pool-001 / generation 1 / EC 3+1
   |-- node-001 -> its local N2DISK001
@@ -30,9 +31,15 @@ pool-001 / generation 1 / EC 3+1
   `-- node-004 -> its local N2DISK004
 ```
 
-Each agent is the sole authority for its host's `lsblk`, formatting, mounts,
-local runtime files, and systemd services. The commissioner never assumes a
-remote disk exists locally and never operates remote hosts through SSH.
+Each physical host is enrolled once. Its agent is the sole authority for that
+host's `lsblk`, formatting, mounts, local runtime files, and systemd services.
+Logical N2 nodes are then created on an enrolled host and disks are assigned to
+those node instances. Production uses one logical N2 node per physical host.
+An explicit laboratory mode permits multiple isolated N2 processes on one host
+without pretending that they are independent failure domains.
+
+The commissioner never assumes a remote disk exists locally and never operates
+remote hosts through SSH.
 
 The Shell's fan-out is bounded parallel control-plane work. It does not add a
 request-path lock, coordinator, database, or user-facing bottleneck. A million
@@ -48,14 +55,16 @@ The distributed installer enforces these rules:
   currently observed disk serial;
 - assignment records the filesystem UUID, hardware serial, stable device ID,
   and capacity, then revalidates UUID and serial before every commit;
-- one physical machine fingerprint is one failure domain by default;
+- each physical host and provisioning agent is enrolled once;
+- production validation requires one N2 node per physical host;
+- laboratory multi-instance hosts require the explicit shared-failure-domain flag;
 - each writable pool contains exactly `K + M` distinct nodes;
 - a node belongs to exactly one active pool or the reserve set;
 - every node owns at least one locally mounted XFS root;
 - endpoint, pool-generation, node-role, disk-label, and gateway ownership
   collisions are rejected before prepare;
-- every agent independently renders and stages its local files from the same
-  canonical cluster specification;
+- every agent independently renders and stages all of its local N2 node
+  instances from the same canonical cluster specification;
 - the specification, shared environment, certificate, and key are bound to
   one SHA-256 deployment identity;
 - staged file content is hashed again and checked before local commit;
@@ -63,8 +72,8 @@ The distributed installer enforces these rules:
 - an interrupted commit is safe to repeat with the identical hash;
 - no engine or gateway starts during prepare or commit;
 - gateways start only after every required node reports active;
-- an agent can control only its committed node service and its own optional
-  gateway service.
+- an agent can control only the committed node services owned by its physical
+  host and its own optional gateway service.
 
 A distributed filesystem cannot make simultaneous local renames across hosts
 one physical atomic instruction. N2 Shell therefore uses the safer deployment
@@ -89,7 +98,7 @@ sudo install -m 0755 target/release/litiaina-n2-gateway /usr/local/bin/litiaina-
 
 The `litiaina` operating-system user and group must exist on every node.
 
-## Start One Temporary Agent per Node
+## Start One Temporary Agent per Physical Host
 
 Run this on every physical node:
 
@@ -102,7 +111,7 @@ sudo litiaina-n2-shell serve \
   --run-group litiaina
 ```
 
-Each node prints its own agent ID and random setup token. Record which token
+Each host prints its own agent ID and random setup token. Record which token
 belongs to which physical address. The setup port is temporary:
 
 - use a trusted, isolated provisioning LAN;
@@ -113,17 +122,25 @@ belongs to which physical address. The setup port is temporary:
 - stop every Shell agent after commissioning.
 
 Open one agent, for example `http://10.0.0.11:50902`, and authenticate with
-that node's setup token. This browser is now the temporary commissioner.
+that host's setup token. This browser is now the universal temporary
+commissioner for the whole cluster.
 
-## Initialize and Pair the Physical Nodes
+## Initialize, Enroll Hosts, and Create N2 Nodes
 
 ```text
 cluster init cluster-001
 
-node pair node-001 http://10.0.0.11:50902 <node-001-token> 10.0.0.11 50001 50002
-node pair node-002 http://10.0.0.12:50902 <node-002-token> 10.0.0.12 50001 50002
-node pair node-003 http://10.0.0.13:50902 <node-003-token> 10.0.0.13 50001 50002
-node pair node-004 http://10.0.0.14:50902 <node-004-token> 10.0.0.14 50001 50002
+host pair host-001 http://10.0.0.11:50902 <host-001-token>
+host pair host-002 http://10.0.0.12:50902 <host-002-token>
+host pair host-003 http://10.0.0.13:50902 <host-003-token>
+host pair host-004 http://10.0.0.14:50902 <host-004-token>
+
+host list
+
+node create node-001 host-001 10.0.0.11 50001 50002
+node create node-002 host-002 10.0.0.12 50001 50002
+node create node-003 host-003 10.0.0.13 50001 50002
+node create node-004 host-004 10.0.0.14 50001 50002
 
 node list
 ```
@@ -142,29 +159,29 @@ and pairing every agent again. Never place this state in a public repository.
 The advertised host is the address used by N2 peers and clients. Never use
 `0.0.0.0` as an advertised address.
 
-## Inspect, Format, and Assign Remote Disks
+## Inspect and Format Host Disks, Then Assign Them to Nodes
 
 Inventory is explicitly scoped to a physical node:
 
 ```text
-lsblk node-001
-lsblk node-002
-lsblk node-003
-lsblk node-004
+lsblk host-001
+lsblk host-002
+lsblk host-003
+lsblk host-004
 
-disk inspect node-001 /dev/sdb
-disk format node-001 /dev/sdb N2DISK001
-disk format node-002 /dev/sdb N2DISK002
-disk format node-003 /dev/sdb N2DISK003
-disk format node-004 /dev/sdb N2DISK004
+disk inspect host-001 /dev/sdb
+disk format host-001 /dev/sdb N2DISK001
+disk format host-002 /dev/sdb N2DISK002
+disk format host-003 /dev/sdb N2DISK003
+disk format host-004 /dev/sdb N2DISK004
 ```
 
-Use the actual device identity reported by each node. Every format command
+Use the actual device identity reported by each host. Every format command
 prints a distinct confirmation. Successful formatting creates one GPT data
 partition, one XFS filesystem, a UUID-based `/etc/fstab` entry, and a mount at
 `/mnt/N2DISKxxx` on that physical machine.
 
-Bind the initialized roots to their local nodes:
+Bind the initialized host-local roots to their intended logical nodes:
 
 ```text
 disk assign node-001 N2DISK001
@@ -212,8 +229,9 @@ cluster validate
 cluster commit
 ```
 
-Validation contacts every agent in parallel and prints the canonical topology
-hash, physical-node count, distinct machine-fingerprint count, disk count,
+Validation contacts every physical-host agent in parallel and prints the
+canonical topology hash, host count, logical-node count, distinct
+machine-fingerprint count, disk count,
 pool count, reserve count, and gateway count. Commit requires the exact hash
 shown in its confirmation.
 
@@ -227,7 +245,8 @@ The committed artifacts are node-local:
 /etc/systemd/system/litiaina-n2@.service
 ```
 
-Every physical node receives byte-identical membership. Node configuration
+Every physical host receives byte-identical membership for each of its local
+node instances. Node configuration
 contains only that node's endpoint, ports, runtime, and local storage roots.
 
 ## Activate and Observe
@@ -278,14 +297,17 @@ roll back running engine data.
 
 ## Laboratory Simulation
 
-The production default rejects multiple node identities carrying the same
-machine fingerprint. A single-host process simulation must be explicit:
+The production default requires exactly one N2 node per physical host and
+rejects duplicate machine fingerprints. A multi-instance process simulation
+must be explicit:
 
 ```bash
 sudo litiaina-n2-shell serve --allow-shared-failure-domain ...
 ```
 
-This flag proves protocol, membership, routing, and restart behavior. It does
+Under this flag, enroll each physical host once and create multiple logical N2
+nodes on that host with distinct ports and disjoint disk assignments. This
+proves protocol, membership, routing, and restart behavior. It does
 not manufacture independent power, controller, kernel, network, or rack
 failure domains and must not be used to describe a production topology.
 
@@ -294,7 +316,7 @@ failure domains and must not be used to describe a production topology.
 The same hierarchy extends without changing the engine data path:
 
 ```text
-local agent -> physical node -> server pool/reserve set -> cluster
+local agent -> physical host -> logical N2 node -> server pool/reserve set -> cluster
 cluster -> site policy -> federation
 ```
 

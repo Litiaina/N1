@@ -550,7 +550,7 @@ mod tests {
             assert!(
                 shell_command(
                     &shell,
-                    &format!("node pair node-001 {url_one} {token_one} 10.0.0.1 50001 50002"),
+                    &format!("host pair host-001 {url_one} {token_one}"),
                     None
                 )
                 .0
@@ -559,7 +559,25 @@ mod tests {
             assert!(
                 shell_command(
                     &shell,
-                    &format!("node pair node-002 {url_two} {token_two} 10.0.0.2 50001 50002"),
+                    &format!("host pair host-002 {url_two} {token_two}"),
+                    None
+                )
+                .0
+                .success
+            );
+            assert!(
+                shell_command(
+                    &shell,
+                    "node create node-001 host-001 10.0.0.1 50001 50002",
+                    None
+                )
+                .0
+                .success
+            );
+            assert!(
+                shell_command(
+                    &shell,
+                    "node create node-002 host-002 10.0.0.2 50001 50002",
                     None
                 )
                 .0
@@ -600,7 +618,7 @@ mod tests {
             );
             let (validated, output) = shell_command(&shell, "cluster validate", None);
             assert!(validated.success, "{}", output.join("\n"));
-            assert!(output.join("\n").contains("Physical nodes: 2"));
+            assert!(output.join("\n").contains("Physical hosts: 2"));
 
             let (pending, _) = shell_command(&shell, "cluster commit", None);
             let expected = pending.confirmation.unwrap().expected;

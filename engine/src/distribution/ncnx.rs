@@ -29,6 +29,14 @@ const LOCAL_NCNX_BATCH_CONCURRENCY: usize = 4;
 
 static LOCAL_NCNX_BATCH_BUDGET: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(LOCAL_NCNX_BATCH_CONCURRENCY)));
+static LOCAL_NCNX_IO_BUDGET: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| {
+        let workers = std::thread::available_parallelism()
+            .map(|value| value.get().saturating_mul(2))
+            .unwrap_or(4)
+            .clamp(4, 32);
+        Arc::new(Semaphore::new(workers))
+    });
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NcnxReplica {
@@ -113,16 +121,20 @@ pub struct PeerNcnxResponse {
     pub names: Vec<PeerNcnxName>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PeerNcnxBatchAction {
     CreateLive,
+    CreateTrash,
     RemoveLive,
+    RemoveTrash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PeerNcnxBatchItem {
     logical_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trash: Option<TrashLocator>,
     bytes: ByteBuf,
 }
 
@@ -151,6 +163,24 @@ pub struct NcnxRenameBatchItem {
     pub located: LocatedNcnx,
     pub destination_key: String,
     pub destination_record: NcnxRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct NcnxTrashBatchItem {
+    pub located: LocatedNcnx,
+    pub locator: TrashLocator,
+}
+
+#[derive(Clone, Debug)]
+pub struct NcnxRecoverBatchItem {
+    pub located: LocatedNcnx,
+    pub locator: TrashLocator,
+}
+
+#[derive(Clone, Debug)]
+pub struct NcnxPublishBatchItem {
+    pub logical_key: String,
+    pub record: NcnxRecord,
 }
 
 #[derive(Clone, Debug)]
@@ -565,11 +595,29 @@ fn validate_batch_contract<'a>(
     }
     let mut keys = BTreeSet::new();
     for item in &request.items {
-        if !keys.insert(item.logical_key.as_str()) {
+        let identity = ncnx_cursor(&item.logical_key, item.trash.as_ref());
+        if !keys.insert(identity) {
             return Err(AppError::Conflict(format!(
                 "duplicate NCNX key '{}' in peer batch",
                 item.logical_key
             )));
+        }
+        match request.action {
+            PeerNcnxBatchAction::CreateLive | PeerNcnxBatchAction::RemoveLive
+                if item.trash.is_some() =>
+            {
+                return Err(AppError::BadRequest(
+                    "live NCNX batch item cannot carry a trash locator".into(),
+                ));
+            }
+            PeerNcnxBatchAction::CreateTrash | PeerNcnxBatchAction::RemoveTrash
+                if item.trash.is_none() =>
+            {
+                return Err(AppError::BadRequest(
+                    "trash NCNX batch item requires a trash locator".into(),
+                ));
+            }
+            _ => {}
         }
         let layout = build_ncnx_layout(runtime, pool, &request.fragment_id, &item.logical_key)?;
         let assigned = layout
@@ -597,10 +645,19 @@ fn local_apply_batch(
     request: &PeerNcnxBatchRequest,
 ) -> Result<PeerNcnxBatchResponse, AppError> {
     validate_batch_contract(runtime, request)?;
-    let entries = request
+    let live_entries = request
         .items
         .iter()
         .map(|item| (item.logical_key.clone(), item.bytes.clone().into_vec()))
+        .collect::<Vec<_>>();
+    let trash_entries = request
+        .items
+        .iter()
+        .filter_map(|item| {
+            item.trash
+                .clone()
+                .map(|locator| (locator, item.bytes.clone().into_vec()))
+        })
         .collect::<Vec<_>>();
     let mut changed = 0usize;
     let mut selected_root = request.root_id.clone();
@@ -608,7 +665,7 @@ fn local_apply_batch(
         PeerNcnxBatchAction::CreateLive => {
             let mut failures = Vec::new();
             for store in writable_local_stores(runtime, &request.root_id)? {
-                match store.create_live_batch(&request.fragment_id, &entries) {
+                match store.create_live_batch(&request.fragment_id, &live_entries) {
                     Ok(count) => {
                         changed = count;
                         selected_root = store.root_id().to_string();
@@ -627,11 +684,33 @@ fn local_apply_batch(
                 )));
             }
         }
+        PeerNcnxBatchAction::CreateTrash => {
+            let mut failures = Vec::new();
+            for store in writable_local_stores(runtime, &request.root_id)? {
+                match store.create_trash_batch(&request.fragment_id, &trash_entries) {
+                    Ok(count) => {
+                        changed = count;
+                        selected_root = store.root_id().to_string();
+                        failures.clear();
+                        break;
+                    }
+                    Err(error @ AppError::Conflict(_)) => return Err(error),
+                    Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
+                }
+            }
+            if !failures.is_empty() {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "NCNX trash batch publication could not use any healthy disk on node '{}': {}",
+                    runtime.local_node_id,
+                    failures.join("; ")
+                )));
+            }
+        }
         PeerNcnxBatchAction::RemoveLive => {
             let mut successes = 0usize;
             let mut failures = Vec::new();
             for store in local_stores(runtime, &request.root_id) {
-                match store.remove_live_batch_if_exact(&request.fragment_id, &entries) {
+                match store.remove_live_batch_if_exact(&request.fragment_id, &live_entries) {
                     Ok(count) => {
                         successes = successes.saturating_add(1);
                         changed = changed.saturating_add(count);
@@ -646,6 +725,30 @@ fn local_apply_batch(
             if successes == 0 {
                 return Err(AppError::ServiceUnavailable(format!(
                     "NCNX batch removal could not reach any local disk on node '{}': {}",
+                    runtime.local_node_id,
+                    failures.join("; ")
+                )));
+            }
+        }
+        PeerNcnxBatchAction::RemoveTrash => {
+            let mut successes = 0usize;
+            let mut failures = Vec::new();
+            for store in local_stores(runtime, &request.root_id) {
+                match store.remove_trash_batch_if_exact(&request.fragment_id, &trash_entries) {
+                    Ok(count) => {
+                        successes = successes.saturating_add(1);
+                        changed = changed.saturating_add(count);
+                        if count > 0 {
+                            selected_root = store.root_id().to_string();
+                        }
+                    }
+                    Err(error @ AppError::Conflict(_)) => return Err(error),
+                    Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
+                }
+            }
+            if successes == 0 {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "NCNX trash batch removal could not reach any local disk on node '{}': {}",
                     runtime.local_node_id,
                     failures.join("; ")
                 )));
@@ -674,6 +777,40 @@ async fn run_local_batch(
     })
     .await
     .map_err(|error| AppError::InternalServerError(format!("NCNX batch worker failed: {error}")))?
+}
+
+async fn run_local_apply(
+    runtime: Arc<ClusterRuntime>,
+    request: PeerNcnxRequest,
+) -> Result<PeerNcnxResponse, AppError> {
+    let permit = LOCAL_NCNX_IO_BUDGET
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("NCNX filesystem budget is closed".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        local_apply(&runtime, &request)
+    })
+    .await
+    .map_err(|error| AppError::InternalServerError(format!("NCNX worker failed: {error}")))?
+}
+
+async fn run_local_list(
+    runtime: Arc<ClusterRuntime>,
+    request: PeerNcnxRequest,
+) -> Result<PeerNcnxResponse, AppError> {
+    let permit = LOCAL_NCNX_IO_BUDGET
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("NCNX filesystem budget is closed".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        local_list(&runtime, &request)
+    })
+    .await
+    .map_err(|error| AppError::InternalServerError(format!("NCNX list worker failed: {error}")))?
 }
 
 fn local_list(
@@ -789,8 +926,8 @@ async fn peer_handler(
         PeerNcnxAction::ListLive
         | PeerNcnxAction::ListTrash
         | PeerNcnxAction::ListLiveAll
-        | PeerNcnxAction::ListTrashAll => local_list(&runtime, &request)?,
-        _ => local_apply(&runtime, &request)?,
+        | PeerNcnxAction::ListTrashAll => run_local_list(runtime, request).await?,
+        _ => run_local_apply(runtime, request).await?,
     };
     Ok(Json(response))
 }
@@ -818,7 +955,7 @@ async fn send_to_replica(
     request: PeerNcnxRequest,
 ) -> Result<PeerNcnxResponse, AppError> {
     if replica.node_id == runtime.local_node_id {
-        return local_apply(runtime, &request);
+        return run_local_apply(Arc::new(runtime.clone()), request).await;
     }
     let client = peer_http_client()?;
     let mut call = client
@@ -964,6 +1101,11 @@ async fn apply_rename_batch_stage(
                 item.located.logical_key.as_str(),
                 item.located.bytes.clone(),
             ),
+            PeerNcnxBatchAction::CreateTrash | PeerNcnxBatchAction::RemoveTrash => {
+                return Err(AppError::InternalServerError(
+                    "trash action passed to rename batch".into(),
+                ));
+            }
         };
         let layout = build_ncnx_layout(&runtime, pool, &fragment_id, logical_key)?;
         for replica in layout.replicas {
@@ -980,6 +1122,7 @@ async fn apply_rename_batch_stage(
                 .or_default()
                 .push(PeerNcnxBatchItem {
                     logical_key: logical_key.to_string(),
+                    trash: None,
                     bytes: ByteBuf::from(bytes.clone()),
                 });
         }
@@ -1015,6 +1158,106 @@ async fn apply_rename_batch_stage(
 pub async fn rename_live_batch(items: &[NcnxRenameBatchItem]) -> Result<(), AppError> {
     apply_rename_batch_stage(items, PeerNcnxBatchAction::CreateLive).await?;
     apply_rename_batch_stage(items, PeerNcnxBatchAction::RemoveLive).await
+}
+
+async fn apply_trash_move_batch_stage(
+    items: &[(LocatedNcnx, TrashLocator)],
+    action: PeerNcnxBatchAction,
+) -> Result<(), AppError> {
+    if items.is_empty() || items.len() > PEER_NCNX_BATCH_MAX {
+        return Err(AppError::BadRequest(format!(
+            "namespace batch requires 1..={PEER_NCNX_BATCH_MAX} entries"
+        )));
+    }
+    let fragment_id = items[0].0.record.fragment_id.clone();
+    let runtime = active_cluster_runtime()?;
+    let mut identities = BTreeSet::new();
+    let mut groups = BTreeMap::<PeerNcnxBatchTarget, Vec<PeerNcnxBatchItem>>::new();
+    for (located, locator) in items {
+        if located.record.fragment_id != fragment_id || locator.logical_key != located.logical_key {
+            return Err(AppError::Conflict(
+                "namespace batch must preserve fragment, key, and object identity".into(),
+            ));
+        }
+        let identity = ncnx_cursor(&located.logical_key, Some(locator));
+        if !identities.insert(identity) {
+            return Err(AppError::Conflict(format!(
+                "duplicate namespace generation for '{}' in one batch",
+                located.logical_key
+            )));
+        }
+        let pool = pool_for_located(&runtime, located)?;
+        let layout = build_ncnx_layout(&runtime, pool, &fragment_id, &located.logical_key)?;
+        let trash = matches!(
+            action,
+            PeerNcnxBatchAction::CreateTrash | PeerNcnxBatchAction::RemoveTrash
+        )
+        .then(|| locator.clone());
+        for replica in layout.replicas {
+            groups
+                .entry(PeerNcnxBatchTarget {
+                    pool_id: layout.pool_id.clone(),
+                    pool_generation: layout.pool_generation,
+                    node_id: replica.node_id,
+                    instance_id: replica.instance_id,
+                    binding_epoch: replica.binding_epoch,
+                    root_id: replica.root_id,
+                    endpoint: replica.endpoint,
+                })
+                .or_default()
+                .push(PeerNcnxBatchItem {
+                    logical_key: located.logical_key.clone(),
+                    trash: trash.clone(),
+                    bytes: ByteBuf::from(located.bytes.clone()),
+                });
+        }
+    }
+
+    let calls = groups.into_iter().map(|(target, entries)| {
+        let runtime = runtime.clone();
+        let action = action.clone();
+        let fragment_id = fragment_id.clone();
+        async move { send_batch_to_target(&runtime, &target, action, &fragment_id, entries).await }
+    });
+    let mut failures = Vec::new();
+    for result in join_all(calls).await {
+        match result {
+            Ok(_) => {}
+            Err(error @ AppError::Conflict(_)) => return Err(error),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::ServiceUnavailable(format!(
+            "NCNX namespace batch did not reach every exact replica: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+/// Publishes every immutable trash generation before removing any matching
+/// live pointer. A retry is byte-idempotent and can safely converge a partial
+/// destination-first operation.
+pub async fn trash_live_batch(items: &[NcnxTrashBatchItem]) -> Result<(), AppError> {
+    let exact = items
+        .iter()
+        .map(|item| (item.located.clone(), item.locator.clone()))
+        .collect::<Vec<_>>();
+    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::CreateTrash).await?;
+    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::RemoveLive).await
+}
+
+/// Restores every immutable live pointer before removing any exact trash
+/// generation. Existing live content remains a strict conflict.
+pub async fn recover_trash_batch(items: &[NcnxRecoverBatchItem]) -> Result<(), AppError> {
+    let exact = items
+        .iter()
+        .map(|item| (item.located.clone(), item.locator.clone()))
+        .collect::<Vec<_>>();
+    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::CreateLive).await?;
+    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::RemoveTrash).await
 }
 
 fn request_for_replica(
@@ -1300,6 +1543,204 @@ pub async fn publish_new(
     })
 }
 
+/// Publishes independent upload pointers through grouped per-node NCNX
+/// writes. Each key retains survival-write admission (one durable NCNX copy),
+/// exact deterministic placement, conflict isolation, and an independent
+/// result. A failed peer group is retried per key to avoid poisoning unrelated
+/// uploads with one conflicting name.
+pub async fn publish_new_batch(
+    fragment_id: &str,
+    items: &[NcnxPublishBatchItem],
+) -> Vec<Result<LocatedNcnx, AppError>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() > PEER_NCNX_BATCH_MAX {
+        return items
+            .iter()
+            .map(|_| {
+                Err(AppError::BadRequest(format!(
+                    "NCNX publication batch exceeds {PEER_NCNX_BATCH_MAX} entries"
+                )))
+            })
+            .collect();
+    }
+
+    let runtime = match active_cluster_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let message = error.to_string();
+            return items
+                .iter()
+                .map(|_| Err(AppError::ServiceUnavailable(message.clone())))
+                .collect();
+        }
+    };
+    let reads = items.iter().map(|item| async {
+        if item.record.fragment_id != fragment_id {
+            return Err(AppError::Conflict(
+                "NCNX publication batch contains another fragment".into(),
+            ));
+        }
+        let logical_key = validate_logical_key(&item.logical_key)?;
+        Ok::<_, AppError>((
+            logical_key.clone(),
+            find_live_for_survival_write(fragment_id, &logical_key).await?,
+        ))
+    });
+    let observations = join_all(reads).await;
+    let mut prepared = (0..items.len()).map(|_| None).collect::<Vec<_>>();
+    let mut terminal = (0..items.len()).map(|_| None).collect::<Vec<_>>();
+    let mut successes = vec![0usize; items.len()];
+    let mut failures = vec![Vec::<String>::new(); items.len()];
+    let mut groups = BTreeMap::<PeerNcnxBatchTarget, Vec<(usize, PeerNcnxBatchItem)>>::new();
+
+    for (index, observation) in observations.into_iter().enumerate() {
+        let (logical_key, existing) = match observation {
+            Ok(value) => value,
+            Err(error) => {
+                terminal[index] = Some(error);
+                continue;
+            }
+        };
+        let (located, pool) = match existing {
+            Some(existing) if existing.record.object_id != items[index].record.object_id => {
+                terminal[index] = Some(AppError::Conflict(format!(
+                    "logical key '{logical_key}' already points to another object"
+                )));
+                continue;
+            }
+            Some(existing) => {
+                let pool = match pool_for_located(&runtime, &existing) {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        terminal[index] = Some(error);
+                        continue;
+                    }
+                };
+                (existing, pool)
+            }
+            None => {
+                let Some(pool) = runtime.membership.newest_writable_pool() else {
+                    terminal[index] = Some(AppError::ServiceUnavailable(
+                        "cluster has no writable server pool".into(),
+                    ));
+                    continue;
+                };
+                let bytes = match items[index].record.encode() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        terminal[index] = Some(error);
+                        continue;
+                    }
+                };
+                (
+                    LocatedNcnx {
+                        pool_id: pool.id.clone(),
+                        pool_generation: pool.generation,
+                        logical_key: logical_key.clone(),
+                        record: items[index].record.clone(),
+                        bytes,
+                    },
+                    pool,
+                )
+            }
+        };
+        let layout = match build_ncnx_layout(&runtime, pool, fragment_id, &logical_key) {
+            Ok(layout) => layout,
+            Err(error) => {
+                terminal[index] = Some(error);
+                continue;
+            }
+        };
+        for replica in layout.replicas {
+            groups
+                .entry(PeerNcnxBatchTarget {
+                    pool_id: layout.pool_id.clone(),
+                    pool_generation: layout.pool_generation,
+                    node_id: replica.node_id,
+                    instance_id: replica.instance_id,
+                    binding_epoch: replica.binding_epoch,
+                    root_id: replica.root_id,
+                    endpoint: replica.endpoint,
+                })
+                .or_default()
+                .push((
+                    index,
+                    PeerNcnxBatchItem {
+                        logical_key: logical_key.clone(),
+                        trash: None,
+                        bytes: ByteBuf::from(located.bytes.clone()),
+                    },
+                ));
+        }
+        prepared[index] = Some(located);
+    }
+
+    let calls = groups.into_iter().map(|(target, indexed)| {
+        let runtime = runtime.clone();
+        let fragment_id = fragment_id.to_string();
+        let request_items = indexed.iter().map(|(_, item)| item.clone()).collect();
+        async move {
+            let result = send_batch_to_target(
+                &runtime,
+                &target,
+                PeerNcnxBatchAction::CreateLive,
+                &fragment_id,
+                request_items,
+            )
+            .await;
+            (target, indexed, result)
+        }
+    });
+    for (target, indexed, group_result) in join_all(calls).await {
+        if group_result.is_ok() {
+            for (index, _) in indexed {
+                successes[index] = successes[index].saturating_add(1);
+            }
+            continue;
+        }
+        // Exact fallback is exceptional: it isolates one conflict or failed
+        // disk without discarding successful entries from the same batch.
+        for (index, item) in indexed {
+            match send_batch_to_target(
+                &runtime,
+                &target,
+                PeerNcnxBatchAction::CreateLive,
+                fragment_id,
+                vec![item],
+            )
+            .await
+            {
+                Ok(_) => successes[index] = successes[index].saturating_add(1),
+                Err(error @ AppError::Conflict(_)) => terminal[index] = Some(error),
+                Err(error) => failures[index].push(error.to_string()),
+            }
+        }
+    }
+
+    prepared
+        .into_iter()
+        .enumerate()
+        .map(|(index, located)| {
+            if let Some(error) = terminal[index].take() {
+                return Err(error);
+            }
+            if successes[index] == 0 {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "NCNX survival publication reached 0 replicas: {}",
+                    failures[index].join("; ")
+                )));
+            }
+            located.ok_or_else(|| {
+                AppError::InternalServerError(
+                    "NCNX publication batch lost its prepared record".into(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn pool_for_located<'a>(
     runtime: &'a ClusterRuntime,
     located: &LocatedNcnx,
@@ -1498,7 +1939,9 @@ async fn list_node(
         limit: Some(limit),
     };
     if node.id == runtime.local_node_id {
-        return Ok(local_list(runtime, &request)?.names);
+        return Ok(run_local_list(Arc::new(runtime.clone()), request)
+            .await?
+            .names);
     }
     let client = peer_http_client()?;
     let mut call = client
