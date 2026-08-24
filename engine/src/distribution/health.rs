@@ -1,7 +1,8 @@
 use crate::core::operation_gate::cluster_safety_read_only_state;
 use crate::distribution::layout::resolve_configured_layout;
 use crate::distribution::membership::{
-    ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes, live_readable_nodes,
+    ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes,
+    live_mutation_authority_nodes_for_pool, live_readable_nodes,
 };
 use crate::distribution::peer::{cluster_secret, peer_http_client};
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
@@ -60,6 +61,7 @@ pub struct ClusterHealthSnapshot {
     pub ncnx_replicas_required: usize,
     pub ncnx_survival_writable: bool,
     pub ncnx_strictly_writable: bool,
+    pub write_authority_proven: bool,
     pub effective_client_writable: bool,
     pub safety_read_only: bool,
     pub manual_rebalance_available: bool,
@@ -76,9 +78,15 @@ pub struct ClusterHealthSnapshot {
 pub async fn cluster_health_snapshot(
     runtime: &ClusterRuntime,
 ) -> Result<ClusterHealthSnapshot, AppError> {
-    let endpoint_active = live_active_write_nodes(runtime).await;
-    let endpoint_readable = live_readable_nodes(runtime).await;
-    let readiness = storage_readiness_by_node(runtime).await;
+    let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
+        AppError::ServiceUnavailable("cluster has no writable server pool".into())
+    })?;
+    let (endpoint_active, endpoint_readable, namespace_writable, readiness) = tokio::join!(
+        live_active_write_nodes(runtime),
+        live_readable_nodes(runtime),
+        live_mutation_authority_nodes_for_pool(runtime, &write_pool.id),
+        storage_readiness_by_node(runtime),
+    );
     let active = endpoint_active
         .into_iter()
         .filter(|node| {
@@ -97,7 +105,13 @@ pub async fn cluster_health_snapshot(
                 .is_some_and(|(_, status)| status.readable)
         })
         .collect();
-    cluster_health_snapshot_with_readiness(runtime, active, readable, &readiness)
+    cluster_health_snapshot_with_readiness(
+        runtime,
+        active,
+        readable,
+        namespace_writable,
+        &readiness,
+    )
 }
 
 pub fn cluster_health_snapshot_with_live_nodes(
@@ -124,13 +138,14 @@ pub fn cluster_health_snapshot_with_live_nodes(
             )
         })
         .collect::<Vec<_>>();
-    cluster_health_snapshot_with_readiness(runtime, active, readable, &readiness)
+    cluster_health_snapshot_with_readiness(runtime, active.clone(), readable, active, &readiness)
 }
 
 fn cluster_health_snapshot_with_readiness(
     runtime: &ClusterRuntime,
     active: Vec<ClusterNode>,
     readable: Vec<ClusterNode>,
+    namespace_writable: Vec<ClusterNode>,
     readiness: &[(String, crate::core::capacity_manager::StorageReadiness)],
 ) -> Result<ClusterHealthSnapshot, AppError> {
     let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
@@ -169,7 +184,17 @@ fn cluster_health_snapshot_with_readiness(
                 })
         })
         .count();
-    let readable_namespace = readable_blob.len();
+    let writable_namespace = namespace_writable
+        .iter()
+        .filter(|node| {
+            pool_nodes.contains(&node.id)
+                && readiness
+                    .iter()
+                    .find(|(node_id, _)| node_id == &node.id)
+                    .is_some_and(|(_, status)| status.writable)
+        })
+        .count();
+    let readable_namespace = writable_namespace;
     let configured_layout =
         resolve_configured_layout(configured_blob.len(), &runtime.layout_policy)
             .map_err(AppError::BadRequest)?;
@@ -188,16 +213,23 @@ fn cluster_health_snapshot_with_readiness(
     // member of a key's deterministic R=M+1 replica set.
     let estimated_ncnx_replicas_reachable =
         ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(readable_namespace));
-    let writable_namespace = writable_blob.len();
     let guaranteed_writable_ncnx =
         ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(writable_namespace));
     let ncnx_survival_writable =
         writable_namespace >= layout.data_shards && guaranteed_writable_ncnx >= 1;
     let ncnx_strictly_writable = writable_namespace == configured_namespace_nodes;
+    let write_authority_proven = writable_namespace == configured_namespace_nodes
+        && runtime
+            .membership
+            .nodes_for_pool(&write_pool.id)
+            .iter()
+            .all(|node| node.effective_state().accepts_new_writes());
     let safety_state = cluster_safety_read_only_state();
     let safety_read_only = safety_state.is_some();
-    let effective_client_writable =
-        data_plane_writable && ncnx_survival_writable && !safety_read_only;
+    let effective_client_writable = data_plane_writable
+        && ncnx_survival_writable
+        && write_authority_proven
+        && !safety_read_only;
     let missing_blob_writable = configured_blob.len().saturating_sub(active_blob.len());
     let unwritable_blob = active_blob.len().saturating_sub(writable_blob.len());
     let partially_writable_blob = writable_blob.len().saturating_sub(fully_writable_blob);
@@ -279,9 +311,17 @@ fn cluster_health_snapshot_with_readiness(
         ));
     }
     if missing_blob_writable > 0 {
-        if data_plane_writable && ncnx_survival_writable {
+        if data_plane_writable && write_authority_proven {
             notes.push(format!(
-                "{} configured pool node(s) are currently unreachable; survival writes remain enabled at K={} while every commit retains the fixed {}+{} repair layout",
+                "{} configured pool node(s) are unavailable on the native shard plane; exact NCNX authority remains proven and survivor writes stay enabled at K={} while every commit retains the fixed {}+{} healing layout",
+                missing_blob_writable,
+                configured_layout.data_shards,
+                configured_layout.data_shards,
+                configured_layout.parity_shards
+            ));
+        } else if data_plane_writable && ncnx_survival_writable {
+            notes.push(format!(
+                "{} configured pool node(s) are currently unreachable; K={} remains sufficient for reconstruction, but client writes fail closed because reachability alone cannot prove exclusive mutation authority for the fixed {}+{} pool",
                 missing_blob_writable,
                 configured_layout.data_shards,
                 configured_layout.data_shards,
@@ -317,7 +357,7 @@ fn cluster_health_snapshot_with_readiness(
     }
     if !ncnx_strictly_writable {
         notes.push(format!(
-            "namespace NCNX placement is degraded: {} of {} server-pool nodes are writable ({} target replicas per key); upload publication requires one surviving replica and retains the exact repair set",
+            "namespace NCNX placement is unavailable for exact publication: {} of {} server-pool nodes are writable ({} target replicas per key); client mutation cannot acknowledge until every deterministic NCNX replica is writable",
             writable_namespace, configured_namespace_nodes, ncnx_replicas_required
         ));
     }
@@ -344,6 +384,7 @@ fn cluster_health_snapshot_with_readiness(
         ncnx_replicas_required,
         ncnx_survival_writable,
         ncnx_strictly_writable,
+        write_authority_proven,
         effective_client_writable,
         safety_read_only,
         manual_rebalance_available: active_blob.len() >= layout.total_shards(),
@@ -556,6 +597,7 @@ mod tests {
         assert!(snap.data_plane_fully_protected);
         assert!(snap.ncnx_survival_writable);
         assert!(snap.ncnx_strictly_writable);
+        assert!(snap.write_authority_proven);
         assert!(snap.effective_client_writable);
         assert!(!snap.layout_drift_is_health_failure);
         assert_eq!(
@@ -582,7 +624,8 @@ mod tests {
         assert!(!snap.data_plane_fully_protected);
         assert!(snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
-        assert!(snap.effective_client_writable);
+        assert!(!snap.write_authority_proven);
+        assert!(!snap.effective_client_writable);
         assert_eq!(snap.nodes[1].state, NodeState::Offline);
     }
 
@@ -621,14 +664,21 @@ mod tests {
             ),
         ];
 
-        let snap =
-            cluster_health_snapshot_with_readiness(&runtime, active, readable, &readiness).unwrap();
+        let snap = cluster_health_snapshot_with_readiness(
+            &runtime,
+            active.clone(),
+            readable,
+            active,
+            &readiness,
+        )
+        .unwrap();
 
         assert_eq!(snap.state, ClusterHealthState::Degraded);
         assert!(snap.data_plane_writable);
         assert!(snap.data_plane_fully_protected);
         assert!(snap.ncnx_survival_writable);
         assert!(snap.ncnx_strictly_writable);
+        assert!(snap.write_authority_proven);
         assert!(snap.effective_client_writable);
         assert!(snap.nodes[1].accepts_writes);
         assert!(snap.nodes[1].storage_writable);
@@ -639,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_two_plus_one_keeps_survival_writes_at_k() {
+    fn fixed_two_plus_one_keeps_data_reconstructable_at_k_but_fails_writes_closed() {
         let mut runtime = runtime(vec![
             node("blob-a", NodeState::Online),
             node("blob-b", NodeState::Online),
@@ -662,7 +712,58 @@ mod tests {
         assert!(!snap.data_plane_fully_protected);
         assert!(snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
+        assert!(!snap.write_authority_proven);
+        assert!(!snap.effective_client_writable);
+    }
+
+    #[test]
+    fn native_shard_loss_keeps_exact_ncnx_authority_and_k_writes() {
+        let runtime = runtime(vec![
+            node("blob-a", NodeState::Online),
+            node("blob-b", NodeState::Online),
+        ]);
+        let data_live = runtime.membership.nodes[..1].to_vec();
+        let namespace_live = runtime.membership.nodes.clone();
+        let readiness = runtime
+            .membership
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    crate::core::capacity_manager::StorageReadiness {
+                        readable: true,
+                        writable: true,
+                        root_count: 1,
+                        readable_roots: 1,
+                        writable_roots: 1,
+                        minimum_available_bytes: Some(1024 * 1024 * 1024),
+                        issues: Vec::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let snap = cluster_health_snapshot_with_readiness(
+            &runtime,
+            data_live.clone(),
+            data_live,
+            namespace_live,
+            &readiness,
+        )
+        .unwrap();
+
+        assert_eq!(snap.state, ClusterHealthState::Degraded);
+        assert!(snap.data_plane_writable);
+        assert!(!snap.data_plane_fully_protected);
+        assert!(snap.ncnx_strictly_writable);
+        assert!(snap.write_authority_proven);
         assert!(snap.effective_client_writable);
+        assert!(
+            snap.notes
+                .iter()
+                .any(|note| note.contains("survivor writes stay enabled"))
+        );
     }
 
     #[test]
@@ -728,12 +829,13 @@ mod tests {
         assert!(!snap.data_plane_fully_protected);
         assert!(snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
-        assert!(snap.effective_client_writable);
-        assert!(snap.nodes[0].accepts_writes);
+        assert!(!snap.write_authority_proven);
+        assert!(!snap.effective_client_writable);
+        assert!(!snap.nodes[0].accepts_writes);
         assert!(
             snap.notes
                 .iter()
-                .any(|note| note.contains("namespace NCNX placement is degraded"))
+                .any(|note| note.contains("exclusive mutation authority"))
         );
     }
 }

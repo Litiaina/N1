@@ -30,8 +30,8 @@ The N2 3.4.1 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test --workspace --lib --bins --tests`: N2 180/180, gateway 20/20,
-  native client 2/2, and shell 4/4 passed;
+- `cargo test --workspace --lib --bins --tests`: N2 192/192, gateway 27/27,
+  native client 2/2, and shell 18/18 passed;
 - SIMD erasure core: 107 passed with 6 intentionally ignored; integration:
   5 passed with 2 intentionally ignored;
 - optimized `cargo build -p n2 --release`;
@@ -44,18 +44,21 @@ integrity, corrupted block reconstruction, canonical-list refill,
 replica-backed degraded listing, exact static placement, exact metadata
 visibility, copy/delete restart semantics, and object/healing invariants.
 
-### Survival-write code gate
+### Historical reconstruction-threshold write gate
 
-The current survival-write branch has passed the complete debug and optimized
-release library suites: 164 passed, 0 failed in each profile. Its focused
-invariants include:
+The earlier survival-write branch passed the complete debug and optimized
+release library suites: 164 passed, 0 failed in each profile. This evidence is
+retained because it proves immutable-layout reconstruction and healing, but
+its `K`-only mutation admission rule is superseded by the network-partition
+authority gate below. Its focused invariants included:
 
 - the configured `K + M` layout remains unchanged at full width and at `K`;
 - EC streaming persists and checksums every exact piece while only `K` writers
   survive;
 - the same stream rejects `K - 1`;
 - `R = M + 1` NCNX placement intersects every possible `K`-node survivor set;
-- health reports exactly `K` as degraded/writable and `K - 1` as critical;
+- health reported exactly `K` as degraded/writable and `K - 1` as critical
+  under the earlier contract;
 - one failed storage root does not disable a node that retains another
   readable/writable root;
 - object-local healing failures remain local reports instead of global
@@ -626,10 +629,237 @@ Every real-machine run must:
 - retain the first failure artifact instead of hiding it with a rerun;
 - report elapsed duration honestly.
 
+## Network-Partition Release Gate
+
+This gate is intentionally separate from stopped-process, lost-disk, and
+reserve-promotion testing. A stopped process proved that the surviving node can
+read committed data, accept a `K`-boundary object, and heal it after the missing
+node returns. A network partition keeps both processes alive while blocking
+some or all internode communication; clients or gateways may still reach both
+sides.
+
+### Two-host evidence
+
+The independent two-host `1 + 1` run retained at:
+
+```text
+/home/litiaina/dev-test/n2-two-host-1p1-20260823-030752
+```
+
+proved byte-exact one-shot, batch, standard and durable multipart, pagination,
+prefix rename/trash/recovery, all configured disk-root participation, NCNX and
+shard repair, local-root loss, complete process loss, `K=1` survivor write,
+healing, and rolling restart. The core result is `CORE_PASS`.
+
+The same run then kept both N2 processes alive and silently dropped only their
+test-port traffic in both directions. Reads and new/same-key writes returned
+`503`; reconnection exposed no rejected key, no partial publication, no NCNX
+disagreement, and no changed original HEAD. This is a safety pass with an
+explicit availability limit, recorded as:
+
+```text
+PASS_WITH_EXPLICIT_PARTITION_AVAILABILITY_LIMIT
+```
+
+That run was not a complete partition proof. Its silent-DROP result depended
+on timeout ordering and did not cover fast failure or asymmetric links.
+
+The targeted authority patch and real two-host validation on 2026-08-24 is
+retained at:
+
+```text
+/home/litiaina/dev-test/n2-partition-authority-20260824
+```
+
+It used one physical node on the Debian development host with two enrolled
+roots and one physical node on `192.168.0.12` with four isolated HDD roots,
+EC `1 + 1`, NCNX replication two, and the optimized N2 binary. Production N1
+on the server remained active and its roots were not modified.
+
+Results:
+
+- healthy baseline upload returned HTTP 201, read back byte-exact, and exposed
+  `healthy`, `write_authority_proven=true`, and
+  `effective_client_writable=true`;
+- bidirectional peer-HTTP rejection kept both processes alive while native
+  shard traffic remained connected, rejected
+  concurrent different-byte writes to the same key with HTTP 503 on both
+  coordinators, and kept previously committed reads byte-exact on both sides;
+- after reconnection the rejected key returned 404, the original HEAD ULID was
+  unchanged, and health returned to writable/healthy;
+- in each asymmetric direction, exactly the coordinator that could reach the
+  complete pool returned HTTP 201 while the isolated coordinator returned
+  HTTP 503; both accepted objects read back byte-exact;
+- complete loss of the second process left committed reads byte-exact and
+  rejected new writes with HTTP 503; restart restored healthy write authority;
+- a native-only bidirectional partition retained exact NCNX authority: both
+  independent survivor writes returned HTTP 201, health truthfully reported
+  `degraded`, `write_authority_proven=true`,
+  `effective_client_writable=true`, and
+  `data_plane_fully_protected=false`, and both objects read back byte-exact
+  after reconnection;
+- 64 concurrent healthy uploads returned 64 HTTP 201 responses, and file
+  evidence appeared on both local roots and all four remote roots;
+- simultaneous different-byte creation of one absent key through both healthy
+  coordinators produced one HTTP 201 winner and one HTTP 409 conflict;
+- the focused distribution suite passed 87/87 before cleanup.
+
+This closes the pre-existing bidirectional peer-HTTP fast-REJECT,
+native-only survivor, asymmetric-link, stopped-process, reconnection, and
+exact same-key authority cases. It does not yet claim silent-DROP timing,
+crash-at-every-NCNX-stage, wider EC layouts, or independent-witness
+availability.
+
+### Conflict that must be prevented
+
+The critical test is not two isolated writes to different keys. It is two
+acknowledged mutations of the same logical NCNX key:
+
+```text
+component A: videos/a.mp4 -> object-A / version-A
+component B: videos/a.mp4 -> object-B / version-B
+```
+
+The immutable objects can coexist physically, but both NCNX records are valid
+and neither is missing or corrupt. Selecting either record would hide an
+acknowledged write. Autonomous healing must report disagreement rather than
+guess a winner, so admission must prevent this state from being acknowledged.
+
+### Required topology matrix
+
+Run every partition case first on the minimum real two-host `1 + 1` pool, then
+on simulated or physical `2 + 1`, `3 + 1`, `3 + 2`, `2 + 2`, and a wider
+`K > M` pool. Record both configured and observed components.
+
+| EC layout | Authority condition to prove |
+| --- | --- |
+| `1 + 1` without witness | No automatic side selection; fail closed while authority is ambiguous |
+| `1 + 1` with independent witness/reserve | Exactly one one-node component may receive authority |
+| `2 + 1` | Only a component with at least two exclusive voters may mutate |
+| `3 + 1` | Only a component with at least three exclusive voters may mutate |
+| `3 + 2` | Only a component with at least three exclusive voters may mutate |
+| `2 + 2` | Two-node halves need an independent witness or must fail closed |
+| wider `K > M` | Publication still requires K writable EC holders and one exclusive authority component |
+
+### Required fault matrix
+
+Each fault must affect only isolated test addresses, ports, processes, and
+roots. Preserve the first result before rerunning.
+
+1. Bidirectional silent `DROP` of peer HTTP and native traffic.
+2. Bidirectional immediate `REJECT`, TCP reset, and connection-refused paths.
+3. One-way/asymmetric partitions in both directions.
+4. Peer HTTP partition with native traffic available, then the inverse.
+5. Gateway able to reach both nodes while internode traffic is partitioned.
+6. Gateway able to reach only one component while another gateway or direct
+   client reaches the other.
+7. Process pause and event-loop stall without process exit.
+8. Partition during EC streaming, NCDX publication, NCNX publication, and the
+   destination-first/source-delete stages.
+9. Restart of one or both components while the partition remains active.
+10. Reconnection with stale membership/binding epochs and a retired physical
+    instance attempting to publish.
+
+### Required operation matrix
+
+For every relevant fault, synchronize coordinators so the operations overlap:
+
+- create the same absent key with different bytes and object IDs;
+- overwrite the same existing key with different bytes;
+- overwrite versus trash/delete;
+- rename two sources onto one destination;
+- rename versus trash, recover versus new live creation, and double recovery;
+- standard and durable multipart finalization of the same logical key;
+- batch entries containing same-key conflicts and independent keys;
+- independent-key writes, to quantify availability without weakening same-key
+  safety;
+- GET/HEAD of an existing key and negative lookup of an absent key on both
+  components;
+- paginated LIST before partition, on each component, and after convergence.
+
+### Pass criteria
+
+A partition test passes only when all of the following hold:
+
+- at most one conflicting mutation receives a success response;
+- a rejected mutation publishes no live NCNX and no visible partial object;
+- no key has two valid live NCNX records with different object identities;
+- every previously committed object remains byte-exact when at least K pieces
+  are reachable;
+- an unauthorized or stale component is read-only for mutation traffic;
+- reconnection requires no arbitrary HEAD selection and healing restores only
+  missing exact NCNX/NCDX/shard placements;
+- restart cannot revive expired authority or a retired binding;
+- gateway retries cannot convert a rejected mutation into a second commit;
+- expected fail-closed responses are distinguished from engine errors;
+- logs contain no panic, corruption, checksum mismatch, or unexplained
+  internal error;
+- the run records request outcomes, mutation/object/version IDs, membership and
+  binding epochs, component views, peer calls, latency, CPU, and IO.
+
+### Implemented policy and future availability extensions
+
+The current implementation uses an **explicit fail-closed partition policy**.
+Before mutating an existing NCNX, the coordinator concurrently proves its
+complete exact recorded pool reachable; a pool sealed against new object
+placement remains valid for this operation. New uploads instead prove the
+complete newest writable pool. Upload publication requires every exact NCNX
+replica. `K` remains data-reconstruction truth and never becomes authority
+merely because a peer timed out. Health reports new-write authority separately
+through `write_authority_proven`.
+
+Authority probes use peer HTTP because NCNX is the mutation boundary. Native
+shard reachability remains a separate data-plane observation: after authority
+is proven, the fixed layout may commit at `K` and retain unavailable exact
+roles for healing. Tests must therefore partition HTTP and native traffic
+independently as well as together.
+
+Possible future availability extensions remain release-gated:
+
+1. **Fragment-scoped survivor authority.** Extend the epoch-bound lease/fencing
+   concept already used by autonomous healing. Acquire it only on degradation,
+   permit concurrent work under the authorized fragment/component, and require
+   it on every degraded NCNX mutation. Healthy writes must gain no lock or
+   authority round trip.
+2. **Independent witness through a compatible reserve or dedicated control
+   instance.** Use it only to break a balanced `K=M` tie. The witness stores no
+   object shard and must not become a gateway-owned hidden database.
+3. **Operator-confirmed physical fencing.** Permit a survivor after an operator
+   or hardware controller proves the other instance cannot publish. This is a
+   valid low-end fallback when no independent witness exists.
+
+The following are rejected as standalone solutions:
+
+- increasing the outer timeout or treating fast connection failure as proof of
+  node death;
+- allowing both components to write and asking healing to select a winner;
+- making the route-only gateway the sole authority without restart-proof
+  fencing and multi-gateway semantics;
+- adding a cluster-wide namespace database, per-key global lock, or healthy
+  data-path quorum merely to cover degraded operation;
+- importing another storage engine's quorum implementation instead of proving
+  an N2-specific control boundary.
+
+### Planned execution order
+
+1. Complete crash injection during EC, NCDX, and each NCNX publication stage.
+2. Exercise peer-HTTP-only and native-only partition variants.
+3. Exercise stale membership/binding epochs and retired-instance publication
+   while partitioned.
+4. Repeat the matrix on `2 + 1`, `3 + 1`, `3 + 2`, `2 + 2`, and a wider pool.
+5. Run restart proof, repair proof, and a focused healthy-path benchmark.
+6. Only after finite proof passes, run a bounded soak with repeated partition
+   and reconnection cycles.
+
+Until those remaining cases close, the two-host result proves the implemented
+fail-closed rule for existing fast/asymmetric partitions, not uninterrupted
+write availability or every mid-commit partition timing.
+
 ## Remaining Release Gates
 
 - Repeat on four independent physical nodes for independent failure domains.
-- Exercise network partitions, not only stopped processes.
+- Complete the remaining mid-commit and wider-topology partition cases above;
+  stopped processes alone do not qualify them.
 - Exercise sustained disk-full and media replacement on isolated test roots.
 - Repeat at larger namespace cardinality and with mixed multipart workloads.
 - Continue tracking namespace p95/p99 latency and process CPU/IO during long

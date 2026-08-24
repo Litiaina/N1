@@ -29,8 +29,9 @@ autonomous healing. N2 3.1 stores each delete mutation in one
 or EC placement. N2 3.2 makes SHA-256 the only N2 integrity checksum, embeds
 SHA-256 integrity in NCNX and object NCDX, derives object placement from
 immutable server-pool membership, and uses replica-backed exact listing.
-Survival publication uses the same bounded replica merge for every LIST page
-so a noncanonical surviving NCNX copy is immediately visible. N2 3.x does not open or migrate N2
+Replica-backed listing uses the same bounded merge for every LIST page so a
+surviving noncanonical NCNX copy remains visible after later replica loss.
+N2 3.x does not open or migrate N2
 1.x, 2.x, or earlier experimental 3.x roots. N2 3.3 adds an autonomous
 cluster Reserve Set: an unassigned physical instance can replace one failed
 logical pool slot without changing the pool generation, EC width, logical
@@ -38,19 +39,29 @@ placement identities, or immutable object layouts. A separate binding epoch
 fences the retired physical instance while bounded healing restores the
 recorded NCNX, NCDX, shard, and parity layouts.
 
-N2 3.3.1 is the node-churn correctness patch for the 3.3 engine. Autonomous
+N2 3.3.1 was the node-churn correctness patch for the 3.3 engine. Autonomous
 healing distinguishes temporary NCNX/NCDX transport unavailability from
-proven missing, divergent, or corrupt immutable state. The survival write path
-retains the configured layout and can acknowledge at the EC reconstruction
-threshold: `K` EC pieces, `K` NCDX copies, and one of `M + 1` NCNX replicas.
-Missing exact slots remain deterministic healing work; writes reject below
-`K`.
+proven missing, divergent, or corrupt immutable state. Its earlier
+reconstruction-threshold write behavior is retained as historical test
+evidence, not the current mutation-authority contract.
 
-N2 3.4.1 makes that survival path the release contract. It preserves each
-pool's exact static `K + M` layout, acknowledges new objects at `K`, keeps
-missing exact slots as deterministic healing targets, and reports degraded
-rather than falsely healthy until full protection returns. It does not add
+N2 3.4.1 preserves each pool's exact static `K + M` layout and keeps missing
+exact slots as deterministic healing targets. Data remains reconstructable at
+`K`, but the current partition-authority patch acknowledges a new client
+mutation only while the coordinator can reach the complete bound writable
+pool and publish every exact `M + 1` NCNX replica. Ambiguous reachability is
+reported as degraded and fails writes closed rather than manufacturing
+authority from a timeout. It does not add
 quorum consensus or adaptive placement.
+
+Existing-key rename, trash, and recovery prove authority against the NCNX
+record's exact owning pool, not whichever pool is newest. A historical pool
+sealed against new objects therefore remains available for namespace mutation
+without weakening its recorded placement contract.
+
+The proof channel is the peer HTTP/NCNX plane. Native shard transport remains
+independently degradable to `K`, so control safety does not turn temporary
+data-plane pressure into a false loss of namespace authority.
 
 A key such as `videos/mhw.mp4` is stored as `videos/mhw.mp4.ncnx` on its
 deterministic replica holders. The `videos/` path is a key prefix, not a

@@ -101,7 +101,8 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         .unwrap_or_default();
     let configured_layout = resolve_configured_layout(configured_nodes, &runtime.layout_policy)
         .map_err(AppError::BadRequest)?;
-    let survival_writable = health.data_plane_writable && health.ncnx_survival_writable;
+    let data_reconstruction_writable = health.data_plane_writable && health.ncnx_survival_writable;
+    let survival_writable = health.effective_client_writable;
     let fully_protected = health.data_plane_fully_protected && health.ncnx_strictly_writable;
     Ok(Json(serde_json::json!({
         "membership_epoch": runtime.membership.epoch,
@@ -109,6 +110,8 @@ pub async fn cluster_layout(claims: Claims) -> Result<impl axum::response::IntoR
         "active_write_nodes": health.active_write_nodes,
         "layout": configured_layout,
         "configured_layout": configured_layout,
+        "data_reconstruction_writable": data_reconstruction_writable,
+        "write_authority_proven": health.write_authority_proven,
         "survival_writable": survival_writable,
         "fully_protected": fully_protected,
         "degraded_write_layout": survival_writable && !fully_protected,

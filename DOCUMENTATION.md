@@ -34,18 +34,22 @@ loss. Confirmed object-local missing, divergent, corrupt, or unrepairable state
 produces an exact report without globally latching unrelated keys read-only;
 systemic identity and membership failures retain the safety latch.
 
-The survival write path retains the configured layout and can acknowledge at
-the EC reconstruction threshold: `K` EC pieces, `K` NCDX copies, and one of
-`M + 1` NCNX replicas. Missing exact slots remain deterministic healing work;
-writes reject below `K`. The upload existence check follows that same
-reachable-replica boundary. Normal reads and destination-first rename, move,
-trash, and recover retain their stricter namespace rules.
-
-N2 3.4.1 makes this fixed-layout survival behavior the current release
-contract. It is not quorum consensus: the configured server-pool generation,
+N2 retains the configured object layout and can reconstruct committed data at
+`K` surviving pieces. Reconstruction is not mutation authority. The current
+write contract admits a client mutation only while its coordinator reaches
+the complete exact pool that owns the affected record. New object placement
+uses the newest writable pool; an existing NCNX remains mutable through its
+recorded historical pool even when that pool is sealed against new objects.
+Upload commit additionally requires all deterministic `M + 1` NCNX replicas.
+Ambiguous reachability fails closed while reads continue for decodable recorded
+layouts. This is not quorum consensus: the configured server-pool generation,
 logical slots, shard roles, NCDX holders, and NCNX repair targets remain
-unchanged while degraded writes acknowledge only at the reconstruction
-threshold.
+unchanged.
+
+The authority probe uses the peer HTTP/NCNX control path, not the native shard
+listener. Once exact namespace authority is proven, the data plane retains
+N2's fixed-layout survivor contract: at least `K` shard writes may commit and
+the missing exact roles remain recorded healing targets.
 
 N2 3.4 intentionally does not open or migrate N2 1.x, 2.x, or earlier
 experimental 3.x roots. Static server-pool enrollment, root identity, and
@@ -1567,11 +1571,15 @@ Response fields include:
 - static layout `policy` and `configured_layout`;
 - reachable `active_write_nodes` and effective `layout`;
 - `static_server_pool_ec: true`;
-- `survival_writable`, true while at least `K` configured pool nodes can
-  accept writes;
+- `data_reconstruction_writable`, true while the data and minimum namespace
+  planes retain the `K` reconstruction boundary;
+- `write_authority_proven`, true only while the complete exact writable pool
+  is reachable from this coordinator;
+- `survival_writable`, the effective client mutation result after both data
+  reconstruction and authority checks;
 - `fully_protected`, true only at the complete `K + M` width;
-- `degraded_write_layout`, true when survival writes are enabled below full
-  width;
+- `degraded_write_layout`, true only when effective client writes are enabled
+  below full protection;
 - `bounded_object_erasure_set: true`;
 - `old_object_layouts_remain_valid: true`;
 - `automatic_rebalance`, which should remain false for explicit movement.
@@ -1585,24 +1593,25 @@ GET /noa/v1/cluster/health
 Authorization: Bearer <token>
 ```
 
-Health separates data readability, survival-write capability, full protection,
-NCNX replication, and the durable safety latch. Important fields are:
+Health separates data readability, reconstruction capability, mutation
+authority, full protection, NCNX replication, and the durable safety latch.
+Important fields are:
 
 - `state`: `healthy`, `degraded`, or `critical`;
 - `data_plane_readable`, `data_plane_writable`, and
   `data_plane_fully_protected`;
 - `ncnx_replicas`, `ncnx_replicas_required`, and
   `estimated_ncnx_replicas_reachable`;
-- `ncnx_survival_writable`, `ncnx_strictly_writable`, and
-  `effective_client_writable`;
+- `ncnx_survival_writable`, `ncnx_strictly_writable`,
+  `write_authority_proven`, and `effective_client_writable`;
 - `safety_read_only`;
 - `manual_rebalance_available` and `automatic_rebalance`;
 - per-node read/write/reachability state and explanatory `notes`.
 
-At exactly `K` writable pool nodes the state is degraded, new objects remain
-reconstructable, and `effective_client_writable` remains true. The write keeps
-the configured `K + M` target layout; it does not shrink or substitute nodes.
-Below `K`, new writes are rejected.
+At exactly `K` writable pool nodes, committed objects remain reconstructable
+but `write_authority_proven` and `effective_client_writable` are false unless
+an explicit binding/fencing transition has restored the complete writable
+pool. The configured `K + M` target layout never shrinks or substitutes nodes.
 
 ### Detailed Cluster Monitor
 

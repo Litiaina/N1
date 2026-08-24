@@ -38,9 +38,9 @@ cluster-wide mutation log, or implicit redistribution.
 5. A pool generation fixes its node IDs and each node's root-ID set. Expansion
    appends a new complete pool; it never remaps an enrolled pool in place.
 6. Each live `.ncnx` record has an exact target layout of `R = M + 1`
-   replicas on distinct nodes in its immutable namespace home pool. A
-   survival upload may initially publish fewer, never zero; healing restores
-   the same target layout.
+   replicas on distinct nodes in its immutable namespace home pool. A new
+   client-visible upload publishes all exact replicas; healing restores any
+   later loss to that same target layout.
 7. Every node in a server pool can store namespace records, NCDX, shards,
    parity, uploads, and fragment state. There are no namespace/blob roles.
 8. A namespace mutation operates only on NCNX records. It never opens or
@@ -54,10 +54,10 @@ cluster-wide mutation log, or implicit redistribution.
     decode NCNX or open NCDX.
 12. Adding a pool adds capacity for future objects. Existing objects are not
     redistributed unless an operator explicitly requests re-encoding.
-13. A new object is acknowledged only after at least `K` exact EC pieces,
-    `K` immutable NCDX copies, and one NCNX copy are durable. N2 still records
+13. A new object is acknowledged only after the coordinator proves the exact
+    writable pool reachable, at least `K` exact EC pieces and `K` immutable
+    NCDX copies are durable, and all `M + 1` NCNX replicas publish. N2 records
     the complete configured `K + M` shard/NCDX and `M + 1` NCNX repair layout.
-    Fewer than `K` writable pool nodes fails closed.
 14. SHA-256 is the only N2 integrity checksum for NCNX, object NCDX, upload
     bodies, immutable shards, and verified shard blocks.
 15. Placement is calculated from the immutable node membership of the selected
@@ -313,14 +313,14 @@ The replica set is selected by deterministic rendezvous scoring over:
 
 One deterministic selected holder remains the canonical ownership coordinate
 for healing. Normal LIST merges bounded physical names from all replica
-holders because a survival upload's first durable copy may be noncanonical.
-Root selection is deterministic inside each selected node.
+holders so later replica loss and repair never hide a surviving noncanonical
+copy. Root selection is deterministic inside each selected node.
 
-Upload commit attempts all `R` holders and requires at least one durable NCNX
-copy after the object reaches its `K` EC/NCDX threshold. Rename, move, trash,
-and recover retain their destination-first all-`R` copy/delete contract.
-The upload existence check uses the same reachable-replica survival boundary;
-it does not reintroduce an all-`R` admission barrier before the write.
+Upload commit requires all `R` holders after the object reaches its `K`
+EC/NCDX threshold. Rename, move, trash, and recover retain the same
+destination-first all-`R` copy/delete contract. A key-absence decision also
+requires the complete deterministic replica observation; an unavailable
+replica is never interpreted as an empty one.
 
 ## Static Object Placement
 
@@ -367,10 +367,10 @@ truth and may use a newer pool.
 
 ## Zero-Decode Listing
 
-LIST scans physical `.namespace` paths, not NCNX bodies. Because a survival
-commit may initially have only one noncanonical NCNX copy, every relevant
-pool node returns a bounded page of physical replica names. The coordinator
-merges and deduplicates those names without opening them.
+LIST scans physical `.namespace` paths, not NCNX bodies. Every relevant pool
+node returns a bounded page of physical replica names so listing remains
+correct through later replica loss and repair. The coordinator merges and
+deduplicates those names without opening them.
 
 ```text
 coordinator
@@ -419,11 +419,12 @@ requests without adding cluster state.
 
 ```text
 calculate the complete fixed K + M layout
+-> prove that the coordinator reaches every exact pool binding over the NCNX control plane
 -> attempt every exact shard/parity holder in parallel
 -> require at least K successfully written EC pieces
 -> for standard multipart, each participating node syncs its exact shards
 -> publish immutable NCDX to every available exact holder and require K
--> publish to all R=M+1 NCNX holders and require at least one durable copy
+-> publish to every exact R=M+1 NCNX holder
 -> fsync their parent directories
 -> acknowledge
 ```
@@ -432,10 +433,12 @@ The NCDX retains descriptors and SHA-256 checksums for all `K + M` exact
 pieces, including an unavailable target, so healing has one deterministic
 destination rather than inventing a replacement layout. `R=M+1` guarantees
 that every possible `K`-node survivor set intersects the NCNX replica set.
-When all holders are available, publication remains full width. If the
-minimum NCNX publication cannot complete, the immutable object is not live.
-N2 reports that headless immutable data and preserves it; automatic GC never
-guesses that missing namespace authority makes an object disposable.
+The current authority rule is stricter than reconstructability: a client
+mutation fails closed unless the complete bound writable pool is reachable,
+and upload publication requires all exact NCNX replicas. If NCNX publication
+cannot complete, the immutable object is not acknowledged as live. N2 reports
+headless immutable data and preserves it; automatic GC never guesses that
+missing namespace authority makes an object disposable.
 
 ### Copy/move one key
 
@@ -574,21 +577,65 @@ to the recorded layout. Redistribution is a separate explicit re-encode.
 A pool is:
 
 - fully protected when all `K + M` exact holders accept the new object;
-- degraded but writable when at least `K` exact holders, `K` NCDX copies, and
-  one NCNX copy can commit;
-- critical and write-rejecting below `K`.
+- degraded and read-capable when at least `K` exact pieces remain
+  reconstructable but complete mutation authority is unavailable;
+- write-capable only while the complete exact writable pool is reachable;
+- critical for an object read below its recorded `K` boundary.
 
-This is the object EC reconstruction threshold, not a consensus quorum and not
-an adaptive EC layout. Missing pieces and NCNX replicas remain exact
-object-local repair work. An unrepairable object or namespace record emits a
-precise local report but does not stop unrelated reconstructable objects.
-Cluster-wide read-only protection is reserved for systemic control-authority
-failures such as membership or binding identity disagreement.
+`K` is the object EC reconstruction threshold, not a consensus quorum and not
+an adaptive EC layout. It does not grant mutation authority. Missing pieces
+and NCNX replicas remain exact object-local repair work. An unrepairable
+object or namespace record emits a precise local report but does not stop
+unrelated reconstructable reads. Cluster-wide read-only protection is
+reserved for systemic control-authority failures such as membership or
+binding identity disagreement.
 
 Reads continue for objects whose recorded layouts remain decodable.
 
 Work is partitioned by fragment, pool, and canonical key ownership so multiple
 nodes heal concurrently without scanning or repairing the same record.
+
+### Network-partition authority
+
+Transport unreachability is not proof that a physical instance has stopped.
+During an internode partition, every configured instance may remain alive and
+may still be reachable by a gateway or direct NOA/native client. N2 must never
+allow two disconnected components to acknowledge conflicting mutations of the
+same NCNX key. Immutable object IDs and version ULIDs prevent byte-path
+collisions, but they do not resolve two valid NCNX records that point one
+logical key at different objects.
+
+The enforced safety law is therefore:
+
+```text
+transport reachability never creates mutation authority
+```
+
+Connection refusal, timeout, packet loss, and a missing health response are
+observations only; none is independently a fence. A route-only gateway is not
+storage authority and cannot make an isolated node safe merely by selecting it
+for a request. N2 therefore admits a client mutation only after one concurrent
+probe proves the complete exact owning pool reachable from that coordinator.
+New object placement requires the newest writable pool; mutation of an
+existing NCNX uses that record's exact historical pool, including a pool
+sealed only against new object placement. Upload commit then requires every
+deterministic `M + 1` NCNX replica. A missing binding leaves reads available
+whenever `K` recorded pieces survive, but writes fail closed until the binding
+returns or reserve promotion commits a new binding epoch.
+
+Authority and data availability are deliberately separate. The exact peer
+HTTP/NCNX control plane must be reachable so disconnected components cannot
+publish competing names. The native shard plane may lose up to `M` exact
+holders: an object may still commit at `K`, records the unavailable roles in
+its immutable NCDX, and heals those roles when their bindings return. Busy or
+failed shard transport therefore cannot manufacture authority and cannot
+unnecessarily serialize the lightweight namespace plane.
+
+For a configured pool `N = K + M`, `K` still defines object reconstruction,
+not permission to mutate. This intentionally separates data survival from
+write authority. A future availability extension may use an epoch-bound
+witness or physical fence, but it must remain restart proof, reject stale
+instances, and add no healthy-path object lock or namespace database.
 
 ### Reserve replacement healing
 
@@ -656,7 +703,7 @@ Required namespace properties:
 ```text
 GET key       = bounded NCNX replica reads + bounded NCDX holder read
 PUT attempt   = K+M object/NCDX holders + M+1 NCNX holders
-PUT acknowledge = at least K EC pieces + K NCDX copies + 1 NCNX copy
+PUT acknowledge = exact pool authority + at least K EC pieces + K NCDX copies + all M+1 NCNX copies
 DELETE key    = M+1 NCNX holders, zero object data IO
 RENAME key    = source and destination NCNX holders, zero object data IO
 LIST page     = bounded replica filename merge, zero NCNX/NCDX/shard decode
