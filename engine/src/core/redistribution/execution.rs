@@ -193,6 +193,16 @@ pub async fn run_redistribution_job_with_options(
     opts: RedistributionRunOptions,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
+    let running_guard = acquire_redistribution_running()?;
+    run_redistribution_job_reserved(dry_run, opts, ws_manager, running_guard).await
+}
+
+pub(super) async fn run_redistribution_job_reserved(
+    dry_run: bool,
+    opts: RedistributionRunOptions,
+    ws_manager: Arc<WsConnectionManager>,
+    _running_guard: RedistributionRunningGuard,
+) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
     let _write_gate = acquire_maintenance_mode(opts.execution_mode.maintenance_access_mode());
@@ -739,6 +749,9 @@ pub async fn run_redistribution_job_with_options(
         }
     }
 
+    io_guard.complete();
+    drop(_write_gate);
+
     {
         let mut st = REDIST_STATUS.write().await;
         st.is_running = false;
@@ -774,7 +787,6 @@ pub async fn run_redistribution_job_with_options(
         return Err(AppError::InternalServerError(message));
     }
 
-    io_guard.complete();
     Ok(())
 }
 

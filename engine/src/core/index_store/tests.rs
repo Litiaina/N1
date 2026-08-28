@@ -784,6 +784,63 @@ fn live_head_pagination_uses_display_names_not_raw_object_dirs() {
 }
 
 #[test]
+fn bounded_live_pagination_covers_a_wide_replicated_directory_without_skips() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let index_roots = ensure_test_index_roots();
+    let blob_root = ensure_test_blob_roots()
+        .into_iter()
+        .next()
+        .expect("test blob root");
+    let fragment = format!("n1-wide-page-{}", Ulid::new());
+    let version = Ulid::new().to_string();
+    let total = 4_097usize;
+
+    for root in &index_roots {
+        fs::create_dir_all(fragment_root_on(root, &fragment).join("wide"))
+            .expect("create wide namespace directory");
+    }
+    for index in (0..total).rev() {
+        let object_id = new_object_id();
+        let logical_name = format!("item-{index:05}.bin");
+        let object_dir =
+            live_object_dir(&blob_root, &fragment, &object_id).expect("wide object dir");
+        fs::create_dir_all(&object_dir).expect("create wide object dir");
+        let ndx_name = format!(
+            "{version}.{}.{}.{}.ndx",
+            index + 1,
+            1_777_905_000_000_000_000i128 + index as i128,
+            packed_extension_key(&logical_name)
+        );
+        fs::write(object_dir.join(ndx_name), b"zero-decode-page-test")
+            .expect("write zero-decode ndx name");
+        for root in &index_roots {
+            let link = fragment_root_on(root, &fragment)
+                .join("wide")
+                .join(&logical_name);
+            unix_fs::symlink(format!("@o_{object_id}"), link).expect("publish wide namespace link");
+        }
+    }
+
+    let mut cursor = None;
+    let mut observed = Vec::with_capacity(total);
+    loop {
+        let page =
+            scan_live_heads_page(&fragment, Some("wide".to_string()), None, 73, cursor, true)
+                .expect("wide namespace page");
+        observed.extend(page.entries.into_iter().map(|entry| entry.record));
+        cursor = page.continuation_token;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(observed.len(), total);
+    assert!(observed.windows(2).all(|window| window[0] < window[1]));
+    assert_eq!(observed.first().map(String::as_str), Some("item-00000.bin"));
+    assert_eq!(observed.last().map(String::as_str), Some("item-04096.bin"));
+}
+
+#[test]
 fn full_metadata_scan_uses_current_filesystem_path_after_rename() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();

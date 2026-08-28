@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 use ulid::Ulid;
+use walkdir::WalkDir;
 
 pub(crate) const OBJECTS_DIR: &str = N1_OBJECTS_DIR;
 pub(crate) const UPLOADS_DIR: &str = ".uploads";
@@ -738,7 +739,10 @@ fn parse_ndx_file_name(name: &str) -> Option<NdxSummary> {
     })
 }
 
-pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
+pub(crate) fn visit_dir_names(
+    path: &Path,
+    mut visit: impl FnMut(String) -> Result<bool, AppError>,
+) -> Result<(), AppError> {
     let fd = rustix::fs::openat(
         CWD,
         path,
@@ -751,16 +755,26 @@ pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
     let mut dir = Dir::new(fd).map_err(|e| {
         AppError::InternalServerError(format!("scan N1 directory {}: {e}", path.display()))
     })?;
-    let mut names = Vec::new();
     for entry in &mut dir {
         let entry = entry.map_err(|e| {
             AppError::InternalServerError(format!("read N1 directory {}: {e}", path.display()))
         })?;
         let name = entry.file_name().to_string_lossy();
         if name != "." && name != ".." {
-            names.push(name.into_owned());
+            if !visit(name.into_owned())? {
+                break;
+            }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
+    let mut names = Vec::new();
+    visit_dir_names(path, |name| {
+        names.push(name);
+        Ok(true)
+    })?;
     Ok(names)
 }
 
@@ -1455,7 +1469,8 @@ fn scan_live_heads_direct_page(
         .transpose()?
         .unwrap_or_default();
     let limit = limit.max(1);
-    let mut by_record = BTreeMap::<String, (IndexListEntry, Option<ObjectMetadata>)>::new();
+    let candidate_limit = limit.saturating_add(1);
+    let mut candidate_names = BTreeSet::<String>::new();
     for fragment_root in existing_fragment_roots(fragment) {
         let index_root = fragment_root
             .parent()
@@ -1465,20 +1480,48 @@ fn scan_live_heads_direct_page(
         if !dir.is_dir() {
             continue;
         }
-        for name in read_dir_names(&dir)? {
+        visit_dir_names(&dir, |name| {
             if internal_namespace_entry_name(&name) {
-                continue;
+                return Ok(true);
+            }
+            if continuation_token
+                .as_ref()
+                .is_some_and(|after| name.as_str() <= after.as_str())
+            {
+                return Ok(true);
             }
             let child = dir.join(&name);
+            if read_namespace_symlink_object_id(&index_root, fragment, &child)?.is_none()
+                && !child.is_dir()
+            {
+                return Ok(true);
+            }
+            candidate_names.insert(name);
+            if candidate_names.len() > candidate_limit {
+                candidate_names.pop_last();
+            }
+            Ok(true)
+        })?;
+    }
+
+    let has_more = candidate_names.len() > limit;
+    if has_more {
+        candidate_names.pop_last();
+    }
+    let mut entries = Vec::new();
+    let mut objects = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for name in candidate_names {
+        let mut selected = None;
+        for fragment_root in existing_fragment_roots(fragment) {
+            let index_root = fragment_root
+                .parent()
+                .unwrap_or(&fragment_root)
+                .to_path_buf();
+            let child = fragment_root.join(&prefix).join(&name);
             if let Some(object_id) =
                 read_namespace_symlink_object_id(&index_root, fragment, &child)?
             {
-                if continuation_token
-                    .as_ref()
-                    .is_some_and(|after| name.as_str() <= after.as_str())
-                {
-                    continue;
-                }
                 let Some(object_dir) = object_dir_candidates(fragment, &object_id)?
                     .into_iter()
                     .find(|dir| dir.is_dir())
@@ -1491,32 +1534,17 @@ fn scan_live_heads_direct_page(
                 let record = record_path(&prefix, &name);
                 let entry = summary_entry(name.clone(), &summary);
                 let metadata = summary_metadata(fragment, record, summary);
-                by_record.entry(name).or_insert((entry, Some(metadata)));
-            } else if child.is_dir() {
-                if continuation_token
-                    .as_ref()
-                    .is_some_and(|after| name.as_str() <= after.as_str())
-                {
-                    continue;
-                }
-                by_record
-                    .entry(name.clone())
-                    .or_insert((directory_entry(name), None));
+                selected = Some((entry, Some(metadata)));
+                break;
+            }
+            if child.is_dir() {
+                selected = Some((directory_entry(name.clone()), None));
+                break;
             }
         }
-    }
-
-    let mut entries = Vec::new();
-    let mut objects = Vec::new();
-    let mut common_prefixes = Vec::new();
-    let mut next = None;
-    for (idx, (_record, (entry, object))) in by_record.into_iter().enumerate() {
-        if idx >= limit {
-            next = entries
-                .last()
-                .map(|entry: &IndexListEntry| entry.record.clone());
-            break;
-        }
+        let Some((entry, object)) = selected else {
+            continue;
+        };
         if entry.kind == "directory" {
             common_prefixes.push(entry.record.clone());
         }
@@ -1525,6 +1553,9 @@ fn scan_live_heads_direct_page(
         }
         entries.push(entry);
     }
+    let next = has_more
+        .then(|| entries.last().map(|entry| entry.record.clone()))
+        .flatten();
     Ok(ListObjectsResult {
         prefix: Some(prefix),
         limit: Some(limit),
@@ -1559,46 +1590,98 @@ pub fn scan_live_full_metadata_page(
     let prefix = prefix.unwrap_or_default();
     let delimiter = delimiter.unwrap_or_default();
     let limit = limit.max(1);
-    let mut candidates = Vec::new();
+    let candidate_limit = limit.saturating_add(1);
+    let mut candidates = BTreeMap::<String, String>::new();
     let mut objects = Vec::new();
     let mut common_prefixes = BTreeSet::new();
-    for (dir, rel, object_id) in object_dirs_for_all_live(fragment)? {
-        if !prefix.is_empty() && !rel.starts_with(&prefix) {
+    for fragment_root in existing_fragment_roots(fragment) {
+        let index_root = fragment_root
+            .parent()
+            .unwrap_or(&fragment_root)
+            .to_path_buf();
+        let base = fragment_root.join(&prefix);
+        if !base.is_dir() {
             continue;
         }
-        if continuation_token
-            .as_ref()
-            .is_some_and(|after| rel <= *after)
-        {
-            continue;
-        }
-        if delimiter == "/" {
-            let rest = if prefix.is_empty() {
-                rel.as_str()
-            } else {
-                rel.strip_prefix(&prefix).unwrap_or("")
-            };
-            let rest = rest.trim_start_matches('/');
-            if let Some((first, _)) = rest.split_once('/') {
-                let cp = if prefix.is_empty() {
-                    format!("{first}/")
-                } else {
-                    format!("{}/{}", prefix.trim_end_matches('/'), first)
-                };
-                common_prefixes.insert(cp);
+        let walker = WalkDir::new(&base)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !internal_namespace_entry_name(entry.file_name().to_string_lossy().as_ref())
+            });
+        for entry in walker {
+            let entry = entry.map_err(|error| {
+                AppError::InternalServerError(format!(
+                    "walk N1 namespace directory {}: {error}",
+                    base.display()
+                ))
+            })?;
+            if !entry.file_type().is_symlink() {
                 continue;
             }
+            let relative = entry.path().strip_prefix(&fragment_root).map_err(|_| {
+                AppError::InternalServerError(format!(
+                    "N1 namespace entry {} escaped {}",
+                    entry.path().display(),
+                    fragment_root.display()
+                ))
+            })?;
+            let rel = relative.to_string_lossy().replace('\\', "/");
+            if continuation_token
+                .as_ref()
+                .is_some_and(|after| rel <= *after)
+            {
+                continue;
+            }
+            if delimiter == "/" {
+                let rest = if prefix.is_empty() {
+                    rel.as_str()
+                } else {
+                    rel.strip_prefix(&prefix).unwrap_or("")
+                };
+                let rest = rest.trim_start_matches('/');
+                if let Some((first, _)) = rest.split_once('/') {
+                    let cp = if prefix.is_empty() {
+                        format!("{first}/")
+                    } else {
+                        format!("{}/{}", prefix.trim_end_matches('/'), first)
+                    };
+                    common_prefixes.insert(cp);
+                    if common_prefixes.len() > candidate_limit {
+                        common_prefixes.pop_last();
+                    }
+                    continue;
+                }
+            }
+            let Some(object_id) =
+                read_namespace_symlink_object_id(&index_root, fragment, entry.path())?
+            else {
+                continue;
+            };
+            candidates.entry(rel).or_insert(object_id);
+            if candidates.len() > candidate_limit {
+                candidates.pop_last();
+            }
         }
-        candidates.push((rel, object_id, dir));
     }
 
-    let mut continuation = None;
-    if candidates.len() > limit {
-        candidates.truncate(limit);
-        continuation = candidates.last().map(|(rel, _, _)| rel.clone());
+    let has_more = candidates.len() > limit;
+    if has_more {
+        candidates.pop_last();
     }
+    let continuation = has_more
+        .then(|| candidates.last_key_value().map(|(rel, _)| rel.clone()))
+        .flatten();
 
-    for (_rel, object_id, dir) in candidates {
+    for (_rel, object_id) in candidates {
+        let Some(dir) = object_dir_candidates(fragment, &object_id)?
+            .into_iter()
+            .find(|dir| dir.is_dir())
+        else {
+            continue;
+        };
         let Some(summary) = latest_summary_in_object_dir(&dir)? else {
             continue;
         };
@@ -1651,7 +1734,7 @@ pub(crate) use sessions::{
 #[allow(unused_imports)]
 pub(crate) use trash::{
     delete_unreferenced_object_index, delete_unreferenced_object_indexes_batch,
-    referenced_object_ids, remove_trash_payload, scan_trash_records,
+    referenced_object_ids, remove_trash_payload, scan_trash_records, visit_trash_records,
 };
 
 use replicas::count_object_index_records;

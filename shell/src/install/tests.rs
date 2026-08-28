@@ -335,6 +335,22 @@ fn four_disk_assignment_and_ec_validation_is_deterministic() {
     assert!(output.join("\n").contains("EC: 3 + 1"));
     let (started, output) = execute(&shell, "n1 start", None);
     assert!(started.success, "{}", output.join("\n"));
+    let unit = fs::read_to_string(settings.unit_path()).unwrap();
+    let requires_mounts = unit
+        .lines()
+        .find(|line| line.starts_with("RequiresMountsFor="))
+        .expect("storage mount dependency");
+    for index in 1..=4 {
+        assert!(
+            requires_mounts.contains(
+                settings
+                    .mount_path(&format!("NDISK{index:03}"))
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "missing NDISK{index:03} in {requires_mounts}"
+        );
+    }
     let (rejected, output) = execute(&shell, "config ec 2 1", None);
     assert!(!rejected.success);
     assert!(output.join("\n").contains("stop N1"));

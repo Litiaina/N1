@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -11,8 +11,8 @@ use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
 use crate::core::index_store::{
     self, PendingUploadBinding, TRASH_DIR, TrashKind, TrashRecord, fragment_root_on,
     internal_namespace_entry_name, namespace_path, new_object_id, publish_namespace_link,
-    read_dir_names, read_namespace_symlink_object_id, reject_reserved_user_path,
-    scan_trash_records, trash_generation_name, write_pending_binding,
+    read_namespace_symlink_object_id, reject_reserved_user_path, scan_trash_records,
+    trash_generation_name, visit_dir_names, visit_trash_records, write_pending_binding,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -20,6 +20,7 @@ use crate::namespace::models::{
     NamespaceReachabilitySnapshot, ObjectHead,
 };
 use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, parent_path};
+use walkdir::WalkDir;
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
 static FINALIZE_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -336,37 +337,9 @@ impl NamespaceRuntime {
         &self,
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
-        let mut snapshot = NamespaceReachabilitySnapshot::default();
-        for object_id in index_store::referenced_object_ids(fragment)? {
-            for meta in index_store::list_live_versions(fragment, &object_id)? {
-                snapshot.referenced_object_ids.insert(object_id.clone());
-                snapshot.referenced_version_ids.insert(meta.version_id);
-            }
-        }
-        for record in scan_trash_records(fragment)? {
-            snapshot
-                .referenced_object_ids
-                .extend(record.object_keys.iter().cloned());
-            snapshot
-                .referenced_version_ids
-                .extend(record.version_ids.iter().cloned());
-        }
-        Ok(Some(snapshot))
-    }
-
-    pub async fn purged_object_ids_for_gc(
-        &self,
-        _fragment: &str,
-    ) -> Result<BTreeSet<String>, AppError> {
-        Ok(BTreeSet::new())
-    }
-
-    pub async fn purge_unreferenced_object_ids(
-        &self,
-        _fragment: &str,
-        _object_ids: &BTreeSet<String>,
-    ) -> Result<usize, AppError> {
-        Ok(0)
+        Ok(Some(NamespaceReachabilitySnapshot {
+            referenced_object_ids: index_store::referenced_object_ids(fragment)?,
+        }))
     }
 
     pub async fn resolve_live_object_id(
@@ -616,61 +589,82 @@ impl NamespaceRuntime {
             .unwrap_or_default();
         let after = continuation_token.map(ToOwned::to_owned);
         tokio::task::spawn_blocking(move || {
-            let mut entries = Vec::new();
-            let mut seen = HashSet::new();
+            let candidate_limit = limit.saturating_add(1);
+            let mut candidates = std::collections::BTreeMap::<String, String>::new();
             for root in index_roots() {
                 let fragment_root = fragment_root_on(&root, &fragment);
                 let base = fragment_root.join(&prefix);
-                let mut stack = vec![(base, prefix.clone())];
-                while let Some((dir, rel)) = stack.pop() {
-                    if !dir.is_dir() {
+                if !base.is_dir() {
+                    continue;
+                }
+                let walker = WalkDir::new(&base)
+                    .min_depth(1)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        entry.depth() == 0
+                            || !internal_namespace_entry_name(
+                                entry.file_name().to_string_lossy().as_ref(),
+                            )
+                    });
+                for entry in walker {
+                    let entry = entry.map_err(|error| {
+                        AppError::InternalServerError(format!(
+                            "walk N1 namespace directory {}: {error}",
+                            base.display()
+                        ))
+                    })?;
+                    if !entry.file_type().is_symlink() {
                         continue;
                     }
-                    for name in read_dir_names(&dir)? {
-                        if internal_namespace_entry_name(&name) {
-                            continue;
-                        }
-                        let child = dir.join(&name);
-                        let child_rel = if rel.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{rel}/{name}")
-                        };
-                        if let Some(object_id) =
-                            read_namespace_symlink_object_id(&root, &fragment, &child)?
-                        {
-                            if after
-                                .as_ref()
-                                .is_some_and(|cursor| child_rel.as_str() <= cursor.as_str())
-                            {
-                                continue;
-                            }
-                            if !seen.insert(child_rel.clone()) {
-                                continue;
-                            }
-                            let Some(meta) =
-                                index_store::read_current_live_head(&fragment, &object_id)?
-                            else {
-                                continue;
-                            };
-                            entries.push(NamespaceObjectRef {
-                                path: child_rel,
-                                object_id,
-                                version_id: meta.version_id,
-                            });
-                        } else if child.is_dir() {
-                            stack.push((child, child_rel));
-                        }
+                    let relative = entry.path().strip_prefix(&base).map_err(|_| {
+                        AppError::InternalServerError(format!(
+                            "N1 namespace entry {} escaped {}",
+                            entry.path().display(),
+                            base.display()
+                        ))
+                    })?;
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    let child_rel = if prefix.is_empty() {
+                        relative
+                    } else {
+                        format!("{prefix}/{relative}")
+                    };
+                    if after
+                        .as_ref()
+                        .is_some_and(|cursor| child_rel.as_str() <= cursor.as_str())
+                    {
+                        continue;
+                    }
+                    let Some(object_id) =
+                        read_namespace_symlink_object_id(&root, &fragment, entry.path())?
+                    else {
+                        continue;
+                    };
+                    candidates.entry(child_rel).or_insert(object_id);
+                    if candidates.len() > candidate_limit {
+                        candidates.pop_last();
                     }
                 }
             }
-            entries.sort_by(|a, b| a.path.cmp(&b.path));
-            let continuation_token = if entries.len() > limit {
-                entries.truncate(limit);
-                entries.last().map(|entry| entry.path.clone())
-            } else {
-                None
-            };
+            let has_more = candidates.len() > limit;
+            if has_more {
+                candidates.pop_last();
+            }
+            let mut entries = Vec::with_capacity(candidates.len());
+            for (path, object_id) in candidates {
+                let Some(meta) = index_store::read_current_live_head(&fragment, &object_id)? else {
+                    continue;
+                };
+                entries.push(NamespaceObjectRef {
+                    path,
+                    object_id,
+                    version_id: meta.version_id,
+                });
+            }
+            let continuation_token = has_more
+                .then(|| entries.last().map(|entry| entry.path.clone()))
+                .flatten();
             Ok(NamespaceObjectRefPage {
                 entries,
                 continuation_token,
@@ -832,77 +826,56 @@ fn list_live_dir_page(
     if !path.is_empty() && live_entry(fragment, path)?.is_none() {
         return Ok((Vec::new(), None));
     }
-    let mut entries = Vec::new();
-    let mut seen = HashSet::new();
+    let candidate_limit = limit.saturating_add(1);
+    let mut names = BTreeSet::new();
     for root in index_roots() {
         let dir = fragment_root_on(&root, fragment).join(path);
         if !dir.is_dir() {
             continue;
         }
-        let names = match read_dir_names(&dir) {
-            Ok(names) => names,
+        let scan = visit_dir_names(&dir, |name| {
+            if internal_namespace_entry_name(&name) || name == ".trash_objects" {
+                return Ok(true);
+            }
+            if after.is_some_and(|cursor| name.as_str() <= cursor) {
+                return Ok(true);
+            }
+            let child = dir.join(&name);
+            if read_namespace_symlink_object_id(&root, fragment, &child)?.is_none()
+                && !child.is_dir()
+            {
+                return Ok(true);
+            }
+            names.insert(name);
+            if names.len() > candidate_limit {
+                names.pop_last();
+            }
+            Ok(true)
+        });
+        match scan {
+            Ok(()) => {}
             Err(_) if !path_exists_no_follow(&dir) => continue,
             Err(err) => return Err(err),
-        };
-        for name in names {
-            if internal_namespace_entry_name(&name) || name == ".trash_objects" {
-                continue;
-            }
-            let display_name = name.clone();
-            if after.is_some_and(|cursor| display_name.as_str() <= cursor) {
-                continue;
-            }
-            let child_path = if path.is_empty() {
-                display_name.clone()
-            } else {
-                format!("{path}/{display_name}")
-            };
-            let child = dir.join(&name);
-            if let Some(object_id) = read_namespace_symlink_object_id(&root, fragment, &child)? {
-                if !seen.insert(display_name.clone()) {
-                    continue;
-                }
-                let Some(meta) = index_store::read_current_live_head(fragment, &object_id)? else {
-                    continue;
-                };
-                let size_time = Some((meta.created_at, meta.created_at));
-                let mut entry = namespace_entry(
-                    fragment,
-                    child_path,
-                    NamespaceEntryKind::File,
-                    Some(object_id),
-                    LifecycleState::Live,
-                    None,
-                    None,
-                    size_time,
-                );
-                entry.size_bytes = Some(meta.total_size_bytes);
-                entry.version_id = Some(meta.version_id);
-                entries.push(entry);
-            } else if child.is_dir() {
-                if !seen.insert(display_name.clone()) {
-                    continue;
-                }
-                entries.push(namespace_entry(
-                    fragment,
-                    child_path,
-                    NamespaceEntryKind::Directory,
-                    None,
-                    LifecycleState::Live,
-                    None,
-                    None,
-                    None,
-                ));
-            }
         }
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let next = if entries.len() > limit {
-        entries.truncate(limit);
-        entries.last().map(|entry| entry.name.clone())
-    } else {
-        None
-    };
+    let has_more = names.len() > limit;
+    if has_more {
+        names.pop_last();
+    }
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        let child_path = if path.is_empty() {
+            name
+        } else {
+            format!("{path}/{name}")
+        };
+        if let Some(entry) = live_entry(fragment, &child_path)? {
+            entries.push(entry);
+        }
+    }
+    let next = has_more
+        .then(|| entries.last().map(|entry| entry.name.clone()))
+        .flatten();
     Ok((entries, next))
 }
 
@@ -912,29 +885,39 @@ fn list_trash_dir_page(
     limit: usize,
     after: Option<&str>,
 ) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
-    let mut entries = Vec::new();
-    let mut records = scan_trash_records(fragment)?;
-    records.sort_by(|left, right| left.trash_entry_id.cmp(&right.trash_entry_id));
-    for record in records {
+    let candidate_limit = limit.saturating_add(1);
+    let mut records = std::collections::BTreeMap::<String, TrashRecord>::new();
+    visit_trash_records(fragment, |record| {
         if !path.is_empty()
             && record.original_path != path
             && !record.original_path.starts_with(&format!("{path}/"))
         {
-            continue;
+            return Ok(true);
         }
         if after.is_some_and(|cursor| record.trash_entry_id.as_str() <= cursor) {
-            continue;
+            return Ok(true);
         }
+        records.insert(record.trash_entry_id.clone(), record);
+        if records.len() > candidate_limit {
+            records.pop_last();
+        }
+        Ok(true)
+    })?;
+    let has_more = records.len() > limit;
+    if has_more {
+        records.pop_last();
+    }
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records.into_values() {
         entries.push(trash_record_entry(fragment, &record)?);
     }
-    let next = if entries.len() > limit {
-        entries.truncate(limit);
-        entries
-            .last()
-            .and_then(|entry| entry.trash_entry_id.clone())
-    } else {
-        None
-    };
+    let next = has_more
+        .then(|| {
+            entries
+                .last()
+                .and_then(|entry| entry.trash_entry_id.clone())
+        })
+        .flatten();
     Ok((entries, next))
 }
 

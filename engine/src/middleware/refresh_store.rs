@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -200,13 +201,22 @@ async fn write_record(record: &RefreshSessionRecord) -> Result<(), RefreshStoreE
     let path = session_record_path(&record.session_id);
     let root = path
         .parent()
-        .ok_or_else(|| std::io::Error::other("missing refresh session parent"))?;
-    ensure_store_dir(root).await?;
+        .ok_or_else(|| std::io::Error::other("missing refresh session parent"))?
+        .to_path_buf();
+    ensure_store_dir(&root).await?;
 
     let payload = serde_json::to_vec(record)?;
     let tmp_path = root.join(format!("{}.tmp-{}", record.session_id, Uuid::new_v4()));
-    fs::write(&tmp_path, payload).await?;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .await?;
+    file.write_all(&payload).await?;
+    file.sync_all().await?;
+    drop(file);
     fs::rename(&tmp_path, &path).await?;
+    fs::File::open(&root).await?.sync_all().await?;
     Ok(())
 }
 
@@ -221,8 +231,15 @@ async fn read_record(session_id: &str) -> Result<RefreshSessionRecord, RefreshSt
 
 async fn delete_record_if_present(session_id: &str) -> Result<(), RefreshStoreError> {
     let path = session_record_path(session_id);
+    let root = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing refresh session parent"))?
+        .to_path_buf();
     match fs::remove_file(path).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            fs::File::open(&root).await?.sync_all().await?;
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(RefreshStoreError::Io(e)),
     }

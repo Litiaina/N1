@@ -179,11 +179,30 @@ render_unit() {
   unit_tmp="$(mktemp)"
   unit_dest="/etc/systemd/system/${SERVICE_NAME}.service"
 
-  local working_directory binary env_file config_file line
+  local working_directory binary env_file config_file line requires_mounts
   working_directory="$(systemd_escape_path "$INSTALL_DIR")"
   binary="$(systemd_escape_path "$BINARY_PATH")"
   env_file="$(systemd_escape_path "$ENV_FILE")"
   config_file="$(systemd_escape_path "$CONFIG_FILE")"
+  requires_mounts="$({
+    awk '
+      /^\[disk_config\][[:space:]]*$/ { in_disk = 1; next }
+      /^\[/ { in_disk = 0 }
+      in_disk && /^(fs_storage_path|index_store_disks|blob_store_disks)[[:space:]]*=/ {
+        sub(/^[^=]*=/, "")
+        gsub(/,/, "\n")
+        print
+      }
+    ' "$CONFIG_FILE"
+  } | while IFS= read -r mount_path; do
+    mount_path="${mount_path#"${mount_path%%[![:space:]]*}"}"
+    mount_path="${mount_path%"${mount_path##*[![:space:]]}"}"
+    if [[ -n "$mount_path" ]]; then
+      systemd_escape_path "$mount_path"
+      printf '\n'
+    fi
+  done | sort -u | paste -sd' ' -)"
+  [[ -n "$requires_mounts" ]] || die "no N1 storage mounts found in $CONFIG_FILE"
 
   while IFS= read -r line; do
     line="${line//__SERVICE_NAME__/$SERVICE_NAME}"
@@ -193,6 +212,7 @@ render_unit() {
     line="${line//__BINARY__/$binary}"
     line="${line//__ENV_FILE__/$env_file}"
     line="${line//__CONFIG_FILE__/$config_file}"
+    line="${line//__REQUIRES_MOUNTS_FOR__/$requires_mounts}"
     line="${line//__RUST_LOG__/$RUST_LOG_VALUE}"
     printf '%s\n' "$line"
   done < "$TEMPLATE_FILE" > "$unit_tmp"

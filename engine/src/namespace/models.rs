@@ -150,7 +150,6 @@ pub struct NamespaceMutationSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NamespaceReachabilitySnapshot {
     pub referenced_object_ids: BTreeSet<String>,
-    pub referenced_version_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

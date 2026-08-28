@@ -551,7 +551,7 @@ impl InstallShell {
         if role.blob() {
             add_config_path(&mut config, "blob_store_disks", &mount_path)?;
         }
-        self.write_config(&config)
+        self.write_storage_config(&config)
     }
 
     fn unassign_disk(&self, label: &str, role: DiskRole) -> Result<(), String> {
@@ -564,7 +564,7 @@ impl InstallShell {
         if role.blob() {
             remove_config_path(&mut config, "blob_store_disks", &mount_path)?;
         }
-        self.write_config(&config)
+        self.write_storage_config(&config)
     }
 
     fn config_command(
@@ -866,6 +866,26 @@ impl InstallShell {
                 self.settings.engine_binary.display()
             ));
         }
+        let config = self.load_or_create_config()?;
+        let disk = config
+            .section(Some("disk_config"))
+            .ok_or("missing [disk_config]")?;
+        let mut required_mounts = BTreeSet::new();
+        required_mounts.extend(config_paths(disk.get("index_store_disks").unwrap_or("")));
+        required_mounts.extend(config_paths(disk.get("blob_store_disks").unwrap_or("")));
+        let fs_root = PathBuf::from(disk.get("fs_storage_path").unwrap_or(""));
+        if fs_root.is_absolute() {
+            required_mounts.insert(fs_root);
+        }
+        let required_mounts = required_mounts
+            .iter()
+            .map(|path| systemd_escape(path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if required_mounts.is_empty() {
+            return Err("N1 service has no configured storage mounts".into());
+        }
+
         let rendered = SERVICE_TEMPLATE
             .replace("__SERVICE_NAME__", &self.settings.service_name)
             .replace("__RUN_USER__", &self.settings.run_user)
@@ -880,6 +900,7 @@ impl InstallShell {
                 "__CONFIG_FILE__",
                 &systemd_escape(&self.settings.config_path()),
             )
+            .replace("__REQUIRES_MOUNTS_FOR__", &required_mounts)
             .replace("__RUST_LOG__", "info");
         atomic_write(&self.settings.unit_path(), rendered.as_bytes(), 0o644)
     }
@@ -898,6 +919,15 @@ impl InstallShell {
             .write_to(&mut bytes)
             .map_err(|error| format!("serialize N1 config: {error}"))?;
         atomic_write(&self.settings.config_path(), &bytes, 0o640)
+    }
+
+    fn write_storage_config(&self, config: &Ini) -> Result<(), String> {
+        self.write_config(config)?;
+        if self.settings.unit_path().is_file() {
+            self.install_service_unit()?;
+            self.host.reload_systemd()?;
+        }
+        Ok(())
     }
 
     fn config_summary(&self) -> Result<String, String> {

@@ -1,5 +1,5 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX};
-use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectPathManager};
+use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
@@ -10,8 +10,6 @@ use crate::core::io_scheduler::{DiskIoClass, IoProgress, acquire_disk_io};
 use crate::core::operation_gate::safety_read_only_reason;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
-use crate::fs::cleanup_manager::start_cleanup;
-use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
@@ -22,7 +20,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -394,8 +392,6 @@ pub async fn run_garbage_collector(
             });
         }
 
-        start_cleanup(FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string())).await;
-
         with_gc_status_write(|st| {
             st.is_running = false;
             if st.phase != "Failed" && st.phase != "Stopped by User" {
@@ -731,7 +727,6 @@ async fn process_fragment_gc(
     io_progress: &IoProgress,
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
-    let mut live_versions = HashSet::<String>::new();
 
     match index_store::fragment_meta(fragment) {
         Ok(Some(_)) => {}
@@ -768,252 +763,26 @@ async fn process_fragment_gc(
             return stats;
         }
     }
-    let physical_live_objects = match index::list_fragment_live_objects(fragment).await {
-        Ok(objects) => objects,
-        Err(err) => {
-            warn!(
-                "GC: failed to load live heads for fragment {} from N1 index: {}",
-                fragment, err
-            );
-            return stats;
-        }
-    };
-
-    let namespace_snapshot = match global_namespace_runtime()
+    let protected_object_ids = match global_namespace_runtime()
         .reachability_snapshot_if_present(fragment)
         .await
     {
-        Ok(snapshot) => snapshot,
+        Ok(Some(snapshot)) => snapshot.referenced_object_ids,
+        Ok(None) => {
+            warn!(
+                "GC: namespace reachability is unavailable for fragment {}; preserving immutable data",
+                fragment
+            );
+            return stats;
+        }
         Err(err) => {
             warn!(
                 "GC: failed to load namespace reachability for fragment {}: {}",
                 fragment, err
             );
-            None
+            return stats;
         }
     };
-
-    let mut protected_live_object_ids = BTreeSet::<String>::new();
-    if let Some(snapshot) = &namespace_snapshot {
-        protected_live_object_ids.extend(snapshot.referenced_object_ids.iter().cloned());
-        live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
-        // The namespace snapshot names the visible version, while older
-        // immutable versions remain valid object history. Build complete
-        // version truth before reclaiming abandoned standard-upload dirs.
-        for object_id in &protected_live_object_ids {
-            match index::list_live_object_versions_metadata(fragment, object_id).await {
-                Ok(versions) => {
-                    live_versions.extend(versions.into_iter().map(|version| version.version_id));
-                }
-                Err(err) => {
-                    warn!(
-                        "GC: failed to load version history for protected object {}/{}: {}; preserving the fragment",
-                        fragment, object_id, err
-                    );
-                    stats.live_versions_seen = live_versions.len() as u64;
-                    return stats;
-                }
-            }
-        }
-    } else {
-        for meta in &physical_live_objects {
-            io_progress.heartbeat();
-            protected_live_object_ids.insert(meta.object_key.clone());
-            match index::list_live_object_versions_metadata(fragment, &meta.object_key).await {
-                Ok(version_metas) => {
-                    if version_metas.is_empty() {
-                        live_versions.insert(meta.version_id.clone());
-                    } else {
-                        live_versions
-                            .extend(version_metas.into_iter().map(|version| version.version_id));
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "GC: failed to load live version history for protected object {}/{}: {}; preserving head and skipping destructive namespace purge for this fragment",
-                        fragment, meta.object_key, err
-                    );
-                    live_versions.insert(meta.version_id.clone());
-                    stats.live_versions_seen = live_versions.len() as u64;
-                    return stats;
-                }
-            }
-        }
-    }
-
-    let mut purged_object_ids = match global_namespace_runtime()
-        .purged_object_ids_for_gc(fragment)
-        .await
-    {
-        Ok(object_ids) => object_ids,
-        Err(err) => {
-            warn!(
-                "GC: failed to load purged namespace object ids for fragment {}: {}",
-                fragment, err
-            );
-            BTreeSet::new()
-        }
-    };
-    if namespace_snapshot.is_none() && !purged_object_ids.is_empty() {
-        warn!(
-            "GC: preserving {} purged namespace object(s) for fragment {} because namespace reachability was unavailable",
-            purged_object_ids.len(),
-            fragment
-        );
-        purged_object_ids.clear();
-    }
-
-    let mut namespace_absent_gc_candidates = BTreeSet::<String>::new();
-    if namespace_snapshot.is_none() {
-        namespace_absent_gc_candidates.extend(purged_object_ids.iter().cloned());
-    }
-
-    match index::list_fragment_trash_catalog(fragment).await {
-        Ok(trash_entries) => {
-            for entry in trash_entries {
-                io_progress.heartbeat();
-                if should_stop_gc() {
-                    return stats;
-                }
-                let versions =
-                    match index::list_trashed_object_versions_metadata(fragment, &entry.object_key)
-                        .await
-                    {
-                        Ok(versions) => versions,
-                        Err(err) => {
-                            warn!(
-                                "GC: failed to load trash history for {}/{}: {}",
-                                fragment, entry.object_key, err
-                            );
-                            continue;
-                        }
-                    };
-                // Trash is reclaimed only by the targeted TTL lifecycle above.
-                // Mark every retained trash version as committed so the orphan
-                // sweep can never bypass the recovery window.
-                live_versions.extend(versions.into_iter().map(|version| version.version_id));
-            }
-        }
-        Err(err) => {
-            warn!(
-                "GC: failed to load trash catalog for fragment {} from N1 index: {}",
-                fragment, err
-            );
-            return stats;
-        }
-    }
-
-    for object_id in purged_object_ids {
-        io_progress.heartbeat();
-        if should_stop_gc() {
-            return stats;
-        }
-        if namespace_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id))
-        {
-            warn!(
-                "GC: preserving purged namespace object {}/{} because it is still referenced by live/trash namespace rows",
-                fragment, object_id
-            );
-            continue;
-        }
-        if !protected_live_object_ids.contains(&object_id) {
-            continue;
-        }
-
-        let mut version_metas = match index::list_live_object_versions_metadata(
-            fragment, &object_id,
-        )
-        .await
-        {
-            Ok(versions) => versions,
-            Err(err) => {
-                warn!(
-                    "GC: failed to load live version history for purged namespace object {}/{}: {}",
-                    fragment, object_id, err
-                );
-                continue;
-            }
-        };
-        match index::list_trashed_object_versions_metadata(fragment, &object_id).await {
-            Ok(versions) => version_metas.extend(versions),
-            Err(err) => warn!(
-                "GC: failed to load trash version history for purged namespace object {}/{}: {}",
-                fragment, object_id, err
-            ),
-        }
-        let refund_bytes = version_metas
-            .iter()
-            .map(|version| version.total_size_bytes)
-            .sum::<u64>();
-        match index::delete_object_fast(fragment, &object_id).await {
-            Ok(Some(_version_ids)) => {
-                stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(
-                    "GC: failed to delete purged namespace object {}/{}: {}",
-                    fragment, object_id, err
-                );
-            }
-        }
-    }
-
-    for object_id in namespace_absent_gc_candidates {
-        io_progress.heartbeat();
-        if should_stop_gc() {
-            return stats;
-        }
-        if namespace_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id))
-        {
-            continue;
-        }
-
-        let mut version_metas =
-            match index::list_live_object_versions_metadata(fragment, &object_id).await {
-                Ok(versions) => versions,
-                Err(err) => {
-                    warn!(
-                        "GC: failed to load unbound live version history for {}/{}: {}",
-                        fragment, object_id, err
-                    );
-                    continue;
-                }
-            };
-        match index::list_trashed_object_versions_metadata(fragment, &object_id).await {
-            Ok(versions) => version_metas.extend(versions),
-            Err(err) => warn!(
-                "GC: failed to load unbound trash version history for {}/{}: {}",
-                fragment, object_id, err
-            ),
-        }
-        let refund_bytes = version_metas
-            .iter()
-            .map(|version| version.total_size_bytes)
-            .sum::<u64>();
-        for version in &version_metas {
-            live_versions.remove(&version.version_id);
-        }
-
-        match index::delete_object_fast(fragment, &object_id).await {
-            Ok(Some(_version_ids)) => {
-                stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(
-                    "GC: failed to delete unbound completed object {}/{}: {}",
-                    fragment, object_id, err
-                );
-            }
-        }
-    }
-
-    stats.live_versions_seen = live_versions.len() as u64;
     let now_ts = Utc::now().timestamp();
     let ttl_secs = CONFIG.garbage_collector.file_ttl_seconds as i64;
     let mut active_session_versions = HashSet::<String>::new();
@@ -1058,10 +827,7 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let object_is_referenced = protected_live_object_ids.contains(&object_id)
-                || namespace_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id));
+            let object_is_referenced = protected_object_ids.contains(&object_id);
             let mut has_protected_version = false;
             if let Ok(entries) = std::fs::read_dir(&object_dir) {
                 for entry in entries.filter_map(Result::ok) {
@@ -1074,9 +840,11 @@ async fn process_fragment_gc(
                     }
                     gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
                     let version_id = entry.file_name().to_string_lossy().to_string();
-                    let is_committed = live_versions.contains(&version_id);
                     let is_active = active_session_versions.contains(&version_id);
-                    if is_committed || is_active {
+                    if object_is_referenced || is_active {
+                        if object_is_referenced {
+                            stats.live_versions_seen = stats.live_versions_seen.saturating_add(1);
+                        }
                         has_protected_version = true;
                         continue;
                     }
@@ -1090,13 +858,8 @@ async fn process_fragment_gc(
                         .and_then(|metadata| metadata.modified())
                         .unwrap_or(now);
                     let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-                    if orphan_version_reclaimable(
-                        &version_id,
-                        is_committed,
-                        is_active,
-                        age,
-                        file_ttl,
-                    ) && std::fs::remove_dir_all(&path).is_ok()
+                    if orphan_version_reclaimable(&version_id, false, is_active, age, file_ttl)
+                        && std::fs::remove_dir_all(&path).is_ok()
                     {
                         stats.orphan_blob_dirs_deleted += 1;
                     }

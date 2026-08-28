@@ -35,6 +35,7 @@ pub struct AutoHealingStatus {
     pub configured_blob_roots: usize,
     pub writable_blob_roots: usize,
     pub distinct_writable_blob_devices: usize,
+    pub configured_index_roots: usize,
     pub writable_index_roots: usize,
     pub root_identity_error: Option<String>,
     pub data_shards: usize,
@@ -50,6 +51,7 @@ pub struct TopologyAssessment {
     pub configured_blob_roots: usize,
     pub writable_blob_roots: usize,
     pub distinct_writable_blob_devices: usize,
+    pub configured_index_roots: usize,
     pub writable_index_roots: usize,
     pub data_shards: usize,
     pub parity_shards: usize,
@@ -141,6 +143,7 @@ fn evaluate_topology_counts(
     configured_blob_roots: usize,
     writable_blob_roots: usize,
     distinct_writable_blob_devices: usize,
+    configured_index_roots: usize,
     writable_index_roots: usize,
     data_shards: usize,
     parity_shards: usize,
@@ -148,8 +151,13 @@ fn evaluate_topology_counts(
     let required = data_shards.saturating_add(parity_shards);
     let reason = if data_shards == 0 || required == 0 {
         Some("N1 has an invalid zero-width EC configuration.".to_string())
-    } else if writable_index_roots == 0 {
-        Some("N1 has no writable index root; namespace mutations are unsafe.".to_string())
+    } else if configured_index_roots == 0 {
+        Some("N1 has no configured index root; namespace mutations are unsafe.".to_string())
+    } else if writable_index_roots != configured_index_roots {
+        Some(format!(
+            "N1 is read-only: namespace authority requires all {} configured index roots, but only {} are writable and identity-valid.",
+            configured_index_roots, writable_index_roots
+        ))
     } else if configured_blob_roots < required {
         Some(format!(
             "N1 is read-only: {}D+{}P requires {} blob roots, but only {} are configured.",
@@ -173,6 +181,7 @@ fn evaluate_topology_counts(
         configured_blob_roots,
         writable_blob_roots,
         distinct_writable_blob_devices,
+        configured_index_roots,
         writable_index_roots,
         data_shards,
         parity_shards,
@@ -222,6 +231,7 @@ pub async fn assess_current_topology() -> TopologyAssessment {
     }
 
     let configured_blob_roots = blob_roots.len();
+    let configured_index_roots = index_roots.len();
     let (blob_probes, index_probes) = tokio::join!(
         probe_paths(blob_roots, identities.clone()),
         probe_paths(index_roots, identities)
@@ -239,6 +249,7 @@ pub async fn assess_current_topology() -> TopologyAssessment {
         configured_blob_roots,
         writable_blob_roots,
         distinct_writable_blob_devices,
+        configured_index_roots,
         writable_index_roots,
         data_shards,
         parity_shards,
@@ -261,6 +272,7 @@ async fn update_topology_status(assessment: &TopologyAssessment) {
     status.configured_blob_roots = assessment.configured_blob_roots;
     status.writable_blob_roots = assessment.writable_blob_roots;
     status.distinct_writable_blob_devices = assessment.distinct_writable_blob_devices;
+    status.configured_index_roots = assessment.configured_index_roots;
     status.writable_index_roots = assessment.writable_index_roots;
     status.root_identity_error = assessment.root_identity_error.clone();
     status.data_shards = assessment.data_shards;
@@ -450,7 +462,7 @@ mod tests {
 
     #[test]
     fn expanded_topology_stays_write_safe_without_changing_ec_width() {
-        let assessment = evaluate_topology_counts(8, 8, 8, 2, 4, 2);
+        let assessment = evaluate_topology_counts(8, 8, 8, 2, 2, 4, 2);
         assert!(assessment.write_safe);
         assert_eq!(assessment.data_shards, 4);
         assert_eq!(assessment.parity_shards, 2);
@@ -458,7 +470,7 @@ mod tests {
 
     #[test]
     fn insufficient_or_non_distinct_roots_fail_closed() {
-        let missing = evaluate_topology_counts(6, 5, 5, 2, 4, 2);
+        let missing = evaluate_topology_counts(6, 5, 5, 2, 2, 4, 2);
         assert!(!missing.write_safe);
         assert!(
             missing
@@ -468,7 +480,7 @@ mod tests {
                 .contains("writable blob roots")
         );
 
-        let duplicate_devices = evaluate_topology_counts(6, 6, 5, 2, 4, 2);
+        let duplicate_devices = evaluate_topology_counts(6, 6, 5, 2, 2, 4, 2);
         assert!(!duplicate_devices.write_safe);
         assert!(
             duplicate_devices
@@ -481,8 +493,17 @@ mod tests {
 
     #[test]
     fn index_authority_loss_fails_closed() {
-        let assessment = evaluate_topology_counts(6, 6, 6, 0, 4, 2);
+        let assessment = evaluate_topology_counts(6, 6, 6, 2, 1, 4, 2);
         assert!(!assessment.write_safe);
         assert!(assessment.reason.as_deref().unwrap().contains("index root"));
+    }
+
+    #[test]
+    fn every_configured_index_root_is_required_for_namespace_authority() {
+        let assessment = evaluate_topology_counts(4, 4, 4, 4, 3, 3, 1);
+        assert!(!assessment.write_safe);
+        assert_eq!(assessment.configured_index_roots, 4);
+        assert_eq!(assessment.writable_index_roots, 3);
+        assert!(assessment.reason.as_deref().unwrap().contains("all 4"));
     }
 }

@@ -88,7 +88,23 @@ static REDIST_STATUS: LazyLock<Arc<tokio::sync::RwLock<RedistributionJobStatus>>
     LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(RedistributionJobStatus::default())));
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+static REDISTRIBUTION_RUNNING: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 const REDIST_INTENT_SUFFIX: &str = ".redist.intent.msgpack";
+
+struct RedistributionRunningGuard;
+
+impl Drop for RedistributionRunningGuard {
+    fn drop(&mut self) {
+        REDISTRIBUTION_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_redistribution_running() -> Result<RedistributionRunningGuard, AppError> {
+    REDISTRIBUTION_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| RedistributionRunningGuard)
+        .map_err(|_| AppError::Conflict("Job already running".into()))
+}
 #[derive(Clone, Copy, Debug)]
 pub enum RedistributionDurabilityMode {
     Auto,
@@ -626,13 +642,6 @@ pub async fn trigger_redistribution_job_api(
         ));
     }
 
-    {
-        let st = REDIST_STATUS.read().await;
-        if st.is_running {
-            return Err(AppError::Conflict("Job already running".into()));
-        }
-    }
-
     let dry_run = parse_bool_param(&params, "dry_run", false);
     let fast_mode = parse_bool_param(&params, "fast_mode", false);
     let read_only_fast = parse_bool_param(&params, "read_only_fast", false);
@@ -713,9 +722,23 @@ pub async fn trigger_redistribution_job_api(
 
     let ws_manager = Arc::new(state.ws_manager.clone());
     let ws_manager_clone = ws_manager.clone();
+    let running_guard = acquire_redistribution_running()?;
+    {
+        let mut status = REDIST_STATUS.write().await;
+        status.is_running = true;
+        status.phase = "Queued".to_string();
+        status.fast_mode = fast_mode;
+        status.durability_mode = run_opts.effective_durability_mode().to_string();
+        status.scope = run_opts.scope.as_str().to_string();
+        status.last_error = None;
+        status.start_timestamp = Utc::now().timestamp();
+        ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(status.clone()));
+    }
 
     tokio::spawn(async move {
-        if let Err(e) = run_redistribution_job_with_options(dry_run, run_opts, ws_manager).await {
+        if let Err(e) =
+            run_redistribution_job_reserved(dry_run, run_opts, ws_manager, running_guard).await
+        {
             error!("Redistribution job failed: {}", e);
             let mut st = REDIST_STATUS.write().await;
             st.is_running = false;
@@ -765,6 +788,7 @@ mod intent;
 
 #[cfg(test)]
 pub use execution::run_redistribution_job;
+use execution::run_redistribution_job_reserved;
 pub use execution::run_redistribution_job_with_options;
 pub use intent::{collect_redistribution_intent_debt, replay_pending_intents_for_fragment_now};
 

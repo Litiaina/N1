@@ -53,7 +53,23 @@ pub struct TrashCatalogEntry {
 }
 
 pub struct ObjectOperationGuard {
-    _guard: OwnedMutexGuard<()>,
+    key: String,
+    lock: Arc<AsyncMutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for ObjectOperationGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let Ok(mut locks) = OBJECT_OP_LOCKS.lock() else {
+            return;
+        };
+        if locks.get(&self.key).is_some_and(|current| {
+            Arc::ptr_eq(current, &self.lock) && Arc::strong_count(current) <= 2
+        }) {
+            locks.remove(&self.key);
+        }
+    }
 }
 
 pub async fn acquire_object_operation_lock(
@@ -70,13 +86,25 @@ pub async fn acquire_object_operation_lock(
             AppError::InternalServerError("object operation lock poisoned".to_string())
         })?;
         locks
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     };
+    let guard = lock.clone().lock_owned().await;
     Ok(ObjectOperationGuard {
-        _guard: lock.lock_owned().await,
+        key,
+        lock,
+        guard: Some(guard),
     })
+}
+
+#[cfg(test)]
+fn object_operation_lock_count_for_fragment(fragment: &str) -> usize {
+    let prefix = format!("{fragment}\u{001f}");
+    OBJECT_OP_LOCKS
+        .lock()
+        .map(|locks| locks.keys().filter(|key| key.starts_with(&prefix)).count())
+        .unwrap_or(0)
 }
 
 fn parse_crc32_hex(value: &str) -> Result<u32, AppError> {
@@ -616,4 +644,45 @@ pub async fn ensure_object_owner_partition_available(
         index_store::ensure_object_owner_partition_available(&fragment, &object_key)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn object_operation_registry_is_bounded_and_same_key_is_serialized() {
+        let fragment = format!("lock-lifetime-{}", ulid::Ulid::new());
+        for index in 0..4_096usize {
+            let guard = acquire_object_operation_lock(&fragment, &format!("object-{index}"))
+                .await
+                .expect("acquire unique object operation guard");
+            drop(guard);
+        }
+        assert_eq!(object_operation_lock_count_for_fragment(&fragment), 0);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..128usize {
+            let fragment = fragment.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            tasks.push(tokio::spawn(async move {
+                let _guard = acquire_object_operation_lock(&fragment, "shared")
+                    .await
+                    .expect("acquire shared object operation guard");
+                let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                max_active.fetch_max(now, Ordering::AcqRel);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::AcqRel);
+            }));
+        }
+        for task in tasks {
+            task.await.expect("object operation task");
+        }
+        assert_eq!(max_active.load(Ordering::Acquire), 1);
+        assert_eq!(object_operation_lock_count_for_fragment(&fragment), 0);
+    }
 }

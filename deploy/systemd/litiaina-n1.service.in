@@ -2,6 +2,7 @@
 Description=Litiaina N1 Object Storage
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=__REQUIRES_MOUNTS_FOR__
 
 [Service]
 Type=simple

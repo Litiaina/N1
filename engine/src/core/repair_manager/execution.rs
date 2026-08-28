@@ -24,16 +24,16 @@ pub async fn run_repair_job_with_options(
     opts: RepairRunOptions,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
-    if REPAIR_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err(AppError::Conflict(
-            "A repair job is already running.".into(),
-        ));
-    }
-    let _running_guard = RepairRunningGuard;
+    let running_guard = acquire_repair_running()?;
+    run_repair_job_reserved(cfg, opts, ws_manager, running_guard).await
+}
 
+pub(super) async fn run_repair_job_reserved(
+    cfg: RepairRunConfig,
+    opts: RepairRunOptions,
+    ws_manager: Arc<WsConnectionManager>,
+    _running_guard: RepairRunningGuard,
+) -> Result<(), AppError> {
     let result = run_repair_job_inner(cfg, opts, ws_manager.clone()).await;
     if let Err(error) = &result {
         let mut status = REPAIR_STATUS.write().await;
@@ -360,6 +360,9 @@ async fn run_repair_job_inner(
 
     ensure_no_unresolved_repairs(unresolved_repairs, last_unresolved_failure.as_deref())?;
 
+    io_guard.complete();
+    drop(_write_gate);
+
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = false;
@@ -383,7 +386,6 @@ async fn run_repair_job_inner(
         );
     }
 
-    io_guard.complete();
     Ok(())
 }
 

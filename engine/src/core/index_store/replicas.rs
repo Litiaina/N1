@@ -87,21 +87,27 @@ fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
     }
 }
 
-fn hash_replica_tree(
-    hasher: &mut Sha256,
-    fragment_root: &Path,
-    directory: &Path,
-) -> Result<(), AppError> {
-    let mut names = read_dir_names(directory)?;
-    names.sort_unstable();
-    for name in names {
+fn add_digest_mod_256(accumulator: &mut [u8; 32], digest: &[u8; 32]) {
+    let mut carry = 0u16;
+    for index in (0..32).rev() {
+        let sum = u16::from(accumulator[index]) + u16::from(digest[index]) + carry;
+        accumulator[index] = sum as u8;
+        carry = sum >> 8;
+    }
+}
+
+fn hash_replica_tree(fragment_root: &Path, directory: &Path) -> Result<[u8; 32], AppError> {
+    let mut sum = [0u8; 32];
+    let mut xor = [0u8; 32];
+    let mut entry_count = 0u64;
+    visit_dir_names(directory, |name| {
         if directory == fragment_root
             && matches!(
                 name.as_str(),
                 OBJECTS_DIR | TMP_DIR | LOCKS_DIR | REPAIR_DIR
             )
         {
-            continue;
+            return Ok(true);
         }
         let path = directory.join(&name);
         let relative = path.strip_prefix(fragment_root).map_err(|_| {
@@ -114,23 +120,23 @@ fn hash_replica_tree(
         let relative = relative.to_string_lossy();
         let metadata = fs::symlink_metadata(&path)
             .map_err(|e| io_err(e, "inspect N1 replica manifest entry"))?;
+        let mut entry_hasher = Sha256::new();
         if metadata.file_type().is_symlink() {
             let target =
                 fs::read_link(&path).map_err(|e| io_err(e, "read N1 replica manifest symlink"))?;
-            hasher.update(b"L\0");
-            hasher.update(relative.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(target.as_os_str().as_encoded_bytes());
-            hasher.update(b"\0");
+            entry_hasher.update(b"L\0");
+            entry_hasher.update(relative.as_bytes());
+            entry_hasher.update(b"\0");
+            entry_hasher.update(target.as_os_str().as_encoded_bytes());
         } else if metadata.is_dir() {
-            hasher.update(b"D\0");
-            hasher.update(relative.as_bytes());
-            hasher.update(b"\0");
-            hash_replica_tree(hasher, fragment_root, &path)?;
+            entry_hasher.update(b"D\0");
+            entry_hasher.update(relative.as_bytes());
+            entry_hasher.update(b"\0");
+            entry_hasher.update(hash_replica_tree(fragment_root, &path)?);
         } else if metadata.is_file() {
-            hasher.update(b"F\0");
-            hasher.update(relative.as_bytes());
-            hasher.update(b"\0");
+            entry_hasher.update(b"F\0");
+            entry_hasher.update(relative.as_bytes());
+            entry_hasher.update(b"\0");
             let mut file =
                 File::open(&path).map_err(|e| io_err(e, "open N1 replica manifest file"))?;
             let mut buffer = [0u8; 64 * 1024];
@@ -141,28 +147,41 @@ fn hash_replica_tree(
                 if read == 0 {
                     break;
                 }
-                hasher.update(&buffer[..read]);
+                entry_hasher.update(&buffer[..read]);
             }
-            hasher.update(b"\0");
         } else {
             return Err(AppError::InternalServerError(format!(
                 "N1 replica manifest contains unsupported entry {}",
                 path.display()
             )));
         }
-    }
-    Ok(())
+        let digest: [u8; 32] = entry_hasher.finalize().into();
+        add_digest_mod_256(&mut sum, &digest);
+        for (target, value) in xor.iter_mut().zip(digest) {
+            *target ^= value;
+        }
+        entry_count = entry_count.saturating_add(1);
+        Ok(true)
+    })?;
+
+    let mut tree_hasher = Sha256::new();
+    tree_hasher.update(b"n1-replica-tree-unordered-v1\0");
+    tree_hasher.update(entry_count.to_be_bytes());
+    tree_hasher.update(sum);
+    tree_hasher.update(xor);
+    Ok(tree_hasher.finalize().into())
 }
 
 fn replica_state(root: &Path, fragment: &str) -> Result<ReplicaState, AppError> {
     let fragment_root = fragment_root_on(root, fragment);
-    let mut hasher = Sha256::new();
-    if fragment_root.is_dir() {
-        hash_replica_tree(&mut hasher, &fragment_root, &fragment_root)?;
-    }
+    let content_digest = if fragment_root.is_dir() {
+        hash_replica_tree(&fragment_root, &fragment_root)?
+    } else {
+        Sha256::digest(b"n1-replica-tree-missing-v1").into()
+    };
     Ok(ReplicaState {
         score: replica_score(root, fragment),
-        content_digest: hasher.finalize().into(),
+        content_digest,
     })
 }
 

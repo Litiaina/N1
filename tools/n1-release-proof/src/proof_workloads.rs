@@ -247,7 +247,7 @@ impl Proof {
         });
         let start = Instant::now();
         let init_url = format!(
-            "{}/noa/v1/upload/multipart/init/{}",
+            "{}/noa/v1/upload/multipart/durable/init/{}",
             self.base_url,
             encode_path(object_key)
         );
@@ -268,12 +268,12 @@ impl Proof {
         }
         let init: MultipartInit = response.json().await?;
         let restart_after_parts = (expected_parts / 2).max(1);
-        self.upload_part_range(&init.version_id, 0, restart_after_parts, part_size)
+        self.upload_durable_part_range(&init.version_id, 0, restart_after_parts, part_size)
             .await?;
         self.stop_server()?;
         self.start_server("resume").await?;
         self.auth().await?;
-        self.upload_part_range(
+        self.upload_durable_part_range(
             &init.version_id,
             restart_after_parts,
             expected_parts,
@@ -281,7 +281,7 @@ impl Proof {
         )
         .await?;
         let finalize_url = format!(
-            "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
+            "{}/noa/v1/upload/multipart/durable/{}/{}/finalize?object_key={}",
             self.base_url,
             init.version_id,
             init.session_id,
@@ -304,7 +304,7 @@ impl Proof {
         }
         let elapsed = start.elapsed().as_secs_f64();
         Ok(json!({
-            "mode": "multipart",
+            "mode": "durable_multipart_restart_resume",
             "bytes": total_size,
             "parts": expected_parts,
             "part_size_bytes": part_size,
@@ -313,6 +313,101 @@ impl Proof {
             "mib_s": round3((total_size as f64 / 1024.0 / 1024.0) / elapsed.max(0.001)),
             "version_id": init.version_id,
             "session_id": init.session_id,
+        }))
+    }
+
+    async fn standard_multipart_restart_loss_proof(&mut self) -> ProofResult<Value> {
+        let object_key = format!("{}standard-restart-loss.bin", self.args.prefix);
+        let part_size = 1024 * 1024_u64;
+        let params = json!({
+            "content_type": "application/octet-stream",
+            "total_size_bytes": part_size * 2,
+            "expected_parts": 2,
+            "part_size_bytes": part_size,
+        });
+        let response = self
+            .client
+            .post(format!(
+                "{}/noa/v1/upload/multipart/init/{}",
+                self.base_url,
+                encode_path(&object_key)
+            ))
+            .bearer_auth(&self.token)
+            .json(&params)
+            .send()
+            .await?;
+        if response.status() != StatusCode::CREATED {
+            return Err(format!(
+                "standard restart-loss init failed: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+        let init: MultipartInit = response.json().await?;
+        let response = self
+            .client
+            .put(format!(
+                "{}/noa/v1/upload/multipart/{}/0?durability=batched",
+                self.base_url, init.version_id
+            ))
+            .bearer_auth(&self.token)
+            .header("content-type", "application/octet-stream")
+            .header(CONTENT_LENGTH, part_size)
+            .body(vec![0x5a; part_size as usize])
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK && response.status() != StatusCode::CREATED {
+            return Err(format!(
+                "standard restart-loss part failed: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+
+        self.stop_server()?;
+        self.start_server("standard-session-loss").await?;
+        self.auth().await?;
+
+        let status_response = self
+            .client
+            .get(format!(
+                "{}/noa/v1/upload/multipart/{}",
+                self.base_url, init.version_id
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        if status_response.status() != StatusCode::OK {
+            return Err(format!(
+                "standard restart-loss status failed: {} {}",
+                status_response.status(),
+                status_response.text().await?
+            )
+            .into());
+        }
+        let status: Value = status_response.json().await?;
+        let uploaded_parts = status
+            .get("uploaded_parts")
+            .and_then(Value::as_array)
+            .ok_or("standard restart-loss status omitted uploaded_parts")?;
+        if !uploaded_parts.is_empty() {
+            return Err(format!(
+                "standard session survived restart unexpectedly: {uploaded_parts:?}"
+            )
+            .into());
+        }
+
+        self.assert_live_path_absent(&object_key).await?;
+
+        Ok(json!({
+            "mode": "standard_multipart_memory_only",
+            "uploaded_before_restart": [0],
+            "uploaded_after_restart": uploaded_parts,
+            "session_present_after_restart": false,
+            "namespace_published": false,
+            "version_id": init.version_id,
         }))
     }
 

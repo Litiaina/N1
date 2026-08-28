@@ -47,7 +47,7 @@ impl Proof {
         Ok(response.json::<AuthResponse>().await?.access_token)
     }
 
-    async fn upload_part_range(
+    async fn upload_durable_part_range(
         &self,
         version_id: &str,
         start_part: u64,
@@ -66,7 +66,7 @@ impl Proof {
             let response = self
                 .client
                 .put(format!(
-                    "{}/noa/v1/upload/multipart/{}/{}?durability=batched",
+                    "{}/noa/v1/upload/multipart/durable/{}/{}?durability=batched",
                     self.base_url, version_id, part_idx
                 ))
                 .bearer_auth(&self.token)
@@ -375,6 +375,28 @@ impl Proof {
             .into());
         }
         Ok(response.json().await?)
+    }
+
+    async fn assert_live_path_absent(&self, object_key: &str) -> ProofResult<()> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/noa/v1/posix/stat?path={}&trash=false",
+                self.base_url,
+                encode_query_value(object_key)
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        if response.status() != StatusCode::NOT_FOUND {
+            return Err(format!(
+                "expected live path to be absent for {object_key}: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+        Ok(())
     }
 
     async fn assert_expected_visible(&self, expected: &BTreeSet<String>) -> ProofResult<()> {

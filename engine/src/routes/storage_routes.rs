@@ -48,7 +48,6 @@ use crate::core::upload::{
 };
 use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fs_constants::MAX_FILE_SIZE;
 use crate::middleware::auth_middleware::{
     authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
@@ -79,6 +78,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tower_http::cors::{Any, CorsLayer};
+
+const MAX_HTTP_BODY_SIZE: usize = 5 * 1024 * 1024 * 1024;
 
 pub struct AppState {
     pub ws_manager: WsConnectionManager,
@@ -1452,7 +1453,7 @@ fn build_cors_layer() -> CorsLayer {
 
 pub fn apply_runtime_http_layers(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
     router
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE))
         .layer(build_cors_layer())
 }
 

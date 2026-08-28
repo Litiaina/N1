@@ -22,6 +22,11 @@ impl Proof {
         let mut rss_samples = Vec::new();
         let local_sha = self.sha256_file(&self.args.source_file).await?;
         rss_samples.push(self.rss_sample("server_started"));
+        let standard_restart_contract = self.standard_multipart_restart_loss_proof().await?;
+        evidence.push(json!({
+            "gate": "standard_multipart_restart_loss",
+            "status": "PASS"
+        }));
         let upload = self.multipart_restart_resume(&object_key).await?;
         live_expected.insert(object_key.clone());
         self.assert_list_contains(&object_key).await?;
@@ -172,6 +177,7 @@ impl Proof {
             "rate_limiter_enabled": self.args.rate_limiter_enabled,
             "native_protocol": native_protocol,
             "upload": upload,
+            "standard_restart_contract": standard_restart_contract,
             "additional_large_multipart": additional_large,
             "object_storm": object_storm,
             "same_fragment_mixed_users": same_fragment_mixed,

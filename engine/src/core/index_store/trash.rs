@@ -165,9 +165,10 @@ fn collect_trash_object_refs(
     ))
 }
 
-pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
+pub(crate) fn visit_trash_records(
+    fragment: &str,
+    mut visit: impl FnMut(TrashRecord) -> Result<bool, AppError>,
+) -> Result<(), AppError> {
     for fragment_root in existing_fragment_roots(fragment) {
         let index_root = fragment_root
             .parent()
@@ -184,9 +185,6 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                     trash_root.join(&generation).display()
                 )));
             };
-            if !seen.insert(generation.clone()) {
-                continue;
-            }
             let generation_root = trash_root.join(&generation);
             match fs::symlink_metadata(&generation_root) {
                 Ok(metadata) if metadata.is_dir() => {}
@@ -258,7 +256,7 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                 )));
             };
             let source_relative_path = format!("{generation}/{original_path}");
-            out.push(TrashRecord {
+            let record = TrashRecord {
                 trash_entry_id: source_relative_path.clone(),
                 original_path,
                 source_relative_path,
@@ -266,10 +264,22 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                 object_keys,
                 version_ids,
                 deleted_at_unix: unix_nanos / 1_000_000_000,
-            });
+            };
+            if !visit(record)? {
+                return Ok(());
+            }
         }
         break;
     }
+    Ok(())
+}
+
+pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
+    let mut out = Vec::new();
+    visit_trash_records(fragment, |record| {
+        out.push(record);
+        Ok(true)
+    })?;
     out.sort_by(|a, b| {
         a.original_path
             .cmp(&b.original_path)
@@ -359,6 +369,9 @@ fn scan_trash_page(
             by_record
                 .entry(name.clone())
                 .or_insert((directory_entry(name), None));
+            if by_record.len() > limit.saturating_add(1) {
+                by_record.pop_last();
+            }
             continue;
         }
 
@@ -388,16 +401,19 @@ fn scan_trash_page(
             version_ulid: Some(metadata.version_id.clone()),
         };
         by_record.entry(name).or_insert((entry, Some(metadata)));
+        if by_record.len() > limit.saturating_add(1) {
+            by_record.pop_last();
+        }
     }
 
-    let mut page = by_record.into_iter().collect::<Vec<_>>();
-    page.sort_by(|a, b| a.0.cmp(&b.0));
-    let continuation = if page.len() > limit {
-        page.truncate(limit);
-        page.last().map(|(record, _)| record.clone())
-    } else {
-        None
-    };
+    let has_more = by_record.len() > limit;
+    if has_more {
+        by_record.pop_last();
+    }
+    let page = by_record.into_iter().collect::<Vec<_>>();
+    let continuation = has_more
+        .then(|| page.last().map(|(record, _)| record.clone()))
+        .flatten();
     let entries = page
         .iter()
         .map(|(_, (entry, _))| entry.clone())

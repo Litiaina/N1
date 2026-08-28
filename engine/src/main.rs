@@ -23,8 +23,6 @@ use crate::core::upload::{
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
-use crate::fs::cleanup_manager::interval_cleanup;
-use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::io_control::{IoControlConfig, configure_io_control};
 use crate::protocol::{bind_native_protocol, serve_native_protocol};
@@ -1155,14 +1153,6 @@ pub async fn run_server() {
     let serve_storage = apply_runtime_http_layers(storage_router)
         .with_state(app_state)
         .fallback(handler_404);
-
-    let fs_root = FS_STORAGE_ROOT
-        .get()
-        .unwrap_or(&STORAGE_ROOT.to_string())
-        .to_string();
-    tokio::spawn(async move {
-        interval_cleanup(&fs_root).await;
-    });
 
     tokio::spawn(async move {
         serve_native_protocol(native_listener, native_addr, native_state).await;
