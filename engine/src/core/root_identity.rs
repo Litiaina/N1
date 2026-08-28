@@ -179,8 +179,31 @@ pub(crate) fn verify_local_root_identity(
 }
 
 pub fn initialize_local_root_identities(runtime: &ClusterRuntime) -> Result<(), AppError> {
+    let mut available = 0usize;
+    let mut unavailable = Vec::new();
     for root in &runtime.local_storage_roots {
+        match fs::metadata(&root.path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                unavailable.push(format!("{}: path is not a directory", root.id));
+                continue;
+            }
+            Err(error) => {
+                unavailable.push(format!("{}: {error}", root.id));
+                continue;
+            }
+        }
         enroll_root(runtime, root)?;
+        available = available.saturating_add(1);
+    }
+    if available == 0 {
+        return Err(AppError::ServiceUnavailable(format!(
+            "no local N2 storage root is available: {}",
+            unavailable.join("; ")
+        )));
+    }
+    for issue in unavailable {
+        tracing::warn!("N2 root identity unavailable during degraded startup: {issue}");
     }
     Ok(())
 }
@@ -310,5 +333,45 @@ mod tests {
 
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn restart_identity_check_tolerates_one_unavailable_enrolled_root() {
+        let healthy = std::env::temp_dir().join(format!("n2-root-v5-healthy-{}", Ulid::new()));
+        let unavailable =
+            std::env::temp_dir().join(format!("n2-root-v5-unavailable-{}", Ulid::new()));
+        fs::create_dir_all(&healthy).expect("create healthy root");
+        fs::write(&unavailable, b"unavailable mount").expect("create unavailable root marker");
+
+        let mut runtime = runtime(&healthy, "node-a");
+        let missing = StorageRoot {
+            id: "root-unavailable".into(),
+            physical_id: None,
+            path: unavailable.display().to_string(),
+        };
+        runtime.local_storage_roots.push(missing.clone());
+        runtime.membership.nodes[0].storage_roots.push(missing);
+
+        initialize_local_root_identities(&runtime)
+            .expect("one healthy enrolled root keeps the node startable");
+        verify_local_root_identity(&runtime, &runtime.local_storage_roots[0])
+            .expect("healthy root is enrolled");
+
+        let _ = fs::remove_dir_all(healthy);
+        let _ = fs::remove_file(unavailable);
+    }
+
+    #[test]
+    fn restart_identity_check_rejects_zero_available_roots() {
+        let unavailable = std::env::temp_dir().join(format!("n2-root-v5-none-{}", Ulid::new()));
+        fs::write(&unavailable, b"unavailable mount").expect("create unavailable root marker");
+        let error = initialize_local_root_identities(&runtime(&unavailable, "node-a"))
+            .expect_err("a node with no available root must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("no local N2 storage root is available")
+        );
+        let _ = fs::remove_file(unavailable);
     }
 }

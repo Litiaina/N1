@@ -5,10 +5,86 @@ hardware, topology, and methodology boundaries. Correctness and failure
 qualification are kept in [TESTING.md](TESTING.md) so benchmark results are
 not mistaken for a second verification record.
 
+## N2 3.4.1 Real Two-Host CRUD and Namespace Benchmark
+
+Raw evidence bundle: `n2-two-host-crud-benchmark-20260824`. It is retained
+privately outside the repository. Machine usernames, addresses, filesystem
+paths, mount points, and credentials are intentionally excluded from this
+published record.
+
+This finite run used one logical N2 node on each of two physical hosts, one
+exact EC `1 + 1` pool, two NCNX replicas, six enrolled physical roots split
+unevenly as two and four, and a 1 GbE LAN. Every measured request alternated
+between or was verified through both physical coordinators. The tested binary
+SHA-256 was
+`bd95a8da8b028c63747dbeed17f6e21680e226abba450c524b0c6a5e748497e3`.
+
+### Data path
+
+| Operation | Result |
+| --- | ---: |
+| 256 MiB standard multipart create, four concurrent parts | 72.04 MiB/s |
+| 256 MiB read through host A | 137.21 MiB/s; SHA-256 exact |
+| 256 MiB read through host B | 36.33 MiB/s; SHA-256 exact |
+| 256-object batch create, 64 KiB each, concurrency 32 | 25.87 objects/s; 256/256 |
+
+The two reads were consecutive observations and are not labelled cold or warm.
+They prove coordinator correctness, not a universal read ceiling.
+
+### Exact CRUD and lookup latency
+
+| Operation | Samples | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Create 128 KiB | 64 | 235.13 ms | 1,279.08 ms | 1,561.81 ms |
+| Read 128 KiB | 100 | 25.69 ms | 227.92 ms | 1,885.46 ms |
+| Update 128 KiB | 40 | 163.91 ms | 274.09 ms | 1,312.08 ms |
+| Metadata lookup | 100 | 15.59 ms | 54.75 ms | 55.78 ms |
+| POSIX stat | 100 | 12.66 ms | 56.30 ms | 59.71 ms |
+| Single delete to trash | 20 | 86.02 ms | 499.80 ms | 1,114.47 ms |
+| Single recover | 20 | 111.29 ms | 525.04 ms | 900.10 ms |
+
+Forty updates of one logical key produced forty immutable versions and the
+final HEAD downloaded byte-exactly.
+
+### Namespace and POSIX surface
+
+| Operation | Samples | Result |
+| --- | ---: | ---: |
+| Complete object listing, 256 keys in four pages | 10 | p50 207.31 ms; p95 264.11 ms |
+| Complete POSIX listing, 256 keys in four pages | 10 | p50 209.86 ms; p95 295.75 ms |
+| Single-file POSIX rename | 20 | p50 117.41 ms; p95 931.46 ms |
+| Single-file POSIX move | 20 | p50 106.02 ms; p95 612.95 ms |
+| Prefix rename | 256 keys | 6.789 s; 37.71 keys/s |
+| Prefix trash | 256 keys | 5.540 s; 46.21 keys/s |
+| Prefix recover | 256 keys | 5.187 s; 49.35 keys/s |
+| Bulk delete | 128 keys | 2.059 s; 62.17 keys/s |
+| Bulk recover | 128 keys | 4.540 s; 28.19 keys/s |
+| Empty-directory mkdir contract | 32 | correct HTTP 400; p50 10.98 ms |
+
+The `mkdir` result is intentional: N2 3.4 is a flat key namespace and does not
+persist empty directories. Folder presentation is derived from key prefixes or
+kept as a client-side facade. Both listing APIs returned exactly 256 unique,
+ordered keys while pages alternated between coordinators. Every prefix
+operation completed through its tracked operation ID and reported exactly 256
+affected paths.
+
+All byte checks, pagination checks, six-root participation, final health, and
+write-authority gates passed. Final state was healthy, writable,
+authority-proven, and fully protected; suspicious engine log lines were zero.
+The run took 144 seconds and removed all temporary processes, isolated roots,
+payloads, and access credentials.
+
+These results show strong minimum-topology performance, not uniformly instant
+latency. Metadata, stat, reads, and listings have low medians. Durable creates
+and copy/delete mutations retain cross-host and rotational-media fsync tails
+that reach seconds; those tails are reported rather than hidden. This single
+EC `1 + 1` run is not a WAN result, wider-pool result, concurrency saturation
+test, or hardware ceiling.
+
 ## N2 3.4.1 Metal Data-Path and Namespace Optimization
 
-Evidence directory:
-`/home/litiaina/DEV_TEST/n2-metal-optimization-20260815`.
+Raw evidence bundle: `n2-metal-optimization-20260815`. It is retained
+privately outside the repository; its machine path is intentionally omitted.
 
 This controlled run used four isolated N2 processes, four physical XFS HDDs,
 one exact EC `3 + 1` server pool, and loopback HTTPS on the i7-6700K test
@@ -49,8 +125,8 @@ namespace proof, and raw evidence are in the evidence directory's `REPORT.md`.
 
 ## N2 3.4.1 Two-Host Hybrid Cluster and Universal Shell Proof
 
-Evidence directory:
-`/home/litiaina/DEV_TEST/n2-hybrid-cluster-20260815`.
+Raw evidence bundle: `n2-hybrid-cluster-20260815`. It is retained privately
+outside the repository; its machine path is intentionally omitted.
 
 The universal Shell commissioned one cluster across two physical Shell agents.
 The local host ran one logical node with two XFS roots; the remote host ran two
@@ -105,8 +181,8 @@ copy/delete namespace mutation, disk spreading, and restart persistence.
 
 ## N2 3.4.1 Bounded Prefix-Rename Optimization
 
-Evidence directory:
-`/home/litiaina/DEV_TEST/n2-prefix-rename-optimization-20260812`.
+Raw evidence bundle: `n2-prefix-rename-optimization-20260812`. It is retained
+privately outside the repository; its machine path is intentionally omitted.
 
 The controlled comparison used four isolated N2 processes as one exact EC
 `3 + 1` pool, one test root on each of four physical XFS HDDs, 245 objects,
@@ -148,8 +224,8 @@ format-v5 logical-slot binding and autonomous Reserve Set contract.
 
 ## N2 3.3 Four-Slot Plus Reserve Proof
 
-Evidence directory:
-`/home/wlzambo/DEV-TEST/N2-3.3-final-proof/N2-3.0-proof-20260727-044408`.
+Raw evidence bundle: `N2-3.3-final-proof-20260727-044408`. It is retained
+privately outside the repository; its machine path is intentionally omitted.
 
 The retained proof-script filename identifies the flat-NCNX proof family. This
 run used the optimized N2 `3.3.0` binary and format-v5 membership.
@@ -225,8 +301,8 @@ hardware ceiling.
 
 ## Historical N2 3.2 Four-Node Proof
 
-Evidence directory:
-`/home/wlzambo/DEV-TEST/N2-3.0-proof-20260727-013543`.
+Raw evidence bundle: `N2-3.0-proof-20260727-013543`. It is retained privately
+outside the repository; its machine path is intentionally omitted.
 
 The proof-script filename is retained for operator continuity, but this run
 used the optimized N2 `3.2.0` binary, format-v4 membership, and clean 3.2
@@ -293,8 +369,8 @@ ceiling.
 
 ## Historical N2 3.0 Four-Node Proof
 
-Evidence directory:
-`/home/wlzambo/DEV-TEST/N2-3.0-proof-20260718-220508`.
+Raw evidence bundle: `N2-3.0-proof-20260718-220508`. It is retained privately
+outside the repository; its machine path is intentionally omitted.
 
 | Field | Value |
 | --- | --- |
@@ -365,8 +441,8 @@ TESTING.md.
 
 ## N2 1.0.0 Four-Node Proof
 
-Evidence directory:
-`/home/wlzambo/DEV-TEST/n2-maintenance-proof-20260708`.
+Raw evidence bundle: `n2-maintenance-proof-20260708`. It is retained privately
+outside the repository; its machine path is intentionally omitted.
 
 | Field | Value |
 | --- | --- |
@@ -416,8 +492,8 @@ of accepting unsafe split-brain mutations.
 
 ## Earlier Two-Node Dentry-Quorum Rewrite
 
-Evidence directory:
-`/home/wlzambo/DEV-TEST/n2-namespace-rewrite-2node`.
+Raw evidence bundle: `n2-namespace-rewrite-2node`. It is retained privately
+outside the repository; its machine path is intentionally omitted.
 
 | Field | Value |
 | --- | --- |
@@ -474,16 +550,16 @@ coordinator hop and the coordinator-to-client hop back to this workstation.
 
 ## Historical Four-Node 3+1 Results
 
-N2 ran on four remote rotational-disk machines. The fifth machine at
-`192.168.0.37` was deliberately excluded from storage and used only as the
-client, route-only gateway, console host, and test coordinator.
+N2 ran on four remote rotational-disk machines. A fifth physical machine was
+deliberately excluded from storage and used only as the client, route-only
+gateway, console host, and test coordinator.
 
-| Node | Address | Storage root | Direct disk write/read | Client TCP receive/send |
-| --- | --- | --- | ---: | ---: |
-| A | 192.168.0.13 | `/mnt/DISK0` | 175 / 167 MB/s | 933 / 867 Mb/s |
-| B | 192.168.0.18 | `/mnt/DISK2` | 90.8 / 98.0 MB/s | 934 / 868 Mb/s |
-| C | 192.168.0.20 | rotational system disk | 135 / 130 MB/s | 933 / 897 Mb/s |
-| D | 192.168.0.22 | `/mnt/disk-00` | 122 / 122 MB/s | 932 / 868 Mb/s |
+| Node | Storage class | Direct disk write/read | Client TCP receive/send |
+| --- | --- | ---: | ---: |
+| A | Rotational test root A | 175 / 167 MB/s | 933 / 867 Mb/s |
+| B | Rotational test root B | 90.8 / 98.0 MB/s | 934 / 868 Mb/s |
+| C | Rotational system disk | 135 / 130 MB/s | 933 / 897 Mb/s |
+| D | Rotational test root D | 122 / 122 MB/s | 932 / 868 Mb/s |
 
 Disk baselines used 1 GiB direct I/O. TCP values are independent `iperf3`
 measurements in both directions. The client-side raw link ceiling was about
@@ -568,9 +644,9 @@ build keeps granular progress for small objects and uses an indeterminate
 high-speed state plus completed average throughput for large objects. Failed
 large parts remain resumable at the durable part boundary.
 
-The complete evidence is under
-`/home/wlzambo/DEV-TEST/n2-4node-3p1-20260630-135358`. It contains raw network
-and disk baselines, machine-readable benchmark summaries, namespace latency,
+The raw evidence bundle `n2-4node-3p1-20260630-135358` is retained privately
+outside the repository. It contains network and disk baselines,
+machine-readable benchmark summaries, namespace latency,
 destructive shard repair, chaos records, service rollout hashes, and browser
 screenshots. The test deployment uses a self-signed/expired lab certificate and
 disabled upstream certificate validation; production deployment requires a
@@ -622,18 +698,18 @@ correct, but this is a known performance gap and is not presented as line-rate.
 
 ## Five-Node Topology
 
-| Node | Address | CPU | Storage baseline | Link |
-| --- | --- | --- | ---: | ---: |
-| A | 192.168.0.13 | Intel Core i5-10300H | 106 MB/s write | 1,000 Mb/s full duplex |
-| B | 192.168.0.18 | Intel Core i5-11400 | 94.6 MB/s write | 1,000 Mb/s full duplex |
-| C | 192.168.0.20 | Intel Core i5-6400 | 64.0 MB/s write | 1,000 Mb/s full duplex |
-| D | 192.168.0.22 | Intel Core i7-1165G7 | 93.3 MB/s write | 1,000 Mb/s full duplex |
-| E / client | 192.168.0.37 | Intel Core i7-8550U | NVMe | 1,000 Mb/s full duplex |
+| Node | CPU | Storage baseline | Link |
+| --- | --- | ---: | ---: |
+| A | Intel Core i5-10300H | 106 MB/s write | 1,000 Mb/s full duplex |
+| B | Intel Core i5-11400 | 94.6 MB/s write | 1,000 Mb/s full duplex |
+| C | Intel Core i5-6400 | 64.0 MB/s write | 1,000 Mb/s full duplex |
+| D | Intel Core i7-1165G7 | 93.3 MB/s write | 1,000 Mb/s full duplex |
+| E / client | Intel Core i7-8550U | NVMe | 1,000 Mb/s full duplex |
 
-The complete machine-readable evidence is under
-`/home/wlzambo/DEV-TEST/n2-5node-gigabit-20260630-120700`, including raw
-`iperf3`, disk, process, network, upload, status, placement, and integrity
-records. Shard holders in the final summary were derived from immutable object
+The machine-readable evidence bundle `n2-5node-gigabit-20260630-120700` is
+retained privately outside the repository. It includes `iperf3`, disk,
+process, network, upload, status, placement, and integrity records. Shard
+holders in the final summary were derived from immutable object
 IDs resolved through namespace `@o_` pointers, not guessed from logical paths.
 
 ## Historical Three-Node Qualification

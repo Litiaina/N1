@@ -272,30 +272,31 @@ pub(super) fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> 
         }
 
         let candidate = PathBuf::from(trimmed);
-        if !candidate.exists() {
-            std::fs::create_dir_all(&candidate).unwrap_or_else(|e| {
-                panic!("Failed to create {} directory '{}': {}", role, trimmed, e)
-            });
-        }
-
-        let meta = std::fs::symlink_metadata(&candidate)
-            .unwrap_or_else(|e| panic!("Failed to inspect {} path '{}': {}", role, trimmed, e));
+        let meta = match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(error) => {
+                tracing::warn!(
+                    "Skipping unavailable {role} entry '{trimmed}' during degraded startup: {error}"
+                );
+                continue;
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileTypeExt;
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
-                panic!(
-                    "{} entry '{}' is a device. N2 requires mounted directory paths.",
-                    role, trimmed
+                tracing::warn!(
+                    "Skipping {role} entry '{trimmed}': N2 requires a mounted directory, not a device"
                 );
+                continue;
             }
         }
         if !meta.is_dir() {
-            panic!(
-                "{} entry '{}' is not a directory. N2 requires directory paths.",
-                role, trimmed
+            tracing::warn!(
+                "Skipping unavailable {role} entry '{trimmed}': path is not a directory"
             );
+            continue;
         }
 
         let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);

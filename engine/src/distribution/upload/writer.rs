@@ -193,7 +193,7 @@ pub(super) async fn current_write_context() -> Result<
     let pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
     })?;
-    let active = exact_pool_write_nodes(&runtime, &pool.id).await?;
+    let active = pool_write_nodes(&runtime, &pool.id).await?;
     let configured = pool.node_ids.len();
     let live_layout =
         resolve_survival_write_layout(active.len(), configured, &runtime.layout_policy)
@@ -535,7 +535,7 @@ where
         layout,
         &configured_nodes,
     )?;
-    let reachable = exact_pool_write_nodes(&runtime, pool_id)
+    let reachable = pool_write_nodes(&runtime, pool_id)
         .await?
         .into_iter()
         .map(|node| node.id)

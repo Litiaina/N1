@@ -177,8 +177,22 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
         .and_then(|s| s.get("storage_roots"))
         .ok_or_else(|| "Missing storage_roots in [disk_config]".to_string())?;
     let storage_roots = parse_storage_roots(storage_roots).map_err(|error| error.to_string())?;
+    let mut available_roots = 0usize;
+    let mut unavailable = Vec::new();
     for root in storage_roots {
-        ensure_existing_writable_dir(Path::new(&root.path), "N2 storage_roots entry")?;
+        match ensure_existing_writable_dir(Path::new(&root.path), "N2 storage_roots entry") {
+            Ok(()) => available_roots = available_roots.saturating_add(1),
+            Err(error) => unavailable.push(format!("{}: {error}", root.id)),
+        }
+    }
+    if available_roots == 0 {
+        return Err(format!(
+            "no configured N2 storage root is available; {}",
+            unavailable.join("; ")
+        ));
+    }
+    for issue in unavailable {
+        tracing::warn!("N2 will start degraded with an unavailable storage root: {issue}");
     }
 
     Ok(())

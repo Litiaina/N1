@@ -11,7 +11,10 @@ pub async fn namespace_mutation_target_kind(
     match kind {
         NamespaceMutationKind::Rename | NamespaceMutationKind::Trash => {
             let requested = validate_logical_key(requested)?;
-            if find_live(fragment, &requested).await?.is_some() {
+            if find_live_for_survival_write(fragment, &requested)
+                .await?
+                .is_some()
+            {
                 return Ok(NamespaceEntryKind::File);
             }
             let prefix = format!("{requested}/");

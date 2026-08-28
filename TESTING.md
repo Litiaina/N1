@@ -30,7 +30,7 @@ The N2 3.4.1 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test --workspace --lib --bins --tests`: N2 192/192, gateway 27/27,
+- `cargo test --workspace --lib --bins --tests`: N2 196/196, gateway 27/27,
   native client 2/2, and shell 18/18 passed;
 - SIMD erasure core: 107 passed with 6 intentionally ignored; integration:
   5 passed with 2 intentionally ignored;
@@ -66,9 +66,7 @@ authority gate below. Its focused invariants included:
 
 The updated physical root-failure proof completed successfully:
 
-```text
-/home/administrator/DEV-TEST/n2-survival-minimum-20260731-005855/minimum
-```
+Private evidence bundle: `n2-survival-minimum-20260731-005855`.
 
 It proved HTTP 201 plus byte-exact GET while one `1 + 1` root was inaccessible,
 HTTP 201 plus byte-exact GET while that root was at the ENOSPC boundary,
@@ -86,9 +84,7 @@ lines. N1 remained active throughout; all N2 storage paths were isolated below
 The final bounded closure run completed on 2026-08-01 with result `PASS`.
 Evidence copied off the server is retained at:
 
-```text
-/home/litiaina/DEV-TEST/n2-debian-resume-20260801-171816/server-full-closure/results
-```
+Private evidence bundle: `n2-debian-resume-20260801-171816`.
 
 The run used the exact optimized binary with SHA-256
 `6139c2b51e566a4ea9bb5f02068b7044abccd252ee60b685a41bbfa7d46b0396`
@@ -129,11 +125,8 @@ restored and every final proof run must complete before a release result can be
 The full release soak completed on 2026-08-09 with result `PASS`. The retained
 evidence copied off the production server is stored at:
 
-```text
-/home/litiaina/DEV_TEST/n2-production-deploy-20260810-030409/soak-status.json
-/home/litiaina/DEV_TEST/n2-production-deploy-20260810-030409/soak-summary.json
-/home/litiaina/DEV_TEST/n2-production-deploy-20260810-030409/soak-metrics-summary.json
-```
+Private evidence bundle: `n2-production-deploy-20260810-030409`, including its
+status, summary, and metrics summary records.
 
 The run used four logical N2 nodes, four isolated real HDD roots, one static
 `2 + 2` server pool, and NCNX replication `R = 3` on one physical host. It ran
@@ -167,9 +160,7 @@ network-partition testing remain separate production gates.
 The same finite proof was extended on 2026-08-10 for the NOA standard batch
 contract and is retained at:
 
-```text
-/home/litiaina/DEV_TEST/n2-upload-modes-20260810-020903
-```
+Private evidence bundle: `n2-upload-modes-20260810-020903`.
 
 On a real two-process `1 + 1` pool, 64 independent 8 KiB objects committed in
 one request in 0.603790 seconds (105.997 objects/s). All 64 downloaded
@@ -182,9 +173,7 @@ zero.
 The finite two-process `1 + 1` upload proof completed on 2026-08-08 and is
 retained at:
 
-```text
-/home/litiaina/DEV_TEST/n2-upload-modes-20260808-233108
-```
+Private evidence bundle: `n2-upload-modes-20260808-233108`.
 
 It used the optimized release binary, one local storage root per N2 process,
 eight 16 MiB parts per 128 MiB object, and four concurrent client workers. It
@@ -219,9 +208,7 @@ independent-device, multi-host, or maximum-throughput claim.
 The independent 24-hour four-node `2 + 2` survival soak started on
 2026-07-31 and is retained at:
 
-```text
-/home/administrator/DEV-TEST/n2-3.4.0-survival-soak-20260731-011941
-```
+Private evidence bundle: `n2-3.4.0-survival-soak-20260731-011941`.
 
 It ran the exact optimized 3.4.0 server and native-shell binaries over four
 isolated HDD roots. Its workload covers one-shot and multipart upload,
@@ -241,9 +228,7 @@ publication path.
 
 Passing evidence:
 
-```text
-/home/administrator/DEV-TEST/n2-3.3.1-full-roots-24h-20260730-215615/minimum
-```
+Private evidence bundle: `n2-3.3.1-full-roots-24h-20260730-215615`.
 
 | Fault or recovery | Required and observed result |
 | --- | --- |
@@ -276,22 +261,16 @@ loss and healing, one-node and parity-count availability boundaries, and
 rolling restart. The result was `PASS` with zero availability failures, zero
 suspicious log lines, and no safety read-only marker:
 
-```text
-/home/administrator/DEV-TEST/n2-3.3-restart-healing-proof2-20260729-090038
-```
+Private evidence bundle: `n2-3.3-restart-healing-proof2-20260729-090038`.
 
 The format-v5 installer dry-run passed node-only, gateway-only, and combined
 installation:
 
-```text
-/home/wlzambo/DEV-TEST/N2-3.3-installer-proof-20260727-045424
-```
+Private evidence bundle: `N2-3.3-installer-proof-20260727-045424`.
 
 ## N2 3.3 Finite Release Proof
 
-```text
-/home/wlzambo/DEV-TEST/N2-3.3-final-proof/N2-3.0-proof-20260727-044408
-```
+Private evidence bundle: `N2-3.3-final-proof-20260727-044408`.
 
 The retained proof-script filename identifies the flat-NCNX proof family. This
 run used the optimized N2 `3.3.0` binary, format-v5 membership, four logical
@@ -355,9 +334,7 @@ either remote proof disk.
 
 Authoritative evidence directory:
 
-```text
-/home/wlzambo/DEV-TEST/N2-3.0-proof-20260727-013543
-```
+Private evidence bundle: `N2-3.0-proof-20260727-013543`.
 
 The retained proof-script filename predates N2 3.2. This run used the
 optimized `3.2.0` binary, format-v4 membership, two logical nodes on each of
@@ -406,9 +383,7 @@ Documentation-only changes do not alter these engine results.
 
 Authoritative evidence directory:
 
-```text
-/home/wlzambo/DEV-TEST/N2-3.0-proof-20260722-041213
-```
+Private evidence bundle: `N2-3.0-proof-20260722-041213`.
 
 The retained format-v3 proof harness predates the 3.1 package label, but this
 run used the N2 `3.1.0` release binary and its `summary.json` result is `PASS`.
@@ -430,9 +405,7 @@ run used the N2 `3.1.0` release binary and its `summary.json` result is `PASS`.
 
 Authoritative evidence directory:
 
-```text
-/home/wlzambo/DEV-TEST/N2-3.0-proof-20260718-220508
-```
+Private evidence bundle: `N2-3.0-proof-20260718-220508`.
 
 Its `summary.json` result is `PASS`.
 
@@ -508,9 +481,7 @@ Code and release tests exercise these flat-namespace laws:
 
 Local loopback evidence is retained at:
 
-```text
-/home/litiaina/DEV_TEST/n2-namespace-operations-final-20260811-150320/report
-```
+Private evidence bundle: `n2-namespace-operations-final-20260811-150320`.
 
 The proof ran two active processes as one exact EC `1 + 1` server pool plus
 one reserve process. Exact-key rename remained synchronous (`200`, one NCNX
@@ -526,9 +497,7 @@ lines.
 
 Local evidence copied from the isolated four-HDD host proof is retained at:
 
-```text
-/home/litiaina/DEV_TEST/n2-prefix-rename-optimization-20260812/remote-evidence
-```
+Private evidence bundle: `n2-prefix-rename-optimization-20260812`.
 
 The optimized N2 3.4.1 release binary passed four complete 245-object
 forward/reverse rename cycles on a four-node EC `3 + 1` pool. Exact final
@@ -554,9 +523,7 @@ The first requested 12-hour soak did not pass. It failed after 1,287 seconds
 at cycle 122 and exposed a real race between autonomous healing and TTL GC.
 That failure is preserved at:
 
-```text
-/home/wlzambo/DEV-TEST/N2-3.0-soak-20260719-024217/failure.json
-```
+Private failure artifact: `N2-3.0-soak-20260719-024217/failure.json`.
 
 The defect was a time-of-check/time-of-use window: healing could act on an
 NCNX/trash scan entry after concurrent lifecycle work had already changed or
@@ -573,8 +540,8 @@ Post-fix targeted engine tests passed 117/117.
 
 | Run | Evidence | Cycles | Chaos phases | Availability failures | Suspicious events | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Lifecycle regression | `/home/wlzambo/DEV-TEST/N2-3.0-soak-lifecycle-regression-20260719-1159` | 65 | 0 | 0 | 0 | PASS |
-| Six-phase chaos regression | `/home/wlzambo/DEV-TEST/N2-3.0-soak-chaos-regression-20260719-1203` | 65 | 6 | 0 | 0 | PASS |
+| Lifecycle regression | `N2-3.0-soak-lifecycle-regression-20260719-1159` | 65 | 0 | 0 | 0 | PASS |
+| Six-phase chaos regression | `N2-3.0-soak-chaos-regression-20260719-1203` | 65 | 6 | 0 | 0 | PASS |
 
 The lifecycle regression ran for 168 seconds. The chaos regression ran for
 180 seconds and ended healthy with `safety_read_only=false`.
@@ -603,7 +570,7 @@ real HTTP two-agent prepare/commit that leaves byte-identical membership on
 both agents while every engine and gateway remains stopped. Run it with:
 
 ```bash
-N2_TEST_ROOT=/home/litiaina/DEV_TEST/n2-shell-tests cargo test -p n2_shell
+N2_TEST_ROOT=<private-test-root>/n2-shell-tests cargo test -p n2_shell
 ```
 
 Run the finite multi-node proof with isolated roots:
@@ -642,9 +609,7 @@ sides.
 
 The independent two-host `1 + 1` run retained at:
 
-```text
-/home/litiaina/dev-test/n2-two-host-1p1-20260823-030752
-```
+Private evidence bundle: `n2-two-host-1p1-20260823-030752`.
 
 proved byte-exact one-shot, batch, standard and durable multipart, pagination,
 prefix rename/trash/recovery, all configured disk-root participation, NCNX and
@@ -667,12 +632,10 @@ on timeout ordering and did not cover fast failure or asymmetric links.
 The targeted authority patch and real two-host validation on 2026-08-24 is
 retained at:
 
-```text
-/home/litiaina/dev-test/n2-partition-authority-20260824
-```
+Private evidence bundle: `n2-partition-authority-20260824`.
 
 It used one physical node on the Debian development host with two enrolled
-roots and one physical node on `192.168.0.12` with four isolated HDD roots,
+roots and a second physical host with four isolated HDD roots,
 EC `1 + 1`, NCNX replication two, and the optimized N2 binary. Production N1
 on the server remained active and its roots were not modified.
 
@@ -695,7 +658,7 @@ Results:
 - a native-only bidirectional partition retained exact NCNX authority: both
   independent survivor writes returned HTTP 201, health truthfully reported
   `degraded`, `write_authority_proven=true`,
-  `effective_client_writable=true`, and
+  `effective_client_writable=true` under the then-current health contract, and
   `data_plane_fully_protected=false`, and both objects read back byte-exact
   after reconnection;
 - 64 concurrent healthy uploads returned 64 HTTP 201 responses, and file
@@ -709,6 +672,62 @@ native-only survivor, asymmetric-link, stopped-process, reconnection, and
 exact same-key authority cases. It does not yet claim silent-DROP timing,
 crash-at-every-NCNX-stage, wider EC layouts, or independent-witness
 availability.
+
+### Three-host `2 + 1` authority and degraded-root correction
+
+The follow-up physical proof on 2026-08-26 used one exact `2 + 1` pool over
+three independent hosts. One slot had one isolated root, one slot had one
+isolated root, and one slot had four isolated roots. Existing production
+services remained active and no production storage root was enrolled or
+modified.
+
+Private evidence bundle: `n2-survivor-root-retest-20260826-continued`.
+
+The first overlapping-view experiment is deliberately retained as failed
+evidence. A provisional rule requiring only `K` plus a pool majority allowed
+views `A+B` and `B+C` to acknowledge different bytes for the same key when
+that key's exact NCNX layout was `A+C`. Reconnection exposed two valid,
+divergent NCNX records. This disproved reachability-majority as a sufficient
+standalone namespace rule before release.
+
+The corrected rule retains `A = max(K, strict pool majority)` and additionally
+requires every exact NCNX replica for the affected key inside the authorized
+component. Repeating the same synchronized overlapping-view test produced:
+
+- HTTP 503 from both conflicting coordinators;
+- HTTP 404 for the rejected key after reconnection;
+- no live NCNX publication and no arbitrary HEAD selection;
+- with one node stopped rather than ambiguously partitioned, HTTP 201 only for
+  a key whose complete exact two-replica NCNX layout survived, and HTTP 503
+  for a key whose layout included the missing node;
+- byte-exact readback of the admitted degraded object;
+- a three-item prefix rename, trash, and recovery completing 3/3 while the
+  exact per-key authority condition remained satisfied;
+- degraded startup of the four-root node with one configured root replaced by
+  a blocker file, no recreation of the missing mount path, successful write
+  through its remaining roots, and healthy restart after restoration.
+
+The same proof exposed a separate maintenance defect: the fragment repair job
+held one background-repair scheduler permit for its entire run, then each
+object attempted to acquire another. On a one-root node, all affected objects
+were skipped as scheduler-saturated while the job incorrectly reported
+`Completed`, zero repaired, and zero failed. The job-wide permit was removed,
+per-object repair now waits for scheduler admission, and batch execution
+errors increment the failure count instead of disappearing.
+
+A fresh isolated three-process `2 + 1` reproduction using the corrected
+optimized binary then proved the repair closure:
+
+| Repair invariant | Result |
+| --- | --- |
+| State before repair | `degraded`, 2/3 healthy, 1 missing, repairable |
+| Repair result | `Completed`, 1 repaired, 0 failed |
+| State after repair | `healthy`, 3/3 healthy, 0 missing |
+| Reads through all three nodes | SHA-256 and byte exact |
+
+This is a bounded architectural pass for the corrected `2 + 1` cases. It does
+not close the wider-topology, mid-publication crash, silent-DROP timing, or
+independent power/controller gates listed below.
 
 ### Conflict that must be prevented
 
@@ -733,13 +752,13 @@ on simulated or physical `2 + 1`, `3 + 1`, `3 + 2`, `2 + 2`, and a wider
 
 | EC layout | Authority condition to prove |
 | --- | --- |
-| `1 + 1` without witness | No automatic side selection; fail closed while authority is ambiguous |
-| `1 + 1` with independent witness/reserve | Exactly one one-node component may receive authority |
-| `2 + 1` | Only a component with at least two exclusive voters may mutate |
-| `3 + 1` | Only a component with at least three exclusive voters may mutate |
-| `3 + 2` | Only a component with at least three exclusive voters may mutate |
-| `2 + 2` | Two-node halves need an independent witness or must fail closed |
-| wider `K > M` | Publication still requires K writable EC holders and one exclusive authority component |
+| `1 + 1` without witness | `A=2`; no one-node component may mutate |
+| `1 + 1` with independent witness/reserve | Exactly one fenced one-node component may receive authority after a binding/authority transition |
+| `2 + 1` | `A=2`, plus all exact `R=2` NCNX holders for the key |
+| `3 + 1` | `A=3`, plus all exact `R=2` NCNX holders for the key |
+| `3 + 2` | `A=3`, plus all exact `R=3` NCNX holders for the key |
+| `2 + 2` | `A=3`; two-node halves fail closed, plus all exact `R=3` NCNX holders |
+| wider `K > M` | `A=max(K, strict majority)`, plus all exact `R=M+1` NCNX holders |
 
 ### Required fault matrix
 
@@ -799,14 +818,15 @@ A partition test passes only when all of the following hold:
 
 ### Implemented policy and future availability extensions
 
-The current implementation uses an **explicit fail-closed partition policy**.
-Before mutating an existing NCNX, the coordinator concurrently proves its
-complete exact recorded pool reachable; a pool sealed against new object
-placement remains valid for this operation. New uploads instead prove the
-complete newest writable pool. Upload publication requires every exact NCNX
-replica. `K` remains data-reconstruction truth and never becomes authority
-merely because a peer timed out. Health reports new-write authority separately
-through `write_authority_proven`.
+The current implementation uses a **strict-majority plus exact-key policy**.
+Before mutation, the coordinator proves
+`A = max(K, floor((K+M)/2)+1)` bound pool nodes reachable. An existing NCNX
+uses its recorded historical pool; a new upload uses the newest writable pool.
+The mutation then requires every exact `R=M+1` NCNX holder for that key inside
+the authorized component. `K` remains data-reconstruction truth and cannot
+become namespace authority merely because a peer timed out. Health reports
+pool-level authority separately through `write_authority_proven` and remains
+conservative when it cannot guarantee every possible key's exact NCNX set.
 
 Authority probes use peer HTTP because NCNX is the mutation boundary. Native
 shard reachability remains a separate data-plane observation: after authority
@@ -816,15 +836,10 @@ independently as well as together.
 
 Possible future availability extensions remain release-gated:
 
-1. **Fragment-scoped survivor authority.** Extend the epoch-bound lease/fencing
-   concept already used by autonomous healing. Acquire it only on degradation,
-   permit concurrent work under the authorized fragment/component, and require
-   it on every degraded NCNX mutation. Healthy writes must gain no lock or
-   authority round trip.
-2. **Independent witness through a compatible reserve or dedicated control
+1. **Independent witness through a compatible reserve or dedicated control
    instance.** Use it only to break a balanced `K=M` tie. The witness stores no
    object shard and must not become a gateway-owned hidden database.
-3. **Operator-confirmed physical fencing.** Permit a survivor after an operator
+2. **Operator-confirmed physical fencing.** Permit a survivor after an operator
    or hardware controller proves the other instance cannot publish. This is a
    valid low-end fallback when no independent witness exists.
 

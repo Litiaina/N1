@@ -54,10 +54,12 @@ cluster-wide mutation log, or implicit redistribution.
     decode NCNX or open NCDX.
 12. Adding a pool adds capacity for future objects. Existing objects are not
     redistributed unless an operator explicitly requests re-encoding.
-13. A new object is acknowledged only after the coordinator proves the exact
-    writable pool reachable, at least `K` exact EC pieces and `K` immutable
-    NCDX copies are durable, and all `M + 1` NCNX replicas publish. N2 records
-    the complete configured `K + M` shard/NCDX and `M + 1` NCNX repair layout.
+13. A new object is acknowledged only after the coordinator reaches
+    `A = max(K, floor((K + M) / 2) + 1)` bound pool nodes, at least `K` exact
+    EC pieces and `K` immutable NCDX copies are durable, and all `M + 1` exact
+    NCNX replicas for that key publish inside that authorized component. N2
+    records the complete configured `K + M` shard/NCDX and `M + 1` NCNX repair
+    layout even when a recoverable piece is temporarily absent.
 14. SHA-256 is the only N2 integrity checksum for NCNX, object NCDX, upload
     bodies, immutable shards, and verified shard blocks.
 15. Placement is calculated from the immutable node membership of the selected
@@ -419,7 +421,8 @@ requests without adding cluster state.
 
 ```text
 calculate the complete fixed K + M layout
--> prove that the coordinator reaches every exact pool binding over the NCNX control plane
+-> prove pool authority A=max(K, strict pool majority) over the NCNX control plane
+-> require every exact R=M+1 NCNX holder for this key inside that authority component
 -> attempt every exact shard/parity holder in parallel
 -> require at least K successfully written EC pieces
 -> for standard multipart, each participating node syncs its exact shards
@@ -433,12 +436,15 @@ The NCDX retains descriptors and SHA-256 checksums for all `K + M` exact
 pieces, including an unavailable target, so healing has one deterministic
 destination rather than inventing a replacement layout. `R=M+1` guarantees
 that every possible `K`-node survivor set intersects the NCNX replica set.
-The current authority rule is stricter than reconstructability: a client
-mutation fails closed unless the complete bound writable pool is reachable,
-and upload publication requires all exact NCNX replicas. If NCNX publication
-cannot complete, the immutable object is not acknowledged as live. N2 reports
-headless immutable data and preserves it; automatic GC never guesses that
-missing namespace authority makes an object disposable.
+The authority rule is stricter than reconstructability but does not require a
+healthy full-width pool. A coordinator must reach both `K` and a strict pool
+majority, and the complete deterministic NCNX layout for the affected key
+must be inside that component. This permits key-scoped degraded writes without
+allowing two disjoint components to acknowledge competing namespace truth.
+If exact NCNX publication cannot complete, the immutable object is not
+acknowledged as live. N2 reports headless immutable data and preserves it;
+automatic GC never guesses that missing namespace authority makes an object
+disposable.
 
 ### Copy/move one key
 
@@ -578,16 +584,19 @@ A pool is:
 
 - fully protected when all `K + M` exact holders accept the new object;
 - degraded and read-capable when at least `K` exact pieces remain
-  reconstructable but complete mutation authority is unavailable;
-- write-capable only while the complete exact writable pool is reachable;
+  reconstructable;
+- conditionally write-capable when the coordinator reaches
+  `A = max(K, strict pool majority)` and every exact NCNX holder for the
+  affected key, even if as many as `M` shard/NCDX holders are absent;
 - critical for an object read below its recorded `K` boundary.
 
-`K` is the object EC reconstruction threshold, not a consensus quorum and not
-an adaptive EC layout. It does not grant mutation authority. Missing pieces
-and NCNX replicas remain exact object-local repair work. An unrepairable
-object or namespace record emits a precise local report but does not stop
-unrelated reconstructable reads. Cluster-wide read-only protection is
-reserved for systemic control-authority failures such as membership or
+`K` is the object EC reconstruction threshold, not a standalone consensus
+quorum and not an adaptive EC layout. Pool authority additionally requires a
+strict majority; the key's immutable NCNX layout additionally requires every
+exact replica. Missing pieces remain exact object-local repair work. An
+unrepairable object or namespace record emits a precise local report but does
+not stop unrelated reconstructable reads. Cluster-wide read-only protection
+is reserved for systemic control-authority failures such as membership or
 binding identity disagreement.
 
 Reads continue for objects whose recorded layouts remain decodable.
@@ -608,34 +617,35 @@ logical key at different objects.
 The enforced safety law is therefore:
 
 ```text
-transport reachability never creates mutation authority
+pool authority = max(K, strict majority)
+key authority  = pool authority + every exact NCNX holder for that key
 ```
 
 Connection refusal, timeout, packet loss, and a missing health response are
 observations only; none is independently a fence. A route-only gateway is not
-storage authority and cannot make an isolated node safe merely by selecting it
-for a request. N2 therefore admits a client mutation only after one concurrent
-probe proves the complete exact owning pool reachable from that coordinator.
-New object placement requires the newest writable pool; mutation of an
-existing NCNX uses that record's exact historical pool, including a pool
-sealed only against new object placement. Upload commit then requires every
-deterministic `M + 1` NCNX replica. A missing binding leaves reads available
-whenever `K` recorded pieces survive, but writes fail closed until the binding
-returns or reserve promotion commits a new binding epoch.
+storage authority and cannot make an isolated node safe merely by selecting
+it for a request. New object placement uses the newest writable pool;
+mutation of an existing NCNX uses that record's exact historical pool,
+including a pool sealed only against new placement. The coordinator first
+proves `A = max(K, floor(N/2)+1)` reachable bound nodes, then requires every
+deterministic `M + 1` NCNX replica for the key to commit. A component below
+`A`, or one missing even one exact NCNX holder for the key, fails closed.
 
-Authority and data availability are deliberately separate. The exact peer
-HTTP/NCNX control plane must be reachable so disconnected components cannot
-publish competing names. The native shard plane may lose up to `M` exact
-holders: an object may still commit at `K`, records the unavailable roles in
-its immutable NCDX, and heals those roles when their bindings return. Busy or
-failed shard transport therefore cannot manufacture authority and cannot
-unnecessarily serialize the lightweight namespace plane.
+Authority and data availability are deliberately separate. Pool authority is
+evaluated on peer HTTP/NCNX reachability; namespace truth still requires the
+key's complete exact NCNX set. The native shard plane may lose up to `M` exact
+holders: an admitted object may commit at `K`, record unavailable roles in its
+immutable NCDX, and heal those roles when their bindings return. Busy or
+failed shard transport therefore cannot manufacture namespace authority and
+does not force a healthy-path object lock or namespace database.
 
-For a configured pool `N = K + M`, `K` still defines object reconstruction,
-not permission to mutate. This intentionally separates data survival from
-write authority. A future availability extension may use an epoch-bound
-witness or physical fence, but it must remain restart proof, reject stale
-instances, and add no healthy-path object lock or namespace database.
+For a configured pool `N = K + M`, `K` defines object reconstruction and the
+strict majority prevents disjoint mutation owners. Exact NCNX publication
+closes the remaining overlapping-view case: two asymmetric majority views
+cannot both acknowledge the same key unless both can reach that one fixed
+replica set. A `1 + 1` pool has no one-node write authority without an
+independent witness, reserve promotion, or physical fence; it remains readable
+at `K=1` when its object can be decoded.
 
 ### Reserve replacement healing
 
@@ -703,7 +713,7 @@ Required namespace properties:
 ```text
 GET key       = bounded NCNX replica reads + bounded NCDX holder read
 PUT attempt   = K+M object/NCDX holders + M+1 NCNX holders
-PUT acknowledge = exact pool authority + at least K EC pieces + K NCDX copies + all M+1 NCNX copies
+PUT acknowledge = max(K, pool majority) authority + at least K EC pieces + K NCDX copies + all exact M+1 NCNX copies
 DELETE key    = M+1 NCNX holders, zero object data IO
 RENAME key    = source and destination NCNX holders, zero object data IO
 LIST page     = bounded replica filename merge, zero NCNX/NCDX/shard decode
@@ -728,6 +738,8 @@ N2 3.4 is not declared production-stable until the following are proven:
   exact-layout healing, and restart continuation;
 - fail-closed writes beyond the configured failure budget;
 - NCNX and object autonomous repair;
+- repair jobs that never skip scheduler-denied objects while reporting a
+  clean completion;
 - TTL live-wins-over-trash and orphan safety;
 - explicit object redistribution without changing untouched layouts;
 - append-only server-pool expansion;

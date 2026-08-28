@@ -1,6 +1,6 @@
 use crate::distribution::membership::{
-    ClusterNode, ClusterRuntime, ServerPool, active_cluster_runtime, exact_pool_mutation_nodes,
-    exact_pool_write_nodes,
+    ClusterNode, ClusterRuntime, ServerPool, active_cluster_runtime, pool_mutation_authority_nodes,
+    pool_write_authority_nodes,
 };
 use crate::distribution::peer::{authorize_peer, cluster_secret, peer_http_client};
 use crate::distribution::root_routing::{ordered_local_roots, writable_local_roots};

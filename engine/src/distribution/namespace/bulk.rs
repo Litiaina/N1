@@ -29,7 +29,10 @@ pub(super) async fn bulk_trash_exact(
                             )
                         })?;
                     let key = validate_logical_key(&key)?;
-                    Ok::<_, AppError>((key.clone(), find_live(&fragment, &key).await?))
+                    Ok::<_, AppError>((
+                        key.clone(),
+                        find_live_for_survival_write(&fragment, &key).await?,
+                    ))
                 }
                 .await;
                 (index, key, result)
@@ -245,7 +248,7 @@ pub(super) async fn bulk_recover_exact(
                             )
                         })?;
                     let located = read_canonical_record(&fragment, &name).await?;
-                    let live = find_live(&fragment, &name.logical_key).await?;
+                    let live = find_live_for_survival_write(&fragment, &name.logical_key).await?;
                     Ok::<_, AppError>((name, located, live))
                 }
                 .await;

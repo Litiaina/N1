@@ -85,16 +85,35 @@ fn runtime_for_authority_test() -> ClusterRuntime {
 }
 
 #[test]
-fn exact_write_authority_requires_every_bound_pool_slot() {
+fn survivor_write_authority_requires_k_and_a_strict_pool_majority() {
     let runtime = runtime_for_authority_test();
     let full = runtime.membership.nodes_for_pool("pool-a");
-    validate_exact_pool_write_authority(&runtime, "pool-a", &full)
+    validate_pool_write_authority(&runtime, "pool-a", &full)
         .expect("complete exact pool has write authority");
 
-    let error = validate_exact_pool_write_authority(&runtime, "pool-a", &full[..2])
-        .expect_err("K reachable nodes cannot establish exclusive authority");
-    assert!(error.to_string().contains("K=2 proves reconstructability"));
-    assert!(error.to_string().contains("missing: c"));
+    validate_pool_write_authority(&runtime, "pool-a", &full[..2])
+        .expect("two of three slots satisfy K=2 and strict majority");
+
+    let error = validate_pool_write_authority(&runtime, "pool-a", &full[..1])
+        .expect_err("one of three slots has neither K nor majority authority");
+    assert!(error.to_string().contains("strict-majority=2"));
+    assert!(error.to_string().contains("missing: b, c"));
+}
+
+#[test]
+fn tied_k_plus_m_layout_requires_one_more_than_k_for_authority() {
+    let mut runtime = runtime_for_authority_test();
+    runtime.membership.nodes.push(node("d"));
+    runtime.membership.pools[0].node_ids.push("d".into());
+    runtime.membership.pools[0].policy.object_parity_shards = 2;
+    runtime.layout_policy.parity_shards = 2;
+    let full = runtime.membership.nodes_for_pool("pool-a");
+
+    let error = validate_pool_write_authority(&runtime, "pool-a", &full[..2])
+        .expect_err("K=2 is a split tie in a four-slot pool");
+    assert!(error.to_string().contains("strict-majority=3"));
+    validate_pool_write_authority(&runtime, "pool-a", &full[..3])
+        .expect("three of four slots form the only writable component");
 }
 
 #[test]
@@ -102,7 +121,7 @@ fn configured_offline_state_is_not_a_shortcut_to_write_authority() {
     let mut runtime = runtime_for_authority_test();
     runtime.membership.nodes[2].state = Some(NodeState::Offline);
     let reachable = runtime.membership.nodes[..2].to_vec();
-    let error = validate_exact_pool_write_authority(&runtime, "pool-a", &reachable)
+    let error = validate_pool_write_authority(&runtime, "pool-a", &reachable)
         .expect_err("state change without binding fence must fail closed");
     assert!(
         error
@@ -117,9 +136,9 @@ fn sealed_pool_retains_exact_namespace_mutation_authority_only() {
     runtime.membership.pools[0].state = PoolState::Sealed;
     let full = runtime.membership.nodes_for_pool("pool-a");
 
-    validate_exact_pool_mutation_authority(&runtime, "pool-a", &full)
+    validate_pool_mutation_authority(&runtime, "pool-a", &full)
         .expect("sealed historical pool remains namespace-mutable");
-    let error = validate_exact_pool_write_authority(&runtime, "pool-a", &full)
+    let error = validate_pool_write_authority(&runtime, "pool-a", &full)
         .expect_err("sealed pool cannot accept a new object placement");
     assert!(error.to_string().contains("sealed"));
 }

@@ -406,7 +406,7 @@ scripts/proof/run_n2_installer_proof.sh
 The current qualified evidence and exact limitations are in
 [TESTING.md](TESTING.md). Performance numbers and methodology are kept
 separately in [BENCHMARK.md](BENCHMARK.md). Evidence output belongs outside
-the repository under `/home/wlzambo/DEV-TEST`.
+the repository under an operator-selected private test root.
 
 ## Operational Boundaries
 

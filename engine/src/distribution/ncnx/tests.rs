@@ -247,3 +247,66 @@ fn replica_listing_tolerates_only_the_configured_namespace_failure_budget() {
         .collect();
     assert!(merge_node_pages(pages, 100, true).is_err());
 }
+
+#[tokio::test]
+async fn one_failed_local_disk_does_not_turn_the_node_into_a_failed_ncnx_replica() {
+    let base = std::env::temp_dir().join(format!("n2-ncnx-local-disk-loss-{}", Ulid::new()));
+    let failed = base.join("failed-root");
+    let healthy = base.join("healthy-root");
+    std::fs::create_dir_all(&base).expect("create test base");
+    std::fs::write(&failed, b"not a directory").expect("create unusable root");
+    std::fs::create_dir_all(&healthy).expect("create healthy root");
+
+    let roots = vec![
+        StorageRoot {
+            id: "r0-failed".into(),
+            physical_id: None,
+            path: failed.display().to_string(),
+        },
+        StorageRoot {
+            id: "r0-healthy".into(),
+            physical_id: None,
+            path: healthy.display().to_string(),
+        },
+    ];
+    let mut runtime = runtime();
+    runtime.local_storage_roots = roots.clone();
+    runtime.membership.nodes[0].storage_roots = roots;
+    let pool = runtime.membership.pool("pool-a").unwrap();
+    let (logical_key, layout) = (0..20_000)
+        .find_map(|index| {
+            let logical_key = format!("disk-loss/key-{index}");
+            let layout = build_ncnx_layout(&runtime, pool, "fragment", &logical_key).ok()?;
+            layout
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == runtime.local_node_id)
+                .then_some((logical_key, layout))
+        })
+        .expect("find a key assigned to the local NCNX replica");
+    let replica = layout
+        .replicas
+        .iter()
+        .find(|replica| replica.node_id == runtime.local_node_id)
+        .unwrap();
+    let request = request_for_replica(
+        PeerNcnxAction::ReadLive,
+        &layout,
+        replica,
+        "fragment",
+        &logical_key,
+        None,
+        None,
+    );
+
+    let response = run_local_apply(Arc::new(runtime.clone()), request.clone())
+        .await
+        .expect("the healthy disk proves this node's NCNX absence");
+    assert!(response.bytes.is_none());
+
+    runtime.local_storage_roots[1].path = failed.display().to_string();
+    runtime.membership.nodes[0].storage_roots[1].path = failed.display().to_string();
+    assert!(run_local_apply(Arc::new(runtime), request).await.is_err());
+
+    let _ = std::fs::remove_dir_all(base);
+}

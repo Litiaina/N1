@@ -2,7 +2,7 @@ use crate::core::operation_gate::cluster_safety_read_only_state;
 use crate::distribution::layout::resolve_configured_layout;
 use crate::distribution::membership::{
     ClusterNode, ClusterRuntime, NodeState, live_active_write_nodes,
-    live_mutation_authority_nodes_for_pool, live_readable_nodes,
+    live_mutation_authority_nodes_for_pool, live_readable_nodes, required_pool_mutation_authority,
 };
 use crate::distribution::peer::{cluster_secret, peer_http_client};
 use crate::distribution::rebalance::{plan_rebalance, rebalance_status, repair_status};
@@ -215,10 +215,11 @@ fn cluster_health_snapshot_with_readiness(
         ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(readable_namespace));
     let guaranteed_writable_ncnx =
         ncnx_replicas.saturating_sub(configured_namespace_nodes.saturating_sub(writable_namespace));
-    let ncnx_survival_writable =
-        writable_namespace >= layout.data_shards && guaranteed_writable_ncnx >= 1;
+    let ncnx_survival_writable = writable_namespace >= layout.data_shards
+        && guaranteed_writable_ncnx == ncnx_replicas_required;
     let ncnx_strictly_writable = writable_namespace == configured_namespace_nodes;
-    let write_authority_proven = writable_namespace == configured_namespace_nodes
+    let mutation_authority_required = required_pool_mutation_authority(write_pool);
+    let write_authority_proven = writable_namespace >= mutation_authority_required
         && runtime
             .membership
             .nodes_for_pool(&write_pool.id)
@@ -313,17 +314,20 @@ fn cluster_health_snapshot_with_readiness(
     if missing_blob_writable > 0 {
         if data_plane_writable && write_authority_proven {
             notes.push(format!(
-                "{} configured pool node(s) are unavailable on the native shard plane; exact NCNX authority remains proven and survivor writes stay enabled at K={} while every commit retains the fixed {}+{} healing layout",
+                "{} configured pool node(s) are unavailable; pool mutation authority remains proven with {} reachable node(s), requiring max(K={}, strict-majority={})={}, while each key still requires complete publication to its exact NCNX replica set",
                 missing_blob_writable,
+                writable_namespace,
                 configured_layout.data_shards,
-                configured_layout.data_shards,
-                configured_layout.parity_shards
+                configured_namespace_nodes / 2 + 1,
+                mutation_authority_required
             ));
-        } else if data_plane_writable && ncnx_survival_writable {
+        } else if data_plane_writable {
             notes.push(format!(
-                "{} configured pool node(s) are currently unreachable; K={} remains sufficient for reconstruction, but client writes fail closed because reachability alone cannot prove exclusive mutation authority for the fixed {}+{} pool",
+                "{} configured pool node(s) are currently unreachable; K={} remains sufficient for reconstruction, but {} reachable node(s) do not satisfy strict survivor authority {} for the fixed {}+{} pool",
                 missing_blob_writable,
                 configured_layout.data_shards,
+                writable_namespace,
+                mutation_authority_required,
                 configured_layout.data_shards,
                 configured_layout.parity_shards
             ));
@@ -357,13 +361,13 @@ fn cluster_health_snapshot_with_readiness(
     }
     if !ncnx_strictly_writable {
         notes.push(format!(
-            "namespace NCNX placement is unavailable for exact publication: {} of {} server-pool nodes are writable ({} target replicas per key); client mutation cannot acknowledge until every deterministic NCNX replica is writable",
+            "namespace NCNX placement is degraded: {} of {} server-pool nodes are writable ({} target replicas per key); a mutation is acknowledged only when every exact NCNX replica for that key commits, and unavailable placements fail closed until healing or binding replacement",
             writable_namespace, configured_namespace_nodes, ncnx_replicas_required
         ));
     }
     if data_plane_writable && !data_plane_fully_protected {
         notes.push(
-            "new object writes are reconstructable but not fully parity-protected until autonomous repair restores the missing exact slots"
+            "an admitted degraded object write is reconstructable but not fully parity-protected until autonomous repair restores the missing exact slots"
                 .to_string(),
         );
     }
@@ -622,7 +626,7 @@ mod tests {
         assert_eq!(snap.parity_shards, 1);
         assert!(snap.data_plane_writable);
         assert!(!snap.data_plane_fully_protected);
-        assert!(snap.ncnx_survival_writable);
+        assert!(!snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
         assert!(!snap.write_authority_proven);
         assert!(!snap.effective_client_writable);
@@ -689,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_two_plus_one_keeps_data_reconstructable_at_k_but_fails_writes_closed() {
+    fn fixed_two_plus_one_proves_pool_authority_but_not_every_key_ncnx_layout() {
         let mut runtime = runtime(vec![
             node("blob-a", NodeState::Online),
             node("blob-b", NodeState::Online),
@@ -710,9 +714,9 @@ mod tests {
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
         assert!(!snap.data_plane_fully_protected);
-        assert!(snap.ncnx_survival_writable);
+        assert!(!snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
-        assert!(!snap.write_authority_proven);
+        assert!(snap.write_authority_proven);
         assert!(!snap.effective_client_writable);
     }
 
@@ -762,7 +766,7 @@ mod tests {
         assert!(
             snap.notes
                 .iter()
-                .any(|note| note.contains("survivor writes stay enabled"))
+                .any(|note| note.contains("pool mutation authority remains proven"))
         );
     }
 
@@ -816,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn health_reports_strict_ncnx_blocking_writes() {
+    fn one_plus_one_without_witness_fails_survivor_writes_closed() {
         let runtime = runtime(vec![
             node("blob-a", NodeState::Online),
             node("blob-b", NodeState::Online),
@@ -827,7 +831,7 @@ mod tests {
         assert!(snap.data_plane_readable);
         assert!(snap.data_plane_writable);
         assert!(!snap.data_plane_fully_protected);
-        assert!(snap.ncnx_survival_writable);
+        assert!(!snap.ncnx_survival_writable);
         assert!(!snap.ncnx_strictly_writable);
         assert!(!snap.write_authority_proven);
         assert!(!snap.effective_client_writable);
@@ -835,7 +839,7 @@ mod tests {
         assert!(
             snap.notes
                 .iter()
-                .any(|note| note.contains("exclusive mutation authority"))
+                .any(|note| note.contains("strict survivor authority"))
         );
     }
 }

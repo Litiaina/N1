@@ -174,12 +174,6 @@ pub async fn run_repair_job_with_options(
         );
     }
     let _write_gate = acquire_maintenance_mode(effective_access_mode);
-    let _io_guard = acquire_disk_io(
-        DiskIoClass::BackgroundRepair,
-        cfg.target_fragment.as_deref(),
-        "fragment repair job",
-    )
-    .await?;
     let batch_pacing = availability_pacing_delay(cfg.check_mode, opts.fast_mode);
 
     {
@@ -461,8 +455,16 @@ pub(super) async fn apply_meta_batch(
         let delta = match res {
             Ok(d) => d,
             Err(e) => {
-                warn!("Meta batch item failed (non-fatal): {}", e);
-                continue;
+                // The item was selected by the repair scan but could not be
+                // inspected or repaired. Count it. Silently dropping this
+                // error used to let a repair job report `Completed` with zero
+                // failures even though scheduler admission skipped objects.
+                warn!("Meta batch item failed: {}", e);
+                BatchDelta {
+                    scanned: 1,
+                    failed_repairs: 1,
+                    ..BatchDelta::default()
+                }
             }
         };
 

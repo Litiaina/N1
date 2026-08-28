@@ -100,7 +100,20 @@ pub(super) async fn read_from_layout(
     Ok(None)
 }
 
-async fn apply_all(
+fn authority_node_ids(authority: &[ClusterNode]) -> BTreeSet<&str> {
+    authority.iter().map(|node| node.id.as_str()).collect()
+}
+
+fn authority_is_complete(
+    runtime: &ClusterRuntime,
+    pool_id: &str,
+    authority: &[ClusterNode],
+) -> bool {
+    authority.len() == runtime.membership.nodes_for_pool(pool_id).len()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_authorized(
     runtime: &ClusterRuntime,
     layout: &NcnxLayout,
     action: PeerNcnxAction,
@@ -108,7 +121,20 @@ async fn apply_all(
     logical_key: &str,
     trash: Option<&TrashLocator>,
     bytes: &[u8],
+    authority: &[ClusterNode],
 ) -> Result<(), AppError> {
+    let authority_ids = authority_node_ids(authority);
+    let authorized_replicas = layout
+        .replicas
+        .iter()
+        .filter(|replica| authority_ids.contains(replica.node_id.as_str()))
+        .count();
+    if authorized_replicas != layout.replicas.len() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "authorized pool component reaches {authorized_replicas} of {} exact NCNX replicas for key '{logical_key}'; complete NCNX publication is required",
+            layout.replicas.len()
+        )));
+    }
     apply_at_least(
         runtime,
         layout,
@@ -118,6 +144,7 @@ async fn apply_all(
         trash,
         bytes,
         layout.replicas.len(),
+        Some(&authority_ids),
     )
     .await
 }
@@ -132,22 +159,29 @@ async fn apply_at_least(
     trash: Option<&TrashLocator>,
     bytes: &[u8],
     minimum_successes: usize,
+    allowed_nodes: Option<&BTreeSet<&str>>,
 ) -> Result<(), AppError> {
-    let calls = layout.replicas.iter().map(|replica| {
-        send_to_replica(
-            runtime,
-            replica,
-            request_for_replica(
-                action.clone(),
-                layout,
+    let calls = layout
+        .replicas
+        .iter()
+        .filter(|replica| {
+            allowed_nodes.is_none_or(|nodes| nodes.contains(replica.node_id.as_str()))
+        })
+        .map(|replica| {
+            send_to_replica(
+                runtime,
                 replica,
-                fragment_id,
-                logical_key,
-                trash.cloned(),
-                Some(bytes),
-            ),
-        )
-    });
+                request_for_replica(
+                    action.clone(),
+                    layout,
+                    replica,
+                    fragment_id,
+                    logical_key,
+                    trash.cloned(),
+                    Some(bytes),
+                ),
+            )
+        });
     let results = join_all(calls).await;
     let mut successes = 0usize;
     let mut failures = Vec::new();
@@ -235,17 +269,28 @@ pub async fn publish_new(
     let write_pool = runtime.membership.newest_writable_pool().ok_or_else(|| {
         AppError::ServiceUnavailable("cluster has no writable server pool".into())
     })?;
-    exact_pool_write_nodes(&runtime, &write_pool.id).await?;
+    let write_authority = pool_write_authority_nodes(&runtime, &write_pool.id).await?;
+    let complete_authority = authority_is_complete(&runtime, &write_pool.id, &write_authority);
 
-    if let Some(existing) = find_live(fragment_id, &logical_key).await? {
+    let existing = if complete_authority {
+        find_live(fragment_id, &logical_key).await?
+    } else {
+        find_live_for_survival_write(fragment_id, &logical_key).await?
+    };
+    if let Some(existing) = existing {
         if existing.record.object_id != record.object_id {
             return Err(AppError::Conflict(format!(
                 "logical key '{logical_key}' already points to another object"
             )));
         }
         let pool = pool_for_located(&runtime, &existing)?;
+        let authority = if pool.id == write_pool.id {
+            write_authority.clone()
+        } else {
+            pool_mutation_authority_nodes(&runtime, &pool.id).await?
+        };
         let layout = build_ncnx_layout(&runtime, pool, fragment_id, &logical_key)?;
-        apply_all(
+        apply_authorized(
             &runtime,
             &layout,
             PeerNcnxAction::CreateLive,
@@ -253,6 +298,7 @@ pub async fn publish_new(
             &logical_key,
             None,
             &existing.bytes,
+            &authority,
         )
         .await?;
         return Ok(existing);
@@ -261,7 +307,7 @@ pub async fn publish_new(
     let pool = write_pool;
     let layout = build_ncnx_layout(&runtime, pool, fragment_id, &logical_key)?;
     let bytes = record.encode()?;
-    apply_all(
+    apply_authorized(
         &runtime,
         &layout,
         PeerNcnxAction::CreateLive,
@@ -269,6 +315,7 @@ pub async fn publish_new(
         &logical_key,
         None,
         &bytes,
+        &write_authority,
     )
     .await?;
     Ok(LocatedNcnx {
@@ -326,13 +373,17 @@ pub async fn publish_new_batch(
                 .collect();
         }
     };
-    if let Err(error) = exact_pool_write_nodes(&runtime, &write_pool.id).await {
-        let message = error.to_string();
-        return items
-            .iter()
-            .map(|_| Err(AppError::ServiceUnavailable(message.clone())))
-            .collect();
-    }
+    let write_authority = match pool_write_authority_nodes(&runtime, &write_pool.id).await {
+        Ok(authority) => authority,
+        Err(error) => {
+            let message = error.to_string();
+            return items
+                .iter()
+                .map(|_| Err(AppError::ServiceUnavailable(message.clone())))
+                .collect();
+        }
+    };
+    let complete_authority = authority_is_complete(&runtime, &write_pool.id, &write_authority);
     let reads = items.iter().map(|item| async {
         if item.record.fragment_id != fragment_id {
             return Err(AppError::Conflict(
@@ -340,17 +391,25 @@ pub async fn publish_new_batch(
             ));
         }
         let logical_key = validate_logical_key(&item.logical_key)?;
-        Ok::<_, AppError>((
-            logical_key.clone(),
-            find_live(fragment_id, &logical_key).await?,
-        ))
+        let existing = if complete_authority {
+            find_live(fragment_id, &logical_key).await?
+        } else {
+            find_live_for_survival_write(fragment_id, &logical_key).await?
+        };
+        Ok::<_, AppError>((logical_key.clone(), existing))
     });
     let observations = join_all(reads).await;
     let mut prepared = (0..items.len()).map(|_| None).collect::<Vec<_>>();
     let mut terminal = (0..items.len()).map(|_| None).collect::<Vec<_>>();
     let mut successes = vec![0usize; items.len()];
+    let mut required_successes = vec![0usize; items.len()];
     let mut failures = vec![Vec::<String>::new(); items.len()];
     let mut groups = BTreeMap::<PeerNcnxBatchTarget, Vec<(usize, PeerNcnxBatchItem)>>::new();
+    let mut authority_by_pool = BTreeMap::<String, BTreeSet<String>>::new();
+    authority_by_pool.insert(
+        write_pool.id.clone(),
+        write_authority.into_iter().map(|node| node.id).collect(),
+    );
 
     for (index, observation) in observations.into_iter().enumerate() {
         let (logical_key, existing) = match observation {
@@ -410,6 +469,34 @@ pub async fn publish_new_batch(
                 continue;
             }
         };
+        if !authority_by_pool.contains_key(&pool.id) {
+            match pool_mutation_authority_nodes(&runtime, &pool.id).await {
+                Ok(authority) => {
+                    authority_by_pool.insert(
+                        pool.id.clone(),
+                        authority.into_iter().map(|node| node.id).collect(),
+                    );
+                }
+                Err(error) => {
+                    terminal[index] = Some(error);
+                    continue;
+                }
+            }
+        }
+        let authority_ids = &authority_by_pool[&pool.id];
+        let exact_replica_count = layout.replicas.len();
+        let authorized_replica_count = layout
+            .replicas
+            .iter()
+            .filter(|replica| authority_ids.contains(&replica.node_id))
+            .count();
+        if authorized_replica_count != exact_replica_count {
+            terminal[index] = Some(AppError::ServiceUnavailable(format!(
+                "authorized pool component reaches {authorized_replica_count} of {exact_replica_count} exact NCNX replicas for key '{logical_key}'; complete NCNX publication is required"
+            )));
+            continue;
+        }
+        required_successes[index] = exact_replica_count;
         for replica in layout.replicas {
             groups
                 .entry(PeerNcnxBatchTarget {
@@ -480,22 +567,18 @@ pub async fn publish_new_batch(
         if terminal[index].is_some() {
             continue;
         }
-        let Some(located) = prepared[index].as_ref() else {
+        let Some(_located) = prepared[index].as_ref() else {
             terminal[index] = Some(AppError::InternalServerError(
                 "NCNX publication batch lost its prepared record".into(),
             ));
             continue;
         };
-        let expected = runtime
-            .membership
-            .pool(&located.pool_id)
-            .map(|pool| pool.policy.namespace_replicas())
-            .unwrap_or_default();
+        let expected = required_successes[index];
         if successes[index] >= expected && expected > 0 {
             continue;
         }
         terminal[index] = Some(AppError::ServiceUnavailable(format!(
-            "NCNX publication did not reach every exact replica (reached {}, required {}): {}",
+            "NCNX publication did not reach every authorized exact replica (reached {}, required {}): {}",
             successes[index],
             expected,
             failures[index].join("; ")
@@ -565,20 +648,27 @@ async fn copy_live_to_key_bytes(
     let destination_key = validate_logical_key(destination_key)?;
     let runtime = active_cluster_runtime()?;
     let source_pool = pool_for_located(&runtime, located)?;
-    exact_pool_mutation_nodes(&runtime, &source_pool.id).await?;
-    if let Some(existing) = find_live(&located.record.fragment_id, &destination_key).await? {
+    let source_authority = pool_mutation_authority_nodes(&runtime, &source_pool.id).await?;
+    let existing = if authority_is_complete(&runtime, &source_pool.id, &source_authority) {
+        find_live(&located.record.fragment_id, &destination_key).await?
+    } else {
+        find_live_for_survival_write(&located.record.fragment_id, &destination_key).await?
+    };
+    if let Some(existing) = existing {
         if existing.record.object_id == located.record.object_id {
             let pool = pool_for_located(&runtime, &existing)?;
-            if pool.id != source_pool.id {
-                exact_pool_mutation_nodes(&runtime, &pool.id).await?;
-            }
+            let authority = if pool.id == source_pool.id {
+                source_authority.clone()
+            } else {
+                pool_mutation_authority_nodes(&runtime, &pool.id).await?
+            };
             let layout = build_ncnx_layout(
                 &runtime,
                 pool,
                 &located.record.fragment_id,
                 &destination_key,
             )?;
-            apply_all(
+            apply_authorized(
                 &runtime,
                 &layout,
                 PeerNcnxAction::CreateLive,
@@ -586,6 +676,7 @@ async fn copy_live_to_key_bytes(
                 &destination_key,
                 None,
                 &existing.bytes,
+                &authority,
             )
             .await?;
             return Ok(());
@@ -600,7 +691,7 @@ async fn copy_live_to_key_bytes(
         &located.record.fragment_id,
         &destination_key,
     )?;
-    apply_all(
+    apply_authorized(
         &runtime,
         &layout,
         PeerNcnxAction::CreateLive,
@@ -608,6 +699,7 @@ async fn copy_live_to_key_bytes(
         &destination_key,
         None,
         destination_bytes,
+        &source_authority,
     )
     .await
 }
@@ -618,14 +710,14 @@ pub async fn copy_live_to_trash(
 ) -> Result<(), AppError> {
     let runtime = active_cluster_runtime()?;
     let pool = pool_for_located(&runtime, located)?;
-    exact_pool_mutation_nodes(&runtime, &pool.id).await?;
+    let authority = pool_mutation_authority_nodes(&runtime, &pool.id).await?;
     let layout = build_ncnx_layout(
         &runtime,
         pool,
         &located.record.fragment_id,
         &located.logical_key,
     )?;
-    apply_all(
+    apply_authorized(
         &runtime,
         &layout,
         PeerNcnxAction::CreateTrash,
@@ -633,6 +725,7 @@ pub async fn copy_live_to_trash(
         &located.logical_key,
         Some(locator),
         &located.bytes,
+        &authority,
     )
     .await
 }
@@ -640,14 +733,14 @@ pub async fn copy_live_to_trash(
 pub async fn remove_live(located: &LocatedNcnx) -> Result<(), AppError> {
     let runtime = active_cluster_runtime()?;
     let pool = pool_for_located(&runtime, located)?;
-    exact_pool_mutation_nodes(&runtime, &pool.id).await?;
+    let authority = pool_mutation_authority_nodes(&runtime, &pool.id).await?;
     let layout = build_ncnx_layout(
         &runtime,
         pool,
         &located.record.fragment_id,
         &located.logical_key,
     )?;
-    apply_all(
+    apply_authorized(
         &runtime,
         &layout,
         PeerNcnxAction::RemoveLive,
@@ -655,6 +748,7 @@ pub async fn remove_live(located: &LocatedNcnx) -> Result<(), AppError> {
         &located.logical_key,
         None,
         &located.bytes,
+        &authority,
     )
     .await
 }
@@ -662,14 +756,14 @@ pub async fn remove_live(located: &LocatedNcnx) -> Result<(), AppError> {
 pub async fn remove_trash(located: &LocatedNcnx, locator: &TrashLocator) -> Result<(), AppError> {
     let runtime = active_cluster_runtime()?;
     let pool = pool_for_located(&runtime, located)?;
-    exact_pool_mutation_nodes(&runtime, &pool.id).await?;
+    let authority = pool_mutation_authority_nodes(&runtime, &pool.id).await?;
     let layout = build_ncnx_layout(
         &runtime,
         pool,
         &located.record.fragment_id,
         &located.logical_key,
     )?;
-    apply_all(
+    apply_authorized(
         &runtime,
         &layout,
         PeerNcnxAction::RemoveTrash,
@@ -677,6 +771,7 @@ pub async fn remove_trash(located: &LocatedNcnx, locator: &TrashLocator) -> Resu
         &located.logical_key,
         Some(locator),
         &located.bytes,
+        &authority,
     )
     .await
 }

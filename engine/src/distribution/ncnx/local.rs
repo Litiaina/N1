@@ -71,6 +71,7 @@ fn local_apply(
     match request.action {
         PeerNcnxAction::ReadLive => {
             let mut first_error = None;
+            let mut local_disk_responded = false;
             for store in local_stores(runtime, &request.root_id) {
                 match store.read_live(&request.fragment_id, &request.logical_key) {
                     Ok(Some((_, bytes))) => {
@@ -78,19 +79,20 @@ fn local_apply(
                         response.bytes = Some(ByteBuf::from(bytes));
                         return Ok(response);
                     }
-                    Ok(None) => {}
+                    Ok(None) => local_disk_responded = true,
                     Err(error) => {
                         first_error.get_or_insert(error);
                     }
                 }
             }
-            if let Some(error) = first_error {
+            if !local_disk_responded && let Some(error) = first_error {
                 return Err(error);
             }
         }
         PeerNcnxAction::ReadTrash => {
             let locator = required_trash(request)?;
             let mut first_error = None;
+            let mut local_disk_responded = false;
             for store in local_stores(runtime, &request.root_id) {
                 match store.read_trash(&request.fragment_id, locator) {
                     Ok(Some((_, bytes))) => {
@@ -98,13 +100,13 @@ fn local_apply(
                         response.bytes = Some(ByteBuf::from(bytes));
                         return Ok(response);
                     }
-                    Ok(None) => {}
+                    Ok(None) => local_disk_responded = true,
                     Err(error) => {
                         first_error.get_or_insert(error);
                     }
                 }
             }
-            if let Some(error) = first_error {
+            if !local_disk_responded && let Some(error) = first_error {
                 return Err(error);
             }
         }

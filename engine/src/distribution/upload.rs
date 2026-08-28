@@ -10,7 +10,7 @@ use crate::core::upload::{
     ActiveSessionInfo, FinalizeUploadResult, ListUploadsResponse, UploadSessionManifest,
 };
 use crate::core::upload::{DirectWriter, create_direct_file};
-use crate::distribution::membership::{active_cluster_runtime, exact_pool_write_nodes};
+use crate::distribution::membership::{active_cluster_runtime, pool_write_nodes};
 use crate::distribution::peer::{
     PeerShardTarget, RemoteShardWriter, encode_peer_shard_locator, invalidate_local_usage_cache,
     publish_cluster_object_metadata, publish_cluster_object_metadata_after_shard_sync,

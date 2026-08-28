@@ -175,7 +175,12 @@ pub async fn repair_object(
 ) -> Result<ObjectRepairStatus, AppError> {
     let _permit =
         acquire_object_maintenance_permit(meta, ObjectMaintenanceKind::Repair, true).await?;
-    let _io = try_acquire_disk_io(DiskIoClass::BackgroundRepair, Some(&meta.fragment))?;
+    let _io = acquire_disk_io(
+        DiskIoClass::BackgroundRepair,
+        Some(&meta.fragment),
+        "object shard repair",
+    )
+    .await?;
     let (mut report, normalized_parts, repair_targets) =
         inspect_object_parts(meta, check_mode).await?;
     if report.status == "healthy" || report.status == "incomplete" || !report.repairable {
@@ -213,6 +218,11 @@ pub async fn repair_cluster_object_recorded_layout(
 ) -> Result<ObjectRepairStatus, AppError> {
     let _permit =
         acquire_object_maintenance_permit(meta, ObjectMaintenanceKind::Repair, true).await?;
-    let _io = try_acquire_disk_io(DiskIoClass::BackgroundRepair, Some(&meta.fragment))?;
+    let _io = acquire_disk_io(
+        DiskIoClass::BackgroundRepair,
+        Some(&meta.fragment),
+        "distributed object shard repair",
+    )
+    .await?;
     repair_cluster_object_shards(meta, check_mode).await
 }

@@ -60,11 +60,30 @@ async fn apply_rename_batch_stage(
         }
     }
 
-    let authority_checks = pool_ids
-        .iter()
-        .map(|pool_id| exact_pool_mutation_nodes(&runtime, pool_id));
+    let authority_checks = pool_ids.iter().map(|pool_id| async {
+        Ok::<_, AppError>((
+            pool_id.clone(),
+            pool_mutation_authority_nodes(&runtime, pool_id)
+                .await?
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<BTreeSet<_>>(),
+        ))
+    });
+    let mut authority_by_pool = BTreeMap::new();
     for result in join_all(authority_checks).await {
-        result?;
+        let (pool_id, authority) = result?;
+        authority_by_pool.insert(pool_id, authority);
+    }
+    if let Some(target) = groups.keys().find(|target| {
+        !authority_by_pool
+            .get(&target.pool_id)
+            .is_some_and(|nodes| nodes.contains(&target.node_id))
+    }) {
+        return Err(AppError::ServiceUnavailable(format!(
+            "authorized pool component cannot reach exact NCNX replica '{}' for rename batch",
+            target.node_id
+        )));
     }
 
     let calls = groups.into_iter().map(|(target, entries)| {
@@ -86,7 +105,7 @@ async fn apply_rename_batch_stage(
         Ok(())
     } else {
         Err(AppError::ServiceUnavailable(format!(
-            "NCNX rename batch did not reach every exact replica: {}",
+            "NCNX rename batch did not reach every authorized exact replica: {}",
             failures.join("; ")
         )))
     }
@@ -154,11 +173,30 @@ async fn apply_trash_move_batch_stage(
         }
     }
 
-    let authority_checks = pool_ids
-        .iter()
-        .map(|pool_id| exact_pool_mutation_nodes(&runtime, pool_id));
+    let authority_checks = pool_ids.iter().map(|pool_id| async {
+        Ok::<_, AppError>((
+            pool_id.clone(),
+            pool_mutation_authority_nodes(&runtime, pool_id)
+                .await?
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<BTreeSet<_>>(),
+        ))
+    });
+    let mut authority_by_pool = BTreeMap::new();
     for result in join_all(authority_checks).await {
-        result?;
+        let (pool_id, authority) = result?;
+        authority_by_pool.insert(pool_id, authority);
+    }
+    if let Some(target) = groups.keys().find(|target| {
+        !authority_by_pool
+            .get(&target.pool_id)
+            .is_some_and(|nodes| nodes.contains(&target.node_id))
+    }) {
+        return Err(AppError::ServiceUnavailable(format!(
+            "authorized pool component cannot reach exact NCNX replica '{}' for namespace batch",
+            target.node_id
+        )));
     }
 
     let calls = groups.into_iter().map(|(target, entries)| {
@@ -179,7 +217,7 @@ async fn apply_trash_move_batch_stage(
         Ok(())
     } else {
         Err(AppError::ServiceUnavailable(format!(
-            "NCNX namespace batch did not reach every exact replica: {}",
+            "NCNX namespace batch did not reach every authorized exact replica: {}",
             failures.join("; ")
         )))
     }

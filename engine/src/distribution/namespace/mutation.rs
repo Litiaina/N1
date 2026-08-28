@@ -20,7 +20,7 @@ pub(super) async fn rename_key_or_prefix(
             "cannot move a key prefix inside itself".into(),
         ));
     }
-    if let Some(located) = find_live(fragment, &source).await? {
+    if let Some(located) = find_live_for_survival_write(fragment, &source).await? {
         rename_one(&located, &destination, mutation_id, now_nanos).await?;
         return Ok(mutation_summary(
             "rename",
@@ -63,27 +63,28 @@ pub(super) async fn rename_key_or_prefix(
                 let destination_key = rename_prefix(&name.logical_key, &source, &destination)
                     .map_err(|err| AppError::BadRequest(err.to_string()))?;
                 let source_record = read_canonical_record(&fragment, &name).await?;
-                let destination_record = match find_live(&fragment, &destination_key).await? {
-                    Some(existing)
-                        if existing.record.object_id == source_record.record.object_id =>
-                    {
-                        // A retry may observe only part of an earlier destination
-                        // publication. Reuse that exact immutable generation so
-                        // missing replicas converge byte-for-byte.
-                        existing.record
-                    }
-                    Some(_) => {
-                        return Err(AppError::Conflict(format!(
-                            "rename destination '{destination_key}' already exists"
-                        )));
-                    }
-                    None => NcnxRecord::new(
-                        &source_record.record.fragment_id,
-                        &source_record.record.object_id,
-                        mutation_id,
-                        now_nanos,
-                    )?,
-                };
+                let destination_record =
+                    match find_live_for_survival_write(&fragment, &destination_key).await? {
+                        Some(existing)
+                            if existing.record.object_id == source_record.record.object_id =>
+                        {
+                            // A retry may observe only part of an earlier destination
+                            // publication. Reuse that exact immutable generation so
+                            // missing replicas converge byte-for-byte.
+                            existing.record
+                        }
+                        Some(_) => {
+                            return Err(AppError::Conflict(format!(
+                                "rename destination '{destination_key}' already exists"
+                            )));
+                        }
+                        None => NcnxRecord::new(
+                            &source_record.record.fragment_id,
+                            &source_record.record.object_id,
+                            mutation_id,
+                            now_nanos,
+                        )?,
+                    };
                 Ok::<_, AppError>(NcnxRenameBatchItem {
                     located: source_record,
                     destination_key,
@@ -202,7 +203,7 @@ pub(super) async fn trash_key_or_prefix(
     control: &NamespaceMutationControl,
 ) -> Result<NamespaceMutationSummary, AppError> {
     let source = validate_logical_key(source)?;
-    if let Some(located) = find_live(fragment, &source).await? {
+    if let Some(located) = find_live_for_survival_write(fragment, &source).await? {
         trash_one(&located, mutation_id, now_nanos).await?;
         return Ok(mutation_summary(
             "trash",
@@ -420,7 +421,7 @@ pub(super) async fn recover_one(
         .trash
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("trash recovery has no locator".into()))?;
-    if find_live(&located.record.fragment_id, &name.logical_key)
+    if find_live_for_survival_write(&located.record.fragment_id, &name.logical_key)
         .await?
         .is_some()
     {

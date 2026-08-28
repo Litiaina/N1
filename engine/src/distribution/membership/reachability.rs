@@ -106,14 +106,26 @@ pub async fn live_active_write_nodes_for_pool(
     .await
 }
 
-/// Prove that this coordinator can reach every exact slot in a recorded pool.
+/// Minimum connected component that can safely own degraded mutation traffic.
 ///
-/// `K` reachable nodes prove that an EC object is reconstructable; they do
-/// not prove that another live component cannot also publish a conflicting
-/// NCNX mutation. Transport failure must therefore never manufacture write
-/// authority. Reserve promotion or another binding-epoch transition restores
-/// a complete pool before client-visible mutation resumes.
-pub fn validate_exact_pool_mutation_authority(
+/// `K` preserves reconstructability. A strict pool majority prevents two
+/// disjoint network components from both acknowledging NCNX mutations. The
+/// larger requirement is the authority boundary for the fixed pool.
+pub fn required_pool_mutation_authority(pool: &ServerPool) -> usize {
+    pool.policy
+        .object_data_shards
+        .max(pool.node_ids.len() / 2 + 1)
+}
+
+/// Prove that this coordinator belongs to the only pool component large
+/// enough to acknowledge a mutation.
+///
+/// Healthy operation still reaches the complete exact pool. During node loss
+/// or a partition, at most the component containing both `K` nodes and a
+/// strict majority can write. Smaller components remain readable when their
+/// available shards permit it, but cannot manufacture mutation authority from
+/// a transport timeout.
+pub fn validate_pool_mutation_authority(
     runtime: &ClusterRuntime,
     pool_id: &str,
     reachable: &[ClusterNode],
@@ -164,10 +176,16 @@ pub fn validate_exact_pool_mutation_authority(
         .difference(&configured_ids)
         .copied()
         .collect::<Vec<_>>();
-    if !missing.is_empty() || !unexpected.is_empty() {
-        let layout = &pool.policy;
+    if !unexpected.is_empty() {
         return Err(AppError::ServiceUnavailable(format!(
-            "N2 write authority is ambiguous for pool '{pool_id}': reached {} of {} exact slots (missing: {}; unexpected: {}). K={} proves reconstructability, not exclusive mutation authority; restore or replace the missing binding before writing",
+            "N2 write authority is invalid for pool '{pool_id}': reached unexpected logical slot(s) {}",
+            unexpected.join(", "),
+        )));
+    }
+    let required = required_pool_mutation_authority(pool);
+    if reachable_ids.len() < required {
+        return Err(AppError::ServiceUnavailable(format!(
+            "N2 write authority is unavailable for pool '{pool_id}': reached {} of {} exact slots (missing: {}). Mutation requires max(K={}, strict-majority={}) = {} reachable slots; restore a binding or promote a reserve before writing",
             reachable_ids.len(),
             configured_ids.len(),
             if missing.is_empty() {
@@ -175,12 +193,9 @@ pub fn validate_exact_pool_mutation_authority(
             } else {
                 missing.join(", ")
             },
-            if unexpected.is_empty() {
-                "none".into()
-            } else {
-                unexpected.join(", ")
-            },
-            layout.object_data_shards,
+            pool.policy.object_data_shards,
+            configured_ids.len() / 2 + 1,
+            required,
         )));
     }
     Ok(())
@@ -189,7 +204,7 @@ pub fn validate_exact_pool_mutation_authority(
 /// Prove exact authority for a new object write. Unlike namespace mutation of
 /// an existing object, new object placement additionally requires a writable
 /// pool; a sealed historical pool remains mutable only for its recorded NCNX.
-pub fn validate_exact_pool_write_authority(
+pub fn validate_pool_write_authority(
     runtime: &ClusterRuntime,
     pool_id: &str,
     reachable: &[ClusterNode],
@@ -202,24 +217,32 @@ pub fn validate_exact_pool_write_authority(
             "server pool '{pool_id}' is sealed"
         )));
     }
-    validate_exact_pool_mutation_authority(runtime, pool_id, reachable)
+    validate_pool_mutation_authority(runtime, pool_id, reachable)
 }
 
-pub async fn exact_pool_mutation_nodes(
+pub async fn pool_mutation_authority_nodes(
     runtime: &ClusterRuntime,
     pool_id: &str,
 ) -> Result<Vec<ClusterNode>, AppError> {
     let reachable = live_mutation_authority_nodes_for_pool(runtime, pool_id).await;
-    validate_exact_pool_mutation_authority(runtime, pool_id, &reachable)?;
+    validate_pool_mutation_authority(runtime, pool_id, &reachable)?;
     Ok(reachable)
 }
 
-pub async fn exact_pool_write_nodes(
+pub async fn pool_write_authority_nodes(
     runtime: &ClusterRuntime,
     pool_id: &str,
 ) -> Result<Vec<ClusterNode>, AppError> {
-    let authority = live_mutation_authority_nodes_for_pool(runtime, pool_id).await;
-    validate_exact_pool_write_authority(runtime, pool_id, &authority)?;
+    let reachable = live_mutation_authority_nodes_for_pool(runtime, pool_id).await;
+    validate_pool_write_authority(runtime, pool_id, &reachable)?;
+    Ok(reachable)
+}
+
+pub async fn pool_write_nodes(
+    runtime: &ClusterRuntime,
+    pool_id: &str,
+) -> Result<Vec<ClusterNode>, AppError> {
+    pool_write_authority_nodes(runtime, pool_id).await?;
 
     // Authority belongs to the exact NCNX control plane. The shard/native
     // plane remains independently degradable: callers enforce K before

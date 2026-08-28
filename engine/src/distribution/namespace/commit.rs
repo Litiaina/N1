@@ -180,7 +180,9 @@ pub async fn commit_namespace_mutation_controlled(
                             })?;
                         Ok::<_, AppError>((
                             logical_key.clone(),
-                            find_live(&fragment, &logical_key).await?.is_some(),
+                            find_live_for_survival_write(&fragment, &logical_key)
+                                .await?
+                                .is_some(),
                         ))
                     });
                 }
