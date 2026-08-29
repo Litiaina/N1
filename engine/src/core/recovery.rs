@@ -8,7 +8,7 @@ use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
 use crc32fast::Hasher;
-use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
+use ecs_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};

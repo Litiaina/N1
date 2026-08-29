@@ -76,6 +76,10 @@ async fn main() {
             println!("N1_RELEASE_PROOF PASS");
         }
         Err(err) => {
+            // `std::process::exit` does not run `Drop`. Stop the isolated test
+            // engine explicitly so a failed proof cannot leave its ports or
+            // temporary storage roots active for the next run.
+            let _ = proof.stop_server();
             proof.summary = json!({
                 "status": "FAIL",
                 "error": err.to_string(),

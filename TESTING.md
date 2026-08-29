@@ -14,6 +14,22 @@ RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 
 This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, object-level repair/status, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, capacity/placement behavior, or real disk behavior.
 
+### ECS Core integration gate
+
+N1 consumes the separately versioned ECS Core library through a thin adapter.
+Before changing that dependency or adapter, require all of the following:
+
+- the ECS Core unit, streaming, hard-stress, and real-disk gates pass;
+- `engine/tests/ecs_compatibility.rs` proves exact piece bytes and CRC32 values
+  across supported layouts, boundary sizes, tails, and arbitrary input chunks;
+- the four-disk N1 release matrix passes restart/resume, download hashing,
+  recover-on-read, disk repair, redistribution, and clean-log inspection;
+- the installed N1 build retains ownership of placement, file sync, atomic
+  rename, directory sync, immutable NDX publication, and namespace commit.
+
+ECS Core is only the byte-to-piece streaming boundary. A green library test
+cannot replace the full N1 storage proof.
+
 ### N1 Shell Provisioning Gate
 
 The embedded installation terminal has an additional non-destructive gate:

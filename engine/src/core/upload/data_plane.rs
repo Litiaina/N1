@@ -147,7 +147,7 @@ impl DirectWriter {
     }
 
     fn spawn_buffer_flush(&mut self) {
-        if self.write_buffer.len() == 0 || self.write_task.is_some() {
+        if self.write_buffer.is_empty() || self.write_task.is_some() {
             return;
         }
 
@@ -204,7 +204,7 @@ impl AsyncWrite for DirectWriter {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        if self.write_buffer.len() > 0 && self.write_task.is_none() {
+        if !self.write_buffer.is_empty() && self.write_task.is_none() {
             self.spawn_buffer_flush();
         }
 
@@ -890,7 +890,7 @@ where
             writers,
             data_shards,
             parity_shards,
-            final_shard_len as usize,
+            content_length,
             calc_total_checksum,
             block_size,
         )?;
@@ -1217,7 +1217,7 @@ where
             writers,
             data_shards,
             parity_shards,
-            final_shard_len as usize,
+            content_length,
             calc_total_checksum,
             block_size,
         )?;

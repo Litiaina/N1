@@ -42,8 +42,10 @@ unversioned storage roots rather than adopting or migrating them.
   package `n1_shell`, executable `litiaina-n1-shell`.
 - `native_client/` - canonical Rust client for the `n1://` protocol; Cargo
   package `n1_native_client`.
-- `simd-erasure-core/` - internal erasure-coding core used by N1; Cargo package
-  `simd-erasure-core`.
+- [ECS Core](https://github.com/Litiaina/ecs-core) - separately versioned,
+  bounded-memory streaming erasure coding shared with other Litiaina storage
+  engines. N1 still owns disk placement, durability sync, atomic publication,
+  metadata, and namespace semantics.
 - `cli_core/` - shared shell support; Cargo package `cli_core`.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling;
   Cargo package and executable `n1-release-proof`.
@@ -98,6 +100,11 @@ NOA v1 preserves the existing simple N1 request and response semantics while
 giving the HTTPS surface a stable, engine-independent name. See [NOA.md](NOA.md).
 
 ## Build
+
+N1 pins ECS Core to an exact Git commit in `engine/Cargo.toml`. A fresh checkout
+therefore builds reproducibly without requiring a sibling repository or a
+machine-specific filesystem layout. Update that revision only after the ECS
+Core gates and N1 compatibility matrix pass together.
 
 ```bash
 cargo build -p n1 --release

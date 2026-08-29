@@ -45,11 +45,11 @@ governor.workspace = true
 ulid.workspace = true
 libc.workspace = true
 crc32fast.workspace = true
+ecs-core = { git = "https://github.com/Litiaina/ecs-core.git", rev = "c77c638bfb709368f49517f2828fa977738e8467" }
 tokio-stream.workspace = true
 async_zip = { workspace = true, features = ["tokio", "deflate"] }
 tokio-tar.workspace = true
 tracing-appender.workspace = true
-simd-erasure-core = { path = "../simd-erasure-core" }
 core_affinity.workspace = true
 rmp-serde.workspace = true
 argon2.workspace = true

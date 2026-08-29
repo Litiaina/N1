@@ -4,7 +4,6 @@ members = [
     "engine",
     "shell",
     "native_client",
-    "simd-erasure-core",
     "tools/n1-release-proof",
 ]
 resolver = "2"

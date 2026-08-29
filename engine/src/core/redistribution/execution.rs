@@ -1134,7 +1134,7 @@ pub(super) async fn redistribute_object_streaming(
             writers,
             target_data_shards,
             target_parity_shards,
-            final_shard_len as usize,
+            old_part_arc.size_bytes,
             false,
             new_block_size,
         )?;

@@ -68,6 +68,55 @@ verification.
 
 ## Focused Proof Evidence
 
+### N1 3.5.0 ECS Core Integration and Four-Disk Release Proof
+
+On August 29, 2026, N1 completed the migration from its embedded erasure-code
+implementation to the independently tested ECS Core streaming library. N1
+continues to own disk placement, temporary files, durability synchronization,
+atomic publication, NDX records, and namespace state; ECS Core owns only the
+bounded-memory byte-to-piece encode, decode, checksum, and repair pipeline.
+
+- Byte-for-byte compatibility passed for `1 + 0`, `1 + 1`, `3 + 1`, `4 + 2`,
+  and `6 + 2` layouts across zero-length, boundary, tail, multistripe, and
+  arbitrarily chunked inputs. Source and piece CRC32 values also matched.
+- N1's strict capacity contract was preserved: raw `ENOSPC` and `EDQUOT`
+  failures cross the library boundary unchanged, remain eligible for HTTP
+  `507` mapping, and cannot publish NDX or namespace truth.
+- Strict N1 all-target testing passed `145` engine tests and both ECS adapter
+  integration tests. Workspace all-target compilation passed with warnings
+  denied.
+- ECS Core passed its normal, failure, hard-stress, codec, documentation, and
+  lint gates. The hard matrix included `128` concurrent streams, `1,000`
+  randomized cases, exhaustive recoverable decode/repair combinations, fault
+  injection, and a bounded-memory 4 GiB stream.
+- A direct ECS Core `3 + 1` proof used four distinct XFS HDDs and a 4 GiB
+  source. Durable encode completed at `205.74 MiB/s`; every missing data or
+  parity position decoded and repaired to an exact checksum match. Durable
+  repair samples ranged from `59.24` to `63.23 MiB/s` on the tested HDDs.
+- The N1 `3 + 1` release matrix then completed with `3,846` live objects and
+  all `22` gates passing. Coverage included restart-resumable multipart,
+  native and NOA paths, authentication boundaries, high-concurrency object
+  storms, same-key contention, multi-user and multi-fragment isolation,
+  POSIX/trash/GC, archive streaming, recover-on-read, object repair, disk-format
+  repair, `2 -> 1 -> 2` redistribution, and bounded chaos.
+- Physical inspection found `3,846` namespace links on every index replica and
+  the expected colocated immutable metadata and payload state. The release log
+  scan contained no bad lines, and peak observed RSS was `187,232 KiB`.
+- A final smoke used the exact install candidate after the capacity-error fix.
+  HTTP and native one-shot/multipart paths passed, including four-way
+  pipelined multipart, with a clean log scan.
+- The installed production binary has SHA-256
+  `6987e0bac46fb7f39b75484b191958c9821d858975e05b1d18325d1e5f0a8642`.
+  Service restart, HTTPS health, native listener, and post-start journal checks
+  passed. The prior binary remains available as an explicit rollback artifact.
+
+For the primary server-local HTTP workload, the extracted ECS implementation
+did not regress the data path: the measured multipart median increased from
+`118.808 MiB/s` to `218.407 MiB/s`, while pipelined multipart increased from
+`119.497 MiB/s` to `224.716 MiB/s`. Native samples were mixed on the same HDD
+host and are retained as measurements rather than presented as universal
+throughput claims.
+
 ### N1 3.5.0 Capacity-Free Standard Batch Proof
 
 On August 10, 2026, the N1 3.5.0 candidate passed a focused real-process
