@@ -4,8 +4,8 @@ use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
 
+use ecs_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use sha2::{Digest, Sha256};
-use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;

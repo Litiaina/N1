@@ -5,6 +5,37 @@ hardware, topology, and methodology boundaries. Correctness and failure
 qualification are kept in [TESTING.md](TESTING.md) so benchmark results are
 not mistaken for a second verification record.
 
+## N2 3.5 ECS Core Two-Host Integration Measurement
+
+Raw evidence bundle: `n2-ecs-3.5-real-20260829-164124`. It is retained
+privately outside the repository. Machine usernames, addresses, filesystem
+paths, mount points, and credentials are intentionally excluded.
+
+This finite integration run used three logical nodes across two physical
+hosts, two enrolled roots per node, one exact EC `2 + 1` pool, two NCNX
+replicas, TLS HTTP/1.1, and the N2 3.5 ECS Core adapter. The optimized binary
+SHA-256 was
+`57a693dd5d84f195206e74ad619fc0cf902e58c2dd7cc0ed848024c1df488757`.
+
+| Operation | Result |
+| --- | ---: |
+| 128 MiB multipart upload | 55.304 MiB/s; finalized and byte exact |
+| 128 MiB read through logical node A | 67.883 MiB/s; SHA-256 exact |
+| 128 MiB read through logical node B | 53.011 MiB/s; SHA-256 exact |
+| 128 MiB read through logical node C | 56.876 MiB/s; SHA-256 exact |
+| Concurrent one-shot create | 96/96 objects |
+| Prefix rename | 96/96 objects; tracked operation completed |
+
+All six roots received immutable shard/parity pieces. Ordered pagination,
+degraded write at exactly `K`, deleted-shard reconstruction, autonomous repair,
+and post-restart reads also passed; the correctness detail is recorded in
+[TESTING.md](TESTING.md).
+
+These are one finite 128 MiB integration measurements over mixed local and
+network paths. They prove that the ECS extraction did not break N2's real
+streaming path; they are not disk-ceiling, network-ceiling, sustained-load,
+NVMe, wider-pool, or multi-rack benchmark claims.
+
 ## N2 3.4.1 Real Two-Host CRUD and Namespace Benchmark
 
 Raw evidence bundle: `n2-two-host-crud-benchmark-20260824`. It is retained

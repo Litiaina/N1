@@ -194,7 +194,7 @@ where
             writers,
             data_shards,
             parity_shards,
-            final_shard_len as usize,
+            content_length,
             calc_total_checksum,
             block_size,
         )?;
@@ -477,7 +477,7 @@ where
             writers,
             data_shards,
             parity_shards,
-            final_shard_len as usize,
+            content_length,
             calc_total_checksum,
             block_size,
         )?;

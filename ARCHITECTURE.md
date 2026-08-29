@@ -1,19 +1,20 @@
-# N2 3.4 Architecture
+# N2 3.5 Architecture
 
 ## Status
 
-This document is the locked implementation contract for N2 3.4, the current
+This document is the locked implementation contract for N2 3.5, the current
 release of the clean N2 3.x engine generation. It does not read, migrate, or
 maintain compatibility with the N2 2.0 inode namespace.
 
-N2 3.4 is a clean format. It accepts only the generation-directory trash
-layout and SHA-256 NCNX/object-NCDX/shard integrity defined here. Earlier
-experimental 3.x records are rejected rather than ignored or guessed.
+N2 3.5 retains the clean 3.x format. It accepts only the
+generation-directory trash layout and SHA-256 NCNX/object-NCDX/shard integrity
+defined here. Earlier experimental 3.x records are rejected rather than
+ignored or guessed.
 
 N2 is a high-performance distributed object storage system built for durable,
 redundant, namespace-managed, and efficient storage.
 
-N2 3.4 combines:
+N2 3.5 combines:
 
 - immutable, object-level erasure sets;
 - flat physical-key namespace records;
@@ -23,6 +24,12 @@ N2 3.4 combines:
 - autonomous object and namespace healing;
 - optional cluster-wide reserve capacity with autonomous logical-slot
   replacement.
+
+N2 3.5 delegates only bounded byte-to-piece erasure encoding,
+reconstruction, and repair primitives to ECS Core. The engine retains pool
+authority, placement, survivor admission, fsync/rename publication, metadata,
+namespace, and healing ownership. This boundary removes a duplicated codec
+without adding a service, database, network hop, or disk-format transition.
 
 The architecture has no database, global namespace writer, directory inode,
 cluster-wide mutation log, or implicit redistribution.
@@ -74,6 +81,10 @@ cluster-wide mutation log, or implicit redistribution.
     surviving pool slot and the reserve candidate, compatible roots and
     capacity, an atomic membership commit, and a durable retired-instance
     fence.
+19. ECS Core receives an already selected `K + M` layout and caller-owned
+    streams. It cannot choose nodes, roots, pools, namespace replicas, or
+    publication state. A missing piece still receives its deterministic
+    SHA-256 repair identity even when no writer exists for that slot.
 
 ## Cluster And Server Pools
 

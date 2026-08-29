@@ -10,7 +10,7 @@ versioned public contract, see [NOA.md](NOA.md).
 
 ## Status
 
-N2 `3.4.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.5.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the 2.x distributed-inode namespace with a flat replicated NCNX key
 plane. N2 3.1 adds collision-free per-mutation trash generation directories.
 N2 3.2 makes SHA-256 the only engine integrity checksum, adds SHA-256
@@ -54,6 +54,12 @@ the missing exact roles remain recorded healing targets.
 N2 3.4 intentionally does not open or migrate N2 1.x, 2.x, or earlier
 experimental 3.x roots. Static server-pool enrollment, root identity, and
 format-v5 membership prevent old layouts from being silently reinterpreted.
+
+N2 3.5 uses ECS Core for bounded streaming erasure encoding, reconstruction,
+and repair. N2 still owns every storage-engine decision: static server-pool
+authority, deterministic node/root placement, survivor admission, temporary
+files, durability sync, atomic publication, NCNX/NCDX, and healing policy. The
+3.5 migration is byte-compatible and introduces no disk-format conversion.
 
 N2 3.4 deliberately fails closed on retired NCNX, NCDX, and trash layouts
 instead of maintaining multiple integrity and lifecycle formats.
@@ -2303,13 +2309,21 @@ REMOTE_PASS='operator-supplied' \
   scripts/bench/run_n2_3_0_release_proof.sh
 ```
 
+Finite N2 3.5 ECS Core proof across three logical nodes and two physical
+hosts, after supplying six new isolated roots and the required connection
+variables:
+
+```bash
+scripts/bench/run_n2_3_5_ecs_two_host_proof.sh
+```
+
 Inspect lifecycle/chaos options:
 
 ```bash
 scripts/bench/run_n2_3_0_soak_chaos.sh --help
 ```
 
-For N2 3.4 qualification, prove at minimum:
+For N2 3.5 qualification, prove at minimum:
 
 - identical format-v5 membership and static pool contracts on every node;
 - fragment creation and authentication;

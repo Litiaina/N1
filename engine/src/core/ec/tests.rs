@@ -12,7 +12,7 @@ async fn stream_writer_records_checksums_for_every_immutable_shard_block() {
         Some(tokio::io::sink()),
         Some(tokio::io::sink()),
     ];
-    let mut writer = ErasureStreamWriter::new(writers, 2, 1, block_size, true, block_size)
+    let mut writer = ErasureStreamWriter::new(writers, 2, 1, input.len() as u64, true, block_size)
         .expect("create writer");
     writer.write(&input).await.expect("write stripe");
     writer.finalize().await.expect("finalize");
@@ -44,7 +44,7 @@ async fn stream_writer_commits_at_k_and_describes_the_missing_exact_slot() {
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let writers = vec![None, Some(tokio::io::sink()), Some(tokio::io::sink())];
-    let mut writer = ErasureStreamWriter::new(writers, 2, 1, block_size, true, block_size)
+    let mut writer = ErasureStreamWriter::new(writers, 2, 1, input.len() as u64, true, block_size)
         .expect("create degraded writer");
 
     writer.write(&input).await.expect("write at K");
@@ -69,11 +69,29 @@ async fn stream_writer_commits_at_k_and_describes_the_missing_exact_slot() {
 }
 
 #[tokio::test]
-async fn stream_writer_rejects_a_commit_below_k() {
+async fn stream_writer_rejects_initial_width_below_k() {
     let block_size = 4096;
     let writers = vec![None, Some(tokio::io::sink()), None];
-    let mut writer = ErasureStreamWriter::new(writers, 2, 1, block_size, true, block_size)
-        .expect("create under-width writer");
+    let result = ErasureStreamWriter::new(writers, 2, 1, (block_size * 2) as u64, true, block_size);
 
-    assert!(writer.write(&vec![7; block_size * 2]).await.is_err());
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn stream_writer_rejects_incomplete_source_without_publication() {
+    let block_size = 4096;
+    let writers = vec![
+        Some(tokio::io::sink()),
+        Some(tokio::io::sink()),
+        Some(tokio::io::sink()),
+    ];
+    let mut writer =
+        ErasureStreamWriter::new(writers, 2, 1, (block_size * 2) as u64, true, block_size)
+            .expect("create writer");
+    writer
+        .write(&vec![7; block_size])
+        .await
+        .expect("partial write");
+
+    assert!(writer.finalize().await.is_err());
 }

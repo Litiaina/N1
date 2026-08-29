@@ -1,6 +1,6 @@
 [package]
 name = "n2"
-version = "3.4.1"
+version = "3.5.0"
 edition = "2024"
 
 [[bin]]
@@ -50,7 +50,7 @@ tokio-stream.workspace = true
 async_zip = { workspace = true, features = ["tokio", "deflate"] }
 tokio-tar.workspace = true
 tracing-appender.workspace = true
-simd-erasure-core = { path = "../simd-erasure-core" }
+ecs-core = { git = "https://github.com/Litiaina/ecs-core.git", rev = "2a5130c746ef7fb484f0a3f491cb47f57a65db77" }
 core_affinity.workspace = true
 rmp-serde.workspace = true
 argon2.workspace = true

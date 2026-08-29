@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::checksum::{format_sha256, sha256_digest};
 use crate::core::disk_manager::ShardInfo;
-use simd_erasure_core::ReedSolomonEncoder;
+use ecs_core::ReedSolomonEncoder;
 use ulid::Ulid;
 
 fn local_shard(path: &std::path::Path, expected: &[u8]) -> ShardInfo {

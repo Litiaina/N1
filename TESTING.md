@@ -1,13 +1,13 @@
-# N2 3.4 Testing
+# N2 3.5 Testing
 
 This document is the single correctness and resilience record for the current
-N2 3.4 engine. It covers test scope, procedures, results, failures, fixes, and
+N2 3.5 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Qualification Boundary
 
-N2 3.4 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
+N2 3.5 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
 server pools, immutable NCDX/object layouts, and healing model. Its lifecycle
 stores one delete mutation under
 `.trash/<unix-nanos>.<mutation-ulid>/<logical-key>.ncnx`. NCNX and object NCDX
@@ -26,14 +26,17 @@ they are not five independent host, power, network, or rack failure domains.
 
 ## Repository Gates
 
-The N2 3.4.1 implementation currently has passed:
+The N2 3.5.0 implementation currently has passed:
 
 - `cargo fmt --all -- --check`;
 - `cargo check --workspace --all-targets`;
-- `cargo test --workspace --lib --bins --tests`: N2 196/196, gateway 27/27,
+- N2 engine migration suite with warnings denied: 197/197 passed;
+- ECS Core normal suite: 17/17 passed;
+- ECS Core hard suite: 5/5 passed, including 128 concurrent streams, 1,000
+  randomized round trips, 124 decode and 184 repair loss cases, injected
+  midstream/flush failures, and a 4 GiB bounded-memory stream;
+- `cargo test --workspace --lib --bins --tests`: gateway 27/27,
   native client 2/2, and shell 18/18 passed;
-- SIMD erasure core: 107 passed with 6 intentionally ignored; integration:
-  5 passed with 2 intentionally ignored;
 - optimized `cargo build -p n2 --release`;
 - `git diff --check`.
 
@@ -43,6 +46,43 @@ capacity rejection, stale-target fencing, SHA-256 NCNX/object-NCDX/shard
 integrity, corrupted block reconstruction, canonical-list refill,
 replica-backed degraded listing, exact static placement, exact metadata
 visibility, copy/delete restart semantics, and object/healing invariants.
+
+### N2 3.5 ECS Core two-host proof — PASS
+
+The isolated N2 3.5 proof completed on 2026-08-29 with result `PASS`.
+
+Private evidence bundle: `n2-ecs-3.5-real-20260829-164124`.
+
+The exact optimized binary had SHA-256
+`57a693dd5d84f195206e74ad619fc0cf902e58c2dd7cc0ed848024c1df488757`.
+The topology used three logical nodes across two physical hosts, two enrolled
+roots per node, one exact `2 + 1` server pool, two NCNX replicas, and no
+reserve. Machine identities, addresses, credentials, and storage paths are
+intentionally excluded from this public record.
+
+The run proved:
+
+- one 128 MiB multipart object encoded through ECS Core and downloaded
+  byte-exactly through every logical node;
+- 96 concurrent one-shot objects, complete ordered pagination in pages of 17,
+  and one tracked prefix rename affecting all 96 objects;
+- physical shard/parity participation from all six enrolled roots;
+- HTTP 201 survival write after one parity-role node was stopped, with
+  byte-exact read through the two surviving nodes;
+- byte-exact reconstruction after one physical shard was deleted;
+- autonomous healing recreated that exact missing shard path;
+- full three-node restart preserved the original multipart object; and
+- initial and final cluster health were healthy, fully protected, writable,
+  and authority-proven, with zero panic or fatal log matches.
+
+The proof runner is
+`scripts/bench/run_n2_3_5_ecs_two_host_proof.sh`. It accepts only new isolated
+test roots, never formats devices, removes its temporary node processes and
+storage roots on exit, and preserves a finite evidence bundle. This closes the
+bounded compatibility and real multi-root integration gate for replacing the
+embedded erasure implementation with ECS Core. It does not replace the wider
+topology, independent-power-domain, disk-full, partition-at-publication, or
+long-duration gates below.
 
 ### Historical reconstruction-threshold write gate
 

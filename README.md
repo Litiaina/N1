@@ -19,7 +19,7 @@ namespace, and maintenance operations on any healthy node, places immutable
 erasure-coded object versions across static server pools, and keeps every
 user-visible mutation in a small flat namespace record.
 
-N2 `3.4.1` uses the clean N2 3.x engine and disk-format generation. N2 3.0
+N2 `3.5.0` uses the clean N2 3.x engine and disk-format generation. N2 3.0
 replaced the N2 2.x inode namespace with replicated flat NCNX key records
 while retaining
 immutable NCDX metadata, immutable shards and parity, per-object recorded
@@ -54,6 +54,13 @@ reported as degraded and fails writes closed rather than manufacturing
 authority from a timeout. It does not add
 quorum consensus or adaptive placement.
 
+N2 3.5 moves its bounded streaming erasure pipeline into the independently
+tested ECS Core library. The change is byte-compatible with the prior N2
+encoder and does not alter placement, pool authority, NCNX/NCDX formats,
+publication ordering, or repair policy. ECS Core now returns deterministic
+SHA-256 identities for every planned piece, including a missing or failed
+writer, so N2 retains exact repair targets during survivor writes.
+
 Existing-key rename, trash, and recovery prove authority against the NCNX
 record's exact owning pool, not whichever pool is newest. A historical pool
 sealed against new objects therefore remains available for namespace mutation
@@ -82,8 +89,8 @@ for N2-native operators, peers, tools, and future internal systems.
   `n2_gateway`, executable `litiaina-n2-gateway`.
 - `native_client/` - reusable Rust client for `n2://`; Cargo package
   `n2_native_client`.
-- `simd-erasure-core/` - SIMD erasure implementation used by N2; Cargo package
-  `simd-erasure-core`.
+- `ecs-core` - exact external Erasure Coding Streaming Core dependency used by
+  N2 for bounded byte-to-piece encoding, reconstruction, and repair.
 
 The generic directory names describe repository structure. Product-specific
 Cargo packages, executables, systemd services, configuration, and protocol
@@ -99,15 +106,15 @@ identities remain unchanged so installed components are unambiguous.
 - [N2_SHELL_SETUP.md](N2_SHELL_SETUP.md): distributed physical-node
   commissioning, remote disk ownership, canonical prepare/commit, and
   controlled topology evolution.
-- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.4 storage, NCNX namespace,
+- [ARCHITECTURE.md](ARCHITECTURE.md): N2 3.5 storage, NCNX namespace,
   lifecycle, healing, expansion, and failure laws.
 - [MULTI_CLUSTER.md](MULTI_CLUSTER.md): proposed regional active-active and
   read-only fragment replication, site policy, convergence, fencing,
   failover, maturity isolation, and release gates.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
-  soak procedures with the currently qualified evidence, including the clean
-  N2 3.4.1 24-hour release-soak pass.
+  soak procedures with the currently qualified evidence, including the N2 3.5
+  ECS Core two-host pass and clean N2 3.4.1 24-hour release-soak pass.
 - [BENCHMARK.md](BENCHMARK.md): measured performance, topology, methodology,
   limitations, and reproduction guidance.
 
@@ -198,8 +205,6 @@ gateway/
 deploy/systemd/
   litiaina-n2*.service.in
 deploy/install.sh       production installer
-simd-erasure-core/
-  src/                  erasure coding implementation
 scripts/bench/
   run_n2_3_0_release_proof.sh
   run_n2_3_0_soak_chaos.sh
@@ -397,6 +402,14 @@ Run the bounded lifecycle/chaos harness:
 scripts/bench/run_n2_3_0_soak_chaos.sh --help
 ```
 
+Run the finite N2 3.5 ECS Core integration proof after supplying six new,
+isolated storage roots and the remote-host connection variables documented by
+the script:
+
+```bash
+scripts/bench/run_n2_3_5_ecs_two_host_proof.sh
+```
+
 Run installer dry-run proof:
 
 ```bash
@@ -410,7 +423,7 @@ the repository under an operator-selected private test root.
 
 ## Operational Boundaries
 
-- N2 `3.4.1` is a clean 3.x engine format, not an in-place migration
+- N2 `3.5.0` is a clean 3.x engine format, not an in-place migration
   from N2 1.x or 2.x.
 - A server pool's `K + M`, node IDs, and root-ID set are static after
   enrollment. Expansion adds a new complete pool generation.

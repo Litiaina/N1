@@ -574,7 +574,7 @@ where
         writers,
         data_shards,
         parity_shards,
-        final_shard_len as usize,
+        content_length,
         expected_checksum.is_some(),
         block_size,
     )?;
