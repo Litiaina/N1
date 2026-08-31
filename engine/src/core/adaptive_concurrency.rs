@@ -28,15 +28,22 @@ fn interval_ms() -> u64 {
 }
 
 fn clamp_next(cur: usize, min_v: usize, max_v: usize, down_pct: usize, up_pct: usize) -> usize {
+    let cur = cur.max(min_v).min(max_v);
     if down_pct > 0 {
-        let next = cur.saturating_mul(100 - down_pct) / 100;
+        let retained_pct = 100usize.saturating_sub(down_pct.min(100));
+        let next = cur.saturating_mul(retained_pct) / 100;
         return next.max(min_v).min(max_v);
     }
-    if up_pct > 0 {
-        let next = cur.saturating_mul(100 + up_pct) / 100;
+    if up_pct > 0 && cur < max_v {
+        // Percentage growth performed with integer arithmetic must still make
+        // forward progress. Without the minimum increment, values such as
+        // 4 * 110 / 100 truncate back to 4 and permanently pin the adaptive
+        // controller at its floor after a pressure event.
+        let increase = cur.saturating_mul(up_pct).div_ceil(100).max(1);
+        let next = cur.saturating_add(increase);
         return next.max(min_v).min(max_v);
     }
-    cur.max(min_v).min(max_v)
+    cur
 }
 
 fn clamp_next_aligned(
@@ -147,5 +154,44 @@ pub async fn run_adaptive_concurrency_loop() {
         }
 
         tokio::time::sleep(Duration::from_millis(interval_ms())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_next;
+
+    #[test]
+    fn upward_recovery_always_advances_below_the_maximum() {
+        for current in 4..8 {
+            let next = clamp_next(current, 4, 8, 0, 10);
+            assert!(
+                next > current,
+                "adaptive recovery did not advance from {current}: {next}"
+            );
+            assert!(next <= 8);
+        }
+    }
+
+    #[test]
+    fn recovery_reaches_the_maximum_from_the_minimum() {
+        let mut current = 4;
+        for _ in 0..8 {
+            current = clamp_next(current, 4, 8, 0, 10);
+        }
+        assert_eq!(current, 8);
+    }
+
+    #[test]
+    fn pressure_reduction_respects_the_configured_floor() {
+        assert_eq!(clamp_next(8, 4, 8, 50, 0), 4);
+        assert_eq!(clamp_next(4, 4, 8, 50, 0), 4);
+    }
+
+    #[test]
+    fn stable_and_out_of_range_targets_remain_bounded() {
+        assert_eq!(clamp_next(3, 4, 8, 0, 0), 4);
+        assert_eq!(clamp_next(12, 4, 8, 0, 10), 8);
+        assert_eq!(clamp_next(8, 4, 8, 0, 10), 8);
     }
 }

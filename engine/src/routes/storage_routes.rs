@@ -38,7 +38,8 @@ use crate::core::storage_capacity_parser::{
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
     cancel_standard_upload_direct, cancel_upload_session as durable_cancel_upload_session_impl,
-    complete_standard_upload, finalize_object_upload as durable_finalize_object_upload_impl,
+    complete_standard_upload,
+    finalize_object_upload_direct as durable_finalize_object_upload_direct,
     finalize_standard_upload_direct, find_reusable_standard_upload,
     get_standard_upload_status_direct, get_upload_status as durable_get_upload_status_impl,
     initiate_object_upload as durable_initiate_object_upload_impl, initiate_standard_upload_direct,
@@ -1354,27 +1355,25 @@ async fn finalize_object_upload_durable_scoped(
         .as_ref()
         .map(|value| value.physical_object_id.clone())
         .unwrap_or_else(|| key_query.object_key.clone());
-    let response = durable_finalize_object_upload_impl(
-        State(state.clone()),
+    let finalized = durable_finalize_object_upload_direct(
         claims,
-        Path((fragment.clone(), version_id.clone(), session_id)),
-        Query(crate::core::disk_manager::ObjectKeyQuery {
-            object_key: physical.clone(),
-            version_id: key_query.version_id,
-            filename: None,
-        }),
-        AxumJson(params),
+        fragment.clone(),
+        version_id.clone(),
+        session_id,
+        physical.clone(),
+        params,
     )
-    .await?
-    .into_response();
-    if response.status() != StatusCode::OK {
-        return Ok(response);
-    }
+    .await?;
+    let mut parsed = match finalized {
+        crate::core::upload::FinalizeUploadResult::Complete(metadata) => metadata,
+        crate::core::upload::FinalizeUploadResult::Incomplete(incomplete) => {
+            return Ok((StatusCode::CONFLICT, AxumJson(incomplete)).into_response());
+        }
+    };
     let logical_path = binding
         .as_ref()
         .map(|value| value.logical_path.clone())
         .unwrap_or(key_query.object_key);
-    let mut parsed = index::read_object_version(&fragment, &physical, &version_id).await?;
     let committed_physical =
         commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed)
             .await?;

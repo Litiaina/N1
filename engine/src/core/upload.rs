@@ -1484,18 +1484,14 @@ pub async fn finalize_object_upload_direct(
         .as_ref()
         .map(manifest_data_shards)
         .unwrap_or_else(configured_data_shards);
-    let mut found_data_roots = 0usize;
-
-    for root in &blob_roots {
-        let shard_dir_check =
-            path_manager.get_shard_dir_on_disk(root, &fragment, &object_key, &version_id);
-        if tokio_fs::try_exists(&shard_dir_check)
-            .await
-            .unwrap_or(false)
-        {
-            found_data_roots += 1;
-        }
-    }
+    let shard_dir_checks = blob_roots
+        .iter()
+        .map(|root| path_manager.get_shard_dir_on_disk(root, &fragment, &object_key, &version_id));
+    let found_data_roots = join_all(shard_dir_checks.map(tokio_fs::try_exists))
+        .await
+        .into_iter()
+        .filter(|result| matches!(result, Ok(true)))
+        .count();
 
     if found_data_roots < required_data_shards {
         error!(
@@ -1512,33 +1508,54 @@ pub async fn finalize_object_upload_direct(
 
     if let Some(m) = manifest.as_ref() {
         let receipts = index::load_session_part_receipts(&fragment, &version_id, m).await?;
-        for i in 0..expected_parts {
-            let mut resolved = None;
+        let validation_concurrency = (expected_parts as usize).clamp(1, 8);
+        let path_manager_ref = &path_manager;
+        let fragment_ref = fragment.as_str();
+        let version_id_ref = version_id.as_str();
+        let resolved_parts = futures_util::stream::iter(0..expected_parts)
+            .map(|i| {
+                let receipt = receipts
+                    .as_ref()
+                    .and_then(|items| items.get(i as usize))
+                    .and_then(|entry| entry.clone());
+                async move {
+                    let mut resolved = None;
 
-            if let Some(receipt) = receipts
-                .as_ref()
-                .and_then(|items| items.get(i as usize))
-                .and_then(|entry| entry.as_ref())
-            {
-                resolved = reconstruct_part_meta_from_receipt(&path_manager, m, receipt).await?;
-            }
+                    if let Some(receipt) = receipt.as_ref() {
+                        resolved = reconstruct_part_meta_from_receipt(
+                            path_manager_ref,
+                            m,
+                            receipt,
+                        )
+                        .await?;
+                    }
 
-            if resolved.is_none() && m.part_size_bytes > 0 {
-                resolved = reconstruct_part_meta_from_disk(&path_manager, m, i).await?;
-            }
+                    if resolved.is_none() && m.part_size_bytes > 0 {
+                        resolved =
+                            reconstruct_part_meta_from_disk(path_manager_ref, m, i).await?;
+                    }
 
-            if resolved.is_none() {
-                resolved = read_part_meta_any(&fragment, &version_id, i).await;
-            }
+                    if resolved.is_none() {
+                        resolved = read_part_meta_any(fragment_ref, version_id_ref, i).await;
+                    }
 
-            if resolved.is_some() && !part_exists_on_disk(&path_manager, m, i).await? {
-                warn!(
-                    "Finalization deferred for {}/{} part {} because its complete recorded EC shard set is not present",
-                    fragment, version_id, i
-                );
-                resolved = None;
-            }
+                    if resolved.is_some() && !part_exists_on_disk(path_manager_ref, m, i).await? {
+                        warn!(
+                            "Finalization deferred for {}/{} part {} because its complete recorded EC shard set is not present",
+                            fragment_ref, version_id_ref, i
+                        );
+                        resolved = None;
+                    }
 
+                    Ok::<_, AppError>((i, resolved))
+                }
+            })
+            .buffer_unordered(validation_concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        for result in resolved_parts {
+            let (i, resolved) = result?;
             if let Some(pm) = resolved {
                 present.insert(i);
                 parts.push(pm);
