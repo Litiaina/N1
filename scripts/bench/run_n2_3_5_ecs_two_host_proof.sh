@@ -4,7 +4,9 @@ set -Eeuo pipefail
 # Finite N2 3.5 proof for one real 2+1 server pool across two physical hosts.
 # Node A owns two local roots. Nodes B and C each own two remote roots. The
 # caller must provide six new, isolated directories; this script never formats
-# a device or reuses an existing N2 root.
+# a device or reuses an existing N2 root. In addition to the normal data path,
+# the proof denies one root while its node remains online, crashes coordinators
+# with SIGKILL, and verifies restart-resumable durable/namespace operations.
 
 : "${N2_ECS_BIN:?set N2_ECS_BIN to the tested litiaina-n2 release binary}"
 : "${N2_ECS_OUT:?set N2_ECS_OUT to a new evidence directory}"
@@ -49,6 +51,11 @@ MASTER="n2-ecs-master-$RUN_ID"
 FRAGMENT_KEY="n2-ecs-fragment-$RUN_ID"
 TOKEN=""
 RESULT="FAIL"
+ROOT_FALLBACK_KEY=""
+ROOT_FALLBACK_REPAIR_VERSION=""
+ROOT_FALLBACK_WRITE_VERSION=""
+DURABLE_VERSION=""
+PREFIX_OPERATION_ID=""
 
 SSH=(ssh)
 SCP=(scp)
@@ -116,6 +123,11 @@ stop_remote_node() {
   remote "if [ -f '$run/n2.pid' ]; then pid=\$(cat '$run/n2.pid'); kill \"\$pid\" 2>/dev/null || true; for i in \$(seq 1 50); do kill -0 \"\$pid\" 2>/dev/null || break; sleep 0.1; done; kill -9 \"\$pid\" 2>/dev/null || true; rm -f '$run/n2.pid'; fi"
 }
 
+crash_remote_node() {
+  local run="$1"
+  remote "if [ -f '$run/n2.pid' ]; then pid=\$(cat '$run/n2.pid'); kill -9 \"\$pid\" 2>/dev/null || true; rm -f '$run/n2.pid'; fi"
+}
+
 collect_remote_logs() {
   copy_remote "$REMOTE_USER@$REMOTE_IP:$REMOTE_B/server.log" "$OUT/node-b.log" >/dev/null 2>&1 || true
   copy_remote "$REMOTE_USER@$REMOTE_IP:$REMOTE_C/server.log" "$OUT/node-c.log" >/dev/null 2>&1 || true
@@ -123,6 +135,8 @@ collect_remote_logs() {
 
 cleanup() {
   set +e
+  chmod 0755 "$LOCAL_ROOT_1" "$LOCAL_ROOT_2" >/dev/null 2>&1 || true
+  remote "chmod 0755 '$REMOTE_ROOT_1' '$REMOTE_ROOT_2' '$REMOTE_ROOT_3' '$REMOTE_ROOT_4'" >/dev/null 2>&1 || true
   kill_local
   stop_remote_node "$REMOTE_B" >/dev/null 2>&1 || true
   stop_remote_node "$REMOTE_C" >/dev/null 2>&1 || true
@@ -416,6 +430,124 @@ for root in "$LOCAL_ROOT_1" "$LOCAL_ROOT_2"; do
 done
 remote "for root in '$REMOTE_ROOT_1' '$REMOTE_ROOT_2' '$REMOTE_ROOT_3' '$REMOTE_ROOT_4'; do count=\$(find \"\$root\" -type f \( -name '*.shard' -o -name '*.parity' \) | wc -l); test \"\$count\" -gt 0; printf '%s %s\\n' \"\$root\" \"\$count\"; done" >"$OUT/remote-root-distribution.txt"
 
+# Prove that an N2 node is the EC failure domain, not one permanently bound
+# disk. Select an object whose node-A piece resides on root-a1, deny that root,
+# then require repair and a new version to use root-a2 while node A stays live.
+for candidate in $(seq 1 64); do
+  ROOT_FALLBACK_KEY="disk-fallback/candidate-$candidate.bin"
+  curl_auth -X POST "$B_BASE/noa/v1/upload/one-shot/$ROOT_FALLBACK_KEY" \
+    --data-binary @"$OUT/small.bin" >"$OUT/root-fallback-candidate-$candidate.json"
+  ROOT_FALLBACK_REPAIR_VERSION="$(jq -er '.version_id' "$OUT/root-fallback-candidate-$candidate.json")"
+  if find "$LOCAL_ROOT_1" -path "*/$ROOT_FALLBACK_REPAIR_VERSION/part_0_*" -type f -print -quit | grep -q .; then
+    break
+  fi
+  ROOT_FALLBACK_KEY=""
+  ROOT_FALLBACK_REPAIR_VERSION=""
+done
+[[ -n "$ROOT_FALLBACK_KEY" && -n "$ROOT_FALLBACK_REPAIR_VERSION" ]]
+if find "$LOCAL_ROOT_2" -path "*/$ROOT_FALLBACK_REPAIR_VERSION/part_0_*" -type f -print -quit | grep -q .; then
+  echo "selected root-fallback piece already exists on both local roots" >&2
+  exit 1
+fi
+
+chmod 0000 "$LOCAL_ROOT_1"
+sleep 1
+curl_auth "$B_BASE/noa/v1/cluster/health" >"$OUT/health-local-root-lost.json"
+jq -e '
+  .effective_client_writable == true
+  and .write_authority_proven == true
+  and any(.nodes[];
+    .node_id == "node-a"
+    and .accepts_writes == true
+    and .storage_readable == true
+    and .storage_writable == true
+    and (.storage_issues | length) > 0)
+' "$OUT/health-local-root-lost.json" >/dev/null
+
+for base in "$A_BASE" "$B_BASE" "$C_BASE"; do
+  curl -k --http1.1 -sS -X POST "$base/noa/v1/cluster/healing/cycle" \
+    -H "Authorization: Bearer $TOKEN" >"$OUT/root-fallback-heal-$(echo "$base" | tr ':/' '_').json" || true
+done
+for _ in $(seq 1 240); do
+  if find "$LOCAL_ROOT_2" -path "*/$ROOT_FALLBACK_REPAIR_VERSION/part_0_*" -type f -print -quit | grep -q .; then
+    break
+  fi
+  sleep 0.25
+done
+find "$LOCAL_ROOT_2" -path "*/$ROOT_FALLBACK_REPAIR_VERSION/part_0_*" -type f -print -quit | grep -q .
+
+curl_auth -X POST "$C_BASE/noa/v1/upload/one-shot/$ROOT_FALLBACK_KEY" \
+  --data-binary @"$OUT/small.bin" >"$OUT/root-fallback-write.json"
+ROOT_FALLBACK_WRITE_VERSION="$(jq -er '.version_id' "$OUT/root-fallback-write.json")"
+find "$LOCAL_ROOT_2" -path "*/$ROOT_FALLBACK_WRITE_VERSION/part_0_*" -type f -print -quit | grep -q .
+curl_auth -G "$A_BASE/noa/v1/objects/download" \
+  --data-urlencode "object_key=$ROOT_FALLBACK_KEY" -o "$OUT/root-fallback-download.bin"
+cmp -s "$OUT/small.bin" "$OUT/root-fallback-download.bin"
+
+chmod 0755 "$LOCAL_ROOT_1"
+curl_auth "$C_BASE/noa/v1/cluster/health" >"$OUT/health-local-root-restored.json"
+jq -e '
+  .effective_client_writable == true
+  and any(.nodes[];
+    .node_id == "node-a"
+    and .storage_readable == true
+    and .storage_writable == true
+    and (.storage_issues | length) == 0)
+' "$OUT/health-local-root-restored.json" >/dev/null
+
+# Durable multipart must recover its compact receipts after the owning
+# coordinator is killed. No standard in-memory upload guarantee is inferred.
+dd if="$OUT/source.bin" of="$OUT/durable-source.bin" bs=1M count=32 status=none
+dd if="$OUT/durable-source.bin" of="$OUT/durable-part-0.bin" bs=1M count=16 status=none
+dd if="$OUT/durable-source.bin" of="$OUT/durable-part-1.bin" bs=1M skip=16 count=16 status=none
+DURABLE_BYTES="$(stat -c%s "$OUT/durable-source.bin")"
+DURABLE_PART_BYTES="$(stat -c%s "$OUT/durable-part-0.bin")"
+DURABLE_SHA="$(sha256sum "$OUT/durable-source.bin" | awk '{print $1}')"
+curl_json -X POST "$B_BASE/noa/v1/upload/multipart/durable/init/crash/durable.bin" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":$DURABLE_BYTES,\"expected_parts\":2,\"part_size_bytes\":$DURABLE_PART_BYTES}" >"$OUT/durable-init.json"
+DURABLE_VERSION="$(jq -er '.version_id' "$OUT/durable-init.json")"
+DURABLE_SESSION="$(jq -er '.session_id' "$OUT/durable-init.json")"
+# This proof initializes directly against node B, so node B owns the session.
+# coordinator_node_id is gateway routing metadata and is not part of the
+# direct-engine initialization response.
+curl_auth -X PUT "$B_BASE/noa/v1/upload/multipart/durable/$DURABLE_VERSION/0" \
+  --data-binary @"$OUT/durable-part-0.bin" >"$OUT/durable-part-0.json"
+curl_auth -X PUT "$B_BASE/noa/v1/upload/multipart/durable/$DURABLE_VERSION/1" \
+  --data-binary @"$OUT/durable-part-1.bin" >"$OUT/durable-part-1.json"
+crash_remote_node "$REMOTE_B"
+sleep 1
+start_remote "$REMOTE_B"
+wait_ping "$B_BASE"
+curl_auth "$B_BASE/noa/v1/upload/multipart/durable/$DURABLE_VERSION" >"$OUT/durable-status-after-crash.json"
+jq -e '(.uploaded_parts | sort) == [0,1]' "$OUT/durable-status-after-crash.json" >/dev/null
+curl_json -X POST "$B_BASE/noa/v1/upload/multipart/durable/$DURABLE_VERSION/$DURABLE_SESSION/finalize?object_key=crash/durable.bin" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{\"content_type\":\"application/octet-stream\",\"total_size_bytes\":$DURABLE_BYTES,\"expected_parts\":2,\"part_size_bytes\":$DURABLE_PART_BYTES}" >"$OUT/durable-finalize.json"
+curl_auth -G "$C_BASE/noa/v1/objects/download" \
+  --data-urlencode 'object_key=crash/durable.bin' -o "$OUT/durable-download.bin"
+[[ "$(sha256sum "$OUT/durable-download.bin" | awk '{print $1}')" == "$DURABLE_SHA" ]]
+
+# Prefix mutation is persisted before execution. Kill its coordinator after
+# acceptance, require a nonterminal record on disk, then let restart recovery
+# resume the same mutation ULID to completion without duplicate publication.
+curl_json -X POST "$C_BASE/noa/v1/posix/rename" -H "Authorization: Bearer $TOKEN" \
+  -d '{"source_path":"renamed","destination_path":"restart-renamed"}' >"$OUT/restart-prefix-rename.json"
+PREFIX_OPERATION_ID="$(jq -er '.operation_id' "$OUT/restart-prefix-rename.json")"
+crash_remote_node "$REMOTE_C"
+PREFIX_RECORD="$REMOTE_C/state/.n2/namespace-operations/$PREFIX_OPERATION_ID.json"
+remote "test -f '$PREFIX_RECORD'"
+[[ -n "$PREFIX_RECORD" ]]
+PREFIX_STATE_AFTER_CRASH="$(remote "jq -r '.state' '$PREFIX_RECORD'")"
+[[ "$PREFIX_STATE_AFTER_CRASH" == "planning" || "$PREFIX_STATE_AFTER_CRASH" == "running" ]]
+start_remote "$REMOTE_C"
+wait_ping "$C_BASE"
+await_namespace_operation "$C_BASE" "$OUT/restart-prefix-rename.json"
+jq -e '.state == "completed" and .affected_paths == 96' "$OUT/restart-prefix-rename.json" >/dev/null
+curl_auth -G "$A_BASE/noa/v1/objects" \
+  --data-urlencode 'prefix=restart-renamed/' --data-urlencode 'limit=128' >"$OUT/restart-renamed-list.json"
+jq -e '.entries | length == 96' "$OUT/restart-renamed-list.json" >/dev/null
+
 stop_remote_node "$REMOTE_C"
 sleep 2
 DEGRADED_STATUS="$(curl -k --http1.1 -sS -o "$OUT/degraded-upload.json" -w '%{http_code}' \
@@ -468,13 +600,18 @@ jq -n \
   --arg binary_sha256 "$BIN_SHA" \
   --arg fragment "$FRAGMENT" \
   --arg degraded_status "$DEGRADED_STATUS" \
+  --arg root_fallback_repair_version "$ROOT_FALLBACK_REPAIR_VERSION" \
+  --arg root_fallback_write_version "$ROOT_FALLBACK_WRITE_VERSION" \
+  --arg durable_version "$DURABLE_VERSION" \
+  --arg prefix_operation_id "$PREFIX_OPERATION_ID" \
+  --arg prefix_state_after_crash "$PREFIX_STATE_AFTER_CRASH" \
   --slurpfile upload "$OUT/upload-throughput.json" \
   --slurpfile download_a "$OUT/download-a-throughput.json" \
   --slurpfile download_b "$OUT/download-b-throughput.json" \
   --slurpfile download_c "$OUT/download-c-throughput.json" \
   --slurpfile initial "$OUT/health-initial.json" \
   --slurpfile final "$OUT/health-final.json" \
-  '{result:$result,run_id:$run_id,binary_sha256:$binary_sha256,topology:{physical_hosts:2,logical_nodes:3,roots_per_node:2,ec:"2+1",ncnx_replicas:2},fragment:$fragment,byte_exact_downloads:["node-a","node-b","node-c","reconstructed","post-restart"],small_objects:96,paginated_listing:true,prefix_rename_objects:96,every_root_received_pieces:true,degraded_write_http_status:($degraded_status|tonumber),missing_shard_reconstructed_and_healed:true,restart_persistence:true,throughput:{upload:$upload[0],download_node_a:$download_a[0],download_node_b:$download_b[0],download_node_c:$download_c[0]},health:{initial:$initial[0],final:$final[0]}}' >"$OUT/summary.json"
+  '{result:$result,run_id:$run_id,binary_sha256:$binary_sha256,topology:{physical_hosts:2,logical_nodes:3,roots_per_node:2,ec:"2+1",ncnx_replicas:2},fragment:$fragment,byte_exact_downloads:["node-a","node-b","node-c","root-fallback","durable-after-coordinator-crash","reconstructed","post-restart"],small_objects:96,paginated_listing:true,prefix_rename_objects:96,every_root_received_pieces:true,local_root_loss:{node_remained_writable:true,missing_piece_relocated:true,write_used_surviving_root:true,repair_version:$root_fallback_repair_version,write_version:$root_fallback_write_version},durable_multipart_coordinator_crash:{receipts_recovered:true,finalized_byte_exactly:true,version:$durable_version},prefix_operation_coordinator_crash:{state_after_crash:$prefix_state_after_crash,resumed_same_operation:true,operation_id:$prefix_operation_id,affected_paths:96},degraded_write_http_status:($degraded_status|tonumber),missing_shard_reconstructed_and_healed:true,restart_persistence:true,throughput:{upload:$upload[0],download_node_a:$download_a[0],download_node_b:$download_b[0],download_node_c:$download_c[0]},health:{initial:$initial[0],final:$final[0]}}' >"$OUT/summary.json"
 
 RESULT="PASS"
 echo "N2 3.5 ECS two-host proof: PASS"

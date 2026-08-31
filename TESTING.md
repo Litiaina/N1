@@ -84,6 +84,42 @@ embedded erasure implementation with ECS Core. It does not replace the wider
 topology, independent-power-domain, disk-full, partition-at-publication, or
 long-duration gates below.
 
+### N2 3.5 continued disk and coordinator-crash proof — PASS
+
+The expanded isolated proof completed on 2026-08-30 with result `PASS`.
+
+Private evidence bundle: `n2-ecs-3.5-fault-20260830-124150`.
+
+The exact optimized binary had SHA-256
+`8cec0e031e0fadd5e60509c986c979f0ab2204ff869c7f1ed2e3fe8a6576b86b`.
+It retained the same bounded topology: three logical nodes on two physical
+hosts, two roots per node, one exact EC `2 + 1` server pool, two NCNX replicas,
+and no reserve. Machine identities, addresses, credentials, and storage paths
+are intentionally excluded.
+
+In addition to rerunning the normal multipart, concurrent-create, pagination,
+rename, degraded-write, reconstruction, healing, and restart path, this run
+proved:
+
+- one enrolled root became unreadable and unwritable while its node remained
+  online; health reported the exact root fault while preserving proven write
+  authority through the node's other root;
+- repair relocated an immutable missing piece to the surviving root, and a
+  later object version also selected that surviving root;
+- durable multipart retained both completed-part receipts across a coordinator
+  `SIGKILL`, finalized after restart, and downloaded byte-exactly;
+- a persisted 96-object prefix rename was killed in `planning`, recovered the
+  same operation ULID after restart, and completed exactly 96 paths;
+- complete loss of one parity-role node still admitted an authority-proven
+  HTTP 201 survival write;
+- deleted-shard reconstruction and autonomous healing passed; and
+- the final full-cluster restart returned healthy, fully protected, writable,
+  authority-proven state with no panic or fatal log matches.
+
+This closes the bounded local-root failover and coordinator restart-resumption
+gates for this topology. It does not claim independent power-domain, wider
+pool, sustained disk-full, or multi-rack qualification.
+
 ### Historical reconstruction-threshold write gate
 
 The earlier survival-write branch passed the complete debug and optimized

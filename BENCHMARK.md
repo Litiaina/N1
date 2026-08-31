@@ -36,6 +36,31 @@ network paths. They prove that the ECS extraction did not break N2's real
 streaming path; they are not disk-ceiling, network-ceiling, sustained-load,
 NVMe, wider-pool, or multi-rack benchmark claims.
 
+### Continued fault-proof measurement
+
+Raw evidence bundle: `n2-ecs-3.5-fault-20260830-124150`. It is retained
+privately outside the repository with host and storage identities excluded
+from this report. The optimized binary SHA-256 was
+`8cec0e031e0fadd5e60509c986c979f0ab2204ff869c7f1ed2e3fe8a6576b86b`.
+
+The same three-node, two-host, two-roots-per-node EC `2 + 1` topology was
+rerun with local-root denial, coordinator `SIGKILL` and restart, degraded
+write, shard deletion and healing, and full-cluster restart injected around
+the workload.
+
+| Operation | Result |
+| --- | ---: |
+| 128 MiB multipart upload | 53.086 MiB/s; finalized and byte exact |
+| 128 MiB read through logical node A | 35.799 MiB/s; SHA-256 exact |
+| 128 MiB read through logical node B | 108.772 MiB/s; SHA-256 exact |
+| 128 MiB read through logical node C | 104.495 MiB/s; SHA-256 exact |
+| Durable multipart after coordinator crash | 2/2 receipts recovered; byte exact |
+| Prefix rename after coordinator crash | 96/96 paths; same operation resumed |
+
+These figures are end-to-end observations from the fault-proof run, not
+isolated hardware ceilings. The correctness assertions and qualification
+boundary are recorded in [TESTING.md](TESTING.md).
+
 ## N2 3.4.1 Real Two-Host CRUD and Namespace Benchmark
 
 Raw evidence bundle: `n2-two-host-crud-benchmark-20260824`. It is retained
