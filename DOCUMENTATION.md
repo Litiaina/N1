@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 3.5.0 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, high-throughput and durable upload modes, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, archive download, and realtime namespace events.
+N1 3.5.1 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, high-throughput and durable upload modes, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, resumable bulk export, and realtime namespace events.
 
 N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -10,7 +10,7 @@ notes, see [VERIFICATION.md](VERIFICATION.md).
 
 ## Version And Release Status
 
-N1 `3.5.0` is the current development engine/package version. It is on the
+N1 `3.5.1` is the current development engine/package version. It is on the
 development release channel and is not a declaration that this engine line has
 reached its stable product milestone. Storage compatibility is tracked
 separately as engine format `3`; package updates within this development line
@@ -1213,7 +1213,7 @@ Cancel removes the pending upload session. GC can later reclaim orphaned partial
 
 Use the durable variant when unfinished-upload restart recovery matters more
 than maximum ingest throughput. Its existing replicated manifest, pending
-namespace binding, and compact part-receipt contract is unchanged in N1 3.5.0.
+namespace binding, and compact part-receipt contract is unchanged in N1 3.5.1.
 The request and response bodies are identical to standard multipart; insert
 `/durable` after `/multipart`:
 
@@ -1229,14 +1229,151 @@ DELETE /noa/v1/upload/multipart/durable/{version_id}
 Durable part upload continues to accept the `durability`,
 `strict_durability`, and `io_gate` query controls documented for the previous
 multipart contract. Existing native `n1://` multipart operations retain this
-durable restart-resumable behavior; N1 3.5.0 does not silently change their
+durable restart-resumable behavior; N1 3.5.1 does not silently change their
 established contract.
 
 ## Archive Download
 
-### `POST /noa/v1/objects/archive`
+### Restart-safe bulk export
 
-Downloads selected files or folders as an archive.
+N1 3.5.1 uses an asynchronous export job for large or operationally important
+folder downloads. The job captures one immutable version for every selected
+logical path, builds the complete archive before publication, survives an N1
+restart, and exposes a stable browser-resumable download.
+
+Create an export:
+
+```http
+POST /noa/v1/exports
+Authorization: Bearer <fragment-token>
+Content-Type: application/json
+```
+
+```json
+{
+  "keys": ["videos/clip.mp4"],
+  "prefixes": ["photos", "reports/2026"],
+  "format": "zip",
+  "filename": "account-export.zip",
+  "export_all": false,
+  "include_internal": false
+}
+```
+
+`format` is `zip` or `tar`. ZIP uses stored entries and ZIP64 so browsers can
+open archives larger than the classic ZIP limits without spending CPU on
+recompressing already-compressed media. TAR avoids a central directory and is
+preferred for extremely high entry counts. `include_internal=true` is rejected;
+an export can contain only the authenticated fragment's live user namespace.
+The create body is bounded to 4 MiB, at most 10,000 explicit keys, and at most
+1,024 prefixes. Use a prefix instead of enumerating millions of keys.
+
+An authenticated business layer whose user-visible path differs from its N1
+storage key may instead submit mapped entries:
+
+```json
+{
+  "entries": [
+    {
+      "object_key": "01K...opaque-storage-object",
+      "archive_path": "patients/2026/scan.dcm",
+      "version_id": "01K...immutable-version",
+      "offset_bytes": 0,
+      "length_bytes": 8388608
+    }
+  ],
+  "format": "zip",
+  "filename": "patient-records.zip"
+}
+```
+
+Mapped entries are mutually exclusive with `keys`, prefixes, and `export_all`.
+N1 validates every source path, exact immutable version, archive path, and byte
+range before publishing the manifest. Multiple entries may safely reference
+different byte ranges of one immutable source object, which lets Space export
+packed small objects without unpacking them into temporary files or exposing
+opaque storage identities as filenames.
+
+The create call returns `202 Accepted`:
+
+```json
+{
+  "export_id": "01K...",
+  "phase": "queued",
+  "status_url": "/noa/v1/exports/01K...",
+  "download_url": "/noa/v1/exports/01K.../download",
+  "expires_at_unix": 1788240000
+}
+```
+
+Read progress:
+
+```http
+GET /noa/v1/exports/{export_id}
+Authorization: Bearer <fragment-token>
+```
+
+Phases are `queued`, `capturing_manifest`, `building`, `ready`, `failed`, and
+`cancelled`. Progress reports selected/completed object counts and source byte
+counts. A ready status additionally returns `artifact_size_bytes`, a quoted
+SHA-256 `etag`, and `download_url`. A failed export contains a safe public
+`error`; exact failure context remains in N1 logs.
+
+Download when ready:
+
+```http
+GET /noa/v1/exports/{export_id}/download
+Authorization: Bearer <fragment-token>
+Range: bytes=33554432-
+If-Range: "<etag>"
+```
+
+The response has an exact `Content-Length`, `ETag`, `Accept-Ranges: bytes`, and
+`Content-Disposition`. A valid range returns `206 Partial Content` with
+`Content-Range`; an unsatisfiable or multi-range request returns `416`. Standard
+browser download managers and `curl -C -` can therefore resume the same
+artifact instead of restarting its object scan. `If-None-Match` returns `304`
+for an unchanged retained artifact.
+
+Cancel and remove a retained artifact:
+
+```http
+DELETE /noa/v1/exports/{export_id}
+Authorization: Bearer <fragment-token>
+```
+
+Cancellation returns `202 Accepted`. N1 never exposes an archive until every
+selected entry has been validated and every artifact chunk is durable. A crash
+during manifest capture repeats capture; a crash during build preserves the
+completed manifest, removes partial artifact chunks, and rebuilds that exact
+version set.
+
+The optional `[export]` configuration section is:
+
+```ini
+[export]
+retention_seconds=86400
+cleanup_interval_seconds=60
+max_concurrent_jobs=2
+max_queued_jobs=128
+object_read_concurrency=8
+artifact_chunk_size_bytes=16777216
+artifact_write_concurrency=4
+max_retained_bytes=0
+```
+
+`max_retained_bytes=0` leaves actual kernel writes authoritative. A nonzero
+value bounds ready artifacts plus admitted in-progress reservations. Export
+retention is independent of object-trash retention and never deletes source
+objects.
+
+### Compatibility streaming archive
+
+#### `POST /noa/v1/objects/archive`
+
+Streams selected files or folders directly to the caller. This compatibility
+path has no stable length or restart-resume identity; use `/noa/v1/exports` for
+large bulk download, unreliable networks, or browser retry support.
 
 Body:
 
@@ -1252,9 +1389,10 @@ Body:
 }
 ```
 
-Use `tar` for very large folder downloads. `zip` is available but is not ideal for very large archives.
+Use `tar` for very large folder downloads on this live-streaming path. `zip` is
+available but is not ideal for very large compatibility streams.
 
-### `POST /noa/v1/objects/archive/manifest`
+#### `POST /noa/v1/objects/archive/manifest`
 
 Streams an archive from a request manifest.
 

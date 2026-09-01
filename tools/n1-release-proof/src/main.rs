@@ -31,6 +31,7 @@ include!("proof_noa.rs");
 include!("proof_batch.rs");
 include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
+include!("proof_export.rs");
 include!("proof_multipart_resume.rs");
 include!("proof_auto_healing.rs");
 include!("proof_maintenance_coverage.rs");
@@ -48,7 +49,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.maintenance_coverage_proof {
+    let result = if proof.args.export_proof {
+        proof.run_export_proof().await
+    } else if proof.args.maintenance_coverage_proof {
         proof.run_maintenance_coverage_proof().await
     } else if proof.args.trash_maintenance_proof {
         proof.run_trash_maintenance_proof().await

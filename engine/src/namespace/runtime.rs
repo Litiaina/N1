@@ -673,6 +673,124 @@ impl NamespaceRuntime {
         .await
         .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
     }
+
+    /// Stream one immutable live-version reference per namespace entry from one
+    /// healthy namespace replica. Bulk export uses this path so a million-entry
+    /// selection is traversed once rather than rescanning the namespace for
+    /// every pagination boundary. Any broken entry fails the export instead of
+    /// silently producing an incomplete archive.
+    pub fn stream_live_object_refs(
+        &self,
+        fragment: &str,
+        prefix: Option<&str>,
+        channel_capacity: usize,
+    ) -> tokio::sync::mpsc::Receiver<Result<NamespaceObjectRef, AppError>> {
+        let fragment = fragment.to_string();
+        let prefix = match prefix.map(normalize_user_path).transpose() {
+            Ok(prefix) => prefix.unwrap_or_default(),
+            Err(error) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let _ = tx.try_send(Err(error));
+                return rx;
+            }
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity.max(1));
+
+        tokio::task::spawn_blocking(move || {
+            let Some(root) = index_roots()
+                .into_iter()
+                .find(|root| fragment_root_on(root, &fragment).is_dir())
+            else {
+                let _ = tx.blocking_send(Err(AppError::NotFound));
+                return;
+            };
+            let fragment_root = fragment_root_on(&root, &fragment);
+            let base = fragment_root.join(&prefix);
+            if !base.is_dir() {
+                return;
+            }
+
+            let walker = WalkDir::new(&base)
+                .min_depth(1)
+                .follow_links(false)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_entry(|entry| {
+                    entry.depth() == 0
+                        || !internal_namespace_entry_name(
+                            entry.file_name().to_string_lossy().as_ref(),
+                        )
+                });
+
+            for entry in walker {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(AppError::InternalServerError(format!(
+                            "walk N1 namespace export root: {error}"
+                        ))));
+                        return;
+                    }
+                };
+                if !entry.file_type().is_symlink() {
+                    continue;
+                }
+                let relative = match entry.path().strip_prefix(&base) {
+                    Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+                    Err(_) => {
+                        let _ = tx.blocking_send(Err(AppError::InternalServerError(
+                            "N1 namespace export entry escaped its traversal root".to_string(),
+                        )));
+                        return;
+                    }
+                };
+                let path = if prefix.is_empty() {
+                    relative
+                } else {
+                    format!("{prefix}/{relative}")
+                };
+                let object_id =
+                    match read_namespace_symlink_object_id(&root, &fragment, entry.path()) {
+                        Ok(Some(object_id)) => object_id,
+                        Ok(None) => {
+                            let _ = tx.blocking_send(Err(AppError::InternalServerError(format!(
+                                "N1 namespace export entry '{path}' has no object identity"
+                            ))));
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = tx.blocking_send(Err(error));
+                            return;
+                        }
+                    };
+                let metadata = match index_store::read_current_live_head(&fragment, &object_id) {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => {
+                        let _ = tx.blocking_send(Err(AppError::InternalServerError(format!(
+                            "N1 namespace export entry '{path}' has no live object version"
+                        ))));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(error));
+                        return;
+                    }
+                };
+                if tx
+                    .blocking_send(Ok(NamespaceObjectRef {
+                        path,
+                        object_id,
+                        version_id: metadata.version_id,
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        rx
+    }
 }
 
 fn index_roots() -> Vec<PathBuf> {

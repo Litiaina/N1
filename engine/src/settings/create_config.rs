@@ -24,6 +24,16 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("file_ttl_seconds", "3600")
         .set("trash_retention_seconds", "2592000");
 
+    conf.with_section(Some("export"))
+        .set("retention_seconds", "86400")
+        .set("cleanup_interval_seconds", "60")
+        .set("max_concurrent_jobs", "2")
+        .set("max_queued_jobs", "128")
+        .set("object_read_concurrency", "8")
+        .set("artifact_chunk_size_bytes", "16777216")
+        .set("artifact_write_concurrency", "4")
+        .set("max_retained_bytes", "0");
+
     conf.with_section(Some("auto_healing"))
         .set("enabled", "true")
         .set("topology_check_interval_seconds", "30")
@@ -117,6 +127,10 @@ mod tests {
             .expect("garbage_collector section");
         assert_eq!(gc.get("trash_retention_seconds"), Some("2592000"));
         assert!(gc.get("retention_seconds").is_none());
+        let export = ini.section(Some("export")).expect("export section");
+        assert_eq!(export.get("retention_seconds"), Some("86400"));
+        assert_eq!(export.get("artifact_chunk_size_bytes"), Some("16777216"));
+        assert_eq!(export.get("max_retained_bytes"), Some("0"));
         let auto_healing = ini
             .section(Some("auto_healing"))
             .expect("auto_healing section");

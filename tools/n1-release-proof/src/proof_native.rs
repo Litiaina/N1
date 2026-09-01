@@ -1004,14 +1004,14 @@ async fn read_native_response(
     let mut frame = vec![0u8; len];
     stream.read_exact(&mut frame).await?;
     let mut response = rmp_serde::from_slice::<NativeProofResponse>(&frame)?;
-    if response.body.is_none() {
-        if let Some(body_len) = response.body_len {
-            let mut body = vec![0u8; body_len as usize];
-            if !body.is_empty() {
-                stream.read_exact(&mut body).await?;
-            }
-            response.body = Some(serde_bytes::ByteBuf::from(body));
+    if response.body.is_none()
+        && let Some(body_len) = response.body_len
+    {
+        let mut body = vec![0u8; body_len as usize];
+        if !body.is_empty() {
+            stream.read_exact(&mut body).await?;
         }
+        response.body = Some(serde_bytes::ByteBuf::from(body));
     }
     if response.id != id {
         return Err(format!("native response id mismatch: got {} expected {}", response.id, id).into());

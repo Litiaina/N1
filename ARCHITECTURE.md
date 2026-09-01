@@ -1,15 +1,15 @@
 # N1 Object Storage Architecture
 
-This document defines the N1 3.5.0 development-engine storage contract. It is the reference for
+This document defines the N1 3.5.1 development-engine storage contract. It is the reference for
 object identity, namespace behavior, upload commit, repair, redistribution, and
 garbage collection.
 
-N1 3.5.0 uses engine format 3 and preserves N1's immutable-object and
+N1 3.5.1 uses engine format 3 and preserves N1's immutable-object and
 namespace-mutation architecture while introducing the TTL trash lifecycle,
 per-object EC-set authority, and autonomous repair.
 It does not open, adopt, or migrate any earlier N1 engine format.
 
-Version `3.5.0` identifies the current development package line; it does not
+Version `3.5.1` identifies the current development package line; it does not
 declare stable-release status. Engine format `3` is the independent on-disk
 compatibility boundary defined by this document.
 
@@ -485,7 +485,8 @@ Scheduler admission, progress tracking, and execution remain separate:
   wait expires
 - admitted operations have no arbitrary whole-operation deadline
 - upload/download streams record logical byte progress
-- repair, GC, and redistribution heartbeat during scans and rewrites
+- repair, GC, redistribution, and bulk-export construction heartbeat during
+  scans and rewrites
 - per-class latency, queue depth, failure, slow-path, and stall telemetry is
   bounded in memory
 
@@ -496,6 +497,54 @@ inherit N2 peer quorum, peer routing, or cluster job authority.
 Multipart encoding remains streaming. Shard writes and final flushes run in
 parallel within the admitted request budget. N1 does not buffer whole objects
 for EC.
+
+## Bulk Export
+
+Bulk export is an asynchronous projection of committed immutable object data;
+it is not a new authoritative object representation. The export manager stores
+durable job state and a version-pinned manifest below the configured filesystem
+state root:
+
+```text
+<fs_storage_path>/.n1-exports/<export-ulid>/
+  state.json
+  manifest.ndjson
+```
+
+Manifest capture traverses one healthy strict namespace replica once, validates
+every selected live entry, and records its logical archive path, stable object
+identity, exact version ULID, and byte size. A missing namespace or object
+record fails the complete job; N1 never silently publishes a partial export.
+Once the manifest is durable, restart recovery rebuilds from that same pinned
+version set rather than observing a newer namespace view.
+
+Archive bytes are generated through bounded object-read prefetch and written as
+fixed-size chunks across configured blob roots:
+
+```text
+<blob_root>/.n1-export-artifacts/<export-ulid>/chunk-<index>.bin
+```
+
+Manifest capture and archive construction hold a fragment-scoped background IO
+admission for the complete job and report progress through the shared disk
+scheduler. They therefore remain bounded beside repair, GC, and redistribution
+instead of creating an unaccounted IO path. Delivery of a ready artifact holds
+foreground-read admission for the complete HTTP body stream, including resumed
+range transfers, and releases it only after the requested bytes finish.
+
+Each chunk is synchronized and atomically renamed before the job becomes
+`ready`. The ready state contains the logical chunk order, exact content length,
+and whole-artifact SHA-256. HTTP download maps a single byte range onto only the
+required chunks and returns stable `Content-Length`, `ETag`, `Accept-Ranges`,
+and `Content-Range` headers. A process interruption before readiness exposes no
+downloadable partial archive. An interrupted build discards partial chunks and
+is regenerated after restart.
+
+Export chunks are retained conveniences, not EC-protected user objects. A
+missing or truncated chunk fails closed and the client creates a replacement
+export from authoritative N1 data. Cancellation and configured retention remove
+manifest, state, and artifact chunks. Retention capacity may be bounded by
+configuration; when its limit is zero, actual kernel writes remain authoritative.
 
 ## Transport Faces
 
@@ -527,7 +576,7 @@ The native face must not bypass:
 
 ## Locked Invariants
 
-N1 3.5.0 is correct only while all of these remain true:
+N1 3.5.1 is correct only while all of these remain true:
 
 1. Index roots own namespace/control state only.
 2. Blob roots own immutable object metadata and payload.
@@ -573,3 +622,9 @@ N1 3.5.0 is correct only while all of these remain true:
 42. Upload correctness relies on actual K+M kernel writes, not synchronous free-space prediction; no upload hot path scans total configured roots for capacity.
 43. Kernel capacity exhaustion publishes neither immutable object metadata nor a namespace entry and is reported as `507 Insufficient Storage` over HTTP and native transports.
 44. Standard batch upload preserves one independent EC set and commit boundary per object; durable multipart has no batch variant.
+45. A ready bulk export is derived only from one durable manifest of exact immutable object versions; later namespace mutations cannot change it.
+46. Bulk export fails as one job when any selected namespace entry, object metadata record, or payload is unavailable; silent archive omission is forbidden.
+47. Partial export artifacts are never downloadable, and restart recovery removes them before rebuilding the same pinned manifest.
+48. Export artifacts are retained non-authoritative projections; their loss cannot mutate object, namespace, EC, repair, or lifecycle truth.
+49. A mapped export entry pins an immutable source version and validated byte range independently from its archive path; logical business-layer names never alter N1 object identity.
+50. Multiple mapped entries may read disjoint ranges from one immutable packed object, while duplicate archive paths and out-of-bounds ranges fail the export before publication.

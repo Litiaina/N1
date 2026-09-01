@@ -2,7 +2,7 @@
 
 This document tracks release proof and hardening evidence. It is intentionally separate from the user guide.
 
-The current package line is N1 `3.5.0` on the development channel, using
+The current package line is N1 `3.5.1` on the development channel, using
 engine format `3`. Stable product status has not been declared for this engine
 line. Dated evidence names below remain unchanged because they identify the
 exact candidate binaries and runs that produced them.
@@ -45,6 +45,7 @@ Before an LTS release, N1 should pass:
 - no upload path performs synchronous topology-wide or selected-root free-space probes
 - kernel `ENOSPC`/quota failures return `507` and publish no object or namespace truth
 - standard small-object batch upload proves bounded concurrency, mixed-result isolation, and per-object EC/namespace identity
+- restart-safe bulk export proves exact archive contents, mapped immutable byte ranges, build interruption recovery, byte-range resume, cancellation, and retention cleanup
 
 ## Rust Release Proof Runner
 
@@ -67,6 +68,49 @@ proves persisted receipts and restart/resume. Both require download hash
 verification.
 
 ## Focused Proof Evidence
+
+### N1 3.5.1 Restart-safe Bulk Export Proof
+
+On September 1, 2026, the N1 3.5.1 candidate passed the dedicated optimized
+bulk-export proof on four distinct XFS HDDs with EC `3 + 1`.
+
+- The fixture contained `128` immutable objects and `134,217,728` source bytes.
+- The runner waited for phase `building`, forcibly terminated the N1 process,
+  restarted the same binary, and observed autonomous recovery to `ready` from
+  the durable version-pinned manifest.
+- The recovered ZIP64 artifact contained exactly `128` entries. Every entry's
+  decoded payload matched its deterministic source SHA-256, and the complete
+  `134,247,010`-byte artifact matched its published SHA-256 ETag.
+- Exact content length, stable ETag, `Accept-Ranges`, `206 Content-Range`,
+  conditional `304`, cancellation, and retention reclamation all passed.
+- Fixed-size artifact chunks used all four eligible blob roots. These chunks
+  remained retained projections and were removed without mutating source data.
+- A separate uninterrupted export materialized `128 MiB` in `3.371 s`, or
+  `37.967 MiB/s` source rate on the tested HDD workload. Server-local artifact
+  delivery measured `431.889 MiB/s`.
+- After integration with the shared disk scheduler, the exact final candidate
+  independently passed the same four-HDD EC `3 + 1` proof while the production
+  stack remained online on that hardware. It rebuilt `128 MiB` in `8.695 s`
+  (`14.721 MiB/s`) and delivered the retained artifact server-locally at
+  `306.112 MiB/s`. Scheduler telemetry recorded one clean
+  `background_export`, `134,217,728` logical bytes, zero stalls, and complete
+  permit release.
+- A real LAN client was terminated after `8,437,751` bytes. Browser-style range
+  resume returned HTTP `206` and `Content-Range: bytes
+  8437751-134247009/134247010`, transferred the remaining `125,809,259` bytes at
+  `111,765,172` bytes/s (`106.59 MiB/s`), and produced the exact final ETag with
+  all `128` ZIP entries intact.
+- Both forced-restart engine logs and the later LAN-serving log contained zero
+  warning, error, panic, critical, degraded, or failed lines.
+- The exact final source produced release binary SHA-256
+  `9e4168530223009d5cb52504c8eca4614b3d92abd012cf7d24e197e250619778`.
+  That exact binary passed build-interruption recovery, ZIP64 integrity, TAR
+  integrity, range, cancel, retention, and clean-log proof across four distinct
+  physical HDD roots. The final warnings-denied workspace gate passed `157`
+  engine tests, both ECS compatibility tests, `10` shell tests, `7` shell CLI
+  tests, all release-proof tests, and N1 doc tests.
+- Isolated engine processes and disk roots were removed after evidence
+  collection. No production data or service was modified.
 
 ### N1 3.5.0 ECS Core Integration and Four-Disk Release Proof
 

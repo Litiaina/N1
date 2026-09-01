@@ -1158,6 +1158,8 @@ pub async fn run_server() {
         serve_native_protocol(native_listener, native_addr, native_state).await;
     });
 
+    tokio::spawn(crate::core::export::run_export_manager());
+
     serve(storage_addr, serve_storage, cert).await;
 }
 

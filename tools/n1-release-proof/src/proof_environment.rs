@@ -17,13 +17,13 @@ impl Proof {
         }
         let roots = self.disk_roots()?;
         self.active_disk_count = roots.len();
-        let focused_single_root_noa = self.args.noa_api_proof
+        let focused_single_root_functional = (self.args.noa_api_proof || self.args.export_proof)
             && self.data_shards == 1
             && self.parity_shards == 0
             && roots.len() == 1;
-        if roots.len() < 2 && !focused_single_root_noa {
+        if roots.len() < 2 && !focused_single_root_functional {
             return Err(
-                "release proof requires at least two roots; only the focused NOA API proof permits an explicit 1+0 functional topology"
+                "release proof requires at least two roots; only focused NOA API and export proofs permit an explicit 1+0 functional topology"
                     .into(),
             );
         }
@@ -56,6 +56,20 @@ impl Proof {
                 "trash_retention_seconds must be at least 5 for deterministic recovery proofs"
                     .into(),
             );
+        }
+        if self.args.export_proof {
+            if self.args.export_objects == 0 {
+                return Err("export_objects must be at least 1".into());
+            }
+            if self.args.export_object_bytes == 0 {
+                return Err("export_object_bytes must be at least 1".into());
+            }
+            if self.args.export_upload_concurrency == 0 {
+                return Err("export_upload_concurrency must be at least 1".into());
+            }
+            if self.args.export_retention_seconds < 60 {
+                return Err("export_retention_seconds must be at least 60".into());
+            }
         }
         for root in &roots {
             if !root.is_dir() {
@@ -184,7 +198,7 @@ impl Proof {
         };
         let config = format!(
             r#"[server]
-host=127.0.0.1
+host={}
 https_port={}
 native_port={}
 cert_path={}
@@ -208,6 +222,16 @@ max_loaded_dbs=auto
 cleanup_interval_seconds=86400
 file_ttl_seconds=30
 trash_retention_seconds={}
+
+[export]
+retention_seconds={}
+cleanup_interval_seconds=5
+max_concurrent_jobs=2
+max_queued_jobs=32
+object_read_concurrency=8
+artifact_chunk_size_bytes=1048576
+artifact_write_concurrency=4
+max_retained_bytes=0
 
 [auto_healing]
 enabled={}
@@ -256,6 +280,7 @@ data_shards={}
 parity_shards={}
 stripe_block_size=262144
 "#,
+            self.args.listen_host,
             self.args.port,
             self.native_port(),
             cert.display(),
@@ -264,6 +289,7 @@ stripe_block_size=262144
             blob_roots,
             self.args.out_dir.join("fs").display(),
             self.args.trash_retention_seconds,
+            self.args.export_retention_seconds,
             auto_healing_enabled,
             topology_recovery_stability_seconds,
             initial_scan_delay_seconds,
@@ -292,22 +318,20 @@ stripe_block_size=262144
         self.server = Some(child);
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
-            if let Some(child) = self.server.as_mut() {
-                if let Some(status) = child.try_wait()? {
-                    return Err(format!("N1 exited during startup with {status}").into());
-                }
+            if let Some(child) = self.server.as_mut()
+                && let Some(status) = child.try_wait()?
+            {
+                return Err(format!("N1 exited during startup with {status}").into());
             }
             if let Ok(response) = self
                 .client
                 .get(format!("{}/noa/v1/ping", self.base_url))
                 .send()
                 .await
+                && response.status() == StatusCode::OK
+                && response.bytes().await?.as_ref() == b"pong"
             {
-                if response.status() == StatusCode::OK
-                    && response.bytes().await?.as_ref() == b"pong"
-                {
-                    return Ok(());
-                }
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

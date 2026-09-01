@@ -9,6 +9,7 @@ use crate::core::delete::{BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOp
 use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
 };
+use crate::core::export::{cancel_export, create_export, download_export, export_status};
 use crate::core::fragment_manager::{
     create_fragment, delete_fragment, get_fragment_hash, update_fragment, verify_fragment_existence,
 };
@@ -81,6 +82,7 @@ use tokio::task::JoinSet;
 use tower_http::cors::{Any, CorsLayer};
 
 const MAX_HTTP_BODY_SIZE: usize = 5 * 1024 * 1024 * 1024;
+const MAX_EXPORT_REQUEST_BODY_SIZE: usize = 4 * 1024 * 1024;
 
 pub struct AppState {
     pub ws_manager: WsConnectionManager,
@@ -1538,6 +1540,15 @@ pub fn build_storage_routes_unbound_with_options(
                 "/noa/v1/objects/archive/manifest",
                 post(download_manifest_archive_scoped),
             )
+            .route(
+                "/noa/v1/exports",
+                post(create_export).layer(DefaultBodyLimit::max(MAX_EXPORT_REQUEST_BODY_SIZE)),
+            )
+            .route(
+                "/noa/v1/exports/{:id}",
+                get(export_status).delete(cancel_export),
+            )
+            .route("/noa/v1/exports/{:id}/download", get(download_export))
             .merge(build_posix_read_routes());
 
         let read_ops = layers

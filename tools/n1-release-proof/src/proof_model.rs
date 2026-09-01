@@ -15,6 +15,8 @@ struct Args {
     out_dir: PathBuf,
     #[arg(long, default_value_t = 50_671)]
     port: u16,
+    #[arg(long, default_value = "127.0.0.1")]
+    listen_host: String,
     #[arg(long, default_value_t = 0)]
     native_port: u16,
     #[arg(long, default_value = "release-proof/")]
@@ -79,6 +81,16 @@ struct Args {
     native_transport_benchmark: bool,
     #[arg(long, default_value_t = false)]
     upload_benchmark: bool,
+    #[arg(long, default_value_t = false)]
+    export_proof: bool,
+    #[arg(long, default_value_t = 64)]
+    export_objects: usize,
+    #[arg(long, default_value_t = 512 * 1024)]
+    export_object_bytes: usize,
+    #[arg(long, default_value_t = 8)]
+    export_upload_concurrency: usize,
+    #[arg(long, default_value_t = 60)]
+    export_retention_seconds: u64,
     #[arg(long, default_value_t = false)]
     multipart_resume_proof: bool,
     #[arg(long, default_value_t = false)]

@@ -195,6 +195,32 @@ prove:
 - small-object evidence records objects/second, MiB/second, CPU cycles, latency percentiles, RSS, and disk I/O
 - scale analysis demonstrates no O(total configured disks) capacity work in any upload hot path
 
+## N1 3.5.1 Bulk Export Release Requirement
+
+N1 3.5.1 must preserve every engine-format-3 and 3.5.0 invariant and prove:
+
+- manifest capture traverses the selected live namespace once and pins logical path, object identity, exact version ULID, and byte size
+- missing or corrupt selected metadata fails the entire job instead of omitting an archive entry
+- no partial archive is downloadable before the durable `ready` boundary
+- process termination during manifest capture safely repeats capture after restart
+- process termination during artifact build reuses the completed immutable manifest, removes partial chunks, and rebuilds the same version set
+- ZIP64 and TAR artifacts reproduce the selected entry set and every entry's source SHA-256
+- mapped business-layer entries preserve their archive paths and export only the requested immutable source byte ranges, including multiple logical files sharing one packed source object
+- ready downloads return exact `Content-Length`, stable SHA-256 `ETag`, `Accept-Ranges: bytes`, and correct `206`/`416` behavior
+- an interrupted LAN download resumes through a single byte range and the final artifact hash still equals its ETag
+- artifact chunks use bounded concurrent writes and distribute across eligible blob roots without becoming authoritative object data
+- cancellation leaves no published artifact, and export retention removes job state, manifest, and chunks without touching source objects
+- queue, job, object-read, chunk-size, write, and optional retained-byte limits remain bounded
+- server-local build/delivery and LAN-resume measurements are recorded separately
+- release evidence contains topology labels and measurements but no host filesystem paths or credentials
+
+The focused Rust proof is invoked through `n1-release-proof --export-proof`.
+Use distinct physical roots for EC evidence; same-device directories are only a
+functional test. A complete proof deliberately kills the optimized N1 process
+while phase is `building`, restarts it, validates the recovered archive, creates
+a second uninterrupted performance export, tests cancel and TTL cleanup, and
+scans all engine logs with warnings/errors treated as failure.
+
 The reusable release runner has one bounded API gate and three focused
 autonomous-maintenance gates:
 

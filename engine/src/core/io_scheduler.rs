@@ -62,16 +62,18 @@ pub enum DiskIoClass {
     BackgroundRepair,
     BackgroundGc,
     BackgroundRedistribution,
+    BackgroundExport,
 }
 
 impl DiskIoClass {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
     const ALL: [Self; Self::COUNT] = [
         Self::ForegroundRead,
         Self::ForegroundWrite,
         Self::BackgroundRepair,
         Self::BackgroundGc,
         Self::BackgroundRedistribution,
+        Self::BackgroundExport,
     ];
 
     pub fn label(self) -> &'static str {
@@ -81,6 +83,7 @@ impl DiskIoClass {
             Self::BackgroundRepair => "background repair",
             Self::BackgroundGc => "background gc",
             Self::BackgroundRedistribution => "background redistribution",
+            Self::BackgroundExport => "background export",
         }
     }
 
@@ -91,6 +94,7 @@ impl DiskIoClass {
             Self::BackgroundRepair => "background_repair",
             Self::BackgroundGc => "background_gc",
             Self::BackgroundRedistribution => "background_redistribution",
+            Self::BackgroundExport => "background_export",
         }
     }
 
@@ -101,6 +105,7 @@ impl DiskIoClass {
             Self::BackgroundRepair => 2,
             Self::BackgroundGc => 3,
             Self::BackgroundRedistribution => 4,
+            Self::BackgroundExport => 5,
         }
     }
 
@@ -730,6 +735,7 @@ mod tests {
     fn scheduler_class_labels_are_operator_readable() {
         assert_eq!(DiskIoClass::ForegroundWrite.label(), "foreground write");
         assert_eq!(DiskIoClass::BackgroundRepair.label(), "background repair");
+        assert_eq!(DiskIoClass::BackgroundExport.label(), "background export");
     }
 
     #[test]

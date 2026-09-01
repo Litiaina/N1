@@ -101,10 +101,25 @@ POST   /noa/v1/objects/bulk-recover
 POST   /noa/v1/trash/recover-all
 POST   /noa/v1/objects/archive
 POST   /noa/v1/objects/archive/manifest
+POST   /noa/v1/exports
+GET    /noa/v1/exports/{export_id}
+GET    /noa/v1/exports/{export_id}/download
+DELETE /noa/v1/exports/{export_id}
 ```
 
 Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
 not add empty-trash, hard-delete, or per-version-delete semantics.
+
+The export family is the restart-safe bulk-download contract. Creation pins an
+exact immutable version set and returns an operation id; status exposes bounded
+progress; download becomes available only after the complete ZIP64 or TAR
+artifact is durable. Business layers may create exports with mapped
+`object_key`, `archive_path`, exact `version_id`, `offset_bytes`, and
+`length_bytes` entries so opaque or packed physical storage retains the correct
+user-visible archive namespace.
+Ready downloads have stable content length, SHA-256 ETag, and single-range
+resume support. Cancellation and export-specific retention
+remove only the derived artifact and never mutate source objects.
 
 ## Uploads
 

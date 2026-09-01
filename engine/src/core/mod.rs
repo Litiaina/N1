@@ -7,6 +7,7 @@ pub mod delete;
 pub mod disk_manager;
 pub mod download;
 pub mod ec;
+pub mod export;
 pub mod fragment_identity;
 pub mod fragment_manager;
 pub mod fragment_metadata;

@@ -1084,7 +1084,7 @@ impl Proof {
                         .get("d")
                         .and_then(|event| event.get("data"))
                         .cloned()
-                        .unwrap_or_else(|| json!(null));
+                        .unwrap_or(Value::Null);
                     let event_operation = data.get("operation").and_then(Value::as_str);
                     let event_path = data.get("path").and_then(Value::as_str);
                     let event_source = data.get("source_path").and_then(Value::as_str);

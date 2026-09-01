@@ -8,6 +8,7 @@ name = "n1-release-proof"
 path = "src/main.rs"
 
 [dependencies]
+async_zip.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 percent-encoding.workspace = true

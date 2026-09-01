@@ -796,19 +796,24 @@ impl Proof {
                 continue;
             }
             let text = fs::read_to_string(&path).unwrap_or_default();
+            let report_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("server.log")
+                .to_string();
             let mut line_count = 0usize;
             for (idx, line) in text.lines().enumerate() {
                 line_count += 1;
                 if log_line_is_failure(line) {
                     bad_lines.push(json!({
-                        "file": path,
+                        "file": report_name.clone(),
                         "line": idx + 1,
                         "text": line,
                     }));
                 }
             }
             files.push(json!({
-                "file": path,
+                "file": report_name,
                 "lines": line_count,
             }));
         }

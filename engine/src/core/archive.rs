@@ -31,6 +31,7 @@ use crate::{
         ShardInfo,
     },
     core::{
+        export::sanitize_export_filename,
         index,
         metadata_parser::{get_metadata, get_version_metadata},
         recovery::read_or_recover_chunk,
@@ -73,6 +74,9 @@ pub async fn download_selected_archive(
     AxumPath(fragment): AxumPath<String>,
     Json(req): Json<DownloadArchiveRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
     if claims.fragment != fragment {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
@@ -117,11 +121,11 @@ pub async fn download_selected_archive(
 
     let stream = stream_archive(fragment, selection, effective_format.to_string()).await?;
 
-    Ok(Response::builder()
+    Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from_stream(stream))
-        .unwrap())
+        .map_err(|error| AppError::InternalServerError(format!("build archive response: {error}")))
 }
 
 pub async fn download_logical_archive(
@@ -169,11 +173,13 @@ pub async fn download_logical_archive(
     )
     .await?;
 
-    Ok(Response::builder()
+    Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from_stream(stream))
-        .unwrap())
+        .map_err(|error| {
+            AppError::InternalServerError(format!("build logical archive response: {error}"))
+        })
 }
 
 pub async fn download_manifest_archive(
@@ -182,6 +188,9 @@ pub async fn download_manifest_archive(
     Query(query): Query<DownloadArchiveManifestQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
     if claims.fragment != fragment {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
@@ -201,14 +210,16 @@ pub async fn download_manifest_archive(
     )
     .await?;
 
-    Ok(Response::builder()
+    Response::builder()
         .header(header::CONTENT_TYPE, "application/x-tar")
         .header(
             header::CONTENT_DISPOSITION,
             archive_content_disposition(&filename, ".tar"),
         )
         .body(Body::from_stream(stream))
-        .unwrap())
+        .map_err(|error| {
+            AppError::InternalServerError(format!("build manifest archive response: {error}"))
+        })
 }
 
 fn canonical_key(key: &str) -> String {
@@ -216,17 +227,8 @@ fn canonical_key(key: &str) -> String {
 }
 
 fn archive_content_disposition(filename: &str, extension: &str) -> String {
-    let filename = filename.trim();
-    let filename = if filename.is_empty() {
-        "export"
-    } else {
-        filename
-    };
-    let with_extension = if filename.to_lowercase().ends_with(&extension.to_lowercase()) {
-        filename.to_string()
-    } else {
-        format!("{filename}{extension}")
-    };
+    let format = extension.trim_start_matches('.');
+    let with_extension = sanitize_export_filename(filename, format);
     format!("attachment; filename=\"{}\"", with_extension)
 }
 
@@ -922,16 +924,33 @@ async fn write_tar_archive(
     Ok(())
 }
 
-fn create_multipart_reader(
+pub(crate) fn create_multipart_reader(
     metadata: &ObjectMetadata,
 ) -> StreamReader<impl Stream<Item = std::io::Result<Bytes>> + Unpin, Bytes> {
-    let parts: std::collections::VecDeque<PartMetadata> = metadata.parts.clone().into();
+    create_multipart_range_reader(metadata, 0, metadata.total_size_bytes)
+}
+
+pub(crate) fn create_multipart_range_reader(
+    metadata: &ObjectMetadata,
+    offset_bytes: u64,
+    length_bytes: u64,
+) -> StreamReader<impl Stream<Item = std::io::Result<Bytes>> + Unpin, Bytes> {
+    let mut parts: std::collections::VecDeque<PartMetadata> = metadata.parts.clone().into();
+    let mut remaining_offset = offset_bytes;
+    while let Some(part) = parts.front() {
+        if remaining_offset < part.size_bytes {
+            break;
+        }
+        remaining_offset = remaining_offset.saturating_sub(part.size_bytes);
+        parts.pop_front();
+    }
     let stripe_size_bytes = metadata.stripe_size_bytes;
 
     struct ReaderState {
         parts_queue: std::collections::VecDeque<PartMetadata>,
         blob_dir: PathBuf,
         cursor_in_part: u64,
+        remaining_total: u64,
         file_cache: HashMap<String, StdFile>,
         stripe_size: usize,
     }
@@ -939,7 +958,8 @@ fn create_multipart_reader(
     let initial_state = ReaderState {
         parts_queue: parts,
         blob_dir: PathBuf::new(),
-        cursor_in_part: 0,
+        cursor_in_part: remaining_offset,
+        remaining_total: length_bytes,
         file_cache: HashMap::new(),
         stripe_size: stripe_size_bytes,
     };
@@ -949,13 +969,26 @@ fn create_multipart_reader(
         let mut buf = Vec::with_capacity(chunk_req_size);
 
         loop {
+            if state.remaining_total == 0 {
+                if !buf.is_empty() {
+                    return Some((Ok(Bytes::from(buf)), state));
+                }
+                return None;
+            }
             let part = match state.parts_queue.front() {
                 Some(p) => p,
                 None => {
                     if !buf.is_empty() {
                         return Some((Ok(Bytes::from(buf)), state));
                     }
-                    return None;
+                    state.remaining_total = 0;
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "immutable object parts ended before the requested byte range",
+                        )),
+                        state,
+                    ));
                 }
             };
 
@@ -968,7 +1001,10 @@ fn create_multipart_reader(
 
             let bytes_left_in_part = part.size_bytes - state.cursor_in_part;
             let bytes_to_fill = chunk_req_size - buf.len();
-            let bytes_to_read = std::cmp::min(bytes_left_in_part, bytes_to_fill as u64) as usize;
+            let bytes_to_read = std::cmp::min(
+                state.remaining_total,
+                std::cmp::min(bytes_left_in_part, bytes_to_fill as u64),
+            ) as usize;
 
             if bytes_to_read == 0 {
                 state.parts_queue.pop_front();
@@ -1017,6 +1053,8 @@ fn create_multipart_reader(
                     Ok(data) => {
                         buf.extend_from_slice(&data);
                         state.cursor_in_part += chunk_len as u64;
+                        state.remaining_total =
+                            state.remaining_total.saturating_sub(chunk_len as u64);
                         temp_bytes_read += chunk_len;
                     }
                     Err(e) => {
