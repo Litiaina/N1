@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File as StdFile;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize,
 use std::sync::{Arc, Weak};
 use std::sync::{LazyLock, Mutex, OnceLock as StdOnceLock, RwLock};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use axum::Json as AxumJson;
 use axum::body::Body;
@@ -42,6 +43,7 @@ pub use crate::core::linux_io::sync_dir;
 use crate::core::operation_gate::ensure_user_mutations_allowed;
 use crate::core::root_identity::configured_root_identity_is_current;
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::record_io_latency;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -339,6 +341,10 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
     } else {
         UploadDurabilityMode::Batched
     }
+}
+
+pub(crate) fn upload_uses_strict_durability(query: &UploadPartQuery) -> bool {
+    parse_upload_durability_mode(query).strict()
 }
 
 mod data_plane;
@@ -1077,13 +1083,13 @@ async fn upload_object_one_shot_inner(
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
+    let index_write_durability = if strict_durability {
+        index::IndexWriteDurability::Strict
     } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
+        index::IndexWriteDurability::Relaxed
     };
     if let Err(err) =
-        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
+        index::publish_object_with_durability(&object_meta, index_write_durability).await
     {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
             .await;
@@ -1265,13 +1271,13 @@ where
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
+    let index_write_durability = if strict_durability {
+        index::IndexWriteDurability::Strict
     } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
+        index::IndexWriteDurability::Relaxed
     };
     if let Err(err) =
-        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
+        index::publish_object_with_durability(&object_meta, index_write_durability).await
     {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
             .await;
@@ -1384,13 +1390,13 @@ where
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
+    let index_write_durability = if strict_durability {
+        index::IndexWriteDurability::Strict
     } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
+        index::IndexWriteDurability::Relaxed
     };
     if let Err(err) =
-        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
+        index::publish_object_with_durability(&object_meta, index_write_durability).await
     {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
             .await;

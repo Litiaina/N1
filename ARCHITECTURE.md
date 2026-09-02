@@ -255,19 +255,27 @@ same immutable final object representation.
 The standard high-throughput contract keeps its manifest and compact part
 completion state in bounded process memory. Initialization performs no storage
 write. Distinct parts independently claim one memory slot and stream through EC
-to the fixed object placement in parallel. There is no persistent binding or
-receipt. Finalize verifies that every part slot is complete, synchronizes all
-K+M shard files and their directories, publishes the immutable `.ndx`, and then
-publishes the namespace entry. Restart discards unfinished sessions; their
+to the fixed object placement in parallel, atomically publishing their stable
+K+M shard names only after each complete part. There is no persistent binding
+or receipt. Finalize verifies that every part slot is complete, publishes the
+immutable `.ndx`, and then publishes the namespace entry. It deliberately
+does not force every shard, metadata file, or parent directory to stable media;
+that would turn concurrent finalization into a K+M-times-parts flush storm.
+Restart discards unfinished sessions; their
 unreferenced shard versions remain invisible and the TTL orphan scan reclaims
 them. GC treats live in-memory version ids as active while the process exists.
+Standard completion is atomic and immediately readable, but recently completed
+standard writes may be lost by sudden power failure before the kernel flushes
+them. Clients requiring power-loss acknowledgement use durable multipart or an
+explicit strict one-shot upload.
 
 The standard small-object batch endpoint amortizes authentication and HTTP
 request overhead without combining object identities. Every multipart field
 is named `object` and carries its percent-encoded logical key as its filename.
-It consumes the request incrementally and keeps at most a bounded number of one-megabyte-or-smaller
-objects in flight, and sends every entry through the ordinary standard
-one-shot EC and namespace commit boundary. Each result succeeds or fails
+It consumes the request incrementally and keeps at most a globally bounded
+number of one-megabyte-or-smaller objects in flight across all clients, and
+sends every entry through the ordinary standard one-shot EC and namespace
+commit boundary. Each result succeeds or fails
 independently. There is no batch manifest, shared object, packed payload,
 durable upload receipt, or batch-wide rollback contract.
 
@@ -296,9 +304,12 @@ Finalize:
 5. publishes or updates the namespace symlink
 6. retires upload-session state
 
-Neither contract makes the namespace visible before immutable object truth is
-durable. Direct upload remains the bounded small-object path: one request body
-streams directly through EC and performs the same final publication boundary.
+Neither contract makes the namespace visible before all K+M writes and
+immutable object metadata are complete. The durable contract additionally
+forces its data and publication boundary to stable media before acknowledgement.
+Direct upload remains the bounded small-object path: one request body streams
+directly through EC and performs the selected standard or strict publication
+boundary.
 
 No upload performs synchronous `statvfs` or free-space prediction. Such a
 check races every concurrent writer and would add O(total roots) or O(K+M)

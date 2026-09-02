@@ -8,11 +8,14 @@ use rustix::fs::{CWD, renameat};
 use serde::Serialize;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
+#[cfg(test)]
+use crate::core::index_store::publish_namespace_link;
 use crate::core::index_store::{
     self, PendingUploadBinding, TRASH_DIR, TrashKind, TrashRecord, fragment_root_on,
-    internal_namespace_entry_name, namespace_path, new_object_id, publish_namespace_link,
-    read_namespace_symlink_object_id, reject_reserved_user_path, scan_trash_records,
-    trash_generation_name, visit_dir_names, visit_trash_records, write_pending_binding,
+    internal_namespace_entry_name, namespace_path, new_object_id,
+    publish_namespace_link_with_durability, read_namespace_symlink_object_id,
+    reject_reserved_user_path, scan_trash_records, trash_generation_name, visit_dir_names,
+    visit_trash_records, write_pending_binding,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -406,6 +409,24 @@ impl NamespaceRuntime {
         physical_object_id: &str,
         metadata: &ObjectMetadata,
     ) -> Result<String, AppError> {
+        self.finalize_logical_upload_with_durability(
+            fragment,
+            logical_path,
+            physical_object_id,
+            metadata,
+            true,
+        )
+        .await
+    }
+
+    pub async fn finalize_logical_upload_with_durability(
+        &self,
+        fragment: &str,
+        logical_path: &str,
+        physical_object_id: &str,
+        metadata: &ObjectMetadata,
+        strict_durability: bool,
+    ) -> Result<String, AppError> {
         let fragment = fragment.to_string();
         let logical_path = normalize_user_path(logical_path)?;
         let physical_object_id = physical_object_id.to_string();
@@ -473,9 +494,13 @@ impl NamespaceRuntime {
                 if already_present {
                     continue;
                 }
-                if let Err(err) =
-                    publish_namespace_link(&root, &fragment, &logical_path, &final_object_id)
-                {
+                if let Err(err) = publish_namespace_link_with_durability(
+                    &root,
+                    &fragment,
+                    &logical_path,
+                    &final_object_id,
+                    strict_durability,
+                ) {
                     for published_link in published.into_iter().rev() {
                         let _ = fs::remove_file(&published_link);
                         if let Some(parent) = published_link.parent() {

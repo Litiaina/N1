@@ -31,6 +31,7 @@ include!("proof_noa.rs");
 include!("proof_batch.rs");
 include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
+include!("proof_concurrent_upload.rs");
 include!("proof_export.rs");
 include!("proof_multipart_resume.rs");
 include!("proof_auto_healing.rs");
@@ -61,6 +62,8 @@ async fn main() {
         proof.run_object_maintenance_gate_proof().await
     } else if proof.args.multipart_resume_proof {
         proof.run_multipart_resume_proof().await
+    } else if proof.args.concurrent_upload_proof {
+        proof.run_concurrent_upload_proof().await
     } else if proof.args.upload_benchmark {
         proof.run_upload_benchmark().await
     } else if proof.args.native_transport_benchmark {

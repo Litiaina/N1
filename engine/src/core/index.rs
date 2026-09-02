@@ -13,9 +13,9 @@ static OBJECT_OP_LOCKS: LazyLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IndexReplicaWriteMode {
-    BackgroundBestEffort,
-    SyncBestEffort,
+pub enum IndexWriteDurability {
+    Relaxed,
+    Strict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +136,7 @@ pub async fn commit_session_part(
     fragment: &str,
     version_id: &str,
     part: &PartMetadata,
-    _replica_write_mode: IndexReplicaWriteMode,
+    _write_durability: IndexWriteDurability,
 ) -> Result<(), AppError> {
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
@@ -247,13 +247,13 @@ pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     run_index_blocking(move || index_store::upsert_live_version(&metadata)).await
 }
 
-pub async fn publish_object_with_replica_mode(
+pub async fn publish_object_with_durability(
     metadata: &ObjectMetadata,
-    replica_write_mode: IndexReplicaWriteMode,
+    write_durability: IndexWriteDurability,
 ) -> Result<(), AppError> {
     let metadata = metadata.clone();
     run_index_blocking(move || {
-        index_store::upsert_live_version_with_replica_mode(&metadata, replica_write_mode)
+        index_store::upsert_live_version_with_durability(&metadata, write_durability)
     })
     .await
 }

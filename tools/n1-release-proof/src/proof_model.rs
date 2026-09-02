@@ -82,6 +82,8 @@ struct Args {
     #[arg(long, default_value_t = false)]
     upload_benchmark: bool,
     #[arg(long, default_value_t = false)]
+    concurrent_upload_proof: bool,
+    #[arg(long, default_value_t = false)]
     export_proof: bool,
     #[arg(long, default_value_t = 64)]
     export_objects: usize,

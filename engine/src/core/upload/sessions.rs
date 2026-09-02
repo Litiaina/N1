@@ -640,53 +640,13 @@ pub fn list_standard_uploads_direct(
     })
 }
 
-async fn sync_standard_parts(parts: &[PartMetadata]) -> Result<(), AppError> {
-    let mut files_by_shard = BTreeMap::<usize, Vec<PathBuf>>::new();
-    let mut directories = BTreeSet::<PathBuf>::new();
-    for part in parts {
-        for shard in &part.shards {
-            let path = PathBuf::from(&shard.absolute_path);
-            let parent = path.parent().ok_or_else(|| {
-                AppError::InternalServerError("shard path has no parent".to_string())
-            })?;
-            directories.insert(parent.to_path_buf());
-            files_by_shard
-                .entry(shard.shard_index)
-                .or_default()
-                .push(path);
-        }
-    }
-
-    let tasks = files_by_shard.into_values().map(|files| {
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            for path in files {
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .map_err(|err| AppError::Io(err, format!("open shard {}", path.display())))?;
-                file.sync_data()
-                    .map_err(|err| AppError::Io(err, format!("sync shard {}", path.display())))?;
-            }
-            Ok(())
-        })
-    });
-    for result in join_all(tasks).await {
-        result.map_err(|err| {
-            AppError::InternalServerError(format!("standard upload sync task failed: {err}"))
-        })??;
-    }
-    for result in join_all(directories.iter().map(|path| sync_dir(path))).await {
-        result?;
-    }
-    Ok(())
-}
-
 pub async fn finalize_standard_upload_direct(
     claims: Claims,
     fragment: String,
     version_id: String,
     session_id: String,
 ) -> Result<FinalizeUploadResult, AppError> {
+    let finalize_started = Instant::now();
     ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
@@ -745,7 +705,6 @@ pub async fn finalize_standard_upload_direct(
             .map(|index| standard_part_metadata(&path_manager, &session, index))
             .collect::<Result<Vec<_>, _>>()?;
         parts.sort_by_key(|part| part.part_index);
-        sync_standard_parts(&parts).await?;
         let total_size_bytes = parts.iter().map(|part| part.size_bytes).sum();
         let metadata = ObjectMetadata {
             object_key: physical_object_key.clone(),
@@ -765,13 +724,29 @@ pub async fn finalize_standard_upload_direct(
         };
         let _object_lock =
             index::acquire_object_operation_lock(&fragment, &physical_object_key).await?;
-        index::publish_object(&metadata).await?;
+        let publish_started = Instant::now();
+        let publish_result =
+            index::publish_object_with_durability(&metadata, index::IndexWriteDurability::Relaxed)
+                .await;
+        record_io_latency(
+            "upload.standard.finalize.publish",
+            publish_started.elapsed(),
+            metadata.total_size_bytes,
+            publish_result.is_ok(),
+        );
+        publish_result?;
         Ok::<_, AppError>(metadata)
     }
     .await;
 
     match finalize_result {
         Ok(metadata) => {
+            record_io_latency(
+                "upload.standard.finalize.total",
+                finalize_started.elapsed(),
+                metadata.total_size_bytes,
+                true,
+            );
             session
                 .last_activity_at
                 .store(Utc::now().timestamp(), Ordering::Release);
@@ -781,6 +756,12 @@ pub async fn finalize_standard_upload_direct(
             Ok(FinalizeUploadResult::Complete(metadata))
         }
         Err(err) => {
+            record_io_latency(
+                "upload.standard.finalize.total",
+                finalize_started.elapsed(),
+                session.manifest.total_size_bytes,
+                false,
+            );
             session
                 .lifecycle
                 .store(STANDARD_SESSION_OPEN, Ordering::Release);

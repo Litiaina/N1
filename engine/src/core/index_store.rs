@@ -3,7 +3,7 @@ use super::disk_manager::{
     PartMetadata, ReservationReceipt,
 };
 use super::index::{
-    IndexReplicaWriteMode, IndexSessionState, SessionPartReceipt, TrashCatalogEntry,
+    IndexSessionState, IndexWriteDurability, SessionPartReceipt, TrashCatalogEntry,
 };
 use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_OBJECTS_DIR;
@@ -578,11 +578,22 @@ pub(crate) fn read_namespace_symlink_object_id(
     Ok(object_id_from_dir_name(name))
 }
 
+#[cfg(test)]
 pub(crate) fn publish_namespace_link(
     root: &Path,
     fragment: &str,
     logical_path: &str,
     object_id: &str,
+) -> Result<(), AppError> {
+    publish_namespace_link_with_durability(root, fragment, logical_path, object_id, true)
+}
+
+pub(crate) fn publish_namespace_link_with_durability(
+    root: &Path,
+    fragment: &str,
+    logical_path: &str,
+    object_id: &str,
+    strict_durability: bool,
 ) -> Result<(), AppError> {
     let logical_path = normalize_object_key(logical_path)?;
     let link = namespace_path(root, fragment, &logical_path);
@@ -608,7 +619,9 @@ pub(crate) fn publish_namespace_link(
     }
     let target = object_symlink_target(object_id)?;
     unix_fs::symlink(target, &link).map_err(|e| io_err(e, "publish N1 namespace link"))?;
-    sync_dir(parent);
+    if strict_durability {
+        sync_dir(parent);
+    }
     Ok(())
 }
 
@@ -1078,8 +1091,17 @@ pub(crate) fn sync_dir(path: &Path) {
     let _ = linux_io::sync_dir_blocking(path);
 }
 
+fn write_atomic_with_durability(
+    path: &Path,
+    bytes: &[u8],
+    strict_durability: bool,
+) -> Result<(), AppError> {
+    linux_io::atomic_write_blocking_with_durability(path, bytes, strict_durability)
+        .map_err(|e| io_err(e, "atomic write N1 file"))
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    linux_io::atomic_write_blocking(path, bytes).map_err(|e| io_err(e, "atomic write N1 file"))
+    write_atomic_with_durability(path, bytes, true)
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<bool, AppError> {
@@ -1096,7 +1118,10 @@ fn create_empty_marker(path: &Path) -> Result<(), AppError> {
         .map_err(|e| io_err(e, "create N1 marker"))
 }
 
-fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
+fn write_metadata_to_roots_with_durability(
+    metadata: &ObjectMetadata,
+    strict_durability: bool,
+) -> Result<(), AppError> {
     ensure_fragment_dirs(&metadata.fragment)?;
     let bytes = encode(metadata)?;
     let file_name = ndx_file_name(metadata);
@@ -1142,7 +1167,7 @@ fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
                 root.display()
             )));
         }
-        write_atomic(&object_dir.join(&file_name), &bytes)?;
+        write_atomic_with_durability(&object_dir.join(&file_name), &bytes, strict_durability)?;
         written += 1;
     }
     if written == 0 {
@@ -1152,6 +1177,10 @@ fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
         )));
     }
     Ok(())
+}
+
+fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
+    write_metadata_to_roots_with_durability(metadata, true)
 }
 
 pub(crate) fn object_metadata_placements_healthy(
@@ -1260,11 +1289,14 @@ pub fn upsert_live_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
     write_metadata_to_roots(metadata)
 }
 
-pub fn upsert_live_version_with_replica_mode(
+pub fn upsert_live_version_with_durability(
     metadata: &ObjectMetadata,
-    _mode: IndexReplicaWriteMode,
+    durability: IndexWriteDurability,
 ) -> Result<(), AppError> {
-    write_metadata_to_roots(metadata)
+    write_metadata_to_roots_with_durability(
+        metadata,
+        matches!(durability, IndexWriteDurability::Strict),
+    )
 }
 
 pub fn rebind_unpublished_object_version(

@@ -609,8 +609,16 @@ impl Proof {
         });
         let results = join_all(futures).await;
         let mut reports = Vec::new();
+        let mut max_finalize_ms = 0u64;
         for result in results {
             let report = result?;
+            max_finalize_ms = max_finalize_ms.max(
+                report
+                    .get("upload")
+                    .and_then(|upload| upload.get("finalize_elapsed_ms"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            );
             if let Some(key) = report.get("object_key").and_then(Value::as_str) {
                 expected.insert(key.to_string());
             }
@@ -619,6 +627,8 @@ impl Proof {
         Ok(json!({
             "users": users,
             "elapsed_s": round3(start.elapsed().as_secs_f64()),
+            "max_finalize_ms": max_finalize_ms,
+            "finalize_timeout_ms": 30_000,
             "reports": reports,
         }))
     }
@@ -930,6 +940,7 @@ impl Proof {
             "expected_parts": expected_parts,
             "part_size_bytes": part_size,
         });
+        let init_started = Instant::now();
         let response = self
             .client
             .post(format!(
@@ -941,6 +952,7 @@ impl Proof {
             .json(&params)
             .send()
             .await?;
+        let init_elapsed = init_started.elapsed();
         if response.status() != StatusCode::CREATED {
             return Err(format!(
                 "parallel multipart init failed: {} {}",
@@ -950,6 +962,7 @@ impl Proof {
             .into());
         }
         let init: MultipartInit = response.json().await?;
+        let parts_started = Instant::now();
         for (idx, chunk) in payload.chunks(part_size).enumerate() {
             let response = self
                 .client
@@ -971,19 +984,25 @@ impl Proof {
                 .into());
             }
         }
-        let response = self
-            .client
-            .post(format!(
-                "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
-                self.base_url,
-                init.version_id,
-                init.session_id,
-                encode_query_value(object_key)
-            ))
-            .bearer_auth(token)
-            .json(&params)
-            .send()
-            .await?;
+        let parts_elapsed = parts_started.elapsed();
+        let finalize_started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.client
+                .post(format!(
+                    "{}/noa/v1/upload/multipart/{}/{}/finalize?object_key={}",
+                    self.base_url,
+                    init.version_id,
+                    init.session_id,
+                    encode_query_value(object_key)
+                ))
+                .bearer_auth(token)
+                .json(&params)
+                .send(),
+        )
+        .await
+        .map_err(|_| format!("standard multipart finalization timed out for {object_key}"))??;
+        let finalize_elapsed = finalize_started.elapsed();
         if response.status() != StatusCode::OK {
             return Err(format!(
                 "parallel multipart finalize failed: {} {}",
@@ -999,6 +1018,9 @@ impl Proof {
             "part_size_bytes": part_size,
             "version_id": init.version_id,
             "session_id": init.session_id,
+            "init_elapsed_ms": init_elapsed.as_millis(),
+            "parts_elapsed_ms": parts_elapsed.as_millis(),
+            "finalize_elapsed_ms": finalize_elapsed.as_millis(),
             "elapsed_s": round3(start.elapsed().as_secs_f64()),
         }))
     }

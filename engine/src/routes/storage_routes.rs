@@ -38,8 +38,8 @@ use crate::core::storage_capacity_parser::{
 };
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
-    cancel_standard_upload_direct, cancel_upload_session as durable_cancel_upload_session_impl,
-    complete_standard_upload,
+    acquire_upload_io_guard_for_query, cancel_standard_upload_direct,
+    cancel_upload_session as durable_cancel_upload_session_impl, complete_standard_upload,
     finalize_object_upload_direct as durable_finalize_object_upload_direct,
     finalize_standard_upload_direct, find_reusable_standard_upload,
     get_standard_upload_status_direct, get_upload_status as durable_get_upload_status_impl,
@@ -47,9 +47,11 @@ use crate::core::upload::{
     list_active_uploads as durable_list_active_uploads_impl, list_standard_uploads_direct,
     object_upload_part as durable_object_upload_part_impl, object_upload_part_standard_body_direct,
     upload_object_one_shot as upload_object_one_shot_impl, upload_object_one_shot_body_direct,
+    upload_uses_strict_durability,
 };
 use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
+use crate::io_control::record_io_latency;
 use crate::middleware::auth_middleware::{
     authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
@@ -77,7 +79,7 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -282,6 +284,24 @@ pub(crate) async fn commit_logical_upload_from_meta(
 ) -> Result<String, AppError> {
     global_namespace_runtime()
         .finalize_logical_upload(fragment, logical_path, physical_object_id, metadata)
+        .await
+}
+
+async fn commit_logical_upload_from_meta_with_durability(
+    fragment: &str,
+    logical_path: &str,
+    physical_object_id: &str,
+    metadata: &crate::core::disk_manager::ObjectMetadata,
+    strict_durability: bool,
+) -> Result<String, AppError> {
+    global_namespace_runtime()
+        .finalize_logical_upload_with_durability(
+            fragment,
+            logical_path,
+            physical_object_id,
+            metadata,
+            strict_durability,
+        )
         .await
 }
 
@@ -881,18 +901,39 @@ async fn finalize_object_upload_scoped(
     AxumJson(_params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    match finalize_standard_upload_direct(claims, fragment.clone(), version_id.clone(), session_id)
-        .await?
+    let gate_context = format!("standard-finalize fragment={fragment}, version={version_id}");
+    let finalize_io_guard =
+        acquire_upload_io_guard_for_query(Some(true), &fragment, &gate_context).await?;
+    let response = match finalize_standard_upload_direct(
+        claims,
+        fragment.clone(),
+        version_id.clone(),
+        session_id,
+    )
+    .await?
     {
         crate::core::upload::FinalizeUploadResult::Incomplete(incomplete) => {
-            Ok((StatusCode::CONFLICT, AxumJson(incomplete)).into_response())
+            (StatusCode::CONFLICT, AxumJson(incomplete)).into_response()
         }
         crate::core::upload::FinalizeUploadResult::Complete(mut metadata) => {
             let logical_path = key_query.object_key;
             let physical = metadata.object_key.clone();
-            let committed_physical =
-                commit_logical_upload_from_meta(&fragment, &logical_path, &physical, &metadata)
-                    .await?;
+            let namespace_started = Instant::now();
+            let committed_result = commit_logical_upload_from_meta_with_durability(
+                &fragment,
+                &logical_path,
+                &physical,
+                &metadata,
+                false,
+            )
+            .await;
+            record_io_latency(
+                "upload.standard.finalize.namespace",
+                namespace_started.elapsed(),
+                metadata.total_size_bytes,
+                committed_result.is_ok(),
+            );
+            let committed_physical = committed_result?;
             complete_standard_upload(&fragment, &version_id)?;
             metadata.object_key = logical_path;
             emit_logical_file_uploaded(
@@ -903,9 +944,13 @@ async fn finalize_object_upload_scoped(
                 &metadata,
             );
             metadata.strip_internal_layout();
-            Ok((StatusCode::OK, AxumJson(metadata)).into_response())
+            (StatusCode::OK, AxumJson(metadata)).into_response()
         }
+    };
+    if let Some(guard) = finalize_io_guard {
+        guard.complete();
     }
+    Ok(response)
 }
 
 async fn cancel_upload_session_scoped(
@@ -962,6 +1007,7 @@ async fn upload_object_one_shot_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
+    let strict_durability = upload_uses_strict_durability(&query);
     let response = upload_object_one_shot_impl(
         State(state.clone()),
         claims,
@@ -979,8 +1025,14 @@ async fn upload_object_one_shot_scoped(
         parse_json_response(response, "one-shot upload").await?;
     let mut parsed =
         index::read_object_version(&fragment, &physical, &public_meta.version_id).await?;
-    let committed_physical =
-        commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
+    let committed_physical = commit_logical_upload_from_meta_with_durability(
+        &fragment,
+        &object_key,
+        &physical,
+        &parsed,
+        strict_durability,
+    )
+    .await?;
     parsed.object_key = object_key;
     emit_logical_file_uploaded(
         &state,
@@ -1029,9 +1081,8 @@ struct StandardBatchUploadResponse {
 }
 
 fn default_standard_batch_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|cores| cores.get().saturating_mul(4))
-        .unwrap_or(16)
+    crate::core::io_scheduler::disk_io_scheduler_snapshot()
+        .foreground_target
         .clamp(1, STANDARD_BATCH_MAX_CONCURRENCY)
 }
 
@@ -1086,11 +1137,17 @@ async fn upload_standard_batch_object(
     let size_bytes = bytes.len() as u64;
     let operation = async {
         let fragment = claims.fragment.clone();
+        let gate_context = format!("standard-batch fragment={fragment}, object={logical_path}");
+        let io_guard =
+            acquire_upload_io_guard_for_query(Some(true), &fragment, &gate_context).await?;
         let physical = resolve_logical_write_key(&fragment, &logical_path).await?;
         let query = crate::core::disk_manager::UploadPartQuery {
             checksum: None,
             durability: Some("batched".to_string()),
             strict_durability: Some(false),
+            // The outer batch guard spans the EC write, NCDX publication, and
+            // logical namespace commit, so the inner one-shot path must not
+            // acquire a second permit.
             io_gate: Some(false),
         };
         let mut metadata = upload_object_one_shot_body_direct(
@@ -1104,8 +1161,14 @@ async fn upload_standard_batch_object(
             false,
         )
         .await?;
-        let committed_physical =
-            commit_logical_upload_from_meta(&fragment, &logical_path, &physical, &metadata).await?;
+        let committed_physical = commit_logical_upload_from_meta_with_durability(
+            &fragment,
+            &logical_path,
+            &physical,
+            &metadata,
+            false,
+        )
+        .await?;
         metadata.object_key = logical_path.clone();
         emit_logical_file_uploaded(
             &state,
@@ -1114,6 +1177,9 @@ async fn upload_standard_batch_object(
             &committed_physical,
             &metadata,
         );
+        if let Some(guard) = io_guard {
+            guard.complete();
+        }
         Ok::<_, AppError>(metadata)
     }
     .await;

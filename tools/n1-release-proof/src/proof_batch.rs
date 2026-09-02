@@ -1,4 +1,93 @@
 impl Proof {
+    async fn concurrent_standard_batch_upload_proof(
+        &self,
+        expected: &mut BTreeSet<String>,
+    ) -> ProofResult<Value> {
+        const OBJECTS_PER_CLIENT: usize = 64;
+        const OBJECT_SIZE: usize = 16 * 1024;
+        let clients = self.args.mixed_users.clamp(2, 32);
+
+        let started = Instant::now();
+        let requests = (0..clients).map(|client_index| async move {
+            let mut form = reqwest::multipart::Form::new();
+            let mut keys = Vec::with_capacity(OBJECTS_PER_CLIENT);
+            let mut samples = Vec::new();
+            for object_index in 0..OBJECTS_PER_CLIENT {
+                let key = format!(
+                    "{}concurrent-standard-batch/client-{client_index:02}/file-{object_index:04}.bin",
+                    self.args.prefix
+                );
+                let payload = deterministic_payload(OBJECT_SIZE, key.as_bytes());
+                if object_index == 0 || object_index + 1 == OBJECTS_PER_CLIENT {
+                    samples.push((key.clone(), sha256_bytes(&payload)));
+                }
+                form = form.part(
+                    "object",
+                    reqwest::multipart::Part::bytes(payload)
+                        .file_name(encode_query_value(&key))
+                        .mime_str("application/octet-stream")?,
+                );
+                keys.push(key);
+            }
+
+            let request_started = Instant::now();
+            let response = tokio::time::timeout(
+                Duration::from_secs(60),
+                self.client
+                    .post(format!("{}/noa/v1/upload/batch", self.base_url))
+                    .bearer_auth(&self.token)
+                    .multipart(form)
+                    .send(),
+            )
+            .await
+            .map_err(|_| format!("concurrent standard batch client {client_index} timed out"))??;
+            let status = response.status();
+            let body: Value = response.json().await?;
+            if status != StatusCode::CREATED
+                || body.get("succeeded").and_then(Value::as_u64)
+                    != Some(OBJECTS_PER_CLIENT as u64)
+                || body.get("failed").and_then(Value::as_u64) != Some(0)
+            {
+                return Err(format!(
+                    "concurrent standard batch client {client_index} failed: {status} {body}"
+                )
+                .into());
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                keys,
+                samples,
+                request_started.elapsed().as_millis() as u64,
+            ))
+        });
+
+        let mut request_elapsed_ms = Vec::with_capacity(clients);
+        let mut verified_samples = Vec::new();
+        for result in join_all(requests).await {
+            let (keys, samples, elapsed_ms) = result?;
+            request_elapsed_ms.push(elapsed_ms);
+            expected.extend(keys);
+            for (key, sha256) in samples {
+                self.assert_download_sha256(&key, &sha256).await?;
+                verified_samples.push(json!({ "object_key": key, "sha256": sha256 }));
+            }
+        }
+
+        let elapsed = started.elapsed().as_secs_f64();
+        let object_count = clients * OBJECTS_PER_CLIENT;
+        Ok(json!({
+            "status": "PASS",
+            "concurrent_clients": clients,
+            "objects_per_client": OBJECTS_PER_CLIENT,
+            "objects": object_count,
+            "object_size_bytes": OBJECT_SIZE,
+            "elapsed_s": round3(elapsed),
+            "objects_per_s": round3(object_count as f64 / elapsed.max(0.001)),
+            "mib_s": round3(((object_count * OBJECT_SIZE) as f64 / 1024.0 / 1024.0) / elapsed.max(0.001)),
+            "request_elapsed_ms": request_elapsed_ms,
+            "verified_samples": verified_samples,
+        }))
+    }
+
     async fn standard_batch_upload_proof(
         &self,
         expected: &mut BTreeSet<String>,
