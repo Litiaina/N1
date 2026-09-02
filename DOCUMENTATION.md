@@ -186,7 +186,17 @@ latency_samples_per_class=1024
 JWT_SECRET=change-this
 MASTER_KEY=change-this-master-key
 SIGNED_READ_URL_SECRET=change-this-signed-url-secret
+N1_ACCEL_SEARCH_URL=http://127.0.0.1:53001
+N1_ACCEL_SEARCH_BACKEND_ID=n1-primary
 ```
+
+`N1_ACCEL_SEARCH_URL` enables the optional authenticated namespace-search
+proxy. The browser continues to authenticate to N1 with its fragment token;
+N1 forwards only the search request and authority to the configured local
+Accel backend. Accel can therefore remain bound to loopback and is never a
+second public authentication surface. If the variable is absent or Accel is
+unavailable, ordinary namespace listing and every authoritative N1 operation
+continue to work; only accelerated search returns `503`.
 
 ### Disk And Capacity Notes
 
@@ -914,6 +924,33 @@ Example:
 curl -k "$BASE/noa/v1/objects?prefix=videos/&limit=200" "${AUTH[@]}"
 ```
 
+### `GET /noa/v1/namespace/snapshot`
+
+Streams every live user-facing namespace file exactly once as
+`application/x-ndjson`. Each `entry` frame contains the logical `object_key`,
+immutable `version_id`, content type, byte size, and creation time. A successful
+stream always ends with one `complete` frame containing the exact entry count.
+
+This endpoint is intended for disposable search/index projections such as
+Litiaina Accel. It performs one bounded-memory namespace traversal, does not
+read object payloads, does not expose physical object identities, and requires
+fragment-scoped read authority. Consumers must reject a stream without its
+completion frame rather than publishing a partial index.
+
+### `GET /noa/v1/namespace/search`
+
+Authenticated browser-safe proxy for the configured Litiaina Accel namespace
+index. It accepts Accel's search query contract (`q`, `scope`, `field`,
+`match`, `limit`, and `continuation_token`) and forwards the caller's fragment
+read authority. N1 fixes the backend id from server configuration; clients
+cannot select an arbitrary origin or turn this route into a general proxy.
+
+Search is a disposable projection only. Results contain logical paths and
+immutable public version summaries. N1 remains authoritative for lookup,
+listing, reads, and mutations. Exact and prefix matches use the ordered index;
+contains matching scans only Accel's bounded in-memory projection, never N1
+object bytes.
+
 ### `GET /noa/v1/trash`
 
 Lists trash entries. Supports the same paging style as object listing.
@@ -1334,6 +1371,25 @@ The response has an exact `Content-Length`, `ETag`, `Accept-Ranges: bytes`, and
 browser download managers and `curl -C -` can therefore resume the same
 artifact instead of restarting its object scan. `If-None-Match` returns `304`
 for an unchanged retained artifact.
+
+Browser applications which cannot attach an authorization header to the
+browser's native download manager can mint a short-lived URL after the export
+is ready:
+
+```http
+POST /noa/v1/exports/{export_id}/signed-url
+Authorization: Bearer <fragment-token>
+Content-Type: application/json
+
+{"expires_in":21600}
+```
+
+The response URL targets `GET /noa/v1/signed-exports/download`. Its HMAC binds
+the export id, fragment authority, and expiry. The expiry is clamped to the
+retained export lifetime. This global download route accepts the same single
+byte-range and conditional request headers as the authenticated route, so the
+browser owns save location, pause, continuation, and restart-resume without
+exposing the fragment token in the URL.
 
 Cancel and remove a retained artifact:
 

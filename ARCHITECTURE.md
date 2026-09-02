@@ -247,6 +247,20 @@ The packed extension is a `u64`:
 Full `.ndx` decoding is reserved for reads, repair, redistribution, status,
 recover-on-read, archive operations, and GC.
 
+Search acceleration remains outside N1 authority. N1 can stream one complete
+live namespace snapshot in a single bounded-memory traversal for a derived
+index such as Accel. The stream contains logical paths and public version
+summaries, never physical object identities or payload bytes, and terminates
+with an exact completion count. An accelerator must discard an interrupted
+snapshot. Loss of that projection changes only search speed; N1 namespace
+truth and ordinary paginated listing remain complete.
+
+User-facing clients reach that projection through N1's authenticated,
+fixed-origin search proxy. Accel remains private, N1 validates the fragment
+token before forwarding it, and the configured backend id cannot be chosen by
+the caller. Proxy failure is isolated to search and cannot affect authoritative
+listing, object reads, namespace mutation, repair, or lifecycle.
+
 ## Upload And Commit
 
 N1 has two multipart contracts that share the same streaming EC writer and the

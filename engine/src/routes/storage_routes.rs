@@ -58,7 +58,9 @@ use crate::middleware::auth_middleware::{
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
 use crate::posix::routes::{build_posix_read_routes, build_posix_write_routes};
+use crate::routes::accel_routes::proxy_namespace_search;
 use crate::structs::auth_structs::Claims;
+use crate::url::signed_export::{download_signed_export, mint_signed_export_url};
 use crate::url::signed_read::{
     SignedReadUrlRequest, mint_signed_read_url, read_object_via_signed_url,
 };
@@ -68,23 +70,40 @@ use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{
     Json as AxumJson, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 
 const MAX_HTTP_BODY_SIZE: usize = 5 * 1024 * 1024 * 1024;
 const MAX_EXPORT_REQUEST_BODY_SIZE: usize = 4 * 1024 * 1024;
+const NAMESPACE_SNAPSHOT_CHANNEL_CAPACITY: usize = 128;
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NamespaceSnapshotFrame {
+    Entry {
+        object_key: String,
+        version_id: String,
+        content_type: String,
+        total_size_bytes: u64,
+        created_at: i64,
+    },
+    Complete {
+        entry_count: usize,
+    },
+}
 
 pub struct AppState {
     pub ws_manager: WsConnectionManager,
@@ -438,6 +457,71 @@ async fn list_trash_objects_scoped(
             .list_objects_page(&fragment, &params, true)
             .await?,
     ))
+}
+
+async fn stream_namespace_snapshot_scoped(claims: Claims) -> Result<Response<Body>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let fragment = claims.fragment;
+    let mut source = global_namespace_runtime().stream_live_object_refs(
+        &fragment,
+        None,
+        NAMESPACE_SNAPSHOT_CHANNEL_CAPACITY,
+    );
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(
+        NAMESPACE_SNAPSHOT_CHANNEL_CAPACITY,
+    );
+    tokio::spawn(async move {
+        let mut entry_count = 0usize;
+        while let Some(result) = source.recv().await {
+            let object = match result {
+                Ok(object) => object,
+                Err(error) => {
+                    let _ = sender
+                        .send(Err(std::io::Error::other(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let frame = NamespaceSnapshotFrame::Entry {
+                object_key: object.path,
+                version_id: object.version_id,
+                content_type: object.content_type,
+                total_size_bytes: object.total_size_bytes,
+                created_at: object.created_at,
+            };
+            let mut encoded = match serde_json::to_vec(&frame) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let _ = sender.send(Err(std::io::Error::other(error))).await;
+                    return;
+                }
+            };
+            encoded.push(b'\n');
+            if sender.send(Ok(Bytes::from(encoded))).await.is_err() {
+                return;
+            }
+            entry_count = entry_count.saturating_add(1);
+        }
+        let mut encoded =
+            match serde_json::to_vec(&NamespaceSnapshotFrame::Complete { entry_count }) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let _ = sender.send(Err(std::io::Error::other(error))).await;
+                    return;
+                }
+            };
+        encoded.push(b'\n');
+        let _ = sender.send(Ok(Bytes::from(encoded))).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "private, no-store")
+        .body(Body::from_stream(ReceiverStream::new(receiver)))
+        .map_err(|error| AppError::InternalServerError(error.to_string()))
 }
 
 async fn list_object_versions_scoped(
@@ -1572,6 +1656,11 @@ pub fn build_storage_routes_unbound_with_options(
             .route("/noa/v1/fragments", get(list_fragments))
             .route("/noa/v1/objects", get(list_objects_scoped))
             .route(
+                "/noa/v1/namespace/snapshot",
+                get(stream_namespace_snapshot_scoped),
+            )
+            .route("/noa/v1/namespace/search", get(proxy_namespace_search))
+            .route(
                 "/noa/v1/objects/signed-url",
                 post(mint_signed_read_url_scoped),
             )
@@ -1615,6 +1704,10 @@ pub fn build_storage_routes_unbound_with_options(
                 get(export_status).delete(cancel_export),
             )
             .route("/noa/v1/exports/{:id}/download", get(download_export))
+            .route(
+                "/noa/v1/exports/{:id}/signed-url",
+                post(mint_signed_export_url),
+            )
             .merge(build_posix_read_routes());
 
         let read_ops = layers
@@ -1794,6 +1887,10 @@ pub fn build_storage_routes_unbound_with_options(
         .route("/noa/v1/fragments/check", get(verify_fragment_existence))
         .route("/noa/v1/fragments/hash", get(get_fragment_hash))
         .route(
+            "/noa/v1/signed-exports/download",
+            get(download_signed_export),
+        )
+        .route(
             "/noa/v1/objects/signed-read",
             get(read_object_via_signed_url),
         );
@@ -1858,6 +1955,30 @@ async fn removed_manual_reclamation_route() -> impl IntoResponse {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn namespace_snapshot_completion_frame_is_explicit_ndjson() {
+        let encoded = serde_json::to_string(&NamespaceSnapshotFrame::Complete { entry_count: 7 })
+            .expect("completion JSON");
+        let frame: serde_json::Value = serde_json::from_str(&encoded).expect("completion JSON");
+        assert_eq!(frame["kind"], "complete");
+        assert_eq!(frame["entry_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn namespace_snapshot_requires_read_authority() {
+        let result = stream_namespace_snapshot_scoped(Claims {
+            fragment: "@f_snapshot-test-forbidden".into(),
+            fragment_alias: None,
+            read: false,
+            write: true,
+            modify: true,
+            delete: true,
+            exp: usize::MAX,
+        })
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
 
     #[test]
     fn standard_batch_object_keys_are_explicit_and_percent_decoded() {

@@ -119,10 +119,14 @@ async fn explicit_object_ref(fragment: &str, path: &str) -> Result<NamespaceObje
             "N1 namespace export entry '{path}' has no live version identity"
         ))
     })?;
+    let metadata = index::read_object_version(fragment, &object_id, &version_id).await?;
     Ok(NamespaceObjectRef {
         path: path.to_string(),
         object_id,
         version_id,
+        content_type: metadata.content_type,
+        total_size_bytes: metadata.total_size_bytes,
+        created_at: metadata.created_at,
     })
 }
 

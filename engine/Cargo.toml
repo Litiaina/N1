@@ -54,6 +54,7 @@ core_affinity.workspace = true
 rmp-serde.workspace = true
 argon2.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 rustix.workspace = true
 tower.workspace = true
 

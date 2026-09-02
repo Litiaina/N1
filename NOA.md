@@ -84,6 +84,8 @@ POST /noa/v1/posix/recover
 
 ```text
 GET    /noa/v1/objects
+GET    /noa/v1/namespace/snapshot
+GET    /noa/v1/namespace/search
 GET    /noa/v1/trash
 GET    /noa/v1/objects/meta/{object_key}
 GET    /noa/v1/objects/versions/{object_key}
@@ -104,11 +106,22 @@ POST   /noa/v1/objects/archive/manifest
 POST   /noa/v1/exports
 GET    /noa/v1/exports/{export_id}
 GET    /noa/v1/exports/{export_id}/download
+POST   /noa/v1/exports/{export_id}/signed-url
+GET    /noa/v1/signed-exports/download
 DELETE /noa/v1/exports/{export_id}
 ```
 
 Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
 not add empty-trash, hard-delete, or per-version-delete semantics.
+
+The namespace snapshot is a read-authorized, single-pass NDJSON feed for
+rebuildable external indexes. It exposes logical paths and public immutable
+version summaries only and ends with an exact completion marker. It is not a
+second namespace authority.
+
+Namespace search is an authenticated, fixed-destination proxy to the optional
+Accel projection. The fragment token remains the authority, the backend id is
+server-configured, and an unavailable accelerator affects search only.
 
 The export family is the restart-safe bulk-download contract. Creation pins an
 exact immutable version set and returns an operation id; status exposes bounded
@@ -120,6 +133,9 @@ user-visible archive namespace.
 Ready downloads have stable content length, SHA-256 ETag, and single-range
 resume support. Cancellation and export-specific retention
 remove only the derived artifact and never mutate source objects.
+The signed-export route lets native browser downloads retain those same range
+semantics without putting a reusable fragment token into a URL; the signature
+is scoped to one export, one fragment, and one bounded expiry.
 
 ## Uploads
 

@@ -121,6 +121,41 @@ fn ensure_export_access(claims: &Claims, state: &PersistedExport) -> Result<(), 
     Ok(())
 }
 
+pub(crate) async fn signed_export_context(
+    claims: &Claims,
+    id: &str,
+) -> Result<(String, i64), AppError> {
+    let state = load_state(id).await?;
+    ensure_export_access(claims, &state)?;
+    if state.expires_at_unix <= now_unix() {
+        return Err(AppError::NotFound);
+    }
+    if state.phase != ExportPhase::Ready {
+        return Err(AppError::Conflict(
+            "export is not ready for download".to_string(),
+        ));
+    }
+    Ok((state.fragment, state.expires_at_unix))
+}
+
+pub(crate) async fn download_export_with_signed_authority(
+    fragment: &str,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let state = load_state(id).await?;
+    if state.fragment != fragment {
+        return Err(AppError::Unauthorized);
+    }
+    if state.expires_at_unix <= now_unix() {
+        if !ACTIVE_EXPORTS.contains_key(id) {
+            remove_job(id).await;
+        }
+        return Err(AppError::NotFound);
+    }
+    build_download_response(&state, headers).await
+}
+
 fn estimated_artifact_bytes(state: &PersistedExport) -> u64 {
     state
         .source_bytes_total

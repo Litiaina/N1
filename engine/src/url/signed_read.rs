@@ -4,29 +4,16 @@ use crate::core::metadata_parser::get_version_metadata;
 use crate::core::retrieve::{get_object_metadata_direct, stream_object as stream_object_impl};
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
+use crate::url::signing;
 use axum::Json as AxumJson;
 use axum::extract::{Path, Query};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use hmac::{Hmac, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::env;
-use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const SIGNED_READ_URL_DEFAULT_TTL_SECS: u64 = 60 * 60;
 const SIGNED_READ_URL_MAX_TTL_SECS: u64 = 6 * 60 * 60;
-
-type SignedReadHmac = Hmac<Sha256>;
-
-static SIGNED_READ_URL_SECRET: LazyLock<Vec<u8>> = LazyLock::new(|| {
-    env::var("SIGNED_READ_URL_SECRET")
-        .or_else(|_| env::var("JWT_SECRET"))
-        .expect("SIGNED_READ_URL_SECRET or JWT_SECRET must be set for signed read urls")
-        .into_bytes()
-});
 
 #[derive(Debug, Deserialize)]
 pub struct SignedReadUrlRequest {
@@ -75,11 +62,7 @@ struct ValidatedSignedRead {
 }
 
 fn current_unix_timestamp_secs() -> Result<i64, AppError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| AppError::InternalServerError(format!("clock drift detected: {}", e)))?;
-    i64::try_from(now.as_secs())
-        .map_err(|_| AppError::InternalServerError("system clock exceeds supported range".into()))
+    signing::now_unix()
 }
 
 fn normalize_signed_read_disposition(value: Option<&str>) -> Result<&'static str, AppError> {
@@ -127,6 +110,7 @@ fn signed_read_payload(
     )
 }
 
+#[cfg(test)]
 fn sign_signed_read_with_secret(
     secret: &[u8],
     fragment: &str,
@@ -144,9 +128,7 @@ fn sign_signed_read_with_secret(
         version_id,
         filename,
     );
-    let mut mac = SignedReadHmac::new_from_slice(secret).expect("valid HMAC key");
-    mac.update(payload.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    signing::sign_with_secret(secret, payload.as_bytes())
 }
 
 fn sign_signed_read(
@@ -157,17 +139,18 @@ fn sign_signed_read(
     version_id: Option<&str>,
     filename: Option<&str>,
 ) -> String {
-    sign_signed_read_with_secret(
-        SIGNED_READ_URL_SECRET.as_slice(),
+    let payload = signed_read_payload(
         fragment,
         object_key,
         expires,
         disposition,
         version_id,
         filename,
-    )
+    );
+    signing::sign(payload.as_bytes())
 }
 
+#[cfg(test)]
 fn validate_signed_read_query_with_secret(
     secret: &[u8],
     query: &SignedReadObjectQuery,
@@ -202,11 +185,7 @@ fn validate_signed_read_query_with_secret(
         filename.as_deref(),
     );
 
-    let signature = hex::decode(query.signature.trim()).map_err(|_| AppError::Unauthorized)?;
-    let mut mac = SignedReadHmac::new_from_slice(secret).expect("valid HMAC key");
-    mac.update(payload.as_bytes());
-    mac.verify_slice(&signature)
-        .map_err(|_| AppError::Unauthorized)?;
+    signing::verify_with_secret(secret, payload.as_bytes(), &query.signature)?;
 
     Ok(ValidatedSignedRead {
         disposition: disposition.to_string(),
@@ -218,11 +197,38 @@ fn validate_signed_read_query_with_secret(
 fn validate_signed_read_query(
     query: &SignedReadObjectQuery,
 ) -> Result<ValidatedSignedRead, AppError> {
-    validate_signed_read_query_with_secret(
-        SIGNED_READ_URL_SECRET.as_slice(),
-        query,
-        current_unix_timestamp_secs()?,
-    )
+    let object_key = ObjectPathManager::canonical_object_key(&query.object_key);
+    if query.fragment.trim().is_empty() || object_key.is_empty() {
+        return Err(AppError::BadRequest(
+            "Signed read URL is missing a fragment or object key".into(),
+        ));
+    }
+    let now = current_unix_timestamp_secs()?;
+    if query.expires < now {
+        return Err(AppError::Unauthorized);
+    }
+    let disposition = normalize_signed_read_disposition(query.disposition.as_deref())?;
+    let version_id = normalize_optional_non_empty(query.version_id.as_deref());
+    let filename = normalize_optional_non_empty(query.filename.as_deref());
+    if version_id.is_some() && disposition != "download" {
+        return Err(AppError::BadRequest(
+            "Signed version reads are only supported for download disposition".into(),
+        ));
+    }
+    let payload = signed_read_payload(
+        &query.fragment,
+        &object_key,
+        query.expires,
+        disposition,
+        version_id.as_deref(),
+        filename.as_deref(),
+    );
+    signing::verify(payload.as_bytes(), &query.signature)?;
+    Ok(ValidatedSignedRead {
+        disposition: disposition.to_string(),
+        version_id,
+        filename,
+    })
 }
 
 fn build_signed_read_path(

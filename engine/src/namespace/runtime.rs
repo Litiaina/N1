@@ -37,6 +37,9 @@ pub struct NamespaceObjectRef {
     pub path: String,
     pub object_id: String,
     pub version_id: String,
+    pub content_type: String,
+    pub total_size_bytes: u64,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +688,9 @@ impl NamespaceRuntime {
                     path,
                     object_id,
                     version_id: meta.version_id,
+                    content_type: meta.content_type,
+                    total_size_bytes: meta.total_size_bytes,
+                    created_at: meta.created_at,
                 });
             }
             let continuation_token = has_more
@@ -806,6 +812,9 @@ impl NamespaceRuntime {
                         path,
                         object_id,
                         version_id: metadata.version_id,
+                        content_type: metadata.content_type,
+                        total_size_bytes: metadata.total_size_bytes,
+                        created_at: metadata.created_at,
                     }))
                     .is_err()
                 {
