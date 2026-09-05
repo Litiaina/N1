@@ -228,9 +228,13 @@ retention_seconds={}
 cleanup_interval_seconds=5
 max_concurrent_jobs=2
 max_queued_jobs=32
+manifest_validation_concurrency=8
 object_read_concurrency=8
-artifact_chunk_size_bytes=1048576
+artifact_chunk_size_bytes=16777216
 artifact_write_concurrency=4
+max_buffered_bytes_per_job=67108864
+max_buffered_bytes_global=134217728
+max_concurrent_downloads=16
 max_retained_bytes=0
 
 [auto_healing]

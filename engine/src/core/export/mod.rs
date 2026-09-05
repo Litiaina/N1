@@ -4,6 +4,7 @@ mod manifest;
 mod models;
 mod store;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use dashmap::DashMap;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::core::disk_manager::DownloadArchiveRequest;
@@ -29,18 +30,95 @@ use manifest::capture_manifest;
 use models::PersistedExport;
 pub use models::{CreateExportResponse, ExportPhase, ExportStatusResponse};
 use store::{
-    blob_roots, cleanup_artifact_chunks, ensure_state_root, export_config, list_states, load_state,
-    remove_job, save_state,
+    blob_roots, cleanup_artifact_chunks, cleanup_orphan_artifact_jobs, ensure_state_root,
+    export_config, list_states, load_state, remove_job, save_state,
 };
 
 static ACTIVE_EXPORTS: LazyLock<DashMap<String, Arc<ActiveProgress>>> = LazyLock::new(DashMap::new);
+static ACTIVE_DOWNLOADS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
 static EXPORT_JOB_LIMIT: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(export_config().max_concurrent_jobs));
+static EXPORT_DOWNLOAD_LIMIT: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(export_config().max_concurrent_downloads)));
 static EXPORT_QUOTA_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static EXPORT_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const MAX_EXPLICIT_EXPORT_KEYS: usize = 10_000;
 const MAX_EXPORT_PREFIXES: usize = 1_024;
 const MAX_EXPORT_FILENAME_CHARS: usize = 255;
+
+struct ActiveDownloadLease {
+    export_id: String,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ActiveDownloadLease {
+    fn drop(&mut self) {
+        let remove = if let Some(mut count) = ACTIVE_DOWNLOADS.get_mut(&self.export_id) {
+            *count = count.saturating_sub(1);
+            *count == 0
+        } else {
+            false
+        };
+        if remove {
+            ACTIVE_DOWNLOADS.remove(&self.export_id);
+        }
+    }
+}
+
+fn export_has_active_downloads(id: &str) -> bool {
+    ACTIVE_DOWNLOADS.get(id).is_some_and(|count| *count > 0)
+}
+
+async fn lease_ready_export(id: &str) -> Result<(PersistedExport, ActiveDownloadLease), AppError> {
+    let permit = Arc::clone(&EXPORT_DOWNLOAD_LIMIT)
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError::ServiceUnavailable(
+                "N1 export download concurrency limit reached; retry shortly".to_string(),
+            )
+        })?;
+    let _guard = EXPORT_LIFECYCLE_LOCK.lock().await;
+    let state = load_state(id).await?;
+    if state.expires_at_unix <= now_unix() {
+        return Err(AppError::NotFound);
+    }
+    if state.phase != ExportPhase::Ready {
+        return Err(AppError::Conflict(format!(
+            "export is not ready; current phase is {:?}",
+            state.phase
+        )));
+    }
+    ACTIVE_DOWNLOADS
+        .entry(id.to_string())
+        .and_modify(|count| *count = count.saturating_add(1))
+        .or_insert(1);
+    Ok((
+        state,
+        ActiveDownloadLease {
+            export_id: id.to_string(),
+            _permit: permit,
+        },
+    ))
+}
+
+async fn remove_job_when_idle(id: &str) -> bool {
+    let _guard = EXPORT_LIFECYCLE_LOCK.lock().await;
+    if export_has_active_downloads(id) || ACTIVE_EXPORTS.contains_key(id) {
+        return false;
+    }
+    remove_job(id).await;
+    true
+}
+
+pub(crate) async fn gc_protected_fragments() -> Result<HashSet<String>, AppError> {
+    Ok(list_states()
+        .await?
+        .into_iter()
+        .filter(|state| !state.phase.is_terminal())
+        .map(|state| state.fragment)
+        .collect())
+}
 
 fn now_unix() -> i64 {
     Utc::now().timestamp()
@@ -148,9 +226,6 @@ pub(crate) async fn download_export_with_signed_authority(
         return Err(AppError::Unauthorized);
     }
     if state.expires_at_unix <= now_unix() {
-        if !ACTIVE_EXPORTS.contains_key(id) {
-            remove_job(id).await;
-        }
         return Err(AppError::NotFound);
     }
     build_download_response(&state, headers).await
@@ -159,7 +234,10 @@ pub(crate) async fn download_export_with_signed_authority(
 fn estimated_artifact_bytes(state: &PersistedExport) -> u64 {
     state
         .source_bytes_total
-        .saturating_add(state.objects_total.saturating_mul(2048))
+        // ZIP records the path in both the local entry and central directory;
+        // the namespace contract permits paths up to 4096 bytes. This upper
+        // bound also safely covers TAR headers and block padding.
+        .saturating_add(state.objects_total.saturating_mul(10 * 1024))
         .saturating_add(1024 * 1024)
 }
 
@@ -251,9 +329,11 @@ async fn run_export_job(id: String, progress: Arc<ActiveProgress>) {
                 state.reserved_bytes = 0;
                 state.chunks.clear();
                 state.artifact_size_bytes = None;
+                state.artifact_bytes_completed = 0;
                 state.etag_sha256 = None;
                 if progress.cancel.load(Ordering::Acquire) {
                     state.phase = ExportPhase::Cancelled;
+                    state.expires_at_unix = state.updated_at_unix;
                     state.error = None;
                 } else {
                     tracing::error!(export_id = %id, fragment = %state.fragment, error = %error, "N1 export job failed");
@@ -297,7 +377,7 @@ async fn run_export_job_inner(id: &str, progress: Arc<ActiveProgress>) -> Result
             id,
             &state.fragment,
             &state.request,
-            export_config().object_read_concurrency,
+            export_config().manifest_validation_concurrency,
             Arc::clone(&progress),
         )
         .await?;
@@ -307,6 +387,7 @@ async fn run_export_job_inner(id: &str, progress: Arc<ActiveProgress>) -> Result
         state.source_bytes_total = summary.source_bytes_total;
         state.objects_completed = 0;
         state.source_bytes_completed = 0;
+        state.artifact_bytes_completed = 0;
         state.updated_at_unix = now_unix();
         reserve_export_capacity(&mut state).await?;
     }
@@ -315,6 +396,7 @@ async fn run_export_job_inner(id: &str, progress: Arc<ActiveProgress>) -> Result
     state.phase = ExportPhase::Building;
     state.objects_completed = 0;
     state.source_bytes_completed = 0;
+    state.artifact_bytes_completed = 0;
     state.updated_at_unix = now_unix();
     state.error = None;
     save_state(&state).await?;
@@ -333,6 +415,7 @@ async fn run_export_job_inner(id: &str, progress: Arc<ActiveProgress>) -> Result
     state.phase = ExportPhase::Ready;
     state.objects_completed = state.objects_total;
     state.source_bytes_completed = state.source_bytes_total;
+    state.artifact_bytes_completed = artifact.size_bytes;
     state.artifact_size_bytes = Some(artifact.size_bytes);
     state.etag_sha256 = Some(artifact.sha256);
     state.chunks = artifact.chunks;
@@ -396,6 +479,7 @@ pub async fn create_export(
         objects_completed: 0,
         source_bytes_total: 0,
         source_bytes_completed: 0,
+        artifact_bytes_completed: 0,
         reserved_bytes: 0,
         artifact_size_bytes: None,
         etag_sha256: None,
@@ -424,12 +508,12 @@ pub async fn export_status(
     let mut state = load_state(&id).await?;
     ensure_export_access(&claims, &state)?;
     if state.expires_at_unix <= now_unix() && !ACTIVE_EXPORTS.contains_key(&id) {
-        remove_job(&id).await;
         return Err(AppError::NotFound);
     }
     if let Some(active) = ACTIVE_EXPORTS.get(&id) {
         state.objects_completed = active.objects_completed.load(Ordering::Relaxed);
         state.source_bytes_completed = active.source_bytes_completed.load(Ordering::Relaxed);
+        state.artifact_bytes_completed = active.artifact_bytes_completed.load(Ordering::Relaxed);
     }
     Ok(Json(ExportStatusResponse::from_state(&state)))
 }
@@ -442,9 +526,6 @@ pub async fn download_export(
     let state = load_state(&id).await?;
     ensure_export_access(&claims, &state)?;
     if state.expires_at_unix <= now_unix() {
-        if !ACTIVE_EXPORTS.contains_key(&id) {
-            remove_job(&id).await;
-        }
         return Err(AppError::NotFound);
     }
     build_download_response(&state, &headers).await
@@ -461,17 +542,20 @@ pub async fn cancel_export(
         state.phase = ExportPhase::Cancelled;
         state.error = None;
         state.updated_at_unix = now_unix();
+        state.expires_at_unix = state.updated_at_unix;
         save_state(&state).await?;
     } else if state.phase != ExportPhase::Cancelled {
         state.phase = ExportPhase::Cancelled;
         state.error = None;
         state.updated_at_unix = now_unix();
+        state.expires_at_unix = state.updated_at_unix;
         state.reserved_bytes = 0;
         state.chunks.clear();
         state.artifact_size_bytes = None;
+        state.artifact_bytes_completed = 0;
         state.etag_sha256 = None;
-        cleanup_artifact_chunks(&id).await;
         save_state(&state).await?;
+        let _ = remove_job_when_idle(&id).await;
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -482,18 +566,31 @@ pub async fn cancel_export(
 async fn recover_and_cleanup_exports() -> Result<(), AppError> {
     ensure_state_root().await?;
     let now = now_unix();
-    for state in list_states().await? {
+    let mut states = list_states().await?;
+    states.sort_by(|left, right| {
+        left.created_at_unix
+            .cmp(&right.created_at_unix)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for state in states {
         if state.expires_at_unix <= now {
             if let Some(active) = ACTIVE_EXPORTS.get(&state.id) {
                 active.cancel.store(true, Ordering::Release);
             } else {
-                remove_job(&state.id).await;
+                let _ = remove_job_when_idle(&state.id).await;
             }
             continue;
         }
         if !state.phase.is_terminal() {
             spawn_export_job(state.id);
         }
+    }
+    let removed_orphans = cleanup_orphan_artifact_jobs().await?;
+    if removed_orphans > 0 {
+        tracing::info!(
+            removed_artifact_jobs = removed_orphans,
+            "N1 export manager removed orphan artifacts"
+        );
     }
     Ok(())
 }

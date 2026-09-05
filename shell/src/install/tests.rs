@@ -341,13 +341,9 @@ fn four_disk_assignment_and_ec_validation_is_deterministic() {
         .find(|line| line.starts_with("RequiresMountsFor="))
         .expect("storage mount dependency");
     for index in 1..=4 {
+        let mount_path = settings.mount_path(&format!("NDISK{index:03}"));
         assert!(
-            requires_mounts.contains(
-                settings
-                    .mount_path(&format!("NDISK{index:03}"))
-                    .to_string_lossy()
-                    .as_ref()
-            ),
+            requires_mounts.contains(&systemd_escape(&mount_path)),
             "missing NDISK{index:03} in {requires_mounts}"
         );
     }

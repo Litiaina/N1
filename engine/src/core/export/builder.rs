@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
@@ -26,11 +26,126 @@ use super::store::{artifact_job_directory, cleanup_artifact_chunks, manifest_pat
 const ARCHIVE_PIPE_BYTES: usize = 4 * 1024 * 1024;
 const OBJECT_PIPE_CAPACITY: usize = 4;
 const OBJECT_READ_BYTES: usize = 256 * 1024;
+const BUFFER_ADMISSION_UNIT_BYTES: usize = 1024 * 1024;
+const ZIP_DIRECTORY_FIXED_BYTES: usize = 1024 * 1024;
+const ZIP_DIRECTORY_SAFETY_MULTIPLIER: usize = 2;
+
+static EXPORT_BUFFER_LIMIT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let permits = super::store::export_config()
+        .max_buffered_bytes_global
+        .div_ceil(BUFFER_ADMISSION_UNIT_BYTES)
+        .max(1);
+    Arc::new(Semaphore::new(permits))
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExportBufferPlan {
+    pub object_read_concurrency: usize,
+    pub artifact_chunk_size_bytes: usize,
+    pub artifact_write_concurrency: usize,
+    pub admitted_bytes: usize,
+}
+
+fn estimated_buffered_bytes(
+    object_read_concurrency: usize,
+    artifact_chunk_size_bytes: usize,
+    artifact_write_concurrency: usize,
+    format_overhead_bytes: usize,
+) -> usize {
+    let object_reader_bytes = OBJECT_READ_BYTES.saturating_mul(OBJECT_PIPE_CAPACITY + 1);
+    ARCHIVE_PIPE_BYTES
+        .saturating_add(object_reader_bytes.saturating_mul(object_read_concurrency))
+        .saturating_add(artifact_chunk_size_bytes.saturating_mul(artifact_write_concurrency))
+        .saturating_add(format_overhead_bytes)
+}
+
+pub(super) fn export_buffer_plan(config: &ExportConfig, root_count: usize) -> ExportBufferPlan {
+    export_buffer_plan_with_overhead(config, root_count, 0)
+        .expect("minimum export buffer budget always fits the base pipeline")
+}
+
+pub(super) fn export_buffer_plan_with_overhead(
+    config: &ExportConfig,
+    root_count: usize,
+    format_overhead_bytes: usize,
+) -> Result<ExportBufferPlan, AppError> {
+    let budget = config
+        .max_buffered_bytes_per_job
+        .min(config.max_buffered_bytes_global)
+        .max(16 * 1024 * 1024);
+    let object_reader_bytes = OBJECT_READ_BYTES.saturating_mul(OBJECT_PIPE_CAPACITY + 1);
+    let fixed_and_reader = ARCHIVE_PIPE_BYTES
+        .saturating_add(object_reader_bytes)
+        .saturating_add(format_overhead_bytes);
+    if fixed_and_reader.saturating_add(1024 * 1024) > budget {
+        return Err(AppError::ServiceUnavailable(
+            "N1 ZIP directory exceeds the export memory budget; use TAR or increase max_buffered_bytes_per_job"
+                .to_string(),
+        ));
+    }
+    let maximum_chunk = budget.saturating_sub(fixed_and_reader).max(1024 * 1024);
+    let artifact_chunk_size_bytes = config
+        .artifact_chunk_size_bytes
+        .min(maximum_chunk)
+        .max(1024 * 1024);
+    let mut object_read_concurrency = config.object_read_concurrency.max(1);
+    let mut artifact_write_concurrency = config
+        .artifact_write_concurrency
+        .min(root_count.max(1))
+        .max(1);
+
+    while estimated_buffered_bytes(
+        object_read_concurrency,
+        artifact_chunk_size_bytes,
+        artifact_write_concurrency,
+        format_overhead_bytes,
+    ) > budget
+    {
+        let readers = object_reader_bytes.saturating_mul(object_read_concurrency);
+        let writers = artifact_chunk_size_bytes.saturating_mul(artifact_write_concurrency);
+        if artifact_write_concurrency > 1 && (object_read_concurrency == 1 || writers >= readers) {
+            artifact_write_concurrency -= 1;
+        } else if object_read_concurrency > 1 {
+            object_read_concurrency -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let admitted_bytes = estimated_buffered_bytes(
+        object_read_concurrency,
+        artifact_chunk_size_bytes,
+        artifact_write_concurrency,
+        format_overhead_bytes,
+    )
+    .min(budget);
+    Ok(ExportBufferPlan {
+        object_read_concurrency,
+        artifact_chunk_size_bytes,
+        artifact_write_concurrency,
+        admitted_bytes,
+    })
+}
+
+async fn acquire_buffer_admission(bytes: usize) -> Result<OwnedSemaphorePermit, AppError> {
+    let permits = bytes
+        .div_ceil(BUFFER_ADMISSION_UNIT_BYTES)
+        .max(1)
+        .try_into()
+        .map_err(|_| {
+            AppError::InternalServerError("N1 export buffer admission overflow".to_string())
+        })?;
+    Arc::clone(&EXPORT_BUFFER_LIMIT)
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| AppError::InternalServerError("N1 export buffer scheduler closed".to_string()))
+}
 
 pub(super) struct ActiveProgress {
     pub cancel: Arc<AtomicBool>,
     pub objects_completed: AtomicU64,
     pub source_bytes_completed: AtomicU64,
+    pub artifact_bytes_completed: AtomicU64,
     scheduler_progress: OnceLock<IoProgress>,
 }
 
@@ -40,6 +155,7 @@ impl ActiveProgress {
             cancel: Arc::new(AtomicBool::new(false)),
             objects_completed: AtomicU64::new(0),
             source_bytes_completed: AtomicU64::new(0),
+            artifact_bytes_completed: AtomicU64::new(0),
             scheduler_progress: OnceLock::new(),
         }
     }
@@ -54,6 +170,11 @@ impl ActiveProgress {
         if let Some(progress) = self.scheduler_progress.get() {
             progress.record(bytes);
         }
+    }
+
+    fn record_artifact_bytes(&self, bytes: u64) {
+        self.artifact_bytes_completed
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(super) fn ensure_running(&self) -> Result<(), AppError> {
@@ -73,6 +194,8 @@ pub(super) struct BuiltArtifact {
     pub size_bytes: u64,
     pub sha256: String,
 }
+
+type ChunkWriteResult = Result<(u64, PathBuf, u64, String), AppError>;
 
 struct PreparedEntry {
     manifest: ExportManifestEntry,
@@ -191,19 +314,19 @@ fn spawn_object_reader(
                 task_manifest.source_offset_bytes,
                 task_manifest.size_bytes,
             );
-            let mut buffer = vec![0_u8; OBJECT_READ_BYTES];
             loop {
                 progress
                     .ensure_running()
                     .map_err(|error| io_error("export cancelled", error))?;
+                let mut buffer = BytesMut::with_capacity(OBJECT_READ_BYTES);
                 let read = reader
-                    .read(&mut buffer)
+                    .read_buf(&mut buffer)
                     .await
                     .map_err(|error| io_error("read immutable object bytes", error))?;
                 if read == 0 {
                     break;
                 }
-                let chunk = Bytes::copy_from_slice(&buffer[..read]);
+                let chunk = buffer.freeze();
                 if sender.send(Ok(chunk)).await.is_err() {
                     return Ok(());
                 }
@@ -346,10 +469,11 @@ async fn sync_parent(path: &Path) -> std::io::Result<()> {
 async fn write_chunk_with_failover(
     id: String,
     index: u64,
-    data: Vec<u8>,
+    data: Bytes,
     roots: Arc<Vec<PathBuf>>,
     first_root: usize,
-) -> Result<(u64, PathBuf, u64), AppError> {
+) -> Result<(u64, PathBuf, u64, String), AppError> {
+    let checksum = hex::encode(Sha256::digest(&data));
     let mut last_error = None;
     for attempt in 0..roots.len() {
         let root = &roots[(first_root + attempt) % roots.len()];
@@ -373,7 +497,9 @@ async fn write_chunk_with_failover(
         }
         .await;
         match operation {
-            Ok(()) => return Ok((index, final_path, data.len() as u64)),
+            Ok(()) => {
+                return Ok((index, final_path, data.len() as u64, checksum));
+            }
             Err(error) => {
                 let _ = fs::remove_file(&partial_path).await;
                 last_error = Some(error);
@@ -387,8 +513,9 @@ async fn write_chunk_with_failover(
 }
 
 async fn collect_chunk_result(
-    tasks: &mut JoinSet<Result<(u64, PathBuf, u64), AppError>>,
-    chunks: &mut Vec<(u64, PathBuf, u64)>,
+    tasks: &mut JoinSet<ChunkWriteResult>,
+    chunks: &mut Vec<(u64, PathBuf, u64, String)>,
+    progress: &ActiveProgress,
 ) -> Result<(), AppError> {
     let result = tasks
         .join_next()
@@ -397,6 +524,7 @@ async fn collect_chunk_result(
         .map_err(|error| {
             AppError::InternalServerError(format!("export chunk task failed: {error}"))
         })??;
+    progress.record_artifact_bytes(result.2);
     chunks.push(result);
     Ok(())
 }
@@ -409,6 +537,7 @@ pub(super) async fn persist_archive_chunks<R: AsyncRead + Unpin>(
     progress: Arc<ActiveProgress>,
 ) -> Result<BuiltArtifact, AppError> {
     let roots = Arc::new(roots);
+    let plan = export_buffer_plan(&config, roots.len());
     let start_root = id.bytes().fold(0usize, |value, byte| {
         value.wrapping_mul(31).wrapping_add(byte as usize)
     }) % roots.len();
@@ -420,48 +549,51 @@ pub(super) async fn persist_archive_chunks<R: AsyncRead + Unpin>(
 
     loop {
         progress.ensure_running()?;
-        let mut chunk = Vec::with_capacity(config.artifact_chunk_size_bytes);
-        while chunk.len() < config.artifact_chunk_size_bytes {
-            let remaining = config.artifact_chunk_size_bytes - chunk.len();
-            let mut buffer = vec![0_u8; remaining.min(1024 * 1024)];
-            let read = reader.read(&mut buffer).await.map_err(|error| {
+        while tasks.len() >= plan.artifact_write_concurrency {
+            collect_chunk_result(&mut tasks, &mut completed_chunks, &progress).await?;
+        }
+        let mut chunk = BytesMut::with_capacity(plan.artifact_chunk_size_bytes);
+        while chunk.len() < plan.artifact_chunk_size_bytes {
+            let prior_len = chunk.len();
+            let read = reader.read_buf(&mut chunk).await.map_err(|error| {
                 AppError::Io(error, "read generated export archive".to_string())
             })?;
             if read == 0 {
                 break;
             }
-            hasher.update(&buffer[..read]);
-            chunk.extend_from_slice(&buffer[..read]);
+            hasher.update(&chunk[prior_len..prior_len + read]);
             total_size = total_size.saturating_add(read as u64);
         }
         if chunk.is_empty() {
             break;
         }
-        while tasks.len() >= config.artifact_write_concurrency.min(roots.len()).max(1) {
-            collect_chunk_result(&mut tasks, &mut completed_chunks).await?;
-        }
         let task_roots = Arc::clone(&roots);
         let task_id = id.clone();
         let root_index = (start_root + index as usize) % roots.len();
         tasks.spawn(write_chunk_with_failover(
-            task_id, index, chunk, task_roots, root_index,
+            task_id,
+            index,
+            chunk.freeze(),
+            task_roots,
+            root_index,
         ));
         index = index.saturating_add(1);
     }
 
     while !tasks.is_empty() {
-        collect_chunk_result(&mut tasks, &mut completed_chunks).await?;
+        collect_chunk_result(&mut tasks, &mut completed_chunks, &progress).await?;
     }
-    completed_chunks.sort_by_key(|(index, _, _)| *index);
+    completed_chunks.sort_by_key(|(index, _, _, _)| *index);
     let mut logical_offset = 0_u64;
     let chunks = completed_chunks
         .into_iter()
-        .map(|(index, path, size_bytes)| {
+        .map(|(index, path, size_bytes, sha256)| {
             let chunk = ArtifactChunk {
                 index,
                 path: path.to_string_lossy().to_string(),
                 logical_offset,
                 size_bytes,
+                sha256,
             };
             logical_offset = logical_offset.saturating_add(size_bytes);
             chunk
@@ -489,9 +621,41 @@ pub(super) async fn build_artifact(
 ) -> Result<BuiltArtifact, AppError> {
     cleanup_artifact_chunks(id).await;
     let manifest_path = manifest_path(id)?;
+    let format_overhead_bytes = if format == "zip" {
+        let manifest_bytes = fs::metadata(&manifest_path)
+            .await
+            .map_err(|error| {
+                AppError::Io(
+                    error,
+                    "stat N1 export manifest for ZIP memory admission".to_string(),
+                )
+            })?
+            .len()
+            .try_into()
+            .unwrap_or(usize::MAX);
+        manifest_bytes
+            .saturating_mul(ZIP_DIRECTORY_SAFETY_MULTIPLIER)
+            .saturating_add(ZIP_DIRECTORY_FIXED_BYTES)
+    } else {
+        0
+    };
+    let plan = export_buffer_plan_with_overhead(config, roots.len(), format_overhead_bytes)?;
+    let _buffer_admission = acquire_buffer_admission(plan.admitted_bytes).await?;
+    tracing::info!(
+        export_id = %id,
+        admitted_bytes = plan.admitted_bytes,
+        object_read_concurrency = plan.object_read_concurrency,
+        artifact_chunk_size_bytes = plan.artifact_chunk_size_bytes,
+        artifact_write_concurrency = plan.artifact_write_concurrency,
+        format_overhead_bytes,
+        "N1 export buffer plan admitted"
+    );
     let (reader, writer) = tokio::io::duplex(ARCHIVE_PIPE_BYTES);
     let sink_id = id.to_string();
-    let sink_config = config.clone();
+    let mut sink_config = config.clone();
+    sink_config.object_read_concurrency = plan.object_read_concurrency;
+    sink_config.artifact_chunk_size_bytes = plan.artifact_chunk_size_bytes;
+    sink_config.artifact_write_concurrency = plan.artifact_write_concurrency;
     let sink_progress = Arc::clone(&progress);
     let sink = tokio::spawn(async move {
         persist_archive_chunks(reader, sink_id, roots, sink_config, sink_progress).await
@@ -504,7 +668,7 @@ pub(super) async fn build_artifact(
                 fragment.to_string(),
                 writer,
                 Arc::clone(&progress),
-                config.object_read_concurrency,
+                plan.object_read_concurrency,
             )
             .await
         }
@@ -514,7 +678,7 @@ pub(super) async fn build_artifact(
                 fragment.to_string(),
                 writer,
                 Arc::clone(&progress),
-                config.object_read_concurrency,
+                plan.object_read_concurrency,
             )
             .await
         }

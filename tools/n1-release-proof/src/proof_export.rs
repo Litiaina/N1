@@ -36,6 +36,7 @@ impl Proof {
         let full = self.download_export_full(&export_id).await?;
         self.validate_zip_export(&full.bytes, &expected).await?;
         self.validate_export_ranges(&export_id, &full).await?;
+        self.validate_export_corruption_detection(&export_id).await?;
         let artifact_root_count = self.validate_export_chunk_spread(&export_id, full.bytes.len())?;
 
         let mapped_source = expected
@@ -65,6 +66,8 @@ impl Proof {
         self.validate_zip_export(&mapped_download.bytes, &mapped_expected)
             .await?;
         self.cancel_export_job(&mapped_id).await?;
+        self.wait_for_export_cancellation_cleanup(&mapped_id, Duration::from_secs(30))
+            .await?;
 
         let tar_expected = expected
             .iter()
@@ -83,7 +86,7 @@ impl Proof {
         let tar_download = self.download_export_full(&tar_id).await?;
         self.validate_tar_export(&tar_download.bytes, &tar_expected)?;
         self.cancel_export_job(&tar_id).await?;
-        self.wait_for_export_phase(&tar_id, "cancelled", Duration::from_secs(30))
+        self.wait_for_export_cancellation_cleanup(&tar_id, Duration::from_secs(30))
             .await?;
 
         let performance_started = Instant::now();
@@ -103,15 +106,14 @@ impl Proof {
             return Err("performance export ETag does not match its artifact bytes".into());
         }
         self.cancel_export_job(&performance_id).await?;
-        self.wait_for_export_phase(&performance_id, "cancelled", Duration::from_secs(30))
+        self.wait_for_export_cancellation_cleanup(&performance_id, Duration::from_secs(30))
             .await?;
 
         let cancel_id = self
             .create_export_job(&prefix, "tar", "n1-cancel-proof.tar")
             .await?;
-        self.cancel_export_job(&cancel_id).await?;
-        let cancelled = self
-            .wait_for_export_phase(&cancel_id, "cancelled", Duration::from_secs(30))
+        let cancelled = self.cancel_export_job(&cancel_id).await?;
+        self.wait_for_export_cancellation_cleanup(&cancel_id, Duration::from_secs(30))
             .await?;
 
         let expires_at = ready
@@ -136,6 +138,7 @@ impl Proof {
             "archive_bytes": full.bytes.len(),
             "etag": full.etag,
             "range_resume": "PASS",
+            "artifact_corruption_detection": "PASS",
             "mapped_byte_range_export": "PASS",
             "cancel": cancelled.get("phase").cloned().unwrap_or(Value::Null),
             "retention_cleanup": "PASS",
@@ -508,22 +511,128 @@ impl Proof {
         Ok(())
     }
 
-    async fn cancel_export_job(&self, id: &str) -> ProofResult<()> {
+    async fn validate_export_corruption_detection(&self, id: &str) -> ProofResult<()> {
+        let path = self
+            .blob_roots
+            .iter()
+            .map(|root| root.join(".n1-export-artifacts").join(id))
+            .filter_map(|directory| fs::read_dir(directory).ok())
+            .flatten()
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("chunk-") && name.ends_with(".bin"))
+            })
+            .ok_or("export proof could not find an artifact chunk to corrupt")?;
+        let original = fs::read(&path)?;
+        if original.is_empty() {
+            return Err("export proof selected an empty artifact chunk".into());
+        }
+        let mut corrupted = original.clone();
+        corrupted[0] ^= 0x5a;
+        fs::write(&path, &corrupted)?;
+
+        let response_result: ProofResult<()> = async {
+            let response = self
+                .client
+                .get(format!("{}/noa/v1/exports/{id}/download", self.base_url))
+                .bearer_auth(&self.token)
+                .send()
+                .await?;
+            if response.status() != StatusCode::OK {
+                return Err(format!(
+                    "corrupted export download did not enter its integrity-checked stream: {}",
+                    response.status()
+                )
+                .into());
+            }
+            match response.bytes().await {
+                Err(_) => Ok(()),
+                Ok(bytes) => Err(format!(
+                    "corrupted export was delivered successfully ({} bytes)",
+                    bytes.len()
+                )
+                .into()),
+            }
+        }
+        .await;
+
+        fs::write(&path, &original)?;
+        response_result?;
+        let restored = self.download_export_full(id).await?;
+        if format!("\"{}\"", sha256_bytes(&restored.bytes)) != restored.etag {
+            return Err("restored export no longer matches its ETag".into());
+        }
+        Ok(())
+    }
+
+    async fn cancel_export_job(&self, id: &str) -> ProofResult<Value> {
         let response = self
             .client
             .delete(format!("{}/noa/v1/exports/{id}", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .await?;
-        if response.status() != StatusCode::ACCEPTED {
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        if status != StatusCode::ACCEPTED {
             return Err(format!(
                 "cancel export failed: {} {}",
-                response.status(),
-                response.text().await?
+                status, body
             )
             .into());
         }
-        Ok(())
+        if body.get("phase").and_then(Value::as_str) != Some("cancelled") {
+            return Err(format!("cancel export did not acknowledge cancellation: {body}").into());
+        }
+        Ok(body)
+    }
+
+    async fn wait_for_export_cancellation_cleanup(
+        &self,
+        id: &str,
+        timeout: Duration,
+    ) -> ProofResult<()> {
+        let deadline = Instant::now() + timeout;
+        let mut last = Value::Null;
+        while Instant::now() < deadline {
+            let (status, body) = self.export_status_value(id).await?;
+            match status {
+                StatusCode::NOT_FOUND if self.artifact_root_count(id) == 0 => return Ok(()),
+                StatusCode::OK => {
+                    if body.get("phase").and_then(Value::as_str) != Some("cancelled") {
+                        return Err(format!(
+                            "cancelled export returned an unexpected phase: {body}"
+                        )
+                        .into());
+                    }
+                    last = body;
+                }
+                StatusCode::NOT_FOUND => {
+                    last = json!({"phase": "removed", "artifact_roots_remaining": self.artifact_root_count(id)});
+                }
+                _ => {
+                    return Err(format!(
+                        "cancelled export cleanup returned an unexpected status: {status} {body}"
+                    )
+                    .into());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!(
+            "timed out waiting for cancelled export cleanup; last={last}, artifact_roots_remaining={}",
+            self.artifact_root_count(id)
+        )
+        .into())
     }
 
     fn artifact_root_count(&self, id: &str) -> usize {

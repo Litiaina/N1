@@ -202,6 +202,7 @@ pub(crate) fn visit_trash_records(
             let (anchor, original_path) =
                 match trash_generation_anchor(&generation_root, path_depth) {
                     Ok(anchor) => anchor,
+                    Err(AppError::NotFound) => continue,
                     Err(error) => {
                         match fs::symlink_metadata(&generation_root) {
                             Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
@@ -250,6 +251,16 @@ pub(crate) fn visit_trash_records(
             } else if metadata.is_file() {
                 (TrashKind::File, Vec::new(), Vec::new())
             } else {
+                if matches!(
+                    fs::symlink_metadata(&anchor),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    // The anchor was a namespace symlink when it was first
+                    // inspected, but a concurrent recover/TTL sweep removed
+                    // it before its target could be read. Treat that as the
+                    // generation disappearing, not as malformed metadata.
+                    continue 'generation;
+                }
                 return Err(AppError::InternalServerError(format!(
                     "N1 trash generation anchor '{}' has an unsupported file type",
                     anchor.display()

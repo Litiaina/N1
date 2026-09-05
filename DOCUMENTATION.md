@@ -1412,16 +1412,33 @@ retention_seconds=86400
 cleanup_interval_seconds=60
 max_concurrent_jobs=2
 max_queued_jobs=128
+manifest_validation_concurrency=8
 object_read_concurrency=8
 artifact_chunk_size_bytes=16777216
 artifact_write_concurrency=4
+max_buffered_bytes_per_job=134217728
+max_buffered_bytes_global=268435456
+max_concurrent_downloads=32
 max_retained_bytes=0
 ```
+
+Manifest validation, immutable-object read ahead, and artifact writes are
+independently concurrent. The ZIP/TAR serializer remains ordered. The two
+buffer limits are authoritative byte budgets: N1 reduces the effective reader
+or writer concurrency and artifact chunk size when their configured product
+would exceed the per-job budget, while the global budget limits aggregate
+active export builders. Download admission is separately bounded and returns a
+retryable service-unavailable response rather than allocating beyond
+`max_concurrent_downloads`.
 
 `max_retained_bytes=0` leaves actual kernel writes authoritative. A nonzero
 value bounds ready artifacts plus admitted in-progress reservations. Export
 retention is independent of object-trash retention and never deletes source
-objects.
+objects. Garbage collection conservatively defers a fragment while one of its
+durable exports is active; this protection is bounded by the export job count
+rather than the number of objects in a potentially million-entry manifest.
+Expired or explicitly cancelled artifacts are not removed from underneath an
+active HTTP download.
 
 ### Compatibility streaming archive
 

@@ -29,9 +29,13 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("cleanup_interval_seconds", "60")
         .set("max_concurrent_jobs", "2")
         .set("max_queued_jobs", "128")
+        .set("manifest_validation_concurrency", "8")
         .set("object_read_concurrency", "8")
         .set("artifact_chunk_size_bytes", "16777216")
         .set("artifact_write_concurrency", "4")
+        .set("max_buffered_bytes_per_job", "134217728")
+        .set("max_buffered_bytes_global", "268435456")
+        .set("max_concurrent_downloads", "32")
         .set("max_retained_bytes", "0");
 
     conf.with_section(Some("auto_healing"))
@@ -129,7 +133,11 @@ mod tests {
         assert!(gc.get("retention_seconds").is_none());
         let export = ini.section(Some("export")).expect("export section");
         assert_eq!(export.get("retention_seconds"), Some("86400"));
+        assert_eq!(export.get("manifest_validation_concurrency"), Some("8"));
         assert_eq!(export.get("artifact_chunk_size_bytes"), Some("16777216"));
+        assert_eq!(export.get("max_buffered_bytes_per_job"), Some("134217728"));
+        assert_eq!(export.get("max_buffered_bytes_global"), Some("268435456"));
+        assert_eq!(export.get("max_concurrent_downloads"), Some("32"));
         assert_eq!(export.get("max_retained_bytes"), Some("0"));
         let auto_healing = ini
             .section(Some("auto_healing"))

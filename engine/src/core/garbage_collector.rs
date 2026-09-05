@@ -649,6 +649,23 @@ async fn perform_gc_scan(
     let retention_duration = Duration::from_secs(CONFIG.garbage_collector.trash_retention_seconds);
 
     let file_ttl = options.file_ttl(is_manual_run);
+    let export_gc_protection = match crate::core::export::gc_protected_fragments().await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            warn!(
+                "GC: preserving immutable data because active export protection could not be proven: {}",
+                err
+            );
+            with_gc_status_write(|st| {
+                st.phase = "Preserved: export protection unavailable".to_string();
+                st.last_error = Some(err.to_string());
+                st.total_errors = st.total_errors.saturating_add(1);
+                st.duration_seconds = start.elapsed().as_secs();
+            });
+            io_guard.complete();
+            return Ok(());
+        }
+    };
 
     for fragment in fragments {
         if should_stop_gc() {
@@ -669,6 +686,7 @@ async fn perform_gc_scan(
             options,
             &state,
             &io_progress,
+            &export_gc_protection,
         )
         .await;
         io_guard.record_progress(stats.refund_bytes);
@@ -725,6 +743,7 @@ async fn process_fragment_gc(
     _options: GcRunOptions,
     _state: &Arc<AppState>,
     io_progress: &IoProgress,
+    export_gc_protection: &HashSet<String>,
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
 
@@ -744,6 +763,14 @@ async fn process_fragment_gc(
             );
             return stats;
         }
+    }
+
+    if export_gc_protection.contains(fragment) {
+        warn!(
+            "GC: preserving fragment {} while a durable export is active",
+            fragment
+        );
+        return stats;
     }
 
     let now = SystemTime::now();
@@ -801,7 +828,6 @@ async fn process_fragment_gc(
     active_session_versions.extend(crate::core::upload::active_standard_upload_versions(
         fragment,
     ));
-
     let total_session_refund: u64 = sessions_to_delete.iter().map(|(_, amount)| *amount).sum();
     stats.refund_bytes += total_session_refund;
     stats.sessions_deleted += sessions_to_delete.len() as u64;

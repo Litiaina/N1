@@ -9,11 +9,15 @@ use sha2::{Digest, Sha256};
 
 use crate::core::disk_manager::{DownloadArchiveEntry, DownloadArchiveRequest};
 
-use super::builder::{ActiveProgress, persist_archive_chunks};
+use super::builder::{
+    ActiveProgress, export_buffer_plan, export_buffer_plan_with_overhead, persist_archive_chunks,
+};
 use super::manifest::validate_archive_path;
 use super::models::ExportConfig;
 use super::store::load_export_config_from;
-use super::validate_create_request;
+use super::{
+    ACTIVE_DOWNLOADS, ActiveDownloadLease, export_has_active_downloads, validate_create_request,
+};
 
 fn test_root(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -109,16 +113,84 @@ fn export_configuration_is_bounded_without_requiring_new_config_keys() {
         .set("retention_seconds", "1")
         .set("max_concurrent_jobs", "999")
         .set("max_queued_jobs", "99999")
+        .set("manifest_validation_concurrency", "0")
         .set("object_read_concurrency", "0")
         .set("artifact_chunk_size_bytes", "32")
-        .set("artifact_write_concurrency", "999");
+        .set("artifact_write_concurrency", "999")
+        .set("max_buffered_bytes_per_job", "1")
+        .set("max_buffered_bytes_global", "1")
+        .set("max_concurrent_downloads", "0");
     let bounded = load_export_config_from(&configured);
     assert_eq!(bounded.retention_seconds, 60);
     assert_eq!(bounded.max_concurrent_jobs, 32);
     assert_eq!(bounded.max_queued_jobs, 4096);
+    assert_eq!(bounded.manifest_validation_concurrency, 1);
     assert_eq!(bounded.object_read_concurrency, 1);
     assert_eq!(bounded.artifact_chunk_size_bytes, 1024 * 1024);
     assert_eq!(bounded.artifact_write_concurrency, 32);
+    assert_eq!(bounded.max_buffered_bytes_per_job, 16 * 1024 * 1024);
+    assert_eq!(bounded.max_buffered_bytes_global, 16 * 1024 * 1024);
+    assert_eq!(bounded.max_concurrent_downloads, 1);
+}
+
+#[test]
+fn export_buffer_plan_contains_hostile_concurrency_configuration() {
+    let config = ExportConfig {
+        object_read_concurrency: 128,
+        artifact_chunk_size_bytes: 1024 * 1024 * 1024,
+        artifact_write_concurrency: 32,
+        max_buffered_bytes_per_job: 16 * 1024 * 1024,
+        max_buffered_bytes_global: 16 * 1024 * 1024,
+        ..ExportConfig::default()
+    };
+    let plan = export_buffer_plan(&config, 200);
+    assert!(plan.admitted_bytes <= 16 * 1024 * 1024);
+    assert!(plan.artifact_chunk_size_bytes >= 1024 * 1024);
+    assert!(plan.artifact_chunk_size_bytes < config.artifact_chunk_size_bytes);
+    assert!(plan.object_read_concurrency >= 1);
+    assert!(plan.artifact_write_concurrency >= 1);
+    assert!(plan.object_read_concurrency < config.object_read_concurrency);
+    assert!(plan.artifact_write_concurrency < config.artifact_write_concurrency);
+}
+
+#[test]
+fn export_buffer_plan_never_schedules_more_writers_than_roots() {
+    let config = ExportConfig {
+        artifact_write_concurrency: 32,
+        max_buffered_bytes_per_job: 1024 * 1024 * 1024,
+        max_buffered_bytes_global: 1024 * 1024 * 1024,
+        ..ExportConfig::default()
+    };
+    let plan = export_buffer_plan(&config, 3);
+    assert_eq!(plan.artifact_write_concurrency, 3);
+}
+
+#[test]
+fn zip_directory_memory_must_fit_the_per_job_budget() {
+    let config = ExportConfig {
+        max_buffered_bytes_per_job: 16 * 1024 * 1024,
+        max_buffered_bytes_global: 16 * 1024 * 1024,
+        ..ExportConfig::default()
+    };
+    assert!(export_buffer_plan_with_overhead(&config, 4, 8 * 1024 * 1024).is_ok());
+    assert!(export_buffer_plan_with_overhead(&config, 4, 15 * 1024 * 1024).is_err());
+}
+
+#[tokio::test]
+async fn active_download_lease_releases_retention_fence_on_drop() {
+    let id = format!("test-download-{}", std::process::id());
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .acquire_owned()
+        .await
+        .expect("download permit");
+    ACTIVE_DOWNLOADS.insert(id.clone(), 1);
+    let lease = ActiveDownloadLease {
+        export_id: id.clone(),
+        _permit: permit,
+    };
+    assert!(export_has_active_downloads(&id));
+    drop(lease);
+    assert!(!export_has_active_downloads(&id));
 }
 
 #[tokio::test]
@@ -155,6 +227,10 @@ async fn artifact_chunks_round_robin_across_roots_and_reconstruct_exactly() {
     assert_eq!(result.size_bytes, data.len() as u64);
     assert_eq!(result.sha256, expected_sha);
     assert_eq!(result.chunks.len(), 4);
+    for chunk in &result.chunks {
+        let bytes = tokio::fs::read(&chunk.path).await.expect("read chunk");
+        assert_eq!(chunk.sha256, hex::encode(Sha256::digest(&bytes)));
+    }
     let used_roots = result
         .chunks
         .iter()

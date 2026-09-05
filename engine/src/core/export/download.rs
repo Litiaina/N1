@@ -7,13 +7,15 @@ use axum::response::Response;
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, acquire_disk_io};
 use crate::enums::app_error_enum::AppError;
 
-use super::models::{ArtifactChunk, ExportPhase, PersistedExport};
+use super::ActiveDownloadLease;
+use super::models::{ArtifactChunk, PersistedExport};
 use super::store::path_is_on_configured_blob_root;
 
 const DOWNLOAD_READ_BYTES: usize = 1024 * 1024;
@@ -23,12 +25,21 @@ struct ArtifactSegment {
     path: PathBuf,
     file_offset: u64,
     size_bytes: u64,
+    file_size_bytes: u64,
+    expected_sha256: Option<String>,
+}
+
+struct ActiveSegment {
+    file: File,
+    remaining: u64,
+    checksum: Option<(Sha256, String)>,
 }
 
 struct SegmentStreamState {
     segments: VecDeque<ArtifactSegment>,
-    current: Option<(File, u64)>,
+    current: Option<ActiveSegment>,
     io_guard: Option<DiskIoGuard>,
+    _download_lease: ActiveDownloadLease,
 }
 
 fn strict_range(value: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
@@ -124,6 +135,11 @@ fn relevant_segments(
             path,
             file_offset: segment_start - chunk_start,
             size_bytes: segment_end - segment_start + 1,
+            file_size_bytes: chunk.size_bytes,
+            expected_sha256: (segment_start == chunk_start
+                && segment_end == chunk_end
+                && !chunk.sha256.is_empty())
+            .then(|| chunk.sha256.clone()),
         });
     }
     let covered = segments.iter().fold(0_u64, |total, segment| {
@@ -143,15 +159,9 @@ async fn preflight_segments(segments: &[ArtifactSegment]) -> Result<(), AppError
             let metadata = tokio::fs::metadata(&segment.path).await.map_err(|error| {
                 AppError::Io(error, "stat N1 export artifact chunk".to_string())
             })?;
-            let required = segment
-                .file_offset
-                .checked_add(segment.size_bytes)
-                .ok_or_else(|| {
-                    AppError::InternalServerError("N1 export artifact segment overflow".to_string())
-                })?;
-            if metadata.len() < required {
+            if metadata.len() != segment.file_size_bytes {
                 return Err(AppError::ServiceUnavailable(
-                    "N1 export artifact chunk is truncated; rebuild the export".to_string(),
+                    "N1 export artifact chunk length is invalid; rebuild the export".to_string(),
                 ));
             }
             Ok(())
@@ -164,28 +174,45 @@ async fn preflight_segments(segments: &[ArtifactSegment]) -> Result<(), AppError
     Ok(())
 }
 
-fn artifact_body(segments: Vec<ArtifactSegment>, io_guard: DiskIoGuard) -> Body {
+fn artifact_body(
+    segments: Vec<ArtifactSegment>,
+    io_guard: DiskIoGuard,
+    download_lease: ActiveDownloadLease,
+) -> Body {
     let state = SegmentStreamState {
         segments: segments.into(),
         current: None,
         io_guard: Some(io_guard),
+        _download_lease: download_lease,
     };
     let stream = futures_util::stream::try_unfold(state, |mut state| async move {
         loop {
-            if let Some((file, remaining)) = state.current.as_mut() {
-                let mut buffer = vec![0_u8; (*remaining as usize).min(DOWNLOAD_READ_BYTES)];
-                let read = file.read(&mut buffer).await?;
+            if let Some(current) = state.current.as_mut() {
+                let mut buffer = vec![0_u8; (current.remaining as usize).min(DOWNLOAD_READ_BYTES)];
+                let read = current.file.read(&mut buffer).await?;
                 if read == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "N1 export artifact chunk ended early",
                     ));
                 }
-                *remaining -= read as u64;
+                current.remaining -= read as u64;
+                if let Some((hasher, _)) = current.checksum.as_mut() {
+                    hasher.update(&buffer[..read]);
+                }
                 if let Some(io_guard) = state.io_guard.as_ref() {
                     io_guard.record_progress(read as u64);
                 }
-                if *remaining == 0 {
+                if current.remaining == 0 {
+                    if let Some((hasher, expected)) = current.checksum.take() {
+                        let actual = hex::encode(hasher.finalize());
+                        if actual != expected {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "N1 export artifact chunk checksum mismatch",
+                            ));
+                        }
+                    }
                     state.current = None;
                 }
                 buffer.truncate(read);
@@ -201,7 +228,13 @@ fn artifact_body(segments: Vec<ArtifactSegment>, io_guard: DiskIoGuard) -> Body 
             let mut file = File::open(&segment.path).await?;
             file.seek(std::io::SeekFrom::Start(segment.file_offset))
                 .await?;
-            state.current = Some((file, segment.size_bytes));
+            state.current = Some(ActiveSegment {
+                file,
+                remaining: segment.size_bytes,
+                checksum: segment
+                    .expected_sha256
+                    .map(|expected| (Sha256::new(), expected)),
+            });
         }
     });
     Body::from_stream(stream)
@@ -220,12 +253,7 @@ pub(super) async fn build_download_response(
     state: &PersistedExport,
     headers: &HeaderMap,
 ) -> Result<Response, AppError> {
-    if state.phase != ExportPhase::Ready {
-        return Err(AppError::Conflict(format!(
-            "export is not ready; current phase is {:?}",
-            state.phase
-        )));
-    }
+    let (state, download_lease) = super::lease_ready_export(&state.id).await?;
     let size = state.artifact_size_bytes.ok_or_else(|| {
         AppError::InternalServerError("ready export has no artifact size".to_string())
     })?;
@@ -327,6 +355,7 @@ pub(super) async fn build_download_response(
                         "N1 export download lost disk scheduler admission".to_string(),
                     )
                 })?,
+                download_lease,
             )
         })
         .map_err(|error| {
@@ -337,6 +366,7 @@ pub(super) async fn build_download_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn range_parser_supports_browser_resume_forms() {
@@ -355,5 +385,38 @@ mod tests {
             "report__X-Evil_ yes.zip"
         );
         assert_eq!(safe_download_filename(" ", "tar"), "export.tar");
+    }
+
+    #[tokio::test]
+    async fn preflight_requires_the_exact_persisted_chunk_length() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "n1-export-preflight-{}-{unique}",
+            std::process::id()
+        ));
+        tokio::fs::write(&path, b"artifact")
+            .await
+            .expect("write artifact");
+        let valid = ArtifactSegment {
+            path: path.clone(),
+            file_offset: 0,
+            size_bytes: 8,
+            file_size_bytes: 8,
+            expected_sha256: None,
+        };
+        assert!(
+            preflight_segments(std::slice::from_ref(&valid))
+                .await
+                .is_ok()
+        );
+        let invalid = ArtifactSegment {
+            file_size_bytes: 7,
+            ..valid
+        };
+        assert!(preflight_segments(&[invalid]).await.is_err());
+        let _ = tokio::fs::remove_file(path).await;
     }
 }

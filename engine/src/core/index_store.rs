@@ -763,7 +763,11 @@ pub(crate) fn visit_dir_names(
         Mode::empty(),
     )
     .map_err(|e| {
-        AppError::InternalServerError(format!("open N1 directory {}: {e}", path.display()))
+        if e == rustix::io::Errno::NOENT {
+            AppError::NotFound
+        } else {
+            AppError::InternalServerError(format!("open N1 directory {}: {e}", path.display()))
+        }
     })?;
     let mut dir = Dir::new(fd).map_err(|e| {
         AppError::InternalServerError(format!("scan N1 directory {}: {e}", path.display()))

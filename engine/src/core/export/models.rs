@@ -25,6 +25,8 @@ pub(super) struct ArtifactChunk {
     pub path: String,
     pub logical_offset: u64,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,8 @@ pub(super) struct PersistedExport {
     pub source_bytes_total: u64,
     #[serde(default)]
     pub source_bytes_completed: u64,
+    #[serde(default)]
+    pub artifact_bytes_completed: u64,
     #[serde(default)]
     pub reserved_bytes: u64,
     #[serde(default)]
@@ -92,6 +96,7 @@ pub struct ExportStatusResponse {
     pub objects_completed: u64,
     pub source_bytes_total: u64,
     pub source_bytes_completed: u64,
+    pub artifact_bytes_completed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +121,13 @@ impl ExportStatusResponse {
             objects_completed: state.objects_completed,
             source_bytes_total: state.source_bytes_total,
             source_bytes_completed: state.source_bytes_completed,
+            artifact_bytes_completed: if state.phase == ExportPhase::Ready {
+                state
+                    .artifact_size_bytes
+                    .unwrap_or(state.artifact_bytes_completed)
+            } else {
+                state.artifact_bytes_completed
+            },
             artifact_size_bytes: state.artifact_size_bytes,
             etag: state.etag_sha256.as_ref().map(|etag| format!("\"{etag}\"")),
             error: state.error.clone(),
@@ -131,9 +143,13 @@ pub struct ExportConfig {
     pub cleanup_interval_seconds: u64,
     pub max_concurrent_jobs: usize,
     pub max_queued_jobs: usize,
+    pub manifest_validation_concurrency: usize,
     pub object_read_concurrency: usize,
     pub artifact_chunk_size_bytes: usize,
     pub artifact_write_concurrency: usize,
+    pub max_buffered_bytes_per_job: usize,
+    pub max_buffered_bytes_global: usize,
+    pub max_concurrent_downloads: usize,
     pub max_retained_bytes: u64,
 }
 
@@ -147,9 +163,13 @@ impl Default for ExportConfig {
             cleanup_interval_seconds: 60,
             max_concurrent_jobs: 2,
             max_queued_jobs: 128,
+            manifest_validation_concurrency: parallelism.saturating_mul(2).clamp(2, 32),
             object_read_concurrency: parallelism.saturating_mul(2).clamp(2, 32),
             artifact_chunk_size_bytes: 16 * 1024 * 1024,
             artifact_write_concurrency: 4,
+            max_buffered_bytes_per_job: 128 * 1024 * 1024,
+            max_buffered_bytes_global: 256 * 1024 * 1024,
+            max_concurrent_downloads: 32,
             max_retained_bytes: 0,
         }
     }

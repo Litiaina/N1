@@ -57,6 +57,12 @@ fn load_export_config() -> ExportConfig {
         .clamp(1, 32),
         max_queued_jobs: parsed_usize(section, "max_queued_jobs", defaults.max_queued_jobs)
             .clamp(1, 4096),
+        manifest_validation_concurrency: parsed_usize(
+            section,
+            "manifest_validation_concurrency",
+            defaults.manifest_validation_concurrency,
+        )
+        .clamp(1, 128),
         object_read_concurrency: parsed_usize(
             section,
             "object_read_concurrency",
@@ -75,6 +81,24 @@ fn load_export_config() -> ExportConfig {
             defaults.artifact_write_concurrency,
         )
         .clamp(1, 32),
+        max_buffered_bytes_per_job: parsed_usize(
+            section,
+            "max_buffered_bytes_per_job",
+            defaults.max_buffered_bytes_per_job,
+        )
+        .clamp(16 * 1024 * 1024, 8 * 1024 * 1024 * 1024usize),
+        max_buffered_bytes_global: parsed_usize(
+            section,
+            "max_buffered_bytes_global",
+            defaults.max_buffered_bytes_global,
+        )
+        .clamp(16 * 1024 * 1024, 64 * 1024 * 1024 * 1024usize),
+        max_concurrent_downloads: parsed_usize(
+            section,
+            "max_concurrent_downloads",
+            defaults.max_concurrent_downloads,
+        )
+        .clamp(1, 4096),
         max_retained_bytes: parsed_u64(section, "max_retained_bytes", defaults.max_retained_bytes),
     }
 }
@@ -200,6 +224,58 @@ pub(super) async fn cleanup_artifact_chunks(id: &str) {
     }
 }
 
+pub(super) async fn cleanup_orphan_artifact_jobs() -> Result<u64, AppError> {
+    let mut removed = 0_u64;
+    for root in blob_roots()? {
+        let artifact_root = root.join(EXPORT_BLOB_DIRECTORY);
+        let mut entries = match fs::read_dir(&artifact_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(AppError::Io(
+                    error,
+                    "scan N1 export artifact root".to_string(),
+                ));
+            }
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| AppError::Io(error, "scan N1 export artifact job".to_string()))?
+        {
+            if !entry
+                .file_type()
+                .await
+                .map_err(|error| AppError::Io(error, "stat N1 export artifact job".to_string()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            if validate_export_id(&id).is_err() {
+                continue;
+            }
+            match load_state(&id).await {
+                Ok(_) => continue,
+                Err(AppError::NotFound) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        export_id = %id,
+                        error = %error,
+                        "preserving export artifact whose state could not be verified"
+                    );
+                    continue;
+                }
+            }
+            fs::remove_dir_all(entry.path()).await.map_err(|error| {
+                AppError::Io(error, "remove orphan N1 export artifact".to_string())
+            })?;
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
+}
+
 pub(super) async fn remove_job(id: &str) {
     cleanup_artifact_chunks(id).await;
     if let Ok(directory) = job_directory(id) {
@@ -235,6 +311,12 @@ pub(super) fn load_export_config_from(ini: &Ini) -> ExportConfig {
         .clamp(1, 32),
         max_queued_jobs: parsed_usize(section, "max_queued_jobs", defaults.max_queued_jobs)
             .clamp(1, 4096),
+        manifest_validation_concurrency: parsed_usize(
+            section,
+            "manifest_validation_concurrency",
+            defaults.manifest_validation_concurrency,
+        )
+        .clamp(1, 128),
         object_read_concurrency: parsed_usize(
             section,
             "object_read_concurrency",
@@ -253,6 +335,24 @@ pub(super) fn load_export_config_from(ini: &Ini) -> ExportConfig {
             defaults.artifact_write_concurrency,
         )
         .clamp(1, 32),
+        max_buffered_bytes_per_job: parsed_usize(
+            section,
+            "max_buffered_bytes_per_job",
+            defaults.max_buffered_bytes_per_job,
+        )
+        .clamp(16 * 1024 * 1024, 8 * 1024 * 1024 * 1024usize),
+        max_buffered_bytes_global: parsed_usize(
+            section,
+            "max_buffered_bytes_global",
+            defaults.max_buffered_bytes_global,
+        )
+        .clamp(16 * 1024 * 1024, 64 * 1024 * 1024 * 1024usize),
+        max_concurrent_downloads: parsed_usize(
+            section,
+            "max_concurrent_downloads",
+            defaults.max_concurrent_downloads,
+        )
+        .clamp(1, 4096),
         max_retained_bytes: parsed_u64(section, "max_retained_bytes", defaults.max_retained_bytes),
     }
 }
