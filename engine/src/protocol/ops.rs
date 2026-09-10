@@ -198,6 +198,8 @@ where
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
+            let _upload_activity =
+                crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
             let mut metadata = upload_object_one_shot_reader_direct(
                 claims,
                 fragment.clone(),
@@ -270,6 +272,8 @@ where
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
+            let _upload_activity =
+                crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
             let mut metadata = upload_object_one_shot_stream_direct(
                 claims,
                 fragment.clone(),
@@ -537,6 +541,8 @@ async fn execute_native_op_inner(
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
+            let _upload_activity =
+                crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
             let mut metadata = upload_object_one_shot_direct(
                 claims,
                 fragment.clone(),
@@ -628,6 +634,8 @@ async fn execute_native_op_inner(
                 .as_ref()
                 .map(|value| value.physical_object_id.clone())
                 .unwrap_or_else(|| logical.clone());
+            let _upload_activity =
+                crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
             match finalize_object_upload_direct(
                 claims,
                 fragment.clone(),
@@ -650,9 +658,12 @@ async fn execute_native_op_inner(
                         &metadata,
                     )
                     .await?;
-                    global_namespace_runtime()
-                        .clear_pending_upload(&fragment, &metadata.version_id)
-                        .await?;
+                    crate::core::index::remove_session(
+                        &fragment,
+                        &metadata.version_id,
+                        "finalized",
+                    )
+                    .await?;
                     metadata.object_key = logical_path;
                     emit_logical_file_uploaded(
                         &state,

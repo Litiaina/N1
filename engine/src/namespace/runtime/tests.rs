@@ -6,6 +6,62 @@ use crate::core::index_store;
 use ulid::Ulid;
 
 #[test]
+fn cancelled_request_keeps_namespace_publication_exclusive_until_worker_finishes() {
+    use futures_util::FutureExt;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let _test_guard = crate::test_support::global_test_lock().lock().await;
+        ensure_test_index_roots();
+        let fragment = format!("cancel-publish-{}", Ulid::new());
+        let object = new_object_id();
+        let metadata = test_metadata(&fragment, &object, 32);
+        index_store::upsert_live_version(&metadata).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        let key = format!("{fragment}\0item.bin");
+        let mut request = Box::pin(
+            global_namespace_runtime()
+                .finalize_logical_upload(&fragment, "item.bin", &object, &metadata),
+        );
+        assert!(request.as_mut().now_or_never().is_none());
+        let lock = finalize_guard::lock_for_test(&key).unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(request); // Worker is queued, but cancellation cannot stop it.
+        let still_exclusive = lock.try_lock().is_err();
+        drop(lock);
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        // One blocking thread: this sentinel runs after the queued publisher.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        assert!(
+            still_exclusive,
+            "cancelled request released a still-running publisher's path lock"
+        );
+        assert_eq!(
+            global_namespace_runtime()
+                .resolve_live_object_id(&fragment, "item.bin")
+                .await
+                .unwrap(),
+            Some(object),
+        );
+        assert!(
+            finalize_guard::lock_for_test(&key).is_none(),
+            "cancelled publication leaked a path-lock entry"
+        );
+    });
+}
+
+#[test]
 fn trash_parent_pruning_removes_only_empty_logical_parents() {
     let base = std::env::temp_dir().join(format!(
         "n1-trash-prune-{}-{}",
@@ -742,4 +798,81 @@ async fn n1_recover_and_ttl_sweep_race_preserves_data_without_a_namespace_lock()
             outcome => panic!("invalid recover/sweep outcome: {outcome:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn ttl_reclamation_preserves_an_upload_to_the_expiring_object() {
+    let _test_guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let fragment = format!("ttl-active-upload-{}", Ulid::new());
+    let path = "ongoing.bin";
+    let object = publish_logical_object(&roots, &fragment, path, 32);
+    let metadata = index_store::read_current_live_head(&fragment, &object)
+        .unwrap()
+        .unwrap();
+    global_namespace_runtime()
+        .trash(&fragment, path)
+        .await
+        .unwrap();
+    // A previously initialized upload may still target the physical object
+    // after the user trashes its namespace path.
+    let active = crate::core::upload::UploadActivityGuard::begin(&fragment, &object).unwrap();
+    let sweep = global_namespace_runtime()
+        .sweep_expired_trash(&fragment, 0, Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert_eq!(sweep.expired_entries, 1);
+    assert_eq!(
+        sweep.reclaimed_objects, 0,
+        "TTL reclaimed an active upload's object directory"
+    );
+    assert!(
+        index_store::read_live_version(&fragment, &object, &metadata.version_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(Path::new(&metadata.parts[0].shards[0].absolute_path).is_file());
+    drop(active);
+    assert!(index_store::delete_unreferenced_object_index(&fragment, &object).unwrap());
+}
+
+#[tokio::test]
+async fn idle_durable_session_blocks_ttl_object_reclamation_until_removed() {
+    let _guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let fragment = format!("ttl-idle-durable-{}", Ulid::new());
+    let object = publish_logical_object(&roots, &fragment, "idle.bin", 32);
+    let manifest = crate::core::upload::UploadSessionManifest {
+        fragment: fragment.clone(),
+        object_key: object.clone(),
+        version_id: Ulid::new().to_string(),
+        session_id: Ulid::new().to_string(),
+        total_size_bytes: 32,
+        expected_parts: 1,
+        part_size_bytes: 32,
+        content_type: "application/octet-stream".into(),
+        created_at: Utc::now().timestamp(),
+        stripe_size_bytes: 4096,
+        data_shards: 1,
+        parity_shards: 0,
+        placement_roots: BLOB_STORE_DISKS.get().unwrap().clone(),
+    };
+    index_store::open_session(&manifest, None).unwrap();
+    global_namespace_runtime()
+        .trash(&fragment, "idle.bin")
+        .await
+        .unwrap();
+    let sweep = global_namespace_runtime()
+        .sweep_expired_trash(&fragment, 0, Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert_eq!(sweep.expired_entries, 1);
+    assert_eq!(sweep.reclaimed_objects, 0);
+    assert!(
+        index_store::read_current_live_head(&fragment, &object)
+            .unwrap()
+            .is_some()
+    );
+    index_store::remove_session(&fragment, &manifest.version_id).unwrap();
+    assert!(index_store::delete_unreferenced_object_index(&fragment, &object).unwrap());
 }

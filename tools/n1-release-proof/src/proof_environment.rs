@@ -230,7 +230,7 @@ max_concurrent_jobs=2
 max_queued_jobs=32
 manifest_validation_concurrency=8
 object_read_concurrency=8
-artifact_chunk_size_bytes=16777216
+artifact_chunk_size_bytes={export_chunk_size}
 artifact_write_concurrency=4
 max_buffered_bytes_per_job=67108864
 max_buffered_bytes_global=134217728
@@ -302,7 +302,8 @@ stripe_block_size=262144
             self.args.rate_limiter_enabled,
             self.args.max_part_size,
             self.data_shards,
-            self.parity_shards
+            self.parity_shards,
+            export_chunk_size = PROOF_EXPORT_CHUNK_SIZE,
         );
         fs::write(self.args.out_dir.join("n1_config.ini"), config)?;
         Ok(())

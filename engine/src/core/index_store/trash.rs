@@ -114,6 +114,12 @@ fn trash_generation_anchor(
     let mut components = Vec::with_capacity(path_depth);
     for position in 0..path_depth {
         let names = read_dir_names(&current)?;
+        if names.is_empty() {
+            // Trash publication builds the parent chain before moving its
+            // anchor; recovery removes the anchor before pruning that chain.
+            // An empty intermediate directory is not a committed trash item.
+            return Err(AppError::NotFound);
+        }
         if names.len() != 1 {
             return Err(AppError::InternalServerError(format!(
                 "N1 trash generation '{}' has {} entries at logical path depth {}; expected exactly one",
@@ -125,12 +131,21 @@ fn trash_generation_anchor(
         let name = names.into_iter().next().expect("one trash path component");
         components.push(name.clone());
         current = current.join(name);
-        if position + 1 < path_depth && !current.is_dir() {
-            return Err(AppError::InternalServerError(format!(
-                "N1 trash generation '{}' ends before its declared logical path depth {}",
-                generation_root.display(),
-                path_depth
-            )));
+        if position + 1 < path_depth {
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.is_dir() => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AppError::NotFound);
+                }
+                Err(error) => return Err(io_err(error, "inspect N1 trash parent")),
+                Ok(_) => {
+                    return Err(AppError::InternalServerError(format!(
+                        "N1 trash generation '{}' ends before its declared logical path depth {}",
+                        generation_root.display(),
+                        path_depth
+                    )));
+                }
+            }
         }
     }
     Ok((current, components.join("/")))
@@ -229,7 +244,13 @@ pub(crate) fn visit_trash_records(
             let (kind, object_keys, version_ids) = if let Some(object_id) =
                 read_namespace_symlink_object_id(&index_root, fragment, &anchor)?
             {
-                let mut versions = list_live_versions(fragment, &object_id)?
+                let Some(versions) = while_trash_anchor_present(&anchor, || {
+                    list_live_versions(fragment, &object_id)
+                })?
+                else {
+                    continue 'generation;
+                };
+                let mut versions = versions
                     .into_iter()
                     .map(|metadata| metadata.version_id)
                     .collect::<Vec<_>>();
@@ -237,16 +258,12 @@ pub(crate) fn visit_trash_records(
                 versions.dedup();
                 (TrashKind::File, vec![object_id], versions)
             } else if metadata.is_dir() {
-                let (objects, versions) =
-                    match collect_trash_object_refs(&index_root, fragment, &anchor) {
-                        Ok(references) => references,
-                        Err(error) => match fs::symlink_metadata(&anchor) {
-                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
-                                continue 'generation;
-                            }
-                            _ => return Err(error),
-                        },
-                    };
+                let Some((objects, versions)) = while_trash_anchor_present(&anchor, || {
+                    collect_trash_object_refs(&index_root, fragment, &anchor)
+                })?
+                else {
+                    continue 'generation;
+                };
                 (TrashKind::Directory, objects, versions)
             } else if metadata.is_file() {
                 (TrashKind::File, Vec::new(), Vec::new())
@@ -283,6 +300,68 @@ pub(crate) fn visit_trash_records(
         break;
     }
     Ok(())
+}
+
+fn while_trash_anchor_present<T>(
+    anchor: &Path,
+    read: impl FnOnce() -> Result<T, AppError>,
+) -> Result<Option<T>, AppError> {
+    match read() {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let missing = matches!(&error, AppError::NotFound)
+                || matches!(&error, AppError::Io(io, _) if io.kind() == std::io::ErrorKind::NotFound);
+            // TTL can unlink the anchor and reclaim NDX between enumeration
+            // and decoding. Only that confirmed disappearance is benign;
+            // missing metadata for a retained anchor, EIO and corruption fail.
+            if missing
+                && matches!(fs::symlink_metadata(anchor), Err(io) if io.kind() == std::io::ErrorKind::NotFound)
+            {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_disappearing_after_ttl_unlinks_anchor_is_not_a_broken_record() {
+        let root = std::env::temp_dir().join(format!("trash-read-race-{}", ulid::Ulid::new()));
+        fs::create_dir_all(&root).unwrap();
+        let anchor = root.join("anchor");
+        let metadata = root.join("object.ndx");
+        fs::write(&anchor, b"anchor").unwrap();
+        fs::write(&metadata, b"fixture").unwrap();
+        let result = while_trash_anchor_present(&anchor, || {
+            fs::remove_file(&anchor).unwrap();
+            fs::remove_file(&metadata).unwrap();
+            fs::read(&metadata).map_err(|io| io_err(io, "read N1 object metadata"))
+        });
+        assert!(matches!(result, Ok(None)));
+        fs::write(&anchor, b"still committed").unwrap();
+        assert!(
+            while_trash_anchor_present(&anchor, || {
+                fs::read(&metadata).map_err(|io| io_err(io, "read N1 object metadata"))
+            })
+            .is_err()
+        );
+        fs::remove_file(&anchor).unwrap();
+        assert!(
+            while_trash_anchor_present::<()>(&anchor, || {
+                Err(io_err(
+                    std::io::Error::from_raw_os_error(libc::EIO),
+                    "injected hard I/O failure",
+                ))
+            })
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
@@ -582,34 +661,30 @@ pub(crate) fn delete_unreferenced_object_index(
     fragment: &str,
     object_id: &str,
 ) -> Result<bool, AppError> {
-    let object_id = normalize_object_id(object_id)?;
-    if referenced_object_ids(fragment)?.contains(&object_id) {
-        return Ok(false);
-    }
-    let mut removed = false;
-    for dir in object_dir_candidates(fragment, &object_id)? {
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "delete N1 object index dir"))?;
-            removed = true;
-            if let Some(parent) = dir.parent() {
-                sync_dir(parent);
-            }
-        }
-    }
-    Ok(removed)
+    Ok(!delete_unreferenced_object_indexes_batch(fragment, &[object_id.to_owned()])?.is_empty())
 }
 
 pub(crate) fn delete_unreferenced_object_indexes_batch(
     fragment: &str,
     candidates: &[String],
 ) -> Result<Vec<String>, AppError> {
+    // Start tracking before either snapshot. The last trash anchor can expire
+    // while a previously initialized upload still owns this physical object.
+    let upload_scan = crate::core::upload::UploadGcScan::begin(fragment)?;
+    let mut pending = crate::core::upload::standard_upload_object_ids(fragment)?;
+    for session in list_active_sessions(fragment)? {
+        pending.insert(normalize_object_id(&session.manifest.object_key)?);
+    }
     let referenced = referenced_object_ids(fragment)?;
     let mut removed = Vec::new();
     for object_id in candidates.iter().collect::<BTreeSet<_>>() {
         let object_id = normalize_object_id(object_id)?;
-        if referenced.contains(&object_id) {
+        if referenced.contains(&object_id) || pending.contains(&object_id) {
             continue;
         }
+        let Some(_reclaim_guard) = upload_scan.try_reclaim(&object_id)? else {
+            continue;
+        };
         let mut object_removed = false;
         for dir in object_dir_candidates(fragment, &object_id)? {
             if !dir.exists() {

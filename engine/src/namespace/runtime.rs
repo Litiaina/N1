@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use chrono::Utc;
 use rustix::fs::{CWD, renameat};
@@ -26,8 +26,8 @@ use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, 
 use walkdir::WalkDir;
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
-static FINALIZE_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+mod finalize_guard;
+use finalize_guard::FinalizeGuard;
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
 }
@@ -434,17 +434,16 @@ impl NamespaceRuntime {
         let logical_path = normalize_user_path(logical_path)?;
         let physical_object_id = physical_object_id.to_string();
         let metadata = metadata.clone();
+        let upload_activity =
+            crate::core::upload::UploadActivityGuard::begin(&fragment, &physical_object_id)?;
         let lock_key = format!("{fragment}\0{logical_path}");
-        let lock = {
-            let mut locks = FINALIZE_LOCKS.lock().await;
-            locks
-                .entry(lock_key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let guard = lock.lock().await;
+        let guard = FinalizeGuard::acquire(lock_key).await?;
 
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
+            // Blocking publication may outlive a cancelled HTTP/native future.
+            // Move its protection into the worker, not just the awaiting task.
+            let _upload_activity = upload_activity;
+            let _publication_guard = guard;
             let final_object_id = match live_entry(&fragment, &logical_path)? {
                 Some(entry) if entry.kind == NamespaceEntryKind::Directory => {
                     return Err(AppError::Conflict(format!(
@@ -457,6 +456,8 @@ impl NamespaceRuntime {
                     .unwrap_or_else(|| physical_object_id.clone()),
                 None => physical_object_id.clone(),
             };
+            let _target_activity =
+                crate::core::upload::UploadActivityGuard::begin(&fragment, &final_object_id)?;
 
             let mut namespace_placements = Vec::new();
             for root in index_roots() {
@@ -517,16 +518,7 @@ impl NamespaceRuntime {
             Ok(final_object_id)
         })
         .await
-        .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?;
-
-        drop(guard);
-        let mut locks = FINALIZE_LOCKS.lock().await;
-        if locks.get(&lock_key).is_some_and(|existing| {
-            Arc::ptr_eq(existing, &lock) && Arc::strong_count(existing) <= 2
-        }) {
-            locks.remove(&lock_key);
-        }
-        result
+        .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
     }
 
     pub async fn bind_pending_upload(

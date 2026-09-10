@@ -8,7 +8,7 @@ use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
-use tracing::{error, info};
+use tracing::info;
 
 async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError> {
     let path_manager = ObjectPathManager::new();
@@ -16,6 +16,7 @@ async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError
     let fragment_owned = fragment.to_string();
     let now = SystemTime::now();
     let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+    let upload_scan = crate::core::upload::UploadGcScan::begin(fragment)?;
     let live_objects = index::list_fragment_live_objects(fragment).await?;
     let active_sessions = index::list_active_sessions(fragment).await?;
     let total_usage = live_objects
@@ -23,52 +24,42 @@ async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError
         .filter(|meta| !meta.is_delete_marker)
         .map(|meta| meta.total_size_bytes)
         .sum::<u64>();
-    let referenced_object_ids = index_store::referenced_object_ids(fragment)?;
-    let active_session_versions = active_sessions
+    let mut active_session_versions = active_sessions
         .into_iter()
         .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
         .map(|session| session.manifest.version_id)
         .collect::<HashSet<_>>();
+    active_session_versions.extend(crate::core::upload::active_standard_upload_versions(
+        fragment,
+    )?);
+    let referenced_object_ids = index_store::referenced_object_ids(fragment)?;
 
     let orphans_removed = tokio::task::spawn_blocking(move || -> Result<i32, AppError> {
         let mut orphans_count = 0;
 
         for root in blob_roots {
-            let Ok(object_dirs) = index_store::local_object_dirs_under_root(&root, &fragment_owned)
-            else {
-                continue;
-            };
+            let object_dirs = index_store::local_object_dirs_under_root(&root, &fragment_owned)?;
             for (object_dir, object_id) in object_dirs {
                 if referenced_object_ids.contains(&object_id) {
                     continue;
                 }
-                let has_active_session = std::fs::read_dir(&object_dir)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .any(|entry| {
-                        entry.path().is_dir()
-                            && active_session_versions
-                                .contains(&entry.file_name().to_string_lossy().to_string())
-                    });
-                if has_active_session {
+                let Some(_reclaim_guard) = upload_scan.try_reclaim(&object_id)? else {
                     continue;
-                }
-                let modified = std::fs::metadata(&object_dir)
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(now);
-                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= file_ttl {
-                    continue;
-                }
-                if let Err(err) = std::fs::remove_dir_all(&object_dir) {
-                    error!(
-                        "Sync: Failed to remove orphaned object {:?}: {}",
-                        object_dir, err
-                    );
-                } else {
-                    orphans_count += 1;
-                }
+                };
+                let removed = crate::core::garbage_collector::reclaim_object_versions(
+                    &object_dir,
+                    &active_session_versions,
+                    now,
+                    file_ttl,
+                    || true,
+                )
+                .map_err(|error| {
+                    AppError::InternalServerError(format!(
+                        "fragment orphan cleanup incomplete: {error}"
+                    ))
+                })?;
+                orphans_count =
+                    i32::saturating_add(orphans_count, i32::try_from(removed).unwrap_or(i32::MAX));
             }
         }
         Ok(orphans_count)

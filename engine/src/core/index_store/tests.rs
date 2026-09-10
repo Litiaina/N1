@@ -363,6 +363,137 @@ fn repair_fragment_replicas_repairs_namespace_only_and_preserves_objects() {
 }
 
 #[test]
+fn replica_repair_preserves_inflight_atomic_writes_and_local_workspaces() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("n1-repair-inflight-{}", Ulid::new());
+    publish_logical_object(&roots, &fragment, "docs/live.bin", 123);
+    let temp_like_user_path = format!("docs/.user.tmp.{}", Ulid::new());
+    publish_logical_object(&roots, &fragment, &temp_like_user_path, 123);
+    assert!(!internal_namespace_entry_name(
+        base_name(&temp_like_user_path).as_str()
+    ));
+    let repair_temporary = format!("{REPLICA_TMP_PREFIX}{}", Ulid::new());
+    assert!(
+        internal_namespace_entry_name(&repair_temporary),
+        "repair staging must never be exposed by listing"
+    );
+    assert!(reject_reserved_user_path(&repair_temporary).is_err());
+    let destination = fragment_root_on(&roots[0], &fragment);
+    fs::remove_file(destination.join("docs/live.bin")).unwrap();
+    fs::remove_file(destination.join(&temp_like_user_path)).unwrap();
+    let interrupted_copy_dir = destination.join(UPLOADS_DIR).join("interrupted-copy");
+    fs::create_dir_all(&interrupted_copy_dir).unwrap();
+    for _ in 0..8 {
+        fs::write(
+            interrupted_copy_dir.join(format!("{REPLICA_TMP_PREFIX}{}", Ulid::new())),
+            b"unfinished replica copy",
+        )
+        .unwrap();
+    }
+    let mut pending = Vec::new();
+    for root in &roots {
+        let root = fragment_root_on(root, &fragment);
+        for relative in ["..fragment.ndx.tmp.", ".uploads/session/.manifest.ndx.tmp."] {
+            let path = root.join(format!("{relative}{}", Ulid::new()));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"in-flight writer bytes").unwrap();
+            pending.push(path);
+        }
+        for name in [TMP_DIR, LOCKS_DIR, GC_DIR, REPAIR_DIR] {
+            let path = root.join(name).join("local-operation");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, root.as_os_str().as_encoded_bytes()).unwrap();
+            pending.push(path);
+        }
+    }
+
+    repair_fragment_all_partition_replicas(&fragment, false).unwrap();
+    assert!(destination.join("docs/live.bin").is_symlink());
+    assert!(
+        destination.join(&temp_like_user_path).is_symlink(),
+        "valid user names must not be mistaken for staging files"
+    );
+    for path in &pending {
+        assert!(
+            path.is_file(),
+            "repair removed an active writer's file: {path:?}"
+        );
+        if path.file_name().unwrap() != "local-operation" {
+            // The original writer must still be able to complete its rename.
+            fs::rename(path, path.with_extension("committed")).unwrap();
+        } else {
+            let owner = path.parent().unwrap().parent().unwrap();
+            assert_eq!(
+                fs::read(path).unwrap(),
+                owner.as_os_str().as_encoded_bytes()
+            );
+        }
+    }
+    for root in &roots {
+        let root = fragment_root_on(root, &fragment);
+        let staged = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("..fragment.ndx.tmp.")
+            })
+            .count();
+        assert_eq!(
+            staged, 1,
+            "repair must not copy another root's temporary files"
+        );
+    }
+}
+
+#[test]
+fn trash_scan_tolerates_inflight_parent_chains_but_rejects_ambiguous_generations() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("n1-trash-inflight-{}", Ulid::new());
+    publish_logical_object(&roots, &fragment, "docs/live.bin", 123);
+    let pending = trash_generation_name(1_700_000_000_000_000_000, 4);
+    let committed = trash_generation_name(1_700_000_001_000_000_000, 2);
+    let empty_folder = trash_generation_name(1_700_000_002_000_000_000, 1);
+    for root in &roots {
+        let root = fragment_root_on(root, &fragment);
+        let trash = root.join(TRASH_DIR);
+        fs::create_dir_all(trash.join(&pending).join("a/b")).unwrap();
+        fs::create_dir_all(trash.join(&committed).join("docs")).unwrap();
+        fs::rename(
+            root.join("docs/live.bin"),
+            trash.join(&committed).join("docs/live.bin"),
+        )
+        .unwrap();
+        fs::create_dir_all(trash.join(&empty_folder).join("empty-folder")).unwrap();
+    }
+    let records =
+        scan_trash_records(&fragment).expect("in-flight empty parents are not corruption");
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.original_path == "docs/live.bin")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.original_path == "empty-folder")
+    );
+
+    // Multiple competing path components really are ambiguous and must not be
+    // silently skipped by either listing or GC reachability inspection.
+    let pending_root = fragment_root_on(&roots[0], &fragment)
+        .join(TRASH_DIR)
+        .join(&pending);
+    fs::create_dir_all(pending_root.join("other")).unwrap();
+    assert!(scan_trash_records(&fragment).is_err());
+}
+
+#[test]
 fn replica_inspection_detects_equal_count_different_namespace_content() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
@@ -1161,6 +1292,109 @@ fn multipart_manifest_and_binding_are_stable_session_truth() {
     assert_eq!(loaded_binding.physical_object_id, manifest.object_key);
 }
 
+#[tokio::test]
+async fn durable_finalize_retains_resume_truth_until_namespace_commit() {
+    let _guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let blob_roots = ensure_test_blob_roots();
+    let fragment = format!("durable-handoff-{}", Ulid::new());
+    let object_id = new_object_id();
+    let metadata = test_metadata(&fragment, &object_id, 4096);
+    let manifest = UploadSessionManifest {
+        fragment: fragment.clone(),
+        object_key: object_id.clone(),
+        version_id: metadata.version_id.clone(),
+        session_id: metadata.upload_session_id.clone(),
+        total_size_bytes: 4096,
+        expected_parts: 1,
+        part_size_bytes: 4096,
+        content_type: metadata.content_type.clone(),
+        created_at: chrono::Utc::now().timestamp(),
+        stripe_size_bytes: 4096,
+        data_shards: 1,
+        parity_shards: 0,
+        placement_roots: vec![blob_roots[0].to_string_lossy().into_owned()],
+    };
+    open_session(&manifest, None).unwrap();
+    write_pending_binding(&PendingUploadBinding {
+        fragment: fragment.clone(),
+        logical_path: "folder/file.bin".into(),
+        physical_object_id: object_id.clone(),
+        version_id: manifest.version_id.clone(),
+        session_id: manifest.session_id.clone(),
+        created_at_unix: manifest.created_at,
+    })
+    .unwrap();
+    let claims = crate::structs::auth_structs::Claims {
+        fragment: fragment.clone(),
+        fragment_alias: None,
+        read: true,
+        write: true,
+        modify: true,
+        delete: true,
+        exp: usize::MAX,
+    };
+    for _ in 0..2 {
+        let result = crate::core::upload::finalize_object_upload_direct(
+            claims.clone(),
+            fragment.clone(),
+            manifest.version_id.clone(),
+            manifest.session_id.clone(),
+            object_id.clone(),
+            crate::core::disk_manager::InitiateUploadParams {
+                content_type: None,
+                total_size_bytes: 4096,
+                expected_parts: 1,
+                part_size_bytes: Some(4096),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            crate::core::upload::FinalizeUploadResult::Complete(_)
+        ));
+        assert!(
+            list_active_sessions(&fragment)
+                .unwrap()
+                .iter()
+                .any(|session| session.manifest.version_id == manifest.version_id),
+            "NDX publication must not discard GC protection before the namespace commit"
+        );
+        assert_eq!(
+            read_pending_binding(&fragment, &manifest.version_id)
+                .unwrap()
+                .unwrap()
+                .logical_path,
+            "folder/file.bin",
+            "a retry must retain the original logical target"
+        );
+    }
+    for root in &roots {
+        publish_namespace_link(root, &fragment, "folder/file.bin", &object_id).unwrap();
+    }
+    // Namespace publication succeeds first; only then may the caller remove
+    // the manifest, receipts and binding together. This also models retry.
+    crate::core::index::remove_session(&fragment, &manifest.version_id, "finalized")
+        .await
+        .unwrap();
+    assert!(
+        load_session(&fragment, &manifest.version_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read_pending_binding(&fragment, &manifest.version_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        referenced_object_ids(&fragment)
+            .unwrap()
+            .contains(&object_id)
+    );
+}
+
 #[test]
 fn removing_multipart_session_clears_manifest_binding_and_receipts_on_all_replicas() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
@@ -1222,6 +1456,80 @@ fn removing_multipart_session_clears_manifest_binding_and_receipts_on_all_replic
             .expect("read binding after remove")
             .is_none(),
         "removed upload sessions must not leave pending namespace bindings"
+    );
+}
+
+#[test]
+fn durable_receipts_refresh_idle_age_without_rewriting_manifest() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("durable-activity-{}", Ulid::new());
+    let manifest = UploadSessionManifest {
+        fragment: fragment.clone(),
+        object_key: new_object_id(),
+        version_id: Ulid::new().to_string(),
+        session_id: Ulid::new().to_string(),
+        total_size_bytes: 4096,
+        expected_parts: 1,
+        part_size_bytes: 4096,
+        content_type: "application/octet-stream".into(),
+        created_at: 1,
+        stripe_size_bytes: 4096,
+        data_shards: 1,
+        parity_shards: 0,
+        placement_roots: vec![ensure_test_blob_roots()[0].to_string_lossy().into_owned()],
+    };
+    open_session(&manifest, None).unwrap();
+    let mut manifests = Vec::new();
+    for root in &roots {
+        let dir = fragment_root_on(root, &fragment)
+            .join(UPLOADS_DIR)
+            .join(&manifest.version_id);
+        let path = dir.join(MANIFEST_FILE);
+        let mut row: SessionRow = decode(&fs::read(&path).unwrap()).unwrap();
+        row.last_activity_at = 1;
+        let bytes = encode(&row).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        fs::File::open(&dir)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2)),
+            )
+            .unwrap();
+        manifests.push((path, bytes));
+    }
+    let before = load_session(&fragment, &manifest.version_id)
+        .unwrap()
+        .unwrap();
+    let receipt_time = chrono::Utc::now().timestamp();
+    commit_session_part_receipt(
+        &fragment,
+        &manifest.version_id,
+        &SessionPartReceipt {
+            part_index: 0,
+            size_bytes: 4096,
+            shard_size_bytes: 4096,
+            created_at: receipt_time,
+            checksum: Some(1),
+            shard_checksums: vec![2],
+        },
+    )
+    .unwrap();
+    let after = load_session(&fragment, &manifest.version_id)
+        .unwrap()
+        .unwrap();
+    for (path, bytes) in manifests {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "activity tracking must not add manifest writes"
+        );
+    }
+    assert!(after.last_activity_at > before.last_activity_at);
+    assert!(
+        after.last_activity_at >= receipt_time,
+        "GC idle age must reflect the latest completed receipt"
     );
 }
 

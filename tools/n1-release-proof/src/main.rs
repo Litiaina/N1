@@ -36,6 +36,8 @@ include!("proof_export.rs");
 include!("proof_multipart_resume.rs");
 include!("proof_auto_healing.rs");
 include!("proof_maintenance_coverage.rs");
+include!("proof_gc_safety.rs");
+include!("proof_upload_gc.rs");
 include!("proof_maintenance.rs");
 include!("proof_jobs.rs");
 include!("proof_utils.rs");
@@ -50,7 +52,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.export_proof {
+    let result = if proof.args.gc_safety_proof {
+        proof.run_gc_safety_proof().await
+    } else if proof.args.export_proof {
         proof.run_export_proof().await
     } else if proof.args.maintenance_coverage_proof {
         proof.run_maintenance_coverage_proof().await

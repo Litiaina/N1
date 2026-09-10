@@ -60,7 +60,13 @@ fn count_upload_records(root: &Path, fragment: &str) -> u64 {
             };
             if file_type.is_dir() {
                 stack.push(entry.path());
-            } else if file_type.is_file() {
+            } else if file_type.is_file()
+                && !is_replica_staging_name(&entry.file_name().to_string_lossy())
+                && !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REPLICA_TMP_PREFIX)
+            {
                 count += 1;
             }
         }
@@ -96,17 +102,37 @@ fn add_digest_mod_256(accumulator: &mut [u8; 32], digest: &[u8; 32]) {
     }
 }
 
+fn is_replica_staging_name(name: &str) -> bool {
+    name.starts_with('.')
+        && name
+            .rsplit_once(".tmp.")
+            .is_some_and(|(_, nonce)| nonce.len() == 26 && Ulid::from_string(nonce).is_ok())
+}
+
+fn replica_local_entry(path: &Path, name: &str, at_fragment_root: bool) -> bool {
+    // User objects are symlinks, and user directories may legitimately have a
+    // name resembling an atomic-write sibling. Only regular-file staging and
+    // our reserved repair prefix belong to the writer, not the namespace.
+    name.starts_with(REPLICA_TMP_PREFIX)
+        || (is_replica_staging_name(name)
+            && match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata.is_file(),
+                // The owning writer may have completed its rename since readdir.
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            })
+        || (at_fragment_root
+            && matches!(
+                name,
+                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | GC_DIR | REPAIR_DIR
+            ))
+}
+
 fn hash_replica_tree(fragment_root: &Path, directory: &Path) -> Result<[u8; 32], AppError> {
     let mut sum = [0u8; 32];
     let mut xor = [0u8; 32];
     let mut entry_count = 0u64;
     visit_dir_names(directory, |name| {
-        if directory == fragment_root
-            && matches!(
-                name.as_str(),
-                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | REPAIR_DIR
-            )
-        {
+        if replica_local_entry(&directory.join(&name), &name, directory == fragment_root) {
             return Ok(true);
         }
         let path = directory.join(&name);
@@ -209,6 +235,9 @@ pub(super) fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
     for entry in entries.filter_map(|entry| entry.ok()) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        if replica_local_entry(&entry.path(), &name, false) {
+            continue;
+        }
         if matches!(
             name.as_ref(),
             OBJECTS_DIR | FRAGMENT_META_FILE | TMP_DIR | LOCKS_DIR | GC_DIR | REPAIR_DIR
@@ -356,7 +385,6 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
         if dst.exists() && replica_state(&dst_root, fragment)? == source_state {
             continue;
         }
-        clear_index_plane(&dst)?;
         copy_dir_contents(&source, &dst)?;
     }
     let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
@@ -401,7 +429,6 @@ pub fn repair_fragment_all_partition_replicas(
                 Err(_) => {
                     corrupt += 1;
                     if !dry_run {
-                        clear_index_plane(&dst)?;
                         copy_dir_contents(&source, &dst)?;
                     }
                     continue;
@@ -417,7 +444,6 @@ pub fn repair_fragment_all_partition_replicas(
             }
         }
         if !dry_run {
-            clear_index_plane(&dst)?;
             copy_dir_contents(&source, &dst)?;
         }
     }
@@ -502,51 +528,231 @@ fn clear_index_plane(fragment_root: &Path) -> Result<(), AppError> {
     for entry in fs::read_dir(fragment_root).map_err(|e| io_err(e, "scan N1 replica root"))? {
         let entry = entry.map_err(|e| io_err(e, "scan N1 replica root entry"))?;
         let name = entry.file_name();
-        if matches!(name.to_str(), Some(OBJECTS_DIR)) {
+        if replica_local_entry(&entry.path(), &name.to_string_lossy(), true) {
             continue;
         }
-        let path = entry.path();
-        let meta =
-            fs::symlink_metadata(&path).map_err(|e| io_err(e, "inspect N1 replica target"))?;
-        if meta.file_type().is_symlink() || meta.is_file() {
-            fs::remove_file(&path).map_err(|e| io_err(e, "clear N1 replica file"))?;
-        } else if meta.is_dir() {
-            fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear N1 replica dir"))?;
+        remove_stale_replica_entry(&entry.path())?;
+    }
+    linux_io::sync_dir_blocking(fragment_root).map_err(|e| io_err(e, "sync cleared N1 replica"))?;
+    Ok(())
+}
+
+// Never recursively unlink a parent: an atomic writer can still own a temporary
+// sibling underneath it. This also preserves unrecognised non-file entries.
+fn remove_stale_replica_entry(path: &Path) -> Result<(), AppError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_err(err, "inspect stale N1 replica")),
+    };
+    if replica_local_entry(
+        path,
+        &path.file_name().unwrap_or_default().to_string_lossy(),
+        false,
+    ) {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).map_err(|e| io_err(e, "scan stale N1 replica dir"))? {
+            remove_stale_replica_entry(
+                &entry
+                    .map_err(|e| io_err(e, "scan stale N1 replica"))?
+                    .path(),
+            )?;
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => (),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                ()
+            }
+            Err(err) => return Err(io_err(err, "remove empty N1 replica dir")),
+        }
+    } else if meta.is_file() || meta.file_type().is_symlink() {
+        match fs::remove_file(path) {
+            Ok(()) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+            Err(err) => return Err(io_err(err, "remove stale N1 replica file")),
         }
     }
     Ok(())
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), AppError> {
+    retry_changed_replica_snapshot(src, dst, || reconcile_replica_directory(src, dst, true))
+}
+
+// A durable upload can finish and remove its session directory after readdir
+// but before repair opens/copies that entry. Retry from the same source, never
+// promote the partially copied destination to authority. Missing roots and
+// non-ENOENT I/O failures remain real failures, not concurrency conflicts.
+fn retry_changed_replica_snapshot(
+    src: &Path,
+    dst: &Path,
+    mut reconcile: impl FnMut() -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    for attempt in 0..3 {
+        match reconcile() {
+            Err(AppError::Io(error, _))
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(src).is_ok_and(|metadata| metadata.is_dir())
+                    && fs::symlink_metadata(dst).is_ok_and(|metadata| metadata.is_dir()) =>
+            {
+                if attempt == 2 {
+                    return Err(AppError::Conflict(
+                        "N1 replica contents changed during online repair; retry the scan".into(),
+                    ));
+                }
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final changed-snapshot attempt returns a conflict")
+}
+
+fn reconcile_replica_directory(
+    src: &Path,
+    dst: &Path,
+    at_fragment_root: bool,
+) -> Result<(), AppError> {
+    if let Ok(meta) = fs::symlink_metadata(dst) {
+        if !meta.is_dir() {
+            return Err(AppError::Conflict(format!(
+                "N1 replica directory conflicts with {}",
+                dst.display()
+            )));
+        }
+    }
     fs::create_dir_all(dst).map_err(|e| io_err(e, "create N1 replica dir"))?;
     for entry in fs::read_dir(src).map_err(|e| io_err(e, "scan N1 replica source"))? {
         let entry = entry.map_err(|e| io_err(e, "scan N1 replica entry"))?;
-        if matches!(entry.file_name().to_str(), Some(OBJECTS_DIR)) {
+        if replica_local_entry(
+            &entry.path(),
+            &entry.file_name().to_string_lossy(),
+            at_fragment_root,
+        ) {
             continue;
         }
         let source = entry.path();
         let target = dst.join(entry.file_name());
         let meta =
             fs::symlink_metadata(&source).map_err(|e| io_err(e, "inspect N1 replica source"))?;
-        if meta.file_type().is_symlink() {
-            if fs::symlink_metadata(&target).is_ok() {
-                let _ = fs::remove_file(&target);
+        if meta.is_dir() {
+            reconcile_replica_directory(&source, &target, false)?;
+        } else if meta.file_type().is_symlink() || meta.is_file() {
+            // Publish a complete sibling without truncating the destination or
+            // introducing a missing-file window. Payload memory stays bounded.
+            let temporary = target.with_file_name(format!("{REPLICA_TMP_PREFIX}{}", Ulid::new()));
+            let result = (|| -> std::io::Result<()> {
+                if meta.file_type().is_symlink() {
+                    unix_fs::symlink(fs::read_link(&source)?, &temporary)?;
+                } else {
+                    let mut input = File::open(&source)?;
+                    let mut output = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&temporary)?;
+                    std::io::copy(&mut input, &mut output)?;
+                    output.sync_all()?;
+                }
+                fs::rename(&temporary, &target)?;
+                linux_io::sync_dir_blocking(dst)
+            })();
+            if let Err(err) = result {
+                let _ = fs::remove_file(&temporary);
+                return Err(io_err(
+                    err,
+                    &format!(
+                        "publish N1 replica entry {} -> {}",
+                        source.display(),
+                        target.display()
+                    ),
+                ));
             }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 replica parent"))?;
-            }
-            let link_target =
-                fs::read_link(&source).map_err(|e| io_err(e, "read N1 replica symlink"))?;
-            unix_fs::symlink(link_target, &target)
-                .map_err(|e| io_err(e, "copy N1 replica symlink"))?;
-        } else if meta.is_dir() {
-            copy_dir_contents(&source, &target)?;
         } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 replica parent"))?;
-            }
-            fs::copy(&source, &target).map_err(|e| io_err(e, "copy N1 replica file"))?;
+            return Err(AppError::Conflict(format!(
+                "unsupported N1 replica entry {}",
+                source.display()
+            )));
         }
     }
+    for entry in fs::read_dir(dst).map_err(|e| io_err(e, "scan N1 replica destination"))? {
+        let entry = entry.map_err(|e| io_err(e, "scan N1 replica destination entry"))?;
+        let name = entry.file_name();
+        if replica_local_entry(&entry.path(), &name.to_string_lossy(), at_fragment_root) {
+            continue;
+        }
+        match fs::symlink_metadata(src.join(&name)) {
+            Ok(_) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                remove_stale_replica_entry(&entry.path())?;
+            }
+            Err(err) => return Err(io_err(err, "inspect N1 replica source before pruning")),
+        }
+    }
+    linux_io::sync_dir_blocking(dst).map_err(|e| io_err(e, "sync N1 replica directory"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_retry_tests {
+    use super::*;
+
+    #[test]
+    fn changed_children_retry_but_lost_roots_and_hard_io_errors_do_not() {
+        let base = std::env::temp_dir().join(format!("n1-replica-retry-{}", Ulid::new()));
+        let source = base.join("source");
+        let target = base.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let missing = || {
+            AppError::Io(
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+                "test child disappeared".into(),
+            )
+        };
+        let mut calls = 0;
+        retry_changed_replica_snapshot(&source, &target, || {
+            calls += 1;
+            if calls == 1 { Err(missing()) } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        calls = 0;
+        assert!(matches!(
+            retry_changed_replica_snapshot(&source, &target, || {
+                calls += 1;
+                Err(missing())
+            }),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(calls, 3, "online retry work must stay bounded");
+        calls = 0;
+        assert!(matches!(
+            retry_changed_replica_snapshot(&source, &target, || {
+                calls += 1;
+                Err(AppError::Io(
+                    std::io::Error::from_raw_os_error(5),
+                    "test EIO".into(),
+                ))
+            }),
+            Err(AppError::Io(_, _))
+        ));
+        assert_eq!(calls, 1);
+        fs::remove_dir(&target).unwrap();
+        calls = 0;
+        assert!(matches!(
+            retry_changed_replica_snapshot(&source, &target, || {
+                calls += 1;
+                Err(missing())
+            }),
+            Err(AppError::Io(_, _))
+        ));
+        assert_eq!(calls, 1, "root loss must retain the safety fault");
+        fs::remove_dir_all(base).unwrap();
+    }
 }

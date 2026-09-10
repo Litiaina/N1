@@ -109,6 +109,7 @@ pub async fn initiate_object_upload_direct(
     }
 
     let manifest = prepare_upload_manifest(&fragment, &object_key, &params).await?;
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &object_key)?;
     let version_id = manifest.version_id.clone();
     let session_id = manifest.session_id.clone();
 
@@ -194,6 +195,7 @@ pub async fn initiate_standard_upload_direct(
     }
 
     let manifest = prepare_upload_manifest(&fragment, &physical_object_key, &params).await?;
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &physical_object_key)?;
     let expected_parts = usize::try_from(manifest.expected_parts)
         .map_err(|_| AppError::BadRequest("expected_parts is too large".into()))?;
     let mut parts = Vec::new();
@@ -405,6 +407,7 @@ pub async fn object_upload_part_standard_body_direct(
     let session = standard_session(&fragment, &version_id)?
         .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
     validate_standard_part_request(&session, part_index, content_length)?;
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &session.manifest.object_key)?;
     let claim = match claim_standard_part(&session, part_index)? {
         StandardPartClaimResult::AlreadyComplete => return Ok(()),
         StandardPartClaimResult::Claimed(claim) => claim,
@@ -487,6 +490,7 @@ where
     let session = standard_session(&fragment, &version_id)?
         .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
     validate_standard_part_request(&session, part_index, content_length)?;
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &session.manifest.object_key)?;
     let claim = match claim_standard_part(&session, part_index)? {
         StandardPartClaimResult::AlreadyComplete => return Ok(()),
         StandardPartClaimResult::Claimed(claim) => claim,
@@ -640,6 +644,21 @@ pub fn list_standard_uploads_direct(
     })
 }
 
+/// Dropping a request future is also a finalization exit. Reset only our busy
+/// state, never a successfully finalized session, so retries can proceed.
+struct StandardFinalizeGuard<'a>(&'a StandardUploadSession);
+
+impl Drop for StandardFinalizeGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.lifecycle.compare_exchange(
+            STANDARD_SESSION_FINALIZING,
+            STANDARD_SESSION_OPEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 pub async fn finalize_standard_upload_direct(
     claims: Claims,
     fragment: String,
@@ -660,6 +679,7 @@ pub async fn finalize_standard_upload_direct(
         return Err(AppError::Forbidden("Session id mismatch".into()));
     }
     let physical_object_key = session.manifest.object_key.clone();
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &physical_object_key)?;
     if session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_FINALIZED {
         return Ok(FinalizeUploadResult::Complete(
             index::read_object_version(&fragment, &physical_object_key, &version_id).await?,
@@ -674,6 +694,7 @@ pub async fn finalize_standard_upload_direct(
             Ordering::Acquire,
         )
         .map_err(|_| AppError::Conflict("Multipart session is busy".to_string()))?;
+    let _finalize_guard = StandardFinalizeGuard(&session);
 
     let present = session
         .parts
@@ -687,9 +708,6 @@ pub async fn finalize_standard_upload_direct(
         .filter(|index| !present.contains(index))
         .collect::<Vec<_>>();
     if !missing.is_empty() || session.in_flight_parts.load(Ordering::Acquire) != 0 {
-        session
-            .lifecycle
-            .store(STANDARD_SESSION_OPEN, Ordering::Release);
         return Ok(FinalizeUploadResult::Incomplete(
             FinalizeIncompleteResponse {
                 uploaded_parts: present.into_iter().collect(),
@@ -762,9 +780,6 @@ pub async fn finalize_standard_upload_direct(
                 session.manifest.total_size_bytes,
                 false,
             );
-            session
-                .lifecycle
-                .store(STANDARD_SESSION_OPEN, Ordering::Release);
             Err(err)
         }
     }
@@ -812,12 +827,31 @@ pub fn cancel_standard_upload_direct(
     Ok(())
 }
 
-pub fn active_standard_upload_versions(fragment: &str) -> HashSet<String> {
-    let Ok(mut registry) = STANDARD_UPLOADS.write() else {
-        return HashSet::new();
-    };
-    let now = Utc::now().timestamp();
-    let ttl = CONFIG.garbage_collector.file_ttl_seconds as i64;
+pub fn active_standard_upload_versions(fragment: &str) -> Result<HashSet<String>, AppError> {
+    active_standard_upload_versions_at(
+        fragment,
+        Utc::now().timestamp(),
+        i64::try_from(CONFIG.garbage_collector.file_ttl_seconds).unwrap_or(i64::MAX),
+    )
+}
+
+pub(super) fn active_standard_upload_versions_at(
+    fragment: &str,
+    now: i64,
+    ttl: i64,
+) -> Result<HashSet<String>, AppError> {
+    let mut registry = standard_registry_write()?;
+    let protected_objects = registry
+        .values()
+        .filter(|session| session.manifest.fragment == fragment)
+        .map(|session| {
+            let object = &session.manifest.object_key;
+            Ok((
+                object.clone(),
+                UploadActivityGuard::active(fragment, object)?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, AppError>>()?;
     registry.retain(|_, session| {
         if session.manifest.fragment != fragment {
             return true;
@@ -825,24 +859,37 @@ pub fn active_standard_upload_versions(fragment: &str) -> HashSet<String> {
         let lifecycle = session.lifecycle.load(Ordering::Acquire);
         let idle = now.saturating_sub(session.last_activity_at.load(Ordering::Acquire));
         let expired = idle >= ttl
+            && !protected_objects
+                .get(&session.manifest.object_key)
+                .copied()
+                .unwrap_or(false)
             && session.in_flight_parts.load(Ordering::Acquire) == 0
             && lifecycle != STANDARD_SESSION_FINALIZING;
         if expired {
-            session
+            return session
                 .lifecycle
-                .store(STANDARD_SESSION_CANCELLED, Ordering::Release);
+                .compare_exchange(
+                    lifecycle,
+                    STANDARD_SESSION_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err();
         }
-        !expired
+        true
     });
-    registry
+    Ok(registry
         .values()
         .filter(|session| session.manifest.fragment == fragment)
         .filter(|session| {
             matches!(
                 session.lifecycle.load(Ordering::Acquire),
-                STANDARD_SESSION_OPEN | STANDARD_SESSION_FINALIZING
+                // Publication of NDX precedes the namespace commit. Keep the
+                // finalized session protected until complete_standard_upload
+                // removes it after that commit (or the abandoned session TTL).
+                STANDARD_SESSION_OPEN | STANDARD_SESSION_FINALIZING | STANDARD_SESSION_FINALIZED
             )
         })
         .map(|session| session.manifest.version_id.clone())
-        .collect()
+        .collect())
 }

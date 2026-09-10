@@ -69,6 +69,147 @@ verification.
 
 ## Focused Proof Evidence
 
+### September 7–9, 2026: GC and concurrent maintenance hardening
+
+The hardening candidate retains N1 3.5.1, engine format 3, its existing ECS
+adapter, and the standard/durable upload boundaries. This is not a production
+deployment or a new declaration of LTS readiness.
+
+Confirmed failures were reproduced before patching:
+
+- GC and fragment cleanup could delete a young version or unknown child by
+  recursively reclaiming its old object parent. Reclamation now evaluates
+  real version directories separately and prunes only empty expired parents.
+- Failure to establish upload-session protection now preserves that fragment
+  and reports incomplete GC instead of pretending protection is empty.
+  Standard sessions remain protected between NDX finalization and namespace
+  completion. Job status is initialized before admission returns.
+- Automatic replica repair removed an in-flight fragment-metadata temporary
+  file, causing fragment creation to return 503. Reconciliation now preserves
+  writer-owned staging and root-local workspaces and publishes replacement
+  files/symlinks atomically. Staging entries are hidden from namespace listing;
+  similarly named legitimate user entries are not excluded.
+- Concurrent trash/recover could expose an empty intermediate generation
+  directory and make an unrelated recovery return 500. Enumeration now treats
+  empty/missing parent chains as having no published anchor. Ambiguous
+  multi-child generations still fail closed; committed empty folders remain
+  valid entries.
+- Fragment metadata healing now uses the existing file-fsync/rename/
+  directory-fsync writer instead of a separate rename-only helper.
+
+The proof runner also corrected an artifact-spread assertion that used a
+different chunk size than its configuration. This was a harness error, not
+missing archive chunks. The expanded GC proof performs a scan before active
+export retention can defer collection, overlaps standard/durable uploads with
+namespace work, and explicitly verifies preserve/report/retry behavior after
+injected corrupt session metadata.
+
+Online reconciliation retries a disappearing child from the same source up to
+three times. Continued concurrent change is reported through the existing
+retryable-conflict path, not as successful repair; missing roots and hard I/O
+errors remain safety failures. Repair staging is excluded from replica scoring
+as well as content copying and user listing.
+
+Validation status: the pre-blackout candidate passed 203 workspace tests.
+Ten hardware stages were last observed passing; the final comprehensive
+matrix result was not recovered before the reported host blackout. This is
+not a complete hardware acceptance pass. All server fault injection was
+isolated to dedicated test directories on four XFS HDDs, EC 3+1, with
+server-local clients; production services were not replaced.
+
+The September 8 continuation reproduced two additional defects before fixing
+them: a cancelled standard finalizer retained its busy state, and durable
+finalization removed its session/binding before namespace commit. A drop guard
+now releases cancelled finalization, and durable session cleanup follows
+successful logical publication in both HTTP and native routes. Process-local
+upload protection covers GC overlap through namespace publication, including
+blocking publication workers that outlive a cancelled caller. Scan protection
+is bounded and defers reclamation conservatively if its budget is exhausted.
+EC encoding, placement, on-disk format and upload durability modes are unchanged.
+
+An additional regression reproduced durable-session idle age remaining at
+initialization despite newly committed receipts. Session loading now uses the
+existing directory metadata to account for receipt activity without changing
+manifest bytes or adding per-part heartbeat writes.
+
+Candidate 6 passed 214 workspace tests and four pinned local functional suites:
+GC safety, concurrent uploads, automatic healing and the complete matrix. The
+local suites use four private memory-backed filesystems, not physical drives.
+Hardware acceptance resumed on the recovered server using four XFS HDDs.
+The recovered older driver confirms ten passes but no final matrix result.
+Readback from isolated copies of the interrupted fixture verified one known
+64 MiB committed object against its source SHA-256 after the blackout. This is
+limited recovery evidence, not an exhaustive acknowledged-write audit.
+
+Final review reproduced another cancellation defect: an awaiting request
+could release its same-path publication gate while its blocking worker still
+ran. The worker now owns that existing gate, with cancellation-safe registry
+cleanup. Queued-waiter cancellation, independent paths and worker unwind have
+explicit regressions. A full regression also exposed metadata ENOENT during
+concurrent trash recovery/TTL expiry. Enumeration now tolerates that read only
+when the corresponding anchor has disappeared; retained broken anchors,
+corruption and hard I/O errors remain failures. The final candidate requires
+its own acceptance evidence; candidate-6 passes do not certify these changes.
+
+The September 9 review reproduced a separate TTL-reclamation bypass: deleting
+the last expired trash anchor could reclaim the whole physical object while
+an upload still owned it. Trash reclamation now uses the same upload/scan
+protection and excludes pending standard and durable sessions. Session
+inspection failures defer reclamation rather than treating protection as
+empty. A deterministic active-upload regression and an actual paused HTTP
+upload both failed against the preceding engine; idle-session tests also
+verify that cancellation/removal makes reclamation possible again.
+
+Final acceptance on September 9: candidate 8 passed **221 workspace tests**,
+all four pinned local suites, and **all 11 four-HDD stages**. The hardware run
+completed in 46 minutes 59 seconds; the full matrix took 37 minutes 6 seconds.
+The tested engine SHA-256 is
+`8f1ff151a6062dd471905b3a12f27cd853d7e22ed6297adb1488c2b4eb402a42`;
+the proof runner SHA-256 is
+`bb10bb62c6d556b4844099dc543f28b5e1ce4cb4d9ce684c762df205521a6db7`.
+
+The same build passed:
+
+- Three GC/upload/TTL-safety repetitions and three automatic-healing runs.
+- Concurrent standard/durable uploads, maintenance-mode coverage, trash
+  lifecycle, and resumable ZIP/TAR export with archive integrity checks.
+- The 21-gate full matrix: HTTP/native behavior, restart contracts, permission
+  boundaries, namespace mutations, repair, and redistribution from four test
+  roots to one and back to four. Older internal gate labels still say
+  `2_1_2`; the recorded final disk count and placement checks are four.
+- A 1,000-object storm at concurrency 24, 12 mixed users, 12 parallel multipart
+  users, eight isolated fragment users, and 192 same-key versions. The final
+  matrix verified a listing of 1,966 live objects. Hash checks cover the
+  explicitly recorded payloads/samples, not every storm object's contents.
+- Another 960 contested trash/recovery iterations against the final workspace
+  test executable. Formatting and diff-whitespace checks also passed.
+
+The post-run audit inspected all saved server logs: zero unexpected warning,
+error or panic lines. Twenty-four expected fault lines correspond to injected
+corrupt session metadata, missing/identity-invalid roots, and deliberate loss
+beyond EC recovery capacity. The tests verified preservation/fail-safe behavior
+and successful recovery after faults were removed, rather than suppressing
+these faults or claiming they never occurred.
+
+One workload sample recorded 225.5 uploads/s for 16 KiB objects and a maximum
+45 ms standard multipart finalization across 12 users in the full matrix.
+These are server-local observations on HDDs shared with running services,
+not an isolated throughput benchmark or a before/after improvement claim.
+Production service PIDs and the production N1 binary hash were unchanged;
+disposable test processes stopped and test ports were released. No production
+deployment was performed.
+
+Candidate 7's hardware run was deliberately stopped after reproducing the TTL
+bypass; it is not a completed pass. Candidate 6's last hardware matrix exceeded
+its outer 30-minute budget during active redistribution. The final matrix
+retained its per-job deadlines and assertions but allowed 90 minutes overall
+for its several maintenance jobs. Earlier failures remain separate evidence.
+
+These bounded tests do not establish constant-memory million-object GC,
+exhaustive concurrent publication/namespace authority correctness, or physical
+power-cut durability. Full clippy with warnings denied remains a separate
+unmet gate because of the existing lint backlog.
+
 ### N1 3.5.1 Restart-safe Bulk Export Proof
 
 On September 1, 2026, the N1 3.5.1 candidate passed the dedicated optimized

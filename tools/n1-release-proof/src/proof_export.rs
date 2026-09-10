@@ -36,8 +36,10 @@ impl Proof {
         let full = self.download_export_full(&export_id).await?;
         self.validate_zip_export(&full.bytes, &expected).await?;
         self.validate_export_ranges(&export_id, &full).await?;
-        self.validate_export_corruption_detection(&export_id).await?;
-        let artifact_root_count = self.validate_export_chunk_spread(&export_id, full.bytes.len())?;
+        self.validate_export_corruption_detection(&export_id)
+            .await?;
+        let artifact_root_count =
+            self.validate_export_chunk_spread(&export_id, full.bytes.len())?;
 
         let mapped_source = expected
             .keys()
@@ -100,8 +102,7 @@ impl Proof {
         let download_started = Instant::now();
         let performance_download = self.download_export_full(&performance_id).await?;
         let download_seconds = download_started.elapsed().as_secs_f64();
-        if format!("\"{}\"", sha256_bytes(&performance_download.bytes))
-            != performance_download.etag
+        if format!("\"{}\"", sha256_bytes(&performance_download.bytes)) != performance_download.etag
         {
             return Err("performance export ETag does not match its artifact bytes".into());
         }
@@ -224,7 +225,10 @@ impl Proof {
             )
             .into());
         }
-        Ok(response.json::<ExportCreateProofResponse>().await?.export_id)
+        Ok(response
+            .json::<ExportCreateProofResponse>()
+            .await?
+            .export_id)
     }
 
     async fn create_export_keys(
@@ -254,7 +258,10 @@ impl Proof {
             )
             .into());
         }
-        Ok(response.json::<ExportCreateProofResponse>().await?.export_id)
+        Ok(response
+            .json::<ExportCreateProofResponse>()
+            .await?
+            .export_id)
     }
 
     async fn create_mapped_export(
@@ -288,7 +295,10 @@ impl Proof {
             )
             .into());
         }
-        Ok(response.json::<ExportCreateProofResponse>().await?.export_id)
+        Ok(response
+            .json::<ExportCreateProofResponse>()
+            .await?
+            .export_id)
     }
 
     async fn export_status_value(&self, id: &str) -> ProofResult<(StatusCode, Value)> {
@@ -584,11 +594,7 @@ impl Proof {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         if status != StatusCode::ACCEPTED {
-            return Err(format!(
-                "cancel export failed: {} {}",
-                status, body
-            )
-            .into());
+            return Err(format!("cancel export failed: {} {}", status, body).into());
         }
         if body.get("phase").and_then(Value::as_str) != Some("cancelled") {
             return Err(format!("cancel export did not acknowledge cancellation: {body}").into());
@@ -646,7 +652,7 @@ impl Proof {
         let roots = self.artifact_root_count(id);
         let expected = self
             .active_disk_count
-            .min(artifact_bytes.div_ceil(1024 * 1024));
+            .min(artifact_bytes.div_ceil(PROOF_EXPORT_CHUNK_SIZE));
         if roots != expected {
             return Err(format!(
                 "export chunks did not use every eligible root: expected={expected} actual={roots}"
@@ -676,10 +682,7 @@ impl Proof {
 }
 
 fn retention_cleanup_wait(expires_at: i64, now: i64) -> u64 {
-    expires_at
-        .saturating_sub(now)
-        .max(0)
-        .saturating_add(8) as u64
+    expires_at.saturating_sub(now).max(0).saturating_add(8) as u64
 }
 
 #[cfg(test)]
@@ -693,9 +696,7 @@ mod export_proof_tests {
     }
 }
 
-fn tar_payload_hashes(
-    raw: &[u8],
-) -> ProofResult<std::collections::BTreeMap<String, String>> {
+fn tar_payload_hashes(raw: &[u8]) -> ProofResult<std::collections::BTreeMap<String, String>> {
     let mut entries = std::collections::BTreeMap::new();
     let mut offset = 0usize;
     while offset + 512 <= raw.len() {
@@ -713,9 +714,7 @@ fn tar_payload_hashes(
         let size_text = parse_tar_string(&header[124..136]);
         let size = usize::from_str_radix(size_text.trim(), 8)
             .map_err(|error| format!("invalid TAR entry size for {full_name}: {error}"))?;
-        let data_start = offset
-            .checked_add(512)
-            .ok_or("TAR entry offset overflow")?;
+        let data_start = offset.checked_add(512).ok_or("TAR entry offset overflow")?;
         let data_end = data_start
             .checked_add(size)
             .ok_or("TAR entry size overflow")?;

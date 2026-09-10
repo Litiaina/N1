@@ -39,7 +39,6 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{error, info, warn};
-use ulid::Ulid;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RepairJobStatus {

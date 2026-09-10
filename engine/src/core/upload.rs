@@ -347,8 +347,30 @@ pub(crate) fn upload_uses_strict_durability(query: &UploadPartQuery) -> bool {
     parse_upload_durability_mode(query).strict()
 }
 
+mod activity;
 mod data_plane;
 mod sessions;
+pub(crate) use activity::{UploadActivityGuard, UploadGcScan};
+
+/// TTL reclamation is not session expiry. An idle resumable upload remains
+/// protected until normal upload GC/cancellation removes its session.
+pub(crate) fn standard_upload_object_ids(fragment: &str) -> Result<HashSet<String>, AppError> {
+    Ok(standard_registry_read()?
+        .values()
+        .filter(|session| session.manifest.fragment == fragment)
+        .filter(|session| session.lifecycle.load(Ordering::Acquire) != STANDARD_SESSION_CANCELLED)
+        .map(|session| session.manifest.object_key.clone())
+        .collect())
+}
+
+pub(crate) fn standard_namespace_activity(
+    fragment: &str,
+    version: &str,
+) -> Result<UploadActivityGuard, AppError> {
+    let session = standard_session(fragment, version)?
+        .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
+    UploadActivityGuard::begin(fragment, &session.manifest.object_key)
+}
 
 pub use data_plane::{
     ActiveSessionInfo, DirectWriter, ListUploadsResponse, UploadSessionManifest,
@@ -529,6 +551,7 @@ pub async fn object_upload_part(
     let manifest = read_manifest_any(&fragment, &version_id)
         .await?
         .ok_or(AppError::BadRequest("Upload session not found".into()))?;
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &manifest.object_key)?;
     if part_index >= manifest.expected_parts {
         return Ok((StatusCode::BAD_REQUEST, "Part index out of range").into_response());
     }
@@ -731,8 +754,10 @@ where
         .await?
         .ok_or(AppError::BadRequest("Upload session not found".into()))?;
     if part_index >= manifest.expected_parts {
+        // Validate before admitting activity for this version.
         return Err(AppError::BadRequest("Part index out of range".into()));
     }
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &manifest.object_key)?;
     let _part_lock = acquire_multipart_part_lock(&fragment, &version_id, part_index).await?;
     let expected_size = expected_part_size_bytes(&manifest, part_index);
     let expected_checksum = query
@@ -878,8 +903,10 @@ where
         .await?
         .ok_or(AppError::BadRequest("Upload session not found".into()))?;
     if part_index >= manifest.expected_parts {
+        // Validate before admitting activity for this version.
         return Err(AppError::BadRequest("Part index out of range".into()));
     }
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &manifest.object_key)?;
     let _part_lock = acquire_multipart_part_lock(&fragment, &version_id, part_index).await?;
     let expected_size = expected_part_size_bytes(&manifest, part_index);
     let expected_checksum = query
@@ -1023,6 +1050,7 @@ async fn upload_object_one_shot_inner(
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &object_key)?;
     let session_id = Ulid::new().to_string();
     let expected_checksum = query
         .checksum
@@ -1212,6 +1240,7 @@ where
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &object_key)?;
     let session_id = Ulid::new().to_string();
     let expected_checksum = query
         .checksum
@@ -1331,6 +1360,7 @@ where
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &object_key)?;
     let session_id = Ulid::new().to_string();
     let expected_checksum = query
         .checksum
@@ -1460,6 +1490,8 @@ pub async fn finalize_object_upload_direct(
 
     let path_manager = ObjectPathManager::new();
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
+
+    let _upload_activity = UploadActivityGuard::begin(&fragment, &object_key)?;
 
     if let Ok(existing) = index::read_object_version(&fragment, &object_key, &version_id).await {
         return Ok(FinalizeUploadResult::Complete(existing));
@@ -1639,7 +1671,9 @@ pub async fn finalize_object_upload_direct(
 
     index::publish_object(&object_meta).await?;
 
-    let _ = index::remove_session(&fragment, &version_id, "finalized").await;
+    // NDX publication is not the logical namespace commit. The HTTP/native
+    // caller removes this durable session only after that commit succeeds.
+    // Keeping its manifest and binding also makes a cancelled handoff retryable.
 
     Ok(FinalizeUploadResult::Complete(object_meta))
 }

@@ -278,7 +278,10 @@ impl Proof {
         while Instant::now() < deadline {
             let response = self
                 .client
-                .get(format!("{}/noa/v1/maintenance/repair/status", self.base_url))
+                .get(format!(
+                    "{}/noa/v1/maintenance/repair/status",
+                    self.base_url
+                ))
                 .bearer_auth(&self.token)
                 .send()
                 .await?;
@@ -305,14 +308,14 @@ impl Proof {
 
     async fn run_redistribution_and_wait(&self) -> ProofResult<Value> {
         self.start_redistribution_job().await?;
-        self.wait_job("/noa/v1/maintenance/redistribution/status", "redistribution")
-            .await
+        self.wait_job(
+            "/noa/v1/maintenance/redistribution/status",
+            "redistribution",
+        )
+        .await
     }
 
-    async fn run_object_redistribution_and_wait(
-        &self,
-        object_key: &str,
-    ) -> ProofResult<Value> {
+    async fn run_object_redistribution_and_wait(&self, object_key: &str) -> ProofResult<Value> {
         let response = self
             .client
             .post(format!(
@@ -331,8 +334,11 @@ impl Proof {
             )
             .into());
         }
-        self.wait_job("/noa/v1/maintenance/redistribution/status", "object redistribution")
-            .await
+        self.wait_job(
+            "/noa/v1/maintenance/redistribution/status",
+            "object redistribution",
+        )
+        .await
     }
 
     async fn start_redistribution_job(&self) -> ProofResult<Value> {
@@ -482,8 +488,7 @@ impl Proof {
     fn object_version_dirs(&self, version_id: &str) -> ProofResult<Vec<PathBuf>> {
         let mut out = Vec::new();
         for root in &self.blob_roots {
-            let objects =
-                physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
+            let objects = physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
             for object_dir in collect_object_dirs(&objects)? {
                 let version_dir = object_dir.join(version_id);
                 if version_dir.is_dir() {
@@ -499,8 +504,7 @@ impl Proof {
     fn assert_object_version_placement(&self, version_id: &str) -> ProofResult<Value> {
         let mut placements = Vec::new();
         for root in self.blob_roots.iter().take(self.active_disk_count) {
-            let objects =
-                physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
+            let objects = physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
             let mut payload = None;
             let mut metadata = None;
             for object_dir in collect_object_dirs(&objects)? {
@@ -626,20 +630,17 @@ impl Proof {
         self.object_version_dirs(version_id)
             .is_ok_and(|dirs| !dirs.is_empty())
             || self.blob_roots.iter().any(|root| {
-                let objects = physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
+                let objects =
+                    physical_fragment_root(root, &self.stable_fragment_id).join(".objects");
                 count_files_with_suffix(&objects, ".ndx").is_ok_and(|count| {
                     count > 0
                         && collect_object_dirs(&objects).is_ok_and(|dirs| {
                             dirs.into_iter().any(|dir| {
                                 fs::read_dir(dir).is_ok_and(|entries| {
                                     entries.filter_map(Result::ok).any(|entry| {
-                                        entry
-                                            .file_name()
-                                            .to_str()
-                                            .is_some_and(|name| {
-                                                name.starts_with(version_id)
-                                                    && name.ends_with(".ndx")
-                                            })
+                                        entry.file_name().to_str().is_some_and(|name| {
+                                            name.starts_with(version_id) && name.ends_with(".ndx")
+                                        })
                                     })
                                 })
                             })
@@ -783,8 +784,13 @@ impl Proof {
     }
 
     fn scan_logs(&self) -> ProofResult<Value> {
+        self.scan_logs_with_expected(&[])
+    }
+
+    fn scan_logs_with_expected(&self, expected: &[&str]) -> ProofResult<Value> {
         let mut files = Vec::new();
         let mut bad_lines = Vec::new();
+        let mut expected_lines = Vec::new();
         for entry in fs::read_dir(&self.args.out_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -795,7 +801,7 @@ impl Proof {
             if !is_log {
                 continue;
             }
-            let text = fs::read_to_string(&path).unwrap_or_default();
+            let text = fs::read_to_string(&path)?;
             let report_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -805,11 +811,16 @@ impl Proof {
             for (idx, line) in text.lines().enumerate() {
                 line_count += 1;
                 if log_line_is_failure(line) {
-                    bad_lines.push(json!({
+                    let record = json!({
                         "file": report_name.clone(),
                         "line": idx + 1,
                         "text": line,
-                    }));
+                    });
+                    if expected.iter().any(|needle| line.contains(needle)) {
+                        expected_lines.push(record);
+                    } else {
+                        bad_lines.push(record);
+                    }
                 }
             }
             files.push(json!({
@@ -824,6 +835,7 @@ impl Proof {
             "status": "PASS",
             "files": files,
             "bad_lines": bad_lines,
+            "expected_injected_faults": expected_lines,
         }))
     }
 

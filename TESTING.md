@@ -60,6 +60,96 @@ machine.
 
 ## Gate 2: Release Drills
 
+### GC and concurrent publication safety
+
+The `n1-release-proof --gc-safety-proof` mode runs against a separate engine
+instance and dedicated test roots. Never pass production roots directly to a
+fault-injection proof. Keep the binary, configuration, logs, and fixtures in
+one disposable test environment.
+
+This proof requires these observable outcomes:
+
+- An old object parent cannot cause a young version or unknown child to be
+  recursively removed. Apply the same check to fragment cleanup and GC.
+- Expired, unreferenced, inactive version directories are reclaimed.
+- Pause a real one-shot HTTP body after its K+M shard files are opened. Age
+  only its isolated test directories beyond the GC TTL, run GC and fragment
+  cleanup, then finish the body and verify its download hash before and after
+  restart. An active writer is not an expired orphan merely because it is slow.
+- Repeat with an existing committed version: pause its replacement upload,
+  trash the old path, wait for real TTL expiry, and require the GC status to
+  confirm an expired anchor. The replacement's shard directories must survive
+  physical trash reclamation too. Finish and hash-check it across restart.
+  Deterministic tests separately protect idle standard and durable sessions
+  until cancellation/session removal allows reclamation.
+- Standard and durable multipart writers overlap with read/list/rename/trash/
+  recover work and GC. Each published payload is hash-checked; standard
+  finalize has a deadline so a hang is a failure.
+- A ZIP export runs alongside the mixed workload and GC, and its contents are
+  independently checked. At least one GC pass starts before export retention
+  can defer cleanup.
+- Deliberately corrupting session metadata must preserve potential live data
+  and produce an explicit GC error. Removing the injected corruption must
+  allow a clean retry. Expected fault logs are matched explicitly; other
+  errors still fail the proof, and unreadable logs are an error.
+- Restart and final namespace verification must pass.
+
+Run `--auto-healing-proof` repeatedly on the same candidate as well. It must
+allow fragment creation while the scheduler is active. The unit regression
+`replica_repair_preserves_inflight_atomic_writes_and_local_workspaces` also
+checks that repair neither deletes nor clones atomic-write temporary files,
+that the original writer can finish its rename, and that root-local work
+directories remain owned by their original root.
+
+These are bounded workload proofs, not a guarantee of constant-memory GC at
+millions of objects or an exhaustive proof of all concurrent mutations.
+
+Additional deterministic regressions cover cancellation and publication:
+
+- `cancelled_standard_finalize_releases_busy_state_for_retry` polls the actual
+  finalizer while its publication lock is held, drops the future, and repeats.
+  Cancellation must release the busy state without touching completed parts.
+- `durable_finalize_retains_resume_truth_until_namespace_commit` verifies the
+  manifest and logical binding after NDX publication and on retry; only a
+  successful namespace commit permits removing the session.
+- `durable_receipts_refresh_idle_age_without_rewriting_manifest` verifies that
+  receipt-directory activity refreshes durable session idle age while manifest
+  bytes remain unchanged. Session age must not remain stuck at initialization.
+- `cancelled_request_keeps_namespace_publication_exclusive_until_worker_finishes`
+  cancels the actual logical finalizer after its blocking publisher is queued.
+  The same-path gate must stay held until the worker finishes, and its registry
+  entry must then disappear. Companion cases cover 16 cancelled waiters,
+  unrelated-path concurrency and worker unwind.
+- `metadata_disappearing_after_ttl_unlinks_anchor_is_not_a_broken_record`
+  injects a metadata read after TTL unlinks a trash anchor. Only that confirmed
+  disappearance is benign. A retained anchor with missing metadata and a hard
+  I/O failure still return errors. The concurrent recover/TTL regression checks
+  the winning operation and resulting live visibility, not just HTTP status.
+- `core::upload::activity::tests` covers uploads beginning before/after a GC
+  snapshot, completed uploads against stale snapshots, clock rollback with
+  zero TTL, per-object exclusion, overlapping scans, concurrent writers,
+  canonical object IDs, poisoned-state preservation and cancelled callers
+  whose blocking publishers are still running.
+
+Upload activity protection is process-local, not a new durable receipt. Its
+registry contains active operations, not the entire stored namespace. Each
+scan remembers at most 65,536 overlapping object IDs (each validated to at
+most 128 bytes); reaching that limit defers that scan's remaining orphan
+reclamation and logs the deferral, without refusing uploads. Registry locks
+cover bookkeeping only, never filesystem work or network streaming. This
+bound does not make the existing namespace reachability scan constant-memory.
+
+Temporary private filesystems can run these functional tests on one machine.
+They do not establish independent-disk resilience, fsync power-loss durability,
+or physical-disk performance. Do not substitute them for hardware acceptance.
+
+Trash enumeration must also distinguish an in-flight empty parent chain from
+an ambiguous committed generation. Run
+`trash_scan_tolerates_inflight_parent_chains_but_rejects_ambiguous_generations`:
+partially created/pruned parents must not break another user's recover, but
+multiple competing path components must still fail closed. A committed empty
+folder is a valid trash item and must remain listed.
+
 Run the release drill harness before tagging or deploying:
 
 ```bash

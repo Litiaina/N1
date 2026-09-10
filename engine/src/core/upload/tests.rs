@@ -56,6 +56,42 @@ fn standard_test_session(part_count: usize) -> StandardUploadSession {
 }
 
 #[test]
+fn gc_protects_standard_upload_until_namespace_publication_completes() {
+    let mut session = standard_test_session(1);
+    session.manifest.fragment = format!("gc-session-{}", ulid::Ulid::new());
+    session
+        .last_activity_at
+        .store(chrono::Utc::now().timestamp(), Ordering::Release);
+    session
+        .lifecycle
+        .store(super::STANDARD_SESSION_FINALIZED, Ordering::Release);
+    let fragment = session.manifest.fragment.clone();
+    let version = session.manifest.version_id.clone();
+    let key = super::standard_session_key(&fragment, &version);
+    super::standard_registry_write()
+        .unwrap()
+        .insert(key, std::sync::Arc::new(session));
+    let protected = super::sessions::active_standard_upload_versions_at(
+        &fragment,
+        chrono::Utc::now().timestamp(),
+        3600,
+    )
+    .unwrap();
+    // Clean up even if the regression assertion fails, for test isolation.
+    super::complete_standard_upload(&fragment, &version).unwrap();
+    assert!(protected.contains(&version));
+    assert!(
+        !super::sessions::active_standard_upload_versions_at(
+            &fragment,
+            chrono::Utc::now().timestamp(),
+            3600
+        )
+        .unwrap()
+        .contains(&version)
+    );
+}
+
+#[test]
 fn upload_durability_default_follows_runtime_config_or_batched_when_unset() {
     let q = UploadPartQuery {
         checksum: None,
@@ -73,6 +109,121 @@ fn upload_durability_default_follows_runtime_config_or_batched_when_unset() {
         UploadDurabilityMode::Batched
     };
     assert_eq!(parse_upload_durability_mode(&q), expected);
+}
+
+#[test]
+fn idle_standard_session_blocks_ttl_object_reclamation_until_removed() {
+    use crate::core::disk_manager::BLOB_STORE_DISKS;
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let base = std::env::temp_dir().join(format!("ttl-standard-{}", ulid::Ulid::new()));
+    let blobs = BLOB_STORE_DISKS.get_or_init(|| {
+        (0..2)
+            .map(|i| base.join(format!("blob-{i}")).display().to_string())
+            .collect()
+    });
+    let indexes = INDEX_STORE_DISKS.get_or_init(|| {
+        (0..2)
+            .map(|i| base.join(format!("index-{i}")).display().to_string())
+            .collect()
+    });
+    for root in blobs.iter().chain(indexes) {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    let mut session = standard_test_session(1);
+    session.manifest.fragment = format!("idle-standard-{}", ulid::Ulid::new());
+    let fragment = session.manifest.fragment.clone();
+    let object = session.manifest.object_key.clone();
+    let version = session.manifest.version_id.clone();
+    let dir = ObjectPathManager::new().get_shard_dir_on_disk(
+        &std::path::PathBuf::from(&blobs[0]),
+        &fragment,
+        &object,
+        &version,
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("part_0_shard_0.shard"), b"unfinished upload").unwrap();
+    super::standard_registry_write().unwrap().insert(
+        super::standard_session_key(&fragment, &version),
+        std::sync::Arc::new(session),
+    );
+    let reclaimed =
+        crate::core::index_store::delete_unreferenced_object_index(&fragment, &object).unwrap();
+    assert!(!reclaimed);
+    assert!(dir.is_dir());
+    super::cancel_standard_upload_direct(
+        &crate::structs::auth_structs::Claims {
+            fragment: fragment.clone(),
+            fragment_alias: None,
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            exp: usize::MAX,
+        },
+        &fragment,
+        &version,
+    )
+    .unwrap();
+    assert!(
+        crate::core::index_store::delete_unreferenced_object_index(&fragment, &object).unwrap()
+    );
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn cancelled_standard_finalize_releases_busy_state_for_retry() {
+    let _test_guard = crate::test_support::global_test_lock().lock().await;
+    let mut session = standard_test_session(0);
+    session.manifest.fragment = format!("cancel-finalize-{}", ulid::Ulid::new());
+    session.manifest.object_key = ulid::Ulid::new().to_string();
+    session.manifest.version_id = ulid::Ulid::new().to_string();
+    let fragment = session.manifest.fragment.clone();
+    let version = session.manifest.version_id.clone();
+    let key = super::standard_session_key(&fragment, &version);
+    let session = std::sync::Arc::new(session);
+    super::standard_registry_write()
+        .unwrap()
+        .insert(key.clone(), session.clone());
+    let claims = crate::structs::auth_structs::Claims {
+        fragment: fragment.clone(),
+        fragment_alias: None,
+        read: true,
+        write: true,
+        modify: true,
+        delete: true,
+        exp: usize::MAX,
+    };
+    // Stop the real finalizer exactly at its publication lock, not with a sleep.
+    let _publish_lock =
+        crate::core::index::acquire_object_operation_lock(&fragment, &session.manifest.object_key)
+            .await
+            .unwrap();
+    for _ in 0..2 {
+        let mut finalize = Box::pin(super::finalize_standard_upload_direct(
+            claims.clone(),
+            fragment.clone(),
+            version.clone(),
+            session.manifest.session_id.clone(),
+        ));
+        assert!(matches!(
+            futures_util::poll!(&mut finalize),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            session.lifecycle.load(Ordering::Acquire),
+            super::STANDARD_SESSION_FINALIZING
+        );
+        drop(finalize);
+        let state = session.lifecycle.load(Ordering::Acquire);
+        if state != STANDARD_SESSION_OPEN {
+            super::standard_registry_write().unwrap().remove(&key);
+        }
+        assert_eq!(
+            state, STANDARD_SESSION_OPEN,
+            "cancelled request must not wedge the session"
+        );
+    }
+    super::standard_registry_write().unwrap().remove(&key);
 }
 
 #[test]

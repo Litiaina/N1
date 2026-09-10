@@ -1,6 +1,7 @@
 type ProofResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const DEFAULT_MAX_PART_SIZE: u64 = 52_428_800;
+const PROOF_EXPORT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(about = "Rust-only N1 release proof matrix runner")]
@@ -101,6 +102,8 @@ struct Args {
     trash_maintenance_proof: bool,
     #[arg(long, default_value_t = false)]
     maintenance_coverage_proof: bool,
+    #[arg(long, default_value_t = false)]
+    gc_safety_proof: bool,
     #[arg(long, default_value_t = 1_000)]
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]
@@ -209,7 +212,6 @@ impl Proof {
             self.args.native_port
         }
     }
-
 }
 
 impl Drop for Proof {

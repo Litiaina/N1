@@ -50,6 +50,7 @@ pub(crate) const OBJECT_DIR_PREFIX: &str = "@o_";
 pub(crate) const FRAGMENT_DIR_PREFIX: &str = PHYSICAL_FRAGMENT_PREFIX;
 const INTENTS_DIR: &str = ".intents";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
+const REPLICA_TMP_PREFIX: &str = ".tmp-replica-";
 static N1_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +428,7 @@ fn reserved_user_segment(segment: &str) -> bool {
 pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
     name.starts_with(OBJECT_DIR_PREFIX)
         || name.starts_with(FRAGMENT_DIR_PREFIX)
+        || name.starts_with(REPLICA_TMP_PREFIX)
         || matches!(
             name,
             FRAGMENT_ALIAS_DIR

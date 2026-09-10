@@ -31,6 +31,9 @@ use tokio::runtime::Handle;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+mod reclaim;
+pub(crate) use reclaim::reclaim_object_versions;
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GcJobStatus {
     pub is_running: bool,
@@ -367,21 +370,19 @@ pub async fn run_garbage_collector(
         );
     }
     GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
-
+    // Publish admission before returning 202: immediate status polling must
+    // never mistake the preceding job's completion for this job's completion.
+    with_gc_status_write(|st| {
+        *st = GcJobStatus {
+            is_running: true,
+            phase: "Initializing".to_string(),
+            is_manual_run: true,
+            current_fragment: target_fragment.clone().unwrap_or_default(),
+            start_timestamp: Utc::now().timestamp(),
+            ..Default::default()
+        };
+    });
     tokio::spawn(async move {
-        {
-            with_gc_status_write(|st| {
-                *st = GcJobStatus {
-                    is_running: true,
-                    phase: "Initializing".to_string(),
-                    is_manual_run: true,
-                    current_fragment: target_fragment.clone().unwrap_or_default(),
-                    start_timestamp: Utc::now().timestamp(),
-                    ..Default::default()
-                };
-            });
-        }
-
         if let Err(err) = run_gc_scan_offthread(state.clone(), true, target_fragment, options).await
         {
             error!("Manual GC Scan failed: {}", err);
@@ -395,7 +396,12 @@ pub async fn run_garbage_collector(
         with_gc_status_write(|st| {
             st.is_running = false;
             if st.phase != "Failed" && st.phase != "Stopped by User" {
-                st.phase = "Completed".to_string();
+                st.phase = if st.total_errors > 0 {
+                    "Completed with errors"
+                } else {
+                    "Completed"
+                }
+                .to_string();
             }
         });
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
@@ -583,6 +589,33 @@ fn orphan_version_reclaimable(
         && orphan_blob_age_expired(age, ttl)
 }
 
+fn prune_orphan_object_dir(object_dir: &Path, now: SystemTime, ttl: Duration) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(object_dir) else {
+        return false;
+    };
+    if !metadata.file_type().is_dir() {
+        return false;
+    }
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+    // A parent's mtime does not describe activity in its descendants. Only
+    // prune an EMPTY parent: young versions, unknown files, failed deletions,
+    // and children created after the scan must remain intact. The kernel's
+    // empty-directory check also closes the check-then-remove race here.
+    orphan_blob_age_expired(age, ttl) && fs::remove_dir(object_dir).is_ok()
+}
+
+fn record_gc_preservation_error(fragment: &str, context: &str, error: impl std::fmt::Display) {
+    let message = format!("GC preserving fragment {fragment}: {context}: {error}");
+    warn!("{message}");
+    with_gc_status_write(|status| {
+        status.total_errors = status.total_errors.saturating_add(1);
+        status.last_error = Some(message);
+    });
+}
+
 async fn perform_gc_scan(
     state: Arc<AppState>,
     is_manual_run: bool,
@@ -641,6 +674,7 @@ async fn perform_gc_scan(
         st.total_sessions_deleted = 0;
         st.total_orphan_blob_dirs_deleted = 0;
         st.total_refund_bytes = 0;
+        st.total_errors = 0;
         st.duration_seconds = 0;
         st.last_error = None;
         st.start_timestamp = Utc::now().timestamp();
@@ -750,23 +784,21 @@ async fn process_fragment_gc(
     match index_store::fragment_meta(fragment) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            warn!(
-                "GC: preserving fragment {} because N1 3 engine metadata is missing",
-                fragment
+            record_gc_preservation_error(
+                fragment,
+                "engine metadata unavailable",
+                "missing N1 3 metadata",
             );
             return stats;
         }
         Err(err) => {
-            warn!(
-                "GC: preserving fragment {} because the N1 3 engine-format gate failed: {}",
-                fragment, err
-            );
+            record_gc_preservation_error(fragment, "engine-format gate failed", err);
             return stats;
         }
     }
 
     if export_gc_protection.contains(fragment) {
-        warn!(
+        info!(
             "GC: preserving fragment {} while a durable export is active",
             fragment
         );
@@ -775,18 +807,64 @@ async fn process_fragment_gc(
 
     let now = SystemTime::now();
     let now_unix = Utc::now().timestamp();
+    let upload_scan = match crate::core::upload::UploadGcScan::begin(fragment) {
+        Ok(scan) => scan,
+        Err(error) => {
+            record_gc_preservation_error(fragment, "cannot track concurrent uploads", error);
+            return stats;
+        }
+    };
+    let now_ts = Utc::now().timestamp();
+    let ttl_secs = i64::try_from(CONFIG.garbage_collector.file_ttl_seconds).unwrap_or(i64::MAX);
+    let mut active_session_versions = HashSet::<String>::new();
+    let mut sessions_to_delete = Vec::<(String, u64, String)>::new();
+    let active_sessions = match index::list_active_sessions(fragment).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            record_gc_preservation_error(
+                fragment,
+                "cannot establish durable upload protection",
+                error,
+            );
+            return stats;
+        }
+    };
+    for session in active_sessions {
+        let idle_secs = now_ts.saturating_sub(session.last_activity_at.max(0));
+        if idle_secs > ttl_secs {
+            let amount = session.reservation.map(|r| r.amount).unwrap_or(0);
+            sessions_to_delete.push((
+                session.manifest.version_id,
+                amount,
+                session.manifest.object_key,
+            ));
+        } else {
+            active_session_versions.insert(session.manifest.version_id);
+        }
+    }
+    match crate::core::upload::active_standard_upload_versions(fragment) {
+        Ok(versions) => active_session_versions.extend(versions),
+        Err(error) => {
+            record_gc_preservation_error(
+                fragment,
+                "cannot establish standard upload protection",
+                error,
+            );
+            return stats;
+        }
+    }
+
+    // Observe sessions before namespace references so captured sessions remain
+    // protected while namespace publication proceeds. This ordering is not a
+    // transactionally consistent snapshot of every concurrent mutation.
+    // Do not begin destructive cleanup until both session sources were read.
     match global_namespace_runtime()
         .sweep_expired_trash(fragment, retention.as_secs(), now_unix)
         .await
     {
-        Ok(summary) => {
-            stats.trash_versions_expired = summary.expired_versions;
-        }
+        Ok(summary) => stats.trash_versions_expired = summary.expired_versions,
         Err(err) => {
-            warn!(
-                "GC: targeted trash lifecycle failed for fragment {}; preserving immutable data: {}",
-                fragment, err
-            );
+            record_gc_preservation_error(fragment, "trash lifecycle failed", err);
             return stats;
         }
     }
@@ -796,48 +874,38 @@ async fn process_fragment_gc(
     {
         Ok(Some(snapshot)) => snapshot.referenced_object_ids,
         Ok(None) => {
-            warn!(
-                "GC: namespace reachability is unavailable for fragment {}; preserving immutable data",
-                fragment
+            record_gc_preservation_error(
+                fragment,
+                "namespace reachability unavailable",
+                "missing snapshot",
             );
             return stats;
         }
         Err(err) => {
-            warn!(
-                "GC: failed to load namespace reachability for fragment {}: {}",
-                fragment, err
-            );
+            record_gc_preservation_error(fragment, "namespace reachability unavailable", err);
             return stats;
         }
     };
-    let now_ts = Utc::now().timestamp();
-    let ttl_secs = CONFIG.garbage_collector.file_ttl_seconds as i64;
-    let mut active_session_versions = HashSet::<String>::new();
-    let mut sessions_to_delete = Vec::<(String, u64)>::new();
-    if let Ok(active_sessions) = index::list_active_sessions(fragment).await {
-        for session in active_sessions {
-            let idle_secs = now_ts.saturating_sub(session.last_activity_at.max(0));
-            if idle_secs > ttl_secs {
-                let amount = session.reservation.map(|r| r.amount).unwrap_or(0);
-                sessions_to_delete.push((session.manifest.version_id, amount));
-            } else {
-                active_session_versions.insert(session.manifest.version_id);
-            }
-        }
-    }
-    active_session_versions.extend(crate::core::upload::active_standard_upload_versions(
-        fragment,
-    ));
-    let total_session_refund: u64 = sessions_to_delete.iter().map(|(_, amount)| *amount).sum();
-    stats.refund_bytes += total_session_refund;
-    stats.sessions_deleted += sessions_to_delete.len() as u64;
 
-    for (version_id, _) in &sessions_to_delete {
+    for (version_id, amount, object_id) in &sessions_to_delete {
         io_progress.heartbeat();
         if should_stop_gc() {
             return stats;
         }
-        let _ = index::remove_session(fragment, version_id, "gc-expired").await;
+        let _reclaim_guard = match upload_scan.try_reclaim(object_id) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => continue,
+            Err(error) => {
+                record_gc_preservation_error(fragment, "cannot fence expired session", error);
+                return stats;
+            }
+        };
+        if let Err(error) = index::remove_session(fragment, version_id, "gc-expired").await {
+            record_gc_preservation_error(fragment, "cannot expire durable upload session", error);
+            return stats;
+        }
+        stats.sessions_deleted = stats.sessions_deleted.saturating_add(1);
+        stats.refund_bytes = stats.refund_bytes.saturating_add(*amount);
     }
 
     for root in blob_roots {
@@ -845,8 +913,12 @@ async fn process_fragment_gc(
         if should_stop_gc() {
             return stats;
         }
-        let Ok(object_dirs) = index_store::local_object_dirs_under_root(root, fragment) else {
-            continue;
+        let object_dirs = match index_store::local_object_dirs_under_root(root, fragment) {
+            Ok(dirs) => dirs,
+            Err(error) => {
+                record_gc_preservation_error(fragment, "object directory scan failed", error);
+                continue;
+            }
         };
         for (object_dir, object_id) in object_dirs {
             io_progress.heartbeat();
@@ -854,55 +926,55 @@ async fn process_fragment_gc(
                 return stats;
             }
             let object_is_referenced = protected_object_ids.contains(&object_id);
-            let mut has_protected_version = false;
+            let _reclaim_guard = if object_is_referenced {
+                None
+            } else {
+                match upload_scan.try_reclaim(&object_id) {
+                    Ok(Some(guard)) => Some(guard),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        record_gc_preservation_error(
+                            fragment,
+                            "cannot fence orphan reclamation",
+                            error,
+                        );
+                        return stats;
+                    }
+                }
+            };
             if let Ok(entries) = std::fs::read_dir(&object_dir) {
                 for entry in entries.filter_map(Result::ok) {
                     if should_stop_gc() {
                         return stats;
                     }
                     let path = entry.path();
-                    if !path.is_dir() {
+                    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                         continue;
                     }
                     gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
-                    let version_id = entry.file_name().to_string_lossy().to_string();
-                    let is_active = active_session_versions.contains(&version_id);
-                    if object_is_referenced || is_active {
-                        if object_is_referenced {
-                            stats.live_versions_seen = stats.live_versions_seen.saturating_add(1);
-                        }
-                        has_protected_version = true;
-                        continue;
-                    }
-                    if ulid::Ulid::from_string(&version_id).is_err() {
-                        // Unknown directories are not part of the upload
-                        // lifecycle contract and therefore fail closed.
-                        has_protected_version = true;
-                        continue;
-                    }
-                    let modified = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .unwrap_or(now);
-                    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-                    if orphan_version_reclaimable(&version_id, false, is_active, age, file_ttl)
-                        && std::fs::remove_dir_all(&path).is_ok()
-                    {
-                        stats.orphan_blob_dirs_deleted += 1;
+                    if object_is_referenced {
+                        stats.live_versions_seen = stats.live_versions_seen.saturating_add(1);
                     }
                 }
             }
-            if object_is_referenced || has_protected_version {
+            if object_is_referenced {
                 continue;
             }
 
-            let modified = fs::metadata(&object_dir)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(now);
-            let orphan_age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-            if orphan_blob_age_expired(orphan_age, file_ttl)
-                && std::fs::remove_dir_all(&object_dir).is_ok()
-            {
-                stats.orphan_blob_dirs_deleted += 1;
+            match reclaim_object_versions(
+                &object_dir,
+                &active_session_versions,
+                now,
+                file_ttl,
+                || {
+                    io_progress.heartbeat();
+                    !should_stop_gc()
+                },
+            ) {
+                Ok(removed) => stats.orphan_blob_dirs_deleted += removed,
+                Err(error) => {
+                    record_gc_preservation_error(fragment, "orphan reclamation incomplete", error)
+                }
             }
         }
     }
@@ -924,6 +996,78 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::Duration;
     use ulid::Ulid;
+
+    #[test]
+    fn orphan_parent_pruning_preserves_unexpired_child() {
+        let base = std::env::temp_dir().join(format!("n1-gc-parent-{}", Ulid::new()));
+        let child = base.join(Ulid::new().to_string());
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("part_0_shard_0.shard"), b"keep upload bytes").unwrap();
+        let now = std::time::SystemTime::now();
+        fs::File::open(&base)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(now - Duration::from_secs(120)))
+            .unwrap();
+        assert!(!super::prune_orphan_object_dir(
+            &base,
+            now,
+            Duration::from_secs(60)
+        ));
+        assert_eq!(
+            fs::read(child.join("part_0_shard_0.shard")).unwrap(),
+            b"keep upload bytes"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn orphan_parent_pruning_preserves_unknown_files_even_in_scrub() {
+        let base = std::env::temp_dir().join(format!("n1-gc-unknown-{}", Ulid::new()));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("unknown.metadata"), b"preserve").unwrap();
+        assert!(!super::prune_orphan_object_dir(
+            &base,
+            std::time::SystemTime::now(),
+            Duration::ZERO
+        ));
+        assert_eq!(
+            fs::read(base.join("unknown.metadata")).unwrap(),
+            b"preserve"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn orphan_parent_pruning_removes_only_empty_expired_directories() {
+        let base = std::env::temp_dir().join(format!("n1-gc-empty-{}", Ulid::new()));
+        fs::create_dir_all(&base).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(!super::prune_orphan_object_dir(
+            &base,
+            now,
+            Duration::from_secs(60)
+        ));
+        assert!(super::prune_orphan_object_dir(&base, now, Duration::ZERO));
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn orphan_parent_pruning_never_follows_symlinks() {
+        let base = std::env::temp_dir().join(format!("n1-gc-symlink-{}", Ulid::new()));
+        fs::create_dir_all(base.join("target")).unwrap();
+        fs::write(base.join("target/payload"), b"not an orphan").unwrap();
+        symlink(base.join("target"), base.join("link")).unwrap();
+        assert!(!super::prune_orphan_object_dir(
+            &base.join("link"),
+            std::time::SystemTime::now(),
+            Duration::ZERO
+        ));
+        assert_eq!(
+            fs::read(base.join("target/payload")).unwrap(),
+            b"not an orphan"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn orphan_version_reclaim_requires_valid_uncommitted_inactive_ulid_past_ttl() {

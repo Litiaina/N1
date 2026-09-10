@@ -99,9 +99,26 @@ pub fn load_session(
     };
     let mut state = row.into_state();
     for dir in session_roots(fragment, version_id) {
-        if !dir.is_dir() {
+        let directory_metadata = match fs::metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err(error, "inspect upload session directory")),
+        };
+        if !directory_metadata.is_dir() {
             continue;
         }
+        // Receipt creation/atomic replacement already advances this directory's
+        // mtime. Reuse the existing directory metadata check: no per-part stat,
+        // manifest rewrite, or new durable heartbeat is needed for idle expiry.
+        let activity = directory_metadata
+            .modified()
+            .map_err(|error| io_err(error, "read upload session activity"))?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        state.last_activity_at = state
+            .last_activity_at
+            .max(i64::try_from(activity).unwrap_or(i64::MAX));
         let mut shard_receipts = BTreeMap::<u64, BTreeMap<usize, u32>>::new();
         let mut part_checksums = BTreeMap::<u64, u32>::new();
         for name in read_dir_names(&dir)? {

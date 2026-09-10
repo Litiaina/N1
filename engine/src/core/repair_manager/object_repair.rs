@@ -48,19 +48,6 @@ fn sha256_bytes(b: &[u8]) -> [u8; 32] {
     arr
 }
 
-async fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let _ = fs::create_dir_all(parent).await;
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-        Ulid::new().to_string()
-    ));
-    fs::write(&tmp, data).await?;
-    fs::rename(&tmp, path).await?;
-    Ok(())
-}
-
 #[derive(Clone)]
 struct RawReplica {
     bytes: Option<Vec<u8>>,
@@ -142,18 +129,14 @@ async fn replicate_bytes_strict(
                 if sha256_bytes(&b) != canon_sha {
                     divergent += 1;
                     if !dry_run {
-                        atomic_write(p, canonical)
-                            .await
-                            .map_err(|e| AppError::Io(e, "repair replica file".into()))?;
+                        linux_io::atomic_write(p, canonical.to_vec()).await?;
                     }
                 }
             }
             Err(_) => {
                 missing += 1;
                 if !dry_run {
-                    atomic_write(p, canonical)
-                        .await
-                        .map_err(|e| AppError::Io(e, "repair replica file".into()))?;
+                    linux_io::atomic_write(p, canonical.to_vec()).await?;
                 }
             }
         }

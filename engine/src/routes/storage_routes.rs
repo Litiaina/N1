@@ -988,6 +988,8 @@ async fn finalize_object_upload_scoped(
     let gate_context = format!("standard-finalize fragment={fragment}, version={version_id}");
     let finalize_io_guard =
         acquire_upload_io_guard_for_query(Some(true), &fragment, &gate_context).await?;
+    let _upload_activity =
+        crate::core::upload::standard_namespace_activity(&fragment, &version_id)?;
     let response = match finalize_standard_upload_direct(
         claims,
         fragment.clone(),
@@ -1092,6 +1094,7 @@ async fn upload_object_one_shot_scoped(
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let strict_durability = upload_uses_strict_durability(&query);
+    let _upload_activity = crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
     let response = upload_object_one_shot_impl(
         State(state.clone()),
         claims,
@@ -1225,6 +1228,8 @@ async fn upload_standard_batch_object(
         let io_guard =
             acquire_upload_io_guard_for_query(Some(true), &fragment, &gate_context).await?;
         let physical = resolve_logical_write_key(&fragment, &logical_path).await?;
+        let _upload_activity =
+            crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
         let query = crate::core::disk_manager::UploadPartQuery {
             checksum: None,
             durability: Some("batched".to_string()),
@@ -1507,6 +1512,7 @@ async fn finalize_object_upload_durable_scoped(
         .as_ref()
         .map(|value| value.physical_object_id.clone())
         .unwrap_or_else(|| key_query.object_key.clone());
+    let _upload_activity = crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
     let finalized = durable_finalize_object_upload_direct(
         claims,
         fragment.clone(),
@@ -1529,9 +1535,7 @@ async fn finalize_object_upload_durable_scoped(
     let committed_physical =
         commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed)
             .await?;
-    global_namespace_runtime()
-        .clear_pending_upload(&parsed.fragment, &parsed.version_id)
-        .await?;
+    index::remove_session(&parsed.fragment, &parsed.version_id, "finalized").await?;
     parsed.object_key = logical_path;
     emit_logical_file_uploaded(
         &state,
