@@ -1,6 +1,7 @@
 pub mod adaptive_concurrency;
 pub mod archive;
 pub mod auto_healing;
+pub mod backup;
 pub mod capacity_manager;
 pub mod constants;
 pub mod delete;
@@ -15,6 +16,7 @@ pub mod garbage_collector;
 pub mod header_parser;
 pub mod index;
 pub mod index_store;
+pub mod instance_lease;
 pub mod io_scheduler;
 pub mod linux_io;
 pub mod maintenance;

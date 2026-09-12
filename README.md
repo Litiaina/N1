@@ -38,6 +38,9 @@ unversioned storage roots rather than adopting or migrating them.
 
 - `engine/` - N1 server and storage engine; Cargo package `n1`, executable
   `litiaina-n1`.
+- `litiaina-n1-backup` - encrypted offline storage snapshots, portable restore,
+  and one-way snapshot repository replication. See [BACKUP.md](BACKUP.md) for
+  maintenance-window requirements, commands, and recovery boundaries.
 - `shell/` - operator shell and future embedded management server; Cargo
   package `n1_shell`, executable `litiaina-n1-shell`.
 - `native_client/` - canonical Rust client for the `n1://` protocol; Cargo

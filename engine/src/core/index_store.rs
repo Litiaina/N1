@@ -160,6 +160,18 @@ struct SessionRow {
     aborted_at: Option<i64>,
 }
 
+/// Restore rewrites only physical placement; session/object identity is retained.
+pub(crate) fn remap_backup_session_manifest(
+    bytes: &[u8],
+    mut map: impl FnMut(&str) -> Result<String, AppError>,
+) -> Result<Vec<u8>, AppError> {
+    let mut row: SessionRow = decode(bytes)?;
+    for root in &mut row.manifest.placement_roots {
+        *root = map(root)?;
+    }
+    encode(&row)
+}
+
 impl SessionRow {
     fn into_state(self) -> IndexSessionState {
         IndexSessionState {

@@ -60,6 +60,37 @@ machine.
 
 ## Gate 2: Release Drills
 
+### Offline backup and snapshot replication
+
+Build `litiaina-n1-backup` beside the same-revision test engine and run
+`n1-release-proof --backup-proof` with dedicated test roots on distinct physical
+disks. The engine must be stopped for snapshot capture. See
+[BACKUP.md](BACKUP.md) for the operational boundary; this is not live replication.
+
+The release drill must prove:
+
+- A running source engine prevents capture; unfinished snapshots are not listed.
+- Full and incremental snapshots authenticate correctly, and a second repository
+  retains an older recovery point after independent source retention.
+- Original shard paths become unavailable before restore, so successful readback
+  cannot accidentally fall back to the source files.
+- Restored fragments retain credentials, object/version identity, namespace,
+  empty folders and unexpired trash. Every fixture payload is hash-checked.
+- A captured durable multipart session can finish after restore. Standard
+  in-memory sessions are intentionally not restart-resumable.
+- An interrupted SSH transfer publishes no partial snapshot; retry and repeated
+  transfer succeed, including verification after incomplete-job cleanup.
+- Killing restore mid-write leaves startup fences on all roots. Engine startup
+  fails, matching `--resume` succeeds, and restored payloads match the offline
+  source before normal engine operations resume.
+- Wrong keys, damaged blocks, ambiguous target contents, and unsafe path/root
+  mappings fail closed. Existing unrelated target files are not deleted.
+
+Record exact binary hashes, test topology, elapsed time, fixture counts, and
+production service state before/after the isolated drill. Process termination is
+not equivalent to a physical power cut. Large recovery sets, independent-site
+failures, and application/database consistency require separate acceptance.
+
 ### GC and concurrent publication safety
 
 The `n1-release-proof --gc-safety-proof` mode runs against a separate engine

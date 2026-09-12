@@ -7,7 +7,13 @@ edition = "2024"
 name = "litiaina-n1"
 path = "src/main.rs"
 
+[[bin]]
+name = "litiaina-n1-backup"
+path = "src/bin/backup.rs"
+
 [dependencies]
+clap.workspace = true
+ring = "0.17"
 # External workspace dependencies
 axum.workspace = true
 chrono.workspace = true

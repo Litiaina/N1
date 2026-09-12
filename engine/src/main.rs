@@ -815,6 +815,22 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
+    // Process-lifetime exclusion lets offline snapshots prove there is no
+    // engine writer, healer or collector. No per-request lock is introduced.
+    let instance_roots = INDEX_STORE_DISKS
+        .get()
+        .unwrap()
+        .iter()
+        .chain(BLOB_STORE_DISKS.get().unwrap())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let _instance_lease = crate::core::instance_lease::InstanceLease::engine(&instance_roots)
+        .unwrap_or_else(|error| {
+            tracing::error!("Cannot acquire N1 storage instance lease: {error}");
+            // A busy/offline-restoring root is an operational startup refusal,
+            // not a programming panic or a reason to produce a core dump.
+            std::process::exit(1);
+        });
     tracing::info!(
         "Storage mode: N1 object storage system with namespace-only index roots and colocated object metadata/payload roots"
     );

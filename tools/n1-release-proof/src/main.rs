@@ -28,6 +28,7 @@ include!("proof_workloads.rs");
 include!("proof_client.rs");
 include!("proof_native.rs");
 include!("proof_noa.rs");
+include!("proof_backup.rs");
 include!("proof_batch.rs");
 include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
@@ -52,7 +53,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.gc_safety_proof {
+    let result = if proof.args.backup_proof {
+        proof.run_backup_proof().await
+    } else if proof.args.gc_safety_proof {
         proof.run_gc_safety_proof().await
     } else if proof.args.export_proof {
         proof.run_export_proof().await

@@ -69,6 +69,74 @@ verification.
 
 ## Focused Proof Evidence
 
+### September 11–12, 2026: offline backup and snapshot replication
+
+The N1 3.5.1 candidate adds an encrypted backup utility without changing engine
+format 3, ECS encoding/placement, or upload publication. Capture requires a
+maintenance window with the source engine stopped throughout the scan. Replication
+copies committed recovery points to another repository; it does not create a
+live writable standby or provide automatic failover.
+
+Two complete server-local hardware drills passed on four independent XFS HDDs
+with EC 3+1. They used isolated fixtures, not production storage roots. Both
+verified that production N1, Space and Accel process identities and the installed
+N1 binary remained unchanged.
+
+Each drill passed 18 assertions: active-source exclusion, encrypted capture,
+incremental capture, idempotent replication, unavailable original paths, portable
+restore, paginated listing, version identity/history, download hashes, empty
+folders, trash recovery, durable multipart continuation, range reads, fresh
+write/delete, independent retention, live-block protection during repository GC,
+all 128 small-object hashes, and two independently authenticated fragments.
+A 64 MiB durable upload was captured halfway through and completed after restore.
+
+The metadata-heavy fixture captured approximately 51 MB of physical files in the
+first point and 52 MB after the incremental change. The following times are
+single runs, not cold-cache or device-ceiling benchmarks:
+
+| Operation | Initial implementation | Restore sync optimization |
+| --- | ---: | ---: |
+| First capture | 43.43 s | 47.69 s |
+| Incremental capture | 9.72 s | 12.14 s |
+| First replication | 26.75 s | 27.00 s |
+| Portable restore | 781.73 s | 163.27 s |
+
+Restore no longer synchronizes its disposable inventory per namespace record.
+Restored files are synchronized individually, followed by all final directories
+before startup fences are removed. This reduced restore time on this fixture;
+it does not establish multi-terabyte recovery throughput. Different generated
+object identifiers produced slightly different directory counts between runs.
+
+Final-candidate continuation checks also passed:
+
+- `cargo test --workspace --all-targets --offline`: **235 passed**, including
+  14 focused backup regressions. Formatting and whitespace checks passed.
+- Actual SSH transfer from a second machine was killed. The receiver exposed no
+  partial recovery point; retry completed, repeating the transfer was idempotent,
+  and verification passed before and after incomplete-job cleanup. The retry
+  took 112.89 s while the separate restore drill shared the destination disks;
+  this is recovery evidence, not an isolated network-throughput benchmark.
+- A restore process was killed after metadata materialization began. All four
+  roots retained their startup fences and the engine refused startup. `--resume`
+  completed in 180.67 s with approximately 9.5 MiB peak helper RSS on this fixture.
+  All 552 captured payload/receipt files compared byte-for-byte against the
+  offline source. Fragment authentication and an HTTP download then passed.
+- Test engines stopped afterward, test listeners were closed, and production
+  process IDs and the installed N1 binary still matched their initial state.
+
+The final helper also validates timestamps before snapshot publication and
+re-establishes publication sync barriers before acknowledging an already-present
+replica. Engine startup refusal is an operational error rather than a panic.
+These final adjustments were covered by the last regression run and the SSH/
+killed-restore checks; the two full workload runs above used their recorded
+earlier candidate hashes. Existing unrelated Clippy warnings remain; a strict
+warning-free Clippy gate is not claimed.
+
+Remaining boundaries include actual power-cut/fsync-stage injection, very large
+recovery sets, independent-site failure, key rotation, different-layout recoding,
+and coordinated application database recovery. See [BACKUP.md](BACKUP.md) before
+operating this utility; passing these drills does not prove live replication.
+
 ### September 7–9, 2026: GC and concurrent maintenance hardening
 
 The hardening candidate retains N1 3.5.1, engine format 3, its existing ECS
