@@ -69,6 +69,64 @@ verification.
 
 ## Focused Proof Evidence
 
+### September 12, 2026: automatic backup and standalone Accel
+
+Optional systemd-supervised backup jobs were added to the existing offline
+snapshot utility. The example remains disabled; no production timer was enabled
+and no production engine/application binary was replaced during these checks.
+N1 stays on version 3.5.1 and engine format 3, with unchanged EC and publication
+semantics.
+
+A real failure was found in the initial isolated hardware run: killing the whole
+backup cgroup could also kill the `ExecStopPost` restart process. Durable restart
+intent survived, but that run required manual recovery and was **not a pass**.
+The supplied service now also starts an `OnFailure` recovery unit in a separate
+cgroup. The fresh repeated drill passed all 11 checks on four independent XFS
+HDDs with EC 3+1:
+
+- Disabled job leaves the source available; timer-triggered capture succeeds.
+- Local verification and replication complete before independent retention.
+- Capture error, capture timeout, and whole-job SIGKILL recover the active source.
+- Replica failure preserves pending progress and skips retention; the retry uses
+  the same snapshot without another stop/start of the source.
+- Source/destination retain two/three completed points respectively.
+- An initially stopped engine stays stopped, and repeated payload hashes match.
+
+The synthetic fixture held 24 objects of 64 KiB each, with a separate 256 MiB
+file used to prolong fault-injected capture. These are workflow/correctness
+checks, not a large-backup throughput claim. Final status was complete with no
+pending snapshot, restart intent or error. Production N1, Space and Accel process
+identities and the installed N1 binary hash matched before/after. Temporary
+services and listeners were stopped and their runtime unit links removed.
+
+An independent N1 + Accel fixture passed 12 server-local API checks without
+routing through Space: authenticated fragment-wide search, cold MISS then HIT,
+stable pagination across 24 objects, authorization rejection, fragment isolation,
+upload visibility after refresh, rename refresh, version-pinned byte-cache
+MISS/HIT hashes, range bytes, direct N1 download while Accel is down, and projection
+rebuild after restart. Search is refresh-based, not a strongly consistent index.
+Console ordinary downloads still target N1 directly; testing Accel's byte endpoint
+does not mean those downloads automatically traverse it. See [ACCEL.md](ACCEL.md).
+
+Local verification passed:
+
+- N1 workspace/all-target tests: **244 passed**, including 23 backup regressions.
+- Accel workspace tests: **29 passed**.
+- Console type checks: zero errors/warnings. Its two existing mocked-backend
+  browser tests for accelerated search/pagination and TAR handoff passed. These
+  are separate from the live API checks, not a live browser-to-server proof.
+- Release builds, formatting and whitespace checks passed. Existing unrelated
+  Clippy warnings remain; no new warning locations in the backup additions were
+  reported by the final Clippy run.
+
+The automatic workflow used a local/mounted replica and user-systemd test units
+on one physical host. Root-system-unit policy, automatic SSH destination pruning,
+boot/power-cut recovery, every fsync-stage crash point, multi-terabyte datasets
+and independent-site failures still require their own acceptance drills. The
+earlier SSH snapshot-transfer proof below does not establish those new cases.
+No failover, zero data-loss, or numerical durability guarantee follows from this
+result.
+
 ### September 11–12, 2026: offline backup and snapshot replication
 
 The N1 3.5.1 candidate adds an encrypted backup utility without changing engine

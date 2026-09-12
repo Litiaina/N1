@@ -1,5 +1,6 @@
 //! Encrypted, incremental offline snapshots and one-way snapshot replication.
 //! Does not mutate engine placement, add upload receipts, or rely on live scans.
+pub mod automation;
 pub mod capture;
 pub mod cli;
 mod crypto;

@@ -5,6 +5,37 @@ use super::{Result, invalid};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 
+/// Explicit policy, not implicit replication of source deletions. Protect the
+/// just-verified point even if wall-clock rollback puts its ULID before others.
+pub fn prune(repo: &Repository, keep_last: usize, protect: &str) -> Result<()> {
+    repo.ensure_writable()?;
+    if !(1..=10000).contains(&keep_last) {
+        return Err(invalid("keep-last must be 1..10000"));
+    }
+    let mut snapshots = repo.list()?;
+    if !snapshots.iter().any(|s| s.id == protect) {
+        return Err(invalid("protected recovery point does not exist"));
+    }
+    // No retention until ALL current recovery points authenticate successfully.
+    for snapshot in &snapshots {
+        super::restore::verify(repo, snapshot)?;
+    }
+    snapshots.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+    let mut retained = 1;
+    for snapshot in snapshots {
+        if snapshot.id == protect {
+            continue;
+        }
+        if retained < keep_last {
+            retained += 1;
+        } else {
+            forget(repo, &snapshot.id)?;
+        }
+    }
+    gc(repo, false)?;
+    Ok(())
+}
+
 pub fn forget(repo: &Repository, id: &str) -> Result<()> {
     repo.ensure_writable()?;
     repo.snapshot(id)?;

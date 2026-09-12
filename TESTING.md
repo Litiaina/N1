@@ -91,6 +91,33 @@ production service state before/after the isolated drill. Process termination is
 not equivalent to a physical power cut. Large recovery sets, independent-site
 failures, and application/database consistency require separate acceptance.
 
+### Optional supervised backup jobs
+
+Use isolated test services and repositories, never a production service for
+failure injection. Exercise the supplied timer, job unit and separate recovery
+unit together; a direct `run-job` process does not prove systemd recovery.
+
+- Disabled jobs must not stop N1. An initially inactive engine must stay inactive.
+- A timer-triggered run must capture, restart N1, verify, optionally replicate,
+  and only then apply the independently configured retention policies.
+- Capture errors and timeouts must restart a previously active engine without
+  recording success. Verify payload hashes after restart.
+- Kill the entire job cgroup during capture. Its separate `OnFailure` recovery
+  unit must restore the durable restart intent even if `ExecStopPost` is killed.
+- Make the replica unavailable after capture. Do not prune recovery points or
+  report success. A later retry must finish the pending snapshot without another
+  source outage or an unexpected configuration/destination change.
+- Check overlapping jobs, corrupt state, restart failure, and unsafe paths in
+  focused regression tests. Keep restart intent when recovery fails.
+- Confirm `job-status` exposes failed/incomplete/overdue protection; monitoring
+  must not treat a prior successful point as proof the latest job succeeded.
+- Inspect `Persistent=false` and boot recovery wiring. An actual reboot during
+  capture and a missed-window boot drill remain separate hardware acceptance
+  tests; do not infer them from a process-kill test.
+
+See [VERIFICATION.md](VERIFICATION.md) for the dated four-disk results and their
+limits. Automatic capture still requires a maintenance window.
+
 ### GC and concurrent publication safety
 
 The `n1-release-proof --gc-safety-proof` mode runs against a separate engine

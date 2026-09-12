@@ -7,6 +7,27 @@ use std::io::{BufReader, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 
+#[test]
+fn automatic_retention_authenticates_before_deleting_and_preserves_protected_point() {
+    let f = Fixture::new();
+    let repo = f.repo("retention");
+    fs::write(f.root().join("data"), b"first").unwrap();
+    let first = capture::create(&repo, f.roots.clone(), 1).unwrap();
+    fs::write(f.root().join("data"), b"second").unwrap();
+    let second = capture::create(&repo, f.roots.clone(), 1).unwrap();
+    let block = repo.block_path(&crypto::digest(b"second")).unwrap();
+    let original = fs::read(&block).unwrap();
+    fs::write(&block, b"corrupted").unwrap();
+    assert!(retention::prune(&repo, 1, &first.id).is_err());
+    assert_eq!(repo.list().unwrap().len(), 2);
+    fs::write(&block, original).unwrap();
+    assert!(retention::prune(&repo, 0, &first.id).is_err());
+    retention::prune(&repo, 1, &first.id).unwrap();
+    assert_eq!(repo.list().unwrap().len(), 1);
+    restore::verify(&repo, &repo.snapshot(&first.id).unwrap()).unwrap();
+    assert!(repo.snapshot(&second.id).is_err());
+}
+
 struct Fixture {
     base: PathBuf,
     key: PathBuf,

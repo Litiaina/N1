@@ -39,7 +39,8 @@ unversioned storage roots rather than adopting or migrating them.
 - `engine/` - N1 server and storage engine; Cargo package `n1`, executable
   `litiaina-n1`.
 - `litiaina-n1-backup` - encrypted offline storage snapshots, portable restore,
-  and one-way snapshot repository replication. See [BACKUP.md](BACKUP.md) for
+  one-way snapshot repository replication, and optional supervised backup jobs.
+  See [BACKUP.md](BACKUP.md) for
   maintenance-window requirements, commands, and recovery boundaries.
 - `shell/` - operator shell and future embedded management server; Cargo
   package `n1_shell`, executable `litiaina-n1-shell`.
@@ -50,6 +51,9 @@ unversioned storage roots rather than adopting or migrating them.
   engines. N1 still owns disk placement, durability sync, atomic publication,
   metadata, and namespace semantics.
 - `cli_core/` - shared shell support; Cargo package `cli_core`.
+- Optional [N1 + Console + Accel](ACCEL.md) integration provides authenticated
+  fragment-wide file search without Space. Accel remains a rebuildable layer,
+  not authoritative storage.
 - `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling;
   Cargo package and executable `n1-release-proof`.
 - `DOCUMENTATION.md` - user-facing N1 documentation.

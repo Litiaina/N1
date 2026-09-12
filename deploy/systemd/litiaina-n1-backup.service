@@ -1,0 +1,26 @@
+[Unit]
+Description=Litiaina N1 optional offline backup and replication
+Wants=network-online.target
+After=network-online.target
+# Separate cgroup: a whole-job SIGKILL can race and kill ExecStopPost itself.
+OnFailure=litiaina-n1-backup-recover.service
+
+[Service]
+Type=oneshot
+# Lifecycle supervision needs permission to stop/start N1. Config and keys must
+# be administrator-owned. The engine itself keeps its existing service account.
+User=root
+UMask=0077
+StateDirectory=litiaina/n1-backup
+StateDirectoryMode=0700
+ExecStart=/opt/litiaina/n1/litiaina-n1-backup run-job --config /etc/litiaina/n1/backup-job.json
+# systemd runs this only after killing the remaining job cgroup, including SSH.
+ExecStopPost=/opt/litiaina/n1/litiaina-n1-backup recover-job --state-dir /var/lib/litiaina/n1-backup
+KillMode=control-group
+TimeoutStartSec=infinity
+TimeoutStopSec=360
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Do not add Restart=on-failure: retrying a fresh capture can repeatedly take N1
+# offline. Transfer retries are bounded inside the job; failed snapshots remain.

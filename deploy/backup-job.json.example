@@ -1,0 +1,23 @@
+{
+  "enabled": false,
+  "service": { "unit": "litiaina-n1.service", "user": false },
+  "engine_config": "/opt/litiaina/n1/n1_config.ini",
+  "repository": "/backup/n1-primary",
+  "key_file": "/etc/litiaina/n1/backup.key",
+  "state_dir": "/var/lib/litiaina/n1-backup",
+  "workers": 4,
+  "capture_timeout_seconds": 3600,
+  "operation_timeout_seconds": 3600,
+  "service_timeout_seconds": 330,
+  "replication_attempts": 3,
+  "keep_last": 4,
+  "max_age_seconds": 691200,
+  "replica": {
+    "repository": "/backup/n1-replica",
+    "key_file": "/etc/litiaina/n1/backup.key",
+    "ssh": "n1-backup@backup-host",
+    "ssh_config": "/etc/litiaina/n1/backup-ssh.conf",
+    "remote_binary": "/opt/litiaina/n1/litiaina-n1-backup",
+    "keep_last": 8
+  }
+}

@@ -30,6 +30,30 @@ impl RepoArgs {
 
 #[derive(Subcommand)]
 enum Operation {
+    /// Run an optional configured offline backup/replication workflow.
+    RunJob {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Recover service restart intent after a killed backup job (ExecStopPost).
+    RecoverJob {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Print job status; exits nonzero for enabled jobs with overdue/failed protection.
+    JobStatus {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Verify retained points, keep at least N including the protected point, then GC.
+    Prune {
+        #[command(flatten)]
+        repo: RepoArgs,
+        #[arg(long)]
+        keep_last: usize,
+        #[arg(long)]
+        protect: String,
+    },
     /// Generate a random 256-bit encryption key. Keep a separate protected copy.
     Keygen {
         #[arg(long)]
@@ -117,8 +141,54 @@ fn quoted(value: &str) -> Result<String> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
+pub(crate) fn ssh_command(
+    host: &str,
+    config: Option<&std::path::Path>,
+    binary: &str,
+    args: &[String],
+) -> Result<Command> {
+    if host.is_empty()
+        || host.starts_with('-')
+        || host.contains(char::is_whitespace)
+        || host.contains('\0')
+    {
+        return Err(invalid("invalid SSH target"));
+    }
+    let mut remote = quoted(binary)?;
+    for arg in args {
+        remote.push(' ');
+        remote.push_str(&quoted(arg)?);
+    }
+    let mut command = Command::new("ssh");
+    if let Some(config) = config {
+        command.arg("-F").arg(config);
+    }
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "--",
+        host,
+        &remote,
+    ]);
+    Ok(command)
+}
+
 pub fn run() -> Result<()> {
     match Cli::parse().command {
+        Operation::RunJob { config } => super::automation::run(&config)?,
+        Operation::RecoverJob { state_dir } => super::automation::recover(&state_dir)?,
+        Operation::JobStatus { config } => super::automation::status(&config)?,
+        Operation::Prune {
+            repo,
+            keep_last,
+            protect,
+        } => super::retention::prune(&repo.open(true)?, keep_last, &protect)?,
         Operation::Keygen { key_file } => super::crypto::create_key(&key_file)?,
         Operation::Init { repo } => Repository::initialize(&repo.repository, &repo.key_file)?,
         Operation::Create {

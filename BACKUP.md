@@ -141,11 +141,133 @@ Nested/overlapping roots are rejected. A successful `create` prints its snapshot
 ID, entry count, and captured physical byte count as JSON. Failures return nonzero;
 unfinished work never appears as a completed recovery point.
 
-For scheduling, use a service-account-owned job/systemd timer with explicit
-application quiescing, engine stop/start, error handling, and alerting. Ensure its
-failure handler restarts a source service that the job stopped. **Do not** rely on
-`stop && create && start`: a failed capture would leave the engine stopped. The
-utility deliberately does not stop arbitrary host services or install timers.
+The explicit `create` command never stops services. For optional, supervised
+scheduling, use the automatic job described below. **Do not** replace it with
+`stop && create && start`: a failed capture would leave the engine stopped.
+
+## Optional automatic backup
+
+Automatic backup wraps the same offline capture/restore format. It is disabled
+by default and does not add a daemon, upload-path work, live replication, or
+automatic failover. systemd provides scheduling and process supervision. Only
+the explicitly configured N1 service is stopped; Space/custom applications are
+not automatically quiesced or backed up. Coordinate those separately if used.
+
+The workflow is:
+
+1. Validate configured roots, initialized backup leases, repositories and keys;
+   acquire exclusive job and service locks. Overlapping jobs fail without taking
+   the engine offline.
+2. If N1 is active, durably record a restart intent **before** stopping it.
+   An already stopped N1 is deliberately left stopped after the job.
+3. Capture under the existing storage-root leases, with a configurable timeout.
+   Restore the original service state before verification and replication.
+4. Authenticate the local snapshot and replicate it if a destination is configured.
+   Transfer retries are bounded and reuse the same snapshot. A later run finishes
+   an outstanding snapshot without another capture/outage. Keep the original
+   job settings until that outstanding point completes.
+5. Apply explicitly configured source/destination retention only after required
+   verification and replication succeed. Record completion and recovery-point age.
+
+Normal errors attempt restart immediately. systemd `ExecStopPost` also processes
+the durable restart intent after killing a cancelled/failed job's remaining
+processes, including transfer children. A separate recovery unit is also wired
+through `OnFailure`, so killing the entire job cgroup cannot kill both recovery
+paths. That unit also runs at boot for an intent left by host interruption.
+Restart failure remains recorded and
+visible; this cannot repair a broken engine configuration or missing hardware.
+Do not run this job concurrently with operator stop/start or disk maintenance.
+
+### Configure and enable deliberately
+
+First initialize both repositories and protect the encryption key as described
+above. Run the matching updated N1 binary once so its root leases exist. Copy
+`deploy/backup-job.json.example` to `/etc/litiaina/n1/backup-job.json`, owned by
+the administrator and not writable by group/other users. Set actual paths,
+service identity and optional replica, then change `enabled` to `true` only when
+the maintenance window has been approved. The example's `enabled: false` is
+intentional.
+
+The system service runs the supervisor/helper as root for lifecycle control;
+N1 keeps its existing service account. Job state and repository/key files must
+be owner-only. The state directory must be outside all repositories and N1
+roots. Never grant untrusted users write access to the job config, its parent
+directories, the helper binary, SSH config, or state directory.
+
+| Setting | Meaning |
+| --- | --- |
+| `enabled` | Explicit opt-in; default `false`. |
+| `service.unit` | Exact N1 systemd service to stop/start. |
+| `service.user` | Default `false`; `true` is for user-manager deployments/tests. |
+| `engine_config` | N1 config whose absolute roots are captured; must match the service. |
+| `state_dir` | Persistent private journal/status directory. |
+| `workers` | Capture concurrency, 1–32; default 4. |
+| `capture_timeout_seconds` | Deadline for capture after stopping the engine. |
+| `operation_timeout_seconds` | Deadline per verify, transfer attempt, or retention operation. |
+| `service_timeout_seconds` | Bound for each service command; allow N1's graceful-stop timeout. |
+| `replication_attempts` | 1–10 attempts per run, two seconds between failures. |
+| `keep_last` | Source completed points to retain; `0` disables automatic pruning. |
+| `replica.keep_last` | Independently chosen destination retention; `0` disables it. |
+| `max_age_seconds` | Age beyond which an enabled job's protection status is unhealthy. |
+| `replica` | Omit or set `null` for local-only backup; otherwise use mounted/SSH destination settings. |
+
+The example retains four source and eight destination points and considers a
+weekly backup overdue after eight days. The destination may use a different
+retention count; this is an explicit policy, not automatic propagation of source
+object deletion. Retention authenticates all completed points before deleting
+any, always protects the newly verified point even under clock rollback, and
+never removes the last point. Interrupted-job pins remain until the separate
+`gc --discard-incomplete` command is deliberately used. Budget repository
+capacity/inodes and inspect failures; scheduling does not create extra capacity.
+
+Install `deploy/systemd/litiaina-n1-backup.service`,
+`litiaina-n1-backup.timer`, and `litiaina-n1-backup-recover.service` into the
+system unit directory. Their default helper path is
+`/opt/litiaina/n1/litiaina-n1-backup`; their journal path is
+`/var/lib/litiaina/n1-backup`. Keep the job's `state_dir` and both recovery
+commands consistent if changing those paths. These files are supplied, not enabled
+automatically by building N1.
+
+```sh
+sudo systemctl daemon-reload
+# Supervised, immediate acceptance run inside an approved maintenance window:
+sudo systemctl start litiaina-n1-backup.service
+sudo /opt/litiaina/n1/litiaina-n1-backup job-status \
+  --config /etc/litiaina/n1/backup-job.json
+
+# Only after checking the calendar and successful recovery drill:
+sudo systemctl enable --now litiaina-n1-backup.timer
+systemctl list-timers litiaina-n1-backup.timer
+journalctl -u litiaina-n1-backup.service
+```
+
+The supplied timer uses Sunday 02:00 in the host's configured timezone, with no
+random delay and `Persistent=false`. A missed window is **skipped**, not caught up
+at boot when users may be working. An enabled recovery unit can restart N1 after
+an interrupted prior job without starting a new backup. Edit the timer schedule
+through an override and choose an overdue threshold appropriate to that schedule.
+Applications/clients may receive unavailable responses during capture; standard
+in-memory uploads do not survive the stop. Notify users and drain work first.
+
+`job-status` emits JSON and exits nonzero for an enabled job that is overdue,
+failed, interrupted or not yet completed. Connect this command and the systemd
+unit's failure state to the site's monitoring/alert channel. No email/webhook
+credentials or notification service are invented by this feature. A successful
+status means the configured workflow completed, not a promise of zero data loss
+or a quantified durability percentage.
+
+To disable future runs, disable the timer and set `enabled: false`. Do not remove
+the recovery unit/state while a job has a pending restart intent. For an emergency
+interruption use `systemctl stop litiaina-n1-backup.service` and confirm N1 recovered.
+`run-job --config ...` is also available manually, but **only a supervised systemd
+run has automatic cleanup after the controller is SIGKILLed**. Manual recovery is:
+
+```sh
+litiaina-n1-backup recover-job --state-dir /var/lib/litiaina/n1-backup
+```
+
+Use that only after the previous job and its children have exited. It restores
+the recorded service intention; it does not manufacture a successful backup.
 
 ## One-way replication
 
@@ -268,7 +390,7 @@ Recorded acceptance results and their limits are in
 
 Remaining work beyond this maintenance-window version includes live snapshot
 staging/change tracking, continuous replication lag reporting, automated standby
-promotion, different-layout recoding, managed schedules/UI integration, key
+promotion, different-layout recoding, graphical schedule management, key
 rotation, application-coordinated recovery orchestration, and independent-site
 power-loss/restore drills. Do not infer those capabilities from a successful
 offline recovery proof.
