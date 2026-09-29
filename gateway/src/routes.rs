@@ -168,6 +168,8 @@ fn build_cors_layer() -> CorsLayer {
             HeaderName::from_static("digest"),
             HeaderName::from_static("buffer"),
             HeaderName::from_static("range"),
+            HeaderName::from_static("if-range"),
+            HeaderName::from_static("if-none-match"),
             HeaderName::from_static("upgrade"),
             HeaderName::from_static("connection"),
             HeaderName::from_static("sec-websocket-key"),
@@ -181,6 +183,13 @@ fn build_cors_layer() -> CorsLayer {
             Method::PUT,
             Method::DELETE,
             Method::OPTIONS,
+        ])
+        .expose_headers([
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::ETAG,
+            header::CONTENT_DISPOSITION,
         ])
         .max_age(std::time::Duration::from_secs(86400))
 }

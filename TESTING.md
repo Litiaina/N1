@@ -47,6 +47,49 @@ integrity, corrupted block reconstruction, canonical-list refill,
 replica-backed degraded listing, exact static placement, exact metadata
 visibility, copy/delete restart semantics, and object/healing invariants.
 
+### Durable archive export proof — PASS, 2026-09-20
+
+The [export job API](EXPORT.md), fixed-owner gateway routing, and shared
+N1/N2 Console export flow passed the following scoped checks:
+
+- `cargo test -p n2 -p n2_gateway --offline`: engine **219/219** and gateway
+  **29/29**, including overlapping download leases and streamed downloads that
+  outlive the ordinary request timeout;
+- `cargo build -p n2 -p n2_gateway --offline`, Rust formatting, installer shell
+  syntax, and `git diff --check`;
+- Console `npm run check`: zero errors and warnings;
+- Console `tests/search-export.spec.ts`: **7/7** on desktop Chromium, covering
+  both engines' TAR download handoff, terminal failures, cancellation that is
+  not falsely acknowledged during connection failure, and the existing N1
+  search regression;
+- standard Clippy completed, with no diagnostics in the new export/signing
+  modules or modified archive reader. Repository-wide `-D warnings` remains
+  blocked by existing lint debt; it is not claimed as a clean gate here.
+
+The executable proof is `scripts/proof/n2_export_proof.py`. Final evidence
+bundle: `n2-export-proof-0wlxg1pp`. It ran freshly built debug binaries as two
+isolated loopback engine processes, one enrolled directory each, EC **1+1**,
+and a third gateway process. It proved:
+
+- exact ZIP64 and TAR contents from distributed shards, SHA-256 ETags, exact
+  lengths, range resume, invalid-range rejection, and signed-URL tamper rejection;
+- fragment isolation for status, download, signing, and cancellation;
+- a missing selection fails the whole job without publishing a partial archive;
+- owner SIGKILL during a 64 MiB build, immutable-manifest reuse after restart,
+  no gateway takeover, and byte-exact recovered ZIP64 output;
+- a durable source pin rejects holder-side purge while the owner is down,
+  including after the holder itself restarts;
+- exact mapped source byte ranges;
+- acknowledged cancellation persists across owner restart and blocks delivery;
+- natural 120-second retention removes state and artifact chunks while leaving
+  source objects intact.
+
+All child processes were stopped and evidence retained. No deployment service,
+production data, N1 storage, or cluster membership outside the fixture changed.
+This one-host process-crash proof does **not** qualify independent hosts/disks,
+power loss, disk-full behavior, large-scale throughput, owner takeover, or
+cluster backup/restore. Those remain distinct from export API correctness.
+
 ### N2 3.5 ECS Core two-host proof — PASS
 
 The isolated N2 3.5 proof completed on 2026-08-29 with result `PASS`.

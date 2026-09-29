@@ -375,6 +375,13 @@ async fn process_fragment_gc(
     fragment: &str,
     retention: Duration,
 ) -> Result<FragmentGcStats, AppError> {
+    if crate::core::export::pins::fragment_is_pinned(fragment).await? {
+        tracing::info!(
+            fragment,
+            "deferring fragment GC while export retains source versions"
+        );
+        return Ok(FragmentGcStats::default());
+    }
     let now_unix = Utc::now().timestamp();
     let live = collect_live_object_ids(fragment).await?;
     let mut protected = collect_unexpired_trash_object_ids(fragment, retention, now_unix).await?;

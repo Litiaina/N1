@@ -64,6 +64,46 @@ pub(super) async fn proxy_fallback(
     let path = request.uri().path().to_string();
     let retry_template = replay_safe_proxy_template(&request);
     let query = proxy_query_parameters(request.uri().query());
+    // Job identity carries its fixed owner. Never replay a status/download on
+    // another node: it could neither recover nor authorize this local artifact.
+    if path.starts_with("/noa/v1/exports/") || path == "/noa/v1/signed-exports/download" {
+        let id = if path == "/noa/v1/signed-exports/download" {
+            query.get("export_id").map(String::as_str).unwrap_or("")
+        } else {
+            path.trim_start_matches("/noa/v1/exports/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+        };
+        let owner = match export_owner_hash(id) {
+            Some(owner) => owner,
+            None => return text_response(StatusCode::BAD_REQUEST, "invalid export identity"),
+        };
+        let node = match state
+            .config
+            .nodes
+            .iter()
+            .find(|node| export_node_hash(&node.id) == owner)
+        {
+            Some(node) => node.clone(),
+            None => {
+                return text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "export coordinator is not configured",
+                );
+            }
+        };
+        if !state.nodes.is_available(&node.id).await && !state.nodes.probe_node(&node.id).await {
+            return text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "export coordinator is unavailable; retry when it returns",
+            );
+        }
+        state.nodes.mark_route(&node.id).await;
+        return match proxy_http(&state, node, request).await {
+            Ok(response) | Err(response) => response,
+        };
+    }
     let mut node = match if path.starts_with("/noa/v1/namespace/operations/")
         && coordinator_node_id(request.headers(), &query).is_some()
     {
@@ -91,6 +131,26 @@ pub(super) async fn proxy_fallback(
             }
         }
     }
+}
+
+pub(super) fn export_node_hash(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(id.as_bytes()))
+}
+
+pub(super) fn export_owner_hash(id: &str) -> Option<&str> {
+    let parts = id.split('.').collect::<Vec<_>>();
+    let valid_hash = |s: &str| {
+        s.len() == 64
+            && s.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    };
+    (parts.len() == 3
+        && valid_hash(parts[0])
+        && valid_hash(parts[1])
+        && parts[2].len() == 26
+        && ulid::Ulid::from_string(parts[2]).is_ok())
+    .then(|| parts[0])
 }
 
 pub(super) fn proxy_query_parameters(query: Option<&str>) -> HashMap<String, String> {

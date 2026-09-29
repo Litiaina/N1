@@ -108,7 +108,7 @@ async fn sync_dir(dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+pub(crate) async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let parent = path.parent().ok_or_else(|| {
         AppError::InternalServerError(format!("missing parent for {}", path.display()))
     })?;

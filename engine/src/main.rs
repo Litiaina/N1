@@ -693,6 +693,7 @@ pub async fn run_server() {
     });
 
     crate::distribution::peer::spawn_fragment_control_sync_task();
+    tokio::spawn(crate::core::export::run_export_manager());
     crate::distribution::auto_healing::spawn_auto_healing_task();
     crate::distribution::reserve_set::spawn_reserve_set_task();
 

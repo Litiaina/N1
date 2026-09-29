@@ -49,6 +49,7 @@ pub enum DiskIoClass {
     BackgroundRepair,
     BackgroundGc,
     BackgroundRedistribution,
+    BackgroundExport,
 }
 
 impl DiskIoClass {
@@ -59,6 +60,7 @@ impl DiskIoClass {
             Self::BackgroundRepair => "background repair",
             Self::BackgroundGc => "background gc",
             Self::BackgroundRedistribution => "background redistribution",
+            Self::BackgroundExport => "background export",
         }
     }
 

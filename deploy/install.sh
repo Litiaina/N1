@@ -302,6 +302,17 @@ cleanup_interval_seconds=3600
 file_ttl_seconds=3600
 retention_seconds=2592000
 
+[export]
+retention_seconds=86400
+cleanup_interval_seconds=60
+max_concurrent_jobs=2
+max_queued_jobs=128
+max_concurrent_downloads=32
+artifact_chunk_size_bytes=16777216
+max_buffered_bytes_per_job=134217728
+max_buffered_bytes_global=268435456
+max_retained_bytes=0
+
 [auto_healing]
 enabled=true
 initial_delay_seconds=30

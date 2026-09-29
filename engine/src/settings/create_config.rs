@@ -31,6 +31,17 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("file_ttl_seconds", "3600")
         .set("retention_seconds", "2592000");
 
+    conf.with_section(Some("export"))
+        .set("retention_seconds", "86400")
+        .set("cleanup_interval_seconds", "60")
+        .set("max_concurrent_jobs", "2")
+        .set("max_queued_jobs", "128")
+        .set("max_concurrent_downloads", "32")
+        .set("artifact_chunk_size_bytes", "16777216")
+        .set("max_buffered_bytes_per_job", "134217728")
+        .set("max_buffered_bytes_global", "268435456")
+        .set("max_retained_bytes", "0");
+
     conf.with_section(Some("auto_healing"))
         .set("enabled", "true")
         .set("initial_delay_seconds", "30")

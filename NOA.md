@@ -77,10 +77,21 @@ POST   /noa/v1/objects/bulk-delete
 POST   /noa/v1/objects/bulk-recover
 POST   /noa/v1/objects/archive
 POST   /noa/v1/objects/archive/manifest
+POST   /noa/v1/exports
+GET    /noa/v1/exports/{id}
+DELETE /noa/v1/exports/{id}
+GET    /noa/v1/exports/{id}/download
+POST   /noa/v1/exports/{id}/signed-url
+GET    /noa/v1/signed-exports/download
 ```
 
 Deletion is soft. TTL lifecycle owns physical reclamation; NOA v1 does not
 define empty-trash or hard-delete operations.
+
+Use the durable `/exports` workflow for ZIP64/TAR generation and resumable
+delivery. The older archive routes are streaming compatibility APIs. See
+[EXPORT.md](EXPORT.md) for request bodies, permissions, coordinator ownership,
+retention, and the all-member source-pin admission requirement.
 
 ### Uploads
 

@@ -924,4 +924,4 @@ async fn write_tar_archive(
 #[path = "archive/reader.rs"]
 mod reader;
 
-use reader::create_multipart_reader;
+pub(crate) use reader::{create_multipart_range_reader, create_multipart_reader};

@@ -1806,6 +1806,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "hex",
  "http-body-util",
  "n2_native_client",
  "percent-encoding",
@@ -1816,12 +1817,14 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "ulid",
  "uuid",
 ]
 

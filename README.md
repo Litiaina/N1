@@ -112,6 +112,8 @@ identities remain unchanged so installed components are unambiguous.
   read-only fragment replication, site policy, convergence, fencing,
   failover, maturity isolation, and release gates.
 - [GATEWAY.md](GATEWAY.md): optional route-only gateway deployment.
+- [EXPORT.md](EXPORT.md): durable ZIP64/TAR jobs, coordinator routing,
+  resumable browser downloads, source-retention pins, and failure limits.
 - [TESTING.md](TESTING.md): correctness, lifecycle, failure, restart, and
   soak procedures with the currently qualified evidence, including the N2 3.5
   ECS Core two-host pass and clean N2 3.4.1 24-hour release-soak pass.

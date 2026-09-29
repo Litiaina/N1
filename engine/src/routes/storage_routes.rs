@@ -218,6 +218,19 @@ pub fn build_storage_routes_unbound_with_options(
                 get(get_object_repair_status_scoped),
             )
             .route("/noa/v1/objects/download", get(download_object_scoped))
+            .route("/noa/v1/exports", post(crate::core::export::create_export))
+            .route(
+                "/noa/v1/exports/{id}",
+                get(crate::core::export::export_status).delete(crate::core::export::cancel_export),
+            )
+            .route(
+                "/noa/v1/exports/{id}/download",
+                get(crate::core::export::download_export),
+            )
+            .route(
+                "/noa/v1/exports/{id}/signed-url",
+                post(crate::url::signed_export::mint_signed_export_url),
+            )
             .route(
                 "/noa/v1/objects/download/chunk",
                 get(download_object_chunk_scoped),
@@ -386,6 +399,10 @@ pub fn build_storage_routes_unbound_with_options(
     let ws_routes = { Router::new().route("/noa/v1/ws", get(ws_handler)) };
 
     let public_global_routes = Router::new()
+        .route(
+            "/noa/v1/signed-exports/download",
+            get(crate::url::signed_export::download_signed_export),
+        )
         .route("/noa/v1/fragments/check", get(verify_fragment_existence))
         .route("/noa/v1/fragments/hash", get(get_fragment_hash))
         .route(
@@ -395,6 +412,7 @@ pub fn build_storage_routes_unbound_with_options(
     let public_global_routes = layers.layer_global(public_global_routes);
 
     let peer_routes = Router::new()
+        .merge(crate::core::export::pins::routes())
         .merge(build_peer_routes())
         .merge(build_ncnx_peer_routes())
         .merge(build_auto_healing_peer_routes())

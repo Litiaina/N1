@@ -97,6 +97,19 @@ POST stop                    -> client sends coordinator_node_id=node-a
 The gateway does not store job state. The selected coordinator owns the local
 job state, and N2 owns the distributed repair/rebalance work.
 
+## Archive Export Routing
+
+Export IDs embed hashes of the owning logical node and physical instance. The
+gateway routes status, cancellation, signed-URL creation, and downloads only to
+that owner; a client-supplied coordinator cannot override it. Configure gateway
+node IDs to match membership slot IDs. The engine rejects a replacement instance
+even if it occupies the same logical slot. No gateway route database or automatic
+export takeover is introduced.
+
+Export downloads use `request_timeout_seconds` as a connection/read-idle limit,
+not a total body lifetime. Job-management requests retain the ordinary timeout.
+See [EXPORT.md](EXPORT.md) for retention, source pins, and restart limitations.
+
 ## Configuration
 
 The gateway creates `n2_gateway_config.ini` on first run if missing.
@@ -266,6 +279,12 @@ POST /noa/v1/cluster/rebalance/start           select coordinator and return coo
 GET  /noa/v1/cluster/rebalance/status          route to client-supplied coordinator_node_id
 POST /noa/v1/cluster/rebalance/stop            route to client-supplied coordinator_node_id
 GET  /noa/v1/objects/download                  stream through native N2 from a selected node
+POST /noa/v1/exports                           select an available export owner
+GET  /noa/v1/exports/{id}                       route only to the embedded owner
+DELETE /noa/v1/exports/{id}                     cancel at the embedded owner
+GET  /noa/v1/exports/{id}/download              stream from the embedded owner
+POST /noa/v1/exports/{id}/signed-url            mint at the embedded owner
+GET  /noa/v1/signed-exports/download            route using the signed export_id
 ```
 
 All other `/noa/v1/...` routes are proxied to an available N2 node.
@@ -305,6 +324,8 @@ Other `/noa/v1/...` routes are transparently proxied over HTTP to a healthy N2 n
   coordinator node returned by multipart init.
 - Existing repair/rebalance jobs remain sticky only when the client supplies
   the coordinator node returned by job start.
+- Export requests remain bound to the owner encoded in the export ID, including
+  browser downloads using signed URLs. They never fall back to another node.
 - If the coordinator is unavailable, the gateway returns a clear unavailable
   response instead of inventing cross-node resume or cross-node job state.
 - If the gateway restarts, there is no gateway upload or job route state to

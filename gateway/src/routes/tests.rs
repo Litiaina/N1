@@ -17,6 +17,132 @@ struct MockNativeNode {
     operations: Arc<Mutex<Vec<String>>>,
 }
 
+#[tokio::test]
+async fn export_status_and_signed_download_stay_on_the_embedded_owner() {
+    let a = spawn_mock_native_node("node-a").await;
+    let b = spawn_mock_native_node("node-b").await;
+    let state = two_node_gateway_state(&a, &b).await;
+    let app = router(state);
+    let id = format!(
+        "{}.{}.{}",
+        export_node_hash("node-b"),
+        export_node_hash("physical-b"),
+        ulid::Ulid::new()
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/noa/v1/exports/{id}"))
+                .header("x-n2-coordinator-node", "node-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["owner"], "node-b");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/noa/v1/signed-exports/download?export_id={id}&signature=test"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()[header::ETAG], "\"export-etag\"");
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "node-b"
+    );
+    let missing = format!(
+        "{}.{}.{}",
+        export_node_hash("absent"),
+        export_node_hash("absent"),
+        ulid::Ulid::new()
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/noa/v1/exports/{missing}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/noa/v1/exports/not-an-export")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn export_download_has_an_idle_timeout_not_a_total_lifetime_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/noa/v1/exports/test/download",
+        get(|headers: HeaderMap| async move {
+            assert_eq!(headers[header::RANGE], "bytes=0-7");
+            let stream = futures_util::stream::unfold(0u8, |i| async move {
+                if i == 8 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Some((Ok::<_, std::io::Error>(bytes::Bytes::from(vec![i])), i + 1))
+            });
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_RANGE, "bytes 0-7/8")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let node = NodeConfig {
+        id: "node-a".into(),
+        http_url,
+        native_url: "n2://127.0.0.1:1".into(),
+        weight: 1,
+    };
+    let mut config = gateway_config(vec![node.clone()]);
+    config.request_timeout = Duration::from_millis(250);
+    let state = GatewayState::new(config).await.unwrap();
+    let request = Request::builder()
+        .uri("/noa/v1/exports/test/download")
+        .header(header::RANGE, "bytes=0-7")
+        .body(Body::empty())
+        .unwrap();
+    let response = proxy_http(&state, node, request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 0-7/8");
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        &[0, 1, 2, 3, 4, 5, 6, 7]
+    );
+    server.abort();
+}
+
 async fn spawn_mock_native_node(node_id: &'static str) -> MockNativeNode {
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_url = format!("http://{}", http_listener.local_addr().unwrap());
@@ -143,6 +269,24 @@ async fn spawn_mock_native_node(node_id: &'static str) -> MockNativeNode {
         }
     };
     let http_app = Router::new()
+        .route(
+            "/noa/v1/exports/{id}",
+            get(move |Path(id): Path<String>| async move {
+                Json(json!({"export_id": id, "owner": node_id}))
+            }),
+        )
+        .route(
+            "/noa/v1/signed-exports/download",
+            get(move || async move {
+                (
+                    [
+                        (header::ETAG, "\"export-etag\""),
+                        (header::ACCEPT_RANGES, "bytes"),
+                    ],
+                    node_id,
+                )
+            }),
+        )
         .route("/noa/v1/auth/fragment", post(auth_fragment))
         .route("/noa/v1/auth/refresh", post(auth_refresh))
         .route("/noa/v1/auth/logout", post(auth_logout))

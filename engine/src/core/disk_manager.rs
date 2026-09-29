@@ -386,10 +386,24 @@ pub struct UploadPartQuery {
     pub io_gate: Option<bool>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DownloadArchiveEntry {
+    pub object_key: String,
+    pub archive_path: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub offset_bytes: Option<u64>,
+    #[serde(default)]
+    pub length_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DownloadArchiveRequest {
     #[serde(default)]
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<DownloadArchiveEntry>,
     #[serde(default)]
     pub prefix: Option<String>,
     #[serde(default)]

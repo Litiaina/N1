@@ -24,8 +24,14 @@ pub async fn proxy_http(
     let stream = body
         .into_data_stream()
         .map_err(|err| std::io::Error::other(err.to_string()));
-    let mut builder = state
-        .http
+    let client = if uri.path() == "/noa/v1/signed-exports/download"
+        || (uri.path().starts_with("/noa/v1/exports/") && uri.path().ends_with("/download"))
+    {
+        &state.export_http
+    } else {
+        &state.http
+    };
+    let mut builder = client
         .request(method, upstream_url)
         .body(reqwest::Body::wrap_stream(stream));
     builder = copy_request_headers(builder, &headers);

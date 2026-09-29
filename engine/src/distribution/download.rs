@@ -39,6 +39,13 @@ impl Default for VerifiedShardCache {
 }
 
 impl VerifiedShardCache {
+    pub(crate) fn for_sequential_export() -> Self {
+        Self {
+            max_verified_blocks: 1,
+            ..Self::default()
+        }
+    }
+
     pub fn clear(&mut self) {
         self.verified.clear();
         self.rejected.clear();
