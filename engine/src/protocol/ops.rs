@@ -109,6 +109,12 @@ fn native_operation_requires_write_safe_topology(op: &str) -> bool {
     )
 }
 
+fn native_operation_is_upload(op: &str) -> bool {
+    matches!(op, "upload.one_shot" | "object.upload.one_shot")
+        || op.starts_with("multipart.")
+        || op.starts_with("upload.multipart.")
+}
+
 pub async fn execute_native_op(
     state: Arc<AppState>,
     session: &NativeSession,
@@ -192,6 +198,11 @@ where
     R: AsyncRead + Unpin + Send,
 {
     let claims = require_claims(session)?;
+    let _lifecycle = if native_operation_is_upload(op) {
+        Some(crate::core::fragment_lifecycle::acquire_live(&claims.fragment).await?)
+    } else {
+        None
+    };
     let response = match op {
         "upload.one_shot" | "object.upload.one_shot" => {
             require_write(&claims)?;
@@ -251,6 +262,7 @@ where
     if let Some(response) = response {
         return Ok(Some(response));
     }
+    drop(_lifecycle);
     execute_native_op_inner(state, session, op, payload, None).await
 }
 
@@ -266,6 +278,11 @@ where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
 {
     let claims = require_claims(session)?;
+    let _lifecycle = if native_operation_is_upload(op) {
+        Some(crate::core::fragment_lifecycle::acquire_live(&claims.fragment).await?)
+    } else {
+        None
+    };
     let response = match op {
         "upload.one_shot" | "object.upload.one_shot" => {
             require_write(&claims)?;
@@ -337,6 +354,15 @@ async fn execute_native_op_inner(
     let claims = match op {
         "fragment.create" | "fragment.hash.public" | "fragment.check" => None,
         _ => Some(require_claims(session)?),
+    };
+
+    let _lifecycle = if native_operation_is_upload(op) {
+        Some(
+            crate::core::fragment_lifecycle::acquire_live(&claims.as_ref().unwrap().fragment)
+                .await?,
+        )
+    } else {
+        None
     };
 
     let response = match op {

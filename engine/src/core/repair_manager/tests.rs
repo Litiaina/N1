@@ -12,6 +12,84 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use ulid::Ulid;
 
+#[tokio::test]
+async fn fragment_deletion_waits_for_healing_and_stale_scan_cannot_resurrect_it() {
+    use super::object_repair::{fragment_is_present, repair_fragment_metadata_replicas};
+    use crate::core::fragment_lifecycle;
+    use std::time::Duration;
+
+    let fragment = Ulid::new().to_string();
+    let base = std::env::temp_dir().join(format!("n1-heal-delete-{fragment}"));
+    let roots: Vec<_> = (0..4)
+        .map(|slot| base.join(format!("root-{slot}")))
+        .collect();
+    let bytes = rmp_serde::to_vec_named(&serde_json::json!({"fragment": fragment})).unwrap();
+    for root in &roots {
+        fs::create_dir_all(physical_fragment_root_on(root, &fragment)).unwrap();
+    }
+    fs::write(
+        physical_fragment_root_on(&roots[0], &fragment).join(FRAGMENT_METADATA_FILE),
+        &bytes,
+    )
+    .unwrap();
+
+    let repair_guard = fragment_lifecycle::acquire(&fragment).await.unwrap();
+    let delete_fragment = fragment.clone();
+    let delete_roots = roots.clone();
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    let (deleted_tx, mut deleted_rx) = tokio::sync::oneshot::channel();
+    let delete = tokio::task::spawn_blocking(move || {
+        waiting_tx.send(()).unwrap();
+        let _guard = fragment_lifecycle::acquire_blocking(&delete_fragment).unwrap();
+        for root in delete_roots {
+            fs::remove_dir_all(physical_fragment_root_on(&root, &delete_fragment)).unwrap();
+        }
+        deleted_tx.send(()).unwrap();
+    });
+    waiting_rx.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut deleted_rx)
+            .await
+            .is_err()
+    );
+    assert!(fragment_is_present(&roots, &fragment).await.unwrap());
+    assert_eq!(
+        repair_fragment_metadata_replicas(&roots, &fragment, false)
+            .await
+            .unwrap(),
+        (3, 0, 0),
+        "genuine missing replicas must still be repaired"
+    );
+    drop(repair_guard);
+    delete.await.unwrap();
+    deleted_rx.await.unwrap();
+
+    let _stale_scan_guard = fragment_lifecycle::acquire(&fragment).await.unwrap();
+    assert!(!fragment_is_present(&roots, &fragment).await.unwrap());
+    assert!(
+        roots
+            .iter()
+            .all(|root| !physical_fragment_root_on(root, &fragment).exists())
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn fragment_lifecycle_does_not_hide_real_io_failures() {
+    use super::object_repair::fragment_is_present;
+    let fragment = Ulid::new().to_string();
+    let base = std::env::temp_dir().join(format!("n1-lifecycle-io-{fragment}"));
+    fs::create_dir_all(&base).unwrap();
+    let blocked_root = base.join("not-a-directory");
+    fs::write(&blocked_root, b"blocker").unwrap();
+    assert!(
+        fragment_is_present(&[blocked_root], &fragment)
+            .await
+            .is_err()
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn parse_check_mode_is_case_insensitive_and_accepts_aliases() {
     let mut params = HashMap::new();

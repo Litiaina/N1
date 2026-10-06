@@ -568,7 +568,7 @@ pub struct ChunkQuery {
     pub chunk_size: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct UploadPartQuery {
     pub checksum: Option<String>,
     #[serde(default)]

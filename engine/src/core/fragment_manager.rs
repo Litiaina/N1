@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     core::{
@@ -329,7 +331,10 @@ pub async fn delete_fragment(
     Json(payload): Json<DeleteFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_user_mutations_allowed()?;
-    let stable_fragment_id = resolve_stable_fragment_id(&fragment).await?;
+    // Resolve aliases without requiring metadata that a previous partial
+    // deletion may already have removed. The JWT, master key and confirmation
+    // below still authorize only this exact stable fragment.
+    let stable_fragment_id = crate::core::index_store::stable_fragment_id_for_fragment(&fragment);
     validate_delete_fragment_request(
         &claims,
         &stable_fragment_id,
@@ -342,34 +347,14 @@ pub async fn delete_fragment(
     let index_roots = path_manager.get_all_index_roots();
     let blob_roots = path_manager.get_blob_roots();
     let stable_owned = stable_fragment_id.clone();
+    let lifecycle_guard = crate::core::fragment_lifecycle::acquire(&stable_owned).await?;
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // Keep exclusion in the worker even if the HTTP request is cancelled.
+        let _lifecycle_guard = lifecycle_guard;
         global_namespace_runtime().evict_fragment(&stable_owned);
 
-        for root in index_roots.iter() {
-            let fragment_path = fragment_root_on(root, &stable_owned);
-            if fragment_path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&fragment_path) {
-                    warn!("Failed to delete fragment index {:?}: {}", fragment_path, e);
-                }
-            }
-            remove_fragment_aliases_for_stable_id(root, &stable_owned);
-        }
-
-        for root in blob_roots.iter() {
-            let fragment_path = fragment_root_on(root, &stable_owned);
-            if fragment_path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&fragment_path) {
-                    warn!(
-                        "Failed to delete fragment blob dir {:?}: {}",
-                        fragment_path, e
-                    );
-                }
-            }
-            remove_fragment_aliases_for_stable_id(root, &stable_owned);
-        }
-
-        Ok(())
+        remove_fragment_storage(&stable_owned, index_roots.into_iter().chain(blob_roots))
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
@@ -390,6 +375,32 @@ pub async fn delete_fragment(
             "message": "Fragment deleted successfully"
         })),
     ))
+}
+
+fn remove_fragment_storage(
+    fragment: &str,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<(), AppError> {
+    let roots = roots.into_iter().collect::<BTreeSet<_>>();
+    for root in &roots {
+        let path = fragment_root_on(root, fragment);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => {
+                return Err(AppError::Io(
+                    e,
+                    format!("delete fragment {}", path.display()),
+                ));
+            }
+        }
+    }
+    // Keep aliases on failure so an authorized caller can retry. Never announce
+    // deletion until every distinct member and its aliases have been removed.
+    for root in &roots {
+        remove_fragment_aliases_for_stable_id(root, fragment)?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -435,6 +446,43 @@ pub async fn verify_fragment_existence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_fragment_removal_preserves_aliases_and_can_be_retried() {
+        let fragment = ulid::Ulid::new().to_string();
+        let base = std::env::temp_dir().join(format!("n1-delete-error-{fragment}"));
+        let roots = vec![base.join("a"), base.join("b")];
+        for root in &roots {
+            std::fs::create_dir_all(root.join(".fragment")).unwrap();
+            std::os::unix::fs::symlink(
+                format!("../@f_{fragment}"),
+                root.join(".fragment/public-alias"),
+            )
+            .unwrap();
+        }
+        let malformed = fragment_root_on(&roots[0], &fragment);
+        std::fs::write(&malformed, b"not a directory").unwrap();
+        let healthy = fragment_root_on(&roots[1], &fragment);
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::write(healthy.join("fixture"), b"payload").unwrap();
+        assert!(matches!(
+            remove_fragment_storage(&fragment, roots.clone()),
+            Err(AppError::Io(_, _))
+        ));
+        assert!(healthy.join("fixture").exists());
+        assert!(std::fs::symlink_metadata(roots[0].join(".fragment/public-alias")).is_ok());
+        std::fs::remove_file(malformed).unwrap();
+        // Missing members and duplicate index/blob roots are valid on retry.
+        remove_fragment_storage(
+            &fragment,
+            roots.iter().cloned().chain(roots.iter().cloned()),
+        )
+        .unwrap();
+        assert!(!healthy.exists());
+        assert!(std::fs::symlink_metadata(roots[0].join(".fragment/public-alias")).is_err());
+        remove_fragment_storage(&fragment, roots).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     fn claims(fragment: &str, delete: bool, modify: bool) -> Claims {
         Claims {

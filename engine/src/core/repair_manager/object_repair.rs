@@ -145,6 +145,32 @@ async fn replicate_bytes_strict(
     Ok((missing, divergent))
 }
 
+pub(super) async fn fragment_is_present(
+    roots: &[PathBuf],
+    fragment: &str,
+) -> Result<bool, AppError> {
+    for root in roots {
+        let path = fragment_root_on(root, fragment);
+        match fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_dir() => return Ok(true),
+            Ok(_) => {
+                return Err(AppError::Conflict(format!(
+                    "fragment root is not a directory: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Io(
+                    error,
+                    format!("inspect fragment lifecycle {}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(super) async fn repair_fragment_metadata_replicas(
     index_roots: &[PathBuf],
     fragment: &str,

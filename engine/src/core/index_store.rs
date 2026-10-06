@@ -338,6 +338,10 @@ pub(crate) fn reconcile_fragment_alias_replicas(
     };
 
     for (stable_fragment_id, aliases) in aliases_by_stable {
+        // Discovery is a snapshot. Recheck physical identity under the same
+        // per-fragment exclusion used by DELETE before recreating any alias.
+        let _lifecycle_guard =
+            crate::core::fragment_lifecycle::acquire_shared_blocking(&stable_fragment_id)?;
         if aliases.len() != 1 {
             report.ambiguous_fragments = report.ambiguous_fragments.saturating_add(1);
             continue;

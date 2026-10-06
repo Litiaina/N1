@@ -111,19 +111,36 @@ pub fn list_fragment_aliases(root: &Path) -> Vec<String> {
     out
 }
 
-pub fn remove_fragment_aliases_for_stable_id(root: &Path, stable_fragment_id: &str) {
+pub fn remove_fragment_aliases_for_stable_id(
+    root: &Path,
+    stable_fragment_id: &str,
+) -> Result<(), AppError> {
     let alias_dir = fragment_alias_dir(root);
-    let Ok(entries) = fs::read_dir(alias_dir) else {
-        return;
+    let entries = match fs::read_dir(&alias_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::Io(e, format!("read {}", alias_dir.display()))),
     };
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-            continue;
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::Io(e, "read fragment alias entry".into()))?;
+        let target = match fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidInput) => continue,
+            Err(e) => return Err(AppError::Io(e, "read fragment alias target".into())),
         };
-        if fragment_alias_target_stable_id(root, &name).as_deref() == Some(stable_fragment_id) {
-            let _ = fs::remove_file(entry.path());
+        let target_id = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(physical_fragment_id_from_dir_name);
+        if target_id.as_deref() == Some(stable_fragment_id) {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => (),
+                Err(e) if e.kind() == ErrorKind::NotFound => (),
+                Err(e) => return Err(AppError::Io(e, "remove fragment alias".into())),
+            }
         }
     }
+    Ok(())
 }
 
 pub async fn ensure_fragment_identity_on_root(

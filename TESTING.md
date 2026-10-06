@@ -5,7 +5,67 @@ dated evidence, not guarantees for every server. Older versions' passes do not
 certify the current namespace/pool design. Personal test paths and credentials
 are intentionally omitted.
 
-## Current candidate — October 6, 2026
+## Upload/deletion hardening — October 6, 2026
+
+Tested engine SHA-256:
+7fedadeb07086ba965c8ceeb68099a16d9f54fbf2674e29c00dd20af542851f1.
+Initial validation used new isolated four-member storage. The subsequent
+live rollout is recorded below.
+
+| Gate | Result |
+| --- | --- |
+| Serial workspace/all-target tests | PASS: 248 engine, 2 native, 6 proof-runner, 10 shell, 7 CLI; 273 total |
+| Upload tests selected independently | PASS: all 12; the previous isolated run failed because storage settings were uninitialized |
+| All-target check, warnings-denied engine compilation, formatting/whitespace | PASS |
+| Four-member 3+1 verification, 11m 45s | PASS: 25 checks covering deletion errors/retry, stale HTTP/native uploads, upload/delete/disconnect overlap, restart readback, recover-on-read, autonomous shard/NCX healing and fail-safe retry |
+| Interrupted rename/move/trash/recover | PASS: 128 objects per operation remained reachable and hash-correct; retry completed; ordinary mutations left immutable files unchanged |
+| Batch contracts | PASS: mixed results, empty/oversize fields, 32 same-key versions/max ULID, disconnect, explicit strict readback and 4,096/4,097-field boundary |
+| Real LAN uploads | PASS: 24 trials, two repeats, 16 KiB/1 MiB objects, one-shot/batch and up to four clients; all 1,792 uploads hash-verified |
+
+LAN measurements used direct certificate-verified HTTPS with keep-alive, no
+SSH tunnel or Accel. Readback was outside the upload timer. Engine peak RSS
+was **60.2 MiB**, versus **267.1 MiB** in the earlier equivalent LAN workload.
+Peak/end file descriptors were 55/15. The complete fault-test cgroup peaked at
+1.31 GiB, accounting for the harness and kernel memory as well as the engine;
+that is not engine RSS or an uninterrupted-process memory-soak result.
+
+| 1 MiB batch workload | Earlier throughput | Candidate throughput |
+| --- | ---: | ---: |
+| One client, concurrency 8, 32 objects | 6.45–15.15 MiB/s | 6.08–19.48 MiB/s |
+| One client, concurrency 32, 32 objects | 6.13–7.64 MiB/s | 6.02–11.60 MiB/s |
+| One client, concurrency 128, 128 objects | 5.09–5.25 MiB/s | 5.61–6.32 MiB/s |
+| Four clients, concurrency 32 each, 128 total | 4.41–5.96 MiB/s | 5.45–10.30 MiB/s |
+
+The 32-object/concurrency-8 batch took 1.64–5.26 s for the complete request,
+not per object. Results are mixed: the 16 KiB/concurrency-128 case decreased
+from 0.228–0.360 to 0.086–0.200 MiB/s, and sequential 1 MiB one-shot decreased
+from 1.97–3.50 to 1.33–2.71 MiB/s. Shared HDD/OS state and non-interleaved runs
+limit causal comparison; parallel publication and lower buffering do not
+establish a universal speedup. A prior instrumented trace attributed about
+97% of its upload interval to sync calls; it was not a LAN baseline.
+
+These are bounded process-crash and readback tests, not physical power cuts or
+a new long soak. During those tests, the live engine, Console, Accel and user
+data were unchanged.
+
+### Main-server rollout — October 6, 2026, 22:47 Manila
+
+The tested engine above and its rebuilt matching backup helper are now live.
+Previous binaries were retained for rollback. Startup was write-safe on all
+four independent 3+1 members, with no warning-or-higher startup journal entries.
+Before/after and post-smoke checks preserved 269 live objects, their namespace
+snapshots, 3,708 immutable file paths/stats, 1,192 NDX hashes and three
+version-pinned readback samples. Configuration, credentials and TLS hashes
+were unchanged; existing backups were not modified.
+
+The nine-object live smoke passed one-shot/eight-object batch upload, single
+and eight-key prefix rename/move/trash/recover, exact-version readback and
+immutable-file hashes. Its fragment was removed; a stale upload returned 404
+without recreating it. Console returned verified HTTPS 200, and its nginx
+process and Accel process were unchanged. This is deployment verification,
+not a new LAN benchmark, full payload inventory hash or backup/restore drill.
+
+## Deployed copy/delete candidate — October 6, 2026
 
 Tested engine SHA-256:
 4ff20f6bba63b1c6837d44835f4b81813895191830cc2e3d864201a7454720f0.
@@ -105,6 +165,29 @@ unchanged. This proves a process-crash case, not power-cut/cache-loss durability
 
 ### Failures and corrections
 
+- Oct 6: deeper upload checks reproduced two implementation bugs: fragment
+  deletion returned success despite a permission failure, and an unexpired
+  upload token recreated a deleted fragment. Error propagation/retry aliases
+  and shared upload admission corrected both; the isolated hardware rerun
+  above passed. Batch previously buffered before I/O admission and forced
+  batched durability; admission now precedes buffering and durability follows
+  the existing one-shot configuration/options. Flush requirements were not
+  removed. The old real-directory batch proof fixture was replaced with an
+  oversize-field rejection check, and readback was removed from ingest timing.
+- Oct 6: the requested eight-hour soak failed after 6m 43s, with 18 checks
+  completed. Automatic healing raced whole-fragment deletion and tried to
+  publish a fragment descriptor into a removed directory, triggering the
+  read-only fail-safe. Final baseline validation never ran; this is not a
+  passed soak. The fix adds per-fragment repair/delete exclusion and stale-scan
+  revalidation, without changing ordinary NCX mutations. All 270 warnings-denied
+  serial workspace tests passed, including four new lifecycle regressions.
+  The corrected release build passed 31 hardware check executions in 7m 34s,
+  including six concurrent fragment-deletion rounds during healing and final
+  baseline hash validation. The fresh one-hour run completed in 59m 26s with
+  103 check executions, two fault cycles, 43,093 API requests and 132 fragment
+  deletions during healing. Final baseline hashes passed. Intentional process
+  restarts were part of that run; it was not an uninterrupted-PID memory soak.
+  The live service was unchanged.
 - Oct 6: initial matched latency regressed; repeat still had large outliers.
   The first handoff also failed because the candidate binary was absent; rerun
   began only after both builds were available. The failed handoff is not a pass.

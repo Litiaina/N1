@@ -926,7 +926,12 @@ pub async fn run_server() {
         tracing::error!("N1 storage pool enrollment failed: {error}");
         std::process::exit(1);
     }
-    if let Err(error) = crate::core::index_store::enroll_fragment_control_roots() {
+    let fragment_enrollment =
+        tokio::task::spawn_blocking(crate::core::index_store::enroll_fragment_control_roots)
+            .await
+            .map_err(|error| format!("fragment enrollment worker failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+    if let Err(error) = fragment_enrollment {
         tracing::error!("N1 storage pool fragment enrollment failed: {error}");
         std::process::exit(1);
     }

@@ -20,11 +20,25 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
   bounded workers and durable upload publication.
 - Updated setup, backup, repair, exports and proof tooling for pool/flat storage.
 - No automatic migration or compatibility with earlier development formats.
+- Fixed automatic healing racing whole-fragment deletion: per-fragment
+  exclusion and existence revalidation prevent false read-only faults and
+  recreation of deleted fragments. Ordinary NCX mutations are unchanged.
+- Whole-fragment deletion now reports storage errors and retains aliases for
+  retry. Shared upload/repair admission rejects stale uploads after deletion
+  without serializing concurrent object uploads.
+- Upload NCX replica publication uses the existing bounded parallel holder
+  helper. Batch acquires I/O admission before buffering, caps requests at
+  4,096 objects, and follows one-shot durability configuration/options.
+- Replaced the obsolete real-directory batch proof fixture and made filtered
+  upload unit tests initialize their own storage settings.
 
 The October 6 copy/delete candidate passed testing and was subsequently deployed
 to the main server with its matching backup helper. Objects and configuration
 were preserved; Console and Accel were unchanged. Performance results include
 both regressions and improvements; deployment does not declare LTS readiness.
+The subsequent upload/deletion hardening above passed isolated validation and
+was later deployed with its matching backup helper. Live storage-preservation,
+batch/mutation smoke and stale-upload rejection checks passed.
 
 ## 3.5.1 — historical
 

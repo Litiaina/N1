@@ -375,9 +375,9 @@ pub fn publish(
         }
         let exact = holders(&existing, fragment, key)?;
         check_holders(&exact)?;
-        for root in exact {
-            write(&root, &path(&root, fragment, key), &existing, false)?;
-        }
+        on_holders(&exact, |root| {
+            write(root, &path(root, fragment, key), &existing, false)
+        })?;
         return Ok(existing);
     }
     let pool_id = pool.map(|pool| pool.id.clone()).unwrap_or_default();
@@ -388,9 +388,9 @@ pub fn publish(
     };
     let exact = holders(&pointer, fragment, key)?;
     check_holders(&exact)?;
-    for root in exact {
-        write(&root, &path(&root, fragment, key), &pointer, true)?;
-    }
+    on_holders(&exact, |root| {
+        write(root, &path(root, fragment, key), &pointer, true)
+    })?;
     Ok(pointer)
 }
 

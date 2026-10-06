@@ -62,7 +62,9 @@ impl Proof {
 
         let mut request_elapsed_ms = Vec::with_capacity(clients);
         let mut verified_samples = Vec::new();
-        for result in join_all(requests).await {
+        let outcomes = join_all(requests).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        for result in outcomes {
             let (keys, samples, elapsed_ms) = result?;
             request_elapsed_ms.push(elapsed_ms);
             expected.extend(keys);
@@ -72,7 +74,6 @@ impl Proof {
             }
         }
 
-        let elapsed = started.elapsed().as_secs_f64();
         let object_count = clients * OBJECTS_PER_CLIENT;
         Ok(json!({
             "status": "PASS",
@@ -96,12 +97,7 @@ impl Proof {
         const OBJECT_SIZE: usize = 8 * 1024;
 
         let base = format!("{}standard-batch", self.args.prefix);
-        let conflict_key = format!("{base}/directory-conflict");
-        self.posix_post(
-            "/noa/v1/posix/mkdir",
-            json!({"path": &conflict_key}),
-        )
-        .await?;
+        let oversize_key = format!("{base}/too-large.bin");
 
         let mut form = reqwest::multipart::Form::new();
         let mut samples = Vec::<(String, String)>::new();
@@ -121,8 +117,8 @@ impl Proof {
 
         form = form.part(
             "object",
-            reqwest::multipart::Part::bytes(b"must-conflict".to_vec())
-                .file_name(encode_query_value(&conflict_key))
+            reqwest::multipart::Part::bytes(vec![0; 1024 * 1024 + 1])
+                .file_name(encode_query_value(&oversize_key))
                 .mime_str("application/octet-stream")?,
         );
 
@@ -140,6 +136,7 @@ impl Proof {
             .await?;
         let status = response.status();
         let body: Value = response.json().await?;
+        let elapsed = start.elapsed().as_secs_f64();
         if status != StatusCode::MULTI_STATUS {
             return Err(format!(
                 "standard batch expected 207 for mixed results, got {status}: {body}"
@@ -166,18 +163,18 @@ impl Proof {
             .into());
         }
 
-        let conflict = body
+        let oversize = body
             .get("results")
             .and_then(Value::as_array)
             .and_then(|results| {
                 results.iter().find(|entry| {
                     entry.get("object_key").and_then(Value::as_str)
-                        == Some(conflict_key.as_str())
+                        == Some(oversize_key.as_str())
                 })
             })
-            .ok_or("standard batch response omitted conflict result")?;
-        if conflict.get("status").and_then(Value::as_u64) != Some(409) {
-            return Err(format!("standard batch conflict was not isolated as 409: {conflict}").into());
+            .ok_or("standard batch response omitted oversize result")?;
+        if oversize.get("status").and_then(Value::as_u64) != Some(413) {
+            return Err(format!("standard batch oversize entry was not isolated as 413: {oversize}").into());
         }
 
         for key in batch_keys {
@@ -190,7 +187,6 @@ impl Proof {
                 .await?;
         }
 
-        let elapsed = start.elapsed().as_secs_f64();
         Ok(json!({
             "status": "PASS",
             "objects": OBJECT_COUNT,
@@ -200,7 +196,7 @@ impl Proof {
             "elapsed_s": round3(elapsed),
             "objects_per_s": round3(OBJECT_COUNT as f64 / elapsed.max(0.001)),
             "mib_s": round3(((OBJECT_COUNT * OBJECT_SIZE) as f64 / 1024.0 / 1024.0) / elapsed.max(0.001)),
-            "mixed_result_isolation": "256 created plus one deterministic directory conflict",
+            "mixed_result_isolation": "256 created plus one oversize entry rejected as 413",
             "verified_samples": samples.iter().map(|(key, sha256)| json!({
                 "object_key": key,
                 "sha256": sha256,

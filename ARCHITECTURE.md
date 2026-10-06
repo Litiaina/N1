@@ -109,6 +109,19 @@ the recorded parity tolerance, but missing members do not authorize silently
 rebinding or rewriting an enrolled pool. Repair uses the object's original
 geometry; a newer pool is not an automatic repair/rebalance destination.
 
+Whole-fragment deletion takes exclusive per-fragment admission. Uploads and
+repair share admission, so different uploads still run concurrently. Each
+rechecks on-disk existence after admission; stale tokens or repair snapshots
+cannot recreate a deleted fragment. Started HTTP upload workers retain admission
+through publication/cleanup even after disconnect. Deletion errors propagate
+and aliases remain available for retry until all members are removed.
+Ordinary object/NCX mutations do not acquire this guard.
+
+Upload NCX holders publish in parallel with bounded fanout and all workers
+joined before success. Batch buffering takes the existing shared I/O permit
+before allocating each object body; request concurrency is not extra capacity.
+Batch result memory is bounded by a 4,096-object request limit.
+
 GC/TTL removes expired trash and safely unreferenced immutable versions.
 Active uploads, overlapping scans and retained exports must remain protected;
 uncertain authority causes preservation/reporting, not guessed deletion.

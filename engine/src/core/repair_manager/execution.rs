@@ -1,8 +1,8 @@
 //! Repair-job traversal, batching, pacing, and status orchestration.
 
 use super::object_repair::{
-    list_all_fragments, process_object_repair, reachable_dir_roots, repair_fragment_index_db,
-    repair_fragment_metadata_replicas,
+    fragment_is_present, list_all_fragments, process_object_repair, reachable_dir_roots,
+    repair_fragment_index_db, repair_fragment_metadata_replicas,
 };
 use super::*;
 
@@ -201,6 +201,14 @@ async fn run_repair_job_inner(
             break;
         }
         io_guard.heartbeat();
+
+        let _lifecycle_guard =
+            crate::core::fragment_lifecycle::acquire_shared(&fragment_hash).await?;
+        // A fragment can be deleted after enumeration but before this turn.
+        // Do not rebuild a deleted fragment from a stale scan snapshot.
+        if !fragment_is_present(&index_roots, &fragment_hash).await? {
+            continue;
+        }
 
         {
             let mut status = REPAIR_STATUS.write().await;

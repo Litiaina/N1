@@ -752,8 +752,10 @@ Content-Type: multipart/form-data
 Each file field must be named `object`, and its multipart filename must be the
 percent-encoded object key. Each object is limited to one MiB; use ordinary
 one-shot or multipart for larger files.
-The server consumes the multipart body incrementally and bounds in-flight
-memory. `concurrency` is optional and clamped to the engine safety limit.
+Requests accept at most 4,096 fields. The server consumes the multipart body
+incrementally and acquires the existing shared I/O permit before buffering
+each object. `concurrency` is optional, clamped to 1–128, and does not override
+global or per-fragment I/O admission.
 
 ```bash
 curl --fail-with-body "$BASE/noa/v1/upload/batch?concurrency=32" \
@@ -766,6 +768,10 @@ All-success responses use `201 Created`. A mixed batch uses `207 Multi-Status`
 and reports `status`, `version_id`, `size_bytes`, and any error separately for
 each object. Batch upload is standard-only: it creates no durable session,
 manifest, binding, or receipt and cannot resume after process restart.
+It accepts the same `durability=strict|batched` and `strict_durability` options
+as one-shot upload, falling back to the configured upload default. Strict
+durability and restart-resumable multipart are different features. A disconnect
+may leave complete, unacknowledged objects; list or retry to reconcile.
 
 N1 performs no synchronous free-space scan before one-shot, batch, standard
 multipart, or durable multipart writes. Actual writes to the selected K+P

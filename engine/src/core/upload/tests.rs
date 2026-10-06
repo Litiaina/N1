@@ -27,6 +27,12 @@ fn direct_writer_with_failed_task(errno: i32) -> DirectWriter {
 }
 
 fn standard_test_session(part_count: usize) -> StandardUploadSession {
+    // These tests must also work when selected alone, before other modules
+    // initialize the process-wide storage settings.
+    let base = std::env::temp_dir().join(format!("n1-upload-tests-{}", std::process::id()));
+    INDEX_STORE_DISKS.get_or_init(|| vec![base.join("index").display().to_string()]);
+    crate::core::disk_manager::BLOB_STORE_DISKS
+        .get_or_init(|| vec![base.join("blob").display().to_string()]);
     StandardUploadSession {
         manifest: UploadSessionManifest {
             fragment: "01KFRAGMENT".to_string(),

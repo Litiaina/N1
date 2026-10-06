@@ -38,7 +38,7 @@ use crate::core::storage_capacity_parser::{
 };
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
-    acquire_upload_io_guard_for_query, cancel_standard_upload_direct,
+    AdaptiveIoGuard, acquire_upload_io_guard_for_query, cancel_standard_upload_direct,
     cancel_upload_session as durable_cancel_upload_session_impl, complete_standard_upload,
     finalize_object_upload_direct as durable_finalize_object_upload_direct,
     finalize_standard_upload_direct, find_reusable_standard_upload,
@@ -69,12 +69,12 @@ use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager}
 use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderName, Method, StatusCode};
-use axum::middleware::from_fn;
+use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{
     Json as AxumJson, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
 };
 use bytes::{Bytes, BytesMut};
 use percent_encoding::percent_decode_str;
@@ -1138,13 +1138,40 @@ async fn upload_object_one_shot_scoped(
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
 
+async fn guard_upload_lifecycle(
+    claims: Claims,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    if request.method() == Method::GET
+        || !request.uri().path().starts_with("/noa/v1/upload/")
+        || request.uri().path() == "/noa/v1/upload/batch"
+    {
+        return Ok(next.run(request).await);
+    }
+    let lifecycle = crate::core::fragment_lifecycle::acquire_live(&claims.fragment).await?;
+    // Disk workers cannot be cancelled once started. Keep their shared
+    // admission until the whole request's publication/cleanup has finished.
+    tokio::spawn(async move {
+        let _lifecycle = lifecycle;
+        next.run(request).await
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("upload task failed: {e}")))
+}
+
 const STANDARD_BATCH_OBJECT_MAX_BYTES: usize = 1024 * 1024;
 const STANDARD_BATCH_MAX_CONCURRENCY: usize = 128;
+const STANDARD_BATCH_MAX_OBJECTS: usize = 4096;
 
 #[derive(Debug, Deserialize)]
 struct StandardBatchUploadQuery {
     #[serde(default)]
     concurrency: Option<usize>,
+    #[serde(default)]
+    durability: Option<String>,
+    #[serde(default)]
+    strict_durability: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1226,25 +1253,20 @@ async fn upload_standard_batch_object(
     logical_path: String,
     content_type: String,
     bytes: bytes::Bytes,
+    io_guard: Option<AdaptiveIoGuard>,
+    query: crate::core::disk_manager::UploadPartQuery,
 ) -> StandardBatchUploadEntryResult {
     let size_bytes = bytes.len() as u64;
-    let operation = async {
+    let result_key = logical_path.clone();
+    // Keep already-admitted small-object work alive through publication even
+    // if the multipart request disconnects and drops its JoinSet.
+    let operation = tokio::spawn(async move {
         let fragment = claims.fragment.clone();
-        let gate_context = format!("standard-batch fragment={fragment}, object={logical_path}");
-        let io_guard =
-            acquire_upload_io_guard_for_query(Some(true), &fragment, &gate_context).await?;
+        let _lifecycle = crate::core::fragment_lifecycle::acquire_live(&fragment).await?;
+        let strict_durability = upload_uses_strict_durability(&query);
         let physical = resolve_logical_write_key(&fragment, &logical_path).await?;
         let _upload_activity =
             crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
-        let query = crate::core::disk_manager::UploadPartQuery {
-            checksum: None,
-            durability: Some("batched".to_string()),
-            strict_durability: Some(false),
-            // The outer batch guard spans the EC write, NCDX publication, and
-            // logical namespace commit, so the inner one-shot path must not
-            // acquire a second permit.
-            io_gate: Some(false),
-        };
         let mut metadata = upload_object_one_shot_body_direct(
             claims,
             fragment.clone(),
@@ -1261,7 +1283,7 @@ async fn upload_standard_batch_object(
             &logical_path,
             &physical,
             &metadata,
-            false,
+            strict_durability,
         )
         .await?;
         metadata.object_key = logical_path.clone();
@@ -1276,12 +1298,17 @@ async fn upload_standard_batch_object(
             guard.complete();
         }
         Ok::<_, AppError>(metadata)
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(AppError::InternalServerError(format!(
+            "batch upload task: {e}"
+        )))
+    });
 
     match operation {
         Ok(metadata) => StandardBatchUploadEntryResult {
-            object_key: logical_path,
+            object_key: result_key,
             status: StatusCode::CREATED.as_u16(),
             version_id: Some(metadata.version_id),
             size_bytes: Some(size_bytes),
@@ -1290,7 +1317,7 @@ async fn upload_standard_batch_object(
         Err(error) => {
             let status = batch_error_status(&error);
             StandardBatchUploadEntryResult {
-                object_key: logical_path,
+                object_key: result_key,
                 status: status.as_u16(),
                 version_id: None,
                 size_bytes: Some(size_bytes),
@@ -1342,6 +1369,13 @@ async fn upload_standard_batch_scoped(
     let mut workers = JoinSet::new();
     let mut results = Vec::<IndexedStandardBatchUploadResult>::new();
     let mut requested = 0usize;
+    let upload_query = crate::core::disk_manager::UploadPartQuery {
+        checksum: None,
+        durability: query.durability,
+        strict_durability: query.strict_durability,
+        // The parser's permit spans buffering, EC/NDX and NCX publication.
+        io_gate: Some(false),
+    };
 
     while let Some(mut field) = multipart
         .next_field()
@@ -1349,6 +1383,11 @@ async fn upload_standard_batch_scoped(
         .map_err(|error| AppError::Multipart(error.to_string()))?
     {
         let index = requested;
+        if index >= STANDARD_BATCH_MAX_OBJECTS {
+            return Err(AppError::BadRequest(format!(
+                "Standard batch requests are limited to {STANDARD_BATCH_MAX_OBJECTS} objects"
+            )));
+        }
         requested = requested.saturating_add(1);
         let logical_path = match decode_standard_batch_object_key(field.name(), field.file_name()) {
             Ok(path) => path,
@@ -1370,6 +1409,17 @@ async fn upload_standard_batch_scoped(
             .content_type()
             .map(ToString::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
+        while workers.len() >= concurrency {
+            collect_standard_batch_result(&mut workers, &mut results).await;
+        }
+        // Admit before allocating a body. All batch clients share the existing
+        // I/O limit; concurrency=128 must not buffer 128 waiting 1MiB objects.
+        let context = format!(
+            "standard-batch fragment={}, object={logical_path}",
+            claims.fragment
+        );
+        let io_guard =
+            acquire_upload_io_guard_for_query(Some(true), &claims.fragment, &context).await?;
         let mut body = BytesMut::new();
         let mut too_large = false;
         while let Some(chunk) = field
@@ -1402,11 +1452,9 @@ async fn upload_standard_batch_scoped(
             continue;
         }
 
-        while workers.len() >= concurrency {
-            collect_standard_batch_result(&mut workers, &mut results).await;
-        }
         let task_state = Arc::clone(&state);
         let task_claims = claims.clone();
+        let query = upload_query.clone();
         workers.spawn(async move {
             IndexedStandardBatchUploadResult {
                 index,
@@ -1416,6 +1464,8 @@ async fn upload_standard_batch_scoped(
                     logical_path,
                     content_type,
                     body.freeze(),
+                    io_guard,
+                    query,
                 )
                 .await,
             }
@@ -1880,6 +1930,7 @@ pub fn build_storage_routes_unbound_with_options(
 
         let write_ops = layers
             .layer_upload(write_ops)
+            .layer(from_fn(guard_upload_lifecycle))
             .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         let protected_routes = Router::new()
