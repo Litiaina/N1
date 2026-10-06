@@ -1,23 +1,54 @@
 // Pause a real HTTP one-shot body while both cleanup paths run.
 
 impl Proof {
+    fn gc_fixture_versions(&self) -> ProofResult<BTreeSet<PathBuf>> {
+        let mut versions = BTreeSet::new();
+        for root in &self.blob_roots {
+            let mut stack =
+                vec![physical_fragment_root(root, &self.stable_fragment_id).join(".objects")];
+            while let Some(dir) = stack.pop() {
+                if !dir.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(dir)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|n| n.to_string_lossy().starts_with("@o_"))
+                    {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.len() == 26 && name.bytes().all(|c| c.is_ascii_alphanumeric()) {
+                            versions.insert(path);
+                        }
+                    } else {
+                        stack.push(path);
+                    }
+                }
+            }
+        }
+        Ok(versions)
+    }
+
     async fn paused_upload_gc_proof(
         &self,
         expire_existing: bool,
     ) -> ProofResult<(String, String, Value)> {
-        // A flat 64-hex key intentionally has the same logical/physical ID.
+        // Logical keys and immutable physical identities are separate in v4.
         let key =
             sha256_bytes(format!("paused-upload-{}-{expire_existing}", self.stamp).as_bytes());
-        let previous = if expire_existing {
-            Some(
-                self.upload_bytes(&key, b"previous committed object".to_vec(), "text/plain")
-                    .await?,
-            )
-        } else {
-            None
-        };
+        if expire_existing {
+            self.upload_bytes(&key, b"previous committed object".to_vec(), "text/plain")
+                .await?;
+        }
         let payload = deterministic_payload(128 * 1024, b"paused-http-one-shot");
         let digest = sha256_bytes(&payload);
+        let before = self.gc_fixture_versions()?;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
         tx.send(Ok(payload[..64 * 1024].to_vec())).await?;
         let stream = futures_util::stream::unfold(rx, |mut rx| async move {
@@ -33,19 +64,9 @@ impl Proof {
         let deadline = Instant::now() + Duration::from_secs(15);
         let versions = loop {
             let mut versions = Vec::new();
-            for root in &self.blob_roots {
-                let dir = self.gc_fixture_dir(root, &key);
-                if !dir.is_dir() {
-                    continue;
-                }
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    if entry.file_type()?.is_dir()
-                        && previous.as_deref() != entry.file_name().to_str()
-                        && fs::read_dir(entry.path())?.next().is_some()
-                    {
-                        versions.push(entry.path());
-                    }
+            for path in self.gc_fixture_versions()?.difference(&before) {
+                if fs::read_dir(path)?.next().is_some() {
+                    versions.push(path.clone());
                 }
             }
             if versions.len() == usize::from(self.data_shards + self.parity_shards) {

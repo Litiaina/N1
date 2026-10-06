@@ -12,9 +12,14 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("key_path", "");
 
     conf.with_section(Some("disk_config"))
-        .set("index_store_disks", "")
-        .set("blob_store_disks", "")
         .set("fs_storage_path", "");
+
+    conf.with_section(Some("storage_pool.A"))
+        .set("generation", "1")
+        .set("roots", "")
+        .set("data_shards", "3")
+        .set("parity_shards", "1")
+        .set("sealed", "false");
 
     conf.with_section(Some("index_config"))
         .set("partition_count", "64");
@@ -81,8 +86,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("monitor_interval_seconds", "auto")
         .set("monitor_deep_scan_interval_seconds", "auto")
         .set("max_part_size", "52428800")
-        .set("data_shards", "1")
-        .set("parity_shards", "0")
         .set("stripe_block_size", "262144");
 
     conf.with_section(Some("io_control"))

@@ -298,13 +298,18 @@ fn four_disk_assignment_and_ec_validation_is_deterministic() {
             .0
             .success
         );
-        assert!(
-            execute(&shell, &format!("disk assign {label} both"), None)
-                .0
-                .success
-        );
     }
-    assert!(execute(&shell, "config ec 3 1", None).0.success);
+    let roots = (1..=4)
+        .map(|i| {
+            settings
+                .mount_path(&format!("NDISK{i:03}"))
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let (configured, output) = execute(&shell, &format!("config pool A 3 1 {roots}"), None);
+    assert!(configured.success, "{}", output.join("\n"));
     let mut config = shell.load_or_create_config().unwrap();
     let control = settings.install_dir.join("fs-storage-path");
     fs::create_dir_all(&control).unwrap();
@@ -332,7 +337,7 @@ fn four_disk_assignment_and_ec_validation_is_deterministic() {
     shell.write_config(&config).unwrap();
     let (validated, output) = execute(&shell, "config validate", None);
     assert!(validated.success, "{}", output.join("\n"));
-    assert!(output.join("\n").contains("EC: 3 + 1"));
+    assert!(output.join("\n").contains("1 storage pools"));
     let (started, output) = execute(&shell, "n1 start", None);
     assert!(started.success, "{}", output.join("\n"));
     let unit = fs::read_to_string(settings.unit_path()).unwrap();
@@ -347,7 +352,7 @@ fn four_disk_assignment_and_ec_validation_is_deterministic() {
             "missing NDISK{index:03} in {requires_mounts}"
         );
     }
-    let (rejected, output) = execute(&shell, "config ec 2 1", None);
+    let (rejected, output) = execute(&shell, &format!("config pool B 3 1 {roots}"), None);
     assert!(!rejected.success);
     assert!(output.join("\n").contains("stop N1"));
     let _ = fs::remove_dir_all(root);

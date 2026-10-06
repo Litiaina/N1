@@ -45,6 +45,13 @@ fn remap_part(part: &mut PartMetadata, source: &[Root], target: &[Root]) -> Resu
 
 pub fn remap(relative: &str, bytes: Vec<u8>, source: &[Root], target: &[Root]) -> Result<Vec<u8>> {
     let path = PathBuf::from(relative);
+    if relative == ".n1-pool.json" {
+        let mut pool: crate::core::storage_pool::StoragePool = serde_json::from_slice(&bytes)?;
+        for root in &mut pool.roots {
+            *root = PathBuf::from(remap_path(&root.to_string_lossy(), source, target)?);
+        }
+        return Ok(serde_json::to_vec(&pool)?);
+    }
     if path.extension().is_none_or(|ext| ext != "ndx") {
         return Ok(bytes);
     }
@@ -79,6 +86,9 @@ pub fn remap(relative: &str, bytes: Vec<u8>, source: &[Root], target: &[Root]) -
 }
 
 pub fn requires_remap(relative: &str) -> bool {
+    if relative == ".n1-pool.json" {
+        return true;
+    }
     let path = Path::new(relative);
     if path.extension().is_none_or(|ext| ext != "ndx") {
         return false;

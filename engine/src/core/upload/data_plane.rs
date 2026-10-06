@@ -247,11 +247,57 @@ pub(super) async fn read_manifest_any(
 }
 
 pub(super) fn configured_data_shards() -> usize {
-    DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize
+    if let Ok(pool) = crate::core::storage_pool::write_pool() {
+        return usize::from(pool.data_shards);
+    }
+    DATA_SHARDS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed) as usize)
+        .unwrap_or(1)
+}
+
+pub(super) fn upload_layout(
+    fragment: &str,
+    object_id: &str,
+    version: &str,
+) -> Result<(usize, usize, Vec<String>), AppError> {
+    if !crate::core::storage_pool::configured().is_empty() {
+        let pool = crate::core::storage_pool::write_pool()?;
+        return Ok((
+            usize::from(pool.data_shards),
+            usize::from(pool.parity_shards),
+            pool.roots
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect(),
+        ));
+    }
+    let data = configured_data_shards();
+    let parity = configured_parity_shards();
+    let roots = ObjectPathManager::new().select_blob_roots_for_object(
+        fragment,
+        object_id,
+        version,
+        data + parity,
+    )?;
+    Ok((
+        data,
+        parity,
+        roots
+            .into_iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+    ))
 }
 
 pub(super) fn configured_parity_shards() -> usize {
-    PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize
+    if let Ok(pool) = crate::core::storage_pool::write_pool() {
+        return usize::from(pool.parity_shards);
+    }
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed) as usize)
+        .unwrap_or(0)
 }
 
 pub(super) fn manifest_data_shards(manifest: &UploadSessionManifest) -> usize {

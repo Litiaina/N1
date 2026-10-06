@@ -311,54 +311,6 @@ fn adaptive_stream_max_concurrency(
     core_cap.min(disk_cap).min(mem_cap).clamp(4, 256)
 }
 
-fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::with_capacity(paths.len());
-    for raw in paths {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let candidate = PathBuf::from(trimmed);
-        if !candidate.exists() {
-            std::fs::create_dir_all(&candidate).unwrap_or_else(|e| {
-                panic!("Failed to create {} directory '{}': {}", role, trimmed, e)
-            });
-        }
-
-        let meta = std::fs::symlink_metadata(&candidate)
-            .unwrap_or_else(|e| panic!("Failed to inspect {} path '{}': {}", role, trimmed, e));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileTypeExt;
-            let ft = meta.file_type();
-            if ft.is_block_device() || ft.is_char_device() {
-                panic!(
-                    "{} entry '{}' is a device. N1 requires mounted directory paths.",
-                    role, trimmed
-                );
-            }
-        }
-        if !meta.is_dir() {
-            panic!(
-                "{} entry '{}' is not a directory. N1 requires directory paths.",
-                role, trimmed
-            );
-        }
-
-        let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-        normalized.push(resolved.to_string_lossy().to_string());
-    }
-
-    if normalized.is_empty() {
-        panic!(
-            "At least one valid directory must be configured in {}",
-            role
-        );
-    }
-    normalized
-}
-
 #[cfg(unix)]
 fn detect_unique_storage_devices(paths: &[String]) -> usize {
     use std::os::unix::fs::MetadataExt;
@@ -576,26 +528,23 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     })?;
     probe_directory_writable(&refresh_store_root, "N1 refresh session store")?;
 
-    let index_store_str = disk_section
-        .and_then(|s| s.get("index_store_disks"))
-        .ok_or_else(|| "Missing index_store_disks in [disk_config]".to_string())?;
-    for root in index_store_str
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        ensure_existing_writable_dir(Path::new(root), "N1 index_store_disks entry")?;
-    }
-
-    let blob_store_str = disk_section
-        .and_then(|s| s.get("blob_store_disks"))
-        .ok_or_else(|| "Missing blob_store_disks in [disk_config]".to_string())?;
-    for root in blob_store_str
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        ensure_existing_writable_dir(Path::new(root), "N1 blob_store_disks entry")?;
+    let enrolled: Vec<crate::core::storage_pool::StoragePool> =
+        match stdfs::read(fs_storage_path.join(".n1/storage-pools.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("invalid storage pool catalog: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(format!("read storage pool catalog: {e}")),
+        };
+    for pool in crate::core::storage_pool::parse(config)? {
+        for root in pool.roots {
+            // A known member may be offline at restart. Never create its
+            // directory or enroll a replacement implicitly; identity checks
+            // keep it excluded and each pool enforces its read/write budget.
+            if enrolled.iter().any(|old| old.roots.contains(&root)) {
+                continue;
+            }
+            ensure_existing_writable_dir(&root, "N1 storage pool root")?;
+        }
     }
 
     Ok(())
@@ -773,39 +722,32 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let index_store_str = disk_section
-        .and_then(|s| s.get("index_store_disks"))
-        .expect("Missing index_store_disks in [disk_config]");
-
-    let index_disks: Vec<String> = index_store_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let index_disks = normalize_fs_backed_disk_paths("index_store_disks", index_disks);
-
+    let pools = crate::core::storage_pool::parse(&config).unwrap_or_else(|error| {
+        tracing::error!("Invalid N1 storage pools: {error}");
+        std::process::exit(1);
+    });
+    let blob_disks = pools
+        .iter()
+        .flat_map(|pool| pool.roots.iter())
+        .map(|root| root.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    // Both metadata and payload helpers address the same unified root set.
     INDEX_STORE_DISKS
-        .set(index_disks)
-        .expect("Double initialization of INDEX_STORE_DISKS!");
-
-    let blob_store_str = disk_section
-        .and_then(|s| s.get("blob_store_disks"))
-        .expect("Missing blob_store_disks in [disk_config]");
-
-    let blob_disks: Vec<String> = blob_store_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let blob_disks = normalize_fs_backed_disk_paths("blob_store_disks", blob_disks);
+        .set(blob_disks.clone())
+        .expect("storage roots initialized twice");
+    crate::core::storage_pool::STORAGE_POOLS
+        .set(pools)
+        .expect("storage pools initialized twice");
+    if let Err(error) = crate::core::storage_pool::validate_existing_catalog() {
+        tracing::error!("N1 immutable pool configuration rejected: {error}");
+        std::process::exit(1);
+    }
     let blob_disk_count = blob_disks.len();
     let blob_device_count = detect_unique_storage_devices(&blob_disks);
     let effective_blob_disks_for_auto = blob_device_count.min(blob_disk_count).max(1);
     if blob_device_count < blob_disk_count {
         tracing::warn!(
-            "blob_store_disks has {} configured path(s) but only {} unique physical device(s); auto tuning will use {} effective disk(s)",
+            "storage pools have {} configured member(s) but only {} available physical device(s); auto tuning will use {} effective device(s)",
             blob_disk_count,
             blob_device_count,
             effective_blob_disks_for_auto
@@ -823,6 +765,10 @@ pub async fn run_server() {
         .iter()
         .chain(BLOB_STORE_DISKS.get().unwrap())
         .map(PathBuf::from)
+        // Known enrolled members may be offline at cold start. Never create
+        // their missing directories; lease only available members. Offline
+        // backup still requires the complete configured set.
+        .filter(|root| root.is_dir())
         .collect::<Vec<_>>();
     let _instance_lease = crate::core::instance_lease::InstanceLease::engine(&instance_roots)
         .unwrap_or_else(|error| {
@@ -831,9 +777,7 @@ pub async fn run_server() {
             // not a programming panic or a reason to produce a core dump.
             std::process::exit(1);
         });
-    tracing::info!(
-        "Storage mode: N1 object storage system with namespace-only index roots and colocated object metadata/payload roots"
-    );
+    tracing::info!("Storage mode: N1 4 flat object namespace on independent unified storage pools");
 
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();
@@ -878,17 +822,11 @@ pub async fn run_server() {
     .normalized();
     configure_io_control(io_control_config).expect("Double initialization of N1 IO control");
 
-    let data_shards_value = upload_section
-        .and_then(|s| s.get("data_shards"))
-        .unwrap_or("1")
-        .parse::<usize>()
-        .expect("data_shards does not fit into usize");
-
-    let parity_shards_value = upload_section
-        .and_then(|s| s.get("parity_shards"))
-        .unwrap_or("0")
-        .parse::<usize>()
-        .expect("parity_shards does not fit into usize");
+    let newest_pool = crate::core::storage_pool::configured()
+        .last()
+        .expect("storage pool");
+    let data_shards_value = usize::from(newest_pool.data_shards);
+    let parity_shards_value = usize::from(newest_pool.parity_shards);
     let total_shards_value = data_shards_value.saturating_add(parity_shards_value).max(1);
 
     let stripe_block_size_value = upload_section
@@ -979,9 +917,18 @@ pub async fn run_server() {
     arm_topology_safety_gate();
     if let Err(error) = initialize_configured_root_identities() {
         tracing::error!(
-            "N1 root identity initialization failed; writes remain read-only: {}",
+            "N1 root identity initialization failed; refusing startup: {}",
             error
         );
+        std::process::exit(1);
+    }
+    if let Err(error) = crate::core::storage_pool::enroll() {
+        tracing::error!("N1 storage pool enrollment failed: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = crate::core::index_store::enroll_fragment_control_roots() {
+        tracing::error!("N1 storage pool fragment enrollment failed: {error}");
+        std::process::exit(1);
     }
 
     STRIPE_SIZE_ATOMIC

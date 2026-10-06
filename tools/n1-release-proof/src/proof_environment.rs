@@ -51,6 +51,9 @@ impl Proof {
         if self.args.multi_fragment_files_per_user == 0 {
             return Err("multi_fragment_files_per_user must be at least 1".into());
         }
+        if self.args.gc_workload_timeout_seconds == 0 {
+            return Err("gc_workload_timeout_seconds must be at least 1".into());
+        }
         if self.args.trash_retention_seconds < 5 {
             return Err(
                 "trash_retention_seconds must be at least 5 for deterministic recovery proofs"
@@ -110,16 +113,8 @@ impl Proof {
         let proof_root = format!("n1-release-proof-{}", self.stamp);
         for disk in self.disk_roots()? {
             let root = disk.join(&proof_root);
-            let index = if self.args.colocated_roots {
-                root.join("store")
-            } else {
-                root.join("index")
-            };
-            let blob = if self.args.colocated_roots {
-                index.clone()
-            } else {
-                root.join("blob")
-            };
+            let index = root.join("store");
+            let blob = index.clone();
             fs::create_dir_all(&index)?;
             fs::create_dir_all(&blob)?;
             self.index_roots.push(index);
@@ -155,13 +150,6 @@ impl Proof {
                 self.args.master_key, self.args.master_key, self.args.master_key
             ),
         )?;
-        let index_roots = self
-            .index_roots
-            .iter()
-            .take(self.active_disk_count)
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(",");
         let blob_roots = self
             .blob_roots
             .iter()
@@ -205,9 +193,14 @@ cert_path={}
 key_path={}
 
 [disk_config]
-index_store_disks={}
-blob_store_disks={}
 fs_storage_path={}
+
+[storage_pool.A]
+generation=1
+roots={}
+data_shards={}
+parity_shards={}
+sealed=false
 
 [index_config]
 partition_count=64
@@ -280,8 +273,6 @@ stream_locality_bias_enabled=true
 monitor_interval_seconds=auto
 monitor_deep_scan_interval_seconds=auto
 max_part_size={}
-data_shards={}
-parity_shards={}
 stripe_block_size=262144
 "#,
             self.args.listen_host,
@@ -289,9 +280,10 @@ stripe_block_size=262144
             self.native_port(),
             cert.display(),
             key.display(),
-            index_roots,
-            blob_roots,
             self.args.out_dir.join("fs").display(),
+            blob_roots,
+            self.data_shards,
+            self.parity_shards,
             self.args.trash_retention_seconds,
             self.args.export_retention_seconds,
             auto_healing_enabled,
@@ -301,8 +293,6 @@ stripe_block_size=262144
             checksum_scrub_interval_seconds,
             self.args.rate_limiter_enabled,
             self.args.max_part_size,
-            self.data_shards,
-            self.parity_shards,
             export_chunk_size = PROOF_EXPORT_CHUNK_SIZE,
         );
         fs::write(self.args.out_dir.join("n1_config.ini"), config)?;

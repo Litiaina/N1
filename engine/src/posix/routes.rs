@@ -142,6 +142,8 @@ async fn posix_mkdir(
         created: Some(created),
         trash_entry_id: None,
         deleted_at_unix: None,
+        conflicted_paths: Vec::new(),
+        failed_paths: Vec::new(),
     }))
 }
 
@@ -176,6 +178,8 @@ async fn posix_rename(
         created: None,
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
+        conflicted_paths: summary.conflicted_paths,
+        failed_paths: summary.failed_paths,
     }))
 }
 
@@ -207,6 +211,8 @@ async fn posix_trash(
         created: None,
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
+        conflicted_paths: summary.conflicted_paths,
+        failed_paths: summary.failed_paths,
     }))
 }
 
@@ -247,6 +253,8 @@ async fn posix_recover(
         created: None,
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
+        conflicted_paths: summary.conflicted_paths,
+        failed_paths: summary.failed_paths,
     }))
 }
 

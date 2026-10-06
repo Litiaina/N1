@@ -89,6 +89,10 @@ pub struct PosixRenameRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PosixMutationResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicted_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_paths: Vec<String>,
     pub operation: String,
     pub kind: PosixNodeKind,
     pub affected: usize,

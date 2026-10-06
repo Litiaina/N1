@@ -727,18 +727,7 @@ impl Proof {
         files: usize,
     ) -> ProofResult<ActorReport> {
         let start = Instant::now();
-        self.posix_post_with_token(
-            token,
-            "/noa/v1/posix/mkdir",
-            json!({"path": format!("{base}/inbox")}),
-        )
-        .await?;
-        self.posix_post_with_token(
-            token,
-            "/noa/v1/posix/mkdir",
-            json!({"path": format!("{base}/work")}),
-        )
-        .await?;
+        // Prefixes have no identity: uploads create names without mkdir.
         let sample_stride = (files / 8).max(1);
         let mut final_keys = Vec::with_capacity(files + 32);
         let mut samples = Vec::new();
@@ -766,8 +755,6 @@ impl Proof {
 
         let folder_source = format!("{base}/folder-source");
         let folder_dest = format!("{base}/folder-dest");
-        self.posix_post_with_token(token, "/noa/v1/posix/mkdir", json!({"path": &folder_source}))
-            .await?;
         for idx in 0..16usize {
             let child = format!("{folder_source}/child-{idx:04}.bin");
             let payload = deterministic_payload(32 * 1024, child.as_bytes());
@@ -790,8 +777,6 @@ impl Proof {
         let recover_dir = format!("{base}/recover-dir");
         let recover_child = format!("{recover_dir}/payload.bin");
         let recover_sha = sha256_bytes(&deterministic_payload(64 * 1024, recover_child.as_bytes()));
-        self.posix_post_with_token(token, "/noa/v1/posix/mkdir", json!({"path": &recover_dir}))
-            .await?;
         self.upload_bytes_with_token(
             token,
             &recover_child,
@@ -813,8 +798,6 @@ impl Proof {
 
         let retained_dir = format!("{base}/retained-dir");
         let retained_child = format!("{retained_dir}/payload.bin");
-        self.posix_post_with_token(token, "/noa/v1/posix/mkdir", json!({"path": &retained_dir}))
-            .await?;
         self.upload_bytes_with_token(
             token,
             &retained_child,

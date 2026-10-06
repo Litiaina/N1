@@ -106,6 +106,10 @@ pub struct NamespaceChangeEvent {
     pub entry: Option<NamespaceEntryPatch>,
     pub affected_paths: usize,
     pub affected_objects: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicted_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trash_entry_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +134,8 @@ impl NamespaceChangeEvent {
             entry: None,
             affected_paths: summary.affected_paths,
             affected_objects: summary.affected_objects,
+            conflicted_paths: summary.conflicted_paths,
+            failed_paths: summary.failed_paths,
             trash_entry_id: summary.trash_entry_id,
             deleted_at_unix: summary.deleted_at_unix,
             version_id: None,
@@ -173,6 +179,8 @@ impl NamespaceChangeEvent {
             entry: Some(entry),
             affected_paths: 1,
             affected_objects: 1,
+            conflicted_paths: Vec::new(),
+            failed_paths: Vec::new(),
             trash_entry_id: None,
             deleted_at_unix: None,
             version_id: Some(version_id),
@@ -207,6 +215,8 @@ impl NamespaceChangeEvent {
             entry: Some(entry),
             affected_paths: 1,
             affected_objects: 0,
+            conflicted_paths: Vec::new(),
+            failed_paths: Vec::new(),
             trash_entry_id: None,
             deleted_at_unix: None,
             version_id: None,
@@ -229,6 +239,8 @@ impl NamespaceChangeEvent {
             entry: None,
             affected_paths: 1,
             affected_objects: 1,
+            conflicted_paths: Vec::new(),
+            failed_paths: Vec::new(),
             trash_entry_id: None,
             deleted_at_unix: None,
             version_id: Some(version_id.into()),
@@ -254,6 +266,8 @@ impl NamespaceChangeEvent {
             entry: None,
             affected_paths,
             affected_objects,
+            conflicted_paths: Vec::new(),
+            failed_paths: Vec::new(),
             trash_entry_id: None,
             deleted_at_unix: None,
             version_id: None,
@@ -275,6 +289,8 @@ impl NamespaceChangeEvent {
             entry: None,
             affected_paths: affected,
             affected_objects: affected,
+            conflicted_paths: Vec::new(),
+            failed_paths: Vec::new(),
             trash_entry_id: None,
             deleted_at_unix: None,
             version_id: None,
@@ -349,6 +365,8 @@ mod tests {
                 destination_path: Some("archive/videos".to_string()),
                 trash_entry_id: None,
                 deleted_at_unix: None,
+                conflicted_paths: Vec::new(),
+                failed_paths: Vec::new(),
             },
         ));
 

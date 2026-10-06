@@ -324,11 +324,23 @@ pub(super) async fn process_object_repair(
                         .filter_map(|root| std::fs::metadata(root).ok().map(|meta| meta.dev()))
                         .collect::<HashSet<_>>()
                 };
-                let ranked_roots = path_manager.rank_blob_roots_for_object(
-                    &metadata.fragment,
-                    &metadata.object_key,
-                    &metadata.version_id,
-                );
+                let ranked_roots = if crate::core::storage_pool::configured().is_empty() {
+                    path_manager.rank_blob_roots_for_object(
+                        &metadata.fragment,
+                        &metadata.object_key,
+                        &metadata.version_id,
+                    )
+                } else {
+                    crate::core::storage_pool::pool_for_metadata(&metadata)
+                        .ok_or_else(|| {
+                            AppError::Conflict(
+                                "recorded placement does not belong to one immutable storage pool"
+                                    .into(),
+                            )
+                        })?
+                        .roots
+                        .clone()
+                };
                 let replacement = ranked_roots.into_iter().find(|candidate| {
                     let eligible = writable_blob_roots.iter().any(|active| active == candidate)
                         && !occupied_roots.contains(candidate);

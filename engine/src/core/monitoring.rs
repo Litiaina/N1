@@ -255,6 +255,12 @@ struct SampledObjectDebt {
 }
 
 fn should_count_index_record(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|part| part.as_os_str() == ".namespace")
+    {
+        return path.extension().is_some_and(|ext| ext == "ncx");
+    }
     if path.components().any(|component| {
         matches!(
             component.as_os_str().to_str(),
@@ -848,7 +854,7 @@ async fn collect_system_health(
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_symlink() && should_count_index_record(path) {
+                        if entry.file_type().is_file() && should_count_index_record(path) {
                             current_disk_count += 1;
                         }
 

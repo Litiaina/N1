@@ -327,10 +327,14 @@ fn repair_fragment_replicas_repairs_namespace_only_and_preserves_objects() {
     let fragment = format!("n1-repair-source-{}", Ulid::new());
     let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
-    let bad_root = fragment_root_on(&roots[0], &fragment);
     let object_dir = live_object_dir(&blob_roots[0], &fragment, &object_id).expect("object dir");
     let object_entries_before = read_dir_names(&object_dir).expect("read object placement");
-    fs::remove_file(bad_root.join("docs/video.mp4")).expect("wipe namespace symlink");
+    fs::remove_file(crate::namespace::flat::path(
+        &roots[0],
+        &fragment,
+        "docs/video.mp4",
+    ))
+    .expect("wipe namespace symlink");
 
     let before = inspect_fragment_partition_replicas(&fragment, &roots);
     assert!(!before.healthy);
@@ -344,10 +348,14 @@ fn repair_fragment_replicas_repairs_namespace_only_and_preserves_objects() {
     let repaired = inspect_fragment_partition_replicas(&fragment, &roots);
     assert!(repaired.healthy, "repair should restore mirrored N1 index");
     assert!(
-        fs::symlink_metadata(bad_root.join("docs/video.mp4"))
-            .expect("namespace symlink restored")
-            .file_type()
-            .is_symlink()
+        fs::symlink_metadata(crate::namespace::flat::path(
+            &roots[0],
+            &fragment,
+            "docs/video.mp4"
+        ))
+        .expect("namespace symlink restored")
+        .file_type()
+        .is_file()
     );
     assert_eq!(
         read_dir_names(&object_dir).expect("read object placement after repair"),
@@ -380,8 +388,18 @@ fn replica_repair_preserves_inflight_atomic_writes_and_local_workspaces() {
     );
     assert!(reject_reserved_user_path(&repair_temporary).is_err());
     let destination = fragment_root_on(&roots[0], &fragment);
-    fs::remove_file(destination.join("docs/live.bin")).unwrap();
-    fs::remove_file(destination.join(&temp_like_user_path)).unwrap();
+    fs::remove_file(crate::namespace::flat::path(
+        &roots[0],
+        &fragment,
+        "docs/live.bin",
+    ))
+    .unwrap();
+    fs::remove_file(crate::namespace::flat::path(
+        &roots[0],
+        &fragment,
+        &temp_like_user_path,
+    ))
+    .unwrap();
     let interrupted_copy_dir = destination.join(UPLOADS_DIR).join("interrupted-copy");
     fs::create_dir_all(&interrupted_copy_dir).unwrap();
     for _ in 0..8 {
@@ -409,9 +427,9 @@ fn replica_repair_preserves_inflight_atomic_writes_and_local_workspaces() {
     }
 
     repair_fragment_all_partition_replicas(&fragment, false).unwrap();
-    assert!(destination.join("docs/live.bin").is_symlink());
+    assert!(crate::namespace::flat::path(&roots[0], &fragment, "docs/live.bin").is_file());
     assert!(
-        destination.join(&temp_like_user_path).is_symlink(),
+        crate::namespace::flat::path(&roots[0], &fragment, &temp_like_user_path).is_file(),
         "valid user names must not be mistaken for staging files"
     );
     for path in &pending {
@@ -450,278 +468,189 @@ fn replica_repair_preserves_inflight_atomic_writes_and_local_workspaces() {
 }
 
 #[test]
-fn trash_scan_tolerates_inflight_parent_chains_but_rejects_ambiguous_generations() {
+fn trash_scan_ignores_empty_organizers_and_rejects_corrupt_records() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
     let fragment = format!("n1-trash-inflight-{}", Ulid::new());
     publish_logical_object(&roots, &fragment, "docs/live.bin", 123);
-    let pending = trash_generation_name(1_700_000_000_000_000_000, 4);
-    let committed = trash_generation_name(1_700_000_001_000_000_000, 2);
-    let empty_folder = trash_generation_name(1_700_000_002_000_000_000, 1);
+    let record = crate::namespace::flat::trash_key(&fragment, "docs/live.bin")
+        .unwrap()
+        .unwrap();
     for root in &roots {
-        let root = fragment_root_on(root, &fragment);
-        let trash = root.join(TRASH_DIR);
-        fs::create_dir_all(trash.join(&pending).join("a/b")).unwrap();
-        fs::create_dir_all(trash.join(&committed).join("docs")).unwrap();
-        fs::rename(
-            root.join("docs/live.bin"),
-            trash.join(&committed).join("docs/live.bin"),
+        fs::create_dir_all(
+            fragment_root_on(root, &fragment)
+                .join(TRASH_DIR)
+                .join("empty/prefix"),
         )
         .unwrap();
-        fs::create_dir_all(trash.join(&empty_folder).join("empty-folder")).unwrap();
     }
-    let records =
-        scan_trash_records(&fragment).expect("in-flight empty parents are not corruption");
-    assert_eq!(records.len(), 2);
-    assert!(
-        records
-            .iter()
-            .any(|record| record.original_path == "docs/live.bin")
-    );
-    assert!(
-        records
-            .iter()
-            .any(|record| record.original_path == "empty-folder")
-    );
-
-    // Multiple competing path components really are ambiguous and must not be
-    // silently skipped by either listing or GC reachability inspection.
-    let pending_root = fragment_root_on(&roots[0], &fragment)
-        .join(TRASH_DIR)
-        .join(&pending);
-    fs::create_dir_all(pending_root.join("other")).unwrap();
+    let records = scan_trash_records(&fragment).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].original_path, "docs/live.bin");
+    for root in &roots {
+        fs::write(
+            fragment_root_on(root, &fragment)
+                .join(TRASH_DIR)
+                .join(&record.source_relative_path),
+            b"corrupt",
+        )
+        .unwrap();
+    }
     assert!(scan_trash_records(&fragment).is_err());
 }
 
 #[test]
-fn replica_inspection_detects_equal_count_different_namespace_content() {
+fn replica_inspection_rejects_conflicting_checksums_valid_namespace_identity() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
-    assert!(roots.len() >= 2);
-    let fragment = format!("n1-replica-content-divergence-{}", Ulid::new());
-    let original_object = publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
-    let divergent_object = new_object_id();
-    upsert_live_version(&test_metadata(&fragment, &divergent_object, 456))
-        .expect("publish divergent object metadata");
-
-    let divergent_link = fragment_root_on(&roots[1], &fragment).join("docs/report.bin");
-    fs::remove_file(&divergent_link).expect("remove one replica link");
-    unix_fs::symlink(
-        object_symlink_target(&divergent_object).expect("divergent link target"),
-        &divergent_link,
-    )
-    .expect("inject equal-count divergent namespace link");
-
-    assert_ne!(original_object, divergent_object);
-    let inspection = inspect_fragment_partition_replicas(&fragment, &roots);
-    assert!(!inspection.healthy);
-    assert_eq!(inspection.missing_replicas, 0);
-    assert_eq!(inspection.divergent_replicas, 1);
+    let fragment = format!("n1-replica-divergence-{}", Ulid::new());
+    publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
+    let target = crate::namespace::flat::path(&roots[1], &fragment, "docs/report.bin");
+    let mut divergent = crate::namespace::flat::read(&target).unwrap().unwrap();
+    divergent.object_id = new_object_id();
+    crate::namespace::flat::write(&roots[1], &target, &divergent, false).unwrap();
+    assert!(!inspect_fragment_partition_replicas(&fragment, &roots).healthy);
     assert!(matches!(
         repair_fragment_all_partition_replicas(&fragment, false),
         Err(AppError::Conflict(_))
     ));
     assert_eq!(
-        read_namespace_symlink_object_id(&roots[1], &fragment, &divergent_link)
-            .expect("read divergent link after refused repair"),
-        Some(divergent_object),
-        "automatic repair must fail closed when two equally complete replicas disagree"
+        crate::namespace::flat::read(&target).unwrap(),
+        Some(divergent)
     );
 }
 
 #[test]
-fn replica_content_digest_is_independent_of_directory_iteration_order() {
+fn replica_inspection_is_independent_of_directory_iteration_order() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
-    assert!(roots.len() >= 2);
-    let fragment = format!("n1-replica-manifest-order-{}", Ulid::new());
-    let first_object = new_object_id();
-    let second_object = new_object_id();
-    let first_root = fragment_root_on(&roots[0], &fragment);
-    let second_root = fragment_root_on(&roots[1], &fragment);
-
-    fs::create_dir_all(first_root.join("alpha")).expect("create first alpha");
-    fs::create_dir_all(first_root.join("beta")).expect("create first beta");
-    fs::create_dir_all(second_root.join("beta")).expect("create second beta first");
-    fs::create_dir_all(second_root.join("alpha")).expect("create second alpha last");
-    unix_fs::symlink(
-        object_symlink_target(&first_object).expect("first target"),
-        first_root.join("alpha/a.bin"),
-    )
-    .expect("publish first-root alpha");
-    unix_fs::symlink(
-        object_symlink_target(&second_object).expect("second target"),
-        first_root.join("beta/b.bin"),
-    )
-    .expect("publish first-root beta");
-    unix_fs::symlink(
-        object_symlink_target(&second_object).expect("second target"),
-        second_root.join("beta/b.bin"),
-    )
-    .expect("publish second-root beta");
-    unix_fs::symlink(
-        object_symlink_target(&first_object).expect("first target"),
-        second_root.join("alpha/a.bin"),
-    )
-    .expect("publish second-root alpha");
-
-    let inspection = inspect_fragment_partition_replicas(&fragment, &roots);
-    assert!(inspection.healthy);
-    assert_eq!(inspection.valid_replicas, 2);
-    assert_eq!(inspection.divergent_replicas, 0);
-}
-
-#[test]
-fn redistribution_refuses_equal_count_object_identity_divergence() {
-    let _guard = crate::test_support::global_test_lock().blocking_lock();
-    let roots = ensure_test_index_roots();
-    assert!(roots.len() >= 2);
-    let fragment = format!("n1-redistribution-generation-{}", Ulid::new());
-    let original_object = publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
-    let replacement_object = new_object_id();
-    upsert_live_version(&test_metadata(&fragment, &replacement_object, 456))
-        .expect("publish replacement object metadata");
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    let authoritative_link = fragment_root_on(&roots[0], &fragment).join("docs/report.bin");
-    fs::remove_file(&authoritative_link).expect("remove prior authoritative link");
-    unix_fs::symlink(
-        object_symlink_target(&replacement_object).expect("replacement target"),
-        &authoritative_link,
-    )
-    .expect("publish one-disk replacement");
-    assert!(matches!(
-        sync_fragment_partition_replicas(&fragment),
-        Err(AppError::Conflict(_))
-    ));
-    assert_ne!(original_object, replacement_object);
-}
-
-#[test]
-fn redistribution_repairs_a_partial_folder_rename_without_foreground_coordination() {
-    let _guard = crate::test_support::global_test_lock().blocking_lock();
-    let roots = ensure_test_index_roots();
-    assert!(roots.len() >= 2);
-    let fragment = format!("n1-redistribution-partial-rename-{}", Ulid::new());
-    publish_logical_object(&roots, &fragment, "before/item.bin", 123);
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    fs::rename(
-        fragment_root_on(&roots[0], &fragment).join("before"),
-        fragment_root_on(&roots[0], &fragment).join("after"),
-    )
-    .expect("rename on continuously active replica");
-
-    let (source, _) = choose_replica_source(&fragment).expect("authoritative source");
-    assert_eq!(source, fragment_root_on(&roots[0], &fragment));
-    sync_fragment_partition_replicas(&fragment)
-        .expect("latest filesystem mutation must repair the stale replica");
-    for root in &roots {
-        assert!(
-            fragment_root_on(root, &fragment)
-                .join("after/item.bin")
-                .is_symlink(),
-            "the repaired replica must contain the renamed namespace entry"
-        );
-        assert!(!fragment_root_on(root, &fragment).join("before").exists());
-    }
+    let fragment = format!("n1-replica-order-{}", Ulid::new());
+    let a = new_object_id();
+    let b = new_object_id();
+    publish_namespace_link(&roots[0], &fragment, "alpha/a.bin", &a).unwrap();
+    publish_namespace_link(&roots[0], &fragment, "beta/b.bin", &b).unwrap();
+    publish_namespace_link(&roots[1], &fragment, "beta/b.bin", &b).unwrap();
+    publish_namespace_link(&roots[1], &fragment, "alpha/a.bin", &a).unwrap();
     assert!(inspect_fragment_partition_replicas(&fragment, &roots).healthy);
 }
 
 #[test]
-fn repair_fragment_replicas_ignores_newer_fragment_meta_on_stale_replica() {
+fn redistribution_refuses_conflicting_namespace_identity() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
-    assert!(roots.len() >= 2);
-    let fragment = format!("n1-repair-stale-meta-{}", Ulid::new());
-    publish_logical_object(&roots, &fragment, "docs/original.txt", 123);
-
-    let one_disk_object_id = new_object_id();
-    let one_disk_meta = test_metadata(&fragment, &one_disk_object_id, 34);
-    upsert_live_version(&one_disk_meta).expect("publish colocated object metadata");
-    publish_namespace_link(
-        &roots[0],
-        &fragment,
-        "n1-redistribution/one-disk.txt",
-        &one_disk_object_id,
-    )
-    .expect("publish one-disk namespace link");
-
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    let stale_meta = fragment_root_on(&roots[1], &fragment).join(FRAGMENT_META_FILE);
-    fs::write(&stale_meta, b"newer stale fragment metadata").expect("touch stale meta");
-
-    let (source, _score) = choose_replica_source(&fragment).expect("source replica");
-    assert_eq!(
-        source,
-        fragment_root_on(&roots[0], &fragment),
-        "newer .fragment.ndx on a stale replica must not outrank the richer index plane"
-    );
-
-    repair_fragment_all_partition_replicas(&fragment, false).expect("repair N1 replicas");
-
-    for root in &roots {
-        assert!(
-            fs::symlink_metadata(
-                fragment_root_on(root, &fragment).join("n1-redistribution/one-disk.txt"),
-            )
-            .expect("one-disk namespace link")
-            .file_type()
-            .is_symlink(),
-            "repair must preserve the namespace link created while one replica was active"
-        );
-        assert!(!fragment_root_on(root, &fragment).join(OBJECTS_DIR).exists());
-    }
+    let fragment = format!("n1-redistribution-divergence-{}", Ulid::new());
+    publish_logical_object(&roots, &fragment, "docs/report.bin", 123);
+    let target = crate::namespace::flat::path(&roots[0], &fragment, "docs/report.bin");
+    let mut p = crate::namespace::flat::read(&target).unwrap().unwrap();
+    p.object_id = new_object_id();
+    crate::namespace::flat::write(&roots[0], &target, &p, false).unwrap();
+    assert!(matches!(
+        sync_fragment_partition_replicas(&fragment),
+        Err(AppError::Conflict(_))
+    ));
 }
 
 #[test]
-fn repair_fragment_replicas_prefers_richer_replica_even_when_stale_plane_is_newer() {
+fn namespace_repair_preserves_both_names_after_interrupted_copy_delete() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
-    assert!(roots.len() >= 2);
-    let fragment = format!("n1-repair-stale-plane-{}", Ulid::new());
-    publish_logical_object(&roots, &fragment, "docs/original.txt", 123);
-
-    let one_disk_object_id = new_object_id();
-    let one_disk_meta = test_metadata(&fragment, &one_disk_object_id, 34);
-    upsert_live_version(&one_disk_meta).expect("publish colocated object metadata");
-    publish_namespace_link(
+    let fragment = format!("n1-repair-copy-delete-{}", Ulid::new());
+    let object = publish_logical_object(&roots, &fragment, "before/item.bin", 123);
+    let old = crate::namespace::flat::read(&crate::namespace::flat::path(
         &roots[0],
         &fragment,
-        "n1-redistribution/one-disk.txt",
-        &one_disk_object_id,
+        "before/item.bin",
+    ))
+    .unwrap()
+    .unwrap();
+    crate::namespace::flat::move_key(&fragment, "before/item.bin", "after/item.bin").unwrap();
+    crate::namespace::flat::write(
+        &roots[0],
+        &crate::namespace::flat::path(&roots[0], &fragment, "before/item.bin"),
+        &old,
+        true,
     )
-    .expect("publish one-disk namespace link");
-
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    let stale_user_dir =
-        fragment_root_on(&roots[1], &fragment).join("maintenance-touched-stale-tree");
-    fs::create_dir_all(&stale_user_dir).expect("touch stale index plane");
-
+    .unwrap();
     assert!(
-        latest_index_plane_mtime_nanos(&fragment_root_on(&roots[1], &fragment))
-            > latest_index_plane_mtime_nanos(&fragment_root_on(&roots[0], &fragment)),
-        "stale replica must be newer to reproduce the redistribution regression"
+        crate::namespace::flat::lookup(&fragment, "before/item.bin")
+            .unwrap()
+            .is_some()
     );
-
-    let (source, _score) = choose_replica_source(&fragment).expect("source replica");
-    assert_eq!(
-        source,
-        fragment_root_on(&roots[0], &fragment),
-        "a touched stale plane must not outrank the richer one-disk write"
-    );
-
-    repair_fragment_all_partition_replicas(&fragment, false).expect("repair N1 replicas");
-
+    sync_fragment_partition_replicas(&fragment).unwrap();
     for root in &roots {
-        assert!(
-            fs::symlink_metadata(
-                fragment_root_on(root, &fragment).join("n1-redistribution/one-disk.txt"),
-            )
-            .expect("one-disk namespace link")
-            .file_type()
-            .is_symlink(),
-            "repair must preserve the namespace link created while one replica was active"
+        assert!(crate::namespace::flat::path(root, &fragment, "before/item.bin").exists());
+    }
+    assert_eq!(
+        crate::namespace::flat::lookup(&fragment, "after/item.bin")
+            .unwrap()
+            .unwrap()
+            .object_id,
+        object
+    );
+}
+
+#[test]
+fn namespace_repair_restores_checksums_from_surviving_copy() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("n1-repair-corrupt-{}", Ulid::new());
+    let object = publish_logical_object(&roots, &fragment, "docs/item.bin", 34);
+    let target = crate::namespace::flat::path(&roots[0], &fragment, "docs/item.bin");
+    fs::write(&target, b"corrupt").unwrap();
+    let report = repair_fragment_all_partition_replicas(&fragment, false).unwrap();
+    assert!(report.2 > 0);
+    assert_eq!(
+        crate::namespace::flat::read(&target)
+            .unwrap()
+            .unwrap()
+            .object_id,
+        object
+    );
+}
+
+#[test]
+fn namespace_repair_uses_each_key_not_whole_fragment_authority() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("n1-repair-per-key-{}", Ulid::new());
+    let a = publish_logical_object(&roots, &fragment, "docs/a.bin", 11);
+    let b = publish_logical_object(&roots, &fragment, "docs/b.bin", 22);
+    fs::remove_file(crate::namespace::flat::path(
+        &roots[0],
+        &fragment,
+        "docs/a.bin",
+    ))
+    .unwrap();
+    fs::remove_file(crate::namespace::flat::path(
+        &roots[1],
+        &fragment,
+        "docs/b.bin",
+    ))
+    .unwrap();
+    repair_fragment_all_partition_replicas(&fragment, false).unwrap();
+    for root in &roots {
+        assert_eq!(
+            crate::namespace::flat::read(&crate::namespace::flat::path(
+                root,
+                &fragment,
+                "docs/a.bin"
+            ))
+            .unwrap()
+            .unwrap()
+            .object_id,
+            a
         );
-        assert!(!fragment_root_on(root, &fragment).join(OBJECTS_DIR).exists());
+        assert_eq!(
+            crate::namespace::flat::read(&crate::namespace::flat::path(
+                root,
+                &fragment,
+                "docs/b.bin"
+            ))
+            .unwrap()
+            .unwrap()
+            .object_id,
+            b
+        );
     }
 }
 
@@ -862,13 +791,11 @@ fn live_head_listing_reads_filenames_without_decoding_ndx_body() {
             .expect("publish namespace link");
     }
 
-    let listed = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
+    let listed = scan_live_heads_page(&fragment, Some("docs/".to_string()), None, 10, None, true)
         .expect("zero-decode list");
     assert_eq!(listed.entries.len(), 1);
-    assert_eq!(listed.objects.len(), 1);
-    assert_eq!(listed.objects[0].total_size_bytes, 12345);
-    assert_eq!(listed.objects[0].object_key, logical_path);
-    assert_eq!(listed.objects[0].content_type, "video/mp4");
+    assert!(listed.objects.is_empty());
+    assert_eq!(listed.entries[0].record, "bad-body.mp4");
     assert!(read_current_live_head(&fragment, &object_id).is_err());
 }
 
@@ -885,19 +812,19 @@ fn live_head_pagination_uses_display_names_not_raw_object_dirs() {
         publish_logical_object(&roots, &fragment, name, size);
     }
 
-    let first = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 2, None, true)
+    let first = scan_live_heads_page(&fragment, Some("docs/".to_string()), None, 2, None, true)
         .expect("first page");
     assert_eq!(
         first
-            .objects
+            .entries
             .iter()
-            .map(|meta| meta.object_key.as_str())
+            .map(|meta| meta.record.as_str())
             .collect::<Vec<_>>(),
-        vec!["docs/a.svg", "docs/b.svg"]
+        vec!["a.svg", "b.svg"]
     );
     let second = scan_live_heads_page(
         &fragment,
-        Some("docs".to_string()),
+        Some("docs/".to_string()),
         None,
         2,
         first.continuation_token,
@@ -906,11 +833,11 @@ fn live_head_pagination_uses_display_names_not_raw_object_dirs() {
     .expect("second page");
     assert_eq!(
         second
-            .objects
+            .entries
             .iter()
-            .map(|meta| meta.object_key.as_str())
+            .map(|meta| meta.record.as_str())
             .collect::<Vec<_>>(),
-        vec!["docs/c.svg"]
+        vec!["c.svg"]
     );
 }
 
@@ -945,10 +872,8 @@ fn bounded_live_pagination_covers_a_wide_replicated_directory_without_skips() {
         fs::write(object_dir.join(ndx_name), b"zero-decode-page-test")
             .expect("write zero-decode ndx name");
         for root in &index_roots {
-            let link = fragment_root_on(root, &fragment)
-                .join("wide")
-                .join(&logical_name);
-            unix_fs::symlink(format!("@o_{object_id}"), link).expect("publish wide namespace link");
+            publish_namespace_link(root, &fragment, &format!("wide/{logical_name}"), &object_id)
+                .unwrap();
         }
     }
 
@@ -956,7 +881,7 @@ fn bounded_live_pagination_covers_a_wide_replicated_directory_without_skips() {
     let mut observed = Vec::with_capacity(total);
     loop {
         let page =
-            scan_live_heads_page(&fragment, Some("wide".to_string()), None, 73, cursor, true)
+            scan_live_heads_page(&fragment, Some("wide/".to_string()), None, 73, cursor, true)
                 .expect("wide namespace page");
         observed.extend(page.entries.into_iter().map(|entry| entry.record));
         cursor = page.continuation_token;
@@ -980,8 +905,8 @@ fn full_metadata_scan_uses_current_filesystem_path_after_rename() {
     let new_key = "docs/new-name.txt";
     let object_id = publish_logical_object(&roots, &fragment, old_key, 42);
     for root in &roots {
-        let old_link = fragment_root_on(root, &fragment).join(old_key);
-        let new_link = fragment_root_on(root, &fragment).join(new_key);
+        let old_link = crate::namespace::flat::path(root, &fragment, old_key);
+        let new_link = crate::namespace::flat::path(root, &fragment, new_key);
         fs::rename(&old_link, &new_link).expect("simulate N1 namespace rename");
         assert_eq!(
             read_namespace_symlink_object_id(root, &fragment, &new_link).expect("read moved link"),
@@ -990,7 +915,7 @@ fn full_metadata_scan_uses_current_filesystem_path_after_rename() {
     }
 
     let page =
-        scan_live_full_metadata_page(&fragment, Some("docs".to_string()), None, 10, None, true)
+        scan_live_full_metadata_page(&fragment, Some("docs/".to_string()), None, 10, None, true)
             .expect("full metadata page");
     assert_eq!(page.objects.len(), 1);
     assert_eq!(page.objects[0].object_key, object_id);
@@ -1006,7 +931,7 @@ fn full_metadata_pagination_advances_by_namespace_path() {
     let third_id = publish_logical_object(&roots, &fragment, "docs/c.txt", 30);
 
     let first =
-        scan_live_full_metadata_page(&fragment, Some("docs".to_string()), None, 2, None, true)
+        scan_live_full_metadata_page(&fragment, Some("docs/".to_string()), None, 2, None, true)
             .expect("first full metadata page");
     assert_eq!(
         first
@@ -1024,7 +949,7 @@ fn full_metadata_pagination_advances_by_namespace_path() {
 
     let second = scan_live_full_metadata_page(
         &fragment,
-        Some("docs".to_string()),
+        Some("docs/".to_string()),
         None,
         2,
         first.continuation_token,
@@ -1056,22 +981,12 @@ fn trash_maintenance_scan_preserves_physical_object_id() {
         .collect::<Vec<_>>();
     assert!(!version_ids.is_empty());
 
-    let generation = trash_generation_name(Utc::now().timestamp_nanos_opt().unwrap(), 2);
-
-    for root in &roots {
-        let fragment_root = fragment_root_on(root, &fragment);
-        let source = fragment_root.join(logical_path);
-        let destination = fragment_root
-            .join(TRASH_DIR)
-            .join(&generation)
-            .join(logical_path);
-        fs::create_dir_all(destination.parent().expect("trash parent"))
-            .expect("create trash payload parent");
-        fs::rename(source, destination).expect("move namespace link into trash");
-    }
+    crate::namespace::flat::trash_key(&fragment, logical_path)
+        .unwrap()
+        .unwrap();
 
     let user_page =
-        scan_trash_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
+        scan_trash_heads_page(&fragment, Some("docs/".to_string()), None, 10, None, true)
             .expect("scan user trash page");
     assert_eq!(user_page.objects.len(), 1);
     assert_eq!(user_page.objects[0].object_key, logical_path);
@@ -1091,19 +1006,9 @@ fn trash_maintenance_scan_descends_into_deleted_directories() {
     let logical_path = "archive/nested/report.bin";
     let object_id = publish_logical_object(&roots, &fragment, logical_path, 73);
 
-    let generation = trash_generation_name(Utc::now().timestamp_nanos_opt().unwrap(), 1);
-
-    for root in &roots {
-        let fragment_root = fragment_root_on(root, &fragment);
-        let destination = fragment_root
-            .join(TRASH_DIR)
-            .join(&generation)
-            .join("archive");
-        fs::create_dir_all(destination.parent().expect("trash parent"))
-            .expect("create trash payload parent");
-        fs::rename(fragment_root.join("archive"), destination)
-            .expect("move namespace directory into trash");
-    }
+    crate::namespace::flat::trash_key(&fragment, logical_path)
+        .unwrap()
+        .unwrap();
 
     let maintenance_page = scan_trash_full_metadata_page(&fragment, None, None, 10, None, true)
         .expect("scan deleted directory maintenance page");
@@ -1573,7 +1478,7 @@ fn root_listing_hides_internal_planes_and_blob_aliases() {
         .map(|entry| entry.record.as_str())
         .collect::<Vec<_>>();
     assert_eq!(records, vec!["docs"]);
-    assert_eq!(page.common_prefixes, vec!["docs"]);
+    assert_eq!(page.common_prefixes, vec!["docs/"]);
 }
 
 #[test]
@@ -1611,11 +1516,10 @@ fn latest_head_uses_max_ulid_and_ignores_invalid_ndx_names() {
         write_atomic(&dir.join(ndx_file_name(&new)), &new_bytes).expect("write new version");
     }
 
-    let page = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
+    let page = scan_live_heads_page(&fragment, Some("docs/".to_string()), None, 10, None, true)
         .expect("list latest head");
-    assert_eq!(page.objects.len(), 1);
-    assert_eq!(page.objects[0].version_id, new_id);
-    assert_eq!(page.objects[0].total_size_bytes, 222);
+    assert_eq!(page.entries.len(), 1);
+    assert!(page.objects.is_empty());
 
     let full = read_current_live_head(&fragment, &object_id)
         .expect("read latest")

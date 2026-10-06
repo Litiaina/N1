@@ -53,255 +53,32 @@ pub fn list_trash_versions(
     Ok(out)
 }
 
-pub(crate) fn remove_trash_payload(fragment: &str, record: &TrashRecord) -> Result<bool, AppError> {
-    let mut removed_primary = false;
-    for root in index_roots() {
-        let payload = fragment_root_on(&root, fragment)
-            .join(TRASH_DIR)
-            .join(&record.source_relative_path);
-        let meta = match fs::symlink_metadata(&payload) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !removed_primary => {
-                return Ok(false);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(io_err(err, "inspect N1 expired trash payload")),
-        };
-        if meta.file_type().is_symlink() || meta.is_file() {
-            match fs::remove_file(&payload) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound && !removed_primary => {
-                    return Ok(false);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(io_err(err, "remove N1 expired trash file")),
-            }
-        } else if meta.is_dir() {
-            match fs::remove_dir_all(&payload) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound && !removed_primary => {
-                    return Ok(false);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(io_err(err, "remove N1 expired trash directory")),
-            }
-        }
-        let trash_root = fragment_root_on(&root, fragment).join(TRASH_DIR);
-        let mut parent = payload.parent();
-        while let Some(directory) = parent {
-            if directory == trash_root {
-                break;
-            }
-            match fs::remove_dir(directory) {
-                Ok(()) => parent = directory.parent(),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    parent = directory.parent();
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
-                Err(err) => return Err(io_err(err, "prune N1 trash generation")),
-            }
-        }
-        removed_primary = true;
-    }
-    Ok(removed_primary)
-}
-
-fn trash_generation_anchor(
-    generation_root: &Path,
-    path_depth: usize,
-) -> Result<(PathBuf, String), AppError> {
-    let mut current = generation_root.to_path_buf();
-    let mut components = Vec::with_capacity(path_depth);
-    for position in 0..path_depth {
-        let names = read_dir_names(&current)?;
-        if names.is_empty() {
-            // Trash publication builds the parent chain before moving its
-            // anchor; recovery removes the anchor before pruning that chain.
-            // An empty intermediate directory is not a committed trash item.
-            return Err(AppError::NotFound);
-        }
-        if names.len() != 1 {
-            return Err(AppError::InternalServerError(format!(
-                "N1 trash generation '{}' has {} entries at logical path depth {}; expected exactly one",
-                generation_root.display(),
-                names.len(),
-                position
-            )));
-        }
-        let name = names.into_iter().next().expect("one trash path component");
-        components.push(name.clone());
-        current = current.join(name);
-        if position + 1 < path_depth {
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.is_dir() => (),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(AppError::NotFound);
-                }
-                Err(error) => return Err(io_err(error, "inspect N1 trash parent")),
-                Ok(_) => {
-                    return Err(AppError::InternalServerError(format!(
-                        "N1 trash generation '{}' ends before its declared logical path depth {}",
-                        generation_root.display(),
-                        path_depth
-                    )));
-                }
-            }
-        }
-    }
-    Ok((current, components.join("/")))
-}
-
-fn collect_trash_object_refs(
-    index_root: &Path,
-    fragment: &str,
-    anchor: &Path,
-) -> Result<(Vec<String>, Vec<String>), AppError> {
-    let mut object_keys = BTreeSet::new();
-    let mut version_ids = BTreeSet::new();
-    let mut stack = vec![anchor.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        for name in read_dir_names(&directory)? {
-            let child = directory.join(name);
-            if let Some(object_id) = read_namespace_symlink_object_id(index_root, fragment, &child)?
-            {
-                if object_keys.insert(object_id.clone()) {
-                    for metadata in list_live_versions(fragment, &object_id)? {
-                        version_ids.insert(metadata.version_id);
-                    }
-                }
-            } else if child.is_dir() {
-                stack.push(child);
-            }
-        }
-    }
-    Ok((
-        object_keys.into_iter().collect(),
-        version_ids.into_iter().collect(),
-    ))
-}
-
 pub(crate) fn visit_trash_records(
     fragment: &str,
     mut visit: impl FnMut(TrashRecord) -> Result<bool, AppError>,
 ) -> Result<(), AppError> {
-    for fragment_root in existing_fragment_roots(fragment) {
-        let index_root = fragment_root
-            .parent()
-            .unwrap_or(&fragment_root)
-            .to_path_buf();
-        let trash_root = fragment_root.join(TRASH_DIR);
-        if !trash_root.is_dir() {
-            continue;
-        }
-        'generation: for generation in read_dir_names(&trash_root)? {
-            let Some((unix_nanos, path_depth)) = parse_trash_generation_name(&generation) else {
-                return Err(AppError::InternalServerError(format!(
-                    "N1 trash entry '{}' uses the pre-3.3 layout; migrate it before starting N1 3.3",
-                    trash_root.join(&generation).display()
-                )));
-            };
-            let generation_root = trash_root.join(&generation);
-            match fs::symlink_metadata(&generation_root) {
-                Ok(metadata) if metadata.is_dir() => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Ok(_) => {
-                    return Err(AppError::InternalServerError(format!(
-                        "N1 trash generation '{}' is not a directory",
-                        generation_root.display()
-                    )));
-                }
-                Err(error) => {
-                    return Err(io_err(error, "inspect N1 trash generation"));
-                }
-            }
-            let (anchor, original_path) =
-                match trash_generation_anchor(&generation_root, path_depth) {
-                    Ok(anchor) => anchor,
-                    Err(AppError::NotFound) => continue,
-                    Err(error) => {
-                        match fs::symlink_metadata(&generation_root) {
-                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
-                                continue;
-                            }
-                            Ok(metadata)
-                                if metadata.is_dir()
-                                    && read_dir_names(&generation_root)
-                                        .is_ok_and(|names| names.is_empty()) =>
-                            {
-                                // A concurrent recover/TTL removal has already moved the
-                                // only anchor and is pruning this now-empty generation.
-                                continue;
-                            }
-                            _ => return Err(error),
-                        }
-                    }
-                };
-            let metadata = match fs::symlink_metadata(&anchor) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(io_err(error, "inspect N1 trash generation anchor")),
-            };
-            let (kind, object_keys, version_ids) = if let Some(object_id) =
-                read_namespace_symlink_object_id(&index_root, fragment, &anchor)?
-            {
-                let Some(versions) = while_trash_anchor_present(&anchor, || {
-                    list_live_versions(fragment, &object_id)
-                })?
-                else {
-                    continue 'generation;
-                };
-                let mut versions = versions
+    for mut record in crate::namespace::flat::trash_records(fragment)? {
+        // NCX owns the logical name/object identity, not immutable version
+        // metadata. Derive the maintenance catalog from authoritative NDX,
+        // deduplicating physical replicas rather than reporting an empty
+        // version list for every flat trash anchor.
+        let mut versions = BTreeSet::new();
+        for object_id in &record.object_keys {
+            versions.extend(
+                list_live_versions(fragment, object_id)?
                     .into_iter()
-                    .map(|metadata| metadata.version_id)
-                    .collect::<Vec<_>>();
-                versions.sort();
-                versions.dedup();
-                (TrashKind::File, vec![object_id], versions)
-            } else if metadata.is_dir() {
-                let Some((objects, versions)) = while_trash_anchor_present(&anchor, || {
-                    collect_trash_object_refs(&index_root, fragment, &anchor)
-                })?
-                else {
-                    continue 'generation;
-                };
-                (TrashKind::Directory, objects, versions)
-            } else if metadata.is_file() {
-                (TrashKind::File, Vec::new(), Vec::new())
-            } else {
-                if matches!(
-                    fs::symlink_metadata(&anchor),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                ) {
-                    // The anchor was a namespace symlink when it was first
-                    // inspected, but a concurrent recover/TTL sweep removed
-                    // it before its target could be read. Treat that as the
-                    // generation disappearing, not as malformed metadata.
-                    continue 'generation;
-                }
-                return Err(AppError::InternalServerError(format!(
-                    "N1 trash generation anchor '{}' has an unsupported file type",
-                    anchor.display()
-                )));
-            };
-            let source_relative_path = format!("{generation}/{original_path}");
-            let record = TrashRecord {
-                trash_entry_id: source_relative_path.clone(),
-                original_path,
-                source_relative_path,
-                kind,
-                object_keys,
-                version_ids,
-                deleted_at_unix: unix_nanos / 1_000_000_000,
-            };
-            if !visit(record)? {
-                return Ok(());
-            }
+                    .map(|metadata| metadata.version_id),
+            );
         }
-        break;
+        record.version_ids = versions.into_iter().collect();
+        if !visit(record)? {
+            break;
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn while_trash_anchor_present<T>(
     anchor: &Path,
     read: impl FnOnce() -> Result<T, AppError>,
@@ -611,6 +388,7 @@ pub fn list_object_keys_with_trash_versions(fragment: &str) -> Result<Vec<String
         .collect())
 }
 
+#[cfg(test)]
 pub(super) fn collect_symlink_object_ids_under(
     root: &Path,
     fragment: &str,
@@ -641,20 +419,7 @@ pub(super) fn collect_symlink_object_ids_under(
 }
 
 pub(crate) fn referenced_object_ids(fragment: &str) -> Result<BTreeSet<String>, AppError> {
-    let mut out = BTreeSet::new();
-    for fragment_root in existing_fragment_roots(fragment) {
-        let index_root = fragment_root
-            .parent()
-            .unwrap_or(&fragment_root)
-            .to_path_buf();
-        out.extend(collect_symlink_object_ids_under(
-            &index_root,
-            fragment,
-            &fragment_root,
-            true,
-        )?);
-    }
-    Ok(out)
+    crate::namespace::flat::referenced_objects(fragment)
 }
 
 pub(crate) fn delete_unreferenced_object_index(

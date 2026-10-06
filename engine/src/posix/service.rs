@@ -19,6 +19,16 @@ fn posix_kind_from_namespace(kind: NamespaceEntryKind) -> PosixNodeKind {
     }
 }
 
+// A trailing delimiter selects a virtual prefix, not a same-named object.
+fn normalize_selection_path(path: &str) -> Result<String, AppError> {
+    let normalized = normalize_posix_path(Some(path))?;
+    Ok(if !normalized.is_empty() && path.trim().ends_with('/') {
+        format!("{normalized}/")
+    } else {
+        normalized
+    })
+}
+
 pub async fn list_dir(
     claims: Claims,
     path: String,
@@ -37,7 +47,9 @@ pub async fn list_dir(
                 .trashed_entry(&fragment, &path)
                 .await?
         } else {
-            global_namespace_runtime().entry(&fragment, &path).await?
+            global_namespace_runtime()
+                .entry(&fragment, &format!("{path}/"))
+                .await?
         }
         .ok_or(AppError::NotFound)?;
         if entry.kind == NamespaceEntryKind::File {
@@ -87,7 +99,7 @@ pub async fn stat_path(
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let fragment = claims.fragment.clone();
-    let path = normalize_posix_path(Some(path.as_str()))?;
+    let path = normalize_selection_path(&path)?;
     let entry = if scan_trash {
         global_namespace_runtime()
             .trashed_entry(&fragment, &path)
@@ -175,6 +187,8 @@ pub async fn mkdir_path(
         created: Some(created),
         trash_entry_id: None,
         deleted_at_unix: None,
+        conflicted_paths: Vec::new(),
+        failed_paths: Vec::new(),
     })
 }
 
@@ -189,8 +203,8 @@ pub async fn rename_path(
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
     let fragment = claims.fragment.clone();
-    let source_path = normalize_posix_path(Some(source_path.as_str()))?;
-    let destination_path = normalize_posix_path(Some(destination_path.as_str()))?;
+    let source_path = normalize_selection_path(&source_path)?;
+    let destination_path = normalize_selection_path(&destination_path)?;
     if source_path.is_empty() || destination_path.is_empty() {
         return Err(AppError::BadRequest(
             "root path cannot be renamed".to_string(),
@@ -212,6 +226,8 @@ pub async fn rename_path(
             created: None,
             trash_entry_id: None,
             deleted_at_unix: None,
+            conflicted_paths: Vec::new(),
+            failed_paths: Vec::new(),
         });
     }
 
@@ -235,6 +251,8 @@ pub async fn rename_path(
         created: None,
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
+        conflicted_paths: summary.conflicted_paths,
+        failed_paths: summary.failed_paths,
     })
 }
 
@@ -244,7 +262,7 @@ pub async fn trash_path(
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
     ensure_user_mutations_allowed()?;
-    let path = normalize_posix_path(Some(path.as_str()))?;
+    let path = normalize_selection_path(&path)?;
     if path.is_empty() {
         return Err(AppError::BadRequest(
             "root path cannot be trashed".to_string(),
@@ -269,6 +287,8 @@ pub async fn trash_path(
         created: None,
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
+        conflicted_paths: summary.conflicted_paths,
+        failed_paths: summary.failed_paths,
     })
 }
 
@@ -278,7 +298,7 @@ pub async fn recover_path(
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
     ensure_user_mutations_allowed()?;
-    let path = normalize_posix_path(Some(path.as_str()))?;
+    let path = normalize_selection_path(&path)?;
     if path.is_empty() {
         return Err(AppError::BadRequest(
             "root path cannot be recovered".to_string(),
@@ -303,5 +323,7 @@ pub async fn recover_path(
         created: None,
         trash_entry_id: summary.trash_entry_id,
         deleted_at_unix: summary.deleted_at_unix,
+        conflicted_paths: summary.conflicted_paths,
+        failed_paths: summary.failed_paths,
     })
 }

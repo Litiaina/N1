@@ -46,6 +46,7 @@ pub(super) fn count_object_index_records(root: &Path, fragment: &str) -> u64 {
     count
 }
 
+#[cfg(test)]
 fn count_upload_records(root: &Path, fragment: &str) -> u64 {
     let uploads_root = fragment_root_on(root, fragment).join(UPLOADS_DIR);
     let mut count = 0u64;
@@ -74,12 +75,17 @@ fn count_upload_records(root: &Path, fragment: &str) -> u64 {
     count
 }
 
+#[cfg(test)]
 fn count_namespace_links(root: &Path, fragment: &str) -> u64 {
+    if !crate::core::storage_pool::configured().is_empty() {
+        return 0;
+    }
     collect_symlink_object_ids_under(root, fragment, &fragment_root_on(root, fragment), true)
         .map(|ids| ids.len() as u64)
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
     ReplicaScore {
         meta_present: u64::from(
@@ -93,6 +99,7 @@ fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
     }
 }
 
+#[cfg(test)]
 fn add_digest_mod_256(accumulator: &mut [u8; 32], digest: &[u8; 32]) {
     let mut carry = 0u16;
     for index in (0..32).rev() {
@@ -102,6 +109,7 @@ fn add_digest_mod_256(accumulator: &mut [u8; 32], digest: &[u8; 32]) {
     }
 }
 
+#[cfg(test)]
 fn is_replica_staging_name(name: &str) -> bool {
     name.starts_with('.')
         && name
@@ -109,6 +117,7 @@ fn is_replica_staging_name(name: &str) -> bool {
             .is_some_and(|(_, nonce)| nonce.len() == 26 && Ulid::from_string(nonce).is_ok())
 }
 
+#[cfg(test)]
 fn replica_local_entry(path: &Path, name: &str, at_fragment_root: bool) -> bool {
     // User objects are symlinks, and user directories may legitimately have a
     // name resembling an atomic-write sibling. Only regular-file staging and
@@ -123,10 +132,11 @@ fn replica_local_entry(path: &Path, name: &str, at_fragment_root: bool) -> bool 
         || (at_fragment_root
             && matches!(
                 name,
-                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | GC_DIR | REPAIR_DIR
+                OBJECTS_DIR | TMP_DIR | LOCKS_DIR | GC_DIR | REPAIR_DIR | ".namespace" | ".trash"
             ))
 }
 
+#[cfg(test)]
 fn hash_replica_tree(fragment_root: &Path, directory: &Path) -> Result<[u8; 32], AppError> {
     let mut sum = [0u8; 32];
     let mut xor = [0u8; 32];
@@ -198,6 +208,7 @@ fn hash_replica_tree(fragment_root: &Path, directory: &Path) -> Result<[u8; 32],
     Ok(tree_hasher.finalize().into())
 }
 
+#[cfg(test)]
 fn replica_state(root: &Path, fragment: &str) -> Result<ReplicaState, AppError> {
     let fragment_root = fragment_root_on(root, fragment);
     let content_digest = if fragment_root.is_dir() {
@@ -211,6 +222,7 @@ fn replica_state(root: &Path, fragment: &str) -> Result<ReplicaState, AppError> 
     })
 }
 
+#[cfg(test)]
 fn replica_index_records(score: &ReplicaScore) -> u64 {
     score
         .object_records
@@ -218,6 +230,7 @@ fn replica_index_records(score: &ReplicaScore) -> u64 {
         .saturating_add(score.upload_records)
 }
 
+#[cfg(test)]
 pub(super) fn mtime_nanos(path: &Path) -> u128 {
     fs::symlink_metadata(path)
         .and_then(|meta| meta.modified())
@@ -227,6 +240,7 @@ pub(super) fn mtime_nanos(path: &Path) -> u128 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub(super) fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
     let mut latest = mtime_nanos(fragment_root);
     let Ok(entries) = fs::read_dir(fragment_root) else {
@@ -256,6 +270,7 @@ pub(super) fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
     latest
 }
 
+#[cfg(test)]
 pub(super) fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaState)> {
     let mut best: Option<(PathBuf, ReplicaState, u128)> = None;
     for root in index_roots() {
@@ -293,59 +308,22 @@ pub(super) fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaS
 }
 
 pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) -> ReplicaInspection {
-    let expected_replicas = roots.len() as u64;
-    let mut present_replicas = 0u64;
-    let mut missing_replicas = 0u64;
-    let mut divergent_replicas = 0u64;
-    let mut corrupt_replicas = 0u64;
-    let Some((source_fragment_root, canonical_state)) = choose_replica_source(fragment) else {
-        return ReplicaInspection {
-            expected_replicas,
-            present_replicas: 0,
-            valid_replicas: 0,
-            missing_replicas: expected_replicas,
-            divergent_replicas: 0,
-            corrupt_replicas: 0,
-            healthy: expected_replicas == 0,
-            canonical_path: None,
-        };
+    let (missing, divergent, corrupt) = match crate::namespace::flat::repair(fragment, true) {
+        Ok(counts) => counts,
+        Err(_) => (0, 0, 1),
     };
-
-    let mut valid_replicas = 0u64;
-    for root in roots {
-        let fragment_root = fragment_root_on(&root, fragment);
-        if !fragment_root.exists() {
-            missing_replicas += 1;
-            continue;
-        }
-        present_replicas += 1;
-        let state = match replica_state(root, fragment) {
-            Ok(state) => state,
-            Err(_) => {
-                corrupt_replicas += 1;
-                continue;
-            }
-        };
-        if state == canonical_state {
-            valid_replicas += 1;
-            continue;
-        }
-        if state.score < canonical_state.score {
-            missing_replicas += 1;
-        } else {
-            divergent_replicas += 1;
-        }
-    }
-
     ReplicaInspection {
-        expected_replicas,
-        present_replicas,
-        valid_replicas,
-        missing_replicas,
-        divergent_replicas,
-        corrupt_replicas,
-        healthy: missing_replicas == 0 && divergent_replicas == 0 && corrupt_replicas == 0,
-        canonical_path: Some(source_fragment_root.display().to_string()),
+        expected_replicas: roots.len() as u64,
+        present_replicas: roots
+            .iter()
+            .filter(|r| fragment_root_on(r, fragment).is_dir())
+            .count() as u64,
+        valid_replicas: (roots.len() as u64).saturating_sub(missing + divergent + corrupt),
+        missing_replicas: missing,
+        divergent_replicas: divergent,
+        corrupt_replicas: corrupt,
+        healthy: missing == 0 && divergent == 0 && corrupt == 0,
+        canonical_path: None,
     }
 }
 
@@ -368,26 +346,7 @@ pub fn fragment_meta(fragment: &str) -> Result<Option<FragmentMeta>, AppError> {
 }
 
 pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
-    let _guard = N1_FS_LOCK
-        .lock()
-        .map_err(|_| AppError::InternalServerError("N1 index sync lock poisoned".to_string()))?;
-    let Some((source, source_state)) = choose_replica_source(fragment) else {
-        return Ok(());
-    };
-    ensure_replica_source_unambiguous(fragment, &source, &source_state)?;
-    let source_root = source.parent().unwrap_or(&source).to_path_buf();
-    let source_state = replica_state(&source_root, fragment)?;
-    for dst in fragment_roots(fragment) {
-        if dst == source {
-            continue;
-        }
-        let dst_root = dst.parent().unwrap_or(&dst).to_path_buf();
-        if dst.exists() && replica_state(&dst_root, fragment)? == source_state {
-            continue;
-        }
-        copy_dir_contents(&source, &dst)?;
-    }
-    let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
+    repair_fragment_all_partition_replicas(fragment, false)?;
     Ok(())
 }
 
@@ -402,92 +361,19 @@ pub fn repair_fragment_all_partition_replicas(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let _guard = N1_FS_LOCK
-        .lock()
-        .map_err(|_| AppError::InternalServerError("N1 index repair lock poisoned".to_string()))?;
-    let Some((source, mut source_state)) = choose_replica_source(fragment) else {
-        return Ok((0, 0, 0));
-    };
-    if !dry_run {
-        ensure_replica_source_unambiguous(fragment, &source, &source_state)?;
-        let source_root = source.parent().unwrap_or(&source).to_path_buf();
-        source_state = replica_state(&source_root, fragment)?;
-    }
-    let mut missing = 0;
-    let mut divergent = 0;
-    let mut corrupt = 0;
-    for dst in fragment_roots(fragment) {
-        if dst == source {
-            continue;
-        }
-        if !dst.exists() {
-            missing += 1;
-        } else {
-            let dst_root = dst.parent().unwrap_or(&dst).to_path_buf();
-            let dst_state = match replica_state(&dst_root, fragment) {
-                Ok(state) => state,
-                Err(_) => {
-                    corrupt += 1;
-                    if !dry_run {
-                        copy_dir_contents(&source, &dst)?;
-                    }
-                    continue;
-                }
-            };
-            if dst_state == source_state {
-                continue;
-            }
-            if dst_state.score < source_state.score {
-                missing += 1;
-            } else {
-                divergent += 1;
-            }
-        }
-        if !dry_run {
-            copy_dir_contents(&source, &dst)?;
-        }
-    }
-    if !dry_run {
-        let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
-    }
-    Ok((missing, divergent, corrupt))
+    // No whole-fragment copying: object versions, multipart sessions and local
+    // operation workspaces are not global namespace replicas.
+    crate::namespace::flat::repair(fragment, dry_run)
 }
 
-fn ensure_replica_source_unambiguous(
-    fragment: &str,
-    source: &Path,
-    source_state: &ReplicaState,
-) -> Result<(), AppError> {
-    let source_root = source.parent().unwrap_or(source);
-    let source_objects = collect_symlink_object_ids_under(source_root, fragment, source, true)?;
-    for root in index_roots() {
-        let fragment_root = fragment_root_on(&root, fragment);
-        if !fragment_root.exists() || fragment_root == source {
-            continue;
-        }
-        let Ok(state) = replica_state(&root, fragment) else {
-            continue;
-        };
-        if state.score != source_state.score || state.content_digest == source_state.content_digest
-        {
-            continue;
-        }
-        let objects = collect_symlink_object_ids_under(&root, fragment, &fragment_root, true)?;
-        if objects != source_objects {
-            return Err(AppError::Conflict(format!(
-                "N1 namespace replicas for fragment '{fragment}' reference different objects; refusing destructive automatic repair"
-            )));
-        }
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 pub(super) fn same_root(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
     left == right
 }
 
+#[cfg(test)]
 pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<usize, AppError> {
     let active_index_roots = index_roots();
     let Some((_source, source_score)) = choose_replica_source(fragment) else {
@@ -523,6 +409,7 @@ pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<us
     Ok(cleaned)
 }
 
+#[cfg(test)]
 fn clear_index_plane(fragment_root: &Path) -> Result<(), AppError> {
     fs::create_dir_all(fragment_root).map_err(|e| io_err(e, "create N1 replica root"))?;
     for entry in fs::read_dir(fragment_root).map_err(|e| io_err(e, "scan N1 replica root"))? {
@@ -539,6 +426,7 @@ fn clear_index_plane(fragment_root: &Path) -> Result<(), AppError> {
 
 // Never recursively unlink a parent: an atomic writer can still own a temporary
 // sibling underneath it. This also preserves unrecognised non-file entries.
+#[cfg(test)]
 fn remove_stale_replica_entry(path: &Path) -> Result<(), AppError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -582,14 +470,11 @@ fn remove_stale_replica_entry(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), AppError> {
-    retry_changed_replica_snapshot(src, dst, || reconcile_replica_directory(src, dst, true))
-}
-
 // A durable upload can finish and remove its session directory after readdir
 // but before repair opens/copies that entry. Retry from the same source, never
 // promote the partially copied destination to authority. Missing roots and
 // non-ENOENT I/O failures remain real failures, not concurrency conflicts.
+#[cfg(test)]
 fn retry_changed_replica_snapshot(
     src: &Path,
     dst: &Path,
@@ -612,90 +497,6 @@ fn retry_changed_replica_snapshot(
         }
     }
     unreachable!("the final changed-snapshot attempt returns a conflict")
-}
-
-fn reconcile_replica_directory(
-    src: &Path,
-    dst: &Path,
-    at_fragment_root: bool,
-) -> Result<(), AppError> {
-    if let Ok(meta) = fs::symlink_metadata(dst) {
-        if !meta.is_dir() {
-            return Err(AppError::Conflict(format!(
-                "N1 replica directory conflicts with {}",
-                dst.display()
-            )));
-        }
-    }
-    fs::create_dir_all(dst).map_err(|e| io_err(e, "create N1 replica dir"))?;
-    for entry in fs::read_dir(src).map_err(|e| io_err(e, "scan N1 replica source"))? {
-        let entry = entry.map_err(|e| io_err(e, "scan N1 replica entry"))?;
-        if replica_local_entry(
-            &entry.path(),
-            &entry.file_name().to_string_lossy(),
-            at_fragment_root,
-        ) {
-            continue;
-        }
-        let source = entry.path();
-        let target = dst.join(entry.file_name());
-        let meta =
-            fs::symlink_metadata(&source).map_err(|e| io_err(e, "inspect N1 replica source"))?;
-        if meta.is_dir() {
-            reconcile_replica_directory(&source, &target, false)?;
-        } else if meta.file_type().is_symlink() || meta.is_file() {
-            // Publish a complete sibling without truncating the destination or
-            // introducing a missing-file window. Payload memory stays bounded.
-            let temporary = target.with_file_name(format!("{REPLICA_TMP_PREFIX}{}", Ulid::new()));
-            let result = (|| -> std::io::Result<()> {
-                if meta.file_type().is_symlink() {
-                    unix_fs::symlink(fs::read_link(&source)?, &temporary)?;
-                } else {
-                    let mut input = File::open(&source)?;
-                    let mut output = fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&temporary)?;
-                    std::io::copy(&mut input, &mut output)?;
-                    output.sync_all()?;
-                }
-                fs::rename(&temporary, &target)?;
-                linux_io::sync_dir_blocking(dst)
-            })();
-            if let Err(err) = result {
-                let _ = fs::remove_file(&temporary);
-                return Err(io_err(
-                    err,
-                    &format!(
-                        "publish N1 replica entry {} -> {}",
-                        source.display(),
-                        target.display()
-                    ),
-                ));
-            }
-        } else {
-            return Err(AppError::Conflict(format!(
-                "unsupported N1 replica entry {}",
-                source.display()
-            )));
-        }
-    }
-    for entry in fs::read_dir(dst).map_err(|e| io_err(e, "scan N1 replica destination"))? {
-        let entry = entry.map_err(|e| io_err(e, "scan N1 replica destination entry"))?;
-        let name = entry.file_name();
-        if replica_local_entry(&entry.path(), &name.to_string_lossy(), at_fragment_root) {
-            continue;
-        }
-        match fs::symlink_metadata(src.join(&name)) {
-            Ok(_) => (),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                remove_stale_replica_entry(&entry.path())?;
-            }
-            Err(err) => return Err(io_err(err, "inspect N1 replica source before pruning")),
-        }
-    }
-    linux_io::sync_dir_blocking(dst).map_err(|e| io_err(e, "sync N1 replica directory"))?;
-    Ok(())
 }
 
 #[cfg(test)]

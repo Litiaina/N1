@@ -1061,6 +1061,8 @@ async fn upload_object_one_shot_inner(
         request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
 
     let path_manager = ObjectPathManager::new();
+    let (data_shards, parity_shards, placement_roots) =
+        data_plane::upload_layout(&fragment, &object_key, &version_id)?;
     let created_at = Utc::now().timestamp();
     let part_meta = match write_part_blob_to_disk(
         &path_manager,
@@ -1069,10 +1071,10 @@ async fn upload_object_one_shot_inner(
         &version_id,
         0,
         content_length,
-        configured_data_shards(),
-        configured_parity_shards(),
+        data_shards,
+        parity_shards,
         stripe_size,
-        None,
+        Some(&placement_roots),
         body,
         expected_checksum,
         strict_durability,
@@ -1102,8 +1104,8 @@ async fn upload_object_one_shot_inner(
         content_type,
         total_size_bytes: content_length,
         created_at,
-        data_shards: configured_data_shards() as u16,
-        parity_shards: configured_parity_shards() as u16,
+        data_shards: data_shards as u16,
+        parity_shards: parity_shards as u16,
         placement_generation: 0,
         parts: vec![part_meta],
         is_delete_marker: false,
@@ -1250,6 +1252,8 @@ where
     let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
     let path_manager = ObjectPathManager::new();
+    let (data_shards, parity_shards, placement_roots) =
+        data_plane::upload_layout(&fragment, &object_key, &version_id)?;
     let created_at = Utc::now().timestamp();
     let part_meta = match write_part_blob_to_disk_from_stream(
         &path_manager,
@@ -1258,10 +1262,10 @@ where
         &version_id,
         0,
         content_length,
-        configured_data_shards(),
-        configured_parity_shards(),
+        data_shards,
+        parity_shards,
         stripe_size,
-        None,
+        Some(&placement_roots),
         body_stream,
         expected_checksum,
         strict_durability,
@@ -1291,8 +1295,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
-        data_shards: configured_data_shards() as u16,
-        parity_shards: configured_parity_shards() as u16,
+        data_shards: data_shards as u16,
+        parity_shards: parity_shards as u16,
         placement_generation: 0,
         parts: vec![part_meta],
         is_delete_marker: false,
@@ -1316,7 +1320,10 @@ where
     if let Some(guard) = io_guard {
         guard.complete();
     }
-    Ok(object_meta.without_internal_layout())
+    // Internal callers still need placement to publish the NCX in the exact
+    // enrolled pool. HTTP/native response boundaries strip the layout only
+    // after logical publication; stripping here loses the pool identity.
+    Ok(object_meta)
 }
 
 pub async fn upload_object_one_shot_reader_direct<R>(
@@ -1370,6 +1377,8 @@ where
     let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
     let path_manager = ObjectPathManager::new();
+    let (data_shards, parity_shards, placement_roots) =
+        data_plane::upload_layout(&fragment, &object_key, &version_id)?;
     let created_at = Utc::now().timestamp();
     let part_meta = match write_part_blob_to_disk_from_reader(
         &path_manager,
@@ -1378,10 +1387,10 @@ where
         &version_id,
         0,
         content_length,
-        configured_data_shards(),
-        configured_parity_shards(),
+        data_shards,
+        parity_shards,
         stripe_size,
-        None,
+        Some(&placement_roots),
         reader,
         expected_checksum,
         strict_durability,
@@ -1411,8 +1420,8 @@ where
         content_type,
         total_size_bytes: content_length,
         created_at,
-        data_shards: configured_data_shards() as u16,
-        parity_shards: configured_parity_shards() as u16,
+        data_shards: data_shards as u16,
+        parity_shards: parity_shards as u16,
         placement_generation: 0,
         parts: vec![part_meta],
         is_delete_marker: false,
@@ -1436,7 +1445,8 @@ where
     if let Some(guard) = io_guard {
         guard.complete();
     }
-    Ok(object_meta.without_internal_layout())
+    // Preserve placement until logical publication (see the stream variant).
+    Ok(object_meta)
 }
 
 pub async fn finalize_object_upload(

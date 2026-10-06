@@ -186,9 +186,8 @@ render_unit() {
   config_file="$(systemd_escape_path "$CONFIG_FILE")"
   requires_mounts="$({
     awk '
-      /^\[disk_config\][[:space:]]*$/ { in_disk = 1; next }
-      /^\[/ { in_disk = 0 }
-      in_disk && /^(fs_storage_path|index_store_disks|blob_store_disks)[[:space:]]*=/ {
+      /^\[/ { in_disk = ($0 ~ /^\[disk_config\]/); in_pool = ($0 ~ /^\[storage_pool\./); next }
+      (in_disk && /^fs_storage_path[[:space:]]*=/) || (in_pool && /^roots[[:space:]]*=/) {
         sub(/^[^=]*=/, "")
         gsub(/,/, "\n")
         print

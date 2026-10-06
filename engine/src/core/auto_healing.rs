@@ -225,7 +225,7 @@ pub async fn assess_current_topology() -> TopologyAssessment {
                     })
                 }
             })
-            .buffer_unordered(8)
+            .buffered(8)
             .collect()
             .await
     }
@@ -233,7 +233,7 @@ pub async fn assess_current_topology() -> TopologyAssessment {
     let configured_blob_roots = blob_roots.len();
     let configured_index_roots = index_roots.len();
     let (blob_probes, index_probes) = tokio::join!(
-        probe_paths(blob_roots, identities.clone()),
+        probe_paths(blob_roots.clone(), identities.clone()),
         probe_paths(index_roots, identities)
     );
     let writable_blob_roots = blob_probes.iter().filter(|probe| probe.writable).count();
@@ -254,6 +254,43 @@ pub async fn assess_current_topology() -> TopologyAssessment {
         data_shards,
         parity_shards,
     );
+    if !crate::core::storage_pool::configured().is_empty() {
+        // A degraded old pool must not become a global namespace writer gate.
+        // New uploads need one complete pool; mutations enforce all exact
+        // holders of their own home pool inside the per-key coordinator.
+        let writable_pool = crate::core::storage_pool::configured()
+            .iter()
+            .rev()
+            .find(|pool| {
+                let probes = pool
+                    .roots
+                    .iter()
+                    .filter_map(|root| {
+                        blob_roots
+                            .iter()
+                            .position(|path| Path::new(path) == root)
+                            .map(|index| &blob_probes[index])
+                    })
+                    .collect::<Vec<_>>();
+                !pool.sealed
+                    && probes.len() == pool.width()
+                    && probes.iter().all(|p| p.writable)
+                    && probes
+                        .iter()
+                        .filter_map(|p| p.device_id)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        == pool.width()
+            });
+        assessment.write_safe = writable_pool.is_some();
+        assessment.reason = writable_pool
+            .is_none()
+            .then(|| "N1 is read-only: no complete writable storage pool is available".into());
+        if let Some(pool) = writable_pool {
+            assessment.data_shards = usize::from(pool.data_shards);
+            assessment.parity_shards = usize::from(pool.parity_shards);
+        }
+    }
     if let Some(error) = identity_error {
         assessment.write_safe = false;
         assessment.reason = Some(format!(

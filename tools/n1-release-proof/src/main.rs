@@ -29,6 +29,7 @@ include!("proof_client.rs");
 include!("proof_native.rs");
 include!("proof_noa.rs");
 include!("proof_backup.rs");
+include!("proof_flat_namespace.rs");
 include!("proof_batch.rs");
 include!("proof_native_bench.rs");
 include!("proof_upload_bench.rs");
@@ -53,7 +54,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.backup_proof {
+    let result = if proof.args.flat_namespace_proof {
+        proof.run_flat_namespace_proof().await
+    } else if proof.args.pool_expansion_proof {
+        proof.run_pool_expansion_proof().await
+    } else if proof.args.backup_proof {
         proof.run_backup_proof().await
     } else if proof.args.gc_safety_proof {
         proof.run_gc_safety_proof().await
@@ -101,5 +106,39 @@ async fn main() {
             eprintln!("N1_RELEASE_PROOF FAIL {err}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_workload_deadline_retains_the_default_gate_and_accepts_explicit_override() {
+        let required = [
+            "n1-release-proof",
+            "--binary",
+            "engine",
+            "--source-file",
+            "source",
+            "--disk-roots",
+            "/pool/a,/pool/b",
+            "--out-dir",
+            "evidence",
+        ];
+        assert_eq!(
+            Args::try_parse_from(required)
+                .unwrap()
+                .gc_workload_timeout_seconds,
+            300
+        );
+        let mut explicit = required.to_vec();
+        explicit.extend(["--gc-workload-timeout-seconds", "900"]);
+        assert_eq!(
+            Args::try_parse_from(explicit)
+                .unwrap()
+                .gc_workload_timeout_seconds,
+            900
+        );
     }
 }

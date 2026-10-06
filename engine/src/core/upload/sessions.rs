@@ -53,8 +53,8 @@ async fn prepare_upload_manifest(
         part_size_bytes,
     );
     let stripe_size = choose_upload_stripe_size_for_parts(&planned_sizes);
-    let data_shards = configured_data_shards();
-    let parity_shards = configured_parity_shards();
+    let (data_shards, parity_shards, placement_roots) =
+        data_plane::upload_layout(fragment, object_key, &version_id)?;
 
     let manifest = UploadSessionManifest {
         fragment: fragment.to_string(),
@@ -72,16 +72,7 @@ async fn prepare_upload_manifest(
         stripe_size_bytes: stripe_size,
         data_shards: data_shards as u16,
         parity_shards: parity_shards as u16,
-        placement_roots: ObjectPathManager::new()
-            .select_blob_roots_for_object(
-                fragment,
-                object_key,
-                &version_id,
-                data_shards.saturating_add(parity_shards),
-            )?
-            .into_iter()
-            .map(|root| root.to_string_lossy().to_string())
-            .collect(),
+        placement_roots,
     };
 
     ensure_registered_placement_roots(

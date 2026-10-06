@@ -135,6 +135,10 @@ pub struct NamespacePage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceMutationSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_paths: Vec<String>,
     pub operation: String,
     pub kind: NamespaceEntryKind,
     pub affected_paths: usize,

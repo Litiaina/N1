@@ -258,7 +258,11 @@ pub(super) async fn run_redistribution_job_reserved(
         .unwrap_or_else(default_stripe_size);
 
     let pm = ObjectPathManager::new();
-    let blob_roots_cfg = pm.get_blob_roots();
+    let blob_roots_cfg = if crate::core::storage_pool::configured().is_empty() {
+        pm.get_blob_roots()
+    } else {
+        crate::core::storage_pool::write_pool()?.roots.clone()
+    };
 
     let index_roots_cfg: Vec<PathBuf> = INDEX_STORE_DISKS
         .get()
@@ -739,14 +743,6 @@ pub(super) async fn run_redistribution_job_reserved(
                 );
             }
         }
-        for fragment in &scanned_fragments {
-            if let Err(err) = index_store::cleanup_stale_index_plane_on_blob_only_roots(fragment) {
-                warn!(
-                    "Failed to clean stale N1 index plane from blob-only roots for fragment {}: {}",
-                    fragment, err
-                );
-            }
-        }
     }
 
     io_guard.complete();
@@ -802,6 +798,10 @@ pub(crate) async fn check_needs_redistribution(
     _is_trash: bool,
 ) -> RedistributionNeeds {
     let mut needs = RedistributionNeeds::default();
+    // Expansion does not turn healthy immutable old-pool placements into debt.
+    if crate::core::storage_pool::pool_for_metadata(meta).is_some() {
+        return needs;
+    }
     if scope == RedistributionScope::Namespace {
         return needs;
     }

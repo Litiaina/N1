@@ -1,17 +1,18 @@
 use super::disk_manager::{
-    BLOB_STORE_DISKS, IndexListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager,
-    PartMetadata, ReservationReceipt,
+    IndexListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata,
+    ReservationReceipt,
 };
 use super::index::{
     IndexSessionState, IndexWriteDurability, SessionPartReceipt, TrashCatalogEntry,
 };
 use super::upload::UploadSessionManifest;
 use crate::core::constants::N1_OBJECTS_DIR;
+#[cfg(test)]
+use crate::core::disk_manager::BLOB_STORE_DISKS;
 use crate::core::fragment_identity::{
     FRAGMENT_ALIAS_DIR, PHYSICAL_FRAGMENT_PREFIX, fragment_alias_dir, fragment_alias_path,
-    fragment_alias_target_stable_id, fragment_root_on as resolved_fragment_root_on,
-    list_fragment_aliases, physical_fragment_dir_name, physical_fragment_root_on,
-    stable_fragment_id_for_root,
+    fragment_alias_target_stable_id, list_fragment_aliases, physical_fragment_dir_name,
+    physical_fragment_root_on,
 };
 use crate::core::linux_io;
 use crate::enums::app_error_enum::AppError;
@@ -23,13 +24,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
+#[cfg(test)]
 use std::io::Read;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 use ulid::Ulid;
-use walkdir::WalkDir;
 
 pub(crate) const OBJECTS_DIR: &str = N1_OBJECTS_DIR;
 pub(crate) const UPLOADS_DIR: &str = ".uploads";
@@ -39,7 +39,7 @@ pub(crate) const LOCKS_DIR: &str = ".locks";
 pub(crate) const GC_DIR: &str = ".gc";
 pub(crate) const REPAIR_DIR: &str = ".repair";
 const FRAGMENT_META_FILE: &str = ".fragment.ndx";
-pub(crate) const N1_ENGINE_FORMAT_VERSION: u16 = 3;
+pub(crate) const N1_ENGINE_FORMAT_VERSION: u16 = 4;
 const MANIFEST_FILE: &str = "manifest.ndx";
 const BINDING_FILE: &str = "binding.ndx";
 const SHARD_RECEIPT_PREFIX: &str = "shard_p";
@@ -50,8 +50,8 @@ pub(crate) const OBJECT_DIR_PREFIX: &str = "@o_";
 pub(crate) const FRAGMENT_DIR_PREFIX: &str = PHYSICAL_FRAGMENT_PREFIX;
 const INTENTS_DIR: &str = ".intents";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
+#[cfg(test)]
 const REPLICA_TMP_PREFIX: &str = ".tmp-replica-";
-static N1_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMeta {
@@ -105,26 +105,15 @@ pub(crate) struct TrashRecord {
     pub deleted_at_unix: i64,
 }
 
-pub(crate) fn trash_generation_name(unix_nanos: i64, path_depth: usize) -> String {
-    format!("{unix_nanos}.d{path_depth}")
-}
-
-pub(crate) fn parse_trash_generation_name(name: &str) -> Option<(i64, usize)> {
-    let (unix_nanos, path_depth) = name.rsplit_once(".d")?;
-    let unix_nanos = unix_nanos.parse::<i64>().ok()?;
-    let path_depth = path_depth.parse::<usize>().ok()?;
-    (unix_nanos >= 0 && path_depth > 0).then_some((unix_nanos, path_depth))
-}
-
 #[derive(Debug, Clone)]
 struct NdxSummary {
     version_id: String,
     size_bytes: u64,
     unix_nanos: i128,
     packed_ext: u64,
-    file_name: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct ReplicaScore {
     meta_present: u64,
@@ -133,6 +122,7 @@ struct ReplicaScore {
     upload_records: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplicaState {
     score: ReplicaScore,
@@ -248,6 +238,57 @@ fn validate_physical_fragment_identity(
         )));
     }
     Ok(meta.state == "active")
+}
+
+/// Enroll global fragment credentials/identity on newly added pool members.
+/// This small control catalog is not the per-object namespace. No NCX, NDX
+/// object version or payload is moved or copied during expansion.
+pub fn enroll_fragment_control_roots() -> Result<(), AppError> {
+    let roots = index_roots();
+    let aliases = roots
+        .iter()
+        .flat_map(|root| list_fragment_aliases(root))
+        .collect::<BTreeSet<_>>();
+    for alias in aliases {
+        let mut selected: Option<(FragmentMeta, Vec<u8>)> = None;
+        for root in &roots {
+            let path = fragment_root_on(root, &alias).join(FRAGMENT_META_FILE);
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(e, "read fragment control catalog")),
+            };
+            let meta = decode_fragment_meta(&bytes)?;
+            if let Some((old, old_bytes)) = &selected {
+                if old.stable_fragment_id != meta.stable_fragment_id
+                    || (old.updated_at_unix == meta.updated_at_unix && old_bytes != &bytes)
+                {
+                    return Err(AppError::Conflict(
+                        "ambiguous fragment control identity".into(),
+                    ));
+                }
+                if old.updated_at_unix > meta.updated_at_unix {
+                    continue;
+                }
+            }
+            selected = Some((meta, bytes));
+        }
+        let Some((meta, bytes)) = selected else {
+            continue;
+        };
+        if meta.state != "active" {
+            continue;
+        }
+        for root in &roots {
+            let physical = physical_fragment_root_on(root, &meta.stable_fragment_id);
+            let path = physical.join(FRAGMENT_META_FILE);
+            if !path.exists() {
+                write_atomic(&path, &bytes)?;
+            }
+        }
+    }
+    reconcile_fragment_alias_replicas(&roots, false)?;
+    Ok(())
 }
 
 /// Restores a missing alias only when surviving replicas unanimously map one
@@ -388,19 +429,27 @@ fn blob_roots() -> Vec<PathBuf> {
 }
 
 pub(crate) fn fragment_root_on(root: &Path, fragment: &str) -> PathBuf {
-    resolved_fragment_root_on(root, fragment)
+    // All members resolve through the surviving stable identity. Missing one
+    // local alias must not redirect namespace repair into an @f_<public-hash>
+    // tree or hide a healthy pointer on that member.
+    physical_fragment_root_on(root, &stable_fragment_id_for_fragment(fragment))
 }
 
-fn stable_fragment_id_for_fragment(fragment: &str) -> String {
+pub(crate) fn stable_fragment_id_for_fragment(fragment: &str) -> String {
+    // Physical identity, not a mutable public alias, owns placement and
+    // coordination. A missing first member must not hide a surviving alias.
+    if let Some(stable) = fragment.strip_prefix(PHYSICAL_FRAGMENT_PREFIX) {
+        return stable.to_string();
+    }
+    if Ulid::from_string(fragment).is_ok() {
+        return fragment.to_string();
+    }
     for root in index_roots() {
-        if let Some(stable) = stable_fragment_id_for_root(&root, fragment) {
+        if let Some(stable) = fragment_alias_target_stable_id(&root, fragment) {
             return stable;
         }
     }
-    fragment
-        .strip_prefix(PHYSICAL_FRAGMENT_PREFIX)
-        .unwrap_or(fragment)
-        .to_string()
+    fragment.to_string()
 }
 
 fn blob_fragment_root_on(root: &Path, fragment: &str) -> PathBuf {
@@ -437,6 +486,7 @@ fn reserved_user_segment(segment: &str) -> bool {
         || segment.starts_with(TRASH_JOBS_DIR)
 }
 
+#[cfg(test)]
 pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
     name.starts_with(OBJECT_DIR_PREFIX)
         || name.starts_with(FRAGMENT_DIR_PREFIX)
@@ -548,48 +598,19 @@ pub(crate) fn live_object_dir(
     object_index_dir(root, fragment, object_id)
 }
 
-pub(crate) fn namespace_path(root: &Path, fragment: &str, logical_path: &str) -> PathBuf {
-    fragment_root_on(root, fragment).join(logical_path)
-}
-
-fn object_symlink_target(object_id: &str) -> Result<PathBuf, AppError> {
-    Ok(PathBuf::from(object_dir_name_for_id(object_id)?))
-}
-
+#[cfg(test)]
 pub(crate) fn read_namespace_symlink_object_id(
     _root: &Path,
     _fragment: &str,
     link_path: &Path,
 ) -> Result<Option<String>, AppError> {
-    let meta = match fs::symlink_metadata(link_path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(io_err(err, "inspect N1 namespace link")),
-    };
-    if !meta.file_type().is_symlink() {
+    if !link_path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .ends_with(crate::namespace::flat::SUFFIX)
+    }) {
         return Ok(None);
     }
-    let target = match fs::read_link(link_path) {
-        Ok(target) => target,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(io_err(err, "read N1 namespace link")),
-    };
-    if target.is_absolute() {
-        return Err(AppError::InternalServerError(format!(
-            "N1 namespace link {} has absolute target",
-            link_path.display()
-        )));
-    }
-    if target.components().count() != 1 {
-        return Err(AppError::InternalServerError(format!(
-            "N1 namespace link {} target is not a direct object pointer",
-            link_path.display()
-        )));
-    }
-    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
-        return Ok(None);
-    };
-    Ok(object_id_from_dir_name(name))
+    Ok(crate::namespace::flat::read(link_path)?.map(|pointer| pointer.object_id))
 }
 
 #[cfg(test)]
@@ -602,40 +623,22 @@ pub(crate) fn publish_namespace_link(
     publish_namespace_link_with_durability(root, fragment, logical_path, object_id, true)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_namespace_link_with_durability(
     root: &Path,
     fragment: &str,
     logical_path: &str,
     object_id: &str,
-    strict_durability: bool,
+    _strict: bool,
 ) -> Result<(), AppError> {
-    let logical_path = normalize_object_key(logical_path)?;
-    let link = namespace_path(root, fragment, &logical_path);
-    let parent = link.parent().ok_or_else(|| {
-        AppError::InternalServerError("N1 namespace link has no parent".to_string())
-    })?;
-    fs::create_dir_all(parent).map_err(|err| io_err(err, "create N1 namespace parent"))?;
-
-    if let Some(existing) = read_namespace_symlink_object_id(root, fragment, &link)? {
-        if existing == normalize_object_id(object_id)? {
-            return Ok(());
-        }
-        return Err(AppError::Conflict(format!(
-            "logical path '{}' already points to another object",
-            logical_path
-        )));
-    }
-    if fs::symlink_metadata(&link).is_ok() {
-        return Err(AppError::Conflict(format!(
-            "logical path '{}' already exists",
-            logical_path
-        )));
-    }
-    let target = object_symlink_target(object_id)?;
-    unix_fs::symlink(target, &link).map_err(|e| io_err(e, "publish N1 namespace link"))?;
-    if strict_durability {
-        sync_dir(parent);
-    }
+    let key = normalize_object_key(logical_path)?;
+    let id = normalize_object_id(object_id)?;
+    crate::namespace::flat::publish(
+        fragment,
+        &key,
+        &id,
+        crate::core::storage_pool::pool_for_root(root),
+    )?;
     Ok(())
 }
 
@@ -762,7 +765,6 @@ fn parse_ndx_file_name(name: &str) -> Option<NdxSummary> {
         size_bytes,
         unix_nanos,
         packed_ext,
-        file_name: name.to_string(),
     })
 }
 
@@ -984,12 +986,6 @@ fn decode_metadata_file(path: &Path) -> Result<ObjectMetadata, AppError> {
     decode(&bytes)
 }
 
-fn decode_metadata_file_as(path: &Path, object_key: &str) -> Result<ObjectMetadata, AppError> {
-    let mut meta = decode_metadata_file(path)?;
-    meta.object_key = object_key.to_string();
-    Ok(meta)
-}
-
 fn read_authoritative_object_metadata(
     paths: Vec<PathBuf>,
     object_key: &str,
@@ -1042,14 +1038,6 @@ fn read_authoritative_object_metadata(
     }
 }
 
-fn record_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent}/{name}")
-    }
-}
-
 fn summary_metadata(fragment: &str, object_key: String, summary: NdxSummary) -> ObjectMetadata {
     let content_type = mime_guess::from_path(&object_key)
         .first_raw()
@@ -1083,17 +1071,6 @@ fn summary_metadata(fragment: &str, object_key: String, summary: NdxSummary) -> 
     }
 }
 
-fn summary_entry(record: String, summary: &NdxSummary) -> IndexListEntry {
-    IndexListEntry {
-        record,
-        kind: "file".to_string(),
-        size_bytes: summary.size_bytes,
-        created_at_unix_nanos: summary.unix_nanos.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-        packed_ext_u64: Some(summary.packed_ext),
-        version_ulid: Some(summary.version_id.clone()),
-    }
-}
-
 fn directory_entry(record: String) -> IndexListEntry {
     IndexListEntry {
         record,
@@ -1120,6 +1097,10 @@ fn write_atomic_with_durability(
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     write_atomic_with_durability(path, bytes, true)
+}
+
+pub(crate) fn write_pool_identity(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    write_atomic(path, bytes)
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<bool, AppError> {
@@ -1245,44 +1226,16 @@ pub(crate) fn object_metadata_placements_healthy(
 
 fn object_dirs_for_all_live(fragment: &str) -> Result<Vec<(PathBuf, String, String)>, AppError> {
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for fragment_root in existing_fragment_roots(fragment) {
-        let index_root = fragment_root
-            .parent()
-            .unwrap_or(&fragment_root)
-            .to_path_buf();
-        let mut stack = vec![(fragment_root.clone(), String::new())];
-        while let Some((dir, rel)) = stack.pop() {
-            let Ok(names) = read_dir_names(&dir) else {
-                continue;
-            };
-            for name in names {
-                if internal_namespace_entry_name(&name) {
-                    continue;
-                }
-                let child = dir.join(&name);
-                let child_rel = if rel.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel}/{name}")
-                };
-                if let Some(object_id) =
-                    read_namespace_symlink_object_id(&index_root, fragment, &child)?
-                {
-                    let object_dir = object_dir_candidates(fragment, &object_id)?
-                        .into_iter()
-                        .find(|dir| dir.is_dir())
-                        .unwrap_or_default();
-                    if seen.insert(child_rel.clone()) {
-                        out.push((object_dir, child_rel, object_id));
-                    }
-                } else if child.is_dir() {
-                    stack.push((child, child_rel));
-                }
-            }
-        }
+    for key in crate::namespace::flat::keys(fragment, "")? {
+        let Some(pointer) = crate::namespace::flat::lookup(fragment, &key)? else {
+            continue;
+        };
+        let dir = object_dir_candidates(fragment, &pointer.object_id)?
+            .into_iter()
+            .find(|dir| dir.is_dir())
+            .unwrap_or_default();
+        out.push((dir, key, pointer.object_id));
     }
-    out.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(out)
 }
 
@@ -1327,110 +1280,116 @@ pub fn rebind_unpublished_object_version(
         return Ok(metadata.clone());
     }
 
-    let _guard = N1_FS_LOCK
-        .lock()
-        .map_err(|_| AppError::InternalServerError("N1 object rebind lock poisoned".into()))?;
-    let roots = blob_roots();
-    let mut moves = Vec::<(PathBuf, PathBuf)>::new();
-    for root in &roots {
-        let source_dir = object_index_dir(root, &metadata.fragment, &source_object_id)?;
-        let destination_dir = object_index_dir(root, &metadata.fragment, &destination_object_id)?;
-        let source_payload = source_dir.join(&metadata.version_id);
-        let destination_payload = destination_dir.join(&metadata.version_id);
-        if source_payload.is_dir() {
-            if destination_payload.exists() {
-                return Err(AppError::Conflict(format!(
-                    "object version {} already exists under destination object {}",
-                    metadata.version_id, destination_object_id
+    crate::namespace::flat::with_keys(
+        &metadata.fragment,
+        &[&format!("@rebind:{}", metadata.version_id)],
+        || {
+            let roots = blob_roots();
+            let mut moves = Vec::<(PathBuf, PathBuf)>::new();
+            for root in &roots {
+                let source_dir = object_index_dir(root, &metadata.fragment, &source_object_id)?;
+                let destination_dir =
+                    object_index_dir(root, &metadata.fragment, &destination_object_id)?;
+                let source_payload = source_dir.join(&metadata.version_id);
+                let destination_payload = destination_dir.join(&metadata.version_id);
+                if source_payload.is_dir() {
+                    if destination_payload.exists() {
+                        return Err(AppError::Conflict(format!(
+                            "object version {} already exists under destination object {}",
+                            metadata.version_id, destination_object_id
+                        )));
+                    }
+                    moves.push((source_payload, destination_payload));
+                }
+            }
+            if moves.is_empty() {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "unpublished object {} version {} has no shard-bearing placement",
+                    source_object_id, metadata.version_id
                 )));
             }
-            moves.push((source_payload, destination_payload));
-        }
-    }
-    if moves.is_empty() {
-        return Err(AppError::ServiceUnavailable(format!(
-            "unpublished object {} version {} has no shard-bearing placement",
-            source_object_id, metadata.version_id
-        )));
-    }
 
-    let mut completed = Vec::<(PathBuf, PathBuf)>::new();
-    for (source, destination) in &moves {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| io_err(err, "create rebound N1 object placement"))?;
-        }
-        if let Err(err) = fs::rename(source, destination) {
-            for (old_source, new_destination) in completed.iter().rev() {
-                let _ = fs::rename(new_destination, old_source);
+            let mut completed = Vec::<(PathBuf, PathBuf)>::new();
+            for (source, destination) in &moves {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|err| io_err(err, "create rebound N1 object placement"))?;
+                }
+                if let Err(err) = fs::rename(source, destination) {
+                    for (old_source, new_destination) in completed.iter().rev() {
+                        let _ = fs::rename(new_destination, old_source);
+                    }
+                    return Err(io_err(err, "rebind N1 object placement"));
+                }
+                completed.push((source.clone(), destination.clone()));
             }
-            return Err(io_err(err, "rebind N1 object placement"));
-        }
-        completed.push((source.clone(), destination.clone()));
-    }
 
-    let mut rebound = metadata.clone();
-    rebound.placement_generation =
-        rebound.placement_generation.checked_add(1).ok_or_else(|| {
-            AppError::InternalServerError(
-                "object placement generation exhausted during rebind".into(),
-            )
-        })?;
-    rebound.object_key = destination_object_id.clone();
-    for part in &mut rebound.parts {
-        for shard in &mut part.shards {
-            let Some(root) = roots
-                .iter()
-                .find(|root| Path::new(&shard.absolute_path).starts_with(root))
-            else {
+            let mut rebound = metadata.clone();
+            rebound.placement_generation =
+                rebound.placement_generation.checked_add(1).ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "object placement generation exhausted during rebind".into(),
+                    )
+                })?;
+            rebound.object_key = destination_object_id.clone();
+            for part in &mut rebound.parts {
+                for shard in &mut part.shards {
+                    let Some(root) = roots
+                        .iter()
+                        .find(|root| Path::new(&shard.absolute_path).starts_with(root))
+                    else {
+                        for (old_source, new_destination) in completed.iter().rev() {
+                            let _ = fs::rename(new_destination, old_source);
+                        }
+                        return Err(AppError::InternalServerError(format!(
+                            "shard path {} does not belong to a configured blob root",
+                            shard.absolute_path
+                        )));
+                    };
+                    shard.absolute_path =
+                        object_index_dir(root, &metadata.fragment, &destination_object_id)?
+                            .join(&metadata.version_id)
+                            .join(&shard.file_name)
+                            .to_string_lossy()
+                            .into_owned();
+                }
+            }
+
+            if let Err(err) = write_metadata_to_roots(&rebound) {
+                for root in &roots {
+                    let destination_dir =
+                        object_index_dir(root, &metadata.fragment, &destination_object_id)?;
+                    if let Some(path) =
+                        ndx_path_for_version(&destination_dir, &metadata.version_id)?
+                    {
+                        let _ = remove_file_if_exists(&path);
+                    }
+                }
                 for (old_source, new_destination) in completed.iter().rev() {
                     let _ = fs::rename(new_destination, old_source);
                 }
-                return Err(AppError::InternalServerError(format!(
-                    "shard path {} does not belong to a configured blob root",
-                    shard.absolute_path
-                )));
-            };
-            shard.absolute_path =
-                object_index_dir(root, &metadata.fragment, &destination_object_id)?
-                    .join(&metadata.version_id)
-                    .join(&shard.file_name)
-                    .to_string_lossy()
-                    .into_owned();
-        }
-    }
-
-    if let Err(err) = write_metadata_to_roots(&rebound) {
-        for root in &roots {
-            let destination_dir =
-                object_index_dir(root, &metadata.fragment, &destination_object_id)?;
-            if let Some(path) = ndx_path_for_version(&destination_dir, &metadata.version_id)? {
-                let _ = remove_file_if_exists(&path);
+                return Err(err);
             }
-        }
-        for (old_source, new_destination) in completed.iter().rev() {
-            let _ = fs::rename(new_destination, old_source);
-        }
-        return Err(err);
-    }
 
-    for root in &roots {
-        let source_dir = object_index_dir(root, &metadata.fragment, &source_object_id)?;
-        if let Some(path) = ndx_path_for_version(&source_dir, &metadata.version_id)? {
-            let _ = remove_file_if_exists(&path)?;
-        }
-        if source_dir.is_dir()
-            && fs::read_dir(&source_dir)
-                .map_err(|err| io_err(err, "inspect rebound N1 source object"))?
-                .next()
-                .is_none()
-        {
-            fs::remove_dir(&source_dir)
-                .map_err(|err| io_err(err, "remove rebound N1 source object"))?;
-        }
-    }
+            for root in &roots {
+                let source_dir = object_index_dir(root, &metadata.fragment, &source_object_id)?;
+                if let Some(path) = ndx_path_for_version(&source_dir, &metadata.version_id)? {
+                    let _ = remove_file_if_exists(&path)?;
+                }
+                if source_dir.is_dir()
+                    && fs::read_dir(&source_dir)
+                        .map_err(|err| io_err(err, "inspect rebound N1 source object"))?
+                        .next()
+                        .is_none()
+                {
+                    fs::remove_dir(&source_dir)
+                        .map_err(|err| io_err(err, "remove rebound N1 source object"))?;
+                }
+            }
 
-    Ok(rebound)
+            Ok(rebound)
+        },
+    )
 }
 
 pub fn read_live_version(
@@ -1511,106 +1470,46 @@ pub fn list_live_heads(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> 
 fn scan_live_heads_direct_page(
     fragment: &str,
     prefix: Option<String>,
+    delimiter: Option<String>,
     limit: usize,
     continuation_token: Option<String>,
 ) -> Result<ListObjectsResult, AppError> {
-    let prefix = prefix
-        .map(|prefix| normalize_object_key(&prefix))
-        .transpose()?
-        .unwrap_or_default();
-    let limit = limit.max(1);
-    let candidate_limit = limit.saturating_add(1);
-    let mut candidate_names = BTreeSet::<String>::new();
-    for fragment_root in existing_fragment_roots(fragment) {
-        let index_root = fragment_root
-            .parent()
-            .unwrap_or(&fragment_root)
-            .to_path_buf();
-        let dir = fragment_root.join(&prefix);
-        if !dir.is_dir() {
-            continue;
-        }
-        visit_dir_names(&dir, |name| {
-            if internal_namespace_entry_name(&name) {
-                return Ok(true);
-            }
-            if continuation_token
-                .as_ref()
-                .is_some_and(|after| name.as_str() <= after.as_str())
-            {
-                return Ok(true);
-            }
-            let child = dir.join(&name);
-            if read_namespace_symlink_object_id(&index_root, fragment, &child)?.is_none()
-                && !child.is_dir()
-            {
-                return Ok(true);
-            }
-            candidate_names.insert(name);
-            if candidate_names.len() > candidate_limit {
-                candidate_names.pop_last();
-            }
-            Ok(true)
-        })?;
-    }
-
-    let has_more = candidate_names.len() > limit;
-    if has_more {
-        candidate_names.pop_last();
-    }
-    let mut entries = Vec::new();
-    let mut objects = Vec::new();
-    let mut common_prefixes = Vec::new();
-    for name in candidate_names {
-        let mut selected = None;
-        for fragment_root in existing_fragment_roots(fragment) {
-            let index_root = fragment_root
-                .parent()
-                .unwrap_or(&fragment_root)
-                .to_path_buf();
-            let child = fragment_root.join(&prefix).join(&name);
-            if let Some(object_id) =
-                read_namespace_symlink_object_id(&index_root, fragment, &child)?
-            {
-                let Some(object_dir) = object_dir_candidates(fragment, &object_id)?
-                    .into_iter()
-                    .find(|dir| dir.is_dir())
-                else {
-                    continue;
-                };
-                let Some(summary) = latest_summary_in_object_dir(&object_dir)? else {
-                    continue;
-                };
-                let record = record_path(&prefix, &name);
-                let entry = summary_entry(name.clone(), &summary);
-                let metadata = summary_metadata(fragment, record, summary);
-                selected = Some((entry, Some(metadata)));
-                break;
-            }
-            if child.is_dir() {
-                selected = Some((directory_entry(name.clone()), None));
-                break;
-            }
-        }
-        let Some((entry, object)) = selected else {
-            continue;
-        };
-        if entry.kind == "directory" {
-            common_prefixes.push(entry.record.clone());
-        }
-        if let Some(object) = object {
-            objects.push(object);
-        }
-        entries.push(entry);
-    }
-    let next = has_more
-        .then(|| entries.last().map(|entry| entry.record.clone()))
-        .flatten();
+    let prefix = prefix.unwrap_or_default();
+    reject_reserved_user_path(
+        &normalize_path(&prefix).map_err(|e| AppError::BadRequest(e.to_string()))?,
+    )?;
+    let delimiter = delimiter.unwrap_or_else(|| "/".into());
+    let (names, next) = crate::namespace::flat::page(
+        fragment,
+        &prefix,
+        &delimiter,
+        continuation_token.as_deref(),
+        limit,
+    )?;
+    let entries = names
+        .iter()
+        .map(|(key, directory)| IndexListEntry {
+            record: key
+                .strip_prefix(&prefix)
+                .unwrap_or(key)
+                .trim_end_matches('/')
+                .to_string(),
+            kind: if *directory { "directory" } else { "file" }.into(),
+            size_bytes: 0,
+            created_at_unix_nanos: 0,
+            packed_ext_u64: None,
+            version_ulid: None,
+        })
+        .collect();
+    let common_prefixes = names
+        .into_iter()
+        .filter_map(|(key, directory)| directory.then_some(key))
+        .collect();
     Ok(ListObjectsResult {
         prefix: Some(prefix),
         limit: Some(limit),
         entries,
-        objects,
+        objects: Vec::new(),
         common_prefixes,
         continuation_token: next.clone(),
         next_continuation_token: next,
@@ -1625,8 +1524,7 @@ pub fn scan_live_heads_page(
     continuation_token: Option<String>,
     _include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    let _ = delimiter;
-    scan_live_heads_direct_page(fragment, prefix, limit, continuation_token)
+    scan_live_heads_direct_page(fragment, prefix, delimiter, limit, continuation_token)
 }
 
 pub fn scan_live_full_metadata_page(
@@ -1639,115 +1537,34 @@ pub fn scan_live_full_metadata_page(
 ) -> Result<ListObjectsResult, AppError> {
     let prefix = prefix.unwrap_or_default();
     let delimiter = delimiter.unwrap_or_default();
-    let limit = limit.max(1);
-    let candidate_limit = limit.saturating_add(1);
-    let mut candidates = BTreeMap::<String, String>::new();
+    let (names, next) = crate::namespace::flat::page(
+        fragment,
+        &prefix,
+        &delimiter,
+        continuation_token.as_deref(),
+        limit,
+    )?;
     let mut objects = Vec::new();
-    let mut common_prefixes = BTreeSet::new();
-    for fragment_root in existing_fragment_roots(fragment) {
-        let index_root = fragment_root
-            .parent()
-            .unwrap_or(&fragment_root)
-            .to_path_buf();
-        let base = fragment_root.join(&prefix);
-        if !base.is_dir() {
+    let mut common_prefixes = Vec::new();
+    for (key, directory) in names {
+        if directory {
+            common_prefixes.push(key);
             continue;
         }
-        let walker = WalkDir::new(&base)
-            .min_depth(1)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || !internal_namespace_entry_name(entry.file_name().to_string_lossy().as_ref())
-            });
-        for entry in walker {
-            let entry = entry.map_err(|error| {
-                AppError::InternalServerError(format!(
-                    "walk N1 namespace directory {}: {error}",
-                    base.display()
-                ))
-            })?;
-            if !entry.file_type().is_symlink() {
-                continue;
-            }
-            let relative = entry.path().strip_prefix(&fragment_root).map_err(|_| {
-                AppError::InternalServerError(format!(
-                    "N1 namespace entry {} escaped {}",
-                    entry.path().display(),
-                    fragment_root.display()
-                ))
-            })?;
-            let rel = relative.to_string_lossy().replace('\\', "/");
-            if continuation_token
-                .as_ref()
-                .is_some_and(|after| rel <= *after)
-            {
-                continue;
-            }
-            if delimiter == "/" {
-                let rest = if prefix.is_empty() {
-                    rel.as_str()
-                } else {
-                    rel.strip_prefix(&prefix).unwrap_or("")
-                };
-                let rest = rest.trim_start_matches('/');
-                if let Some((first, _)) = rest.split_once('/') {
-                    let cp = if prefix.is_empty() {
-                        format!("{first}/")
-                    } else {
-                        format!("{}/{}", prefix.trim_end_matches('/'), first)
-                    };
-                    common_prefixes.insert(cp);
-                    if common_prefixes.len() > candidate_limit {
-                        common_prefixes.pop_last();
-                    }
-                    continue;
-                }
-            }
-            let Some(object_id) =
-                read_namespace_symlink_object_id(&index_root, fragment, entry.path())?
-            else {
-                continue;
-            };
-            candidates.entry(rel).or_insert(object_id);
-            if candidates.len() > candidate_limit {
-                candidates.pop_last();
+        if let Some(pointer) = crate::namespace::flat::lookup(fragment, &key)? {
+            if let Some(metadata) = read_current_live_head(fragment, &pointer.object_id)? {
+                objects.push(metadata);
             }
         }
-    }
-
-    let has_more = candidates.len() > limit;
-    if has_more {
-        candidates.pop_last();
-    }
-    let continuation = has_more
-        .then(|| candidates.last_key_value().map(|(rel, _)| rel.clone()))
-        .flatten();
-
-    for (_rel, object_id) in candidates {
-        let Some(dir) = object_dir_candidates(fragment, &object_id)?
-            .into_iter()
-            .find(|dir| dir.is_dir())
-        else {
-            continue;
-        };
-        let Some(summary) = latest_summary_in_object_dir(&dir)? else {
-            continue;
-        };
-        objects.push(decode_metadata_file_as(
-            &dir.join(summary.file_name),
-            &object_id,
-        )?);
     }
     Ok(ListObjectsResult {
         prefix: Some(prefix),
         limit: Some(limit),
         entries: Vec::new(),
         objects,
-        common_prefixes: common_prefixes.into_iter().collect(),
-        continuation_token: continuation.clone(),
-        next_continuation_token: continuation,
+        common_prefixes,
+        continuation_token: next.clone(),
+        next_continuation_token: next,
     })
 }
 
@@ -1756,9 +1573,9 @@ mod sessions;
 mod trash;
 
 pub use replicas::{
-    cleanup_stale_index_plane_on_blob_only_roots, fragment_has_object_index_records, fragment_meta,
-    inspect_fragment_partition_replicas, repair_fragment_all_partition_replicas,
-    repair_fragment_partition_replicas, sync_fragment_partition_replicas,
+    fragment_has_object_index_records, fragment_meta, inspect_fragment_partition_replicas,
+    repair_fragment_all_partition_replicas, repair_fragment_partition_replicas,
+    sync_fragment_partition_replicas,
 };
 pub use sessions::{
     commit_session_part, commit_session_part_receipt, list_active_sessions, load_session,
@@ -1784,14 +1601,15 @@ pub(crate) use sessions::{
 #[allow(unused_imports)]
 pub(crate) use trash::{
     delete_unreferenced_object_index, delete_unreferenced_object_indexes_batch,
-    referenced_object_ids, remove_trash_payload, scan_trash_records, visit_trash_records,
+    referenced_object_ids, scan_trash_records, visit_trash_records,
 };
 
 use replicas::count_object_index_records;
+#[cfg(test)]
 use trash::collect_symlink_object_ids_under;
 
 #[cfg(test)]
-use replicas::{choose_replica_source, latest_index_plane_mtime_nanos, same_root};
+use replicas::{cleanup_stale_index_plane_on_blob_only_roots, same_root};
 
 #[cfg(test)]
 mod tests;

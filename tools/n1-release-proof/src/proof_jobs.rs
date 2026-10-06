@@ -216,7 +216,7 @@ impl Proof {
         let mut bad = Vec::new();
         collect_unhealthy_strings("", &body, &mut bad);
         if !bad.is_empty() {
-            return Err(format!("{phase} health reported unhealthy state: {:?}", bad).into());
+            return Err(format!("{phase} health reported unhealthy state: {bad:?}; report={body}").into());
         }
         Ok(())
     }
@@ -653,6 +653,7 @@ impl Proof {
         let mut index_inspections = Vec::new();
         let mut blob_inspections = Vec::new();
         let mut unique_objects = BTreeSet::new();
+        let mut namespace_copies = 0;
         for root in &self.index_roots {
             let fragment_root = physical_fragment_root(root, &self.stable_fragment_id);
             if !fragment_root.join(".fragment.ndx").is_file() {
@@ -670,15 +671,7 @@ impl Proof {
                 .into());
             }
             let namespace_symlinks = count_live_namespace_links(&fragment_root)?;
-            if namespace_symlinks != expected_live_objects {
-                return Err(format!(
-                    "index inspection failed under {}: namespace_symlinks={} expected={}",
-                    fragment_root.display(),
-                    namespace_symlinks,
-                    expected_live_objects
-                )
-                .into());
-            }
+            namespace_copies += namespace_symlinks;
             let root_is_blob = self.blob_roots.iter().any(|blob| blob == root);
             if !root_is_blob && fragment_root.join(".objects").exists() {
                 return Err(format!(
@@ -690,9 +683,12 @@ impl Proof {
             index_inspections.push(json!({
                 "index_root": root,
                 "physical_fragment_root": fragment_root,
-                "namespace_symlinks": namespace_symlinks,
+                "namespace_ncx_records": namespace_symlinks,
                 "colocated_blob_role": root_is_blob,
             }));
+        }
+        if namespace_copies != expected_live_objects * (usize::from(self.parity_shards) + 1) {
+            return Err(format!("flat NCX count: {namespace_copies} copies for {expected_live_objects} objects; expected P+1 copies per key").into());
         }
         for root in &self.blob_roots {
             let fragment_root = physical_fragment_root(root, &self.stable_fragment_id);

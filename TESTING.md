@@ -1,444 +1,185 @@
-# N1 Testing And Release Confidence
+# N1 testing and results
 
-N1 tests are split into three gates. A green in-process suite is useful, but it is not a production release signal by itself.
+N1 4.0.0 / storage format 4 remains development, not LTS. Results below are
+dated evidence, not guarantees for every server. Older versions' passes do not
+certify the current namespace/pool design. Personal test paths and credentials
+are intentionally omitted.
 
-N1 release evidence must inspect the namespace/control plane, colocated immutable object metadata, upload receipts, and EC payload directly. The public API, native protocol, on-disk layout, and maintenance paths all need to agree before a build is considered release-worthy.
+## Current candidate — October 6, 2026
 
-## Gate 1: In-Process Regression Suite
+Tested engine SHA-256:
+4ff20f6bba63b1c6837d44835f4b81813895191830cc2e3d864201a7454720f0.
+The original candidate tests did not deploy this build; production remained on
+the October 5 build during those tests. The subsequent deployment is recorded
+below. Console and Accel were not replaced.
 
-Run this on every code change:
+| Gate | Result |
+| --- | --- |
+| Warnings-denied serial workspace/all-target tests | PASS: 241 engine, 2 native, 6 proof-runner, 10 shell, 7 CLI |
+| Warnings-denied check, formatting and diff whitespace | PASS |
+| Four physical rotational XFS members, 3+1, 1,000 objects | PASS: 32 same-key versions, 128 concurrent batch/native objects, coexistence, conflicts, NCX repair, cold degraded restart and mutation refusal |
+| Live LIST, 73-entry pages | 3.63–5.04 ms, warm server-local observations |
+| Ordinary mutation immutability | NDX/payload paths and hashes unchanged; deliberately corrupt NDX did not block NCX mutation |
+| Process interruption during 128-key rename | Every object retained and hash-verified; retry completed deletion |
 
-```bash
-RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
-```
+### Main-server deployment — October 6, 2026
 
-This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, object-level repair/status, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, capacity/placement behavior, or real disk behavior.
+The engine above and its matching backup helper were deployed to the main
+server. Previous binaries were retained for rollback; configuration,
+credentials, certificates, user objects and backups were preserved.
 
-### ECS Core integration gate
+| Deployment check | Result |
+| --- | --- |
+| Locked release build; namespace regressions | PASS: engine matches tested SHA-256; 41 namespace tests |
+| Before/after live namespace and readback | PASS: 32 objects, complete NCX replicas, identical snapshots and three version-pinned download samples |
+| Existing immutable files | PASS: 1,204 file paths/sizes/mtimes/inodes unchanged; all 128 NDX SHA-256 hashes unchanged |
+| Single-key and eight-key prefix rename/move/trash/recover | PASS: nine isolated test objects; version-pinned bytes and NDX/payload paths, sizes, mtimes and SHA-256 unchanged during mutations |
+| Readiness and logs | PASS: four independent members writable, 3+1, write-safe; no warning-or-higher journal entries after startup |
+| Console and Accel | Existing processes unchanged; Console verified HTTPS login page returned 200 |
 
-N1 consumes the separately versioned ECS Core library through a thin adapter.
-Before changing that dependency or adapter, require all of the following:
+Single-key rename/move/trash/recover took 228/121/100/75 ms. Eight-key prefix
+operations took 228/1,170/176/305 ms. These are one observation per operation
+over server-local, certificate-verified HTTPS with new connections, not a LAN
+benchmark. Sampled engine RSS/HWM was 78,112 KiB after the smoke test; no
+per-mutation memory or continuous-soak claim is made.
 
-- the ECS Core unit, streaming, hard-stress, and real-disk gates pass;
-- `engine/tests/ecs_compatibility.rs` proves exact piece bytes and CRC32 values
-  across supported layouts, boundary sizes, tails, and arbitrary input chunks;
-- the four-disk N1 release matrix passes restart/resume, download hashing,
-  recover-on-read, disk repair, redistribution, and clean-log inspection;
-- the installed N1 build retains ownership of placement, file sync, atomic
-  rename, directory sync, immutable NDX publication, and namespace commit.
+The first smoke harness used the wrong trash-response field and failed after
+its mutation assertions. Its fixture was removed, the harness was corrected,
+and a fresh run passed. That fixture was also removed; the final production
+baseline comparison passed. This deployment does not close the remaining LTS
+gates below.
 
-ECS Core is only the byte-to-piece streaming boundary. A green library test
-cannot replace the full N1 storage proof.
+### Network latency and memory
 
-### N1 Shell Provisioning Gate
+Mutation timing used real LAN HTTPS through an SSH tunnel, verified certificates
+and keep-alive, without Accel. The hardware proof runner was server-local.
+Both matched comparisons are retained; the favorable repeat does not erase
+the initial regression.
 
-The embedded installation terminal has an additional non-destructive gate:
+| Single-object operation | Initial run, before → candidate median (6 samples) | Repeat, before → candidate median (12 samples) | Repeat candidate maximum |
+| --- | --- | --- | --- |
+| Rename | 135 → 447 ms | 117 → 63 ms | 1,007 ms |
+| Move | 162 → 493 ms | 321 → 36 ms | 863 ms |
+| Soft delete | 127 → 985 ms | 142 → 64 ms | 453 ms |
+| Exact-ID recovery | 59 → 454 ms | 70 → 37 ms | 828 ms |
 
-```bash
-cargo test -p n1_shell
-cargo clippy -p n1_shell --all-targets -- \
-  -D warnings -A clippy::too_many_arguments
-node --check shell/web/shell.js
-```
+The initial 32-key rename/move/delete also regressed. A separate fresh candidate
+run with 1 KiB and 8 MiB payloads measured rename/move/delete/recover medians of
+81/78/58/33 ms. There is no universal sub-100-ms guarantee.
 
-The Shell unit suite uses simulated block inventories and proves:
+| 128-object prefix operation | Before | Candidate |
+| --- | ---: | ---: |
+| Rename | 16.30 s | 9.25 s |
+| Move | 21.04 s | 10.08 s |
+| Soft delete | 27.12 s | 14.80 s |
+| Recover | 12.81 s | 2.19 s |
 
-- a root/boot disk is classified as protected and cannot reach confirmation;
-- formatting requires an exact NDISK label plus the currently observed serial;
-- four independently mounted disks can be assigned as index and blob roots;
-- `3 + 1` validates only after four distinct physical blob disks exist;
-- initialization is repeatable, preserves generated secrets, and leaves the
-  service disabled;
-- storage and EC configuration changes are rejected while N1 is active;
-- setup tokens require exact comparison and are independently generated.
+All 1,288 NDX/payload files retained their paths and SHA-256 hashes across those
+cycles. Shared devices, old-first ordering and unreset OS/device state limit
+causal comparison. A separate diagnostic trace observed a directory sync
+taking 326 ms; tracing is not a latency baseline.
 
-The browser transport proof must additionally show an unauthorized WebSocket
-receives `401`, the valid setup token receives `101 Switching Protocols`, and
-read-only `version` plus `lsblk` commands complete through the same embedded UI
-protocol. This transport proof never invokes `disk format` on the development
-machine.
+Sampled candidate RSS/HWM was 24,636 KiB in the initial matched phase and
+77,372 KiB after fresh tests including uploads. These are whole-process samples
+from different histories, not per-mutation allocations or a continuous peak.
 
-## Gate 2: Release Drills
+SIGKILL 150 ms into a 128-key rename left 123 source and 18 destination names,
+including 13 duplicates. Their union contained all 128 correct objects.
+Restart/retry finished the remaining sources; 1,024 immutable files stayed
+unchanged. This proves a process-crash case, not power-cut/cache-loss durability.
 
-### Offline backup and snapshot replication
+### Earlier accepted results
 
-Build `litiaina-n1-backup` beside the same-revision test engine and run
-`n1-release-proof --backup-proof` with dedicated test roots on distinct physical
-disks. The engine must be stopped for snapshot capture. See
-[BACKUP.md](BACKUP.md) for the operational boundary; this is not live replication.
+| Date / candidate | Accepted evidence and limits |
+| --- | --- |
+| Oct 5, 2026 / initial format 4 | Six four-XFS modes passed: 10,000-object flat namespace, mixed-pool expansion, HTTP/native 2 GiB restart/resume, exports, concurrent GC and 18-check backup/restore. LIST median/p95/max 10.29/15.82/19.17 ms; sampled engine RSS 99,304 KiB. These used the earlier deletion design, not the Oct 6 candidate. |
+| Sep 12, 2026 / 3.5.1 | Supervised backup recovery: 11 checks. Separate N1+Accel fixture: 12 API checks; refresh-based search and version-pinned byte-cache hashes. Browser mock tests were separate, not a live end-to-end proof. |
+| Sep 11–12, 2026 / 3.5.1 | Two four-member offline backup drills: 18 checks each; interrupted SSH replication and fenced/resumable restore passed. Metadata-heavy restore improved 781.73 → 163.27 s; small-fixture observations only. |
+| Sep 9, 2026 / 3.5.1 | 221 workspace tests and all 11 four-HDD stages; full matrix 37m 6s. Covered concurrent upload/GC/TTL, exports, repair, 1,000-object storm and 192 same-key versions. No unexpected log faults; 24 expected injected-fault lines. |
+| Sep 1, 2026 / 3.5.1 | 128 MiB export interrupted during build, restarted, range-resumed over LAN and hash-verified. Final shared-hardware build 14.72 MiB/s; LAN resume 106.59 MiB/s. |
+| Aug 29, 2026 / 3.5.0 | ECS compatibility for five EC layouts; four-HDD N1 matrix 22 gates / 3,846 objects. Separate 4 GiB ECS encode 205.74 MiB/s and recoverable missing-member cases passed. |
+| Aug 10, 2026 / 3.5.0 | Kernel ENOSPC returned 507 with no namespace, NDX or shard publication. Local 1+0 small-object batch measured 549.70 vs 228.52 objects/s; not multi-device fault-tolerance evidence. |
+| Aug 8, 2026 / 3.4.0 | Four-HDD standard/durable multipart contracts and large-object hashes passed; LAN standard multipart 93.98 MiB/s end-to-end. One-shot samples varied substantially. |
+| Jul 15–16, 2026 / 3.2.x | NOA physical-topology proof and corrected three-HDD 20-gate matrix passed. Historical sub-ms folder operations used real-directory rename, not current per-child flat semantics. |
+| Jun 11, 2026 / 2.0.0 | Colocated/split-root proofs, multipart restart, repair and redistribution passed; peak RSS 158,476/125,652 KiB. Those retired layouts do not define format 4. |
 
-The release drill must prove:
+### Failures and corrections
 
-- A running source engine prevents capture; unfinished snapshots are not listed.
-- Full and incremental snapshots authenticate correctly, and a second repository
-  retains an older recovery point after independent source retention.
-- Original shard paths become unavailable before restore, so successful readback
-  cannot accidentally fall back to the source files.
-- Restored fragments retain credentials, object/version identity, namespace,
-  empty folders and unexpired trash. Every fixture payload is hash-checked.
-- A captured durable multipart session can finish after restore. Standard
-  in-memory sessions are intentionally not restart-resumable.
-- An interrupted SSH transfer publishes no partial snapshot; retry and repeated
-  transfer succeed, including verification after incomplete-job cleanup.
-- Killing restore mid-write leaves startup fences on all roots. Engine startup
-  fails, matching `--resume` succeeds, and restored payloads match the offline
-  source before normal engine operations resume.
-- Wrong keys, damaged blocks, ambiguous target contents, and unsafe path/root
-  mappings fail closed. Existing unrelated target files are not deleted.
+- Oct 6: initial matched latency regressed; repeat still had large outliers.
+  The first handoff also failed because the candidate binary was absent; rerun
+  began only after both builds were available. The failed handoff is not a pass.
+- Oct 6: an old test required tombstone suppression. It was replaced explicitly
+  with the approved duplicate-name/retry contract, not presented as unchanged.
+- Oct 5: flat GC removed expired trash but failed to count reclaimed logical
+  versions. A reproducing regression was added; the corrected GC proof passed.
+- Sep 12: whole-job SIGKILL killed the backup service's restart subprocess.
+  Separate-cgroup OnFailure recovery was added; the fresh 11-check drill passed.
+- Sep 7–9: GC could reclaim young/active uploads through old parents or last
+  trash anchors; session-inspection failure could remove protection. Cancellation
+  could retain finalizer state or release locks before blocking workers finished.
+  These failures were reproduced and corrected before the final candidate-8 pass.
+- Sep 7–9: repair deleted writer-owned staging; concurrent trash/TTL recovery
+  exposed disappearing metadata. Preserve/retry/fail-closed regressions followed.
+  A blackout interrupted an earlier matrix; ten observed stages were not a full
+  pass. A 30-minute aggregate deadline was exceeded during redistribution; the
+  later 90-minute matrix is a separately labeled run, not a passed old deadline.
+- Jul 2026: order-dependent replica digests and per-replica timestamps caused
+  real hardware failures. Sorted hashing/shared timestamps fixed them. Another
+  harness incorrectly expected healthy reads to repair unused parity; a corrected
+  data-shard fault selector passed a fresh 21-gate matrix.
+- Early native testing: missing TCP_NODELAY caused approximately 82 ms delayed
+  ACK/Nagle latency. Later loopback control-call results improved; they are not
+  current LAN mutation benchmarks.
 
-Record exact binary hashes, test topology, elapsed time, fixture counts, and
-production service state before/after the isolated drill. Process termination is
-not equivalent to a physical power cut. Large recovery sets, independent-site
-failures, and application/database consistency require separate acceptance.
-
-### Optional supervised backup jobs
-
-Use isolated test services and repositories, never a production service for
-failure injection. Exercise the supplied timer, job unit and separate recovery
-unit together; a direct `run-job` process does not prove systemd recovery.
-
-- Disabled jobs must not stop N1. An initially inactive engine must stay inactive.
-- A timer-triggered run must capture, restart N1, verify, optionally replicate,
-  and only then apply the independently configured retention policies.
-- Capture errors and timeouts must restart a previously active engine without
-  recording success. Verify payload hashes after restart.
-- Kill the entire job cgroup during capture. Its separate `OnFailure` recovery
-  unit must restore the durable restart intent even if `ExecStopPost` is killed.
-- Make the replica unavailable after capture. Do not prune recovery points or
-  report success. A later retry must finish the pending snapshot without another
-  source outage or an unexpected configuration/destination change.
-- Check overlapping jobs, corrupt state, restart failure, and unsafe paths in
-  focused regression tests. Keep restart intent when recovery fails.
-- Confirm `job-status` exposes failed/incomplete/overdue protection; monitoring
-  must not treat a prior successful point as proof the latest job succeeded.
-- Inspect `Persistent=false` and boot recovery wiring. An actual reboot during
-  capture and a missed-window boot drill remain separate hardware acceptance
-  tests; do not infer them from a process-kill test.
-
-See [VERIFICATION.md](VERIFICATION.md) for the dated four-disk results and their
-limits. Automatic capture still requires a maintenance window.
-
-### GC and concurrent publication safety
-
-The `n1-release-proof --gc-safety-proof` mode runs against a separate engine
-instance and dedicated test roots. Never pass production roots directly to a
-fault-injection proof. Keep the binary, configuration, logs, and fixtures in
-one disposable test environment.
-
-This proof requires these observable outcomes:
-
-- An old object parent cannot cause a young version or unknown child to be
-  recursively removed. Apply the same check to fragment cleanup and GC.
-- Expired, unreferenced, inactive version directories are reclaimed.
-- Pause a real one-shot HTTP body after its K+M shard files are opened. Age
-  only its isolated test directories beyond the GC TTL, run GC and fragment
-  cleanup, then finish the body and verify its download hash before and after
-  restart. An active writer is not an expired orphan merely because it is slow.
-- Repeat with an existing committed version: pause its replacement upload,
-  trash the old path, wait for real TTL expiry, and require the GC status to
-  confirm an expired anchor. The replacement's shard directories must survive
-  physical trash reclamation too. Finish and hash-check it across restart.
-  Deterministic tests separately protect idle standard and durable sessions
-  until cancellation/session removal allows reclamation.
-- Standard and durable multipart writers overlap with read/list/rename/trash/
-  recover work and GC. Each published payload is hash-checked; standard
-  finalize has a deadline so a hang is a failure.
-- A ZIP export runs alongside the mixed workload and GC, and its contents are
-  independently checked. At least one GC pass starts before export retention
-  can defer cleanup.
-- Deliberately corrupting session metadata must preserve potential live data
-  and produce an explicit GC error. Removing the injected corruption must
-  allow a clean retry. Expected fault logs are matched explicitly; other
-  errors still fail the proof, and unreadable logs are an error.
-- Restart and final namespace verification must pass.
-
-Run `--auto-healing-proof` repeatedly on the same candidate as well. It must
-allow fragment creation while the scheduler is active. The unit regression
-`replica_repair_preserves_inflight_atomic_writes_and_local_workspaces` also
-checks that repair neither deletes nor clones atomic-write temporary files,
-that the original writer can finish its rename, and that root-local work
-directories remain owned by their original root.
-
-These are bounded workload proofs, not a guarantee of constant-memory GC at
-millions of objects or an exhaustive proof of all concurrent mutations.
-
-Additional deterministic regressions cover cancellation and publication:
-
-- `cancelled_standard_finalize_releases_busy_state_for_retry` polls the actual
-  finalizer while its publication lock is held, drops the future, and repeats.
-  Cancellation must release the busy state without touching completed parts.
-- `durable_finalize_retains_resume_truth_until_namespace_commit` verifies the
-  manifest and logical binding after NDX publication and on retry; only a
-  successful namespace commit permits removing the session.
-- `durable_receipts_refresh_idle_age_without_rewriting_manifest` verifies that
-  receipt-directory activity refreshes durable session idle age while manifest
-  bytes remain unchanged. Session age must not remain stuck at initialization.
-- `cancelled_request_keeps_namespace_publication_exclusive_until_worker_finishes`
-  cancels the actual logical finalizer after its blocking publisher is queued.
-  The same-path gate must stay held until the worker finishes, and its registry
-  entry must then disappear. Companion cases cover 16 cancelled waiters,
-  unrelated-path concurrency and worker unwind.
-- `metadata_disappearing_after_ttl_unlinks_anchor_is_not_a_broken_record`
-  injects a metadata read after TTL unlinks a trash anchor. Only that confirmed
-  disappearance is benign. A retained anchor with missing metadata and a hard
-  I/O failure still return errors. The concurrent recover/TTL regression checks
-  the winning operation and resulting live visibility, not just HTTP status.
-- `core::upload::activity::tests` covers uploads beginning before/after a GC
-  snapshot, completed uploads against stale snapshots, clock rollback with
-  zero TTL, per-object exclusion, overlapping scans, concurrent writers,
-  canonical object IDs, poisoned-state preservation and cancelled callers
-  whose blocking publishers are still running.
-
-Upload activity protection is process-local, not a new durable receipt. Its
-registry contains active operations, not the entire stored namespace. Each
-scan remembers at most 65,536 overlapping object IDs (each validated to at
-most 128 bytes); reaching that limit defers that scan's remaining orphan
-reclamation and logs the deferral, without refusing uploads. Registry locks
-cover bookkeeping only, never filesystem work or network streaming. This
-bound does not make the existing namespace reachability scan constant-memory.
-
-Temporary private filesystems can run these functional tests on one machine.
-They do not establish independent-disk resilience, fsync power-loss durability,
-or physical-disk performance. Do not substitute them for hardware acceptance.
-
-Trash enumeration must also distinguish an in-flight empty parent chain from
-an ambiguous committed generation. Run
-`trash_scan_tolerates_inflight_parent_chains_but_rejects_ambiguous_generations`:
-partially created/pruned parents must not break another user's recover, but
-multiple competing path components must still fail closed. A committed empty
-folder is a valid trash item and must remain listed.
-
-Run the release drill harness before tagging or deploying:
+## Reproduce validation
 
 ```bash
-scripts/bench/run_release_drills.sh
+RUSTFLAGS='-D warnings' cargo test --workspace --all-targets -- --test-threads=1
+RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
+cargo fmt --all -- --check
+git diff --check
+cargo build --release -p n1 --bins -p n1-release-proof
 ```
 
-The drill runs high-value workflow cases repeatedly and can include the HA chaos harness. For this workspace, direct every output and Cargo target to `/home/litiaina/DEV_TEST`.
+Default parallel test execution has intermittently failed backup automation's
+immediate lease-reacquisition assertions. A serial pass is not a parallel pass.
+A warning-free full Clippy gate is also not claimed.
 
-For a real large-file multipart restart proof as part of the release drill:
+Run optimized hardware proofs only in new isolated children of mounted members,
+with unique output directories/unused ports. Never reuse live storage roots:
 
 ```bash
-RUN_REAL_RESTART_PROOF=1 \
-SOURCE_FILE=/home/administrator/Downloads/INCDT\ 122225.mp4 \
-DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
-scripts/bench/run_release_drills.sh
+n1-release-proof --binary /proof/bin/litiaina-n1 \
+  --source-file /proof/source.bin --disk-roots /mnt/A,/mnt/B,/mnt/C,/mnt/D \
+  --out-dir /proof/results --port 56001 --native-port 56002 \
+  --data-shards 3 --parity-shards 1 --storm-objects 10000 \
+  --trash-retention-seconds 3600 --flat-namespace-proof
 ```
 
-## Gate 3: Real HTTP Proof
+Also run --pool-expansion-proof, --multipart-resume-proof, --export-proof,
+--backup-proof, --gc-safety-proof and --noa-api-proof separately. Large multipart
+acceptance uses 2 GiB or larger; small fixtures do not establish throughput.
+An extended --gc-workload-timeout-seconds run must not hide a failed default
+300-second performance gate.
 
-This focused gate covers process restart, real disks, multipart receipt
-persistence, streamed download hashing, range reads, health, and committed
-namespace/object state. It is not the complete LTS matrix by itself; repair,
-redistribution, GC, UI, and long chaos still need their Rust-owned gates.
+Required regressions cover immutable pool enrollment, zero-decode LIST, same-key
+lineage/cancellation, NCX-only mutation, destination-before-source barriers,
+joined workers, conflicts, process restart, standard/durable upload boundaries,
+kernel capacity failures, original-layout repair, GC protection and portable
+backup recovery. Live Console/Accel/native/NOA/WebSocket tests must also exercise
+flat key/prefix behavior and partial results.
 
-```bash
-SOURCE_FILE=/home/administrator/Downloads/INCDT\ 122225.mp4 \
-DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
-scripts/bench/run_n1_release_proof.sh
-```
+## Remaining gates and evidence
 
-The proof starts a real `litiaina-n1` server, creates a real fragment, rejects
-one-shot for files under the multipart threshold, uploads a real video through
-multipart, restarts the process midway, resumes from persisted receipts,
-finalizes, lists through public APIs, streams the download hash, checks range
-reads, health-checks, and directly inspects committed namespace, `.ndx`, and
-EC payload state on both roots.
+Physical power-cut/fsync-stage testing, enrolled-member replacement/restore,
+repeated failure masks, capacity exhaustion under format 4, long memory/FD soaks,
+larger/cold namespaces, complete live consumer integration, and format-4
+automatic-backup failure recovery remain release gates. Renaming an isolated
+member directory is not physical device-loss or controller-cache testing.
 
-Expected pass evidence includes:
+This document summarizes accepted results, failures and remaining gates.
+Raw hardware and deployment reports are local-only and excluded from version
+control.
 
-- before-restart list count equals uploaded file count
-- after-restart list count equals uploaded file count
-- before/after path set hashes match
-- sample downloads match source SHA-256
-- after simulated disk format, the surviving root still lists all expected objects
-- strict repair restores the missing index and blob planes
-- after `1 disk -> 2 disk` re-expansion, the one-disk write is still listed
-- every index root reports the same live namespace links
-- index-only roots contain no `.objects`
-- blob-only roots contain no namespace/control state
-- every shard-bearing blob placement has both immutable `.ndx` and payload
-- every `.ndx` placement has payload and every payload placement has `.ndx`
-- server RSS remains bounded instead of growing with object count
-
-Useful knobs:
-
-```bash
-PORT=50491
-CONCURRENCY=16
-MAX_FILES=0
-CLEANUP_ROOTS=0
-OUT_DIR=/tmp/n1-real-proof
-```
-
-Use `MAX_FILES=128` for a smoke run. Use `MAX_FILES=0` for the full source tree.
-
-## Gate 4: Parallel Small-Object Storm
-
-This hardening gate must be owned by a Rust runner. Python is not part of the
-N1 release verification path.
-
-Expected pass evidence includes:
-
-- total uploaded objects equals 12,000
-- every fragment lists exactly 3,000 objects after upload
-- restart listing still returns exactly 3,000 objects per fragment
-- N1 does not hit the process open-file ceiling
-- RSS remains bounded under the storm instead of growing with object count
-- logs contain no write-quorum, replica, namespace, object-index, or blob shard open failures
-
-## Release Rule
-
-For production confidence, require:
-
-```bash
-RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
-scripts/bench/run_release_drills.sh
-SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_release_proof.sh
-```
-
-Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real disk capacity/placement behavior, real disk layout, object-level repair/status, and durable namespace/colocated-object state together.
-
-## N1 3.4.0 Development Release Requirement
-
-N1 3.4.0 must retain the engine-format-3 storage invariants and additionally prove:
-
-- standard multipart init performs no persistent session or namespace write
-- distinct standard multipart parts execute concurrently and publish nothing before finalize
-- duplicate part submission is idempotent after completion and conflict-safe while in flight
-- finalize synchronizes the complete K+M shard set before publishing NDX and namespace state
-- unfinished standard sessions disappear on restart and their headless shards remain TTL-reclaimable
-- `/upload/multipart/durable` retains restart-resumable manifest and part-receipt behavior
-- local-server and LAN benchmarks record direct and multipart throughput independently
-
-- delete is soft-only across HTTP, POSIX, native protocol, shell, and console
-- each deletion receives a unique trash entry id
-- repeated deletion of the same logical path remains independently recoverable
-- recovery succeeds before TTL and fails closed after TTL
-- manual GC cannot shorten trash retention
-- normal lifecycle scans `.trash` rather than the complete blob plane
-- expiry derives its deadline from the timestamp generation and removes no live namespace path
-- exact object ids are reclaimed directly only after live/trash reference verification
-- folder delete remains a directory rename and descendant inspection is deferred until expiry
-- strict recovery returns `409 Conflict` without consuming trash when the live destination exists
-- legacy 3.2 direct-path trash is migrated offline before a 3.3 binary starts; live namespace and blob data do not move
-
-Evidence for the current release belongs under `/home/litiaina/DEV_TEST` and
-must record the exact binary hash, configuration, disk topology, commands,
-results, and any unproven boundaries.
-
-## N1 3.5.0 Upload Release Requirement
-
-N1 3.5.0 must retain every engine-format-3 and 3.4.0 upload invariant and also
-prove:
-
-- one-shot, standard multipart, and durable multipart execute without any synchronous physical-capacity probe
-- a real kernel `ENOSPC`/quota failure returns `507` and publishes no NDX or namespace entry
-- cleanup removes partial shards after a capacity failure, with orphan GC as the crash fallback
-- standard batch upload accepts many independent one-MiB-or-smaller objects through one bounded multipart request
-- a batch entry receives its own object identity, K+M layout, NDX, namespace entry, and response
-- one failed or conflicting batch entry does not corrupt or cancel successful independent entries
-- batch concurrency remains bounded in memory and can be selected independently of total configured disk count
-- no durable batch route exists; durable multipart retains replicated restart-proof manifests and receipts
-- small-object evidence records objects/second, MiB/second, CPU cycles, latency percentiles, RSS, and disk I/O
-- scale analysis demonstrates no O(total configured disks) capacity work in any upload hot path
-
-## N1 3.5.1 Bulk Export Release Requirement
-
-N1 3.5.1 must preserve every engine-format-3 and 3.5.0 invariant and prove:
-
-- manifest capture traverses the selected live namespace once and pins logical path, object identity, exact version ULID, and byte size
-- missing or corrupt selected metadata fails the entire job instead of omitting an archive entry
-- no partial archive is downloadable before the durable `ready` boundary
-- process termination during manifest capture safely repeats capture after restart
-- process termination during artifact build reuses the completed immutable manifest, removes partial chunks, and rebuilds the same version set
-- ZIP64 and TAR artifacts reproduce the selected entry set and every entry's source SHA-256
-- mapped business-layer entries preserve their archive paths and export only the requested immutable source byte ranges, including multiple logical files sharing one packed source object
-- ready downloads return exact `Content-Length`, stable SHA-256 `ETag`, `Accept-Ranges: bytes`, and correct `206`/`416` behavior
-- an interrupted LAN download resumes through a single byte range and the final artifact hash still equals its ETag
-- artifact chunks use bounded concurrent writes and distribute across eligible blob roots without becoming authoritative object data
-- cancellation leaves no published artifact, and export retention removes job state, manifest, and chunks without touching source objects
-- queue, job, object-read, chunk-size, write, and optional retained-byte limits remain bounded
-- server-local build/delivery and LAN-resume measurements are recorded separately
-- release evidence contains topology labels and measurements but no host filesystem paths or credentials
-
-The focused Rust proof is invoked through `n1-release-proof --export-proof`.
-Use distinct physical roots for EC evidence; same-device directories are only a
-functional test. A complete proof deliberately kills the optimized N1 process
-while phase is `building`, restarts it, validates the recovered archive, creates
-a second uninterrupted performance export, tests cancel and TTL cleanup, and
-scans all engine logs with warnings/errors treated as failure.
-
-The reusable release runner has one bounded API gate and three focused
-autonomous-maintenance gates:
-
-- `--noa-api-proof` starts an optimized real N1 process and proves canonical
-  NOA ping/auth, one-shot upload, list/stat/download/range integrity, object
-  status, realtime WebSocket events, POSIX file/folder rename, trash/recover,
-  TTL reclamation, maintenance status, deep health, restart persistence, clean
-  logs, and absence of the former `/n1/...` namespace.
-
-- `--auto-healing-proof` injects data/parity loss, root loss, root-identity
-  mismatch, unrecoverable damage and later recovery, scheduled online checksum
-  with a successful concurrent mutation, and a prospective EC change.
-- `--maintenance-coverage-proof` proves Deep Scan/Fresh Snapshot observation,
-  multipart restart, online availability repair, manual checksum/strict
-  read-only gates, scrub quiescence, and clean gate release.
-- `--trash-maintenance-proof` repairs trashed objects across restart and across
-  the 128-entry metadata batch boundary before recovering and hashing all 141
-  objects.
-
-Pass explicit `--data-shards`, `--parity-shards`, `--disk-roots`,
-`--colocated-roots`, and `--cleanup-roots`. Every `D + P` proof root must be on
-a distinct physical device; same-device directories are functional tests, not
-EC hardware evidence.
-
-Recover-on-read fault injection must remove a data shard (`.shard`) that the
-read path actually consumes. Removing parity (`.parity`) exercises explicit
-object or fragment repair instead; a healthy read is not required to scan for
-or recreate unused parity. The proof runner keeps these two fault classes
-separate so a parity-repair expectation cannot masquerade as recover-on-read
-evidence.
-
-## Historical N1 2.0.0 Evidence
-
-N1 2.0.0 release evidence must include both supported disk-role modes:
-
-- colocated roots, where each physical disk carries index and blob roles
-- split roots, where blob-only roots are proven free of namespace/control state
-
-The proof records live namespace-link counts separately from immutable `.ndx`
-and payload-placement counts. Object-plane GC compatibility links are not
-namespace entries.
-
-Focused N1 2.0.0 evidence from June 11, 2026:
-
-- Colocated two-disk proof passed with `212` live objects and `212` matching
-  namespace links on each index replica.
-- Split-root two-disk proof passed with `94` live objects and `94` matching
-  namespace links on each index replica.
-- Both proofs used a real `256 MiB` multipart object, restarted midway, resumed
-  from receipts, finalized, and verified the downloaded SHA-256.
-- Both proofs passed native protocol operations, concurrent users, POSIX CRUD,
-  trash/recover/GC, recover-on-read, object repair, simulated disk-format loss,
-  strict fragment repair, and `2 disks -> 1 -> 2` redistribution.
-- Split blob roots contained zero aliases, `.fragment.ndx`, uploads, trash, or
-  user namespace entries.
-- Split index roots contained zero `.objects` directories.
-- Every inspected blob placement had matching immutable `.ndx` and payload.
-- Object-level redistribution passed a real `1 + 0 -> 1 + 1` topology change:
-  one object scanned, one mismatch found, one migration completed, zero errors,
-  followed by physical `.ndx + payload` verification on both blob roots.
-- N1 3.2.0 redistribution tests must prove that a higher durable namespace
-  generation wins after `2 -> 1 -> 2`, including equal-count replacement and
-  newer deletion cases, while same-generation content disagreement and writes
-  attempted before reconciliation still fail closed.
-- Server RSS peaked at about `155 MiB` in the larger colocated matrix and about
-  `123 MiB` in the split-root matrix.
-- Log scans reported no warning, error, panic, critical, degraded, or failed
-  lines after the expected failure/recovery operations completed.
-- Release-mode upload benchmarks passed for HTTP and native one-shot,
-  sequential multipart, and pipelined multipart. On this HDD pair, explicit
-  multipart concurrency `2` produced `41.47 MiB/s` HTTP pipelined and
-  `40.82 MiB/s` native sequential multipart averages while keeping peak RSS
-  below `87 MiB`.
+No LTS, failover, zero-loss, constant-memory-at-any-scale or universal latency
+claim follows from these bounded results.

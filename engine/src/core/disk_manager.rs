@@ -75,6 +75,16 @@ impl ObjectPathManager {
             ));
         }
 
+        if !crate::core::storage_pool::configured().is_empty() {
+            let pool = crate::core::storage_pool::write_pool()?;
+            if pool.width() != shard_count {
+                return Err(AppError::ServiceUnavailable(
+                    "upload geometry changed before placement was pinned".into(),
+                ));
+            }
+            return Ok(pool.roots.clone());
+        }
+
         let roots = self.get_blob_roots();
         if roots.len() < shard_count {
             return Err(AppError::ServiceUnavailable(format!(
@@ -111,8 +121,17 @@ impl ObjectPathManager {
         object_key: &str,
         version_id: &str,
     ) -> Vec<PathBuf> {
-        let mut ranked: Vec<([u8; 32], PathBuf)> = self
-            .get_blob_roots()
+        let roots = crate::core::storage_pool::configured()
+            .iter()
+            .find(|pool| {
+                pool.roots.iter().any(|root| {
+                    self.get_shard_dir_on_disk(root, fragment, object_key, version_id)
+                        .is_dir()
+                })
+            })
+            .map(|pool| pool.roots.clone())
+            .unwrap_or_else(|| self.get_blob_roots());
+        let mut ranked: Vec<([u8; 32], PathBuf)> = roots
             .into_iter()
             .map(|root| {
                 let root_label = root.to_string_lossy();

@@ -10,7 +10,7 @@ use ulid::Ulid;
 const ROOT_MARKER_FILE: &str = ".n1-root-id";
 const REGISTRY_DIR: &str = ".n1";
 const REGISTRY_FILE: &str = "topology-roots.json";
-const ROOT_IDENTITY_FORMAT: &str = "n1-3-root-identity-v1";
+const ROOT_IDENTITY_FORMAT: &str = "n1-4-root-identity-v1";
 
 static EXPECTED_ROOT_IDENTITIES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 

@@ -189,7 +189,7 @@ impl Proof {
             )
         };
         let (standard, mixed, durable, background) =
-            tokio::time::timeout(Duration::from_secs(300), async {
+            tokio::time::timeout(Duration::from_secs(self.args.gc_workload_timeout_seconds), async {
                 tokio::try_join!(standard, mixed, durable, background)
             })
             .await
@@ -270,6 +270,7 @@ impl Proof {
         let logs = self.scan_logs_with_expected(&[&expected_fault])?;
         self.summary = json!({
             "status":"PASS", "proof":"gc_safety_and_mixed_workload",
+            "workload_timeout_seconds":self.args.gc_workload_timeout_seconds,
             "topology":{"data_shards":self.data_shards,"parity_shards":self.parity_shards,"roots":self.active_disk_count},
             "protected_files":protected.len(), "expired_orphans":expired.len(),
             "initial_gc":initial_gc, "fragment_cleanup":fragment_cleanup,

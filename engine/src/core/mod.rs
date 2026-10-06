@@ -31,6 +31,7 @@ pub mod repair_manager;
 pub mod retrieve;
 pub mod root_identity;
 pub mod storage_capacity_parser;
+pub mod storage_pool;
 pub mod sync;
 pub mod system;
 pub mod upload;

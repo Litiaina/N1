@@ -1,170 +1,165 @@
 <div align="center">
+
   <img
-    src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
-    alt="Litiaina Icon"
+    src="./assets/litiaina_icon.png"
+    alt="Litiaina"
     width="150"
     height="150"
   />
+
   <h1>Litiaina N1</h1>
+
   <p>
-    N1 is a high-performance single-node object storage system built for durable, redundant, namespace-managed, and efficient storage.
+    <b>N1 is a high-performance single-node object storage system built for durable, redundant, namespace-managed, and efficient storage.</b>
   </p>
+
 </div>
 
----
+<p align="center">
+  <strong>Current release: N1 4.0.0</strong>
+</p>
 
-N1 is Litiaina's single-node object storage system. It is not a generic file
-server and it is not the distributed N2 product. N1 owns local object storage
-truth on one machine: fragments, namespace entries, immutable object versions,
-payload placement, health checks, repair, and garbage collection.
+## Overview
 
-This repository is the N1 product boundary. N2, Registry, NS, and other
-Litiaina services should treat N1 as a storage-system boundary and integrate
-through its supported APIs or through the native client crate.
+N1 is a single-node object store for durable data on local storage. It provides
+authenticated fragments, immutable object versions, streaming erasure coding,
+trash/recovery, repair, exports and encrypted offline backups.
 
-## Development Status
+N1 favors few moving parts and bounded-memory processing. Accel is an optional,
+disposable search/cache layer, not part of storage authority. N1 is not N2 and
+does not provide distributed failover.
 
-- **Current engine/package version:** `3.5.1`
-- **Release channel:** development
-- **Storage engine format:** `3`
-- **Stable release for this engine line:** not yet declared
+Current version: **4.0.0 development**, storage format **4**. This is not an LTS
+release. Earlier development storage formats are not migrated automatically.
 
-The engine/package version identifies the actively evolving implementation; it
-does not itself declare production stability. Engine-format compatibility is a
-separate contract: N1 3.2.0 uses engine format 3 and fails closed on older or
-unversioned storage roots rather than adopting or migrating them.
+## Build and start
 
-## What Is Included
-
-- `engine/` - N1 server and storage engine; Cargo package `n1`, executable
-  `litiaina-n1`.
-- `litiaina-n1-backup` - encrypted offline storage snapshots, portable restore,
-  one-way snapshot repository replication, and optional supervised backup jobs.
-  See [BACKUP.md](BACKUP.md) for
-  maintenance-window requirements, commands, and recovery boundaries.
-- `shell/` - operator shell and future embedded management server; Cargo
-  package `n1_shell`, executable `litiaina-n1-shell`.
-- `native_client/` - canonical Rust client for the `n1://` protocol; Cargo
-  package `n1_native_client`.
-- [ECS Core](https://github.com/Litiaina/ecs-core) - separately versioned,
-  bounded-memory streaming erasure coding shared with other Litiaina storage
-  engines. N1 still owns disk placement, durability sync, atomic publication,
-  metadata, and namespace semantics.
-- `cli_core/` - shared shell support; Cargo package `cli_core`.
-- Optional [N1 + Console + Accel](ACCEL.md) integration provides authenticated
-  fragment-wide file search without Space. Accel remains a rebuildable layer,
-  not authoritative storage.
-- `tools/n1-release-proof/` - N1 release-proof and hardware validation tooling;
-  Cargo package and executable `n1-release-proof`.
-- `DOCUMENTATION.md` - user-facing N1 documentation.
-- `N1_SHELL_SETUP.md` - embedded browser-terminal installation and four-disk provisioning guide.
-- `NOA.md` - canonical NOA v1 transport contract implemented by N1 3.2.0.
-- `ARCHITECTURE.md` - storage architecture and invariants.
-- `TESTING.md` / `VERIFICATION.md` - validation and release evidence.
-- `deploy/systemd/` and `scripts/install-n1-systemd.sh` - production service installation.
-
-The generic directory names describe repository structure. Product-specific
-Cargo packages, executables, systemd services, configuration, and protocol
-identities remain unchanged so installed components are unambiguous.
-
-## Storage Identity
-
-N1 separates mutable namespace/control state from immutable object truth.
-
-```text
-<index_root>/
-  .fragment/<fragment_hash> -> ../@f_<stable_fragment_id>
-  @f_<stable_fragment_id>/
-    .fragment.ndx
-    .trash/
-      <unix-nanos>.d<path-depth>/<original-logical-path>
-    .uploads/
-    <namespace paths>
-
-<blob_root>/
-  @f_<stable_fragment_id>/
-    .objects/
-      <fanout>/@o_<object-id>/
-        <version-summary>.ndx
-        <version-id>/<shard-or-parity-files>
-```
-
-Fragment aliases may change. Stable fragment roots, object records, and payload
-versions do not. Each immutable `.ndx` is stored beside its shard/parity
-placement, while namespace movement remains confined to index roots.
-
-## API Faces
-
-N1 exposes two supported faces:
-
-- NOA v1 at `/noa/v1/...` over HTTPS for general clients, browsers, and integrations.
-- `n1://` for Litiaina-owned low-level tools and services.
-
-Both faces are expected to preserve the same object-storage semantics. The
-native protocol is not a separate storage engine.
-
-NOA v1 preserves the existing simple N1 request and response semantics while
-giving the HTTPS surface a stable, engine-independent name. See [NOA.md](NOA.md).
-
-## Build
-
-N1 pins ECS Core to an exact Git commit in `engine/Cargo.toml`. A fresh checkout
-therefore builds reproducibly without requiring a sibling repository or a
-machine-specific filesystem layout. Update that revision only after the ECS
-Core gates and N1 compatibility matrix pass together.
+Use Linux, a current Rust toolchain, mounted storage and a trusted TLS certificate.
 
 ```bash
-cargo build -p n1 --release
-cargo build -p n1_shell --release
-```
-
-Check the N1 server binary:
-
-```bash
+cargo build --release -p n1 --bins -p n1_shell
 ./target/release/litiaina-n1 --version
 ```
 
-## Run Locally
+Put the binaries in a deployment directory such as /opt/litiaina/n1. Start
+litiaina-n1 there once to generate n1_config.ini and n1.env; an unconfigured
+deployment will not become a usable server. Fill in the mounted roots, TLS
+paths and independently generated secrets before starting again. Protect n1.env
+and the TLS private key; do not commit them.
 
-N1 creates local runtime configuration when started in a fresh deployment
-directory. Those files are machine-local and intentionally ignored by this repo.
+N1 reads configuration from its working directory. Keep the generated defaults;
+change the server and storage sections for your machine:
 
-```bash
-./target/release/litiaina-n1
+```ini
+[server]
+host=127.0.0.1
+https_port=50001
+native_port=50002
+cert_path=cert.pem
+key_path=key.pem
+
+[disk_config]
+fs_storage_path=/var/lib/litiaina/n1-control
+
+[storage_pool.A]
+generation=1
+roots=/mnt/storage00,/mnt/storage01,/mnt/storage02,/mnt/storage03
+data_shards=3
+parity_shards=1
+sealed=false
 ```
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for setup, runtime files, and production service installation.
-For a fresh Debian server provisioned through the embedded N1 Shell terminal,
-follow [N1_SHELL_SETUP.md](N1_SHELL_SETUP.md).
+Each pool needs exactly K+P members on independent mounted devices. Enrolled
+pool identity, geometry and member order cannot be edited. Expand by adding a
+new named pool; existing objects stay in their original pool. The control path
+is not a global object index. See [Architecture](ARCHITECTURE.md).
 
-## Validation
-
-Run the core test suite:
-
-```bash
-cargo test -p n1
-```
-
-Run shell tests:
+For a systemd deployment, ensure the service account already exists and owns
+the deployment/control directories and storage roots, then run:
 
 ```bash
-cargo test -p n1_shell
+sudo scripts/install-n1-systemd.sh \
+  --install-dir /opt/litiaina/n1 --user n1 --group n1 --enable --start
+sudo systemctl status litiaina-n1.service --no-pager
+sudo journalctl -u litiaina-n1.service -f
 ```
 
-Run the release proof harness when validating a real deployment:
+The [operator setup guide](DOCUMENTATION.md#operator-setup) also covers the
+guarded browser-terminal installer. Formatting is destructive; it is not
+required for already provisioned storage.
+
+## Basic use
+
+Create a fragment using the master key, authenticate with its fragment secret,
+then use the returned bearer token. Clients use HTTPS under /noa/v1 or the
+canonical n1_native_client Rust crate on a trusted native connection.
 
 ```bash
-cargo run -p n1-release-proof --release -- --help
+BASE='https://storage.example:50001'
+TOKEN='<fragment-access-token>'
+curl --fail-with-body "$BASE/noa/v1/ping"
+curl --fail-with-body "$BASE/noa/v1/upload/one-shot/docs/example.txt" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: text/plain' --data-binary @example.txt
+curl --fail-with-body "$BASE/noa/v1/posix/list?path=docs&limit=200" \
+  -H "Authorization: Bearer $TOKEN"
+curl --fail-with-body "$BASE/noa/v1/objects/download?object_key=docs/example.txt" \
+  -H "Authorization: Bearer $TOKEN" --output downloaded.txt
 ```
 
-Long hardware proofs should be run against mounted production-like disks, not
-against temporary development directories.
+Trust the certificate normally, or use --cacert with your private CA. Replace
+the hostname and token; the upload example assumes an authenticated fragment.
+Full creation/authentication examples and API contracts are in
+[Documentation](DOCUMENTATION.md#quick-start).
+
+Keys are flat; docs/ is a virtual prefix, not a real folder. Uploads create
+versions; rename, move, trash and recovery change only NCX references. Prefix
+operations process their child keys and can report partial results. Durable
+multipart is the restart-resumable upload option.
+
+## Backups
+
+Erasure coding, trash, exports and Accel are not backups. Keep recovery points
+on independent storage and keep a protected offsite copy of the encryption key.
+
+```bash
+litiaina-n1-backup keygen --key-file /secure/n1-backup.key
+litiaina-n1-backup init \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key
+```
+
+Quiesce writers first. N1 must remain stopped throughout capture:
+
+```bash
+sudo systemctl stop litiaina-n1.service
+litiaina-n1-backup create \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --config /opt/litiaina/n1/n1_config.ini --workers 4
+sudo systemctl start litiaina-n1.service
+litiaina-n1-backup verify \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --snapshot SNAPSHOT_ID
+```
+
+Restart the service even if capture fails; the manual create command does not
+manage it. Run the helper as an account with access to the source and repository.
+Back up configuration, secrets, TLS keys and application databases separately.
+Test restoration before relying on a recovery point. Replication, portable
+restore, retention and disabled-by-default scheduled jobs are documented in
+[Backup and restore](DOCUMENTATION.md#backup-and-restore).
 
 ## Documentation
 
-Start here:
+- [README](README.md): overview, startup and basic backup.
+- [Changelog](CHANGELOG.md): development changes.
+- [Contribution policy](CONTRIBUTING.md): bug reports; no pull requests.
+- [Testing](TESTING.md): procedures, measured results, failures and open gates.
+- [NOA](NOA.md): canonical HTTPS/WebSocket route inventory.
+- [Architecture](ARCHITECTURE.md): storage design and invariants.
+- [Documentation](DOCUMENTATION.md): API reference and operator instructions.
 
-- [DOCUMENTATION.md](DOCUMENTATION.md)
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [TESTING.md](TESTING.md)
-- [VERIFICATION.md](VERIFICATION.md)
+## License and reports
+
+N1 is licensed under [Apache 2.0](LICENSE). Bug reports are welcome; external
+code contributions and pull requests are not accepted. See
+[CONTRIBUTING.md](CONTRIBUTING.md).

@@ -760,6 +760,22 @@ fn object_layout_status(
     meta: &ObjectMetadata,
     path_manager: &ObjectPathManager,
 ) -> ObjectLayoutStatus {
+    if let Some(pool) = crate::core::storage_pool::pool_for_metadata(meta) {
+        return ObjectLayoutStatus {
+            recorded_data_shards: usize::from(meta.data_shards),
+            recorded_parity_shards: usize::from(meta.parity_shards),
+            current_data_shards: usize::from(pool.data_shards),
+            current_parity_shards: usize::from(pool.parity_shards),
+            recorded_stripe_size_bytes: meta.stripe_size_bytes,
+            current_stripe_size_bytes: meta.stripe_size_bytes,
+            configured_blob_roots: pool.width(),
+            layout_matches_current: true,
+            placement_matches_current: true,
+            state: "current_layout".into(),
+            redistributable: false,
+            mismatch_reasons: Vec::new(),
+        };
+    }
     let blob_roots = path_manager.get_blob_roots();
     let current_data = DATA_SHARDS_ATOMIC
         .get()

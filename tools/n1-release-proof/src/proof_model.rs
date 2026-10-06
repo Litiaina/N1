@@ -81,6 +81,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     backup_proof: bool,
     #[arg(long, default_value_t = false)]
+    flat_namespace_proof: bool,
+    #[arg(long, default_value_t = false)]
+    pool_expansion_proof: bool,
+    #[arg(long, default_value_t = false)]
     native_transport_benchmark: bool,
     #[arg(long, default_value_t = false)]
     upload_benchmark: bool,
@@ -106,6 +110,9 @@ struct Args {
     maintenance_coverage_proof: bool,
     #[arg(long, default_value_t = false)]
     gc_safety_proof: bool,
+    /// Aggregate mixed-workload deadline; per-request admission stays unchanged.
+    #[arg(long, default_value_t = 300)]
+    gc_workload_timeout_seconds: u64,
     #[arg(long, default_value_t = 1_000)]
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]

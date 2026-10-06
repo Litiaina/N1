@@ -16,7 +16,14 @@ pub fn open_session(
         aborted_at: None,
     };
     let bytes = encode(&row)?;
-    for root in index_roots() {
+    let placements = if crate::core::storage_pool::configured().is_empty()
+        || manifest.placement_roots.is_empty()
+    {
+        index_roots()
+    } else {
+        manifest.placement_roots.iter().map(PathBuf::from).collect()
+    };
+    for root in placements {
         write_atomic(
             &fragment_root_on(&root, &manifest.fragment)
                 .join(UPLOADS_DIR)
@@ -38,18 +45,45 @@ fn session_roots(fragment: &str, version_id: &str) -> Vec<PathBuf> {
     index_roots()
         .into_iter()
         .map(|root| session_dir(&root, fragment, version_id))
+        .filter(|dir| dir.is_dir())
         .collect()
 }
 
 fn load_session_row(fragment: &str, version_id: &str) -> Result<Option<SessionRow>, AppError> {
+    let mut selected: Option<SessionRow> = None;
+    let mut corrupt = None;
     for dir in session_roots(fragment, version_id) {
         let path = dir.join(MANIFEST_FILE);
         if path.exists() {
-            return decode(&fs::read(path).map_err(|e| io_err(e, "read upload manifest"))?)
-                .map(Some);
+            let row: SessionRow = match fs::read(path)
+                .map_err(|e| io_err(e, "read upload manifest"))
+                .and_then(|bytes| decode(&bytes))
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    corrupt = Some(error);
+                    continue;
+                }
+            };
+            if let Some(current) = &selected {
+                if encode(&current.manifest)? != encode(&row.manifest)? {
+                    return Err(AppError::Conflict(
+                        "conflicting multipart placement manifests".into(),
+                    ));
+                }
+                if current.last_activity_at > row.last_activity_at {
+                    continue;
+                }
+            }
+            selected = Some(row);
         }
     }
-    Ok(None)
+    if selected.is_none() {
+        if let Some(error) = corrupt {
+            return Err(error);
+        }
+    }
+    Ok(selected)
 }
 
 pub fn commit_session_part(
@@ -98,6 +132,9 @@ pub fn load_session(
         return Ok(None);
     };
     let mut state = row.into_state();
+    let mut shard_receipts = BTreeMap::<u64, BTreeMap<usize, u32>>::new();
+    let mut part_checksums = BTreeMap::<u64, u32>::new();
+    let mut corrupt_part = None;
     for dir in session_roots(fragment, version_id) {
         let directory_metadata = match fs::metadata(&dir) {
             Ok(metadata) => metadata,
@@ -119,27 +156,59 @@ pub fn load_session(
         state.last_activity_at = state
             .last_activity_at
             .max(i64::try_from(activity).unwrap_or(i64::MAX));
-        let mut shard_receipts = BTreeMap::<u64, BTreeMap<usize, u32>>::new();
-        let mut part_checksums = BTreeMap::<u64, u32>::new();
         for name in read_dir_names(&dir)? {
             let path = dir.join(&name);
             if name.starts_with(PART_META_PREFIX) && name.ends_with(".ndx") {
-                let part: PartMetadata =
-                    decode(&fs::read(path).map_err(|e| io_err(e, "read upload part metadata"))?)?;
+                let part: PartMetadata = match fs::read(path)
+                    .map_err(|e| io_err(e, "read upload part metadata"))
+                    .and_then(|bytes| decode(&bytes))
+                {
+                    Ok(part) => part,
+                    Err(error) => {
+                        corrupt_part = Some(error);
+                        continue;
+                    }
+                };
+                if let Some(existing) = state.parts.get(&part.part_index) {
+                    if encode(existing)? != encode(&part)? {
+                        return Err(AppError::Conflict(
+                            "conflicting multipart part metadata".into(),
+                        ));
+                    }
+                }
                 state.parts.insert(part.part_index, part);
             } else if let Some((part_index, shard_index, checksum)) =
                 parse_shard_receipt_name(&name)
             {
-                shard_receipts
+                let previous = shard_receipts
                     .entry(part_index)
                     .or_default()
                     .insert(shard_index, checksum);
+                if previous.is_some_and(|old| old != checksum) {
+                    return Err(AppError::Conflict(
+                        "conflicting multipart shard receipts".into(),
+                    ));
+                }
             } else if let Some((part_index, checksum)) = parse_part_receipt_name(&name) {
-                part_checksums.insert(part_index, checksum);
+                if part_checksums
+                    .insert(part_index, checksum)
+                    .is_some_and(|old| old != checksum)
+                {
+                    return Err(AppError::Conflict(
+                        "conflicting multipart part receipts".into(),
+                    ));
+                }
             }
         }
-        push_receipts_from_filename(&mut state, shard_receipts, part_checksums);
-        break;
+    }
+    push_receipts_from_filename(&mut state, shard_receipts, part_checksums);
+    // A corrupt copy must not hide valid progress elsewhere. If no complete
+    // part/receipt survived at all, retain the original failure, not an empty
+    // resume state that could incorrectly authorize reclamation.
+    if state.parts.is_empty() && state.part_receipts.is_empty() {
+        if let Some(error) = corrupt_part {
+            return Err(error);
+        }
     }
     Ok(Some(state))
 }

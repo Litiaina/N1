@@ -1,138 +1,68 @@
-# N1 Documentation
+# N1 programmer and operator documentation
 
-N1 3.5.1 is Litiaina's single-node object storage system. It exposes object-storage semantics through a POSIX-like namespace, immutable object versions, shard/parity blob storage, and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, high-throughput and durable upload modes, autonomous repair, explicit redistribution, targeted TTL trash lifecycle, resumable bulk export, and realtime namespace events.
+This guide describes the current N1 4.0.0 development API and operational tools.
+Storage format 4 does not migrate older development roots. For internals, see
+[ARCHITECTURE.md](ARCHITECTURE.md); for routes, [NOA.md](NOA.md); for actual test
+results and limitations, [TESTING.md](TESTING.md).
 
-N1 is not a filesystem. It is an object storage system with its own namespace rules: folders are namespace directories, files are stable object identities, and each committed write creates an immutable object version. Large data movement stays in the blob plane; namespace operations stay lightweight.
+Jump to [authentication](#authentication-reference), [objects](#object-api),
+[uploads](#upload-api), [exports](#archive-download), [native](#native-protocol),
+[backups](#backup-and-restore) or [setup](#operator-setup).
 
-For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md). The canonical
-HTTPS/WebSocket transport contract is [NOA v1](NOA.md). For release validation
-notes, see [VERIFICATION.md](VERIFICATION.md).
+## API conventions
 
-## Version And Release Status
+- HTTPS base: https://storage.example:50001/noa/v1. Trust the server certificate;
+  use --cacert for a private CA, not disabled verification.
+- JSON requests use Content-Type: application/json. Raw upload/download bodies
+  are bytes; batch upload uses multipart/form-data.
+- Protected requests use a fragment bearer token. read, write, modify and delete
+  permissions are independent; master/fragment secrets stay out of browser URLs.
+- Object keys are logical paths, not host filesystem paths. Encode path/query
+  values correctly and reject parent traversal. A key and its prefix can coexist.
+- Prefix mutations may partially succeed. Inspect per-child conflicts/failures;
+  an interrupted request is not proof that no work committed. Copy/delete retry
+  accepts an identical destination but never overwrites an unrelated object.
+- GET selects the latest committed version unless a version is specified.
+  Latest means maximum valid ULID, not a mutable head. Pin versions for stable
+  reads/export and preserve opaque continuation tokens.
+- Empty mkdir is rejected. Deletion is soft-only; TTL/GC owns reclamation.
 
-N1 `3.5.1` is the current development engine/package version. It is on the
-development release channel and is not a declaration that this engine line has
-reached its stable product milestone. Storage compatibility is tracked
-separately as engine format `3`; package updates within this development line
-must continue to honor the format-3 architecture unless an explicitly new
-engine format is introduced.
+## Quick start
 
-Historical verification directories retain the version of the binary that
-produced them. A `3.0.0` or `3.0.1` evidence path is therefore not renamed when
-the current package version advances to `3.2.0`.
-
-## Core Concepts
-
-- **Fragment:** An authenticated namespace and object-placement scope. Clients mount/authenticate a fragment before using the API. The public fragment hash is a mutable namespace alias; N1 stores data under an immutable `@f_<stable_fragment_id>` physical fragment root.
-- **Namespace:** The user-facing tree of folders and files. This is what `/noa/v1/posix/*` and the UI show.
-- **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
-- **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
-- **Trash:** Every soft delete reserves one timestamp generation and renames the live file or directory to `.trash/<unix-nanos>.d<path-depth>/<same-logical-path>`. Repeated deletion of the same path therefore cannot collide. Recovery moves one selected generation back to its original path and returns `409 Conflict` if that live destination exists. Configured TTL expiry removes the generation and reclaims only safely unreferenced immutable objects.
-- **Repair:** Rebuilds missing namespace/control replicas, immutable object metadata placements, and shard/parity payload when enough data remains.
-- **Redistribution:** Explicitly rewrites selected object versions into the current blob/EC topology. Existing objects remain valid under their recorded topology until redistributed.
-
-## Installation
-
-N1 provides two explicit installation paths:
-
-- The embedded N1 Shell browser terminal performs disk discovery, guarded XFS
-  formatting, persistent mounts, index/blob assignment, atomic configuration,
-  systemd installation, validation, and service activation. Follow the
-  complete [N1 Shell Installation Guide](N1_SHELL_SETUP.md).
-- The manual path below remains supported for existing deployments and
-  package-management automation.
-
-Build N1:
+Examples use Bash and placeholders; replace secrets locally and do not commit
+them. The hostname must match the TLS certificate. Create and authenticate a
+fragment before uploading:
 
 ```bash
-cargo build -p n1 --release
+BASE='https://storage.example:50001'
+curl --fail-with-body "$BASE/noa/v1/ping"
+curl --fail-with-body "$BASE/noa/v1/fragments" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"example","secret":"<MASTER_KEY>","key":"<FRAGMENT_SECRET>"}'
+curl --fail-with-body "$BASE/noa/v1/auth/fragment" \
+  -H 'Content-Type: application/json' \
+  -d '{"fragment":"<FRAGMENT_HASH>","secret":"<FRAGMENT_SECRET>","read":true,"write":true,"modify":true,"delete":true}'
+
+TOKEN='<returned-access-token>'
+AUTH=(-H "Authorization: Bearer $TOKEN")
+curl --fail-with-body "$BASE/noa/v1/upload/one-shot/docs/example.txt" "${AUTH[@]}" \
+  -H 'Content-Type: text/plain' --data-binary @example.txt
+curl --fail-with-body "$BASE/noa/v1/posix/list?path=docs&limit=200" "${AUTH[@]}"
+curl --fail-with-body "$BASE/noa/v1/objects/download?object_key=docs/example.txt" \
+  "${AUTH[@]}" --output downloaded.txt
 ```
 
-Check the exact N1 binary version without starting the server:
-
-```bash
-./target/release/litiaina-n1 --version
-```
-
-Run directly for development:
-
-```bash
-sudo ./target/release/litiaina-n1
-```
-
-## Runtime Files
-
-N1 does not keep machine runtime files in the repository. When N1 starts inside
-a fresh deployment directory, it creates the local files it needs for that
-machine:
-
-- `n1.env` - local secret material.
-- `n1_config.ini` - local machine configuration: ports, disk roots, erasure
-  layout, and deployment settings.
-
-These files are intentionally ignored by git. Start N1 once in the deployment
-directory to generate them, stop the process, then fill the real machine values
-before installing the service.
-
-Production disks should already be mounted before N1 starts. N1 monitors disk
-capacity and placement availability directly; it does not require special
-filesystem accounting support.
-
-## Production Systemd Install
-
-Build the release binary, place it in the deployment directory, and keep
-`n1.env` plus `n1_config.ini` in that same directory. N1 reads those files from
-its working directory by design.
-
-Example deployment directory:
-
-```text
-/home/administrator/SERVERS/N1-SERVER/
-  litiaina-n1
-  n1.env
-  n1_config.ini
-  cert.pem
-  key.pem
-```
-
-Install N1 as a systemd service:
-
-```bash
-sudo scripts/install-n1-systemd.sh \
-  --install-dir /home/administrator/SERVERS/N1-SERVER \
-  --enable \
-  --start
-```
-
-The installer writes into `/etc/systemd/system`, so installation normally uses
-`sudo`. The service itself defaults to the original sudo user and can be pinned
-explicitly with `--user <user> --group <group>`.
-
-Check the service:
-
-```bash
-sudo systemctl status litiaina-n1.service --no-pager --full
-sudo journalctl -u litiaina-n1.service -f
-```
-
-Installer proof commands:
-
-```bash
-bash -n scripts/install-n1-systemd.sh
-sudo scripts/install-n1-systemd.sh \
-  --install-dir /home/administrator/SERVERS/N1-SERVER \
-  --dry-run
-```
-
-`--dry-run` renders the exact unit without installing it.
+Uploading docs/example.txt creates the virtual docs/ prefix automatically.
+For signed browser downloads, multipart and exports, use the contracts below.
 
 ## Configuration
 
 N1 reads `n1_config.ini` and `n1.env` from the server working directory.
-N1 3.2.0 does not accept an older configuration contract: the complete
-`[auto_healing]` section below is required, and malformed values fail startup.
+Keep the generated configuration sections. The `auto_healing` section is
+required; invalid values fail startup. This example shows selected settings,
+not a replacement for the complete generated configuration.
 
-Minimal two-disk configuration where both disks house index and blob roles:
+Minimal two-member storage pool (1+1):
 
 ```ini
 [server]
@@ -143,9 +73,14 @@ cert_path=cert.pem
 key_path=key.pem
 
 [disk_config]
-index_store_disks=/mnt/disk-00,/mnt/disk-01
-blob_store_disks=/mnt/disk-00,/mnt/disk-01
-fs_storage_path=/home/administrator/Server Deploy Test/fs-disk
+fs_storage_path=/var/lib/litiaina/n1-control
+
+[storage_pool.A]
+generation=1
+roots=/mnt/storage-00,/mnt/storage-01
+data_shards=1
+parity_shards=1
+sealed=false
 
 [garbage_collector]
 cleanup_interval_seconds=3600
@@ -164,8 +99,6 @@ shard_repair_concurrency=1
 metadata_batch_size=128
 
 [upload_config]
-data_shards=1
-parity_shards=1
 max_part_size=52428800
 stripe_block_size=262144
 max_concurrent_io=auto
@@ -182,12 +115,12 @@ latency_samples_per_class=1024
 
 `n1.env` must provide the secrets used by N1:
 
-```bash
-JWT_SECRET=change-this
-MASTER_KEY=change-this-master-key
-SIGNED_READ_URL_SECRET=change-this-signed-url-secret
-N1_ACCEL_SEARCH_URL=http://127.0.0.1:53001
-N1_ACCEL_SEARCH_BACKEND_ID=n1-primary
+```dotenv
+JWT_SECRET=<independent-random-secret>
+AUTH_KEY=<independent-random-secret>
+MASTER_KEY=<independent-random-secret>
+ADMIN_KEY=<independent-random-secret>
+SIGNED_READ_URL_SECRET=<independent-random-secret>
 ```
 
 `N1_ACCEL_SEARCH_URL` enables the optional authenticated namespace-search
@@ -198,230 +131,18 @@ second public authentication surface. If the variable is absent or Accel is
 unavailable, ordinary namespace listing and every authoritative N1 operation
 continue to work; only accelerated search returns `503`.
 
-### Disk And Capacity Notes
+Capacity reports deduplicate physical devices. Uploads do not scan free space
+synchronously; actual kernel writes are authoritative and capacity exhaustion
+returns 507. Pool membership/geometry is immutable: append a new complete pool
+for expansion, not index/blob roots. Protect generated secrets and keep them
+separate from application credentials. Optional Accel setup is below.
 
-N1 is Linux-only and works with normal mounted disks. It uses `statvfs`-based
-capacity checks plus per-placement upload preflight so aggregate capacity and
-the placement-limiting disk are both considered before writes proceed.
+## Native protocol
 
-On first N1 3.2.0 startup, every configured index/blob root receives a persistent
-`.n1-root-id`, and N1 atomically records the expected identities under
-`<fs_storage_path>/.n1/topology-roots.json`. Mount all production disks before
-the first startup. Once a path is enrolled, N1 never silently adopts a missing
-mount's underlying directory or a replacement disk at the same path. A root
-identity mismatch is reported as offline and keeps unsafe mutations read-only.
-
-To replace a disk at the same configured path, stop N1, remove that path from
-`index_store_disks`/`blob_store_disks`, and start N1 once so the path is
-explicitly decommissioned. Stop N1 again, mount the replacement, restore the
-path in the configuration, and start N1 to enroll its new identity. Never
-delete or edit the topology registry while N1 is running.
-
-### Fragment Identity Layout
-
-N1 3.2.0 separates the mutable fragment alias, namespace/control plane, and immutable object plane:
-
-```text
-<index_root>/
-  .fragment/
-    <fragment_hash> -> ../@f_<stable_fragment_id>
-
-  @f_<stable_fragment_id>/
-    .fragment.ndx
-    .uploads/
-    .trash/
-      <unix-nanos>.d<path-depth>/<original-logical-path>
-    <namespace directories>
-
-<blob_root>/
-  @f_<stable_fragment_id>/
-    .objects/
-      ab/
-        cd/
-          @o_<object-id>/
-            <version>.<size>.<time>.<extension>.ndx
-            <version>/
-              <shard-or-parity-files>
-```
-
-The `.fragment/<fragment_hash>` symlink is the mount/auth alias. The `@f_<stable_fragment_id>` identity is immutable. Renaming a fragment changes only index-plane alias/control state; it does not move namespace contents, blob payload, or immutable object `.ndx` records.
-
-Object `.ndx` metadata is stored only on blob roots that carry a shard or parity file for that version. The metadata and EC payload therefore share one durability topology. Index-only roots do not carry object metadata capacity.
-
-N1 3.2.0 uses engine format 3 and does not open, adopt, or migrate earlier or unversioned N1 fragments. Initialize fresh engine-format-3 fragments; an incompatible fragment fails closed.
-
-## Quick Start
-
-Set a base URL:
-
-```bash
-BASE='https://127.0.0.1:50001'
-MASTER='<MASTER_KEY>'
-```
-
-Check server health:
-
-```bash
-curl -k "$BASE/noa/v1/ping"
-```
-
-Create a fragment:
-
-```bash
-curl -k "$BASE/noa/v1/fragments" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "mainframe",
-    "secret": "'"$MASTER"'",
-    "key": "fragment-local-secret"
-  }'
-```
-
-Authenticate the fragment:
-
-```bash
-curl -k "$BASE/noa/v1/auth/fragment" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "fragment": "<FRAGMENT_HASH>",
-    "secret": "fragment-local-secret",
-    "read": true,
-    "write": true,
-    "modify": true,
-    "delete": true
-  }'
-```
-
-Use the returned token:
-
-```bash
-TOKEN='<ACCESS_TOKEN>'
-AUTH=(-H "Authorization: Bearer $TOKEN")
-```
-
-Create a folder:
-
-```bash
-curl -k "$BASE/noa/v1/posix/mkdir" "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"path":"videos"}'
-```
-
-Upload a small file with one-shot upload:
-
-```bash
-curl -k "$BASE/noa/v1/upload/one-shot/videos/clip.mp4" "${AUTH[@]}" \
-  -H 'Content-Type: video/mp4' \
-  --data-binary @clip.mp4
-```
-
-List files:
-
-```bash
-curl -k "$BASE/noa/v1/posix/list?path=videos&limit=200" "${AUTH[@]}"
-```
-
-Download a file:
-
-```bash
-curl -k "$BASE/noa/v1/objects/download?object_key=videos/clip.mp4" \
-  "${AUTH[@]}" \
-  -o clip.mp4
-```
-
-Soft delete and recover:
-
-```bash
-curl -k "$BASE/noa/v1/posix/trash" "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"path":"videos/clip.mp4"}'
-
-curl -k "$BASE/noa/v1/posix/recover" "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"path":"videos/clip.mp4"}'
-```
-
-## Authentication
-
-Protected routes require:
-
-```http
-Authorization: Bearer <access_token>
-```
-
-Fragment tokens carry independent permissions:
-
-- `read`
-- `write`
-- `modify`
-- `delete`
-
-## API Conventions
-
-- The universal HTTPS/WebSocket surface is the Litiaina Node Object API (NOA)
-  v1 under `/noa/v1`. N1 3.2.0 preserves the preceding request, response, and
-  storage semantics while replacing the engine-branded route namespace.
-- `object_key`, `path`, `source_path`, and `destination_path` are namespace paths such as `videos/clip.mp4`. URL-encode spaces and special characters when they appear in a path or query string.
-- Request bodies are JSON unless the route says the body is raw bytes.
-- HTTPS is the universal API face for consumers and broad compatibility. `n1://` is the native N1 protocol face for N1 Console, N1 Shell, NS, N2, and heavy internal clients.
-- Large files should use multipart upload. One-shot upload is intended for smaller objects.
-- `version_id` is the persistent upload/object-version id. Multipart part upload and status use `version_id`; finalize also requires the `session_id` returned by init.
-- Delete is always a soft delete. Trash remains recoverable until `trash_retention_seconds` expires; there is no manual empty-trash or hard-delete API.
-- Normal trash reclamation scans only `.trash`, removes expired namespace entries, verifies reference safety, and directly reclaims the exact unreferenced object ids.
-- Object status/repair is object-scoped. A repair or scrub for one object does not lock the whole fragment.
-- When an operation returns `503 Service Unavailable`, retry later. This can mean maintenance is running, object maintenance gates are saturated, or disk provisioning prevents safe progress.
-
-## Native N1 Protocol
-
-N1 3.2.0 includes the native N1 protocol:
-
-```text
-n1://127.0.0.1:50002
-protocol: n1/0.5
-```
-
-HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 Shell, NS, N2, and trusted services that need lower latency than HTTPS for namespace, control-plane, and data-plane calls.
-
-The native protocol does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests use typed `n1://` operations that call N1 core/service functions directly. They do not emulate HTTP requests and they do not dispatch through the Axum route graph.
-
-Rust clients should use the workspace `n1_native_client` crate instead of reimplementing frames. The crate owns native URL parsing, MessagePack frame IO, fragment authentication, typed operation calls, raw upload bodies, and raw streaming response reads.
-
-`n1/0.5` supports the native data plane. It removes manual purge, empty-trash,
-and version-delete operations as part of the N1 3.2.0 lifecycle contract:
-
-- `upload.one_shot`
-- `multipart.init`
-- `multipart.put_part`
-- `multipart.finalize`
-- `multipart.cancel`
-- `uploads.list`
-- `uploads.status`
-- `object.meta`
-- `object.versions`
-- `object.status`
-- `object.repair`
-- `object.rename`
-- `object.delete`
-- `object.recover`
-- `object.bulk_delete`
-- `object.bulk_recover`
-- `object.download_chunk`
-- `object.download`
-- `object.download_stream`
-- `object.view_stream`
-
-Upload bodies are sent as raw bytes after a small MessagePack control frame. The server streams those bytes through a bounded internal pipe into the N1 upload core, so large native one-shot uploads and multipart parts do not become whole in-memory protocol frames. Streaming download/view responses send a small MessagePack response frame with `body_len`, then stream raw object bytes directly on the same socket.
-
-### Configuration
-
-```ini
-[server]
-host=127.0.0.1
-https_port=50001
-native_port=50002
-```
-
-The native listener is part of N1, not an optional sidecar. Configure `native_port` to choose where the low-level protocol binds. N1 fails startup if this required listener cannot bind. Bind `host` carefully. `n1://` should be treated as an internal/trusted-network protocol unless a deployment adds an external secure tunnel or equivalent network protection.
+Use the canonical n1_native_client Rust crate; do not invent another framing
+layer. The n1/0.5 listener is plain TCP on n1://host:50002, so keep it on a
+trusted network or a protected tunnel. Native authentication does not encrypt
+the connection. HTTPS/NOA remains the public TLS interface.
 
 ### Frame Format
 
@@ -432,7 +153,8 @@ u32_be frame_length
 MessagePack payload
 ```
 
-The maximum frame size is currently `8 MiB`. This keeps native control frames bounded and prevents one client from forcing unbounded server buffers. Large object transfer should use streaming/range/multipart semantics instead of attempting to place huge files in one native frame.
+Control frames are limited to `8 MiB`. Use streaming/range/multipart for large
+objects rather than embedding them in a frame.
 
 Client request:
 
@@ -493,157 +215,56 @@ Other auth/session operations:
 - `auth.clear` or `logout`: clear native session state.
 - `session.info`: inspect the current native session permissions.
 
-### Core Operations
+### Operations and tools
 
-Native operations are typed N1 operations, not HTTP bridge calls. Native has no HTTP bridge operation; clients should use the operation names below.
+| Family | Native operations |
+| --- | --- |
+| Session | auth.fragment, auth.bearer, auth.clear/logout, session.info |
+| Namespace | namespace.list, namespace.stat, namespace.mkdir (rejected), namespace.rename, namespace.trash, namespace.recover |
+| Object | object.list, object.status, object.repair, object.delete, object.recover |
+| Trash | trash.list, trash.recover_all |
+| Upload progress | uploads.list, uploads.status, multipart.status, multipart.list |
+| Maintenance | maintenance.health; maintenance.repair/gc/redistribution.start, .status, .stop |
+| Fragment/capacity | fragment.create, fragment.list, fragment.hash, fragment.hash.public, fragment.usage, capacity.usage |
 
-Namespace/POSIX:
+Reuse authenticated connections. Complete raw streaming responses before sending
+another frame. Native multipart is durable/restart-resumable. The canonical
+client and release-proof runner are the source for upload/stream operation
+payloads; [native_client](native_client) is the reusable integration crate.
 
-- `namespace.list`
-- `namespace.stat`
-- `namespace.mkdir`
-- `namespace.rename`
-- `namespace.trash`
-- `namespace.recover`
+Rust client example, using `n1_native_client` and `serde_json`:
 
-Object:
+```rust
+use n1_native_client::{N1NativeClient, NativeClientResult};
+use serde_json::{json, Value};
 
-- `object.list`
-- `object.status`
-- `object.repair`
-- `object.delete`
-- `object.recover`
-
-Trash:
-
-- `trash.list`
-- `trash.recover_all`
-
-Multipart:
-
-- `uploads.list`
-- `uploads.status`
-- `multipart.status`
-- `multipart.list`
-
-Maintenance:
-
-- `maintenance.health`
-- `maintenance.repair.start`
-- `maintenance.repair.status`
-- `maintenance.repair.stop`
-- `maintenance.gc.start`
-- `maintenance.gc.status`
-- `maintenance.gc.stop`
-- `maintenance.redistribution.start`
-- `maintenance.redistribution.status`
-- `maintenance.redistribution.stop`
-
-Fragment:
-
-- `fragment.create`
-- `fragment.list`
-- `fragment.hash`
-- `fragment.hash.public`
-- `fragment.usage`
-- `capacity.usage`
-
-Typed stat example:
-
-```json
-{
-  "id": "stat-1",
-  "op": "namespace.stat",
-  "payload": "{\"path\":\"videos/clip.mp4\"}",
-  "body": null
+async fn list_docs(fragment: &str, secret: &str) -> NativeClientResult<Value> {
+    let mut client = N1NativeClient::connect("n1://127.0.0.1:50002").await?;
+    client.auth_fragment(fragment, secret).await?;
+    client.operation_json(
+        "namespace.list",
+        &json!({"path": "docs", "limit": 200}),
+        None,
+    ).await
 }
 ```
 
-Typed rename example:
+The convenience `auth_fragment` requests all four permissions. For a restricted
+session, send explicit permissions with `auth.fragment` or install an existing
+restricted token using `auth.bearer`. Use `operation_json` for typed MessagePack
+results; `raw_json` is for JSON-envelope operations, not namespace responses.
 
-```json
-{
-  "id": "rename-1",
-  "op": "namespace.rename",
-  "payload": "{\"source_path\":\"videos/clip.mp4\",\"destination_path\":\"videos/final.mp4\"}",
-  "body": null
-}
-```
-
-### Performance Profile
-
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 3.2.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
-
-Current release-build loopback proof on 1,000 measured iterations showed:
-
-- HTTPS `posix stat`: about `3.4k ops/sec`, p50 about `262 us`.
-- Native `namespace.stat`: about `11.8k ops/sec`, p50 about `76 us`.
-- HTTPS `posix list`: about `576 ops/sec`, p50 about `1387 us`.
-- Native `namespace.list`: about `804 ops/sec`, p50 about `1189 us`.
-
-Listing is less transport-bound because namespace scanning and response body size dominate, but the native MessagePack body path avoids JSON duplication and now stays ahead of HTTPS on the POSIX list proof.
-
-### Tooling Policy
-
-N1-owned tools should use `n1://` when they are running on trusted infrastructure. HTTPS stays available for browsers, external consumers, curl workflows, and compatibility. `n1_shell` uses native transport by default and only uses HTTPS when the operator explicitly passes `--url <https-url>`.
-
-`n1_shell` uses the shared `n1_native_client` crate. It does not keep a private native frame/auth implementation.
-
-For normal maintenance, use direct commands. The shell accepts either a fragment name or a fragment hash. `--none` means whole-N1 scope:
+The operator shell also supports trusted native connections:
 
 ```bash
-cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> repair --none --strict --fast-mode
-cargo run -p n1_shell -- --secret <secret> --fragment <fragment-name-or-hash> repair --dry-run --availability
-cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> gc --none --scrub --fast-mode
-cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> redistribute --none --strict --durability strict
+litiaina-n1-shell --native-url n1://127.0.0.1:50002
+litiaina-n1-shell --url https://storage.example:50001
 ```
 
-Status, stop, and watch are flags, not nested subcommands:
+Use help inside the shell for commands and flags. Browser setup is covered in
+[operator setup](#operator-setup).
 
-```bash
-cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> repair --status
-cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> gc --watch
-cargo run -p n1_shell -- --secret <secret> --fragment <auth-fragment> redistribute --stop
-```
-
-`n1_shell` is stateful when opened as a shell:
-
-```bash
-cargo run -p n1_shell -- --secret <secret> --fragment <fragment> shell
-```
-
-The shell keeps one native session open and supports read/maintenance operations:
-
-- `health`
-- `usage`
-- `fragments`
-- `list [path]`
-- `stat <path>`
-- `uploads`
-- `upload <version_id>`
-- `gc status|start`
-- `repair status|start`
-- `redistribute status|start`
-- `object status <object_key>`
-- `object repair <object_key>`
-- `session`
-
-The shell intentionally keeps destructive namespace mutations out of the operator prompt. Rename, delete, update, upload, and application CRUD still belong to the HTTP or native API surfaces used by clients that explicitly own those workflows.
-
-### Stability Boundary
-
-Native `n1://` does not bypass N1 validation, authorization, repair, GC, redistribution, upload accounting, or namespace rules. It reaches N1 core/service functions directly instead of masking HTTP. Its stability risks are protocol risks: framing, session handling, socket behavior, and client implementation. The object storage system behavior stays unchanged.
-
-For LTS release proof, native should remain in the Rust release proof matrix for:
-
-- auth/session
-- list/stat
-- CRUD namespace operations
-- trash/recover/purge
-- object status/repair
-- maintenance status/start
-- multipart control paths
-- benchmark regression detection
+## Authentication reference
 
 ### `POST /noa/v1/auth/fragment`
 
@@ -669,9 +290,11 @@ Response:
   "token_type": "Bearer",
   "expires_in": 3600,
   "refresh_token": "<refresh-token>",
-  "refresh_expires_in": 2592000
+  "refresh_expires_in": 604800
 }
 ```
+
+Use returned expiry values; server configuration bounds requested token life.
 
 ### `POST /noa/v1/auth/refresh`
 
@@ -826,7 +449,7 @@ These routes operate on the user-facing namespace.
 
 Query parameters:
 
-- `path`: directory path, default `""`
+- `path`: virtual prefix, default `""`
 - `limit`: page size, default `200`, max `1000`
 - `continuation_token`: optional cursor
 - `trash`: `true` to list trash
@@ -834,7 +457,7 @@ Query parameters:
 Example:
 
 ```bash
-curl -k "$BASE/noa/v1/posix/list?path=videos&limit=200" "${AUTH[@]}"
+curl --fail-with-body "$BASE/noa/v1/posix/list?path=videos&limit=200" "${AUTH[@]}"
 ```
 
 Response:
@@ -848,14 +471,17 @@ Response:
       "name": "clip.mp4",
       "path": "videos/clip.mp4",
       "kind": "file",
-      "size_bytes": 157230177,
-      "modified_at_unix": 1778045325,
-      "version_id": "01KQXW54GPFX8STY6NGC8J11PA"
+      "modified_at_unix": 0
     }
   ],
   "continuation_token": null
 }
 ```
+
+Live LIST is names-only: optional size/version/content fields are not object
+metadata guarantees. A zero modified_at_unix is not a business timestamp.
+Use stat/meta when metadata is needed. Follow continuation_token unchanged;
+pages are not a namespace snapshot under concurrent changes.
 
 ### `GET /noa/v1/posix/stat`
 
@@ -865,6 +491,8 @@ Query parameters:
 - `trash=true` for trash lookup
 
 ### `POST /noa/v1/posix/mkdir`
+
+Format 4 rejects this operation with `400 Bad Request`: empty folders are not objects.
 
 Body:
 
@@ -885,9 +513,16 @@ Body:
 }
 ```
 
+Use a trailing slash for prefix-only work: source_path: "videos/" selects
+children even if a separate videos object exists. Without it, an exact key
+takes precedence. Prefix rename/move returns affected plus any conflicted_paths
+and failed_paths; inspect these even on a successful HTTP response. Do not
+assume an atomic folder transaction or overwrite of an unrelated destination.
+
 ### `POST /noa/v1/posix/trash`
 
-Soft deletes a file or folder.
+Soft deletes a key or processes a virtual prefix per key. Prefix operations are
+not atomic and report `conflicted_paths` / `failed_paths` alongside counts.
 
 Body:
 
@@ -897,12 +532,15 @@ Body:
 
 ### `POST /noa/v1/posix/recover`
 
-Recovers a trash path by moving it from `.trash` back to the live namespace. Clients should send the `path` returned by trash listing.
+Copies the selected NCX back before deleting its trash replicas. Send the path
+and, when available, trash_entry_id returned by trash listing. Path-only recovery
+selects the newest retained deletion; use the ID to recover a specific one.
+An unrelated live destination conflicts; an identical destination permits retry.
 
 Body:
 
 ```json
-{ "path": "archive/clip.mp4" }
+{ "path": "archive/clip.mp4", "trash_entry_id": "<ID_FROM_TRASH_LIST>" }
 ```
 
 ## Object API
@@ -921,7 +559,7 @@ Lists live objects. Query parameters:
 Example:
 
 ```bash
-curl -k "$BASE/noa/v1/objects?prefix=videos/&limit=200" "${AUTH[@]}"
+curl --fail-with-body "$BASE/noa/v1/objects?prefix=videos/&limit=200" "${AUTH[@]}"
 ```
 
 ### `GET /noa/v1/namespace/snapshot`
@@ -982,7 +620,7 @@ Query parameters:
 Example:
 
 ```bash
-curl -k "$BASE/noa/v1/objects/download?object_key=videos/clip.mp4" \
+curl --fail-with-body "$BASE/noa/v1/objects/download?object_key=videos/clip.mp4" \
   "${AUTH[@]}" \
   -o clip.mp4
 ```
@@ -1030,7 +668,7 @@ Public signed read endpoint. The signed URL generator returns the full URL.
 
 ### `DELETE /noa/v1/objects/{object_key}`
 
-Soft deletes a file or folder.
+Soft deletes an exact key or the keys under a virtual prefix.
 
 ### `POST /noa/v1/objects/recover/{object_key}`
 
@@ -1048,6 +686,9 @@ Body:
   "destination_key": "archive/clip.mp4"
 }
 ```
+
+Cross-fragment rename is rejected with 400. For partial prefix reports, use
+posix/rename or posix/move. The object rename endpoint returns an empty 200 response.
 
 ### `POST /noa/v1/objects/bulk-delete`
 
@@ -1067,7 +708,8 @@ Body:
 
 ## Upload API
 
-Use one-shot upload for small files. Use multipart for large files and resumability.
+Use one-shot for small files and standard multipart for large ingest. Use
+durable multipart when unfinished progress must survive an engine restart.
 
 Multipart upload is pipelined inside N1's foreground write lane. Different parts can upload concurrently, and each part writes/flushes/publishes its shard set in parallel across the configured disks. N1 intentionally serializes retries for the same `(version_id, part_index)` so a duplicate client retry cannot race the same receipt or stable shard files.
 
@@ -1089,7 +731,7 @@ Request body is raw bytes.
 Example:
 
 ```bash
-curl -k "$BASE/noa/v1/upload/one-shot/docs/readme.txt" \
+curl --fail-with-body "$BASE/noa/v1/upload/one-shot/docs/readme.txt" \
   "${AUTH[@]}" \
   -H 'Content-Type: text/plain' \
   --data-binary @readme.txt
@@ -1114,7 +756,7 @@ The server consumes the multipart body incrementally and bounds in-flight
 memory. `concurrency` is optional and clamped to the engine safety limit.
 
 ```bash
-curl -k "$BASE/noa/v1/upload/batch?concurrency=32" \
+curl --fail-with-body "$BASE/noa/v1/upload/batch?concurrency=32" \
   "${AUTH[@]}" \
   -F 'object=@a.txt;filename=docs%2Fa.txt;type=text/plain' \
   -F 'object=@icon.png;filename=images%2Ficon.png;type=image/png'
@@ -1126,7 +768,7 @@ each object. Batch upload is standard-only: it creates no durable session,
 manifest, binding, or receipt and cannot resume after process restart.
 
 N1 performs no synchronous free-space scan before one-shot, batch, standard
-multipart, or durable multipart writes. Actual writes to the selected K+M
+multipart, or durable multipart writes. Actual writes to the selected K+P
 roots are authoritative. Kernel capacity exhaustion returns `507`, publishes
 no namespace entry, and leaves only cleanup/TTL-reclaimable unpublished data.
 Capacity reporting remains available asynchronously through monitoring.
@@ -1135,7 +777,7 @@ Capacity reporting remains available asynchronously through monitoring.
 
 The standard multipart API is the high-throughput path. Initiation and part
 completion state live only in process memory. Parts may be uploaded concurrently;
-each part is streamed once through EC to its fixed K+M placement. N1 writes no
+each part is streamed once through EC to its fixed K+P placement. N1 writes no
 session manifest, namespace pending record, or per-part receipt on this path.
 Finalize synchronizes the completed shard set and then publishes the immutable
 object index and namespace entry once. An unfinished standard session does not
@@ -1186,7 +828,7 @@ Clients should use bounded in-flight parts for large files instead of increasing
 Example:
 
 ```bash
-curl -k "$BASE/noa/v1/upload/multipart/$VERSION_ID/0?io_gate=true" \
+curl --fail-with-body "$BASE/noa/v1/upload/multipart/$VERSION_ID/0?io_gate=true" \
   "${AUTH[@]}" \
   -H 'Content-Type: application/octet-stream' \
   --data-binary @part-000
@@ -1250,7 +892,7 @@ Cancel removes the pending upload session. GC can later reclaim orphaned partial
 
 Use the durable variant when unfinished-upload restart recovery matters more
 than maximum ingest throughput. Its existing replicated manifest, pending
-namespace binding, and compact part-receipt contract is unchanged in N1 3.5.1.
+namespace binding and compact part receipts preserve restart progress.
 The request and response bodies are identical to standard multipart; insert
 `/durable` after `/multipart`:
 
@@ -1265,16 +907,14 @@ DELETE /noa/v1/upload/multipart/durable/{version_id}
 
 Durable part upload continues to accept the `durability`,
 `strict_durability`, and `io_gate` query controls documented for the previous
-multipart contract. Existing native `n1://` multipart operations retain this
-durable restart-resumable behavior; N1 3.5.1 does not silently change their
-established contract.
+multipart contract. Native n1:// multipart retains durable restart-resumable
+behavior. These upload controls do not define namespace-mutation durability modes.
 
 ## Archive Download
 
 ### Restart-safe bulk export
 
-N1 3.5.1 uses an asynchronous export job for large or operationally important
-folder downloads. The job captures one immutable version for every selected
+Use an asynchronous export job for large or restart-resumable prefix downloads. The job captures one immutable version for every selected
 logical path, builds the complete archive before publication, survives an N1
 restart, and exposes a stable browser-resumable download.
 
@@ -1474,251 +1114,88 @@ Query parameters:
 - `format`: `tar` or `zip`, default `tar`
 - `filename`: optional response filename
 
-## Trash And Recovery
+## Trash and recovery
 
-Soft delete reserves one filesystem directory named `<unix-nanos>.d<path-depth>` and renames a file or folder from its live path to `.trash/<generation>/<same-logical-path>` on every index root. Live listing no longer shows it. The generation name supplies deletion time and the retained path supplies the exact recovery destination. There is no lifecycle database, record file, receipt, or temporary state.
+Soft delete copies unchanged NCX to every trash holder before removing live NCX;
+recovery reverses that sequence. Neither reads nor rewrites NDX/payload. Trash
+entry IDs distinguish repeated deletes of the same key; retain the selected ID
+when recovering a specific deletion. Prefix work is bounded and non-atomic.
 
-Each delete has a distinct `trash_entry_id`, so the same logical path may be deleted repeatedly without overwriting older recoverable data. Recovery selects that id, performs the reverse rename, and returns `409 Conflict` without changing trash if the live destination already exists. Folder soft delete and recovery remain directory renames; N1 does not scan descendants until a retained folder reaches expiry.
-
-The background lifecycle scans only timestamp generations below `.trash`, not the full blob plane. It compares each generation timestamp with `trash_retention_seconds`. For expired entries it removes the namespace reference, verifies all candidate object ids once against the remaining namespace, and directly reclaims only unreferenced immutable object directories. A crash can leave only safe immutable orphan data; explicit deep GC reclaims that leak without risking reachable objects.
-
-N1 3.2.0 exposes no empty-trash, per-entry purge, permanent-delete, or version-delete operation over HTTP, POSIX, native protocol, shell, or console. Manual GC cannot shorten the retention window.
-
-Legacy HTTP clients receive `410 Gone` from the retired destructive routes.
-This explicit tombstone prevents a former `/objects/permanent/...` URL from
-falling through to the ordinary object-key catch-all. Removed native operation
-names fail as unsupported requests.
-
-Recover all trash:
+TTL compares trash timestamps with trash_retention_seconds and reclaims only
+safely unreferenced immutable data. Active uploads and export protections remain
+in force. N1 exposes no empty-trash, per-entry purge, permanent-delete or
+version-delete operation. Manual GC does not shorten retention. Retired
+destructive HTTP routes return 410; removed native operations are unsupported.
 
 ```bash
-curl -k -X POST "$BASE/noa/v1/trash/recover-all" "${AUTH[@]}"
+curl --fail-with-body -X POST "$BASE/noa/v1/trash/recover-all" "${AUTH[@]}"
 ```
 
-Lifecycle state is reported in the system health `maintenance` object through `trash_lifecycle_running`, `trash_lifecycle_phase`, `trash_retention_seconds`, and `trash_versions_expired`.
+System health reports trash_lifecycle_running, trash_lifecycle_phase,
+trash_retention_seconds and trash_versions_expired under maintenance.
 
-## Health, Repair, GC, And Redistribution
-
-### Disk IO Scheduler
-
-N1 includes a shared disk IO scheduler for disk-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
-
-The scheduler separates:
-
-- foreground read/write work
-- background repair
-- background GC
-- background redistribution
-- per-fragment pressure
-
-This prevents one hot fragment or one background job from consuming the whole disk path. It does not change object metadata, blob layout, durability semantics, or namespace behavior.
-
-N1 IO control adds bounded foreground admission without imposing a total
-operation timeout. A foreground request that cannot enter the scheduler within
-`foreground_wait_timeout_ms` receives `503 Service Unavailable`; an admitted
-stream remains active as long as it continues making progress. Background
-maintenance waits for its reserved lane and remains governed by its existing
-stop/cancel authority.
-
-The health response includes:
-
-- `io_scheduler`: configured lanes, adaptive foreground target, queue depth,
-  pressure state, per-class operation/byte/failure counters, and active
-  operation progress/stall state
-- `io_control`: configured thresholds, bounded p50/p95/p99 latency samples,
-  recent slow paths, process RSS, thread count, and open file descriptors
-
-Upload and download counters report logical payload bytes. GC reports reclaimed
-logical bytes. Repair and redistribution use progress heartbeats while scanning
-and rewriting so long-running healthy work is not mislabeled as stalled.
-
-The pressure states are:
-
-- `idle`: no disk-heavy operation is active
-- `normal`: work is active without scheduler queue pressure
-- `pressured`: lanes are busy or work is queued
-- `saturated`: foreground work is queued while all scheduler lanes are occupied
-- `stalled`: at least one active operation has made no progress for
-  `stall_threshold_ms`
-
-Adaptive concurrency does not reduce throughput merely because disks are fully
-utilized. It blocks upward growth under pressure and cuts concurrency only when
-an actual no-progress stall or system CPU/RAM/load pressure is observed.
-
-### Health
-
-System health:
+## Health and maintenance
 
 ```http
 GET /noa/v1/maintenance/health?deep_scan=true&refresh=true
-```
-
-Fragment health:
-
-```http
 GET /noa/v1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
-```
-
-The system health `maintenance.auto_healing` object reports the current
-controller phase, registered/writable roots, distinct writable devices, EC
-width, read-only reason, last topology check, last availability scan, last
-checksum scrub, and last error.
-
-N1 starts read-only, validates the registered storage identities and writable
-failure domains, and enables mutations only after the topology has remained
-safe for `topology_recovery_stability_seconds`. The current configured `D + P`
-must fit on distinct healthy devices. Extra configured disks may be offline
-without degrading healthy recorded objects as long as the current EC width can
-still be satisfied.
-
-### Object Status And Repair
-
-Object status:
-
-```http
 GET /noa/v1/objects/status/{object_key}?mode=availability
-```
-
-Response:
-
-```json
-{
-  "object_key": "videos/clip.mp4",
-  "version_id": "01KR...",
-  "status": "healthy",
-  "total_parts": 1,
-  "total_shards": 2,
-  "healthy_shards": 2,
-  "missing_shards": 0,
-  "corrupt_shards": 0,
-  "repairable": true,
-  "repaired_shards": 0,
-  "failed_repairs": 0
-}
-```
-
-Object repair:
-
-```http
 POST /noa/v1/objects/repair/{object_key}?mode=strict
 ```
 
-Modes:
+Health reports topology, read-only reason, controller phase, missing/corrupt
+replicas, last scans/errors and IO pressure. N1 initially validates enrolled
+identities and stabilizes topology before permitting writes. Missing/replaced
+members block unsafe mutations; parity-tolerant reads do not authorize writes
+to an incomplete namespace-holder set.
 
-- `availability`: fast placement/existence check
-- `checksum`: verify checksum where needed
-- `strict`: read-only full integrity check
-- `scrub`: quiesced/offline full integrity check
+Object status includes version_id, status, total_parts/shards, healthy_shards,
+missing_shards, corrupt_shards, repairable, repaired_shards, failed_repairs and
+recorded/current layout information. Status and repair have bounded admission;
+saturation returns 503. Repair preserves recorded pool geometry and membership.
+It does not move healthy old-pool objects to a new expansion pool.
 
-Object status and repair are bounded by global and per-fragment gates. If too many checks or repairs are already running, N1 returns `503 Service Unavailable` with a retry-shortly message. Repair and scrub also take an object-scoped lock so two repair/scrub tasks cannot mutate the same object at the same time.
+Modes are availability (online placement checks), checksum (checksum checks),
+strict (foreground mutations blocked) and scrub (quiesced work). A read-only
+maintenance mode restricts clients; it does not mean repair writes no data.
+Routine auto-healing uses availability scheduling for both availability checks
+and checksum cycles; unsafe topology or unresolved repair debt keeps writes
+blocked. Do not override identity checks to force service startup.
 
-### Fragment Or Global Repair
+### Start, stop and status
 
-The auto-healing controller normally owns routine global maintenance. Its
-availability cycle checks recorded paths and sizes; its checksum cycle verifies
-payload checksums. Fragments are processed serially, while
-`object_scan_concurrency` bounds objects inside the current fragment and
-`shard_repair_concurrency` bounds repair IO. The conservative defaults are one
-object and one shard repair at a time.
-
-Both healthy scheduled cycles remain in `availability` mode, so foreground
-reads and mutations continue. N1 re-reads each immutable version while holding
-its object-operation lock before repairing or atomically publishing a higher
-placement generation. A manually requested `checksum` remains read-only
-by default; `strict` is read-only and `scrub` is quiesced. The autonomous
-controller enters persistent read-only only when topology or root identity is
-unsafe, or when a scan finishes with unresolved repair debt.
-
-When a recorded shard root is gone but enough data and another distinct healthy
-root exist, the healer reconstructs the shard on that replacement root and
-atomically publishes a higher object placement generation. Stale metadata at a
-lower generation cannot win. If any object cannot be repaired, the scan is
-reported as failed and N1 keeps user mutations read-only until a later scan
-completes without unresolved repair debt.
-
-Manual repair remains available for diagnosis or an immediate operator-driven
-cycle:
+Replace {job} with repair, gc or redistribution:
 
 ```http
-POST /noa/v1/maintenance/fragments/{fragment}/repair/start?mode=strict
-POST /noa/v1/maintenance/repair/start?fragment={fragment}&mode=strict
-POST /noa/v1/maintenance/repair/stop
-GET  /noa/v1/maintenance/repair/status
+POST /noa/v1/maintenance/{job}/start?fragment={fragment}&mode=strict
+POST /noa/v1/maintenance/fragments/{fragment}/{job}/start?mode=strict
+POST /noa/v1/maintenance/{job}/stop
+GET /noa/v1/maintenance/{job}/status
+POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
 ```
 
-Useful query parameters:
+| Job | Query controls |
+| --- | --- |
+| Repair | mode=availability/checksum/strict/scrub, dry_run, fast_mode, read_only_fast, meta_concurrency, repair_concurrency, batch |
+| GC | mode=availability/strict/scrub |
+| Redistribution | mode=availability/strict/scrub, scope=all/index/blob, durability=auto/strict/batched, fast_mode, object_concurrency, status_batch |
 
-- `mode`: `availability`, `checksum`, `strict`, `scrub`
-- `dry_run`: boolean
-- `fast_mode`: boolean
-- `read_only_fast`: boolean
-- `meta_concurrency`
-- `repair_concurrency`
-- `batch`
+Poll status until completion and inspect errors, not just admission. Legacy
+index/blob scope names remain API parameters, not separately configured pool
+roles. Healthy format-4 placements are not redistribution debt. This API is
+not an automatic pool migration/recode command. Expansion requires no rebalance.
+Maintenance may inspect/change immutable placements under its own safeguards;
+ordinary rename/trash/recover does not.
 
-### Garbage Collection
+Foreground upload, repair, GC and export share bounded disk IO admission.
+Health exposes disk_io foreground/background lanes, waits, stalls, permits,
+bytes, latency and admission failures. Saturation can reject requests instead
+of allocating unbounded work. This scheduler is not a content/namespace cache.
 
-```http
-POST /noa/v1/maintenance/fragments/{fragment}/gc/start?mode=availability
-POST /noa/v1/maintenance/gc/start?fragment={fragment}&mode=availability
-POST /noa/v1/maintenance/gc/stop
-GET  /noa/v1/maintenance/gc/status
-```
+## WebSocket events
 
-Modes:
-
-- `availability`: conservative online GC
-- `strict`: read-only stronger check
-- `scrub`: quiesced strongest check
-
-### Redistribution
-
-```http
-POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start?mode=strict
-POST /noa/v1/maintenance/redistribution/start?fragment={fragment}&mode=strict
-POST /noa/v1/maintenance/redistribution/stop
-GET  /noa/v1/maintenance/redistribution/status
-```
-
-Useful query parameters:
-
-- `mode`: `availability`, `strict`, `scrub`
-- `scope`: `all`, `index`, or `blob`
-- `durability`: `auto`, `strict`, or `batched`
-- `fast_mode`: boolean
-- `object_concurrency`
-- `status_batch`
-
-Redistribution rewrites selected object versions into the current blob/EC
-topology. Upload and rewrite paths use the same disk-capacity and placement
-preflight model; if a disk is too full, N1 fails before unsafe shard writes.
-
-Redistribution is never triggered by disk addition or auto-healing. Each object
-version remains governed by its recorded `D + P`, stripe size, and root set.
-Changing the configured EC width affects new versions only. Added disks enter
-the deterministic placement pool for new objects and as eligible repair
-targets; healthy existing objects are neither degraded nor rewritten.
-
-Namespace maintenance also reconciles missing or incomplete index replicas.
-Ordinary namespace mutations are direct filesystem operations on every
-accepted index root and write no generation record. Root-identity and topology
-safety prevent mutations while a configured root is absent or replaced, so a
-returning root cannot silently miss foreground writes. Replica inspection uses
-a deterministic digest of sorted namespace/control content; destructive repair
-fails closed when equally complete replicas reference different immutable
-objects.
-
-## Realtime Namespace Websocket
-
-Connect with a fragment token:
-
-```text
-wss://127.0.0.1:50001/noa/v1/ws?token=<access_token>
-```
-
-The websocket emits namespace deltas for CRUD and POSIX changes. It does not ask clients to reload the whole tree after each operation.
-
-Example event:
+Connect using wss://storage.example:50001/noa/v1/ws?token=<access-token>.
+Treat the URL token as a secret. Events use this envelope:
 
 ```json
 {
@@ -1727,88 +1204,281 @@ Example event:
     "timestamp_ms": 1778000000000,
     "type": "NAMESPACE_CHANGED",
     "data": {
-      "fragment": "<fragment_hash>",
+      "fragment": "<fragment>",
       "operation": "rename",
-      "kind": "Directory",
-      "source_path": "videos",
-      "destination_path": "archive/videos",
+      "kind": "File",
+      "source_path": "docs/example.txt",
+      "destination_path": "archive/example.txt",
       "affected_paths": 1,
-      "affected_objects": 1200
+      "affected_objects": 1
     }
   }
 }
 ```
 
-Common operations:
+Common operations: upsert_file, rename, trash, recover, recover_all,
+bulk_delete and bulk_recover. Apply deltas without reloading the entire tree
+after each event. On reconnect, re-list to reconcile missed changes; events
+are not a durable client transaction log. Inspect partial mutation responses
+as well as notifications.
 
-- `upsert_file`
-- `mkdir`
-- `rename`
-- `trash`
-- `recover`
-- `recover_all`
-- `bulk_delete`
-- `bulk_recover`
+## Errors and retries
 
-## Error Handling
+Most failures return status plus plain error text. Preserve the status and
+message in diagnostics; do not assume every error body is JSON.
 
-N1 returns HTTP status codes with plain error text for most failures.
+| Status | Meaning |
+| --- | --- |
+| 400 | Invalid request/path, rejected empty mkdir or cross-fragment rename |
+| 401 / 403 | Invalid/missing authentication / insufficient permission |
+| 404 | Missing object, fragment, version or completed/absent session |
+| 409 | Destination/session conflict or already-running maintenance |
+| 410 | Retired destructive route |
+| 413 | Request/body exceeds a limit |
+| 416 | Unsatisfiable range |
+| 503 | Unsafe topology, unavailable accelerator or admission saturation |
+| 507 | Kernel storage/quota exhaustion |
 
-Common mappings:
+202 accepts asynchronous export work; poll its status. 207 batch upload contains
+per-object outcomes. Prefix mutations may return successful HTTP status with
+conflicted_paths/failed_paths. Retry only the unfinished work, with backoff for
+saturation. Reconcile after connection loss; do not blindly repeat an upload
+and assume it cannot create another immutable version.
 
-- `400 Bad Request`: invalid path, invalid body, missing required field
-- `401 Unauthorized`: missing or invalid token/secret
-- `403 Forbidden`: token lacks required permission
-- `404 Not Found`: object, fragment, or path not found
-- `409 Conflict`: existing fragment or running maintenance job
-- `413 Payload Too Large`: request exceeds configured size
-- `416 Range Not Satisfiable`: invalid range request
-- `503 Service Unavailable`: maintenance mode, saturated upload path, or disk provisioning issue
-- `507 Insufficient Storage`: capacity limit reached
+## Accel integration
 
-## Troubleshooting
+Accel is optional and rebuildable. Configure N1 with:
 
-### Fragment creation fails with disk errors
+```dotenv
+N1_ACCEL_SEARCH_URL=http://127.0.0.1:53001
+N1_ACCEL_SEARCH_BACKEND_ID=n1-primary
+```
 
-Check that every configured index and blob root exists, is mounted, and is
-writable by the N1 service user. Also inspect `maintenance.auto_healing` for a
-root-identity mismatch. N1 deliberately does not overwrite an enrolled
-identity when a disk is replaced or a mount is absent.
+Configure a matching Accel backend ID, N1 origin/trusted TLS and jwt_secret_env
+referencing N1's signing secret, not a fragment secret. Keep Accel private.
+Clients call N1's authenticated namespace/search; N1 forwards to this fixed
+backend. Snapshot ingestion is projection building, never namespace authority.
 
-### Upload returns `Upload path is saturated`
+Search supports q, scope, field, match, limit, cursor and refresh controls of
+the configured Accel implementation. Refresh-based results can be stale; N1
+LIST/lookup remains authoritative. Without Accel, only search returns 503.
+Ordinary reads/writes/listing still work. Enabling search does not route ordinary
+downloads through Accel's byte cache; that needs explicit version-pinned client
+integration. Accel data is not a backup.
 
-The upload IO gate is protecting the server. Retry with backoff or lower client concurrency. On slow mixed disks, this is a backpressure signal, not a data-loss event.
+## Backup and restore
 
-### Deleted data has not been reclaimed yet
+The litiaina-n1-backup helper creates encrypted offline recovery points, not
+live replication or a writable standby. Use the same helper/engine revision.
+Capture requires all configured roots, initialized leases and a stopped engine
+for the entire scan; quiesce application writers first. Source leases reject an
+active updated engine, but cannot protect against unrelated filesystem writes.
+Do not remount/edit roots or overlap maintenance during capture.
 
-This is expected while the configured `trash_retention_seconds` has not elapsed. N1 deliberately preserves the entry for recovery. After expiry, the targeted lifecycle scan removes the `.trash` entry and directly reclaims object data only when no other namespace reference remains. Manual GC does not shorten this window.
+Capture includes pool/fragment identities and credentials, live/trash NCX,
+NDX/payload, durable multipart progress, directories/symlinks and timestamps.
+It excludes runtime leases/physical-root identity, control workspace, config/env,
+TLS/service files, refresh-token sessions, exports, Accel and application DBs.
+Back up these separately. Standard unfinished uploads do not survive a stop.
 
-### Redistribution fails with insufficient storage
+AES-256-GCM/HKDF-SHA256 protects snapshot contents. Repository block names expose
+equality/size, not plaintext. Protect repository/key permissions, and store an
+offsite key copy: losing the key loses recovery. Restore does not recreate Unix
+owners, ACLs or xattrs. Key rotation is not implemented.
 
-Redistribution can need temporary write headroom while it rebuilds shard
-placement. Free capacity, run GC if trash/orphans are expected, or add blob
-capacity before retrying.
-
-### Health shows degraded after disk loss
-
-Wait for the configured automatic availability cycle or start an immediate
-manual repair, then refresh health:
+### Capture and verify
 
 ```bash
-curl -k -X POST "$BASE/noa/v1/maintenance/fragments/$FRAGMENT/repair/start?mode=strict" "${AUTH[@]}"
-curl -k "$BASE/noa/v1/maintenance/fragments/$FRAGMENT/health?deep_scan=true&refresh=true" "${AUTH[@]}"
+litiaina-n1-backup keygen --key-file /secure/n1-backup.key
+litiaina-n1-backup init \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key
+sudo systemctl stop litiaina-n1.service
+litiaina-n1-backup create \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --config /opt/litiaina/n1/n1_config.ini --workers 4
+sudo systemctl start litiaina-n1.service
+litiaina-n1-backup list \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key
+litiaina-n1-backup verify \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --snapshot SNAPSHOT_ID
 ```
 
-### Trash recovery path
+Manual create does not stop/restart N1; restart it even when capture fails.
+Use an account with source/repository access. Incremental capture reuses blocks
+but still reads/hashes the tree; downtime scales with dataset and storage.
+Workers are bounded at 1–32, default four, with streamed 4 MiB blocks.
 
-Trash listing returns both the original path and `trash_entry_id`. Send the id to recover one exact deletion generation. Path-only recovery selects the newest retained generation for that path. Recovery remains strict and returns `409 Conflict` when the original live path is occupied.
+### Replicate recovery points
 
-```json
-{ "path": "videos" }
+Initialize the destination with a protected copy of the same key. Put it on an
+independent storage/host/site failure domain. Replication can run after N1
+restarts because it reads a committed snapshot, not live engine files.
+
+```bash
+litiaina-n1-backup replicate \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --snapshot SNAPSHOT_ID \
+  --target-repository /independent-backup/n1-replica \
+  --target-key-file /secure/n1-backup.key
+
+litiaina-n1-backup replicate \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --snapshot SNAPSHOT_ID --ssh backup@backup-host \
+  --remote-binary /opt/litiaina/n1/litiaina-n1-backup \
+  --target-repository /backup/n1-replica \
+  --target-key-file /secure/n1-backup.key
 ```
 
-## Operational Tradeoffs
+Install the matching helper remotely and configure SSH keys/known_hosts. Normal
+host-key verification applies; --ssh-config can select a dedicated config.
+Interrupted transfer is retried with the same snapshot; verified blocks are
+reused. A partial transfer is not a committed recovery point. Replication does
+not propagate source deletion or retention; choose destination retention separately.
 
-N1 is optimized for durable large-object storage, POSIX movement, repairability, and bounded memory. It can store many small objects, but tiny-object storms pay per-object namespace commit, receipt, and shard/parity overhead. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
+### Portable restore
 
-N1 is strongest when it can stream bytes, keep namespace movement lightweight, and keep durable resumability on disk rather than depending on RAM-only state.
+Keep the destination engine stopped and use fresh empty roots, matching pool
+IDs/generations/geometry and corresponding independent member devices. Root
+remapping uses the same position in the lexicographically sorted unique-root
+lists; review the source/target mapping. This is not format migration or EC
+recoding to a different count/layout. Use a fresh fs_storage_path; do not copy
+the source physical identity registry onto replacement devices.
+
+```bash
+litiaina-n1-backup restore \
+  --repository /backup/n1-replica --key-file /secure/n1-backup.key \
+  --snapshot SNAPSHOT_ID --target-config /etc/litiaina/n1-restored.ini
+```
+
+Restore authenticates blocks, writes startup fences, remaps paths and synchronizes
+files/directories before removing fences. The engine refuses incomplete restore.
+After interruption, repeat the matching command with --resume. Never remove
+fences to force startup; unexpected destination files fail rather than being
+deleted. Configure secrets, TLS and ownership separately before starting.
+
+Validate fragment auth, namespace/history/trash, full download hashes, health,
+new writes and any required durable continuation. Restore a matching application
+DB recovery point before resuming writes. Restore does not reset expiration ages;
+review cleanup policy before first startup of an old snapshot. Keep the backup
+repository intact while validating recovery.
+
+### Retention
+
+```bash
+litiaina-n1-backup forget \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key \
+  --snapshot OLD_SNAPSHOT_ID
+litiaina-n1-backup gc \
+  --repository /backup/n1-primary --key-file /secure/n1-backup.key
+```
+
+forget refuses the last completed point. Repository GC protects authenticated
+completed snapshots and incomplete-job pins. Add --discard-incomplete only when
+deliberately abandoning failed-job pins with no active job. Repository leases
+prevent concurrent destructive cleanup. This is not WORM storage; OS-level
+administrators can still erase it.
+
+### Optional supervised backup jobs
+
+[deploy/backup-job.json.example](deploy/backup-job.json.example) is disabled by
+default. Initialize repositories/key first, configure exact paths/service,
+private state outside roots/repositories, timeouts and independent retention,
+then set enabled=true for an approved maintenance window. Protect the config,
+state, helper and SSH settings from untrusted writes. The source engine must
+have initialized its root leases before capture.
+
+Install the supplied units in /etc/systemd/system and the matching helper at
+their configured executable path:
+
+```bash
+sudo install -m 644 deploy/systemd/litiaina-n1-backup.service \
+  deploy/systemd/litiaina-n1-backup.timer \
+  deploy/systemd/litiaina-n1-backup-recover.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start litiaina-n1-backup.service
+sudo /opt/litiaina/n1/litiaina-n1-backup job-status \
+  --config /etc/litiaina/n1/backup-job.json
+# Enable only after a successful supervised acceptance/recovery drill:
+sudo systemctl enable --now litiaina-n1-backup.timer
+```
+
+The supervisor preserves the original N1 service state, records restart intent
+before stopping, restarts before verify/replication, and applies retention only
+after required success. Pending replication retries reuse the snapshot without
+another capture. ExecStopPost plus separate-cgroup OnFailure/boot recovery handle
+interrupted restart intent. This supervises N1 only, not application DB quiescing.
+
+The supplied timer is Sunday 02:00 host time, Persistent=false: missed windows
+are skipped. The timer also enables the recovery unit. job-status emits JSON
+and exits nonzero for enabled jobs that are failed, interrupted, overdue or not
+yet complete; connect it to monitoring. Building does not enable scheduling.
+
+Disable the timer and enabled setting for future runs, but retain recovery
+state/unit while restart intent is pending. To interrupt, stop the backup
+service and verify N1 recovered. Unsupervised run-job cannot clean up its own
+SIGKILL. After its job and children exit, manual recovery is:
+
+```bash
+litiaina-n1-backup recover-job --state-dir /var/lib/litiaina/n1-backup
+```
+
+This restores service intention, not a successful backup. Live replication,
+standby promotion, automatic key rotation and zero-RPO recovery are not features
+of this offline helper. See [TESTING.md](TESTING.md) for drilled cases and limits.
+
+## Operator setup
+
+For normal startup/systemd installation see [README.md](README.md#build-and-start).
+The browser-terminal shell adds guarded provisioning, not filesystem semantics
+or a required always-running management service. On Debian-family systems it
+needs xfsprogs, util-linux and fdisk; create the intended N1 service account and
+prepare a trusted certificate/key first.
+
+```bash
+cargo build --release -p n1 --bins -p n1_shell
+sudo litiaina-n1-shell serve --bind 127.0.0.1:50901 \
+  --install-dir /opt/litiaina/n1 \
+  --engine-binary /opt/litiaina/n1/litiaina-n1 \
+  --mount-root /mnt --run-user n1 --run-group n1
+```
+
+Use the temporary setup token shown by serve. Keep this privileged setup
+listener on loopback or a protected SSH tunnel; it is not public TLS. Shut it
+down after setup. The N1 systemd service runs independently.
+
+### Browser-terminal sequence
+
+```text
+prerequisites
+lsblk
+disk inspect <device>
+n1 init
+config pool A 3 1 /mnt/NDISK001,/mnt/NDISK002,/mnt/NDISK003,/mnt/NDISK004
+config endpoint 127.0.0.1 50001 50002
+config tls /opt/litiaina/n1/cert.pem /opt/litiaina/n1/key.pem
+config show
+config validate
+n1 start
+n1 status
+n1 logs
+n1 enable
+```
+
+n1 init creates config/secrets and installs a disabled service; it does not
+make unconfigured storage safe. Secrets output is private. Ensure all four
+mounted roots are provisioned before config pool/start. Configure pools while
+the engine is stopped; enrolled topology is immutable.
+
+Only when explicitly provisioning empty devices, disk format <device> NDISK001
+performs destructive GPT/XFS formatting. It requires current label/serial
+confirmation and rejects protected root/boot/swap, mounted and read-only devices.
+Review disk inspect output; never guess a device name. Formatting creates a
+persistent UUID mount and service ownership; it is not secure erasure. Repeat
+with distinct devices/labels only as required. Existing storage should be
+mounted/validated, not formatted again after a startup error.
+
+Use disk mount <label> for prepared mounts, and n1 stop/restart/disable for
+service control. Use help for command details. Missing member/identity errors
+need inspection and a tested replacement/restore procedure, not config editing
+to bypass safety. Pool expansion adds a separate complete pool.

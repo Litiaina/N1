@@ -17,39 +17,22 @@ use crate::core::instance_lease::{InstanceLease, LEASE_FILE, RESTORE_PENDING};
 pub fn roots_from_config(config: &Path) -> Result<Vec<Root>> {
     let config = fs::canonicalize(config)?;
     let ini = ini::Ini::load_from_file(&config)?;
-    let section = ini
-        .section(Some("disk_config"))
-        .ok_or_else(|| invalid("missing disk_config"))?;
     let mut roots = BTreeMap::<String, Root>::new();
-    for (key, index) in [("index_store_disks", true), ("blob_store_disks", false)] {
-        let value = section
-            .get(key)
-            .ok_or_else(|| invalid(format!("missing {key}")))?;
-        if value.trim().is_empty() {
-            return Err(invalid("backup requires configured storage roots"));
-        }
-        for value in value.split(',') {
-            let path = PathBuf::from(value.trim());
-            // Explicit absolute paths avoid accidentally backing up a different
-            // installation when the CLI working directory differs from N1's.
-            if !path.is_absolute() {
-                return Err(invalid("backup requires absolute storage roots in config"));
-            }
+    for pool in crate::core::storage_pool::parse(&ini).map_err(invalid)? {
+        for path in pool.roots {
             let path = fs::canonicalize(path)?;
             let value = path
                 .to_str()
                 .ok_or_else(|| invalid("storage roots must be UTF-8"))?
                 .to_owned();
-            let root = roots.entry(value.clone()).or_insert(Root {
-                path: value,
-                index: false,
-                blob: false,
-            });
-            if index {
-                root.index = true;
-            } else {
-                root.blob = true;
-            }
+            roots.insert(
+                value.clone(),
+                Root {
+                    path: value,
+                    index: true,
+                    blob: true,
+                },
+            );
         }
     }
     let roots: Vec<_> = roots.into_values().collect();

@@ -78,18 +78,20 @@ pub(crate) struct UploadActivityGuard {
 
 impl UploadActivityGuard {
     pub(super) fn active(fragment: &str, object: &str) -> Result<bool, AppError> {
+        let fragment = crate::core::index_store::stable_fragment_id_for_fragment(fragment);
         let object = crate::core::index_store::normalize_object_id(object)?;
-        let state = lock(&REGISTRY)?.get(fragment).cloned();
+        let state = lock(&REGISTRY)?.get(&fragment).cloned();
         let Some(state) = state else { return Ok(false) };
         let active = lock(&state)?
             .objects
             .get(&object)
             .is_some_and(|value| value.uploads != 0);
-        prune_registry(fragment, &state);
+        prune_registry(&fragment, &state);
         Ok(active)
     }
 
     pub(crate) fn begin(fragment: &str, object: &str) -> Result<Self, AppError> {
+        let fragment = crate::core::index_store::stable_fragment_id_for_fragment(fragment);
         let object = crate::core::index_store::normalize_object_id(object)?;
         let mut registry = lock(&REGISTRY)?;
         let state = registry.entry(fragment.to_owned()).or_default().clone();
@@ -138,6 +140,7 @@ pub(crate) struct UploadGcScan {
 impl UploadGcScan {
     /// Must precede the durable-session and namespace snapshots.
     pub(crate) fn begin(fragment: &str) -> Result<Self, AppError> {
+        let fragment = crate::core::index_store::stable_fragment_id_for_fragment(fragment);
         let mut registry = lock(&REGISTRY)?;
         let state = registry.entry(fragment.to_owned()).or_default().clone();
         let id;

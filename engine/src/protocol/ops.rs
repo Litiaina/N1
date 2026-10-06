@@ -430,8 +430,10 @@ async fn execute_native_op_inner(
             );
             native_body(json!({
                 "operation": summary.operation,
-                "affected_paths": summary.affected_paths,
-                "affected_objects": summary.affected_objects,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+            "conflicted_paths": summary.conflicted_paths,
+            "failed_paths": summary.failed_paths,
             }))
         }
         "object.status" => {

@@ -81,38 +81,7 @@ fn count_files_with_suffix(root: &Path, suffix: &str) -> ProofResult<usize> {
 }
 
 fn count_live_namespace_links(root: &Path) -> ProofResult<usize> {
-    if !root.exists() {
-        return Ok(0);
-    }
-    let mut count = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let ty = fs::symlink_metadata(&path)?.file_type();
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            let in_trash = rel
-                .components()
-                .any(|part| part.as_os_str() == ".trash");
-            if in_trash {
-                continue;
-            }
-            if ty.is_symlink() {
-                let target = fs::read_link(&path)?;
-                let is_object_link = target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("@o_"));
-                if is_object_link {
-                    count += 1;
-                }
-            } else if ty.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
-    Ok(count)
+    count_files_with_suffix(&root.join(".namespace"), ".ncx")
 }
 
 fn fragment_alias_stable_id(root: &Path, fragment: &str) -> ProofResult<String> {

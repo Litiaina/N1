@@ -1,49 +1,17 @@
-# Litiaina Node Object API (NOA)
+# Node Object API (NOA)
 
-NOA is the versioned HTTPS and WebSocket contract shared by Litiaina object
-storage engines. N1 3.2.0 is the first reference implementation of NOA v1.
+NOA v1 is N1's canonical HTTPS/WebSocket interface under /noa/v1. It was
+introduced in N1 3.2.0; its version is separate from the package/storage format.
+The native n1:// transport is N1-specific and is not NOA.
 
-NOA standardizes the public transport contract. It does not standardize or
-replace an engine's namespace representation, object metadata, erasure-code
-placement, repair algorithms, lifecycle implementation, or disk topology.
+Use Authorization: Bearer <access-token> on protected calls. Fragment permissions
+remain independent: read, write, modify and delete. Signed URLs carry narrowly
+scoped download authority instead of a reusable fragment token.
 
-## Version Boundary
-
-- API name: `NOA`
-- API version: `v1`
-- HTTPS prefix: `/noa/v1`
-- Realtime endpoint: `/noa/v1/ws`
-- First N1 implementation: `3.2.0`
-
-The NOA version is independent of the N1 package version and N1 engine format.
-A future N1 package can continue implementing NOA v1 without changing the URL.
-An incompatible public API requires a new NOA prefix such as `/noa/v2`.
-
-N1 3.2.0 deliberately replaces the former `/n1/...` HTTPS namespace. It does
-not expose permanent aliases for the old paths. This prevents two public API
-names from becoming separate compatibility contracts.
-
-The native `n1://` protocol remains an N1-specific trusted transport. It calls
-the same engine operations but is not renamed or presented as part of NOA.
-
-## Compatibility Rule
-
-NOA v1 began from the N1 3.1.1 HTTP methods, request bodies, query parameters,
-response bodies, status codes, authentication behavior, and streaming
-behavior. The contract change in N1 3.2.0 was the public route namespace and
-API identity. Later N1 3.2.x bug fixes continue to use the same NOA v1 route
-families; internal namespace, lifecycle, EC, and healing implementations are
-not part of the NOA standard.
-
-Clients authenticate protected calls with:
-
-```http
-Authorization: Bearer <access-token>
-```
-
-The complete field-level request and response contract is documented in
-`DOCUMENTATION.md`. The route families below are the canonical NOA v1 surface
-implemented by N1.
+N1 4 is development: keys are flat, prefixes virtual, empty mkdir rejected and
+prefix mutations non-atomic with per-child results. Old /n1 routes are not
+aliases. This inventory names routes; field-level requests, responses, examples
+and retry rules are in [DOCUMENTATION.md](DOCUMENTATION.md).
 
 ## Connectivity And Authentication
 
@@ -114,28 +82,11 @@ DELETE /noa/v1/exports/{export_id}
 Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
 not add empty-trash, hard-delete, or per-version-delete semantics.
 
-The namespace snapshot is a read-authorized, single-pass NDJSON feed for
-rebuildable external indexes. It exposes logical paths and public immutable
-version summaries only and ends with an exact completion marker. It is not a
-second namespace authority.
-
-Namespace search is an authenticated, fixed-destination proxy to the optional
-Accel projection. The fragment token remains the authority, the backend id is
-server-configured, and an unavailable accelerator affects search only.
-
-The export family is the restart-safe bulk-download contract. Creation pins an
-exact immutable version set and returns an operation id; status exposes bounded
-progress; download becomes available only after the complete ZIP64 or TAR
-artifact is durable. Business layers may create exports with mapped
-`object_key`, `archive_path`, exact `version_id`, `offset_bytes`, and
-`length_bytes` entries so opaque or packed physical storage retains the correct
-user-visible archive namespace.
-Ready downloads have stable content length, SHA-256 ETag, and single-range
-resume support. Cancellation and export-specific retention
-remove only the derived artifact and never mutate source objects.
-The signed-export route lets native browser downloads retain those same range
-semantics without putting a reusable fragment token into a URL; the signature
-is scoped to one export, one fragment, and one bounded expiry.
+Snapshot is a read-authorized NDJSON projection feed with a completion marker.
+Search proxies to optional Accel; unavailable Accel affects search only.
+Exports pin immutable versions, build durable ZIP/TAR artifacts and support
+stable length/ETag, range resume and scoped signed downloads. Cancellation and
+artifact retention do not delete source objects.
 
 ## Uploads
 
@@ -157,19 +108,10 @@ POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
 DELETE /noa/v1/upload/multipart/durable/{version_id}
 ```
 
-The standard multipart family is process-resumable and optimized for concurrent
-ingest: initialization/status/part completion are memory-resident and finalize
-is the only durability/publication boundary. The durable family retains
-restart-resumable manifests and part receipts. Both publish the same immutable
-N1 object and namespace representation after successful finalize.
-
-The standard batch route accepts `multipart/form-data` for high-volume small
-objects. Every file field is named `object`, carries its percent-encoded object
-key as the multipart filename, is limited to one MiB, and remains an
-independent object operation. The optional `concurrency` query is bounded by
-the server. A complete batch returns `201`; mixed per-object results return
-`207`. There is deliberately no durable batch route: clients requiring
-restart-proof progress use durable multipart for each object.
+Standard multipart is nonpersistent until finalize; durable multipart retains
+restart-resumable progress. Both publish immutable objects after finalization.
+Batch accepts independent small objects, returning 201 for all-success or 207
+for mixed results. There is no durable batch route.
 
 ## Maintenance And Object Health
 
@@ -199,18 +141,9 @@ POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start
 POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
 ```
 
-NOA exposes the observable operation and status. N1 continues deciding how the
-operation reaches its object-level EC set and local roots. A future N2 NOA v1
-implementation can use voters, partitions, and distributed placement without
-exposing those internals through ordinary object calls.
+## Conformance
 
-## Conformance Boundary
-
-An implementation conforms to NOA v1 only when the same client request has the
-same externally visible meaning, authentication rules, success response, error
-class, and retry behavior. Matching route names alone is insufficient.
-
-N1's route tests, Shell tests, signed-read tests, and release-proof client use
-the canonical prefix so API drift fails the normal workspace verification.
-The bounded real-process conformance gate is available through the release
-proof runner's `--noa-api-proof` mode.
+Conformance requires matching request meaning, authentication, responses,
+errors and retry behavior, not just route names. N1's workspace tests and the
+release runner's --noa-api-proof check the canonical surface. Test evidence and
+limits are in [TESTING.md](TESTING.md).

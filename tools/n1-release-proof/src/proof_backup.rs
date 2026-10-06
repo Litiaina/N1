@@ -80,8 +80,13 @@ impl Proof {
             "application/octet-stream",
         )
         .await?;
-        self.posix_post("/noa/v1/posix/mkdir", json!({"path":"backup-empty"}))
-            .await?;
+        // Empty physical organizers survive backup but are not logical objects.
+        for root in &self.index_roots {
+            fs::create_dir_all(
+                physical_fragment_root(root, &self.stable_fragment_id)
+                    .join(".namespace/backup-empty"),
+            )?;
+        }
         let trash_key = "backup-trash/file.bin";
         let trash_payload = deterministic_payload(65536, b"backup-trash");
         let trash_hash = sha256_bytes(&trash_payload);
@@ -300,7 +305,14 @@ impl Proof {
             &sha256_bytes(&deterministic_payload(384 * 1024, b"rename-lineage-v2")),
         )
         .await?;
-        self.posix_stat("backup-empty", false).await?;
+        for root in &self.index_roots {
+            if !physical_fragment_root(root, &self.stable_fragment_id)
+                .join(".namespace/backup-empty")
+                .is_dir()
+            {
+                return Err("backup lost an empty physical organizer".into());
+            }
+        }
         self.posix_post("/noa/v1/posix/recover", json!({"path":"backup-trash"}))
             .await?;
         self.assert_download_sha256(trash_key, &trash_hash).await?;
@@ -356,7 +368,7 @@ impl Proof {
             "first_snapshot":first,"second_snapshot":second,"capture_seconds":capture_seconds,"incremental_capture_seconds":incremental_seconds,
             "replication_seconds":replication_seconds,"restore_seconds":restore_seconds,"lineage":lineage,"small_objects":storm,
             "checks":["online_capture_rejected","encrypted_capture_verified","incremental_snapshot","replication_idempotent","original_roots_offline",
-                "portable_restore","paginated_listing","version_identity_and_history","download_sha256","empty_directory","trash_recovery","durable_session_resume",
+                "portable_restore","paginated_listing","version_identity_and_history","download_sha256","empty_physical_organizer","trash_recovery","durable_session_resume",
                 "range_download","new_write_and_delete","retained_older_replica","retention_gc_preserves_live_blocks","all_small_object_hashes","independent_fragment_credentials"],
             "post_restore_version":post,"repository":repo,"replica":replica,"key_file":key,
             "test_scope":"isolated directories; no production service restart or disk formatting"});

@@ -657,6 +657,8 @@ async fn delete_object_scoped(
             "operation": summary.operation,
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
+            "conflicted_paths": summary.conflicted_paths,
+            "failed_paths": summary.failed_paths,
             "trash_entry_id": summary.trash_entry_id,
             "deleted_at_unix": summary.deleted_at_unix,
         })),
@@ -685,6 +687,8 @@ async fn recover_object_scoped(
             "operation": summary.operation,
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
+            "conflicted_paths": summary.conflicted_paths,
+            "failed_paths": summary.failed_paths,
         })),
     ))
 }
@@ -867,6 +871,8 @@ async fn recover_all_trash_scoped(
             "operation": summary.operation,
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
+            "conflicted_paths": summary.conflicted_paths,
+            "failed_paths": summary.failed_paths,
         })),
     ))
 }

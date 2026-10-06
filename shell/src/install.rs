@@ -165,7 +165,7 @@ pub struct FormatResult {
 mod host;
 
 pub use host::{HostOps, LinuxHost, ServiceAction};
-use host::{atomic_write, ensure_fstab_target_available, path_text};
+use host::{atomic_write, ensure_fstab_target_available};
 
 #[cfg(test)]
 use host::parse_lsblk_json;
@@ -197,32 +197,6 @@ fn human_bytes(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[unit])
     } else {
         format!("{value:.2} {}", UNITS[unit])
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiskRole {
-    Index,
-    Blob,
-    Both,
-}
-
-impl DiskRole {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().replace(',', "+").as_str() {
-            "index" => Ok(Self::Index),
-            "blob" => Ok(Self::Blob),
-            "both" | "index+blob" | "blob+index" => Ok(Self::Both),
-            _ => Err("role must be index, blob, or both".into()),
-        }
-    }
-
-    fn index(self) -> bool {
-        matches!(self, Self::Index | Self::Both)
-    }
-
-    fn blob(self) -> bool {
-        matches!(self, Self::Blob | Self::Both)
     }
 }
 
@@ -489,82 +463,9 @@ impl InstallShell {
                 );
                 Ok(success_outcome())
             }
-            "assign" => {
-                let label = arguments
-                    .get(1)
-                    .ok_or("usage: disk assign <NDISKxxx> <index|blob|both>")?;
-                let role = DiskRole::parse(
-                    arguments
-                        .get(2)
-                        .ok_or("usage: disk assign <NDISKxxx> <index|blob|both>")?,
-                )?;
-                self.assign_disk(label, role)?;
-                emit(
-                    OutputKind::Success,
-                    format!("{label} assigned as {}", arguments[2]),
-                );
-                Ok(success_outcome())
-            }
-            "unassign" => {
-                let label = arguments
-                    .get(1)
-                    .ok_or("usage: disk unassign <NDISKxxx> <index|blob|both>")?;
-                let role = DiskRole::parse(
-                    arguments
-                        .get(2)
-                        .ok_or("usage: disk unassign <NDISKxxx> <index|blob|both>")?,
-                )?;
-                self.unassign_disk(label, role)?;
-                emit(OutputKind::Success, format!("{label} assignment removed"));
-                Ok(success_outcome())
-            }
+            "assign" | "unassign" => Err("N1 4 uses complete immutable storage pools; use config pool <name> <data> <parity> <roots-comma-list>".into()),
             _ => Err("usage: disk <inspect|format|mount|assign|unassign> ...".into()),
         }
-    }
-
-    fn assign_disk(&self, label: &str, role: DiskRole) -> Result<(), String> {
-        self.ensure_service_stopped()?;
-        if !valid_ndisk_label(label) {
-            return Err("disk label must be NDISK followed by exactly three digits".into());
-        }
-        let disks = self.host.list_disks()?;
-        let disk = find_disk(&disks, label)
-            .ok_or_else(|| format!("formatted disk '{label}' was not found"))?;
-        if disk.system || disk.filesystem.as_deref() != Some("xfs") {
-            return Err(format!("{label} is not an eligible XFS N1 disk"));
-        }
-        let mount_path = self.settings.mount_path(label);
-        if !disk
-            .mountpoints
-            .iter()
-            .any(|mounted| Path::new(mounted) == mount_path)
-        {
-            return Err(format!(
-                "{label} is not mounted at {}",
-                mount_path.display()
-            ));
-        }
-        let mut config = self.load_or_create_config()?;
-        if role.index() {
-            add_config_path(&mut config, "index_store_disks", &mount_path)?;
-        }
-        if role.blob() {
-            add_config_path(&mut config, "blob_store_disks", &mount_path)?;
-        }
-        self.write_storage_config(&config)
-    }
-
-    fn unassign_disk(&self, label: &str, role: DiskRole) -> Result<(), String> {
-        self.ensure_service_stopped()?;
-        let mut config = self.load_or_create_config()?;
-        let mount_path = self.settings.mount_path(label);
-        if role.index() {
-            remove_config_path(&mut config, "index_store_disks", &mount_path)?;
-        }
-        if role.blob() {
-            remove_config_path(&mut config, "blob_store_disks", &mount_path)?;
-        }
-        self.write_storage_config(&config)
     }
 
     fn config_command(
@@ -573,23 +474,70 @@ impl InstallShell {
         emit: Emit<'_>,
     ) -> Result<CommandOutcome, String> {
         match arguments.first().map(String::as_str).unwrap_or("") {
-            "ec" => {
+            "pool" => {
                 self.ensure_service_stopped()?;
-                let data = parse_positive(arguments.get(1), "usage: config ec <data> <parity>")?;
+                if arguments.len() != 5 {
+                    return Err(
+                        "usage: config pool <name> <data> <parity> <roots-comma-list>".into(),
+                    );
+                }
+                let name = &arguments[1];
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+                {
+                    return Err("invalid storage pool name".into());
+                }
+                let data = parse_positive(arguments.get(2), "pool data must be positive")?;
                 let parity =
-                    parse_nonnegative(arguments.get(2), "usage: config ec <data> <parity>")?;
+                    parse_nonnegative(arguments.get(3), "pool parity must be nonnegative")?;
+                let roots = config_paths(&arguments[4]);
+                if data + parity > 256
+                    || roots.len() != data + parity
+                    || roots.iter().any(|r| !r.is_absolute())
+                {
+                    return Err(
+                        "a storage pool requires exactly K+P absolute roots, at most 256".into(),
+                    );
+                }
                 let mut config = self.load_or_create_config()?;
+                let section = format!("storage_pool.{name}");
+                if config
+                    .section(Some(&section))
+                    .and_then(|s| s.get("roots"))
+                    .is_some_and(|r| !r.is_empty())
+                {
+                    return Err("storage pool membership is immutable; add a new named pool".into());
+                }
+                let generation = config
+                    .iter()
+                    .filter_map(|(n, s)| {
+                        n.filter(|n| n.starts_with("storage_pool."))
+                            .filter(|_| !s.get("roots").unwrap_or("").is_empty())
+                            .and_then(|_| s.get("generation")?.parse::<u64>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("pool generation exhausted")?;
                 config
-                    .with_section(Some("upload_config"))
+                    .with_section(Some(section))
+                    .set("generation", generation.to_string())
                     .set("data_shards", data.to_string())
-                    .set("parity_shards", parity.to_string());
-                self.write_config(&config)?;
+                    .set("parity_shards", parity.to_string())
+                    .set("roots", &arguments[4])
+                    .set("sealed", "false");
+                self.write_storage_config(&config)?;
                 emit(
                     OutputKind::Success,
-                    format!("EC configured as {data} + {parity}"),
+                    format!(
+                        "Storage pool {name} enrolled as {data}+{parity}, generation {generation}"
+                    ),
                 );
                 Ok(success_outcome())
             }
+            "ec" => Err("global EC topology was removed in N1 4; use config pool".into()),
             "endpoint" => {
                 self.ensure_service_stopped()?;
                 if arguments.len() != 4 {
@@ -871,8 +819,11 @@ impl InstallShell {
             .section(Some("disk_config"))
             .ok_or("missing [disk_config]")?;
         let mut required_mounts = BTreeSet::new();
-        required_mounts.extend(config_paths(disk.get("index_store_disks").unwrap_or("")));
-        required_mounts.extend(config_paths(disk.get("blob_store_disks").unwrap_or("")));
+        for (name, section) in config.iter() {
+            if name.is_some_and(|name| name.starts_with("storage_pool.")) {
+                required_mounts.extend(config_paths(section.get("roots").unwrap_or("")));
+            }
+        }
         let fs_root = PathBuf::from(disk.get("fs_storage_path").unwrap_or(""));
         if fs_root.is_absolute() {
             required_mounts.insert(fs_root);
@@ -932,30 +883,24 @@ impl InstallShell {
 
     fn config_summary(&self) -> Result<String, String> {
         let config = self.load_or_create_config()?;
-        let disk = config
-            .section(Some("disk_config"))
-            .ok_or("missing [disk_config]")?;
-        let upload = config
-            .section(Some("upload_config"))
-            .ok_or("missing [upload_config]")?;
-        let server = config.section(Some("server")).ok_or("missing [server]")?;
-        Ok(format!(
-            "N1 INSTALLATION\n  directory: {}\n  engine:    {}\n  service:   {}\n\nSERVER\n  HTTPS:  {}:{}\n  native: {}:{}\n  cert:   {}\n  key:    {}\n\nERASURE CODING\n  data:   {}\n  parity: {}\n\nINDEX ROOTS\n{}\n\nBLOB ROOTS\n{}\n\nCONTROL ROOT\n  {}",
+        let mut output = format!(
+            "N1 4 INSTALLATION\n  directory: {}\n  engine: {}\nSTORAGE POOLS\n",
             self.settings.install_dir.display(),
-            self.settings.engine_binary.display(),
-            self.settings.service_name,
-            server.get("host").unwrap_or(""),
-            server.get("https_port").unwrap_or(""),
-            server.get("host").unwrap_or(""),
-            server.get("native_port").unwrap_or(""),
-            server.get("cert_path").unwrap_or(""),
-            server.get("key_path").unwrap_or(""),
-            upload.get("data_shards").unwrap_or(""),
-            upload.get("parity_shards").unwrap_or(""),
-            format_roots(disk.get("index_store_disks").unwrap_or("")),
-            format_roots(disk.get("blob_store_disks").unwrap_or("")),
-            disk.get("fs_storage_path").unwrap_or("")
-        ))
+            self.settings.engine_binary.display()
+        );
+        for (name, section) in config.iter() {
+            if let Some(name) = name.filter(|name| name.starts_with("storage_pool.")) {
+                output.push_str(&format!(
+                    "  {name}: {}+{}, generation {}, sealed={}\n{}\n",
+                    section.get("data_shards").unwrap_or(""),
+                    section.get("parity_shards").unwrap_or(""),
+                    section.get("generation").unwrap_or(""),
+                    section.get("sealed").unwrap_or("false"),
+                    format_roots(section.get("roots").unwrap_or(""))
+                ));
+            }
+        }
+        Ok(output)
     }
 
     fn validate_installation(&self) -> Result<String, String> {
@@ -963,73 +908,64 @@ impl InstallShell {
         let disk = config
             .section(Some("disk_config"))
             .ok_or("missing [disk_config]")?;
-        let upload = config
-            .section(Some("upload_config"))
-            .ok_or("missing [upload_config]")?;
         let server = config.section(Some("server")).ok_or("missing [server]")?;
-        let data = upload
-            .get("data_shards")
-            .ok_or("missing upload_config.data_shards")?
-            .parse::<usize>()
-            .map_err(|_| "upload_config.data_shards is invalid".to_string())?;
-        let parity = upload
-            .get("parity_shards")
-            .ok_or("missing upload_config.parity_shards")?
-            .parse::<usize>()
-            .map_err(|_| "upload_config.parity_shards is invalid".to_string())?;
-        if data == 0 {
-            return Err("EC data shard count must be at least 1".into());
-        }
-        let index = config_paths(disk.get("index_store_disks").unwrap_or(""));
-        let blob = config_paths(disk.get("blob_store_disks").unwrap_or(""));
-        if index.is_empty() {
-            return Err("at least one index root must be assigned".into());
-        }
-        if blob.len() < data + parity {
-            return Err(format!(
-                "EC {data}+{parity} requires at least {} blob roots; {} configured",
-                data + parity,
-                blob.len()
-            ));
-        }
-        if unique_paths(&index).len() != index.len() || unique_paths(&blob).len() != blob.len() {
-            return Err("duplicate index or blob root in configuration".into());
-        }
         let discovered = self.host.list_disks()?;
-        let mut index_devices = BTreeSet::new();
-        let mut blob_devices = BTreeSet::new();
-        for root in index.iter().chain(blob.iter()) {
-            let disk = discovered
-                .iter()
-                .find(|disk| {
-                    disk.mountpoints
-                        .iter()
-                        .any(|mount| Path::new(mount) == root)
-                })
-                .ok_or_else(|| format!("configured root {} is not mounted", root.display()))?;
-            if disk.system || disk.filesystem.as_deref() != Some("xfs") {
-                return Err(format!(
-                    "configured root {} is not on an eligible XFS disk",
-                    root.display()
-                ));
-            }
-            let identity = if disk.stable_id.is_empty() {
-                disk.path.clone()
-            } else {
-                disk.stable_id.clone()
+        let mut all_roots = Vec::<PathBuf>::new();
+        let mut pool_count = 0usize;
+        for (name, section) in config.iter() {
+            let Some(name) = name.filter(|n| n.starts_with("storage_pool.")) else {
+                continue;
             };
-            if index.iter().any(|candidate| candidate == root) {
-                index_devices.insert(identity.clone());
+            pool_count += 1;
+            let data = section
+                .get("data_shards")
+                .ok_or("pool data missing")?
+                .parse::<usize>()
+                .map_err(|_| "invalid pool data")?;
+            let parity = section
+                .get("parity_shards")
+                .ok_or("pool parity missing")?
+                .parse::<usize>()
+                .map_err(|_| "invalid pool parity")?;
+            let roots = config_paths(section.get("roots").unwrap_or(""));
+            if data == 0 || data + parity > 256 || roots.len() != data + parity {
+                return Err(format!("{name} requires exactly K+P roots"));
             }
-            if blob.iter().any(|candidate| candidate == root) {
-                blob_devices.insert(identity);
+            let mut devices = BTreeSet::new();
+            for root in roots {
+                if !root.is_absolute()
+                    || all_roots
+                        .iter()
+                        .any(|r| root.starts_with(r) || r.starts_with(&root))
+                {
+                    return Err("pool roots must be absolute, distinct and non-overlapping".into());
+                }
+                let member = discovered
+                    .iter()
+                    .find(|disk| {
+                        disk.mountpoints
+                            .iter()
+                            .any(|mount| Path::new(mount) == root)
+                    })
+                    .ok_or_else(|| {
+                        format!("configured pool root {} is not mounted", root.display())
+                    })?;
+                if member.system || member.filesystem.as_deref() != Some("xfs") {
+                    return Err("installation pools require eligible mounted XFS devices".into());
+                }
+                let identity = if member.stable_id.is_empty() {
+                    member.path.clone()
+                } else {
+                    member.stable_id.clone()
+                };
+                if !devices.insert(identity) {
+                    return Err("pool members must occupy distinct physical devices".into());
+                }
+                all_roots.push(root);
             }
         }
-        if index_devices.len() != index.len() {
-            return Err("index roots must resolve to distinct physical disks".into());
-        }
-        if blob_devices.len() != blob.len() {
-            return Err("blob roots must resolve to distinct physical disks".into());
+        if pool_count == 0 {
+            return Err("configure at least one storage pool".into());
         }
         let fs_root = PathBuf::from(disk.get("fs_storage_path").unwrap_or(""));
         if !fs_root.is_dir() {
@@ -1074,10 +1010,8 @@ impl InstallShell {
             ));
         }
         Ok(format!(
-            "Validation: PASS\nEC: {data} + {parity}\nIndex roots: {}\nBlob roots: {}\nUnique mounted disks: {}",
-            index.len(),
-            blob.len(),
-            unique_paths(&blob).len()
+            "N1 4 installation validated: {pool_count} storage pools, {} members",
+            all_roots.len()
         ))
     }
 
@@ -1130,47 +1064,6 @@ fn parse_nonnegative(value: Option<&String>, usage: &str) -> Result<usize, Strin
         .map_err(|_| usage.to_string())
 }
 
-fn add_config_path(config: &mut Ini, key: &str, path: &Path) -> Result<(), String> {
-    let text = path_text(path)?;
-    let current = config
-        .section(Some("disk_config"))
-        .and_then(|section| section.get(key))
-        .unwrap_or("");
-    let mut paths = config_paths(current);
-    if !paths.iter().any(|existing| existing == path) {
-        paths.push(path.to_path_buf());
-    }
-    paths.sort();
-    config.with_section(Some("disk_config")).set(
-        key,
-        paths
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    let _ = text;
-    Ok(())
-}
-
-fn remove_config_path(config: &mut Ini, key: &str, path: &Path) -> Result<(), String> {
-    let current = config
-        .section(Some("disk_config"))
-        .and_then(|section| section.get(key))
-        .unwrap_or("");
-    let mut paths = config_paths(current);
-    paths.retain(|existing| existing != path);
-    config.with_section(Some("disk_config")).set(
-        key,
-        paths
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    Ok(())
-}
-
 fn config_paths(value: &str) -> Vec<PathBuf> {
     value
         .split(',')
@@ -1178,10 +1071,6 @@ fn config_paths(value: &str) -> Vec<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .collect()
-}
-
-fn unique_paths(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
-    paths.iter().cloned().collect()
 }
 
 fn format_roots(value: &str) -> String {
@@ -1321,9 +1210,7 @@ const HELP_TEXT: &str = "COMMANDS
   disk inspect <device-or-label>            inspect one physical disk
   disk format <device> <NDISKxxx>           create one GPT/XFS N1 disk
   disk mount <NDISKxxx>                     finish mounting an initialized N1 disk
-  disk assign <NDISKxxx> <index|blob|both>  assign an initialized disk
-  disk unassign <NDISKxxx> <role>           remove an assignment while N1 is stopped
-  config ec <data> <parity>                 set the static N1 EC layout
+  config pool <name> <data> <parity> <roots-comma-list>  add a complete storage pool
   config endpoint <host> <https> <native>   set engine listeners
   config tls <certificate> <private-key>    set existing TLS files
   config show                               show the complete installation draft
