@@ -1155,6 +1155,13 @@ identities and stabilizes topology before permitting writes. Missing/replaced
 members block unsafe mutations; parity-tolerant reads do not authorize writes
 to an incomplete namespace-holder set.
 
+Write readiness requires `maintenance.access_mode == "availability"`,
+`maintenance.auto_healing.write_safe == true` and no `read_only_reason`.
+The healer status includes the live safety gate, not just the last topology
+probe. Restoring roots alone does not clear a failed-repair gate: a successful
+automatic retry must clear it. Health is an observation, not a write reservation;
+clients must still handle a subsequent `503` if availability changes.
+
 Object status includes version_id, status, total_parts/shards, healthy_shards,
 missing_shards, corrupt_shards, repairable, repaired_shards, failed_repairs and
 recorded/current layout information. Status and repair have bounded admission;

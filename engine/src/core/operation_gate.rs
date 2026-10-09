@@ -95,12 +95,15 @@ pub fn set_auto_healing_fault(reason: Option<String>) {
     *current = reason;
 }
 
-pub fn safety_read_only_reason() -> Option<String> {
-    let auto_healing = AUTO_HEALING_FAULT_REASON
+pub fn auto_healing_fault_reason() -> Option<String> {
+    AUTO_HEALING_FAULT_REASON
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    auto_healing.or_else(|| {
+        .clone()
+}
+
+pub fn safety_read_only_reason() -> Option<String> {
+    auto_healing_fault_reason().or_else(|| {
         TOPOLOGY_READ_ONLY_REASON
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -186,9 +189,9 @@ pub async fn enforce_quiesced_mode_on_reads(req: Request<Body>, next: Next) -> R
 mod tests {
     use super::{
         MaintenanceAccessMode, acquire_maintenance_mode, acquire_read_only_fast_mode,
-        current_maintenance_access_mode, enforce_quiesced_mode_on_reads,
+        auto_healing_fault_reason, current_maintenance_access_mode, enforce_quiesced_mode_on_reads,
         enforce_read_only_fast_mode_on_mutations, is_read_only_fast_mode_active,
-        safety_read_only_reason, set_safety_read_only,
+        safety_read_only_reason, set_auto_healing_fault, set_safety_read_only,
     };
     use axum::Router;
     use axum::body::Body;
@@ -266,6 +269,38 @@ mod tests {
             current_maintenance_access_mode(),
             MaintenanceAccessMode::Availability
         );
+    }
+
+    #[tokio::test]
+    async fn scan_fault_stays_fenced_after_topology_recovers_until_successful_retry() {
+        let _test_lock = acquire_test_lock();
+        let app = Router::new()
+            .route("/write", post(|| async { "ok" }))
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
+
+        set_auto_healing_fault(Some("automatic availability_scan failed".into()));
+        set_safety_read_only(Some("storage root is missing".into()));
+        set_safety_read_only(None);
+        assert!(auto_healing_fault_reason().is_some());
+        let status = crate::core::auto_healing::get_auto_healing_status().await;
+        assert!(!status.write_safe);
+        assert_eq!(status.read_only_reason, auto_healing_fault_reason());
+        let blocked = app
+            .clone()
+            .oneshot(Request::post("/write").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // Only successful repair clears this independent gate. Topology
+        // restoration above must not make an unresolved object writable.
+        set_auto_healing_fault(None);
+        let allowed = app
+            .oneshot(Request::post("/write").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert!(auto_healing_fault_reason().is_none());
     }
 
     #[tokio::test]

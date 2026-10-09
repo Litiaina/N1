@@ -31,6 +31,9 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
   4,096 objects, and follows one-shot durability configuration/options.
 - Replaced the obsolete real-directory batch proof fixture and made filtered
   upload unit tests initialize their own storage settings.
+- Health now reconciles automatic-healing readiness with the live safety gate.
+  Failed scans retry from their persistent fault state even if topology updates
+  replace the display phase; only successful repair clears the scan fault.
 
 The October 6 copy/delete candidate passed testing and was subsequently deployed
 to the main server with its matching backup helper. Objects and configuration

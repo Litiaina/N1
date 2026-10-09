@@ -5,6 +5,86 @@ dated evidence, not guarantees for every server. Older versions' passes do not
 certify the current namespace/pool design. Personal test paths and credentials
 are intentionally omitted.
 
+## Headless release-gate soak — October 8, 2026
+
+**FAIL after 6h 1m 41s; six-hour continuous-PID resource gate PASS.** The isolated
+instance ran from 19:03 Manila on October 8 to 01:05 on October 9, stopping
+before its eight-hour limit. Existing N1 and user storage were not replaced. Test
+directories are isolated on four independent XFS members, with 3+1 EC and
+loopback-only verified HTTPS; physical I/O is shared.
+
+Engine SHA-256:
+7fedadeb07086ba965c8ceeb68099a16d9f54fbf2674e29c00dd20af542851f1,
+matching the deployed production engine.
+
+The uninterrupted phase recorded 4,322 resource samples: 83.2 MiB peak engine
+RSS, 36 peak/15 final quiescent FDs, +2.38 MiB warmed-to-final median RSS and
+zero median FD growth. It completed 101 concurrent batch epochs, 303 mixed
+four-fragment traffic/deletion epochs, 37 autonomous-healing perturbations,
+37 disconnect probes and 18 complete baseline hash checks.
+
+Recovery checks passed for listing, NCX fallback, recover-on-read, autonomous
+repair, unrecoverable-object fencing/retry and root-identity rejection. After
+the directory-outage masks, fragment creation returned 503 because an automatic
+availability scan had failed and its live safety gate was still read-only.
+The harness had accepted an older topology-status snapshot without proving a
+fresh scan and successful write. The run stopped before repeated process-crash
+cycles and final integrity validation; it is not an eight-hour pass.
+
+RSS, file descriptors, CPU and I/O were sampled every five seconds. Planned
+fault-phase restarts are outside the continuous-PID resource phase.
+
+The earlier October 7 main-server run passed six uninterrupted hours: 4,322
+resource samples, 81.7 MiB peak engine RSS, 35 peak/15 final quiescent FDs,
+2.26 MiB warmed-to-final median RSS growth and zero median FD growth. Its
+subsequent recovery phase stopped because the harness wrongly required HTTP
+200 from health below the namespace quorum; N1 correctly returned 503. The
+overall run is not a pass. The October 8 harness corrected that expectation
+and checked below-K rejection before its continuous phase; engine code was
+unchanged between those two long runs.
+
+The MCH attempt started at 09:26 on October 8 with a 17:26 hard limit. Its final
+outcome is unverified because that host is inaccessible from the current home
+network; no pass or confirmed stop is claimed.
+
+The supervisor saves failure/timeout evidence and stops the isolated test
+automatically; OOM, early exit and timeout are not passes. Physical power cuts,
+actual member replacement, capacity exhaustion and the other remaining gates
+below are not established by these tests. No LTS declaration follows from them.
+
+### Safety-gate recovery patch — October 9, 2026
+
+The patch reports the live safety reason in healer health and masks write-safe
+status while that gate is closed. Automatic retry scheduling now checks the
+existing persistent scan fault, not a display phase that topology updates can
+replace. Restoring roots cannot clear unresolved repair debt. No namespace,
+NDX/payload format, mutation ordering or durability policy changed.
+
+The isolated harness now requires a successful post-restoration scan, fresh
+topology check, open maintenance gate and real fragment write/delete after each
+outage mask. A separate regression uses a ten-minute periodic scan interval to
+require prompt fault-driven recovery without restarting the engine.
+
+Candidate engine SHA-256:
+041185921f743a8c4e996d2d1b22a2e67aba38d3ac8c87af01af9a7f63d4303f.
+
+| Validation | Result |
+| --- | --- |
+| Serial workspace/all-target tests | PASS: 252 engine, 2 EC integration, 6 proof-runner, 10 shell, 7 CLI; 277 total |
+| All-target check, warnings-denied engine library compilation, formatting/whitespace | PASS |
+| Lost-retry reproduction on previous engine | FAIL as expected: after topology restoration, the safety gate stayed closed through the 30-second recovery deadline |
+| Same long-interval fault on candidate | PASS: automatic recovery, real write/delete and complete baseline verification within 11.3 s, without restarting during recovery |
+| Four-member 3+1 recovery regression | PASS: two complete fault/crash cycles in 11m 57s; supervisor exit 0 |
+| All single-/two-member directory-outage masks | PASS: 20 executions, each requiring a fresh scan and actual post-restoration write |
+| Interrupted rename/move/trash/recover | PASS: eight process kills, 128 objects per case, early/mid-prefix cuts, hash-correct reachability/retry and unchanged immutable files |
+| Listing, NCX fallback/repair, recover-on-read, autonomous data/parity repair, unrecoverable-object fencing/retry and root identity | PASS in both cycles |
+| Final integrity | PASS: 129 version-pinned baseline downloads plus complete baseline immutable inventory/size/hash comparison |
+
+This was isolated on the main server's four independent XFS members using
+verified loopback HTTPS. Production retained its original PID and engine hash;
+no deployment occurred. Raw reports remain excluded from version control.
+The candidate has not completed a new eight-hour soak or physical power-cut test.
+
 ## Upload/deletion hardening — October 6, 2026
 
 Tested engine SHA-256:
@@ -255,7 +335,8 @@ flat key/prefix behavior and partial results.
 ## Remaining gates and evidence
 
 Physical power-cut/fsync-stage testing, enrolled-member replacement/restore,
-repeated failure masks, capacity exhaustion under format 4, long memory/FD soaks,
+broader pool/failure topologies, capacity exhaustion under format 4, longer
+memory/FD soaks on the patched candidate,
 larger/cold namespaces, complete live consumer integration, and format-4
 automatic-backup failure recovery remain release gates. Renaming an isolated
 member directory is not physical device-loss or controller-cache testing.

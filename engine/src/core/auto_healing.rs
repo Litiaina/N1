@@ -1,8 +1,8 @@
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::operation_gate::{
-    safety_read_only_reason, set_auto_healing_fault, set_safety_read_only,
-    topology_read_only_reason,
+    auto_healing_fault_reason, safety_read_only_reason, set_auto_healing_fault,
+    set_safety_read_only, topology_read_only_reason,
 };
 use crate::core::redistribution::get_redist_status;
 use crate::core::repair_manager::{
@@ -46,6 +46,16 @@ pub struct AutoHealingStatus {
     pub last_error: Option<String>,
 }
 
+impl AutoHealingStatus {
+    fn with_safety_gate(mut self, reason: Option<String>) -> Self {
+        // Topology probes are periodic; the mutation gate can change between
+        // probes when an online repair completes. Never report its old state.
+        self.write_safe &= reason.is_none();
+        self.read_only_reason = reason;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TopologyAssessment {
     pub configured_blob_roots: usize,
@@ -76,7 +86,11 @@ pub fn arm_topology_safety_gate() {
 }
 
 pub async fn get_auto_healing_status() -> AutoHealingStatus {
-    AUTO_HEALING_STATUS.read().await.clone()
+    AUTO_HEALING_STATUS
+        .read()
+        .await
+        .clone()
+        .with_safety_gate(safety_read_only_reason())
 }
 
 #[cfg(unix)]
@@ -450,7 +464,9 @@ pub async fn run_auto_healing_controller(state: Arc<AppState>) {
         }
         update_topology_status(&assessment).await;
 
-        if AUTO_HEALING_STATUS.read().await.phase == "scan_failed" {
+        // A topology check or a running scan can replace the display phase.
+        // The existing persistent fault, not that label, requires a retry.
+        if auto_healing_fault_reason().is_some() {
             availability_due = Instant::now();
         }
 
@@ -495,7 +511,40 @@ pub async fn run_auto_healing_controller(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::evaluate_topology_counts;
+    use super::{AutoHealingStatus, evaluate_topology_counts};
+
+    #[test]
+    fn newly_failed_scan_overrides_previously_write_safe_status() {
+        let previous = AutoHealingStatus {
+            write_safe: true,
+            phase: "scan_failed".into(),
+            ..Default::default()
+        };
+        let status = previous.with_safety_gate(Some("automatic availability_scan failed".into()));
+        assert!(!status.write_safe);
+        assert_eq!(
+            status.read_only_reason.as_deref(),
+            Some("automatic availability_scan failed")
+        );
+    }
+
+    #[test]
+    fn successful_retry_removes_stale_reason_without_waiting_for_topology_poll() {
+        let previous = AutoHealingStatus {
+            write_safe: true,
+            read_only_reason: Some("previous scan failure".into()),
+            ..Default::default()
+        };
+        let status = previous.with_safety_gate(None);
+        assert!(status.write_safe);
+        assert!(status.read_only_reason.is_none());
+    }
+
+    #[test]
+    fn clearing_scan_fault_does_not_make_unsafe_topology_write_safe() {
+        let status = AutoHealingStatus::default().with_safety_gate(None);
+        assert!(!status.write_safe);
+    }
 
     #[test]
     fn expanded_topology_stays_write_safe_without_changing_ec_width() {
