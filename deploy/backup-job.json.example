@@ -17,7 +17,8 @@
     "key_file": "/etc/litiaina/n1/backup.key",
     "ssh": "n1-backup@backup-host",
     "ssh_config": "/etc/litiaina/n1/backup-ssh.conf",
-    "remote_binary": "/opt/litiaina/n1/litiaina-n1-backup",
+    "remote_binary": "/opt/litiaina/n1/litiaina-n1-shell",
+    "remote_backup_subcommand": true,
     "keep_last": 8
   }
 }

@@ -129,7 +129,7 @@ fn encoded_key(key: &str) -> PathBuf {
     path
 }
 
-fn decoded_key(relative: &Path) -> Option<String> {
+pub(crate) fn decoded_key(relative: &Path) -> Option<String> {
     let mut parts = relative.components().peekable();
     let mut key = Vec::new();
     while let Some(part) = parts.next() {

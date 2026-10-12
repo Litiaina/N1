@@ -80,6 +80,20 @@ struct Args {
     noa_api_proof: bool,
     #[arg(long, default_value_t = false)]
     backup_proof: bool,
+    /// Offline byte-exact clone, same-path device cutover and missing-member reconstruction.
+    #[arg(long, default_value_t = false)]
+    pool_maintenance_proof: bool,
+    /// Offline location changes without formatting, mounts or production services.
+    #[arg(long, default_value_t = false)]
+    pool_relocation_proof: bool,
+    /// Optional previous engine used to seed absolute-address v4 objects.
+    #[arg(long)]
+    baseline_binary: Option<PathBuf>,
+    /// Independent spare filesystem for member cutover or a 1+0 portable restore.
+    #[arg(long)]
+    spare_root: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    pool_member: usize,
     #[arg(long, default_value_t = false)]
     flat_namespace_proof: bool,
     #[arg(long, default_value_t = false)]
@@ -155,6 +169,7 @@ struct Proof {
     fragment: String,
     stable_fragment_id: String,
     token: String,
+    operator_token: String,
     summary: Value,
     active_disk_count: usize,
     data_shards: u16,
@@ -207,6 +222,7 @@ impl Proof {
             fragment: String::new(),
             stable_fragment_id: String::new(),
             token: String::new(),
+            operator_token: String::new(),
             summary: json!({}),
             active_disk_count: 0,
             data_shards,

@@ -21,7 +21,11 @@ pub fn open_session(
     {
         index_roots()
     } else {
-        manifest.placement_roots.iter().map(PathBuf::from).collect()
+        manifest
+            .placement_roots
+            .iter()
+            .map(|root| crate::core::storage_pool::resolve_address(root))
+            .collect::<Result<Vec<_>, _>>()?
     };
     for root in placements {
         write_atomic(

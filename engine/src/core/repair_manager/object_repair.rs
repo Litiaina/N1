@@ -269,7 +269,9 @@ pub(super) async fn process_object_repair(
         let mut missing_shards: Vec<usize> = Vec::new();
 
         for shard in &part_fixed.shards {
-            let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
+            let shard_path = crate::core::storage_pool::resolve_address(strip_tmp_attempt_suffix(
+                &shard.absolute_path,
+            ))?;
             let mut healthy = false;
 
             if !configured_blob_roots
@@ -320,7 +322,8 @@ pub(super) async fn process_object_repair(
             else {
                 continue;
             };
-            let original_path = PathBuf::from(&part_fixed.shards[shard_position].absolute_path);
+            let original_address = part_fixed.shards[shard_position].absolute_path.clone();
+            let original_path = crate::core::storage_pool::resolve_address(&original_address)?;
             let original_root = configured_blob_roots
                 .iter()
                 .filter(|root| original_path.starts_with(root))
@@ -334,7 +337,8 @@ pub(super) async fn process_object_repair(
                     .iter()
                     .filter(|shard| shard.shard_index != missing_idx)
                     .filter_map(|shard| {
-                        let path = Path::new(&shard.absolute_path);
+                        let path = crate::core::storage_pool::resolve_address(&shard.absolute_path)
+                            .ok()?;
                         configured_blob_roots
                             .iter()
                             .filter(|root| path.starts_with(root))
@@ -402,7 +406,7 @@ pub(super) async fn process_object_repair(
                     )
                     .join(&part_fixed.shards[shard_position].file_name);
                 part_fixed.shards[shard_position].absolute_path =
-                    replacement_path.to_string_lossy().to_string();
+                    crate::core::storage_pool::record_address(&replacement_path);
             }
 
             let _permit = shard_repair_sem
@@ -418,15 +422,14 @@ pub(super) async fn process_object_repair(
             {
                 Ok(_) => {
                     repaired_total += 1;
-                    placement_changed |=
-                        Path::new(&part_fixed.shards[shard_position].absolute_path)
-                            != original_path;
+                    placement_changed |= crate::core::storage_pool::resolve_address(
+                        &part_fixed.shards[shard_position].absolute_path,
+                    )? != original_path;
                     metadata.parts[part_index] = part_fixed.clone();
                     last_repaired = Some(format!("{}/{}", metadata.fragment, metadata.object_key));
                 }
                 Err(e) => {
-                    part_fixed.shards[shard_position].absolute_path =
-                        original_path.to_string_lossy().to_string();
+                    part_fixed.shards[shard_position].absolute_path = original_address.clone();
                     let message = format!(
                         "Shard repair failed for {}/{} shard {}: {}",
                         metadata.fragment, metadata.object_key, missing_idx, e

@@ -340,6 +340,7 @@ pub async fn read_object_via_signed_url(
     let validated = validate_signed_read_query(&query)?;
     let object_key = ObjectPathManager::canonical_object_key(&query.object_key);
     let claims = Claims {
+        operator: false,
         fragment: query.fragment.clone(),
         fragment_alias: None,
         read: true,

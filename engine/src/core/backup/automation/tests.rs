@@ -13,6 +13,20 @@ impl Fixture {
         Self(path)
     }
     fn state(&self) -> State {
+        // Parallel tests spawn subprocesses. Between fork and exec they can
+        // temporarily inherit another test's CLOEXEC flock descriptor, delaying
+        // its release after drop(state). Retry only this positive reopen helper;
+        // the explicit overlapping-run refusal assertions still call State::open
+        // directly. Production lock acquisition and safety are unchanged.
+        for _ in 0..100 {
+            match State::open(&self.0) {
+                Ok(state) => return state,
+                Err(error) if error.to_string().contains("already in use") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("open fixture state: {error}"),
+            }
+        }
         State::open(&self.0).unwrap()
     }
 }
@@ -149,6 +163,7 @@ fn failed_replication_retries_same_snapshot_without_another_outage_or_retention(
         ssh: None,
         ssh_config: None,
         remote_binary: "backup".into(),
+        remote_backup_subcommand: false,
         keep_last: 2,
     });
     let mut driver = Fake {
@@ -234,6 +249,7 @@ fn process_timeout_terminates_its_child_and_returns_failure() {
         directory: state.path.clone(),
         service_timeout: 1,
         helper: "/bin/false".into(),
+        helper_backup_subcommand: false,
     };
     let mut cmd = std::process::Command::new("/bin/sleep");
     cmd.arg("30");

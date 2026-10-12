@@ -849,7 +849,8 @@ pub(crate) async fn check_needs_redistribution(
                         &meta.version_id,
                     )
                     .join(&shard.file_name);
-                if Path::new(&shard.absolute_path) != expected_path
+                if !crate::core::storage_pool::resolve_address(&shard.absolute_path)
+                    .is_ok_and(|path| path == expected_path)
                     || !tokio_fs::try_exists(&expected_path).await.unwrap_or(false)
                 {
                     needs.payload = true;
@@ -1123,7 +1124,7 @@ pub(super) async fn redistribute_object_streaming(
             new_shards.push(ShardInfo {
                 shard_index: shard_idx,
                 file_name: file_name.clone(),
-                absolute_path: final_path.to_string_lossy().to_string(),
+                absolute_path: crate::core::storage_pool::record_address(&final_path),
                 size_bytes: final_shard_len,
                 checksum: String::new(),
                 is_parity,
@@ -1286,12 +1287,18 @@ pub(super) async fn redistribute_object_streaming(
             .unwrap()
             .shards
             .iter()
-            .map(|s| s.absolute_path.clone())
-            .collect();
+            .map(|s| {
+                crate::core::storage_pool::resolve_address(&s.absolute_path)
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<_, _>>()?;
 
         for old_shard in &old_part_arc.shards {
-            if !new_paths.contains(&old_shard.absolute_path) {
-                old_shards_for_gc.push(old_shard.absolute_path.clone());
+            let old_path = crate::core::storage_pool::resolve_address(&old_shard.absolute_path)?
+                .to_string_lossy()
+                .into_owned();
+            if !new_paths.contains(&old_path) {
+                old_shards_for_gc.push(old_path);
             }
         }
 
@@ -1320,7 +1327,7 @@ pub(super) async fn redistribute_object_streaming(
     if !still_present {
         for part in &meta.parts {
             for shard in &part.shards {
-                let p = PathBuf::from(&shard.absolute_path);
+                let p = crate::core::storage_pool::resolve_address(&shard.absolute_path)?;
                 let _ = tokio_fs::remove_file(&p).await;
             }
         }

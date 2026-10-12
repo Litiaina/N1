@@ -186,6 +186,59 @@ pub struct HealthResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct PoolHealthResponse {
+    pub sampled_at: i64,
+    pub fragment: String,
+    pub allocation_policy: String,
+    pub pools: Vec<PoolHealth>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PoolHealth {
+    pub id: String,
+    pub generation: u64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
+    pub namespace_replicas: usize,
+    pub sealed: bool,
+    pub current_write_pool: bool,
+    pub readiness: String,
+    pub members: Vec<PoolMemberHealth>,
+    pub estimated_data_available_bytes: Option<u64>,
+    pub fragment_metadata_replicas: usize,
+    pub fragment_state: String,
+    pub integrity: PoolIntegrity,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PoolMemberHealth {
+    pub slot: usize,
+    pub member_id: String,
+    pub path: String,
+    pub status: String,
+    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_inodes: Option<u64>,
+    #[serde(default)]
+    pub available_inodes: Option<u64>,
+    #[serde(default)]
+    pub capacity_warning: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PoolIntegrity {
+    pub status: String,
+    pub scope: String,
+    pub files_scanned: u64,
+    pub versions_checked: u64,
+    pub ncx_replicas_checked: u64,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct RepairJobStatus {
     pub is_running: bool,
     pub phase: String,

@@ -1,6 +1,4 @@
-use crate::core::fragment_metadata::{
-    backfill_fragment_nt_hash_if_missing, read_fragment_metadata, verify_fragment_key,
-};
+use crate::core::fragment_metadata::{read_fragment_metadata, verify_metadata_key};
 use crate::middleware::refresh_store::{
     RefreshStoreError, SessionPermissions, create_refresh_session, revoke_refresh_session,
     rotate_refresh_session,
@@ -28,7 +26,6 @@ use std::env;
 use std::fmt::Display;
 use std::sync::LazyLock;
 use std::time::SystemTime;
-use tracing::{info, warn};
 
 pub static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
@@ -104,45 +101,35 @@ pub async fn authorize_fragment_core(payload: AuthorizationRequest) -> Result<Au
         false => return Err(AuthError::FragmentNotFound),
     }
 
-    if payload.secret != *MASTER_KEY {
-        let ok = verify_fragment_key(&payload.fragment, &payload.secret)
-            .await
-            .map_err(|_| AuthError::InternalError)?;
+    let meta = read_fragment_metadata(&payload.fragment)
+        .await
+        .map_err(|_| AuthError::InternalError)?;
+    let operator = payload.secret == *MASTER_KEY;
+    if !operator {
+        let ok =
+            verify_metadata_key(&meta, &payload.secret).map_err(|_| AuthError::InternalError)?;
 
         if !ok {
             return Err(AuthError::WrongCredentials);
         }
-
-        match backfill_fragment_nt_hash_if_missing(&payload.fragment, &payload.secret).await {
-            Ok(true) => {
-                info!(
-                    "backfilled nt_hash_hex for fragment {} after successful auth",
-                    payload.fragment
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!(
-                    "failed to backfill nt_hash_hex for fragment {} after successful auth: {}",
-                    payload.fragment, e
-                );
-            }
-        }
     }
-
-    let meta = read_fragment_metadata(&payload.fragment)
-        .await
-        .map_err(|_| AuthError::InternalError)?;
+    let credential = crate::middleware::refresh_store::credential_fingerprint(if operator {
+        MASTER_KEY.as_str()
+    } else {
+        meta.key_phc.as_str()
+    });
     let stable_fragment = meta.stable_fragment_id;
 
     mint_fragment_auth_body(
         stable_fragment,
         Some(payload.fragment),
+        operator,
         payload.read,
         payload.write,
         payload.modify,
         payload.delete,
         resolve_access_token_ttl(payload.expires_in),
+        credential,
     )
     .await
 }
@@ -208,6 +195,7 @@ pub async fn refresh_access_token(
             mint_fragment_access_token(
                 fragment,
                 None,
+                rotated.permissions.operator,
                 rotated.permissions.read,
                 rotated.permissions.write,
                 rotated.permissions.modify,
@@ -379,15 +367,18 @@ pub enum AuthError {
 async fn mint_fragment_auth_body(
     fragment: String,
     fragment_alias: Option<String>,
+    operator: bool,
     read: bool,
     write: bool,
     modify: bool,
     delete: bool,
     access_expires_in: u64,
+    credential: String,
 ) -> Result<AuthBody, AuthError> {
     let token = mint_fragment_access_token(
         fragment.clone(),
         fragment_alias,
+        operator,
         read,
         write,
         modify,
@@ -398,6 +389,7 @@ async fn mint_fragment_auth_body(
     let refresh = create_refresh_session(
         AuthSessionScope::Fragment { fragment },
         SessionPermissions {
+            operator,
             read,
             write,
             modify,
@@ -405,6 +397,7 @@ async fn mint_fragment_auth_body(
         },
         access_expires_in,
         *REFRESH_TOKEN_TTL_SECS,
+        credential,
     )
     .await
     .map_err(map_refresh_error)?;
@@ -430,6 +423,7 @@ async fn mint_fs_auth_body(
     let refresh = create_refresh_session(
         AuthSessionScope::FileSystem { path },
         SessionPermissions {
+            operator: false,
             read,
             write,
             modify,
@@ -437,6 +431,7 @@ async fn mint_fs_auth_body(
         },
         access_expires_in,
         *REFRESH_TOKEN_TTL_SECS,
+        crate::middleware::refresh_store::credential_fingerprint(AUTH_KEY.as_str()),
     )
     .await
     .map_err(map_refresh_error)?;
@@ -466,6 +461,7 @@ fn resolve_access_token_ttl(requested: Option<u64>) -> u64 {
 fn mint_fragment_access_token(
     fragment: String,
     fragment_alias: Option<String>,
+    operator: bool,
     read: bool,
     write: bool,
     modify: bool,
@@ -474,6 +470,7 @@ fn mint_fragment_access_token(
 ) -> Result<String, AuthError> {
     let claims = Claims {
         fragment,
+        operator,
         fragment_alias,
         read,
         write,
@@ -515,7 +512,7 @@ fn map_refresh_error(error: RefreshStoreError) -> AuthError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
     use crate::core::fragment_identity::ensure_fragment_identity_on_roots;
@@ -523,7 +520,7 @@ mod tests {
     use crate::test_support::global_test_lock;
     use jsonwebtoken::Validation;
 
-    fn ensure_test_env() {
+    pub(crate) fn ensure_test_env() {
         if std::env::var("JWT_SECRET").is_err() {
             unsafe { std::env::set_var("JWT_SECRET", "test-jwt-secret") };
         }
@@ -559,7 +556,7 @@ mod tests {
         }
     }
 
-    async fn ensure_auth_test_fragment(fragment: &str) {
+    pub(crate) async fn ensure_auth_test_fragment(fragment: &str) {
         let mut roots = Vec::new();
         if let Some(index_roots) = INDEX_STORE_DISKS.get() {
             roots.extend(index_roots.iter().map(std::path::PathBuf::from));
@@ -620,6 +617,91 @@ mod tests {
         assert!(decoded.claims.write);
         assert!(decoded.claims.modify);
         assert!(decoded.claims.delete);
+        assert!(decoded.claims.operator);
+    }
+
+    #[tokio::test]
+    async fn fragment_login_cannot_mint_operator_and_rotation_invalidates_refresh() {
+        let _guard = global_test_lock().lock().await;
+        ensure_test_env();
+        let fragment = format!("rotation-{}", ulid::Ulid::new());
+        ensure_auth_test_fragment(&fragment).await;
+        let Json(body) = authorize_fragment(Json(AuthorizationRequest {
+            fragment: fragment.clone(),
+            secret: "fragment-key".into(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: Some(120),
+        }))
+        .await
+        .unwrap();
+        let claims = decode::<Claims>(
+            &body.access_token,
+            &JWT_KEYS.decoding,
+            &Validation::default(),
+        )
+        .unwrap()
+        .claims;
+        assert!(!claims.operator);
+        assert!(
+            crate::core::fragment_metadata::read_fragment_metadata(&fragment)
+                .await
+                .unwrap()
+                .nt_hash_hex
+                .is_none()
+        );
+        let refresh = body.refresh_token.unwrap();
+        let Json(rotated) = refresh_access_token(Json(RefreshRequest {
+            refresh_token: refresh,
+        }))
+        .await
+        .unwrap();
+        crate::core::fragment_metadata::rotate_fragment_key(&fragment, "changed-key")
+            .await
+            .unwrap();
+        assert!(matches!(
+            refresh_access_token(Json(RefreshRequest {
+                refresh_token: rotated.refresh_token.unwrap()
+            }))
+            .await,
+            Err(AuthError::InvalidToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn operator_authority_survives_refresh() {
+        let _guard = global_test_lock().lock().await;
+        ensure_test_env();
+        let fragment = format!("operator-{}", ulid::Ulid::new());
+        ensure_auth_test_fragment(&fragment).await;
+        let Json(body) = authorize_fragment(Json(AuthorizationRequest {
+            fragment,
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: Some(120),
+        }))
+        .await
+        .unwrap();
+        let Json(rotated) = refresh_access_token(Json(RefreshRequest {
+            refresh_token: body.refresh_token.unwrap(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            decode::<Claims>(
+                &rotated.access_token,
+                &JWT_KEYS.decoding,
+                &Validation::default()
+            )
+            .unwrap()
+            .claims
+            .operator
+        );
     }
 
     #[tokio::test]

@@ -486,6 +486,7 @@ mod tests {
 
     fn claims(fragment: &str, delete: bool, modify: bool) -> Claims {
         Claims {
+            operator: false,
             fragment: fragment.to_string(),
             fragment_alias: None,
             read: true,

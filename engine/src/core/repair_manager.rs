@@ -5,7 +5,6 @@ use crate::core::disk_manager::{
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
-use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_io};
@@ -685,7 +684,9 @@ async fn inspect_object_parts(
 
         for shard in &normalized.shards {
             report.total_shards += 1;
-            let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
+            let shard_path = crate::core::storage_pool::resolve_address(strip_tmp_attempt_suffix(
+                &shard.absolute_path,
+            ))?;
             if !active_blob_roots
                 .iter()
                 .any(|root| shard_path.starts_with(root))
@@ -819,7 +820,8 @@ fn object_layout_status(
                 let expected = path_manager
                     .get_shard_dir_on_disk(root, &meta.fragment, &meta.object_key, &meta.version_id)
                     .join(&shard.file_name);
-                Path::new(&shard.absolute_path) == expected
+                crate::core::storage_pool::resolve_address(&shard.absolute_path)
+                    .is_ok_and(|path| path == expected)
             })
         })
     });
@@ -956,14 +958,12 @@ pub async fn trigger_repair_job_api(
         access_mode = MaintenanceAccessMode::ReadOnly;
     }
 
-    let target_fragment = match params
-        .get("fragment")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
-        Some(fragment) => Some(resolve_stable_fragment_id(&fragment).await?),
-        None => None,
-    };
+    let target_fragment = crate::middleware::maintenance_auth::target(
+        &claims,
+        &params,
+        access_mode != MaintenanceAccessMode::Availability,
+    )
+    .await?;
 
     let cfg = RepairRunConfig {
         dry_run: parse_bool_param(&params, "dry_run", false),
@@ -1052,6 +1052,7 @@ pub async fn stop_repair_job_api(
     claims: Claims,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
+    claims.require_operator()?;
     if !claims.write || !claims.modify || !claims.delete {
         return Err(AppError::Forbidden(
             "Write, Modify and Delete permission required".into(),

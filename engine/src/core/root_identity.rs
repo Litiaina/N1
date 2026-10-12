@@ -1,6 +1,8 @@
-use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::core::disk_manager::FS_STORAGE_ROOT;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -131,6 +133,15 @@ fn read_marker(root: &Path) -> Result<Option<RootMarker>, String> {
     Ok(Some(marker))
 }
 
+pub(crate) fn member_id_on(root: &Path) -> Result<Option<String>, String> {
+    Ok(read_marker(root)?.map(|marker| marker.root_id))
+}
+
+pub(crate) fn registered_roots(control: &Path) -> Result<BTreeMap<String, String>, String> {
+    Ok(load_registry_from(&control.join(REGISTRY_DIR).join(REGISTRY_FILE))?.roots)
+}
+
+#[cfg(test)]
 fn create_marker(root: &Path) -> Result<RootMarker, String> {
     let marker = RootMarker {
         engine_format: ROOT_IDENTITY_FORMAT.to_string(),
@@ -154,6 +165,7 @@ fn create_marker(root: &Path) -> Result<RootMarker, String> {
     }
 }
 
+#[cfg(test)]
 fn reconcile_roots(registry_path: &Path, roots: &[PathBuf]) -> Result<RootRegistry, String> {
     let mut registry = load_registry_from(registry_path)?;
     let mut changed = false;
@@ -184,24 +196,54 @@ fn reconcile_roots(registry_path: &Path, roots: &[PathBuf]) -> Result<RootRegist
     Ok(registry)
 }
 
-fn configured_roots() -> Vec<PathBuf> {
-    let mut roots = BTreeSet::new();
-    for root in INDEX_STORE_DISKS
-        .get()
-        .into_iter()
-        .flatten()
-        .chain(BLOB_STORE_DISKS.get().into_iter().flatten())
-    {
-        roots.insert(PathBuf::from(root));
-    }
-    roots.into_iter().collect()
-}
-
 /// Enrolls only roots that are new to the configured topology. Existing entries
 /// are never rebound automatically, so a missing mount cannot become a new disk.
 pub fn initialize_configured_root_identities() -> Result<(), String> {
     let path = registry_path()?;
-    let registry = reconcile_roots(&path, &configured_roots())?;
+    let mut registry = RootRegistry::default();
+    let catalog: Vec<crate::core::storage_pool::StoragePool> =
+        match fs::read(Path::new(FS_STORAGE_ROOT.get().unwrap()).join(".n1/storage-pools.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+    for pool in crate::core::storage_pool::configured() {
+        for (slot, root) in pool.roots.iter().enumerate() {
+            let expected = pool.members.get(slot).ok_or("unbound member identity")?;
+            registry
+                .roots
+                .insert(canonical_root_key(root), expected.clone());
+            if !root.is_dir()
+                || root
+                    .join(crate::core::instance_lease::RESTORE_PENDING)
+                    .exists()
+            {
+                continue;
+            }
+            match read_marker(root)? {
+                Some(marker) if marker.root_id != *expected => {
+                    return Err("mounted member carries a different root identity".into());
+                }
+                Some(_) => {}
+                None => {
+                    let identified = crate::core::storage_pool::read_member(root)?
+                        .is_some_and(|d| d.member_id == *expected);
+                    if identified || !catalog.iter().any(|old| old.id == pool.id) {
+                        write_json_atomic(
+                            &root.join(ROOT_MARKER_FILE),
+                            &RootMarker {
+                                engine_format: ROOT_IDENTITY_FORMAT.into(),
+                                root_id: expected.clone(),
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    if load_registry_from(&path)?.roots != registry.roots || !path.exists() {
+        write_json_atomic(&path, &registry)?;
+    }
     EXPECTED_ROOT_IDENTITIES
         .set(registry.roots)
         .map_err(|_| "N1 root identity authority was initialized twice".to_string())
@@ -227,9 +269,69 @@ pub fn root_matches_expected_identity(root: &Path, expected: &BTreeMap<String, S
 }
 
 pub fn configured_root_identity_is_current(root: &Path) -> bool {
+    if let Some(expected) = EXPECTED_ROOT_IDENTITIES.get() {
+        return root_matches_expected_identity(root, expected);
+    }
     expected_root_identities()
         .map(|expected| root_matches_expected_identity(root, &expected))
         .unwrap_or(false)
+}
+
+/// Offline maintenance retains the enrolled logical identity. Call only while
+/// holding the instance lease and a durable startup fence, after verification.
+pub(crate) fn registered_identity(control: &Path, root: &Path) -> Result<String, String> {
+    if let Some(descriptor) = crate::core::storage_pool::read_member(root)? {
+        let pools: Vec<crate::core::storage_pool::StoragePool> = serde_json::from_slice(
+            &fs::read(control.join(".n1/storage-pools.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if pools.iter().any(|pool| {
+            pool.same_geometry(&descriptor.pool)
+                && pool.members.get(descriptor.member_slot) == Some(&descriptor.member_id)
+        }) {
+            return Ok(descriptor.member_id);
+        }
+    }
+    let registry = load_registry_from(&control.join(REGISTRY_DIR).join(REGISTRY_FILE))?;
+    registry
+        .roots
+        .get(&canonical_root_key(root))
+        .cloned()
+        .ok_or_else(|| format!("root '{}' is not enrolled", root.display()))
+}
+
+pub(crate) fn verify_registered_identity(control: &Path, root: &Path) -> Result<(), String> {
+    let expected = registered_identity(control, root)?;
+    match read_marker(root)? {
+        Some(marker) if marker.root_id == expected => Ok(()),
+        _ => Err(format!(
+            "root '{}' does not match its enrolled identity",
+            root.display()
+        )),
+    }
+}
+
+pub(crate) fn restore_verified_marker(control: &Path, root: &Path) -> Result<(), String> {
+    let expected = registered_identity(control, root)?;
+    if let Some(marker) = read_marker(root)? {
+        if marker.root_id != expected {
+            return Err("replacement has an unrelated root identity".into());
+        }
+        return Ok(());
+    }
+    // Keep staging inside the explicitly fenced maintenance workspace so a
+    // process kill cannot leave an unexplained identity temporary at the root.
+    let staged = root.join(".n1-pool-work").join("verified-root.json");
+    write_json_atomic(
+        &staged,
+        &RootMarker {
+            engine_format: ROOT_IDENTITY_FORMAT.into(),
+            root_id: expected,
+        },
+    )?;
+    fs::rename(&staged, root.join(ROOT_MARKER_FILE))
+        .map_err(|error| io_context(error, "activate verified root identity", root))?;
+    sync_parent(&root.join(ROOT_MARKER_FILE))
 }
 
 #[cfg(test)]

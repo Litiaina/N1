@@ -150,7 +150,7 @@ fn shard_dir_with_locality_hint<'a>(
     }
     if stream_locality_bias_enabled() {
         if let Some(shard) = nth_data_shard(part, shard_index) {
-            let abs = PathBuf::from(&shard.absolute_path);
+            let abs = crate::core::storage_pool::resolve_address(&shard.absolute_path).ok()?;
             if let Some(parent) = abs.parent() {
                 for d in shard_dirs {
                     if parent.starts_with(d) {
@@ -211,6 +211,16 @@ pub async fn stream_object_logic(
     filename_override: Option<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let file_size = metadata.total_size_bytes;
+    if let Some(response) = crate::routes::accel_routes::try_cached_read(
+        &headers,
+        &metadata,
+        disposition_type,
+        filename_override.as_deref(),
+    )
+    .await
+    {
+        return Ok(response.into_response());
+    }
 
     let ObjectMetadata {
         content_type,
@@ -245,6 +255,9 @@ pub async fn stream_object_logic(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_LENGTH, "0")
+            .header(header::ETAG, format!("\"{}\"", version_id))
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CACHE_CONTROL, "private, no-store")
             .header(
                 header::CONTENT_DISPOSITION,
                 format!("{}; filename=\"{}\"", disposition_type, filename),
@@ -477,7 +490,7 @@ pub async fn stream_object_logic(
             header::CONTENT_DISPOSITION,
             format!("{}; filename=\"{}\"", disposition_type, filename),
         )
-        .header(header::CACHE_CONTROL, "public, max-age=3600");
+        .header(header::CACHE_CONTROL, "private, no-store");
 
     if let Some(crc) = checksum_header {
         builder = builder.header("x-litiaina-checksum", crc);

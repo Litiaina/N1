@@ -256,6 +256,73 @@ pub fn format_health(response: &HealthResponse) -> String {
     out
 }
 
+pub fn format_pools(response: &cli_core::models::PoolHealthResponse) -> String {
+    let mut lines = vec![format!(
+        "fragment: {}\nallocation: {}",
+        response.fragment, response.allocation_policy
+    )];
+    for pool in &response.pools {
+        lines.push(format!(
+            "\nPool {} generation {}: {}+{} EC, {} NCX replicas — {}{}{}",
+            pool.id,
+            pool.generation,
+            pool.data_shards,
+            pool.parity_shards,
+            pool.namespace_replicas,
+            pool.readiness,
+            if pool.sealed { " (sealed)" } else { "" },
+            if pool.current_write_pool {
+                " (current write pool)"
+            } else {
+                ""
+            }
+        ));
+        lines.push(format!(
+            "fragment metadata: {}/{} — {}",
+            pool.fragment_metadata_replicas,
+            pool.members.len(),
+            pool.fragment_state
+        ));
+        lines.push(format!(
+            "estimated data space: {} (smallest member free × K; not a reservation)",
+            pool.estimated_data_available_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown".into())
+        ));
+        for member in &pool.members {
+            if let Some(warning) = &member.capacity_warning {
+                lines.push(format!("WARNING slot {}: {}", member.slot, warning));
+            }
+            lines.push(format!(
+                "slot {} [{}] {} — {}{}",
+                member.slot,
+                member.member_id,
+                member.path,
+                member.status,
+                member
+                    .error
+                    .as_ref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            ));
+        }
+        lines.push(format!(
+            "integrity: {} — {} versions, {} NCX replicas, {} ms{}",
+            pool.integrity.status,
+            pool.integrity.versions_checked,
+            pool.integrity.ncx_replicas_checked,
+            pool.integrity.elapsed_ms,
+            pool.integrity
+                .error
+                .as_ref()
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default()
+        ));
+    }
+    lines.push("\nReadiness is not data integrity. Online scans are live, not snapshots; rerun with writers quiesced for a conclusive offline pool verify.".into());
+    lines.join("\n")
+}
+
 pub fn format_health_watch_line(response: &HealthResponse) -> String {
     let disk_summary = response
         .disks

@@ -102,6 +102,7 @@ impl StandardPartSlot {
 /// from the session manifest and are reconstructed only at finalization.
 #[derive(Debug)]
 struct StandardPartRecord {
+    strict_durability: bool,
     size_bytes: u64,
     created_at: i64,
     checksum: Option<u32>,
@@ -386,7 +387,8 @@ pub use sessions::{
 
 #[allow(unused_imports)]
 pub(crate) use data_plane::{
-    choose_upload_stripe_size_for_len_with_ceiling, target_stripe_size_for_metadata,
+    choose_upload_stripe_size_for_len_with_ceiling, shard_specs_for_part, stable_shard_name,
+    target_stripe_size_for_metadata,
 };
 
 use data_plane::{
@@ -398,9 +400,8 @@ use data_plane::{
     format_crc32_u32, manifest_data_shards, manifest_parity_shards, part_exists_on_disk,
     persist_missing_receipt_from_disk, planned_part_sizes, read_manifest_any, read_part_meta_any,
     reconstruct_part_meta_from_disk, reconstruct_part_meta_from_receipt, request_content_length,
-    request_content_type, shard_specs_for_part, uploaded_part_bytes, uploaded_parts_from_disk,
-    write_part_blob_to_disk, write_part_blob_to_disk_from_reader,
-    write_part_blob_to_disk_from_stream,
+    request_content_type, uploaded_part_bytes, uploaded_parts_from_disk, write_part_blob_to_disk,
+    write_part_blob_to_disk_from_reader, write_part_blob_to_disk_from_stream,
 };
 
 #[cfg(test)]

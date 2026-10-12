@@ -186,7 +186,10 @@ fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
 }
 
 async fn should_schedule_background_repair(shard: &ShardInfo) -> bool {
-    let stable = strip_tmp_attempt_suffix(&shard.absolute_path);
+    let Ok(resolved) = crate::core::storage_pool::resolve_address(&shard.absolute_path) else {
+        return false;
+    };
+    let stable = strip_tmp_attempt_suffix(resolved.to_str().unwrap_or(""));
     let path = Path::new(stable);
     let Some(root) = owning_blob_root_for_path(path) else {
         // The scheduled healer owns relocation because only it can atomically
@@ -310,7 +313,8 @@ async fn get_or_open_shard_ha(
         return file.try_clone().ok();
     }
 
-    let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
+    let resolved = crate::core::storage_pool::resolve_address(&shard_info.absolute_path).ok()?;
+    let mut candidates: Vec<String> = stable_abs_candidates(resolved.to_str()?);
 
     if let Some(vdir) = version_dir_hint {
         candidates.push(
@@ -386,7 +390,8 @@ async fn get_or_open_shard_fast(
         return file.try_clone().ok();
     }
 
-    let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
+    let resolved = crate::core::storage_pool::resolve_address(&shard_info.absolute_path).ok()?;
+    let mut candidates: Vec<String> = stable_abs_candidates(resolved.to_str()?);
 
     if let Some(vdir) = version_dir_hint {
         candidates.push(
@@ -629,7 +634,13 @@ pub async fn repair_entire_shard(
         ))?
         .clone();
 
-    let final_path_str = strip_tmp_attempt_suffix(&target_shard.absolute_path).to_string();
+    let resolved = crate::core::storage_pool::resolve_address(&target_shard.absolute_path)?;
+    let final_path_str = strip_tmp_attempt_suffix(
+        resolved
+            .to_str()
+            .ok_or_else(|| AppError::Conflict("non-UTF8 member path".into()))?,
+    )
+    .to_string();
     if final_path_str.is_empty() {
         return Err(AppError::InternalServerError(
             "Target shard has empty absolute_path".into(),

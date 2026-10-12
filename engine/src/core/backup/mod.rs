@@ -4,7 +4,7 @@ pub mod automation;
 pub mod capture;
 pub mod cli;
 mod crypto;
-mod format;
+pub(crate) mod format;
 mod fs;
 mod metadata;
 pub mod repository;

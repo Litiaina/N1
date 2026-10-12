@@ -262,6 +262,9 @@ pub async fn trash_path(
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
     ensure_user_mutations_allowed()?;
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
     let path = normalize_selection_path(&path)?;
     if path.is_empty() {
         return Err(AppError::BadRequest(
@@ -298,6 +301,11 @@ pub async fn recover_path(
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
     ensure_user_mutations_allowed()?;
+    if !claims.modify {
+        return Err(AppError::Forbidden(
+            "Modify permission required to recover".into(),
+        ));
+    }
     let path = normalize_selection_path(&path)?;
     if path.is_empty() {
         return Err(AppError::BadRequest(

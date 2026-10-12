@@ -49,6 +49,7 @@ mod tests {
 
     fn claims(exp: usize) -> Claims {
         Claims {
+            operator: false,
             fragment: "native-auth-test".to_string(),
             fragment_alias: None,
             read: true,

@@ -2,8 +2,7 @@ impl Proof {
     async fn posix_crud_gc_proof(&self, expected: &mut BTreeSet<String>) -> ProofResult<Value> {
         let start = Instant::now();
         let base = format!("{}n1-crud", self.args.prefix);
-        self.posix_post("/noa/v1/posix/mkdir", json!({"path": format!("{base}/folder")}))
-            .await?;
+        // The child upload below creates the virtual prefix; there is no mkdir.
 
         let old_file = format!("{base}/rename-me.txt");
         let new_file = format!("{base}/renamed.txt");
@@ -38,8 +37,8 @@ impl Proof {
             json!({"path": format!("{base}/folder-renamed")}),
         )
         .await?;
-        self.posix_stat(&format!("{base}/folder-renamed"), true)
-            .await?;
+        // Trash contains object bindings, not a persisted parent-folder record.
+        self.posix_stat(&moved_child, true).await?;
         self.posix_post(
             "/noa/v1/posix/recover",
             json!({"path": format!("{base}/folder-renamed")}),

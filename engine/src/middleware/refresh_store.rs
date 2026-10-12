@@ -15,10 +15,16 @@ use uuid::Uuid;
 
 const REFRESH_STORE_DIR: &str = ".auth/refresh_sessions";
 
+pub(crate) fn credential_fingerprint(credential: &str) -> String {
+    hex::encode(Sha256::digest(credential.as_bytes()))
+}
+
 static REFRESH_STORE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SessionPermissions {
+    #[serde(default)]
+    pub operator: bool,
     pub read: bool,
     pub write: bool,
     pub modify: bool,
@@ -27,6 +33,8 @@ pub struct SessionPermissions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RefreshSessionRecord {
+    #[serde(default)]
+    credential_fingerprint: Option<String>,
     session_id: String,
     scope: AuthSessionScope,
     permissions: SessionPermissions,
@@ -81,6 +89,7 @@ pub async fn create_refresh_session(
     permissions: SessionPermissions,
     access_expires_in: u64,
     refresh_expires_in: u64,
+    credential_fingerprint: String,
 ) -> Result<IssuedRefreshSession, RefreshStoreError> {
     let _guard = REFRESH_STORE_LOCK.lock().await;
 
@@ -89,6 +98,7 @@ pub async fn create_refresh_session(
     let token_secret = random_token_secret();
     let refresh_token = build_refresh_token(&session_id, &token_secret);
     let record = RefreshSessionRecord {
+        credential_fingerprint: Some(credential_fingerprint),
         session_id: session_id.clone(),
         scope,
         permissions,
@@ -127,6 +137,25 @@ pub async fn rotate_refresh_session(
     if now >= record.refresh_expires_at {
         delete_record_if_present(&session_id).await?;
         return Err(RefreshStoreError::TokenExpired);
+    }
+
+    let current = match &record.scope {
+        AuthSessionScope::Fragment { fragment } => {
+            let meta = crate::core::fragment_metadata::read_fragment_metadata(fragment)
+                .await
+                .map_err(|_| RefreshStoreError::InvalidToken)?;
+            credential_fingerprint(if record.permissions.operator {
+                crate::middleware::auth_middleware::MASTER_KEY.as_str()
+            } else {
+                meta.key_phc.as_str()
+            })
+        }
+        AuthSessionScope::FileSystem { .. } => {
+            credential_fingerprint(crate::middleware::auth_middleware::AUTH_KEY.as_str())
+        }
+    };
+    if record.credential_fingerprint.as_deref() != Some(current.as_str()) {
+        return Err(RefreshStoreError::InvalidToken);
     }
 
     let presented_hash = hash_secret(&presented_secret);

@@ -62,7 +62,7 @@ impl Proof {
                 "{}/noa/v1/maintenance/fragments/{}/repair/start?mode={mode}&fast_mode=false&meta_concurrency=1&repair_concurrency=1&batch=32",
                 self.base_url, self.fragment
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.operator_token)
             .send()
             .await?;
         if response.status() != StatusCode::ACCEPTED {

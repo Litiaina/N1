@@ -1,5 +1,4 @@
 use crate::core::capacity_manager::get_storage_usage;
-use crate::core::constants::BROWSER_CACHE_MAX_AGE;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use crate::core::fragment_identity::list_fragment_aliases;
 use crate::core::fragment_manager::is_fragment_hash;
@@ -259,10 +258,9 @@ pub async fn get_object(
 
     let headers = response.headers_mut();
 
-    let cache_control_val = format!("public, max-age={}", BROWSER_CACHE_MAX_AGE);
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_str(&cache_control_val).unwrap(),
+        HeaderValue::from_static("private, no-store"),
     );
 
     Ok(response)

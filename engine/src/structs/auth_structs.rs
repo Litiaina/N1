@@ -28,6 +28,9 @@ pub struct LoginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub fragment: String,
+    /// Granted only by master-key authentication, never by a fragment secret.
+    #[serde(default)]
+    pub operator: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fragment_alias: Option<String>,
     pub read: bool,
@@ -35,6 +38,46 @@ pub struct Claims {
     pub modify: bool,
     pub delete: bool,
     pub exp: usize,
+}
+
+impl Claims {
+    pub fn require_modify(&self) -> Result<(), crate::enums::app_error_enum::AppError> {
+        if self.modify {
+            Ok(())
+        } else {
+            Err(crate::enums::app_error_enum::AppError::Forbidden(
+                "Modify permission required".into(),
+            ))
+        }
+    }
+    pub fn require_delete(&self) -> Result<(), crate::enums::app_error_enum::AppError> {
+        if self.delete {
+            Ok(())
+        } else {
+            Err(crate::enums::app_error_enum::AppError::Forbidden(
+                "Delete permission required".into(),
+            ))
+        }
+    }
+    pub fn require_operator(&self) -> Result<(), crate::enums::app_error_enum::AppError> {
+        if self.operator {
+            Ok(())
+        } else {
+            Err(crate::enums::app_error_enum::AppError::Forbidden(
+                "Master-key operator authentication required for server-wide maintenance".into(),
+            ))
+        }
+    }
+
+    pub fn require_maintenance(&self) -> Result<(), crate::enums::app_error_enum::AppError> {
+        if self.write && self.modify && self.delete {
+            Ok(())
+        } else {
+            Err(crate::enums::app_error_enum::AppError::Forbidden(
+                "Write, Modify and Delete permissions required".into(),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

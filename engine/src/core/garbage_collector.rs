@@ -3,7 +3,6 @@ use crate::core::disk_manager::ObjectPathManager;
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
-use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, IoProgress, acquire_disk_io};
@@ -305,14 +304,6 @@ pub async fn get_gc_status_api(
     Ok(Json(get_gc_status().await))
 }
 
-fn parse_gc_target_fragment(params: &HashMap<String, String>) -> Option<String> {
-    params
-        .get("fragment")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
 fn parse_bool_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
     params
         .get(key)
@@ -335,25 +326,24 @@ fn parse_gc_execution_mode(params: &HashMap<String, String>) -> GcExecutionMode 
 }
 
 pub async fn run_garbage_collector(
+    claims: Claims,
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Some(reason) = safety_read_only_reason() {
         return (StatusCode::SERVICE_UNAVAILABLE, reason);
     }
-    let target_fragment = match parse_gc_target_fragment(&params) {
-        Some(fragment) => match resolve_stable_fragment_id(&fragment).await {
-            Ok(stable) => Some(stable),
-            Err(_) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!("Fragment {} was not found.", fragment),
-                );
-            }
-        },
-        None => None,
-    };
     let execution_mode = parse_gc_execution_mode(&params);
+    let target_fragment = match crate::middleware::maintenance_auth::target(
+        &claims,
+        &params,
+        execution_mode != GcExecutionMode::Availability,
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(err) => return (err.status_code(), err.to_string()),
+    };
     let fast_mode = parse_bool_param(
         &params,
         "fast_mode",
@@ -415,6 +405,12 @@ pub async fn stop_garbage_collector(
     claims: Claims,
     State(_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    if claims.require_operator().is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            "Master-key operator authentication required",
+        );
+    }
     if !claims.write || !claims.modify || !claims.delete {
         return (
             StatusCode::FORBIDDEN,

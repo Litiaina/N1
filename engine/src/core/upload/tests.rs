@@ -13,6 +13,66 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 
+#[tokio::test]
+async fn strict_shard_publication_propagates_directory_sync_failure() {
+    let base = std::env::temp_dir().join(format!("strict-sync-{}", ulid::Ulid::new()));
+    std::fs::create_dir(&base).unwrap();
+    let invalid = base.join("not-a-directory");
+    std::fs::write(&invalid, b"unchanged").unwrap();
+    assert!(
+        super::data_plane::sync_published_directories(&[base.clone(), invalid.clone()])
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&invalid).unwrap(), b"unchanged");
+    super::data_plane::sync_published_directories(std::slice::from_ref(&base))
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn retry_cannot_claim_strict_durability_for_a_relaxed_part() {
+    let session = standard_test_session(1);
+    session.parts[0]
+        .record
+        .set(StandardPartRecord {
+            strict_durability: false,
+            size_bytes: 0,
+            created_at: 1,
+            checksum: None,
+            shard_checksums: Box::new([]),
+        })
+        .unwrap();
+    assert!(super::sessions::check_standard_retry_durability(&session, 0, true).is_err());
+    assert!(super::sessions::check_standard_retry_durability(&session, 0, false).is_ok());
+}
+
+#[test]
+fn standard_finalize_carries_effective_durability_to_namespace_publication() {
+    for flags in [[true, true], [true, false], [false, false]] {
+        let session = standard_test_session(2);
+        assert!(!super::sessions::standard_session_uses_strict_durability(
+            &session
+        ));
+        for (slot, strict) in session.parts.iter().zip(flags) {
+            slot.record
+                .set(StandardPartRecord {
+                    strict_durability: strict,
+                    size_bytes: 0,
+                    created_at: 1,
+                    checksum: None,
+                    shard_checksums: Box::new([]),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            super::sessions::standard_session_uses_strict_durability(&session),
+            flags.into_iter().all(|flag| flag)
+        );
+    }
+}
+
 fn direct_writer_with_failed_task(errno: i32) -> DirectWriter {
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -158,6 +218,7 @@ fn idle_standard_session_blocks_ttl_object_reclamation_until_removed() {
     assert!(dir.is_dir());
     super::cancel_standard_upload_direct(
         &crate::structs::auth_structs::Claims {
+            operator: false,
             fragment: fragment.clone(),
             fragment_alias: None,
             read: true,
@@ -191,6 +252,7 @@ async fn cancelled_standard_finalize_releases_busy_state_for_retry() {
         .unwrap()
         .insert(key.clone(), session.clone());
     let claims = crate::structs::auth_structs::Claims {
+        operator: false,
         fragment: fragment.clone(),
         fragment_alias: None,
         read: true,
@@ -408,6 +470,7 @@ fn standard_part_claim_is_write_once_and_duplicate_safe() {
     };
     second
         .complete(StandardPartRecord {
+            strict_durability: false,
             size_bytes: 4096,
             created_at: 1,
             checksum: Some(1),

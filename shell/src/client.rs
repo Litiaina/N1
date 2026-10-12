@@ -104,7 +104,9 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
     let client = build_client(cli.insecure)?;
 
     match &cli.command {
-        Commands::Serve(_) => unreachable!("serve is handled before client dispatch"),
+        Commands::Serve(_) | Commands::Pool(_) | Commands::Backup(_) => {
+            unreachable!("local commands are handled before client dispatch")
+        }
         Commands::Fragment {
             command: command @ FragmentCommands::Create(_),
         } => {
@@ -252,6 +254,7 @@ pub(crate) fn build_gc_start_query(
     fast_mode: bool,
 ) -> Vec<(String, String)> {
     let mut query = Vec::new();
+    push_query_flag(&mut query, "all_fragments", fragment.is_none());
     push_query_value(
         &mut query,
         "fragment",
@@ -295,7 +298,9 @@ async fn handle_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
-        Commands::Serve(_) => unreachable!("serve is handled before authenticated dispatch"),
+        Commands::Serve(_) | Commands::Pool(_) | Commands::Backup(_) => {
+            unreachable!("local commands are handled before authenticated dispatch")
+        }
         Commands::Shell => Err(io::Error::other(
             "shell requires native n1:// transport; omit --url or pass --native-url.",
         )
@@ -323,6 +328,21 @@ async fn handle_authenticated_command(
                 let health: HealthResponse = fetch_json(client, base_url, session, &url).await?;
                 print_output(cli.json, &health, &format_health(&health))
             }
+        }
+        Commands::Pools { pool, deep_scan } => {
+            let mut query = vec![("deep_scan", deep_scan.to_string())];
+            if let Some(pool) = pool {
+                query.push(("pool", pool.clone()));
+            }
+            let response: cli_core::models::PoolHealthResponse = fetch_json_query(
+                client,
+                base_url,
+                session,
+                &api_url(base_url, "/noa/v1/maintenance/pools/health"),
+                &query,
+            )
+            .await?;
+            print_output(cli.json, &response, &crate::output::format_pools(&response))
         }
         Commands::Namespace { command } => match command {
             NamespaceCommands::List { path, limit } => {
@@ -752,6 +772,7 @@ pub(crate) fn build_repair_start_query(
     batch: Option<usize>,
 ) -> Vec<(String, String)> {
     let mut query = Vec::new();
+    push_query_flag(&mut query, "all_fragments", fragment.is_none());
     push_query_flag(&mut query, "dry_run", dry_run);
     push_query_value(
         &mut query,
@@ -783,6 +804,7 @@ pub(crate) fn build_redistribution_start_query(
     status_batch: Option<u64>,
 ) -> Vec<(String, String)> {
     let mut query = Vec::new();
+    push_query_flag(&mut query, "all_fragments", fragment.is_none());
     push_query_flag(&mut query, "dry_run", dry_run);
     push_query_value(
         &mut query,

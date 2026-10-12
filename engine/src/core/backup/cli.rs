@@ -112,6 +112,9 @@ enum Operation {
         ssh_config: Option<PathBuf>,
         #[arg(long, default_value = "litiaina-n1-backup")]
         remote_binary: String,
+        /// Prefix receiver arguments with backup for the integrated Engine or Shell.
+        #[arg(long, requires = "ssh")]
+        remote_backup_subcommand: bool,
     },
     /// Forget one completed snapshot; refuses to remove the last recovery point.
     Forget {
@@ -180,7 +183,34 @@ pub(crate) fn ssh_command(
 }
 
 pub fn run() -> Result<()> {
-    match Cli::parse().command {
+    run_from(std::env::args_os().collect())
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+
+    #[test]
+    fn integrated_receiver_is_an_explicit_quoted_subcommand() {
+        let args = vec![
+            "backup".into(),
+            "receive".into(),
+            "--repository".into(),
+            "/backup/with space".into(),
+        ];
+        let command =
+            ssh_command("operator@backup", None, "/opt/n1/litiaina-n1-shell", &args).unwrap();
+        let remote = command.get_args().last().unwrap().to_str().unwrap();
+        assert_eq!(
+            remote,
+            "'/opt/n1/litiaina-n1-shell' 'backup' 'receive' '--repository' '/backup/with space'"
+        );
+        assert!(ssh_command("-bad", None, "engine", &args).is_err());
+    }
+}
+
+pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
+    match Cli::parse_from(args).command {
         Operation::RunJob { config } => super::automation::run(&config)?,
         Operation::RecoverJob { state_dir } => super::automation::recover(&state_dir)?,
         Operation::JobStatus { config } => super::automation::status(&config)?,
@@ -241,6 +271,7 @@ pub fn run() -> Result<()> {
             ssh,
             ssh_config,
             remote_binary,
+            remote_backup_subcommand,
         } => {
             let repo = repo.open(false)?;
             let snapshot = repo.snapshot(&snapshot)?;
@@ -251,38 +282,24 @@ pub fn run() -> Result<()> {
                 {
                     return Err(invalid("invalid SSH target"));
                 }
-                let remote = format!(
-                    "{} receive --repository {} --key-file {}",
-                    quoted(&remote_binary)?,
-                    quoted(
-                        target_repository
-                            .to_str()
-                            .ok_or_else(|| invalid("invalid remote path"))?
-                    )?,
-                    quoted(
-                        target_key_file
-                            .to_str()
-                            .ok_or_else(|| invalid("invalid remote key path"))?
-                    )?
-                );
-                let mut command = Command::new("ssh");
-                if let Some(config) = ssh_config {
-                    command.arg("-F").arg(config);
+                let mut args = vec![
+                    "receive".into(),
+                    "--repository".into(),
+                    target_repository
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid remote path"))?
+                        .into(),
+                    "--key-file".into(),
+                    target_key_file
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid remote key path"))?
+                        .into(),
+                ];
+                if remote_backup_subcommand {
+                    args.insert(0, "backup".into());
                 }
+                let mut command = ssh_command(&host, ssh_config.as_deref(), &remote_binary, &args)?;
                 let mut child = command
-                    .args([
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "ConnectTimeout=15",
-                        "-o",
-                        "ServerAliveInterval=15",
-                        "-o",
-                        "ServerAliveCountMax=3",
-                        "--",
-                        &host,
-                        &remote,
-                    ])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::inherit())

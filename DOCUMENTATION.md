@@ -26,6 +26,10 @@ Jump to [authentication](#authentication-reference), [objects](#object-api),
   Latest means maximum valid ULID, not a mutable head. Pin versions for stable
   reads/export and preserve opaque continuation tokens.
 - Empty mkdir is rejected. Deletion is soft-only; TTL/GC owns reclamation.
+- Public authentication/fragment-create JSON is limited to 64 KiB; protected
+  JSON controls to 4 MiB. Streaming upload bodies have separate limits.
+- Trash/delete requires `delete`; rename/move/recover requires `modify`.
+  Protected object responses use `Cache-Control: private, no-store`.
 
 ## Quick start
 
@@ -69,6 +73,7 @@ Minimal two-member storage pool (1+1):
 host=127.0.0.1
 https_port=50001
 native_port=50002
+native_max_connections=32
 cert_path=cert.pem
 key_path=key.pem
 
@@ -105,6 +110,7 @@ max_concurrent_io=auto
 upload_memory_budget_bytes=auto
 adaptive_concurrency_enabled=true
 upload_io_gate_enabled=true
+upload_part_strict_durability_default=true
 
 [io_control]
 foreground_wait_timeout_ms=30000
@@ -137,6 +143,11 @@ returns 507. Pool membership/geometry is immutable: append a new complete pool
 for expansion, not index/blob roots. Protect generated secrets and keep them
 separate from application credentials. Optional Accel setup is below.
 
+The example explicitly enables strict upload durability for production use.
+Generated configs retain `upload_part_strict_durability_default=false`: relaxed
+acknowledgements are not a power-loss guarantee. Per-request overrides apply to
+one-shot, batch and multipart parts. This does not change NCX copy/delete.
+
 ## Native protocol
 
 Use the canonical n1_native_client Rust crate; do not invent another framing
@@ -153,8 +164,16 @@ u32_be frame_length
 MessagePack payload
 ```
 
-Control frames are limited to `8 MiB`. Use streaming/range/multipart for large
+Unauthenticated control frames are limited to 64 KiB; authenticated frames to
+8 MiB. Use streaming/range/multipart for large
 objects rather than embedding them in a frame.
+
+`[server] native_max_connections` defaults to 32 (valid range 1–4096). Excess
+connections close without admission; size it for the host/client connection
+pool. This limits sockets, not writers. Control reads time out after 15 seconds
+before authentication and 120 seconds afterward. Raw uploads require prior
+write authority, allow at most 1 GiB per native body and use a 30-second inactivity
+timeout. An invalid declaration closes the connection without reading its body.
 
 Client request:
 
@@ -296,6 +315,15 @@ Response:
 
 Use returned expiry values; server configuration bounds requested token life.
 
+Authentication with `MASTER_KEY` grants signed `operator=true`; a fragment
+secret never does, even with all four permissions. Clients cannot grant this
+capability in request JSON. Native `session.info` reports it. Reauthenticate with
+the master key for whole-server maintenance after upgrading older tokens.
+Ordinary object reads/writes remain scoped to the authenticated fragment.
+
+New fragment credentials use Argon2 only. New/rotated credentials do not generate
+NT hashes; old optional NT fields remain readable until rotation removes them.
+
 ### `POST /noa/v1/auth/refresh`
 
 Body:
@@ -303,6 +331,12 @@ Body:
 ```json
 { "refresh_token": "<refresh-token>" }
 ```
+
+Refresh sessions are bound to the verified fragment credential (or master key
+for an operator). Rotating that credential rejects old refresh tokens; legacy
+sessions without this binding require fresh login. Already issued access tokens
+retain normal expiry, not immediate revocation. No per-object revocation lookup
+or new namespace record is introduced.
 
 ### `POST /noa/v1/auth/logout`
 
@@ -786,9 +820,16 @@ completion state live only in process memory. Parts may be uploaded concurrently
 each part is streamed once through EC to its fixed K+P placement. N1 writes no
 session manifest, namespace pending record, or per-part receipt on this path.
 Finalize synchronizes the completed shard set and then publishes the immutable
-object index and namespace entry once. An unfinished standard session does not
+object index and namespace entry once according to the parts' effective
+durability. An unfinished standard session does not
 survive process restart; its unreferenced shards remain invisible and are
 reclaimed by the normal orphan TTL scan.
+
+Both multipart modes allow at most 131,072 parts. Standard initiation additionally
+caps pending sessions at 1,024 and part-slot allocations at 16 MiB globally;
+saturation returns 503. This bounds temporary slots, not total engine RSS.
+Complete/cancel sessions to free capacity; durable uploads keep separate on-disk
+resume state.
 
 ```http
 POST /noa/v1/upload/multipart/init/{object_key}
@@ -823,11 +864,19 @@ PUT /noa/v1/upload/multipart/{version_id}/{part_index}
 Query parameters:
 
 - `checksum` optional
+- `durability` optional (`strict` or `batched`)
+- `strict_durability` optional boolean
 - `io_gate` optional boolean
 
 Request body is the raw bytes for that part. Distinct part indexes are accepted
 concurrently. Repeating a completed part index in the same live process is
 idempotent; a concurrent duplicate of an in-flight index returns conflict.
+
+All completed parts must have been acknowledged strict for strict NDX and NCX
+finalization. A strict retry of a previously relaxed completed part returns 409;
+it cannot upgrade earlier durability without rewriting bytes. Start a new upload
+if strict durability is required. Mixed/relaxed parts finalize relaxed. Directory
+sync failures on the strict path propagate rather than reporting success.
 
 Clients should use bounded in-flight parts for large files instead of increasing the one-shot size. Start with `2-4` concurrent parts and tune by disk count and disk quality. Very small multipart jobs may not benefit from part concurrency; large files with many parts usually do. N1 will apply upload backpressure when the disk scheduler is saturated.
 
@@ -1145,9 +1194,53 @@ trash_retention_seconds and trash_versions_expired under maintenance.
 ```http
 GET /noa/v1/maintenance/health?deep_scan=true&refresh=true
 GET /noa/v1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
+GET /noa/v1/maintenance/pools/health?pool=A&deep_scan=false
 GET /noa/v1/objects/status/{object_key}?mode=availability
 POST /noa/v1/objects/repair/{object_key}?mode=strict
 ```
+
+Pool diagnostics return `fragment`, `allocation_policy` and `pools`. Omit `pool`
+to inspect every configured pool. Each entry reports ID/generation/K+P, P+1 NCX
+replicas, sealed/current-write-pool flags, member IDs/slots/current paths,
+readiness, fragment-metadata coverage and estimated data space (minimum member
+free space × K, not reserved or guaranteed upload capacity). `ready` describes
+identity/access readiness, not full content integrity.
+
+Members expose `total_inodes`, `available_inodes` and `capacity_warning`. Inode
+counts may be null when unavailable. Warnings flag zero capacity, below 5% free
+bytes or fewer than 1,024 free inodes; they do not reserve space or change pool
+selection. Old pools still need NCX headroom after expansion. Shell and Console
+display these warnings independently of integrity status.
+
+`deep_scan=true` explicitly verifies the authenticated fragment's NCX, committed
+NDX, durable manifests/receipts and recorded piece CRCs using the shared verifier.
+`integrity.status` is `not_scanned`, `passed`, `failed` or `unavailable`.
+Counters report versions and physical NCX replicas checked, not global logical
+object totals. Missing members/fragment metadata cannot produce a complete pass.
+This is a read-only **live scan**, not a consistent snapshot: concurrent
+publication/mutation/reclaim can invalidate it. Quiesce writers and use offline
+`pool verify` for a conclusive maintenance check. Only one explicit pool scan
+runs at a time; overlapping deep requests return 503. No new data cache is used.
+Read permission is required; content scope is the token's fragment. A different
+`fragment` parameter is rejected with 403. Native operation:
+`maintenance.pools.health` with `pool`/`deep_scan` payload parameters.
+The current-write-pool flag identifies allocation selection; existing engine
+safety gates still decide whether mutations are permitted. NCX may remain in an
+older pool while newer versions of its stable object allocate in another pool;
+reference checks recognize that history, but a selected pool scan does not
+certify another pool's payload bytes.
+
+```bash
+litiaina-n1-shell --url n1://storage.example:50002 --fragment mainframe \
+  --secret '<fragment-secret>' pools
+litiaina-n1-shell --url n1://storage.example:50002 --fragment mainframe \
+  --secret '<fragment-secret>' pools --pool A --deep-scan
+```
+
+Console → Resource Monitor → Health exposes pool selection and an explicit
+Verify Fragment Contents action. Ordinary refreshes never initiate that deeper
+scan. Its offline Shell workflow covers verification, cloning, replacement and
+encrypted backups; the browser does not execute host operations or stop N1.
 
 Health reports topology, read-only reason, controller phase, missing/corrupt
 replicas, last scans/errors and IO pressure. N1 initially validates enrolled
@@ -1186,6 +1279,15 @@ POST /noa/v1/maintenance/{job}/stop
 GET /noa/v1/maintenance/{job}/status
 POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
 ```
+
+Starts require `write`, `modify` and `delete`. Ordinary tokens can select only
+their own fragment; omitted scope defaults to that fragment. Operator tokens
+may select another fragment or omit scope for all. Explicit all-fragment
+requests use `all_fragments=true`; Shell `--none` and Console global controls set
+it, so insufficient authority is rejected rather than silently changing scope.
+Restrictive/read-only/quiesced modes and all global stops require operator
+authority because their gates/stop signals are server-wide. Authenticate with
+`MASTER_KEY`, not a full-permission fragment secret, for those operations.
 
 | Job | Query controls |
 | --- | --- |
@@ -1235,6 +1337,9 @@ after each event. On reconnect, re-list to reconcile missed changes; events
 are not a durable client transaction log. Inspect partial mutation responses
 as well as notifications.
 
+WebSocket upgrade requires read permission. The connection closes at token
+expiry even when heartbeats remain active; reconnect with refreshed authority.
+
 ## Errors and retries
 
 Most failures return status plus plain error text. Preserve the status and
@@ -1275,14 +1380,109 @@ backend. Snapshot ingestion is projection building, never namespace authority.
 Search supports q, scope, field, match, limit, cursor and refresh controls of
 the configured Accel implementation. Refresh-based results can be stale; N1
 LIST/lookup remains authoritative. Without Accel, only search returns 503.
-Ordinary reads/writes/listing still work. Enabling search does not route ordinary
-downloads through Accel's byte cache; that needs explicit version-pinned client
-integration. Accel data is not a backup.
+Ordinary reads/writes/listing still work. Search alone does not enable byte caching.
+To accelerate existing Console and API image/video/download URLs, opt in with:
+
+```dotenv
+N1_ACCEL_READ_URL=http://127.0.0.1:53001
+N1_ACCEL_READ_BACKEND_ID=n1-primary
+```
+
+Restart N1 after changing these values. Configure the matching private Accel
+backend with `cache_private_responses=true`. N1 still authorizes every incoming
+read and resolves its namespace/version before proxying immutable bytes. The
+internal read-only token is never returned to browsers; its six-hour lifetime
+covers long streams. Cache-origin requests bypass only the proxy, not N1 auth.
+Console requires no alternate URL or exposed Accel administrative credential.
+Invalid configuration, unavailable Accel, rejected responses and pre-header
+timeouts fall back to N1. A mid-stream failure terminates the response; clients
+may resume with a fresh authorized request. Browser `private, no-store` policy
+is preserved. Accel remains optional and is not a backup or namespace authority.
+
+## Offline pool maintenance
+
+Stop N1 and quiesce application writers before every command below. Use the
+matching `litiaina-n1-shell` and `litiaina-n1` binaries in the same directory
+(or use `pool --engine-binary PATH verify --config CONFIG`). These commands are local administrative
+operations, not HTTP APIs or automatic enrollment exceptions.
+
+```bash
+litiaina-n1-shell pool verify --config /etc/litiaina/n1/n1_config.ini
+litiaina-n1-shell pool verify --config /etc/litiaina/n1/n1_config.ini \
+  --pool A --fragment <STABLE_FRAGMENT_ULID>
+litiaina-n1-shell pool clone --config /etc/litiaina/n1/n1_config.ini \
+  --pool A --member 0 --copy-root /mnt/replacement/n1
+```
+
+Offline `verify --pool A` leases/scans only that pool plus the control workspace;
+unselected members are not inspected for content or required to be online.
+Omit `--fragment` for complete pool verification before activation. A fragment
+filter uses the stable ULID, not its public name/hash, and is not a whole-pool
+activation certificate. Pool membership/catalog validation still applies.
+
+Member numbers are zero-based logical shard slots. Existing path-bound v4
+deployments must first start the updated engine at their original locations to
+upgrade the small pool descriptors; committed NDX and payload are not rewritten.
+Afterward `roots` lists candidate locations. Descriptors, not list order or
+hardware serials, identify members. Keep pool ID/generation/K+P unchanged.
+Clone requires an empty non-overlapping target; for hardware migration, choose
+a different filesystem independent of every remaining pool member. It performs
+a byte-exact copy plus two-way inventory/SHA-256 verification and leaves the source intact.
+It does not recode EC or rewrite NCX/NDX/payload. Keep the engine stopped, mount
+the verified copy at the same or a new root, update only the corresponding
+candidate location in `roots`, run `pool verify`, then start
+N1 and validate listing, version history, full hashes and new writes. Keep the
+source until validation is complete. This also works for a healthy 1+0 member.
+Once writes resume, the old member alone is a stale rollback image. Do not
+remount it as current storage without verifying the resulting complete pool.
+
+For a manual copy, run `pool prepare-copy` with the same selection/target first,
+copy the entire member including hidden files and relative fragment symlinks,
+then run `pool verify-copy`. Preserve the target's safety fence; copying tools
+must not overwrite it. A partial or same-size corrupt copy fails verification.
+Never copy a live member and treat it as a consistent snapshot.
+
+To replace **one lost member**, prepare a blank independent filesystem at its
+existing or a new location; update its candidate location in `roots`, and retain
+the original control workspace and all other members. The missing slot is never
+renumbered. `--member` selects the logical slot, not its discovery-list position:
+
+```bash
+litiaina-n1-shell pool replace --config /etc/litiaina/n1/n1_config.ini \
+  --pool A --member 0 --authorize
+```
+
+All surviving members must verify. The command copies surviving NCX and metadata,
+reconstructs only the selected slot's finalized and acknowledged durable-upload
+pieces, verifies the complete result, and only then restores its enrolled root
+identity. A lost 1+0 member cannot be reconstructed: restore a verified backup.
+Multiple simultaneous member replacements are not supported by this command.
+
+After an interrupted clone/replacement, repeat its exact command with `--resume`.
+An unfinished target stays fenced; do not remove markers to force startup.
+Conflicting or unexpected files fail closed instead of being silently overwritten.
+The offline verifier caps one metadata file at 64 MiB and one durable upload's
+receipt inventory at 131,072 records; exceeding these limits is an explicit
+verification failure, never a health pass. Reports include elapsed time and peak
+process RSS. Ordinary NCX mutations retain their existing lightweight semantics.
+
+Root discovery performs bounded descriptor checks, not a full checksum scrub.
+Accepted identity alone cannot prove freshness/completeness: finish copy/rebuild
+verification before activation. Locations stay fixed while N1 is running;
+relocation is offline. Wrong-pool/slot identities, duplicate members and pending
+maintenance are refused. Missing members retain existing degraded read/write
+rules; existing health checks and background integrity verification remain active.
+New shard/session addresses are logical member-relative addresses. Existing
+absolute addresses resolve through their original slot prefixes without changing
+committed NDX/payload during relocation. Backup/restore below is also supported
+and never requires payload EC recoding when logical pool geometry is unchanged.
 
 ## Backup and restore
 
-The litiaina-n1-backup helper creates encrypted offline recovery points, not
-live replication or a writable standby. Use the same helper/engine revision.
+`litiaina-n1-shell backup` creates encrypted offline recovery points, not
+live replication or a writable standby. It delegates to the matching engine;
+the legacy `litiaina-n1-backup` helper remains available for existing jobs and
+SSH receivers. Both use the same implementation and repository format.
 Capture requires all configured roots, initialized leases and a stopped engine
 for the entire scan; quiesce application writers first. Source leases reject an
 active updated engine, but cannot protect against unrelated filesystem writes.
@@ -1302,17 +1502,17 @@ owners, ACLs or xattrs. Key rotation is not implemented.
 ### Capture and verify
 
 ```bash
-litiaina-n1-backup keygen --key-file /secure/n1-backup.key
-litiaina-n1-backup init \
+litiaina-n1-shell backup keygen --key-file /secure/n1-backup.key
+litiaina-n1-shell backup init \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key
 sudo systemctl stop litiaina-n1.service
-litiaina-n1-backup create \
+litiaina-n1-shell backup create \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --config /opt/litiaina/n1/n1_config.ini --workers 4
 sudo systemctl start litiaina-n1.service
-litiaina-n1-backup list \
+litiaina-n1-shell backup list \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key
-litiaina-n1-backup verify \
+litiaina-n1-shell backup verify \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --snapshot SNAPSHOT_ID
 ```
@@ -1329,21 +1529,23 @@ independent storage/host/site failure domain. Replication can run after N1
 restarts because it reads a committed snapshot, not live engine files.
 
 ```bash
-litiaina-n1-backup replicate \
+litiaina-n1-shell backup replicate \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --snapshot SNAPSHOT_ID \
   --target-repository /independent-backup/n1-replica \
   --target-key-file /secure/n1-backup.key
 
-litiaina-n1-backup replicate \
+litiaina-n1-shell backup replicate \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --snapshot SNAPSHOT_ID --ssh backup@backup-host \
-  --remote-binary /opt/litiaina/n1/litiaina-n1-backup \
+  --remote-binary /opt/litiaina/n1/litiaina-n1-shell --remote-backup-subcommand \
   --target-repository /backup/n1-replica \
   --target-key-file /secure/n1-backup.key
 ```
 
-Install the matching helper remotely and configure SSH keys/known_hosts. Normal
+Install the matching Engine/Shell pair remotely and configure SSH keys/known_hosts.
+`--remote-backup-subcommand` selects their `backup receive` entrypoint; omit it
+only when explicitly using the legacy standalone helper. Normal
 host-key verification applies; --ssh-config can select a dedicated config.
 Interrupted transfer is retried with the same snapshot; verified blocks are
 reused. A partial transfer is not a committed recovery point. Replication does
@@ -1353,13 +1555,13 @@ not propagate source deletion or retention; choose destination retention separat
 
 Keep the destination engine stopped and use fresh empty roots, matching pool
 IDs/generations/geometry and corresponding independent member devices. Root
-remapping uses the same position in the lexicographically sorted unique-root
-lists; review the source/target mapping. This is not format migration or EC
+remapping matches pool ID, generation, K+P and zero-based member slot, independent
+of mount-name sorting; review the source/target mapping. This is not format migration or EC
 recoding to a different count/layout. Use a fresh fs_storage_path; do not copy
 the source physical identity registry onto replacement devices.
 
 ```bash
-litiaina-n1-backup restore \
+litiaina-n1-shell backup restore \
   --repository /backup/n1-replica --key-file /secure/n1-backup.key \
   --snapshot SNAPSHOT_ID --target-config /etc/litiaina/n1-restored.ini
 ```
@@ -1379,10 +1581,10 @@ repository intact while validating recovery.
 ### Retention
 
 ```bash
-litiaina-n1-backup forget \
+litiaina-n1-shell backup forget \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --snapshot OLD_SNAPSHOT_ID
-litiaina-n1-backup gc \
+litiaina-n1-shell backup gc \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key
 ```
 
@@ -1398,11 +1600,12 @@ administrators can still erase it.
 default. Initialize repositories/key first, configure exact paths/service,
 private state outside roots/repositories, timeouts and independent retention,
 then set enabled=true for an approved maintenance window. Protect the config,
-state, helper and SSH settings from untrusted writes. The source engine must
+state, binaries and SSH settings from untrusted writes. The source engine must
 have initialized its root leases before capture.
 
-Install the supplied units in /etc/systemd/system and the matching helper at
-their configured executable path:
+Install the supplied units in /etc/systemd/system and the matching Engine/Shell
+pair at their configured executable paths. Integrated remote replicas set
+`remote_backup_subcommand=true`; legacy helper receivers leave it false.
 
 ```bash
 sudo install -m 644 deploy/systemd/litiaina-n1-backup.service \
@@ -1410,7 +1613,7 @@ sudo install -m 644 deploy/systemd/litiaina-n1-backup.service \
   deploy/systemd/litiaina-n1-backup-recover.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start litiaina-n1-backup.service
-sudo /opt/litiaina/n1/litiaina-n1-backup job-status \
+sudo /opt/litiaina/n1/litiaina-n1-shell backup job-status \
   --config /etc/litiaina/n1/backup-job.json
 # Enable only after a successful supervised acceptance/recovery drill:
 sudo systemctl enable --now litiaina-n1-backup.timer
@@ -1433,7 +1636,7 @@ service and verify N1 recovered. Unsupervised run-job cannot clean up its own
 SIGKILL. After its job and children exit, manual recovery is:
 
 ```bash
-litiaina-n1-backup recover-job --state-dir /var/lib/litiaina/n1-backup
+litiaina-n1-shell backup recover-job --state-dir /var/lib/litiaina/n1-backup
 ```
 
 This restores service intention, not a successful backup. Live replication,

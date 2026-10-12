@@ -40,6 +40,7 @@ pub fn run(path: &Path) -> Result<()> {
         directory: state.path.clone(),
         service_timeout: config.service_timeout_seconds,
         helper: std::env::current_exe()?,
+        helper_backup_subcommand: std::env::args_os().nth(1).is_some_and(|a| a == "backup"),
     };
     if let Some(service) = state.status.restart.clone() {
         let _previous = state::service_lock(&service)?;
@@ -62,6 +63,7 @@ pub fn recover(path: &Path) -> Result<()> {
             directory: state.path.clone(),
             service_timeout: 330,
             helper: std::env::current_exe()?,
+            helper_backup_subcommand: std::env::args_os().nth(1).is_some_and(|a| a == "backup"),
         };
         if let Err(error) = workflow::recover(&mut state, &mut driver) {
             state.status.phase = "restart_required".into();

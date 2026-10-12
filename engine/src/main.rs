@@ -25,7 +25,7 @@ use crate::core::upload::{
 };
 use crate::handlers::error_handlers::handler_404;
 use crate::io_control::{IoControlConfig, configure_io_control};
-use crate::protocol::{bind_native_protocol, serve_native_protocol};
+use crate::protocol::{bind_native_protocol, native_connection_limit, serve_native_protocol};
 use crate::routes::storage_routes::{apply_runtime_http_layers, build_storage_routes_unbound};
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -540,7 +540,7 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
             // A known member may be offline at restart. Never create its
             // directory or enroll a replacement implicitly; identity checks
             // keep it excluded and each pool enforces its read/write budget.
-            if enrolled.iter().any(|old| old.roots.contains(&root)) {
+            if enrolled.iter().any(|old| old.id == pool.id) {
                 continue;
             }
             ensure_existing_writable_dir(&root, "N1 storage pool root")?;
@@ -569,6 +569,7 @@ fn print_usage(binary: &str) {
     println!();
     println!("N1 server binary. Run with no arguments to start the server.");
     println!("Use litiaina-n1-shell for admin and maintenance commands.");
+    println!("Offline operations: {binary} pool --help | {binary} backup --help");
     println!();
     println!("Options:");
     println!("  -V, --version    Print N1 build version and native protocol version");
@@ -602,6 +603,23 @@ fn handle_startup_args() -> StartupCommand {
 }
 
 fn main() {
+    let mut offline_args: Vec<_> = std::env::args_os().collect();
+    if offline_args
+        .get(1)
+        .is_some_and(|arg| arg == "pool" || arg == "backup")
+    {
+        let operation = offline_args.remove(1);
+        let result = if operation == "pool" {
+            crate::core::storage_admin::run_from(offline_args)
+        } else {
+            crate::core::backup::cli::run_from(offline_args)
+        };
+        if let Err(error) = result {
+            eprintln!("N1 offline maintenance failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match handle_startup_args() {
         StartupCommand::RunServer => {}
         StartupCommand::PrintedAndExit => return,
@@ -702,6 +720,9 @@ pub async fn run_server() {
         .get("native_port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(50002);
+    let native_max_connections =
+        native_connection_limit(server_section.get("native_max_connections"))
+            .unwrap_or_else(|err| panic!("Invalid [server] configuration: {err}"));
     let cert_path = server_section
         .get("cert_path")
         .map(|v| v.to_string())
@@ -722,10 +743,14 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let pools = crate::core::storage_pool::parse(&config).unwrap_or_else(|error| {
-        tracing::error!("Invalid N1 storage pools: {error}");
-        std::process::exit(1);
-    });
+    let pools = crate::core::storage_pool::parse(&config)
+        .and_then(|pools| {
+            crate::core::storage_pool::bind_locations(pools, Path::new(fs_storage_path))
+        })
+        .unwrap_or_else(|error| {
+            tracing::error!("Invalid N1 storage pools: {error}");
+            std::process::exit(1);
+        });
     let blob_disks = pools
         .iter()
         .flat_map(|pool| pool.roots.iter())
@@ -759,7 +784,7 @@ pub async fn run_server() {
         .expect("Double initialization of BLOB_STORE_DISKS!");
     // Process-lifetime exclusion lets offline snapshots prove there is no
     // engine writer, healer or collector. No per-request lock is introduced.
-    let instance_roots = INDEX_STORE_DISKS
+    let mut instance_roots = INDEX_STORE_DISKS
         .get()
         .unwrap()
         .iter()
@@ -770,6 +795,7 @@ pub async fn run_server() {
         // backup still requires the complete configured set.
         .filter(|root| root.is_dir())
         .collect::<Vec<_>>();
+    instance_roots.push(PathBuf::from(FS_STORAGE_ROOT.get().unwrap()));
     let _instance_lease = crate::core::instance_lease::InstanceLease::engine(&instance_roots)
         .unwrap_or_else(|error| {
             tracing::error!("Cannot acquire N1 storage instance lease: {error}");
@@ -1123,7 +1149,13 @@ pub async fn run_server() {
         .fallback(handler_404);
 
     tokio::spawn(async move {
-        serve_native_protocol(native_listener, native_addr, native_state).await;
+        serve_native_protocol(
+            native_listener,
+            native_addr,
+            native_state,
+            native_max_connections,
+        )
+        .await;
     });
 
     tokio::spawn(crate::core::export::run_export_manager());
@@ -1137,7 +1169,9 @@ async fn serve(socket: SocketAddr, app: Router, cert: RustlsConfig) {
 
     tokio::spawn(shutdown_signal(handle.clone()));
 
-    let mut server = axum_server::bind_rustls(socket, cert).handle((*handle).clone());
+    let mut server = axum_server::bind_rustls(socket, cert)
+        .map(|acceptor| acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()))
+        .handle((*handle).clone());
     server.http_builder().http2().enable_connect_protocol();
 
     server

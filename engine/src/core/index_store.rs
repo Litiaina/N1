@@ -162,6 +162,119 @@ pub(crate) fn remap_backup_session_manifest(
     encode(&row)
 }
 
+pub(crate) fn offline_session_manifest(bytes: &[u8]) -> Result<UploadSessionManifest, AppError> {
+    Ok(decode::<SessionRow>(bytes)?.manifest)
+}
+
+/// Inspect receipt-only durable progress without initializing engine globals.
+/// Memory is bounded to one upload's receipt inventory; oversized inventories
+/// fail closed instead of certifying incomplete progress or exhausting RAM.
+pub(crate) fn offline_session_parts(
+    directory: &Path,
+    mut manifest: UploadSessionManifest,
+    stable_fragment: &str,
+) -> Result<impl Iterator<Item = Result<PartMetadata, AppError>>, AppError> {
+    if manifest.data_shards == 0
+        || manifest.placement_roots.len() != session_total_shards(&manifest)
+        || manifest.version_id.parse::<ulid::Ulid>().is_err()
+        || Path::new(&manifest.object_key).components().count() != 1
+        || !matches!(
+            Path::new(&manifest.object_key).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || Path::new(stable_fragment).components().count() != 1
+    {
+        return Err(AppError::Conflict(
+            "invalid offline durable placement identity".into(),
+        ));
+    }
+    let mut receipts = BTreeMap::<u64, BTreeMap<usize, u32>>::new();
+    let mut count = 0;
+    for entry in fs::read_dir(directory).map_err(|e| io_err(e, "inspect offline receipts"))? {
+        let entry = entry.map_err(|e| io_err(e, "read offline receipt"))?;
+        let name = entry.file_name();
+        let Some((part, shard, crc)) = name.to_str().and_then(parse_shard_receipt_name) else {
+            continue;
+        };
+        if part >= manifest.expected_parts
+            || shard >= session_total_shards(&manifest)
+            || !entry
+                .file_type()
+                .map_err(|e| io_err(e, "inspect receipt type"))?
+                .is_file()
+            || entry
+                .metadata()
+                .map_err(|e| io_err(e, "inspect receipt size"))?
+                .len()
+                != 0
+        {
+            return Err(AppError::Conflict("invalid offline durable receipt".into()));
+        }
+        count += 1;
+        if count > 131_072 {
+            return Err(AppError::Conflict(
+                "durable receipt inventory exceeds offline verification limit".into(),
+            ));
+        }
+        if receipts
+            .entry(part)
+            .or_default()
+            .insert(shard, crc)
+            .is_some_and(|old| old != crc)
+        {
+            return Err(AppError::Conflict(
+                "conflicting offline durable checksums".into(),
+            ));
+        }
+    }
+    manifest.fragment = stable_fragment.to_string();
+    let width = session_total_shards(&manifest);
+    Ok(receipts
+        .into_iter()
+        .filter(move |(_, checksums)| checksums.len() == width)
+        .map(move |(part_index, checksums)| {
+            let size_bytes = session_part_size(&manifest, part_index)
+                .ok_or_else(|| AppError::Conflict("invalid durable part size".into()))?;
+            let size = session_shard_size(&manifest, size_bytes);
+            let fanout = ObjectPathManager::object_fanout_segments(&manifest.object_key);
+            let shards = manifest
+                .placement_roots
+                .iter()
+                .enumerate()
+                .map(|(shard_index, root)| {
+                    let file_name = crate::core::upload::stable_shard_name(
+                        part_index,
+                        shard_index,
+                        usize::from(manifest.data_shards),
+                    );
+                    let path = Path::new(root)
+                        .join(format!("@f_{stable_fragment}"))
+                        .join(".objects")
+                        .join(&fanout[0])
+                        .join(&fanout[1])
+                        .join(format!("@o_{}", manifest.object_key))
+                        .join(&manifest.version_id)
+                        .join(&file_name);
+                    super::disk_manager::ShardInfo {
+                        shard_index,
+                        is_parity: shard_index >= usize::from(manifest.data_shards),
+                        absolute_path: path.to_string_lossy().into_owned(),
+                        file_name,
+                        size_bytes: size,
+                        checksum: format!("{:08x}", checksums[&shard_index]),
+                    }
+                })
+                .collect();
+            Ok(PartMetadata {
+                part_index,
+                size_bytes,
+                created_at: manifest.created_at,
+                shards,
+                checksum: None,
+            })
+        }))
+}
+
 impl SessionRow {
     fn into_state(self) -> IndexSessionState {
         IndexSessionState {
@@ -1132,8 +1245,8 @@ fn write_metadata_to_roots_with_durability(
         .parts
         .iter()
         .flat_map(|part| part.shards.iter())
-        .map(|shard| PathBuf::from(&shard.absolute_path))
-        .collect::<Vec<_>>();
+        .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut written = 0usize;
     for root in blob_roots() {
         let object_dir = object_index_dir(&root, &metadata.fragment, &metadata.object_key)?;
@@ -1195,8 +1308,8 @@ pub(crate) fn object_metadata_placements_healthy(
         .parts
         .iter()
         .flat_map(|part| part.shards.iter())
-        .map(|shard| PathBuf::from(&shard.absolute_path))
-        .collect::<Vec<_>>();
+        .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut expected_placements = 0usize;
 
     for root in blob_roots() {
@@ -1338,10 +1451,10 @@ pub fn rebind_unpublished_object_version(
             rebound.object_key = destination_object_id.clone();
             for part in &mut rebound.parts {
                 for shard in &mut part.shards {
-                    let Some(root) = roots
-                        .iter()
-                        .find(|root| Path::new(&shard.absolute_path).starts_with(root))
-                    else {
+                    let Some(root) = roots.iter().find(|root| {
+                        crate::core::storage_pool::resolve_address(&shard.absolute_path)
+                            .is_ok_and(|path| path.starts_with(root))
+                    }) else {
                         for (old_source, new_destination) in completed.iter().rev() {
                             let _ = fs::rename(new_destination, old_source);
                         }
@@ -1350,12 +1463,11 @@ pub fn rebind_unpublished_object_version(
                             shard.absolute_path
                         )));
                     };
-                    shard.absolute_path =
-                        object_index_dir(root, &metadata.fragment, &destination_object_id)?
+                    shard.absolute_path = crate::core::storage_pool::record_address(
+                        &object_index_dir(root, &metadata.fragment, &destination_object_id)?
                             .join(&metadata.version_id)
-                            .join(&shard.file_name)
-                            .to_string_lossy()
-                            .into_owned();
+                            .join(&shard.file_name),
+                    );
                 }
             }
 

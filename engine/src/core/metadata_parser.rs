@@ -22,7 +22,7 @@ pub async fn find_latest_metadata_on_disk(
                 "Index latest read failed for {}/{}: {}",
                 fragment, object_key, e
             );
-            Err(AppError::NotFound)
+            Err(e)
         }
     }
 }
@@ -82,7 +82,21 @@ pub async fn get_version_metadata(
                 "Index version read failed for {}/{}/{}: {}",
                 fragment, object_key, version_id, e
             );
-            Err(AppError::NotFound)
+            Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_metadata_lookup_does_not_masquerade_as_absence() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        crate::middleware::auth_middleware::tests::ensure_test_env();
+        let error = find_latest_metadata_on_disk("metadata-errors", "../invalid")
+            .await
+            .unwrap_err();
+        assert_ne!(error.status_code(), axum::http::StatusCode::NOT_FOUND);
     }
 }

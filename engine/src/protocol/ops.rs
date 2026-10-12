@@ -443,7 +443,7 @@ async fn execute_native_op_inner(
         }
         "trash.recover_all" => {
             let claims = claims_required(claims)?;
-            require_write(&claims)?;
+            claims.require_modify()?;
             let summary = global_namespace_runtime()
                 .recover_all(&claims.fragment)
                 .await?;
@@ -494,7 +494,7 @@ async fn execute_native_op_inner(
         }
         "object.rename" => {
             let claims = claims_required(claims)?;
-            require_write_modify(&claims)?;
+            claims.require_modify()?;
             let source = string_field(&payload, "source_key")
                 .or_else(|| string_field(&payload, "source_path"))
                 .ok_or_else(|| AppError::BadRequest("source_key is required".into()))?;
@@ -535,7 +535,7 @@ async fn execute_native_op_inner(
         }
         "object.bulk_delete" | "object.bulk.delete" => {
             let claims = claims_required(claims)?;
-            require_write(&claims)?;
+            claims.require_delete()?;
             native_body(
                 native_bulk_namespace_operation(
                     &state,
@@ -549,7 +549,7 @@ async fn execute_native_op_inner(
         }
         "object.bulk_recover" | "object.bulk.recover" => {
             let claims = claims_required(claims)?;
-            require_write(&claims)?;
+            claims.require_modify()?;
             native_body(
                 native_bulk_namespace_operation(
                     &state,
@@ -770,6 +770,13 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             native_body(system_health_snapshot(state, claims, params_from_payload(&payload)).await?)
         }
+        "maintenance.pools.health" => {
+            let claims = claims_required(claims)?;
+            native_body(
+                crate::core::storage_health::snapshot(claims, params_from_payload(&payload))
+                    .await?,
+            )
+        }
         "maintenance.gc.status" => native_body(get_gc_status().await),
         "maintenance.repair.status" => native_body(get_repair_status().await),
         "maintenance.redistribution.status" => native_body(get_redist_status().await),
@@ -777,7 +784,8 @@ async fn execute_native_op_inner(
             let claims = claims_required(claims)?;
             require_write_modify_delete(&claims)?;
             native_from_response(
-                run_garbage_collector(State(state), Query(params_from_payload(&payload))).await,
+                run_garbage_collector(claims, State(state), Query(params_from_payload(&payload)))
+                    .await,
             )
             .await
         }
@@ -1210,9 +1218,11 @@ fn params_from_payload(payload: &Value) -> HashMap<String, String> {
 
 fn params_with_claim_fragment(claims: &Claims, payload: &Value) -> HashMap<String, String> {
     let mut params = params_from_payload(payload);
-    params
-        .entry("fragment".to_string())
-        .or_insert_with(|| claims.fragment.clone());
+    if !claims.operator {
+        params
+            .entry("fragment".to_string())
+            .or_insert_with(|| claims.fragment.clone());
+    }
     params
 }
 

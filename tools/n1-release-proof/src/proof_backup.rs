@@ -1,4 +1,65 @@
 impl Proof {
+    fn interrupt_backup_restore(
+        &self,
+        repo: &Path,
+        key: &Path,
+        snapshot: &str,
+        config: &Path,
+    ) -> ProofResult<usize> {
+        // Kill the actual restore process, not a delegating shell parent.
+        let log = fs::File::create(self.args.out_dir.join("interrupted-restore.log"))?;
+        let mut child = Command::new(&self.args.binary)
+            .args(["backup", "restore", "--snapshot", snapshot, "--key-file"])
+            .arg(key)
+            .arg("--repository")
+            .arg(repo)
+            .arg("--target-config")
+            .arg(config)
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut progressed = false;
+        while Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Err("restore completed before its interruption proof".into());
+            }
+            if self
+                .index_roots
+                .iter()
+                .all(|r| r.join(".n1-restore-pending").is_file())
+                && self.index_roots.iter().any(|r| self.proof_piece(r).is_ok())
+            {
+                progressed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill()?;
+        child.wait()?;
+        if !progressed {
+            return Err("restore never materialized a piece before interruption".into());
+        }
+        let mut files = 0;
+        for root in &self.index_roots {
+            if !root.join(".n1-restore-pending").is_file() {
+                return Err("interrupted restore lost an activation fence".into());
+            }
+            let mut directories = vec![root.clone()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        directories.push(entry.path());
+                    } else if entry.file_type()?.is_file() {
+                        files += 1;
+                    }
+                }
+            }
+        }
+        Ok(files)
+    }
+
     fn backup_cli(
         &self,
         repo: &Path,
@@ -12,9 +73,13 @@ impl Proof {
             .binary
             .parent()
             .ok_or("missing binary parent")?
-            .join("litiaina-n1-backup");
+            .join("litiaina-n1-shell");
         let mut command = Command::new(binary);
-        command.arg(operation).arg("--key-file").arg(key);
+        command
+            .arg("backup")
+            .arg(operation)
+            .arg("--key-file")
+            .arg(key);
         if operation != "keygen" {
             command.arg("--repository").arg(repo);
         }
@@ -35,6 +100,21 @@ impl Proof {
         self.validate()?;
         self.prepare_dirs()?;
         self.write_config()?;
+        let portable_spare = if self.index_roots.len() == 1 {
+            self.args
+                .spare_root
+                .as_ref()
+                .map(fs::canonicalize)
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(spare) = &portable_spare {
+            use std::os::unix::fs::MetadataExt;
+            if spare.metadata()?.dev() == self.index_roots[0].metadata()?.dev() {
+                return Err("single-member portable restore requires a different device".into());
+            }
+        }
         let evidence = self.args.out_dir.clone();
         let config = evidence.join("n1_config.ini");
         fs::write(
@@ -43,10 +123,14 @@ impl Proof {
         )?;
         let key = evidence.join("backup.key");
         let repo = self.disk_roots()?[0].join(format!("n1-backup-repository-{}", self.stamp));
-        let replica = self
-            .disk_roots()?
-            .last()
-            .ok_or("missing target disk")?
+        let replica = portable_spare
+            .clone()
+            .unwrap_or(
+                self.disk_roots()?
+                    .last()
+                    .ok_or("missing target disk")?
+                    .clone(),
+            )
             .join(format!("n1-backup-replica-{}", self.stamp));
         self.backup_cli(&repo, &key, "keygen", &[], true)?;
         self.backup_cli(&repo, &key, "init", &[], true)?;
@@ -223,6 +307,7 @@ impl Proof {
         }
         self.index_roots = old_index
             .iter()
+            .rev()
             .map(|p| {
                 p.with_file_name(format!(
                     "{}-restored",
@@ -232,6 +317,7 @@ impl Proof {
             .collect();
         self.blob_roots = old_blob
             .iter()
+            .rev()
             .map(|p| {
                 p.with_file_name(format!(
                     "{}-restored",
@@ -239,6 +325,10 @@ impl Proof {
                 ))
             })
             .collect();
+        if let Some(spare) = &portable_spare {
+            self.index_roots = vec![spare.join(format!("n1-restored-store-{}", self.stamp))];
+            self.blob_roots = self.index_roots.clone();
+        }
         for root in self.index_roots.iter().chain(&self.blob_roots) {
             fs::create_dir_all(root)?;
         }
@@ -253,6 +343,8 @@ impl Proof {
                 .replace("file_ttl_seconds=30", "file_ttl_seconds=86400"),
         )?;
         let restore_start = Instant::now();
+        let restore_interrupted_files =
+            self.interrupt_backup_restore(&replica, &key, second_id, &restore_config)?;
         self.backup_cli(
             &replica,
             &key,
@@ -262,6 +354,24 @@ impl Proof {
                 second_id,
                 "--target-config",
                 restore_config.to_str().ok_or("config path")?,
+            ],
+            false,
+        )?;
+        if self.start_server("backup-incomplete-restore").await.is_ok() {
+            self.stop_server()?;
+            return Err("engine admitted an interrupted restore".into());
+        }
+        self.stop_server()?;
+        self.backup_cli(
+            &replica,
+            &key,
+            "restore",
+            &[
+                "--snapshot",
+                second_id,
+                "--target-config",
+                restore_config.to_str().ok_or("config path")?,
+                "--resume",
             ],
             true,
         )?;
@@ -366,9 +476,12 @@ impl Proof {
         self.args.out_dir = evidence;
         self.summary = json!({"status":"PASS","proof":"encrypted_offline_backup_and_snapshot_replication","ec":[self.data_shards,self.parity_shards],
             "first_snapshot":first,"second_snapshot":second,"capture_seconds":capture_seconds,"incremental_capture_seconds":incremental_seconds,
-            "replication_seconds":replication_seconds,"restore_seconds":restore_seconds,"lineage":lineage,"small_objects":storm,
+            "replication_seconds":replication_seconds,"restore_seconds":restore_seconds,"restore_interrupted_files":restore_interrupted_files,
+            "physical_power_cut":false,"lineage":lineage,"small_objects":storm,
+            "single_member_cross_device_restore":portable_spare.is_some(),
             "checks":["online_capture_rejected","encrypted_capture_verified","incremental_snapshot","replication_idempotent","original_roots_offline",
-                "portable_restore","paginated_listing","version_identity_and_history","download_sha256","empty_physical_organizer","trash_recovery","durable_session_resume",
+                "portable_restore","sigkill_after_restore_piece_publication","interrupted_restore_startup_rejected","explicit_restore_resume",
+                "paginated_listing","version_identity_and_history","download_sha256","empty_physical_organizer","trash_recovery","durable_session_resume",
                 "range_download","new_write_and_delete","retained_older_replica","retention_gc_preserves_live_blocks","all_small_object_hashes","independent_fragment_credentials"],
             "post_restore_version":post,"repository":repo,"replica":replica,"key_file":key,
             "test_scope":"isolated directories; no production service restart or disk formatting"});

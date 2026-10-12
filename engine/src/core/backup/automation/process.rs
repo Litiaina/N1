@@ -13,6 +13,7 @@ pub struct Processes {
     pub directory: PathBuf,
     pub service_timeout: u64,
     pub helper: PathBuf,
+    pub helper_backup_subcommand: bool,
 }
 impl Processes {
     pub fn run(&self, mut command: Command, seconds: u64) -> Result<Vec<u8>> {
@@ -66,8 +67,15 @@ impl Processes {
         cmd.arg("--").arg(&service.unit);
         cmd
     }
-    fn helper(&self, operation: &str, config: &Config, snapshot: Option<&str>) -> Command {
+    fn helper_command(&self) -> Command {
         let mut cmd = Command::new(&self.helper);
+        if self.helper_backup_subcommand {
+            cmd.arg("backup");
+        }
+        cmd
+    }
+    fn helper(&self, operation: &str, config: &Config, snapshot: Option<&str>) -> Command {
+        let mut cmd = self.helper_command();
         cmd.arg(operation)
             .arg("--repository")
             .arg(&config.repository)
@@ -83,7 +91,7 @@ impl Processes {
             return Ok(());
         }
         let cmd = if let Some(host) = &replica.ssh {
-            let args = [
+            let mut args = vec![
                 "prune".to_owned(),
                 "--repository".into(),
                 replica.repository.to_string_lossy().into_owned(),
@@ -94,6 +102,9 @@ impl Processes {
                 "--protect".into(),
                 snapshot.into(),
             ];
+            if replica.remote_backup_subcommand {
+                args.insert(0, "backup".into());
+            }
             super::super::cli::ssh_command(
                 host,
                 replica.ssh_config.as_deref(),
@@ -101,7 +112,7 @@ impl Processes {
                 &args,
             )?
         } else {
-            let mut cmd = Command::new(&self.helper);
+            let mut cmd = self.helper_command();
             cmd.arg("prune")
                 .arg("--repository")
                 .arg(&replica.repository)
@@ -232,6 +243,9 @@ impl Driver for Processes {
                 .arg(host)
                 .arg("--remote-binary")
                 .arg(&replica.remote_binary);
+            if replica.remote_backup_subcommand {
+                cmd.arg("--remote-backup-subcommand");
+            }
         }
         if let Some(path) = &replica.ssh_config {
             cmd.arg("--ssh-config").arg(path);
@@ -254,5 +268,30 @@ impl Driver for Processes {
             self.run(cmd, config.operation_timeout_seconds)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+
+    #[test]
+    fn integrated_and_legacy_jobs_use_the_correct_child_entrypoint() {
+        for integrated in [false, true] {
+            let driver = Processes {
+                directory: "/unused".into(),
+                service_timeout: 1,
+                helper: "/test/engine".into(),
+                helper_backup_subcommand: integrated,
+            };
+            for operation in ["create", "verify", "replicate", "prune"] {
+                let command = driver.helper(operation, &Config::default(), None);
+                let args = command.get_args().collect::<Vec<_>>();
+                if integrated {
+                    assert_eq!(args[0], "backup");
+                }
+                assert_eq!(args[usize::from(integrated)], operation);
+            }
+        }
     }
 }

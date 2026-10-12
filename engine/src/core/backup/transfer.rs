@@ -112,7 +112,7 @@ pub fn receive(repo: &Repository, input: &mut impl BufRead, out: &mut impl Write
     super::fs::safe_id(&snapshot.id)?;
     if key_id != repo.key.id
         || snapshot.format != super::format::FORMAT
-        || snapshot.engine_format != 3
+        || snapshot.engine_format != super::format::ENGINE_FORMAT
     {
         return Err(invalid("replication format/key mismatch"));
     }

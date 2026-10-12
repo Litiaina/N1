@@ -38,6 +38,9 @@ pub struct Replica {
     pub ssh_config: Option<PathBuf>,
     #[serde(default = "remote_binary")]
     pub remote_binary: String,
+    /// True for litiaina-n1 or litiaina-n1-shell; false for the legacy helper.
+    #[serde(default)]
+    pub remote_backup_subcommand: bool,
     /// Zero disables automatic destination retention, independently of source.
     #[serde(default)]
     pub keep_last: usize,

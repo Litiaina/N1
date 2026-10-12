@@ -301,6 +301,7 @@ impl Proof {
             ))
             .bearer_auth(token)
             .header("content-type", content_type)
+            .header(CONTENT_LENGTH, payload.len())
             .body(payload)
             .send()
             .await?;

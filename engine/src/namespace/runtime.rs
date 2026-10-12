@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -610,7 +611,9 @@ impl NamespaceRuntime {
                     .iter()
                     .flat_map(|part| &part.shards)
                     .find_map(|shard| {
-                        crate::core::storage_pool::pool_for_root(Path::new(&shard.absolute_path))
+                        crate::core::storage_pool::resolve_address(&shard.absolute_path)
+                            .ok()
+                            .and_then(|path| crate::core::storage_pool::pool_for_root(&path))
                     });
                 flat::publish(&fragment, &logical_path, &final_id, pool)?;
                 Ok(final_id)

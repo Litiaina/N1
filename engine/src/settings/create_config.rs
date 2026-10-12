@@ -8,6 +8,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("host", "127.0.0.1")
         .set("https_port", "50001")
         .set("native_port", "50002")
+        .set("native_max_connections", "32")
         .set("cert_path", "")
         .set("key_path", "");
 

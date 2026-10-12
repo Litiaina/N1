@@ -592,8 +592,8 @@ impl Proof {
         .await?;
         ensure_native_status(&stat, 200, "native namespace stat")?;
 
-        let native_dir = format!("{}native-protocol/probe", self.args.prefix);
-        let renamed_dir = format!("{}native-protocol/probe-renamed", self.args.prefix);
+        let native_dir = format!("{}native-protocol/probe/", self.args.prefix);
+        let renamed_dir = format!("{}native-protocol/probe-renamed/", self.args.prefix);
 
         ensure_native_status(
             &native_round_trip(
@@ -604,9 +604,12 @@ impl Proof {
                 None,
             )
             .await?,
-            200,
-            "native mkdir",
+            400,
+            "native empty mkdir rejected by the v4 flat namespace",
         )?;
+        let prefix_payload = deterministic_payload(4096, b"native-flat-prefix");
+        let prefix_sha = sha256_bytes(&prefix_payload);
+        self.upload_bytes(&format!("{native_dir}entry.bin"), prefix_payload, "application/octet-stream").await?;
         ensure_native_status(
             &native_round_trip(
                 &mut stream,
@@ -643,6 +646,7 @@ impl Proof {
             200,
             "native recover",
         )?;
+        self.assert_download_sha256(&format!("{renamed_dir}entry.bin"), &prefix_sha).await?;
         ensure_native_status(
             &native_round_trip(
                 &mut stream,
@@ -689,6 +693,13 @@ impl Proof {
             200,
             "native gc status",
         )?;
+        let denied_stop = native_round_trip(&mut stream, "fragment-global-stop-denied",
+            "maintenance.gc.stop", json!({}), None).await?;
+        ensure_native_status(&denied_stop, 403, "fragment token cannot stop global maintenance")?;
+        let operator = native_round_trip(&mut stream, "native-operator-auth", "auth.bearer",
+            json!({"token": self.operator_token}), None).await?;
+        ensure_native_ok(&operator, "native master-key operator authentication")?;
+
         ensure_native_status(
             &native_round_trip(
                 &mut stream,
@@ -1032,7 +1043,7 @@ fn ensure_native_status(
     expected: u16,
     label: &str,
 ) -> ProofResult<()> {
-    if response.status == Some(expected) && response.ok {
+    if response.status == Some(expected) && response.ok == (expected < 400) {
         Ok(())
     } else {
         Err(format!(
@@ -1088,6 +1099,14 @@ mod native_rejection_tests {
     fn successful_operation_is_not_a_rejection() {
         let accepted = response(true, Some(200), None);
         assert!(ensure_native_rejected(&accepted, "retired op").is_err());
+    }
+
+    #[test]
+    fn typed_error_assertions_require_exact_status_and_negative_ok_flag() {
+        assert!(ensure_native_status(&response(false, Some(403), None), 403, "denied").is_ok());
+        assert!(ensure_native_status(&response(true, Some(403), None), 403, "denied").is_err());
+        assert!(ensure_native_status(&response(false, Some(400), None), 403, "denied").is_err());
+        assert!(ensure_native_status(&response(false, Some(200), None), 200, "success").is_err());
     }
 }
 

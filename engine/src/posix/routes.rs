@@ -188,6 +188,7 @@ async fn posix_trash(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
+    claims.require_delete()?;
     let summary = global_namespace_runtime()
         .trash(&claims.fragment, &req.path)
         .await?;
@@ -221,6 +222,7 @@ async fn posix_recover(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
+    claims.require_modify()?;
     let summary = match req.trash_entry_id.as_deref().map(str::trim) {
         Some(trash_entry_id) if !trash_entry_id.is_empty() => {
             global_namespace_runtime()

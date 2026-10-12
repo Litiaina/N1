@@ -2,37 +2,66 @@ use crate::core::io_scheduler::IoProgress;
 use crate::core::upload::{AdaptiveIoGuard, acquire_upload_io_guard_for_query};
 use crate::enums::app_error_enum::AppError;
 use crate::protocol::auth::NativeSession;
-use crate::protocol::frame::{read_request_body, read_request_control, write_response};
+use crate::protocol::frame::{read_request_control_with_limit, write_response};
 use crate::protocol::ops::{
     NativeExecutionError, execute_native_op, execute_native_streaming_reader,
     prepare_native_download_stream, stream_native_download_plan,
 };
 use crate::protocol::types::{
-    MAX_NATIVE_BODY_BYTES, N1_NATIVE_PROTOCOL_VERSION, NativeAuthFragmentRequest,
-    NativeBearerRequest, NativeOpResponse, NativeRequest, NativeResponse,
+    MAX_NATIVE_BODY_BYTES, MAX_NATIVE_FRAME_BYTES, N1_NATIVE_PROTOCOL_VERSION,
+    NativeAuthFragmentRequest, NativeBearerRequest, NativeOpResponse, NativeRequest,
+    NativeResponse,
 };
 use crate::routes::storage_routes::AppState;
 use serde_json::{Value, json};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 const NATIVE_UPLOAD_DRAIN_BUFFER_BYTES: usize = 128 * 1024;
+const PREAUTH_FRAME_LIMIT: usize = 64 * 1024;
+
+pub fn native_connection_limit(value: Option<&str>) -> Result<usize, String> {
+    let limit = value
+        .unwrap_or("32")
+        .parse::<usize>()
+        .map_err(|_| "native_max_connections must be an integer from 1 to 4096")?;
+    if !(1..=4096).contains(&limit) {
+        return Err("native_max_connections must be from 1 to 4096".into());
+    }
+    Ok(limit)
+}
 
 pub async fn bind_native_protocol(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
-pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, state: Arc<AppState>) {
-    info!("Native protocol => n1://{}", addr);
+pub async fn serve_native_protocol(
+    listener: TcpListener,
+    addr: SocketAddr,
+    state: Arc<AppState>,
+    max_connections: usize,
+) {
+    info!(
+        "Native protocol => n1://{} ({} connections)",
+        addr, max_connections
+    );
+    let connections = Arc::new(Semaphore::new(max_connections));
 
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 if let Err(err) = stream.set_nodelay(true) {
                     warn!(
                         "N1 native connection {} failed to set TCP_NODELAY: {}",
@@ -41,6 +70,7 @@ pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, stat
                 }
                 let state = state.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = handle_connection(stream, peer, state).await {
                         debug!("N1 native connection {} closed: {}", peer, err);
                     }
@@ -58,12 +88,34 @@ async fn handle_connection(
 ) -> Result<(), String> {
     let mut session = NativeSession::default();
     loop {
-        let Some(request) = read_request_control(&mut stream)
-            .await
-            .map_err(|err| format!("read frame failed: {err}"))?
+        let authenticated = session.claims().is_some();
+        let timeout = if authenticated { 120 } else { 15 };
+        let frame_limit = if authenticated {
+            MAX_NATIVE_FRAME_BYTES
+        } else {
+            PREAUTH_FRAME_LIMIT
+        };
+        let Some(request) = tokio::time::timeout(
+            Duration::from_secs(timeout),
+            read_request_control_with_limit(&mut stream, frame_limit),
+        )
+        .await
+        .map_err(|_| "native control frame timed out".to_string())?
+        .map_err(|err| format!("read frame failed: {err}"))?
         else {
             return Ok(());
         };
+
+        if let Err(error) = validate_request_body(&session, &request) {
+            write_response(
+                &mut stream,
+                &NativeResponse::err(request.id.clone(), "bad_request", error),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            // Unconsumed body bytes must never become another control frame.
+            return Ok(());
+        }
 
         match handle_request(&state, &mut session, peer, request, &mut stream).await {
             NativeRequestOutcome::Response(response) => {
@@ -74,6 +126,34 @@ async fn handle_connection(
             NativeRequestOutcome::Written => {}
         }
     }
+}
+
+fn validate_request_body(session: &NativeSession, request: &NativeRequest) -> Result<(), String> {
+    if request.body.is_some() && request.body_len.is_some() {
+        return Err("use an inline body or a separate raw body, not both".into());
+    }
+    let length = request
+        .body
+        .as_ref()
+        .map_or(request.body_len.unwrap_or(0), |body| body.len() as u64);
+    if length > MAX_NATIVE_BODY_BYTES as u64 {
+        return Err("native body exceeds limit".into());
+    }
+    if length > 0
+        || (native_op_accepts_streaming_body(&request.op)
+            && (request.body.is_some() || request.body_len.is_some()))
+    {
+        if !native_op_accepts_streaming_body(&request.op) {
+            return Err("this operation does not accept a raw body".into());
+        }
+        let claims = session
+            .claims()
+            .ok_or("authenticate before sending upload bytes")?;
+        if !claims.write {
+            return Err("write permission required before sending upload bytes".into());
+        }
+    }
+    Ok(())
 }
 
 enum NativeRequestOutcome {
@@ -113,6 +193,7 @@ async fn handle_request(
                         "write": claims.write,
                         "modify": claims.modify,
                         "delete": claims.delete,
+                        "operator": claims.operator,
                         "expires_at": claims.exp,
                     }),
                 ),
@@ -135,6 +216,7 @@ async fn handle_request(
                     "write": claims.write,
                     "modify": claims.modify,
                     "delete": claims.delete,
+                    "operator": claims.operator,
                     "expires_at": claims.exp,
                 }),
                 None => json!({"authenticated": false}),
@@ -164,7 +246,7 @@ async fn handle_request(
                 }
 
                 let result = if request.body.is_none()
-                    && request.body_len.unwrap_or(0) > 0
+                    && request.body_len.is_some()
                     && native_op_accepts_streaming_body(op)
                 {
                     execute_native_streaming_body(
@@ -180,17 +262,6 @@ async fn handle_request(
                 } else {
                     let body = if let Some(body) = request.body {
                         Some(body.into_vec())
-                    } else if let Some(body_len) = request.body_len.filter(|value| *value > 0) {
-                        match read_request_body(stream, body_len).await {
-                            Ok(body) => Some(body),
-                            Err(err) => {
-                                return NativeRequestOutcome::Response(NativeResponse::err(
-                                    id,
-                                    "bad_request",
-                                    format!("read native body failed: {err}"),
-                                ));
-                            }
-                        }
                     } else {
                         None
                     };
@@ -255,6 +326,7 @@ async fn execute_native_streaming_body(
             stream,
             remaining: body_len,
             progress,
+            idle: Box::pin(tokio::time::sleep(Duration::from_secs(30))),
         };
         let result = execute_native_streaming_reader(
             state,
@@ -327,6 +399,7 @@ struct NativeSocketReader<'a> {
     stream: &'a mut TcpStream,
     remaining: u64,
     progress: Option<IoProgress>,
+    idle: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl AsyncRead for NativeSocketReader<'_> {
@@ -348,7 +421,16 @@ impl AsyncRead for NativeSocketReader<'_> {
         let allowed = this.remaining.min(cap as u64) as usize;
         let mut limited = buf.take(allowed);
         match Pin::new(&mut *this.stream).poll_read(cx, &mut limited) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Pending => {
+                if this.idle.as_mut().poll(cx).is_ready() {
+                    std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "native upload body stalled",
+                    )))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
             std::task::Poll::Ready(Ok(())) => {
                 let read = limited.filled().len();
                 if read == 0 {
@@ -364,6 +446,9 @@ impl AsyncRead for NativeSocketReader<'_> {
                 }
                 buf.advance(read);
                 this.remaining = this.remaining.saturating_sub(read as u64);
+                this.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(30));
                 if let Some(progress) = &this.progress {
                     progress.record(read as u64);
                 }
@@ -378,7 +463,12 @@ async fn drain_native_remaining(stream: &mut TcpStream, mut remaining: u64) -> i
     let mut buffer = vec![0u8; NATIVE_UPLOAD_DRAIN_BUFFER_BYTES];
     while remaining > 0 {
         let wanted = (remaining as usize).min(buffer.len());
-        let read = stream.read(&mut buffer[..wanted]).await?;
+        let read =
+            tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer[..wanted]))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "native rejected body stalled")
+                })??;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -554,4 +644,94 @@ async fn auth_fragment(
         crate::protocol::ops::op_response(200),
         crate::protocol::ops::native_body_bytes(&body),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn native_admission_is_configurable_and_bounded() {
+        assert_eq!(native_connection_limit(None).unwrap(), 32);
+        assert_eq!(native_connection_limit(Some("256")).unwrap(), 256);
+        for invalid in ["0", "4097", "-1", "garbage"] {
+            assert!(native_connection_limit(Some(invalid)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn preauth_frame_limit_rejects_length_before_reading_body() {
+        let mut control = std::io::Cursor::new(((PREAUTH_FRAME_LIMIT + 1) as u32).to_be_bytes());
+        assert_eq!(
+            read_request_control_with_limit(&mut control, PREAUTH_FRAME_LIMIT)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(control.position(), 4);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_declared_gigabyte_is_rejected_without_reading_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                peer,
+                Arc::new(AppState {
+                    ws_manager: crate::websocket::manager::WsConnectionManager::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let request = NativeRequest {
+            id: "bounded".into(),
+            op: "unknown".into(),
+            payload: None,
+            body: None,
+            body_len: Some(MAX_NATIVE_BODY_BYTES as u64),
+        };
+        let control = rmp_serde::to_vec(&request).unwrap();
+        client
+            .write_all(&(control.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&control).await.unwrap();
+        // Send no raw bytes: old code would allocate 1 GiB and block here.
+        let length = tokio::time::timeout(Duration::from_secs(2), client.read_u32())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reply = vec![0; length as usize];
+        client.read_exact(&mut reply).await.unwrap();
+        assert!(!rmp_serde::from_slice::<NativeResponse>(&reply).unwrap().ok);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn zero_byte_uploads_also_require_auth_and_body_encoding_is_unambiguous() {
+        let session = NativeSession::default();
+        let mut request = NativeRequest {
+            id: "empty".into(),
+            op: "upload.one_shot".into(),
+            payload: None,
+            body: None,
+            body_len: Some(0),
+        };
+        assert!(validate_request_body(&session, &request).is_err());
+        request.op = "ping".into();
+        request.body = Some(serde_bytes::ByteBuf::from(Vec::new()));
+        assert!(validate_request_body(&session, &request).is_err());
+        request.body = None;
+        assert!(validate_request_body(&session, &request).is_ok());
+    }
 }

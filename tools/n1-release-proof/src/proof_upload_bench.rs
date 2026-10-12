@@ -357,6 +357,7 @@ impl Proof {
             multipart_bytes,
             &native_multipart_pipelined_samples,
         );
+        let batch = self.concurrent_standard_batch_upload_proof(&mut BTreeSet::new()).await?;
         self.assert_health_clean("upload_benchmark_final").await?;
         let rss = self.rss_sample("after_upload_benchmark");
         let logs = self.scan_logs()?;
@@ -364,6 +365,7 @@ impl Proof {
         self.summary = json!({
             "status": "PASS",
             "proof": "n1_upload_benchmark",
+            "batch": batch,
             "stamp": self.stamp,
             "fragment_hash": self.fragment,
             "base_url": self.base_url,

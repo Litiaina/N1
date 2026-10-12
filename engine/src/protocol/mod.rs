@@ -4,4 +4,4 @@ pub mod ops;
 pub mod server;
 pub mod types;
 
-pub use server::{bind_native_protocol, serve_native_protocol};
+pub use server::{bind_native_protocol, native_connection_limit, serve_native_protocol};

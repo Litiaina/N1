@@ -189,10 +189,84 @@ impl Repository {
             serde_json::from_slice(&self.key.open(&format!("{FORMAT}:snapshot:{id}"), raw)?)?;
         if snapshot.id != id
             || snapshot.format != FORMAT
-            || snapshot.engine_format != 3
+            || !matches!(snapshot.engine_format, 3 | super::format::ENGINE_FORMAT)
             || snapshot.roots.is_empty()
         {
             return Err(invalid("invalid or unsupported N1 snapshot"));
+        }
+        let mut snapshot = snapshot;
+        if snapshot.engine_format == 3 {
+            // Earlier v4 helpers stamped 3. Accept ONLY authenticated flat-v4
+            // pool descriptors, retaining manifest ordinals; never guess an
+            // index/blob-era layout or map legacy roots by alphabetic order.
+            let mut members = std::collections::BTreeMap::new();
+            self.records(&snapshot, |record| {
+                if record.path != ".n1-pool.json" {
+                    return Ok(());
+                }
+                if record.root >= snapshot.roots.len() {
+                    return Err(invalid("legacy snapshot root out of bounds"));
+                }
+                let super::format::Kind::File { size, blocks } = record.kind else {
+                    return Err(invalid("legacy pool descriptor is not a regular file"));
+                };
+                if size > super::format::MAX_RECORD_BYTES as u64 {
+                    return Err(invalid("oversized legacy pool descriptor"));
+                }
+                let mut bytes = Vec::new();
+                for hash in blocks {
+                    let block = self.get(&hash)?;
+                    if bytes.len().saturating_add(block.len()) > size as usize {
+                        return Err(invalid("legacy pool descriptor length mismatch"));
+                    }
+                    bytes.extend(block);
+                }
+                if bytes.len() != size as usize {
+                    return Err(invalid("truncated legacy pool descriptor"));
+                }
+                let pool: crate::core::storage_pool::StoragePool = serde_json::from_slice(&bytes)?;
+                let source = &snapshot.roots[record.root];
+                let slot = pool
+                    .roots
+                    .iter()
+                    .position(|p| p == std::path::Path::new(&source.path))
+                    .ok_or_else(|| {
+                        invalid("legacy pool descriptor does not identify this member")
+                    })?;
+                if pool.data_shards == 0
+                    || pool.width() != pool.roots.len()
+                    || !source.index
+                    || !source.blob
+                {
+                    return Err(invalid("legacy snapshot is not a unified N1 v4 pool"));
+                }
+                if members
+                    .insert(
+                        record.root,
+                        super::format::Member {
+                            pool_id: pool.id,
+                            generation: pool.generation,
+                            data_shards: pool.data_shards,
+                            parity_shards: pool.parity_shards,
+                            slot,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(invalid("duplicate legacy pool descriptor"));
+                }
+                Ok(())
+            })?;
+            if members.len() != snapshot.roots.len() {
+                return Err(invalid(
+                    "legacy snapshot lacks provable N1 v4 pool membership; no automatic format migration",
+                ));
+            }
+            for (slot, member) in members {
+                snapshot.roots[slot].member = Some(member);
+            }
+            super::capture::validate_roots(&snapshot.roots)?;
+            snapshot.engine_format = super::format::ENGINE_FORMAT;
         }
         Ok(snapshot)
     }

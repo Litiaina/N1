@@ -81,12 +81,19 @@ impl Proof {
                     if relative.components().any(|p| p.as_os_str() == ".objects")
                         && matches!(
                             path.extension().and_then(|e| e.to_str()),
-                            Some("ndx" | "shard")
+                            Some("ndx" | "shard" | "parity")
                         )
                     {
                         records.insert(
                             format!("{slot}/{}", relative.display()),
-                            sha256_bytes(&fs::read(&path)?),
+                            {
+                                use std::io::Read;
+                                let mut file = fs::File::open(&path)?;
+                                let mut hash = Sha256::new();
+                                let mut buffer = vec![0u8; 256*1024];
+                                loop { let count=file.read(&mut buffer)?; if count==0 { break; } hash.update(&buffer[..count]); }
+                                format!("{:x}",hash.finalize())
+                            },
                         );
                     }
                 }
@@ -450,6 +457,28 @@ impl Proof {
             .await?;
         self.assert_object_status_clean("new/object.bin", "new pool after expansion")
             .await?;
+        self.pool_health_expansion_checks().await?;
+        // Existing names retain their original NCX pool while new versions
+        // allocate in B. That is fragment growth, not migration of old bytes.
+        self.upload_bytes("old/object.bin", deterministic_payload(1024 * 1024, b"pool-expansion-payload"), "application/octet-stream").await?;
+        self.assert_download_sha256("old/object.bin", &checksum).await?;
+        let ncx = self.flat_ncx_paths("old/object.bin").first().ok_or("old binding lost")?.clone();
+        if fs::read(&ncx)? != old_pointer { return Err("new-pool version moved the established namespace binding".into()); }
+        if self.list_version_ids("old/object.bin").await?.len() != 2 { return Err("version history did not span the old and new pools".into()); }
+        // Hide the old object directory without editing any bytes, simulating
+        // an object whose remaining version summaries are only in the new pool.
+        let directory = collect_object_dirs(&self.blob_roots[0])?.into_iter().next().ok_or("old object directory missing")?;
+        let saved = self.blob_roots[0].join(".n1-pool-work/old-version-fixture");
+        fs::create_dir_all(saved.parent().unwrap())?;
+        fs::rename(&directory, &saved)?;
+        let scan_result = self.client.get(format!("{}/noa/v1/maintenance/pools/health", self.base_url)).bearer_auth(&self.token)
+            .query(&[("pool", "A"), ("deep_scan", "true")]).send().await;
+        fs::rename(&saved, &directory)?;
+        fs::remove_dir(saved.parent().unwrap())?;
+        let scan: Value = scan_result?.json().await?;
+        if scan["pools"][0]["integrity"]["status"] != "passed" {
+            return Err(format!("NCX reference to a newer cross-pool version was misclassified: {scan}").into());
+        }
         self.stop_server()?;
         // Generation is immutable. This remains a valid two-pool config.
         fs::write(
@@ -488,8 +517,89 @@ impl Proof {
             .await?;
         self.stop_server()?;
         self.summary = json!({"status":"PASS", "proof":"n1_v4_mixed_pool_expansion", "old_pool":"1+0", "new_pool":"2+1",
-            "old_pool_immutable":"PASS", "new_pool_placement":"PASS", "no_mandatory_rebalance":"PASS", "restart":"PASS", "geometry_edit_rejected":"PASS", "pool_removal_rejected_without_identity_writes":"PASS"});
+            "old_pool_immutable":"PASS", "new_pool_placement":"PASS", "no_mandatory_rebalance":"PASS", "restart":"PASS", "geometry_edit_rejected":"PASS", "pool_removal_rejected_without_identity_writes":"PASS",
+            "pool_health_http_native":"PASS", "pool_health_scoping":"PASS", "pool_health_failure_isolation":"PASS", "pool_health_crc_detection_without_repair":"PASS", "existing_key_version_expands_into_new_pool":"PASS", "cross_pool_version_reference_verified":"PASS"});
         self.write_summary()?;
+        Ok(())
+    }
+
+    async fn pool_health_expansion_checks(&self) -> ProofResult<()> {
+        let url = format!("{}/noa/v1/maintenance/pools/health", self.base_url);
+        if self.client.get(&url).send().await?.status() != StatusCode::UNAUTHORIZED {
+            return Err("pool diagnostics accepted an unauthenticated request".into());
+        }
+        let before = self.flat_immutable_digest(&self.blob_roots)?;
+        let response = self.client.get(&url).bearer_auth(&self.token).send().await?;
+        if !response.status().is_success() { return Err(format!("pool quick diagnostics: {}", response.text().await?).into()); }
+        let quick: Value = response.json().await?;
+        if quick["pools"].as_array().is_none_or(|p| p.len() != 2)
+            || quick["fragment"] != self.stable_fragment_id
+            || quick["pools"][0]["fragment_metadata_replicas"] != 1
+            || quick["pools"][1]["fragment_metadata_replicas"] != 3
+            || quick["pools"][0]["current_write_pool"] != false
+            || quick["pools"][1]["current_write_pool"] != true
+            || quick["pools"][0]["integrity"]["status"] != "not_scanned" {
+            return Err(format!("pool expansion diagnostic contract: {quick}").into());
+        }
+        for pool in ["A", "B"] {
+            let deep: Value = self.client.get(&url).bearer_auth(&self.token).query(&[("pool", pool), ("deep_scan", "true")]).send().await?.json().await?;
+            if deep["pools"].as_array().is_none_or(|p| p.len() != 1)
+                || deep["pools"][0]["id"] != pool || deep["pools"][0]["integrity"]["status"] != "passed"
+                || deep["pools"][0]["integrity"]["versions_checked"] != 1 {
+                return Err(format!("selected pool integrity diagnostic: {deep}").into());
+            }
+        }
+        let other = self.create_named_fragment(&format!("pool-health-other-{}", self.stamp), "isolated-other-key").await?;
+        if self.client.get(&url).bearer_auth(&self.token).query(&[("fragment", other)]).send().await?.status() != StatusCode::FORBIDDEN {
+            return Err("pool diagnostics exposed another authenticated fragment's content scope".into());
+        }
+        let auth = self.client.post(format!("{}/noa/v1/auth/fragment", self.base_url)).json(&json!({"fragment":self.fragment,"secret":self.args.fragment_key,"read":false,"write":true,"modify":false,"delete":false,"expires_in":3600})).send().await?;
+        if auth.status() != StatusCode::OK { return Err("pool proof could not obtain a write-only token".into()); }
+        let write_only = auth.json::<AuthResponse>().await?.access_token;
+        if self.client.get(&url).bearer_auth(write_only).send().await?.status() != StatusCode::FORBIDDEN {
+            return Err("pool diagnostics accepted a token without read permission".into());
+        }
+        let mut native = TcpStream::connect(("127.0.0.1", self.native_port())).await?;
+        ensure_native_ok(&native_round_trip(&mut native, "pool-auth", "auth.bearer", json!({"token": self.token}), None).await?, "pool native auth")?;
+        let result = native_round_trip(&mut native, "pool-health", "maintenance.pools.health", json!({"pool":"B"}), None).await?;
+        ensure_native_ok(&result, "pool native diagnostics")?;
+        if native_json_body(&result)?["pools"][0]["id"] != "B" { return Err("native pool selection failed".into()); }
+        // Only private proof storage is modified. A missing B member must not
+        // prevent A's diagnostic, and inspecting the fence must not clear it.
+        let fence = self.blob_roots[3].join(".n1-restore-pending");
+        fs::write(&fence, b"isolated pool health failure probe")?;
+        let isolated: Value = self.client.get(&url).bearer_auth(&self.token).query(&[("pool", "A"), ("deep_scan", "true")]).send().await?.json().await?;
+        let unavailable: Value = self.client.get(&url).bearer_auth(&self.token).query(&[("pool", "B"), ("deep_scan", "true")]).send().await?.json().await?;
+        let fence_kept = fence.exists();
+        fs::remove_file(&fence)?;
+        if isolated["pools"][0]["integrity"]["status"] != "passed" || unavailable["pools"][0]["readiness"] != "degraded"
+            || unavailable["pools"][0]["integrity"]["status"] != "unavailable" || !fence_kept {
+            return Err(format!("pool failure isolation: {isolated}, {unavailable}").into());
+        }
+        // Same-sized corruption is invisible to identity/readiness but must
+        // fail the checksum scan. Diagnostics must never heal it themselves.
+        let mut pending = vec![self.blob_roots[3].clone()];
+        let mut piece = None;
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() { pending.push(entry.path()); }
+                else if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "parity") { piece = Some(entry.path()); break; }
+            }
+            if piece.is_some() { break; }
+        }
+        let piece = piece.ok_or("pool proof parity piece missing")?;
+        let original = fs::read(&piece)?;
+        let mut corrupt = original.clone();
+        corrupt[0] ^= 0x80;
+        fs::write(&piece, &corrupt)?;
+        let damaged: Value = self.client.get(&url).bearer_auth(&self.token).query(&[("pool", "B"), ("deep_scan", "true")]).send().await?.json().await?;
+        let untouched = fs::read(&piece)? == corrupt;
+        fs::write(&piece, &original)?;
+        if damaged["pools"][0]["readiness"] != "ready" || damaged["pools"][0]["integrity"]["status"] != "failed" || !untouched {
+            return Err(format!("pool checksum diagnostic failed or repaired data: {damaged}").into());
+        }
+        if before != self.flat_immutable_digest(&self.blob_roots)? { return Err("pool diagnostics rewrote committed bytes".into()); }
         Ok(())
     }
 }

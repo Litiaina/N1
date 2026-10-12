@@ -1068,6 +1068,8 @@ async fn aliases_share_stable_placement_key_locks_and_gc_protection() {
         roots: (0..4)
             .map(|i| PathBuf::from(format!("/member/{i}")))
             .collect(),
+        members: Vec::new(),
+        legacy_roots: Vec::new(),
         sealed: false,
     };
     assert_eq!(

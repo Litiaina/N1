@@ -9,7 +9,7 @@ use std::sync::{
     mpsc,
 };
 
-use super::format::{BLOCK_BYTES, FORMAT, Kind, Record, Root, Snapshot};
+use super::format::{BLOCK_BYTES, ENGINE_FORMAT, FORMAT, Kind, Member, Record, Root, Snapshot};
 use super::repository::{ManifestWriter, Repository};
 use super::{Result, invalid};
 use crate::core::instance_lease::{InstanceLease, LEASE_FILE, RESTORE_PENDING};
@@ -18,8 +18,18 @@ pub fn roots_from_config(config: &Path) -> Result<Vec<Root>> {
     let config = fs::canonicalize(config)?;
     let ini = ini::Ini::load_from_file(&config)?;
     let mut roots = BTreeMap::<String, Root>::new();
-    for pool in crate::core::storage_pool::parse(&ini).map_err(invalid)? {
-        for path in pool.roots {
+    let control = Path::new(
+        ini.section(Some("disk_config"))
+            .and_then(|s| s.get("fs_storage_path"))
+            .unwrap_or("fs-storage-path"),
+    );
+    let pools = crate::core::storage_pool::bind_locations(
+        crate::core::storage_pool::parse(&ini).map_err(invalid)?,
+        control,
+    )
+    .map_err(invalid)?;
+    for pool in pools {
+        for (slot, path) in pool.roots.iter().enumerate() {
             let path = fs::canonicalize(path)?;
             let value = path
                 .to_str()
@@ -29,13 +39,22 @@ pub fn roots_from_config(config: &Path) -> Result<Vec<Root>> {
                 value.clone(),
                 Root {
                     path: value,
+                    legacy_path: Some(pool.address_roots()[slot].to_string_lossy().into_owned()),
                     index: true,
                     blob: true,
+                    member: Some(Member {
+                        pool_id: pool.id.clone(),
+                        generation: pool.generation,
+                        data_shards: pool.data_shards,
+                        parity_shards: pool.parity_shards,
+                        slot,
+                    }),
                 },
             );
         }
     }
-    let roots: Vec<_> = roots.into_values().collect();
+    let mut roots: Vec<_> = roots.into_values().collect();
+    roots.sort_by(|a, b| a.member.cmp(&b.member));
     validate_roots(&roots)?;
     Ok(roots)
 }
@@ -48,11 +67,49 @@ pub(crate) fn validate_roots(roots: &[Root]) -> Result<()> {
         if !Path::new(&a.path).is_absolute() || (!a.index && !a.blob) {
             return Err(invalid("invalid snapshot root descriptor"));
         }
+        if let Some(member) = &a.member {
+            if member.pool_id.is_empty()
+                || member.generation == 0
+                || member.data_shards == 0
+                || member.slot
+                    >= usize::from(member.data_shards) + usize::from(member.parity_shards)
+                || roots
+                    .iter()
+                    .skip(i + 1)
+                    .any(|b| b.member.as_ref() == Some(member))
+            {
+                return Err(invalid("invalid or duplicate logical backup member"));
+            }
+        }
         for b in roots.iter().skip(i + 1) {
             if Path::new(&a.path).starts_with(&b.path) || Path::new(&b.path).starts_with(&a.path) {
                 return Err(invalid(
                     "storage roots cannot overlap; colocated roles must share one descriptor",
                 ));
+            }
+        }
+    }
+    if roots.iter().any(|r| r.member.is_some()) {
+        for root in roots {
+            let member = root
+                .member
+                .as_ref()
+                .ok_or_else(|| invalid("mixed anonymous/enrolled snapshot membership"))?;
+            let pool: Vec<_> = roots
+                .iter()
+                .filter_map(|r| r.member.as_ref())
+                .filter(|m| m.pool_id == member.pool_id)
+                .collect();
+            let width = usize::from(member.data_shards) + usize::from(member.parity_shards);
+            if pool.len() != width
+                || pool.iter().any(|m| {
+                    m.generation != member.generation
+                        || m.data_shards != member.data_shards
+                        || m.parity_shards != member.parity_shards
+                })
+                || (0..width).any(|slot| pool.iter().filter(|m| m.slot == slot).count() != 1)
+            {
+                return Err(invalid("incomplete or conflicting logical snapshot pool"));
             }
         }
     }
@@ -79,6 +136,7 @@ pub fn create(repo: &Repository, roots: Vec<Root>, workers: usize) -> Result<Sna
     // Kept until every read and the durable snapshot publication complete.
     // A crashed capture releases this OS lease but has no committed snapshot.
     let _source = InstanceLease::acquire(&paths, true)?;
+    crate::core::storage_admin::verify_backup_roots(&roots)?;
     let id = ulid::Ulid::new().to_string();
     let pending = repo.pending(&id)?;
     let writer = Mutex::new(ManifestWriter::new(repo, pending.clone()));
@@ -184,7 +242,7 @@ pub fn create(repo: &Repository, roots: Vec<Root>, workers: usize) -> Result<Sna
     writer.finish()?;
     let snapshot = Snapshot {
         format: FORMAT.to_owned(),
-        engine_format: 3,
+        engine_format: ENGINE_FORMAT,
         id,
         created_at: chrono::Utc::now().timestamp(),
         roots,

@@ -409,6 +409,8 @@ pub struct ReservationReceipt {
 pub struct ShardInfo {
     pub shard_index: usize,
     pub file_name: String,
+    /// Historical field name: new writes store n1://pool/generation/slot/relative;
+    /// pre-portability absolute addresses are resolved without rewriting NDX.
     pub absolute_path: String,
     pub size_bytes: u64,
     pub checksum: String,

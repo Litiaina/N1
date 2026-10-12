@@ -1081,6 +1081,62 @@ fn multipart_receipts_are_zero_decode_filename_records() {
 }
 
 #[test]
+fn offline_receipts_derive_physical_pieces_without_engine_initialization() {
+    let dir = std::env::temp_dir().join(format!("n1-offline-receipts-{}", Ulid::new()));
+    fs::create_dir(&dir).unwrap();
+    let manifest = UploadSessionManifest {
+        fragment: "alias".into(),
+        object_key: Ulid::new().to_string(),
+        version_id: Ulid::new().to_string(),
+        session_id: Ulid::new().to_string(),
+        total_size_bytes: 8192,
+        expected_parts: 2,
+        part_size_bytes: 4096,
+        content_type: "application/octet-stream".into(),
+        created_at: 1,
+        stripe_size_bytes: 4096,
+        data_shards: 1,
+        parity_shards: 1,
+        placement_roots: vec!["/first".into(), "/second".into()],
+    };
+    fs::write(
+        dir.join("shard_p00000000000000000000_s0000.11111111.receipt"),
+        [],
+    )
+    .unwrap();
+    fs::write(
+        dir.join("shard_p00000000000000000000_s0001.22222222.receipt"),
+        [],
+    )
+    .unwrap();
+    // Incomplete/unacknowledged part is not promoted to complete progress.
+    fs::write(
+        dir.join("shard_p00000000000000000001_s0000.33333333.receipt"),
+        [],
+    )
+    .unwrap();
+    let parts = offline_session_parts(&dir, manifest.clone(), "stable")
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].shards.len(), 2);
+    assert_eq!(parts[0].shards[1].checksum, "22222222");
+    assert!(
+        parts[0].shards[0]
+            .absolute_path
+            .starts_with("/first/@f_stable/.objects/")
+    );
+    fs::write(
+        dir.join("shard_p00000000000000000000_s0000.44444444.receipt"),
+        [],
+    )
+    .unwrap();
+    assert!(offline_session_parts(&dir, manifest, "stable").is_err());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn multipart_manifest_and_binding_are_stable_session_truth() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
@@ -1231,6 +1287,7 @@ async fn durable_finalize_retains_resume_truth_until_namespace_commit() {
     })
     .unwrap();
     let claims = crate::structs::auth_structs::Claims {
+        operator: false,
         fragment: fragment.clone(),
         fragment_alias: None,
         read: true,

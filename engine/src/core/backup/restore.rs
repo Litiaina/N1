@@ -125,6 +125,7 @@ pub fn restore(
     resume: bool,
 ) -> Result<()> {
     super::capture::validate_roots(&target)?;
+    let target = ordered_targets(&snapshot.roots, target)?;
     if snapshot.roots.len() != target.len()
         || snapshot
             .roots
@@ -249,7 +250,66 @@ pub fn restore(
     for root in &paths {
         File::open(root)?.sync_all()?;
     }
+    crate::core::storage_admin::verify_backup_roots(&target)?;
     super::restore_guard::audit(&paths)?;
     super::restore_guard::complete(&paths, &marker)?;
     Ok(())
+}
+
+/// Bind each snapshot ordinal to its logical pool/slot, not its mount name.
+/// Legacy anonymous descriptors are only used by low-level fixtures; do not
+/// mix anonymous and enrolled descriptors or silently guess a live mapping.
+fn ordered_targets(source: &[Root], target: Vec<Root>) -> Result<Vec<Root>> {
+    if source.iter().all(|r| r.member.is_none()) && target.iter().all(|r| r.member.is_none()) {
+        return Ok(target);
+    }
+    if source.len() != target.len()
+        || source.iter().any(|r| r.member.is_none())
+        || target.iter().any(|r| r.member.is_none())
+    {
+        return Err(invalid(
+            "restore requires matching logical pool/member descriptors",
+        ));
+    }
+    source
+        .iter()
+        .map(|root| {
+            target
+                .iter()
+                .find(|candidate| candidate.member == root.member)
+                .cloned()
+                .ok_or_else(|| invalid("restore pool geometry, generation or member slot differs"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    fn root(path: &str, slot: usize) -> Root {
+        Root {
+            path: path.into(),
+            legacy_path: None,
+            index: true,
+            blob: true,
+            member: Some(super::super::format::Member {
+                pool_id: "A".into(),
+                generation: 1,
+                data_shards: 1,
+                parity_shards: 1,
+                slot,
+            }),
+        }
+    }
+    #[test]
+    fn logical_slots_override_mount_path_sort_order() {
+        let source = vec![root("/old/z", 0), root("/old/a", 1)];
+        let target = vec![root("/new/a", 1), root("/new/z", 0)];
+        let ordered = ordered_targets(&source, target).unwrap();
+        assert_eq!(ordered[0].path, "/new/z");
+        assert_eq!(ordered[1].path, "/new/a");
+        let mut wrong = vec![root("/new/a", 0), root("/new/z", 1)];
+        wrong[1].member.as_mut().unwrap().generation = 2;
+        assert!(ordered_targets(&source, wrong).is_err());
+    }
 }

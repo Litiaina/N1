@@ -268,7 +268,7 @@ pub(super) fn upload_layout(
             usize::from(pool.parity_shards),
             pool.roots
                 .iter()
-                .map(|root| root.to_string_lossy().into_owned())
+                .map(|root| crate::core::storage_pool::record_address(root))
                 .collect(),
         ));
     }
@@ -285,7 +285,7 @@ pub(super) fn upload_layout(
         parity,
         roots
             .into_iter()
-            .map(|root| root.to_string_lossy().into_owned())
+            .map(|root| crate::core::storage_pool::record_address(&root))
             .collect(),
     ))
 }
@@ -374,7 +374,7 @@ pub(super) fn ensure_registered_placement_roots(
     Ok(())
 }
 
-fn stable_shard_name(part_index: u64, shard_index: usize, data_shards: usize) -> String {
+pub(crate) fn stable_shard_name(part_index: u64, shard_index: usize, data_shards: usize) -> String {
     let ext = if shard_index >= data_shards {
         PARITY_SUFFIX
     } else {
@@ -444,7 +444,7 @@ pub(super) fn final_shard_len_for_part(
     stripe_count * block_size as u64
 }
 
-pub(super) fn shard_specs_for_part(
+pub(crate) fn shard_specs_for_part(
     path_manager: &ObjectPathManager,
     manifest: &UploadSessionManifest,
     part_index: u64,
@@ -461,7 +461,8 @@ pub(super) fn shard_specs_for_part(
     let mut out = Vec::with_capacity(total_shards);
 
     for shard_index in 0..total_shards {
-        let disk_root = PathBuf::from(&manifest.placement_roots[shard_index]);
+        let disk_root =
+            crate::core::storage_pool::resolve_address(&manifest.placement_roots[shard_index])?;
         let shard_dir = path_manager.get_shard_dir_on_disk(
             &disk_root,
             &manifest.fragment,
@@ -602,7 +603,7 @@ pub(super) async fn reconstruct_part_meta_from_disk(
         shards.push(ShardInfo {
             shard_index,
             file_name,
-            absolute_path: stable_path.to_string_lossy().to_string(),
+            absolute_path: crate::core::storage_pool::record_address(&stable_path),
             size_bytes: expected_shard_len,
             checksum,
             is_parity,
@@ -657,7 +658,7 @@ pub(super) async fn reconstruct_part_meta_from_receipt(
         shards.push(ShardInfo {
             shard_index,
             file_name,
-            absolute_path: stable_path.to_string_lossy().to_string(),
+            absolute_path: crate::core::storage_pool::record_address(&stable_path),
             size_bytes: shard_size_bytes,
             checksum: format_crc32_u32(*checksum),
             is_parity,
@@ -785,7 +786,10 @@ where
     let final_shard_len = stripe_count * block_size as u64;
 
     let blob_roots = match recorded_placement_roots {
-        Some(roots) => roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        Some(roots) => roots
+            .iter()
+            .map(|root| crate::core::storage_pool::resolve_address(root))
+            .collect::<Result<Vec<_>, _>>()?,
         None => path_manager.select_blob_roots_for_object(
             fragment,
             object_key,
@@ -1035,7 +1039,7 @@ where
         dirs_to_sync.dedup();
 
         if strict_durability {
-            let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+            sync_published_directories(&dirs_to_sync).await?;
         }
 
         let mut shards_info = Vec::with_capacity(total_shards);
@@ -1043,7 +1047,7 @@ where
             shards_info.push(ShardInfo {
                 shard_index: i,
                 file_name: stable_names[i].clone(),
-                absolute_path: stable_paths[i].to_string_lossy().to_string(),
+                absolute_path: crate::core::storage_pool::record_address(&stable_paths[i]),
                 size_bytes: final_shard_len,
                 checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
                 is_parity: i >= data_shards,
@@ -1112,7 +1116,10 @@ where
     let final_shard_len = stripe_count * block_size as u64;
 
     let blob_roots = match recorded_placement_roots {
-        Some(roots) => roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        Some(roots) => roots
+            .iter()
+            .map(|root| crate::core::storage_pool::resolve_address(root))
+            .collect::<Result<Vec<_>, _>>()?,
         None => path_manager.select_blob_roots_for_object(
             fragment,
             object_key,
@@ -1343,7 +1350,7 @@ where
         dirs_to_sync.dedup();
 
         if strict_durability {
-            let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+            sync_published_directories(&dirs_to_sync).await?;
         }
 
         let mut shards_info = Vec::with_capacity(total_shards);
@@ -1351,7 +1358,7 @@ where
             shards_info.push(ShardInfo {
                 shard_index: i,
                 file_name: stable_names[i].clone(),
-                absolute_path: stable_paths[i].to_string_lossy().to_string(),
+                absolute_path: crate::core::storage_pool::record_address(&stable_paths[i]),
                 size_bytes: final_shard_len,
                 checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
                 is_parity: i >= data_shards,
@@ -1466,6 +1473,14 @@ async fn publish_one_shard(
     let _ = linux_io::remove_file_if_exists(stable_path).await;
     linux_io::rename(tmp_path, stable_path).await?;
 
+    Ok(())
+}
+
+pub(super) async fn sync_published_directories(dirs: &[PathBuf]) -> Result<(), AppError> {
+    // Join every holder before returning an error; no durability queue.
+    for result in join_all(dirs.iter().map(|dir| sync_dir(dir))).await {
+        result?;
+    }
     Ok(())
 }
 

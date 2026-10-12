@@ -185,16 +185,17 @@ impl Proof {
 
         let base = format!("{}websocket-delta", self.args.prefix);
         let dir = format!("{base}/dir");
-        let file = format!("{base}/file.txt");
-        let renamed = format!("{base}/renamed.txt");
+        let file = format!("{dir}/file.txt");
+        let renamed = format!("{dir}/renamed.txt");
         let payload = b"n1 websocket namespace delta\n".to_vec();
         let sha = sha256_bytes(&payload);
 
-        self.posix_post("/noa/v1/posix/mkdir", json!({"path": &dir}))
-            .await?;
-        let mkdir_event = self
-            .wait_ws_namespace_event(&mut ws, "mkdir", Some(&dir), None)
-            .await?;
+        let denied = self.client.post(format!("{}/noa/v1/posix/mkdir", self.base_url))
+            .bearer_auth(&self.token).json(&json!({"path": &dir})).send().await?;
+        if denied.status() != StatusCode::BAD_REQUEST {
+            return Err("v4 accepted empty mkdir instead of an object prefix".into());
+        }
+        let mkdir_event = json!({"rejected_status":400,"prefix_created_by_upload":true});
 
         self.upload_bytes(&file, payload, "text/plain").await?;
         let upsert_event = self

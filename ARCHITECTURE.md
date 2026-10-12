@@ -18,19 +18,59 @@ stripe size and placements; expansion creates no mandatory redistribution debt.
 New allocation selects the newest complete, unsealed pool, not a free-space
 balancer. Sealing stops new allocation without retiring stored objects.
 
-Pool ID, generation, geometry and canonical member order are immutable after
-enrollment. Members must be independent mounted devices. Root identities and
-.n1-pool.json descriptors reject missing, replaced or incompatible roots.
-Removing or editing an enrolled pool is not a member-replacement procedure.
+Pool ID, generation, geometry and logical shard slots remain fixed after
+enrollment. Each .n1-pool.json identifies its member and accepted pool. Startup
+reads these small descriptors and binds configured candidate locations by slot,
+not path or discovery order. Mount paths may change; member identity does not.
+Members must remain independent mounted devices. Unknown/conflicting identities,
+duplicate slots and unfinished maintenance are rejected. Missing slots are never
+renumbered or initialized automatically.
+
+Root identity is a software enrollment guard, not a disk serial number. Offline
+cloning preserves a healthy member's bytes and logical identity for verified
+cutover at the same or a new location. Explicit replacement reconstructs only
+the missing member's pieces at its configured location;
+full inventory/CRC verification precedes identity restoration and activation.
+An interrupted operation remains fenced and requires matching explicit resume.
+These administrative fences do not add journals, tombstones or synchronization
+to ordinary NCX mutations. Without parity, a lost member requires a backup.
 
 fs_storage_path holds local topology/control state, including
-.n1/topology-roots.json. It is not a namespace database, object index or global
-object writer. NCX, NDX and payload live together on storage-pool members.
+.n1/topology-roots.json and the accepted logical pool membership. It is not a
+namespace database, object index or global object writer. NCX, NDX and payload
+live together on storage-pool members.
+
+New shard/session addresses name pool, generation, slot and a member-relative
+path. One resolver uses the startup-bound roots for reads, writes and maintenance.
+Pre-portability absolute addresses resolve through each slot's original prefix;
+relocation does not rewrite committed NDX or payload or grow an alias history.
+Locations remain fixed during a running engine; cutover is offline.
+Existing path-bound v4 members first acquire descriptors at their old locations.
+Identity/topology readiness is not a full content-integrity claim: existing
+health gates, recover-on-read and background scans remain responsible for their
+respective checks. A valid marker alone does not prove a complete or fresh copy.
 
 ## Stored representation
 
 Fragments are authentication scopes. Their public aliases may change; physical
 fragment identity and object identity remain stable.
+
+A fragment has no preallocated, pool-local size. On pool expansion, startup
+enrolls its small identity/credential record on the new members. New object
+versions use the current write pool; existing objects/versions remain in their
+original pools. Listing resolves the same fragment across all pools. Adding
+capacity therefore extends where that fragment can store new data, without
+moving old data. Allocation is not automatic free-space balancing: switch to a
+new complete pool before the selected pool fills, and retain metadata headroom
+for NCX operations in old pools.
+
+On-demand pool diagnostics are independent of the global health summary.
+Readiness checks logical member descriptors, fences, independent filesystems,
+fragment metadata replicas and current capacity. Explicit live integrity scans
+reuse the offline NCX/NDX/receipt/piece verifier, scoped to the caller's fragment.
+They do not repair or cache data and are not atomic snapshots of concurrent
+mutations. A single bounded diagnostic worker does not coordinate object writes;
+quiesced offline verification remains the complete maintenance gate.
 
 ```text
 <pool-member>/
@@ -104,6 +144,12 @@ NDX, then NCX. Standard multipart progress is process-local until finalize;
 durable multipart persists progress for restart/resume. Kernel ENOSPC/EDQUOT
 failures return 507 rather than publishing a successful partial object.
 
+Strict upload publication propagates shard-directory synchronization failures.
+Standard multipart tracks each part's acknowledged durability in its existing
+temporary session; all parts must be strict for strict NDX/NCX finalization.
+The relaxed default does not promise power-loss-durable acknowledgement.
+This changes upload error handling, not ordinary copy/delete mutation barriers.
+
 Topology/identity checks block unsafe mutations. Reads may reconstruct within
 the recorded parity tolerance, but missing members do not authorize silently
 rebinding or rewriting an enrolled pool. Repair uses the object's original
@@ -127,8 +173,31 @@ Active uploads, overlapping scans and retained exports must remain protected;
 uncertain authority causes preservation/reporting, not guessed deletion.
 
 Backup captures every pool member offline under exclusive leases. Restore
-preserves logical identities and uses startup fences until complete. Config,
+maps by pool ID/generation/geometry/member slot, never mount-path sorting;
+it preserves logical identities and uses startup fences until complete. Config,
 secrets and application databases require separate backup. Accel can be rebuilt
 from N1 and is never storage truth. See
 [backup instructions](DOCUMENTATION.md#backup-and-restore) and
 [measured validation](TESTING.md).
+
+## Operational boundaries
+
+Optional private Accel read delivery runs only after N1 authorization and
+authoritative namespace/version resolution. Byte cache keys pin immutable object
+identity/version; rename does not invalidate the underlying content. Cache-origin
+requests bypass only the proxy, never authentication. Pre-header failure returns
+to the normal N1 read path; mid-stream failure terminates that response. No cache
+entries, mutable heads or new durable coordination are added to N1. Accepted HTTP
+sockets use TCP_NODELAY, as the native transport already does.
+
+Master-key authentication grants a signed operator capability for server-wide
+maintenance. Fragment secrets cannot request another fragment or put the whole
+server into restrictive maintenance. This is API authorization, not namespace
+state, a new writer lock or distributed coordination. Key rotation invalidates
+credential-bound refresh sessions; access tokens retain their normal expiry.
+
+Native connections/control frames and multipart temporary metadata have bounded
+admission. Pool warnings reuse capacity probes and report byte/inode headroom;
+they add no upload free-space scan, placement reservation or object cache.
+Replication copies authenticated, committed offline recovery points to optional
+independent storage. It does not add a live second writer or distributed failover.

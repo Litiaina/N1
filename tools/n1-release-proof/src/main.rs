@@ -29,6 +29,8 @@ include!("proof_client.rs");
 include!("proof_native.rs");
 include!("proof_noa.rs");
 include!("proof_backup.rs");
+include!("proof_pool_maintenance.rs");
+include!("proof_pool_relocation.rs");
 include!("proof_flat_namespace.rs");
 include!("proof_batch.rs");
 include!("proof_native_bench.rs");
@@ -54,7 +56,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.flat_namespace_proof {
+    let result = if proof.args.pool_relocation_proof {
+        proof.run_pool_relocation_proof().await
+    } else if proof.args.pool_maintenance_proof {
+        proof.run_pool_maintenance_proof().await
+    } else if proof.args.flat_namespace_proof {
         proof.run_flat_namespace_proof().await
     } else if proof.args.pool_expansion_proof {
         proof.run_pool_expansion_proof().await
@@ -112,6 +118,56 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relocation_proof_accepts_logical_member_and_spare_without_mount_mode() {
+        let args = Args::try_parse_from([
+            "proof",
+            "--binary",
+            "engine",
+            "--source-file",
+            "source",
+            "--disk-roots",
+            "/a,/b,/c,/d",
+            "--out-dir",
+            "evidence",
+            "--pool-relocation-proof",
+            "--pool-member",
+            "3",
+            "--spare-root",
+            "/spare",
+        ])
+        .unwrap();
+        assert!(args.pool_relocation_proof);
+        assert!(!args.pool_maintenance_proof);
+        assert_eq!(args.pool_member, 3);
+    }
+
+    #[test]
+    fn backup_proof_accepts_an_independent_spare_without_selecting_pool_maintenance() {
+        let args = Args::try_parse_from([
+            "proof",
+            "--binary",
+            "engine",
+            "--source-file",
+            "source",
+            "--disk-roots",
+            "/pool/a",
+            "--out-dir",
+            "evidence",
+            "--data-shards",
+            "1",
+            "--parity-shards",
+            "0",
+            "--backup-proof",
+            "--spare-root",
+            "/pool/spare",
+        ])
+        .unwrap();
+        assert!(args.backup_proof);
+        assert!(!args.pool_maintenance_proof);
+        assert_eq!(args.spare_root.unwrap(), PathBuf::from("/pool/spare"));
+    }
 
     #[test]
     fn gc_workload_deadline_retains_the_default_gate_and_accepts_explicit_override() {

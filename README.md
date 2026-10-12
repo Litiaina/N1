@@ -29,6 +29,10 @@ N1 favors few moving parts and bounded-memory processing. Accel is an optional,
 disposable search/cache layer, not part of storage authority. N1 is not N2 and
 does not provide distributed failover.
 
+Optional `N1_ACCEL_READ_URL` enables private Accel caching for existing Console
+and API reads after N1 authorization/version resolution. Accel failures before
+client headers fall back to N1. See [Accel setup](DOCUMENTATION.md#accel-integration).
+
 Current version: **4.0.0 development**, storage format **4**. This is not an LTS
 release. Earlier development storage formats are not migrated automatically.
 
@@ -70,7 +74,8 @@ sealed=false
 ```
 
 Each pool needs exactly K+P members on independent mounted devices. Enrolled
-pool identity, geometry and member order cannot be edited. Expand by adding a
+pool identity, geometry and logical shard slots cannot be edited. Root paths
+are discovery locations, not member identities. Expand by adding a
 new named pool; existing objects stay in their original pool. The control path
 is not a global object index. See [Architecture](ARCHITECTURE.md).
 
@@ -112,10 +117,37 @@ the hostname and token; the upload example assumes an authenticated fragment.
 Full creation/authentication examples and API contracts are in
 [Documentation](DOCUMENTATION.md#quick-start).
 
+For acknowledged upload durability, set
+`upload_part_strict_durability_default=true` in `[upload_config]`, or request
+`durability=strict` on every part. The generated default remains relaxed;
+restart-resumable multipart and power-loss durability are different guarantees.
+Strict standard multipart carries its part durability through NDX and NCX
+publication. Hardware qualification still depends on the filesystem/controller.
+
 Keys are flat; docs/ is a virtual prefix, not a real folder. Uploads create
 versions; rename, move, trash and recovery change only NCX references. Prefix
 operations process their child keys and can report partial results. Durable
 multipart is the restart-resumable upload option.
+
+## Storage maintenance
+
+Keep the engine stopped during member cloning or replacement. A healthy member
+can be copied byte-for-byte, including a 1+0 pool, verified, and used at the
+same or a new configured root. Self-identifying descriptors preserve its logical
+slot regardless of mount path or discovery order. Upgrade older path-bound v4
+members at their original locations before relocating them. A blank replacement
+is never trusted automatically.
+Use `litiaina-n1-shell pool help` for offline verification, clone and replacement
+commands. Keep pool identity/geometry unchanged; edit only discovery locations
+after verifying a complete offline copy. Backup/restore remains available;
+do not edit enrolled geometry or delete identity markers to force startup.
+See [pool maintenance](DOCUMENTATION.md#offline-pool-maintenance).
+
+Pool health shows free bytes, available inodes and low/exhausted headroom warnings.
+These are observations, not reservations. Keep free space in old pools for NCX
+mutation even after new uploads move to an expansion pool. Server-wide GC/repair/
+redistribution, restrictive modes and global stops require master-key operator
+authentication; ordinary fragment tokens remain scoped to their fragment.
 
 ## Backups
 
@@ -123,8 +155,8 @@ Erasure coding, trash, exports and Accel are not backups. Keep recovery points
 on independent storage and keep a protected offsite copy of the encryption key.
 
 ```bash
-litiaina-n1-backup keygen --key-file /secure/n1-backup.key
-litiaina-n1-backup init \
+litiaina-n1-shell backup keygen --key-file /secure/n1-backup.key
+litiaina-n1-shell backup init \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key
 ```
 
@@ -132,17 +164,19 @@ Quiesce writers first. N1 must remain stopped throughout capture:
 
 ```bash
 sudo systemctl stop litiaina-n1.service
-litiaina-n1-backup create \
+litiaina-n1-shell backup create \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --config /opt/litiaina/n1/n1_config.ini --workers 4
 sudo systemctl start litiaina-n1.service
-litiaina-n1-backup verify \
+litiaina-n1-shell backup verify \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
   --snapshot SNAPSHOT_ID
 ```
 
 Restart the service even if capture fails; the manual create command does not
-manage it. Run the helper as an account with access to the source and repository.
+manage it. Install the matching engine beside the shell and use an account with
+access to the source and repository. The standalone helper remains compatible
+for existing backup jobs; it is not required for manual shell commands.
 Back up configuration, secrets, TLS keys and application databases separately.
 Test restoration before relying on a recovery point. Replication, portable
 restore, retention and disabled-by-default scheduled jobs are documented in

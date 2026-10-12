@@ -25,7 +25,17 @@ pub async fn read_request_control<R>(reader: &mut R) -> io::Result<Option<Native
 where
     R: AsyncRead + Unpin,
 {
-    let Some(bytes) = read_frame(reader).await? else {
+    read_request_control_with_limit(reader, MAX_NATIVE_FRAME_BYTES).await
+}
+
+pub(crate) async fn read_request_control_with_limit<R>(
+    reader: &mut R,
+    limit: usize,
+) -> io::Result<Option<NativeRequest>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(bytes) = read_frame(reader, limit.min(MAX_NATIVE_FRAME_BYTES)).await? else {
         return Ok(None);
     };
     rmp_serde::from_slice(&bytes)
@@ -83,7 +93,7 @@ where
     writer.flush().await
 }
 
-async fn read_frame<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+async fn read_frame<R>(reader: &mut R, limit: usize) -> io::Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -110,10 +120,10 @@ where
             "empty native frame",
         ));
     }
-    if len > MAX_NATIVE_FRAME_BYTES {
+    if len > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("native frame exceeds {} bytes", MAX_NATIVE_FRAME_BYTES),
+            format!("native frame exceeds {} bytes", limit),
         ));
     }
 

@@ -57,6 +57,13 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "# Admin access key")?;
     writeln!(file, "ADMIN_KEY=")?;
     writeln!(file)?;
+    writeln!(
+        file,
+        "# Optional private Accel read proxy; empty URL keeps reads direct"
+    )?;
+    writeln!(file, "N1_ACCEL_READ_URL=")?;
+    writeln!(file, "N1_ACCEL_READ_BACKEND_ID=n1-primary")?;
+    writeln!(file)?;
 
     writeln!(
         file,

@@ -478,6 +478,63 @@ async fn health_renders_disk_usage_and_health() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pools_selects_one_pool_and_distinguishes_readiness_from_integrity() {
+    async fn pool_handler(
+        headers: HeaderMap,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            format!("Bearer {TOKEN}").as_str()
+        );
+        assert_eq!(query.get("pool").map(String::as_str), Some("B"));
+        assert_eq!(query.get("deep_scan").map(String::as_str), Some("true"));
+        Json(
+            json!({"sampled_at":1,"fragment":AUTH_FRAGMENT_HASH,"allocation_policy":"newest_complete_unsealed_pool_no_free_space_balancing","pools":[{
+                "id":"B","generation":2,"data_shards":3,"parity_shards":1,"namespace_replicas":2,"sealed":false,"current_write_pool":true,"readiness":"ready",
+                "members":[{"slot":0,"member_id":"logical-member","path":"/mnt/new-ssd","status":"ready","available_bytes":100,"total_bytes":1000,"error":null}],
+                "estimated_data_available_bytes":300,"fragment_metadata_replicas":1,"fragment_state":"ready",
+                "integrity":{"status":"failed","scope":"selected_fragment_live_not_snapshot","files_scanned":4,"versions_checked":1,"ncx_replicas_checked":2,"elapsed_ms":3,"error":"recorded checksum differs"}
+            }]}),
+        )
+    }
+    let router = Router::new()
+        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
+        .route("/noa/v1/auth/fragment", post(auth_handler))
+        .route("/noa/v1/maintenance/pools/health", get(pool_handler));
+    let (base_url, handle) = spawn_server(router).await;
+    let output = Command::cargo_bin("litiaina-n1-shell")
+        .unwrap()
+        .args([
+            "--url",
+            &base_url,
+            "--secret",
+            SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
+            "pools",
+            "--pool",
+            "B",
+            "--deep-scan",
+        ])
+        .output()
+        .unwrap();
+    handle.abort();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout={stdout}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Pool B generation 2: 3+1 EC"));
+    assert!(stdout.contains("logical-member"));
+    assert!(stdout.contains("/mnt/new-ssd"));
+    assert!(stdout.contains("integrity: failed"));
+    assert!(stdout.contains("recorded checksum differs"));
+    assert!(stdout.contains("Readiness is not data integrity"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_status_can_emit_json() {
     let router = Router::new()
         .route("/noa/v1/fragments/hash", get(fragment_hash_handler))

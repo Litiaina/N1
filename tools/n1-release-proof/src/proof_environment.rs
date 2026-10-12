@@ -4,6 +4,9 @@ impl Proof {
             return Err(format!("N1 binary does not exist: {}", self.args.binary.display()).into());
         }
         self.args.binary = fs::canonicalize(&self.args.binary)?;
+        if self.args.spare_root.is_some() && !self.args.pool_maintenance_proof && !self.args.pool_relocation_proof && !self.args.backup_proof {
+            return Err("spare-root requires a pool-maintenance or backup proof".into());
+        }
         if !self.args.source_file.is_file() {
             return Err(format!(
                 "source file does not exist: {}",
@@ -17,7 +20,7 @@ impl Proof {
         }
         let roots = self.disk_roots()?;
         self.active_disk_count = roots.len();
-        let focused_single_root_functional = (self.args.noa_api_proof || self.args.export_proof)
+        let focused_single_root_functional = (self.args.noa_api_proof || self.args.export_proof || self.args.pool_maintenance_proof || self.args.pool_relocation_proof || self.args.backup_proof)
             && self.data_shards == 1
             && self.parity_shards == 0
             && roots.len() == 1;
@@ -398,6 +401,9 @@ stripe_block_size=262144
         }
         let auth: AuthResponse = response.json().await?;
         self.token = auth.access_token;
+        // Normal workloads keep fragment authority; only server-wide controls
+        // use the separately authenticated master-key operator capability.
+        self.operator_token = self.auth_fragment(&self.fragment, &self.args.master_key).await?;
         Ok(())
     }
 

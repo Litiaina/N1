@@ -9,7 +9,7 @@ use crate::core::ec::ErasureStreamWriter;
 use crate::core::fragment_identity::{
     fragment_root_on, list_fragment_aliases, stable_fragment_id_for_root,
 };
-use crate::core::fragment_metadata::{fragment_index_partition_count, resolve_stable_fragment_id};
+use crate::core::fragment_metadata::fragment_index_partition_count;
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
@@ -652,14 +652,13 @@ pub async fn trigger_redistribution_job_api(
     let (max_object_concurrency, max_status_batch) = redistribution_limits_for_ram_gib(ram_gib);
     let durability_mode = parse_durability_mode_param(&params, fast_mode);
     let scope = parse_scope_param(&params);
-    let target_fragment = match params
-        .get("fragment")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
-        Some(fragment) => Some(resolve_stable_fragment_id(&fragment).await?),
-        None => None,
-    };
+    let target_fragment = crate::middleware::maintenance_auth::target(
+        &claims,
+        &params,
+        read_only_fast
+            || parse_execution_mode_param(&params) != RedistributionExecutionMode::Availability,
+    )
+    .await?;
     let target_object = params
         .get("object_key")
         .map(|value| value.trim().to_string())
@@ -764,6 +763,7 @@ pub async fn stop_redistribution_job_api(
     claims: Claims,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
+    claims.require_operator()?;
     if !claims.write || !claims.modify || !claims.delete {
         return Err(AppError::Forbidden(
             "Write, Modify and Delete permissions required".into(),

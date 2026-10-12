@@ -544,10 +544,19 @@ impl Proof {
 
         let old_layout_before = self.object_version_dirs(&version_id)?.len();
         self.stop_server()?;
-        self.data_shards = 1;
+        // Enrolled geometry is immutable in v4. Even a valid same-width
+        // replacement geometry must be rejected, not silently recode objects.
+        self.data_shards = original_width as u16;
         self.parity_shards = 0;
         self.write_config()?;
-        self.start_server("auto-healing-ec-change").await?;
+        if self.start_server("auto-healing-ec-change").await.is_ok() {
+            return Err("engine admitted an edited enrolled pool geometry".into());
+        }
+        self.stop_server()?;
+        self.data_shards = original_data_shards;
+        self.parity_shards = original_parity_shards;
+        self.write_config()?;
+        self.start_server("auto-healing-original-geometry-restored").await?;
         self.auth().await?;
         let ec_change_startup = self.wait_for_write_safe("EC change startup").await?;
         self.assert_download_sha256(&object_key, &payload_sha).await?;
@@ -572,7 +581,7 @@ impl Proof {
         let new_layout = self.object_version_dirs(&new_version)?.len();
         if old_layout_before != original_width
             || old_layout_after != original_width
-            || new_layout != 1
+            || new_layout != original_width
         {
             return Err(format!(
                 "per-object EC topology changed unexpectedly: old_before={old_layout_before} old_after={old_layout_after} new={new_layout}"
@@ -595,6 +604,7 @@ impl Proof {
             "identity_mismatch": {"health": replacement_health, "restored": identity_restored_health},
             "unrecoverable_fail_safe": {"health": scan_failure, "recovered": recovered_from_fault},
             "ec_change": {
+                "enrolled_geometry_edit_rejected": true,
                 "startup": ec_change_startup,
                 "old_object_recorded_roots_before": old_layout_before,
                 "old_object_recorded_roots_after": old_layout_after,

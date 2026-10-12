@@ -15,6 +15,7 @@ const CLI_AFTER_HELP: &str = "\
 Examples:
   litiaina-n1-shell --secret <secret> --fragment mainframe shell
   litiaina-n1-shell --secret <secret> --fragment mainframe health
+  litiaina-n1-shell --secret <secret> --fragment mainframe pools --pool A
   litiaina-n1-shell --secret <secret> --fragment mainframe namespace list --path docs
   litiaina-n1-shell --secret <secret> --fragment mainframe uploads list
   litiaina-n1-shell --secret <secret> --fragment mainframe repair --none --strict --fast-mode
@@ -83,9 +84,9 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        default_value_t = true,
+        default_value_t = false,
         help_heading = "Connection",
-        help = "Allow invalid TLS certificates. Keep this on only for trusted lab or LAN deployments."
+        help = "Explicitly allow invalid TLS certificates for disposable lab testing only."
     )]
     pub insecure: bool,
 
@@ -110,6 +111,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
+    /// Offline pool verification, manual-copy validation, cloning and replacement.
+    /// Pass `pool help` for engine-side operation details. No fragment token is used.
+    Pool(OfflineArgs),
+    /// Encrypted offline backups, restores and retained snapshot replication.
+    /// Pass `backup help` for engine-side operation details. No separate backup binary is required.
+    Backup(OfflineArgs),
     #[command(
         about = "Serve the embedded N1 installation terminal.",
         long_about = "Serve the self-contained browser terminal used to discover, format, assign, configure, validate, and start a fresh N1 installation. The setup token is required for every terminal session."
@@ -147,6 +154,15 @@ pub enum Commands {
             default_value_t = false,
             help = "Ask the engine to perform a deeper partition scan instead of using the lighter cached view."
         )]
+        deep_scan: bool,
+    },
+
+    /// Inspect storage pools independently, scoped to the authenticated fragment.
+    Pools {
+        #[arg(long)]
+        pool: Option<String>,
+        /// Read-only NCX/NDX/piece verification. Live scan, not an offline snapshot.
+        #[arg(long)]
         deep_scan: bool,
     },
 
@@ -194,6 +210,16 @@ pub enum Commands {
         long_about = "Direct redistribution control. Use --none for whole-N1 redistribution or --fragment <name-or-hash> for one fragment. Redistribution is for placement realignment after disk or policy changes."
     )]
     Redistribute(RedistributeArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct OfflineArgs {
+    /// Matching N1 engine. Defaults to the engine beside this shell binary.
+    #[arg(long)]
+    pub engine_binary: Option<std::path::PathBuf>,
+    /// Engine-side operation and flags, for example: verify --config /etc/n1.ini.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    pub arguments: Vec<std::ffi::OsString>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -648,5 +674,18 @@ impl RedistributeScopeArg {
             Self::Blob => "blob",
             Self::Index => "index",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_verification_is_default_and_bypass_requires_explicit_flag() {
+        let default = Cli::try_parse_from(["shell", "health"]).unwrap();
+        assert!(!default.insecure);
+        let lab = Cli::try_parse_from(["shell", "--insecure", "health"]).unwrap();
+        assert!(lab.insecure);
     }
 }

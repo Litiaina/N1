@@ -2,6 +2,54 @@
 
 use super::*;
 
+const MAX_UPLOAD_PARTS: u64 = 131_072;
+const STANDARD_METADATA_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STANDARD_SESSIONS: usize = 1024;
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn excessive_part_counts_are_rejected_before_placement_or_allocation() {
+        let params = InitiateUploadParams {
+            content_type: None,
+            total_size_bytes: u64::MAX,
+            expected_parts: u64::MAX,
+            part_size_bytes: Some(1),
+        };
+        assert!(matches!(
+            prepare_upload_manifest("unused", "unused", &params).await,
+            Err(AppError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn standard_metadata_budget_enforces_slots_sessions_and_overflow() {
+        let max_slots = STANDARD_METADATA_BUDGET_BYTES / std::mem::size_of::<StandardPartSlot>();
+        assert!(check_standard_metadata_budget(0, 0, max_slots).is_ok());
+        assert!(check_standard_metadata_budget(0, max_slots, 1).is_err());
+        assert!(check_standard_metadata_budget(MAX_STANDARD_SESSIONS, 0, 1).is_err());
+        assert!(check_standard_metadata_budget(0, usize::MAX, 1).is_err());
+    }
+}
+
+fn check_standard_metadata_budget(
+    session_count: usize,
+    slots: usize,
+    expected_parts: usize,
+) -> Result<(), AppError> {
+    if session_count >= MAX_STANDARD_SESSIONS
+        || slots
+            .saturating_add(expected_parts)
+            .saturating_mul(std::mem::size_of::<StandardPartSlot>())
+            > STANDARD_METADATA_BUDGET_BYTES
+    {
+        return Err(AppError::ServiceUnavailable("standard multipart metadata budget is full; complete/cancel pending sessions and retry".into()));
+    }
+    Ok(())
+}
+
 pub async fn initiate_object_upload(
     claims: Claims,
     AxumPath((fragment, object_key)): AxumPath<(String, String)>,
@@ -18,6 +66,11 @@ async fn prepare_upload_manifest(
 ) -> Result<UploadSessionManifest, AppError> {
     if params.expected_parts == 0 {
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
+    }
+    if params.expected_parts > MAX_UPLOAD_PARTS {
+        return Err(AppError::PayloadTooLarge(
+            "multipart upload exceeds 131072 parts".into(),
+        ));
     }
 
     let part_size_bytes = if params.expected_parts <= 1 {
@@ -79,8 +132,8 @@ async fn prepare_upload_manifest(
         &manifest
             .placement_roots
             .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>(),
+            .map(|root| crate::core::storage_pool::resolve_address(root))
+            .collect::<Result<Vec<_>, _>>()?,
     )?;
     Ok(manifest)
 }
@@ -189,6 +242,21 @@ pub async fn initiate_standard_upload_direct(
     let _upload_activity = UploadActivityGuard::begin(&fragment, &physical_object_key)?;
     let expected_parts = usize::try_from(manifest.expected_parts)
         .map_err(|_| AppError::BadRequest("expected_parts is too large".into()))?;
+    // The existing registry admits bounded temporary metadata before allocation.
+    // No disk I/O or upload body is processed while this lock is held.
+    let mut registry = standard_registry_write()?;
+    if let Some(existing) = registry
+        .values()
+        .filter(|existing| existing.manifest.fragment == fragment)
+        .find(|existing| standard_request_matches(existing, &logical_path, &params))
+    {
+        return Ok(InitiateUploadResponse {
+            session_id: existing.manifest.session_id.clone(),
+            version_id: existing.manifest.version_id.clone(),
+        });
+    }
+    let slots: usize = registry.values().map(|session| session.parts.len()).sum();
+    check_standard_metadata_budget(registry.len(), slots, expected_parts)?;
     let mut parts = Vec::new();
     parts
         .try_reserve_exact(expected_parts)
@@ -210,17 +278,6 @@ pub async fn initiate_standard_upload_direct(
         parts: parts.into_boxed_slice(),
     });
 
-    let mut registry = standard_registry_write()?;
-    if let Some(existing) = registry
-        .values()
-        .filter(|existing| existing.manifest.fragment == fragment)
-        .find(|existing| standard_request_matches(existing, &logical_path, &params))
-    {
-        return Ok(InitiateUploadResponse {
-            session_id: existing.manifest.session_id.clone(),
-            version_id: existing.manifest.version_id.clone(),
-        });
-    }
     registry.insert(
         standard_session_key(&fragment, &response.version_id),
         session,
@@ -228,7 +285,10 @@ pub async fn initiate_standard_upload_direct(
     Ok(response)
 }
 
-fn standard_part_record(metadata: &PartMetadata) -> Result<StandardPartRecord, AppError> {
+fn standard_part_record(
+    metadata: &PartMetadata,
+    strict_durability: bool,
+) -> Result<StandardPartRecord, AppError> {
     let checksum = metadata
         .checksum
         .as_deref()
@@ -243,6 +303,7 @@ fn standard_part_record(metadata: &PartMetadata) -> Result<StandardPartRecord, A
         .map_err(|_| AppError::InternalServerError("invalid shard CRC32".to_string()))?
         .into_boxed_slice();
     Ok(StandardPartRecord {
+        strict_durability,
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,
         checksum,
@@ -281,7 +342,7 @@ fn standard_part_metadata(
             |((shard_index, is_parity, absolute_path, file_name), checksum)| ShardInfo {
                 shard_index,
                 file_name,
-                absolute_path: absolute_path.to_string_lossy().to_string(),
+                absolute_path: crate::core::storage_pool::record_address(&absolute_path),
                 size_bytes: expected_shard_len,
                 checksum: format_crc32_u32(*checksum),
                 is_parity,
@@ -295,6 +356,31 @@ fn standard_part_metadata(
         shards,
         checksum: record.checksum.map(format_crc32_u32),
     })
+}
+
+pub(super) fn check_standard_retry_durability(
+    session: &StandardUploadSession,
+    part_index: u64,
+    strict: bool,
+) -> Result<(), AppError> {
+    if strict
+        && !session.parts[part_index as usize]
+            .record
+            .get()
+            .is_some_and(|record| record.strict_durability)
+    {
+        return Err(AppError::Conflict("This part was acknowledged with relaxed durability; retry cannot upgrade that acknowledgment. Start a new strict upload.".into()));
+    }
+    Ok(())
+}
+
+pub(super) fn standard_session_uses_strict_durability(session: &StandardUploadSession) -> bool {
+    !session.parts.is_empty()
+        && session.parts.iter().all(|slot| {
+            slot.record
+                .get()
+                .is_some_and(|record| record.strict_durability)
+        })
 }
 
 pub(super) enum StandardPartClaimResult<'a> {
@@ -398,9 +484,12 @@ pub async fn object_upload_part_standard_body_direct(
     let session = standard_session(&fragment, &version_id)?
         .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
     validate_standard_part_request(&session, part_index, content_length)?;
+    let strict = upload_uses_strict_durability(&query);
     let _upload_activity = UploadActivityGuard::begin(&fragment, &session.manifest.object_key)?;
     let claim = match claim_standard_part(&session, part_index)? {
-        StandardPartClaimResult::AlreadyComplete => return Ok(()),
+        StandardPartClaimResult::AlreadyComplete => {
+            return check_standard_retry_durability(&session, part_index, strict);
+        }
         StandardPartClaimResult::Claimed(claim) => claim,
     };
 
@@ -436,7 +525,7 @@ pub async fn object_upload_part_standard_body_direct(
         Some(&session.manifest.placement_roots),
         body,
         expected_checksum,
-        false,
+        strict,
         io_progress.as_ref(),
     )
     .await?;
@@ -446,13 +535,13 @@ pub async fn object_upload_part_standard_body_direct(
             &metadata
                 .shards
                 .iter()
-                .map(|shard| PathBuf::from(&shard.absolute_path))
-                .collect::<Vec<_>>(),
+                .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
+                .collect::<Result<Vec<_>, _>>()?,
         )
         .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
-    claim.complete(standard_part_record(&metadata)?)?;
+    claim.complete(standard_part_record(&metadata, strict)?)?;
     if let Some(guard) = io_guard {
         guard.complete();
     }
@@ -481,9 +570,12 @@ where
     let session = standard_session(&fragment, &version_id)?
         .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
     validate_standard_part_request(&session, part_index, content_length)?;
+    let strict = upload_uses_strict_durability(&query);
     let _upload_activity = UploadActivityGuard::begin(&fragment, &session.manifest.object_key)?;
     let claim = match claim_standard_part(&session, part_index)? {
-        StandardPartClaimResult::AlreadyComplete => return Ok(()),
+        StandardPartClaimResult::AlreadyComplete => {
+            return check_standard_retry_durability(&session, part_index, strict);
+        }
         StandardPartClaimResult::Claimed(claim) => claim,
     };
     prepare_standard_part(&session).await?;
@@ -517,7 +609,7 @@ where
         Some(&session.manifest.placement_roots),
         reader,
         expected_checksum,
-        false,
+        strict,
         io_progress.as_ref(),
     )
     .await?;
@@ -526,13 +618,13 @@ where
             &metadata
                 .shards
                 .iter()
-                .map(|shard| PathBuf::from(&shard.absolute_path))
-                .collect::<Vec<_>>(),
+                .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
+                .collect::<Result<Vec<_>, _>>()?,
         )
         .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
-    claim.complete(standard_part_record(&metadata)?)?;
+    claim.complete(standard_part_record(&metadata, strict)?)?;
     if let Some(guard) = io_guard {
         guard.complete();
     }
@@ -655,7 +747,7 @@ pub async fn finalize_standard_upload_direct(
     fragment: String,
     version_id: String,
     session_id: String,
-) -> Result<FinalizeUploadResult, AppError> {
+) -> Result<(FinalizeUploadResult, bool), AppError> {
     let finalize_started = Instant::now();
     ensure_user_mutations_allowed()?;
     if !claims.write {
@@ -672,8 +764,11 @@ pub async fn finalize_standard_upload_direct(
     let physical_object_key = session.manifest.object_key.clone();
     let _upload_activity = UploadActivityGuard::begin(&fragment, &physical_object_key)?;
     if session.lifecycle.load(Ordering::Acquire) == STANDARD_SESSION_FINALIZED {
-        return Ok(FinalizeUploadResult::Complete(
-            index::read_object_version(&fragment, &physical_object_key, &version_id).await?,
+        return Ok((
+            FinalizeUploadResult::Complete(
+                index::read_object_version(&fragment, &physical_object_key, &version_id).await?,
+            ),
+            standard_session_uses_strict_durability(&session),
         ));
     }
     session
@@ -699,15 +794,17 @@ pub async fn finalize_standard_upload_direct(
         .filter(|index| !present.contains(index))
         .collect::<Vec<_>>();
     if !missing.is_empty() || session.in_flight_parts.load(Ordering::Acquire) != 0 {
-        return Ok(FinalizeUploadResult::Incomplete(
-            FinalizeIncompleteResponse {
+        return Ok((
+            FinalizeUploadResult::Incomplete(FinalizeIncompleteResponse {
                 uploaded_parts: present.into_iter().collect(),
                 missing_parts: missing,
                 expected_parts: session.manifest.expected_parts,
-            },
+            }),
+            false,
         ));
     }
 
+    let strict_durability = standard_session_uses_strict_durability(&session);
     let path_manager = ObjectPathManager::new();
     let finalize_result = async {
         let mut parts = (0..session.manifest.expected_parts)
@@ -734,9 +831,12 @@ pub async fn finalize_standard_upload_direct(
         let _object_lock =
             index::acquire_object_operation_lock(&fragment, &physical_object_key).await?;
         let publish_started = Instant::now();
-        let publish_result =
-            index::publish_object_with_durability(&metadata, index::IndexWriteDurability::Relaxed)
-                .await;
+        let durability = if strict_durability {
+            index::IndexWriteDurability::Strict
+        } else {
+            index::IndexWriteDurability::Relaxed
+        };
+        let publish_result = index::publish_object_with_durability(&metadata, durability).await;
         record_io_latency(
             "upload.standard.finalize.publish",
             publish_started.elapsed(),
@@ -762,7 +862,7 @@ pub async fn finalize_standard_upload_direct(
             session
                 .lifecycle
                 .store(STANDARD_SESSION_FINALIZED, Ordering::Release);
-            Ok(FinalizeUploadResult::Complete(metadata))
+            Ok((FinalizeUploadResult::Complete(metadata), strict_durability))
         }
         Err(err) => {
             record_io_latency(

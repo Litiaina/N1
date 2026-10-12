@@ -368,6 +368,7 @@ async fn get_fragment_usage_scoped(claims: Claims) -> Result<impl IntoResponse, 
 }
 
 async fn run_fragment_gc(
+    claims: Claims,
     State(state): State<Arc<AppState>>,
     Path(fragment): Path<String>,
     Query(mut params): Query<HashMap<String, String>>,
@@ -377,7 +378,7 @@ async fn run_fragment_gc(
         Err(err) => return err.into_response(),
     };
     params.insert("fragment".to_string(), fragment);
-    run_garbage_collector(State(state), Query(params))
+    run_garbage_collector(claims, State(state), Query(params))
         .await
         .into_response()
 }
@@ -640,6 +641,9 @@ async fn delete_object_scoped(
     claims: Claims,
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
     let fragment = claims.fragment.clone();
     let summary = global_namespace_runtime()
         .trash(&fragment, &object_key)
@@ -670,6 +674,11 @@ async fn recover_object_scoped(
     claims: Claims,
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden(
+            "Modify permission required to recover".into(),
+        ));
+    }
     let fragment = claims.fragment.clone();
     let summary = global_namespace_runtime()
         .recover(&fragment, &object_key)
@@ -732,8 +741,8 @@ async fn bulk_delete_objects_scoped(
     claims: Claims,
     AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !claims.write {
-        return Err(AppError::Forbidden("Write permission required".into()));
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
     }
     let fragment = claims.fragment.clone();
     let requested = payload.object_keys.len();
@@ -791,9 +800,9 @@ async fn bulk_recover_objects_scoped(
     claims: Claims,
     AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !claims.write {
+    if !claims.modify {
         return Err(AppError::Forbidden(
-            "Write permission required to recover".into(),
+            "Modify permission required to recover".into(),
         ));
     }
     let fragment = claims.fragment.clone();
@@ -852,9 +861,9 @@ async fn recover_all_trash_scoped(
     claims: Claims,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    if !claims.write {
+    if !claims.modify {
         return Err(AppError::Forbidden(
-            "Write permission required to recover all".into(),
+            "Modify permission required to recover all".into(),
         ));
     }
     let summary = global_namespace_runtime().recover_all(&fragment).await?;
@@ -996,14 +1005,10 @@ async fn finalize_object_upload_scoped(
         acquire_upload_io_guard_for_query(Some(true), &fragment, &gate_context).await?;
     let _upload_activity =
         crate::core::upload::standard_namespace_activity(&fragment, &version_id)?;
-    let response = match finalize_standard_upload_direct(
-        claims,
-        fragment.clone(),
-        version_id.clone(),
-        session_id,
-    )
-    .await?
-    {
+    let (finalized, strict_durability) =
+        finalize_standard_upload_direct(claims, fragment.clone(), version_id.clone(), session_id)
+            .await?;
+    let response = match finalized {
         crate::core::upload::FinalizeUploadResult::Incomplete(incomplete) => {
             (StatusCode::CONFLICT, AxumJson(incomplete)).into_response()
         }
@@ -1016,7 +1021,7 @@ async fn finalize_object_upload_scoped(
                 &logical_path,
                 &physical,
                 &metadata,
-                false,
+                strict_durability,
             )
             .await;
             record_io_latency(
@@ -1772,6 +1777,7 @@ pub fn build_storage_routes_unbound_with_options(
 
         let read_ops = layers
             .layer_view(read_ops)
+            .layer(DefaultBodyLimit::max(MAX_EXPORT_REQUEST_BODY_SIZE))
             .layer(from_fn(enforce_quiesced_mode_on_reads));
 
         let write_ops = Router::new()
@@ -1825,9 +1831,13 @@ pub fn build_storage_routes_unbound_with_options(
             )
             .route(
                 "/noa/v1/upload/one-shot/{*object_key}",
-                post(upload_object_one_shot_scoped),
+                post(upload_object_one_shot_scoped)
+                    .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE)),
             )
-            .route("/noa/v1/upload/batch", post(upload_standard_batch_scoped))
+            .route(
+                "/noa/v1/upload/batch",
+                post(upload_standard_batch_scoped).layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE)),
+            )
             .route(
                 "/noa/v1/upload/multipart/{:version_id}",
                 get(get_upload_status_scoped),
@@ -1835,7 +1845,7 @@ pub fn build_storage_routes_unbound_with_options(
             .route("/noa/v1/upload/multipart", get(list_active_uploads_scoped))
             .route(
                 "/noa/v1/upload/multipart/{:version_id}/{:part_index}",
-                put(object_upload_part_scoped),
+                put(object_upload_part_scoped).layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE)),
             )
             .route(
                 "/noa/v1/upload/multipart/{:version_id}/{:session_id}/finalize",
@@ -1859,7 +1869,8 @@ pub fn build_storage_routes_unbound_with_options(
             )
             .route(
                 "/noa/v1/upload/multipart/durable/{:version_id}/{:part_index}",
-                put(object_upload_part_durable_scoped),
+                put(object_upload_part_durable_scoped)
+                    .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE)),
             )
             .route(
                 "/noa/v1/upload/multipart/durable/{:version_id}/{:session_id}/finalize",
@@ -1869,7 +1880,8 @@ pub fn build_storage_routes_unbound_with_options(
                 "/noa/v1/upload/multipart/durable/{:version_id}",
                 delete(cancel_upload_session_durable_scoped),
             )
-            .merge(build_posix_write_routes());
+            .merge(build_posix_write_routes())
+            .layer(DefaultBodyLimit::max(MAX_EXPORT_REQUEST_BODY_SIZE));
 
         let maintenance_ops = Router::new()
             .route(
@@ -1924,9 +1936,15 @@ pub fn build_storage_routes_unbound_with_options(
                 "/noa/v1/maintenance/fragments/{:fragment}/health",
                 get(get_fragment_health),
             )
+            .route(
+                "/noa/v1/maintenance/pools/health",
+                get(crate::core::storage_health::get_pool_health),
+            )
             .route("/noa/v1/maintenance/health", get(get_system_health));
 
-        let maintenance_ops = layers.layer_global(maintenance_ops);
+        let maintenance_ops = layers
+            .layer_global(maintenance_ops)
+            .layer(DefaultBodyLimit::max(MAX_EXPORT_REQUEST_BODY_SIZE));
 
         let write_ops = layers
             .layer_upload(write_ops)
@@ -1955,23 +1973,32 @@ pub fn build_storage_routes_unbound_with_options(
             "/noa/v1/objects/signed-read",
             get(read_object_via_signed_url),
         );
-    let global_routes = layers.layer_global(global_routes);
+    let global_routes = layers
+        .layer_global(global_routes)
+        .layer(DefaultBodyLimit::max(64 * 1024));
 
     let create_fragment_route = Router::new().route("/noa/v1/fragments", post(create_fragment));
     let create_fragment_route = layers
         .layer_auth(create_fragment_route)
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
     let fragment_auth_route =
         Router::new().route("/noa/v1/auth/fragment", post(authorize_fragment));
-    let fragment_auth_route = layers.layer_auth(fragment_auth_route);
+    let fragment_auth_route = layers
+        .layer_auth(fragment_auth_route)
+        .layer(DefaultBodyLimit::max(64 * 1024));
 
     let refresh_auth_route =
         Router::new().route("/noa/v1/auth/refresh", post(refresh_access_token));
-    let refresh_auth_route = layers.layer_auth(refresh_auth_route);
+    let refresh_auth_route = layers
+        .layer_auth(refresh_auth_route)
+        .layer(DefaultBodyLimit::max(64 * 1024));
 
     let logout_auth_route = Router::new().route("/noa/v1/auth/logout", post(logout_refresh_token));
-    let logout_auth_route = layers.layer_auth(logout_auth_route);
+    let logout_auth_route = layers
+        .layer_auth(logout_auth_route)
+        .layer(DefaultBodyLimit::max(64 * 1024));
 
     let ping_route = Router::new().route("/noa/v1/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
@@ -2017,6 +2044,155 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn restricted_http_tokens_cannot_mutate_objects_or_start_global_jobs() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        crate::middleware::auth_middleware::tests::ensure_test_env();
+        let claims = Claims {
+            operator: false,
+            fragment: "permission-regression".into(),
+            fragment_alias: None,
+            read: true,
+            write: false,
+            modify: false,
+            delete: false,
+            exp: (chrono::Utc::now().timestamp() + 120) as usize,
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &crate::middleware::auth_middleware::JWT_KEYS.encoding,
+        )
+        .unwrap();
+        let (router, state) = build_storage_routes_unbound();
+        let router = router.with_state(state);
+        for (method, uri, json) in [
+            (Method::DELETE, "/noa/v1/objects/no-write", "{}"),
+            (Method::POST, "/noa/v1/objects/recover/no-write", "{}"),
+            (
+                Method::POST,
+                "/noa/v1/objects/bulk-delete",
+                "{\"object_keys\":[\"no-write\"]}",
+            ),
+            (
+                Method::POST,
+                "/noa/v1/objects/bulk-recover",
+                "{\"object_keys\":[\"no-write\"]}",
+            ),
+            (Method::POST, "/noa/v1/trash/recover-all", "{}"),
+            (
+                Method::POST,
+                "/noa/v1/posix/trash",
+                "{\"path\":\"no-write\"}",
+            ),
+            (
+                Method::POST,
+                "/noa/v1/posix/recover",
+                "{\"path\":\"no-write\"}",
+            ),
+            (Method::POST, "/noa/v1/maintenance/gc/start", "{}"),
+            (Method::POST, "/noa/v1/maintenance/repair/start", "{}"),
+            (
+                Method::POST,
+                "/noa/v1/maintenance/redistribution/start",
+                "{}",
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 9],
+                            32001,
+                        ))))
+                        .body(Body::from(json))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_auth_body_is_bounded_independently_of_streaming_upload_limit() {
+        let (router, state) = build_storage_routes_unbound_with_options(StorageRouteOptions {
+            include_object_storage: false,
+        });
+        let router = apply_runtime_http_layers(router).with_state(state);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/noa/v1/auth/fragment")
+                    .header("content-type", "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 10],
+                        32001,
+                    ))))
+                    .body(Body::from(vec![b'x'; 65 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn protected_json_control_is_bounded_before_deserialization() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        crate::middleware::auth_middleware::tests::ensure_test_env();
+        let fragment = format!("body-limit-test-{}", ulid::Ulid::new());
+        crate::middleware::auth_middleware::tests::ensure_auth_test_fragment(&fragment).await;
+        let claims = Claims {
+            operator: false,
+            fragment,
+            fragment_alias: None,
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            exp: (chrono::Utc::now().timestamp() + 120) as usize,
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &crate::middleware::auth_middleware::JWT_KEYS.encoding,
+        )
+        .unwrap();
+        let (router, state) = build_storage_routes_unbound();
+        let router = apply_runtime_http_layers(router).with_state(state);
+        for uri in [
+            "/noa/v1/posix/rename",
+            "/noa/v1/objects/bulk-delete",
+            "/noa/v1/upload/multipart/init/key",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 11],
+                            32001,
+                        ))))
+                        .body(Body::from(vec![b'x'; MAX_EXPORT_REQUEST_BODY_SIZE + 1]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        }
+    }
+
     #[test]
     fn namespace_snapshot_completion_frame_is_explicit_ndjson() {
         let encoded = serde_json::to_string(&NamespaceSnapshotFrame::Complete { entry_count: 7 })
@@ -2029,6 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_snapshot_requires_read_authority() {
         let result = stream_namespace_snapshot_scoped(Claims {
+            operator: false,
             fragment: "@f_snapshot-test-forbidden".into(),
             fragment_alias: None,
             read: false,

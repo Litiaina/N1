@@ -8,13 +8,76 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 
 #[test]
+fn mislabeled_v4_snapshot_recovers_authenticated_logical_membership_only() {
+    let f = Fixture::new();
+    let repo = f.repo("legacy-v4");
+    let pool = crate::core::storage_pool::StoragePool {
+        id: "A".into(),
+        generation: 1,
+        data_shards: 1,
+        parity_shards: 0,
+        roots: vec![f.root()],
+        members: Vec::new(),
+        legacy_roots: Vec::new(),
+        sealed: false,
+    };
+    fs::write(
+        f.root().join(".n1-pool.json"),
+        serde_json::to_vec(&pool).unwrap(),
+    )
+    .unwrap();
+    let mut snapshot = f.capture(&repo);
+    snapshot.engine_format = 3;
+    let encrypted = repo
+        .key
+        .seal(
+            &format!("{}:snapshot:{}", format::FORMAT, snapshot.id),
+            &serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+    fs::write(
+        repo.path
+            .join("snapshots")
+            .join(&snapshot.id)
+            .join("manifest"),
+        encrypted,
+    )
+    .unwrap();
+    let normalized = repo.snapshot(&snapshot.id).unwrap();
+    assert_eq!(normalized.engine_format, 4);
+    assert_eq!(normalized.roots[0].member.as_ref().unwrap().slot, 0);
+    assert_eq!(normalized.roots[0].member.as_ref().unwrap().pool_id, "A");
+    // No authenticated flat-pool evidence means no guessed legacy migration.
+    let old = f.repo("legacy-unsupported");
+    fs::remove_file(f.root().join(".n1-pool.json")).unwrap();
+    let mut snapshot = f.capture(&old);
+    snapshot.engine_format = 3;
+    let encrypted = old
+        .key
+        .seal(
+            &format!("{}:snapshot:{}", format::FORMAT, snapshot.id),
+            &serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+    fs::write(
+        old.path
+            .join("snapshots")
+            .join(&snapshot.id)
+            .join("manifest"),
+        encrypted,
+    )
+    .unwrap();
+    assert!(old.snapshot(&snapshot.id).is_err());
+}
+
+#[test]
 fn automatic_retention_authenticates_before_deleting_and_preserves_protected_point() {
     let f = Fixture::new();
     let repo = f.repo("retention");
     fs::write(f.root().join("data"), b"first").unwrap();
-    let first = capture::create(&repo, f.roots.clone(), 1).unwrap();
+    let first = f.capture(&repo);
     fs::write(f.root().join("data"), b"second").unwrap();
-    let second = capture::create(&repo, f.roots.clone(), 1).unwrap();
+    let second = f.capture(&repo);
     let block = repo.block_path(&crypto::digest(b"second")).unwrap();
     let original = fs::read(&block).unwrap();
     fs::write(&block, b"corrupted").unwrap();
@@ -33,7 +96,79 @@ struct Fixture {
     key: PathBuf,
     roots: Vec<Root>,
 }
+
+#[test]
+fn corrupt_source_replication_does_not_replace_last_verified_recovery_point() {
+    let f = Fixture::new();
+    let source = f.repo("source-repository");
+    let target = f.repo("target-repository");
+    fs::write(f.root().join("data"), b"first-good").unwrap();
+    let first = f.capture(&source);
+    transfer::local(&source, &first, &target).unwrap();
+    fs::write(f.root().join("data"), b"new-data").unwrap();
+    let second = f.capture(&source);
+    let block = source.block_path(&crypto::digest(b"new-data")).unwrap();
+    let healthy = fs::read(&block).unwrap();
+    fs::write(&block, &healthy[..healthy.len() / 2]).unwrap();
+    assert!(transfer::local(&source, &second, &target).is_err());
+    assert!(target.snapshot(&second.id).is_err());
+    assert_eq!(target.list().unwrap().len(), 1);
+    restore::verify(&target, &target.snapshot(&first.id).unwrap()).unwrap();
+    assert_eq!(fs::read(f.root().join("data")).unwrap(), b"new-data");
+    fs::write(&block, healthy).unwrap();
+    transfer::local(&source, &second, &target).unwrap();
+    transfer::local(&source, &second, &target).unwrap();
+    assert_eq!(target.list().unwrap().len(), 2);
+    restore::verify(&target, &target.snapshot(&second.id).unwrap()).unwrap();
+}
+
+#[test]
+fn wrong_key_and_corrupt_replica_never_become_verified_snapshots() {
+    let f = Fixture::new();
+    let source = f.repo("source-repository");
+    let target = f.repo("target-repository");
+    fs::write(f.root().join("data"), b"replicated").unwrap();
+    let snapshot = f.capture(&source);
+    let wrong_key = f.base.join("wrong-key");
+    crypto::create_key(&wrong_key).unwrap();
+    let error = Repository::open(&source.path, &wrong_key, false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("key") && !error.contains("busy"));
+    let hash = crypto::digest(b"replicated");
+    let conflicting = target.block_path(&hash).unwrap();
+    fs::create_dir_all(conflicting.parent().unwrap()).unwrap();
+    fs::write(&conflicting, b"corrupt-replica").unwrap();
+    assert!(transfer::local(&source, &snapshot, &target).is_err());
+    assert!(target.snapshot(&snapshot.id).is_err());
+    assert_eq!(fs::read(&conflicting).unwrap(), b"corrupt-replica");
+    restore::verify(&source, &snapshot).unwrap();
+}
 impl Fixture {
+    fn capture(&self, repo: &Repository) -> super::format::Snapshot {
+        self.capture_with_workers(repo, 1)
+    }
+    fn capture_with_workers(&self, repo: &Repository, workers: usize) -> super::format::Snapshot {
+        // A parallel test's fork can briefly inherit this fixture's CLOEXEC
+        // lease before exec. Only positive fresh-fixture acquisition waits;
+        // active-engine/overlap rejection tests still call capture directly.
+        for attempt in 0..100 {
+            match capture::create(repo, self.roots.clone(), workers) {
+                Ok(snapshot) => return snapshot,
+                Err(error)
+                    if attempt < 99
+                        && error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("fresh fixture capture: {error}"),
+            }
+        }
+        unreachable!()
+    }
     fn new() -> Self {
         let base = std::env::temp_dir().join(format!("n1-backup-tests-{}", ulid::Ulid::new()));
         fs::create_dir(&base).unwrap();
@@ -49,6 +184,8 @@ impl Fixture {
                 path: root.to_str().unwrap().to_owned(),
                 index: true,
                 blob: true,
+                member: None,
+                legacy_path: None,
             }],
         }
     }
@@ -67,6 +204,8 @@ impl Fixture {
             path: root.to_str().unwrap().to_owned(),
             index: true,
             blob: true,
+            member: None,
+            legacy_path: None,
         }]
     }
     fn data(&self) -> Vec<u8> {
@@ -93,7 +232,7 @@ fn encrypted_capture_restore_preserves_bytes_links_and_empty_directories() {
     let f = Fixture::new();
     let bytes = f.data();
     let repo = f.repo("repo");
-    let snapshot = capture::create(&repo, f.roots.clone(), 4).unwrap();
+    let snapshot = f.capture_with_workers(&repo, 4);
     restore::verify(&repo, &snapshot).unwrap();
     let target = f.target("target");
     restore::restore(&repo, &snapshot, target.clone(), false).unwrap();
@@ -139,7 +278,7 @@ fn wrong_key_tampering_and_truncation_fail_before_restore() {
     let f = Fixture::new();
     let bytes = f.data();
     let repo = f.repo("repo");
-    let snapshot = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let snapshot = f.capture_with_workers(&repo, 2);
     let wrong = f.base.join("wrong-key");
     crypto::create_key(&wrong).unwrap();
     assert!(Repository::open(&repo.path, &wrong, false).is_err());
@@ -164,7 +303,7 @@ fn replica_is_verified_idempotent_incremental_and_retained() {
     f.data();
     let repo = f.repo("repo");
     let replica = f.repo("replica");
-    let first = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let first = f.capture_with_workers(&repo, 2);
     transfer::local(&repo, &first, &replica).unwrap();
     let before = walkdir::WalkDir::new(replica.path.join("blocks"))
         .into_iter()
@@ -179,7 +318,7 @@ fn replica_is_verified_idempotent_incremental_and_retained() {
         .count();
     assert_eq!(before, after);
     fs::write(f.root().join("new"), b"second recovery point").unwrap();
-    let second = capture::create(&repo, f.roots.clone(), 4).unwrap();
+    let second = f.capture_with_workers(&repo, 4);
     transfer::local(&repo, &second, &replica).unwrap();
     assert_eq!(replica.list().unwrap().len(), 2);
     retention::forget(&repo, &first.id).unwrap();
@@ -198,7 +337,7 @@ fn interrupted_transfer_is_never_published_and_retry_reuses_blocks() {
     f.data();
     let repo = f.repo("repo");
     let replica = f.repo("replica");
-    let snapshot = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let snapshot = f.capture_with_workers(&repo, 2);
     let begin = serde_json::json!({"message":"Begin","snapshot":snapshot,"key_id":repo.key.id});
     let mut bytes = serde_json::to_vec(&begin).unwrap();
     bytes.push(b'\n');
@@ -253,7 +392,7 @@ fn interrupted_restore_is_fenced_resumable_and_refuses_foreign_files() {
     let f = Fixture::new();
     let bytes = f.data();
     let repo = f.repo("repo");
-    let snapshot = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let snapshot = f.capture_with_workers(&repo, 2);
     let target = f.target("target");
     let paths = vec![PathBuf::from(&target[0].path)];
     let marker =
@@ -332,7 +471,7 @@ fn missing_or_foreign_pins_never_reclaim_a_completed_snapshot() {
     let f = Fixture::new();
     let bytes = f.data();
     let repo = f.repo("repo");
-    let snapshot = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let snapshot = f.capture_with_workers(&repo, 2);
     let hash = crypto::digest(&bytes[..format::BLOCK_BYTES]);
     let pin = repo
         .path
@@ -354,11 +493,71 @@ fn missing_or_foreign_pins_never_reclaim_a_completed_snapshot() {
 }
 
 #[test]
+fn portable_backup_keeps_logical_addresses_and_converts_original_prefixes() {
+    use crate::core::backup::format::Member;
+    use crate::core::disk_manager::{PartMetadata, ShardInfo};
+    let f = Fixture::new();
+    let mut source = f.roots.clone();
+    let mut target = f.target("portable-target");
+    let member = Member {
+        pool_id: "A".into(),
+        generation: 1,
+        data_shards: 1,
+        parity_shards: 0,
+        slot: 0,
+    };
+    source[0].member = Some(member.clone());
+    target[0].member = Some(member);
+    source[0].legacy_path = Some("/original/member".into());
+    let logical = "n1://A/1/0/@f_f/.objects/a/b/@o_o/v/piece";
+    assert_eq!(
+        metadata::remap_path(logical, &source, &target).unwrap(),
+        logical
+    );
+    assert_eq!(
+        metadata::remap_path(
+            "/original/member/@f_f/.objects/a/b/@o_o/v/piece",
+            &source,
+            &target
+        )
+        .unwrap(),
+        logical
+    );
+    let part = PartMetadata {
+        part_index: 0,
+        size_bytes: 1,
+        created_at: 0,
+        checksum: None,
+        shards: vec![ShardInfo {
+            shard_index: 0,
+            file_name: "piece".into(),
+            absolute_path: logical.into(),
+            size_bytes: 1,
+            checksum: "00000000".into(),
+            is_parity: false,
+        }],
+    };
+    let bytes = rmp_serde::to_vec(&part).unwrap();
+    assert_eq!(
+        metadata::remap(".uploads/u/part_0.ndx", bytes.clone(), &source, &target).unwrap(),
+        bytes
+    );
+    for bad in [
+        "n1://A/1/1/piece",
+        "n1://A/2/0/piece",
+        "n1://B/1/0/piece",
+        "n1://A/1/0/../../escape",
+    ] {
+        assert!(metadata::remap_path(bad, &source, &target).is_err());
+    }
+}
+
+#[test]
 fn malformed_manifest_counts_and_duplicate_paths_fail_closed() {
     let f = Fixture::new();
     f.data();
     let repo = f.repo("repo");
-    let mut snapshot = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let mut snapshot = f.capture_with_workers(&repo, 2);
     snapshot.records += 1;
     assert!(restore::verify(&repo, &snapshot).is_err());
     snapshot.records -= 1;
@@ -396,9 +595,11 @@ fn partial_multi_root_restore_fences_can_resume_before_and_after_completion() {
         path: second.to_str().unwrap().to_owned(),
         index: true,
         blob: true,
+        member: None,
+        legacy_path: None,
     });
     let repo = f.repo("repo");
-    let snapshot = capture::create(&repo, f.roots.clone(), 2).unwrap();
+    let snapshot = f.capture_with_workers(&repo, 2);
     let mut target = f.target("target");
     target.extend(f.target("target2"));
     let paths = target

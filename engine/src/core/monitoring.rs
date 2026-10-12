@@ -556,7 +556,8 @@ async fn fragment_has_sampled_redundancy_debt(
             }
             for part in &meta.parts {
                 for shard in &part.shards {
-                    if !fs::try_exists(&shard.absolute_path).await.unwrap_or(false) {
+                    let path = crate::core::storage_pool::resolve_address(&shard.absolute_path)?;
+                    if !fs::try_exists(path).await.unwrap_or(false) {
                         return Ok(SampledObjectDebt {
                             actual_redundancy_debt: true,
                             recorded_layout: false,
@@ -714,15 +715,17 @@ async fn detect_index_replica_debt(
 }
 
 #[derive(Clone, Copy)]
-struct DiskCapacitySnapshot {
-    total_bytes: u64,
-    used_bytes: u64,
-    available_bytes: u64,
-    usage_percent: f64,
+pub(crate) struct DiskCapacitySnapshot {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub usage_percent: f64,
+    pub total_inodes: Option<u64>,
+    pub available_inodes: Option<u64>,
 }
 
 #[cfg(unix)]
-fn disk_capacity_snapshot(path: &std::path::Path) -> Option<DiskCapacitySnapshot> {
+pub(crate) fn disk_capacity_snapshot(path: &std::path::Path) -> Option<DiskCapacitySnapshot> {
     let raw_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     let rc = unsafe { libc::statvfs(raw_path.as_ptr(), stats.as_mut_ptr()) };
@@ -755,11 +758,13 @@ fn disk_capacity_snapshot(path: &std::path::Path) -> Option<DiskCapacitySnapshot
         used_bytes: used_bytes.min(u128::from(u64::MAX)) as u64,
         available_bytes: available_bytes.min(u128::from(u64::MAX)) as u64,
         usage_percent,
+        total_inodes: (stats.f_files > 0).then_some(stats.f_files as u64),
+        available_inodes: (stats.f_files > 0).then_some(stats.f_favail as u64),
     })
 }
 
 #[cfg(not(unix))]
-fn disk_capacity_snapshot(_path: &std::path::Path) -> Option<DiskCapacitySnapshot> {
+pub(crate) fn disk_capacity_snapshot(_path: &std::path::Path) -> Option<DiskCapacitySnapshot> {
     None
 }
 

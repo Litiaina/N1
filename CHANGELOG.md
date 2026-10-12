@@ -5,6 +5,50 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## 4.0.0 — development, storage format 4
 
+- Optional private Accel read proxy accelerates existing Console/API images,
+  video ranges and downloads after authoritative authorization/version lookup.
+  Cache-origin reads prevent recursive proxying without bypassing authorization;
+  pre-header failures fall back to N1. No NCX, NDX or payload format changes.
+- Enabled TCP_NODELAY on HTTP accepted sockets to reduce header/early-body
+  packet-coalescing delay; native sockets already used it.
+
+- Propagated strict shard-directory sync errors; standard multipart now honors
+  durability options and preserves effective part durability through NDX/NCX
+  finalization. Relaxed-to-strict completed-part retries return conflict rather
+  than falsely upgrading an acknowledgement. Existing default remains relaxed.
+- Enforced independent delete/recover permissions on HTTP/native object and
+  POSIX operations. Master-authenticated operator capability gates global,
+  cross-fragment and restrictive maintenance; global stops are operator-only.
+- Bound refresh sessions to verified credentials; fragment-key rotation rejects
+  old refresh authority. Fresh login is required for legacy refresh sessions.
+  Removed generation/backfill of weak NT hashes; Argon2 authentication remains.
+- Bounded public JSON, protected JSON, native admission/control frames and
+  multipart temporary allocations. Raw native uploads require prior write
+  authority and stream without unauthenticated whole-body allocation.
+- Required read authority and token-expiry closure for WebSockets; protected
+  object responses are private/no-store. Shell TLS verification is now default.
+- Added available-inode and low/exhausted headroom warnings to existing pool
+  health, Shell and Console. No space reservation or new object cache.
+- Added negative backup/replication verification coverage for wrong keys,
+  corrupt source/replica blocks and preservation of the last valid recovery point.
+
+- Added read-only pool-scoped health over HTTPS/native transport and Shell
+  `pools`: member identity/location, independent readiness/capacity and the
+  authenticated fragment's coverage. Explicit content checks reuse the existing
+  verifier, distinguish live scan results from readiness, and never repair data.
+  Offline `pool verify` can select a pool/stable fragment without scanning other
+  pools. Console exposes these checks and offline maintenance/backup workflows.
+- Corrected pool-local dangling-reference verification: an NCX binding can stay
+  in its original pool while newer versions live in an expansion pool. Online,
+  offline maintenance and backup verification now recognize that existing
+  cross-pool history without relocating namespace bindings or committed bytes.
+
+- Self-identifying pool members bind logical shard slots at startup independently
+  of configured mount paths/discovery order. New addresses are member-relative;
+  a shared resolver reads pre-portability NDX unchanged. Verified offline clones
+  and single-member reconstruction support new locations; startup fences and
+  existing health gates remain enforced. No object cache or namespace changes.
+
 - Named, independently expandable storage pools with immutable K+P geometry
   and membership. New pools do not require rebalancing old objects.
 - Unified pool roots replace separately configured index/blob roles.
@@ -34,6 +78,18 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 - Health now reconciles automatic-healing readiness with the live safety gate.
   Failed scans retry from their persistent fault state even if topology updates
   replace the display phase; only successful repair clears the scan fault.
+- Added shell-integrated offline pool verification, byte-exact healthy cloning
+  and explicit verified single-member replacement with interrupted-work resume.
+  Replacement includes acknowledged durable-upload pieces and activates root
+  identity only after complete validation; NCX mutation semantics are unchanged.
+- Backup restore maps logical pool/member slots rather than alphabetic mount
+  names. New snapshots identify storage format 4; authenticated flat-v4 archives
+  previously mislabeled 3 can recover membership without guessing older layouts.
+- Exposed the shared backup implementation through `litiaina-n1-shell backup`;
+  scheduled jobs and SSH receivers support the integrated entrypoint, while
+  existing standalone helper/job entrypoints remain supported.
+  Offline activation rejects missing/divergent durable manifests and receipts
+  rather than treating a replacement marker as proof of health.
 
 The October 6 copy/delete candidate passed testing and was subsequently deployed
 to the main server with its matching backup helper. Objects and configuration

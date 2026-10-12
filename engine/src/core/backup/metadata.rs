@@ -6,13 +6,30 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub fn remap_path(path: &str, source: &[Root], target: &[Root]) -> Result<String> {
+    if path.starts_with("n1://") {
+        resolve_target(path, target)?;
+        return Ok(path.to_owned());
+    }
     for (i, root) in source.iter().enumerate() {
-        if let Ok(relative) = Path::new(path).strip_prefix(&root.path) {
+        if let Ok(relative) =
+            Path::new(path).strip_prefix(root.legacy_path.as_deref().unwrap_or(&root.path))
+        {
             if relative
                 .components()
                 .any(|c| !matches!(c, std::path::Component::Normal(_)))
             {
                 return Err(invalid("invalid recorded shard path"));
+            }
+            if root.legacy_path.is_some() {
+                if let Some(member) = &target[i].member {
+                    return Ok(format!(
+                        "n1://{}/{}/{}/{}",
+                        member.pool_id,
+                        member.generation,
+                        member.slot,
+                        relative.display()
+                    ));
+                }
             }
             return Ok(Path::new(&target[i].path)
                 .join(relative)
@@ -26,13 +43,50 @@ pub fn remap_path(path: &str, source: &[Root], target: &[Root]) -> Result<String
     ))
 }
 
+fn resolve_target(path: &str, roots: &[Root]) -> Result<PathBuf> {
+    if let Some(logical) = path.strip_prefix("n1://") {
+        let mut fields = logical.splitn(4, '/');
+        let pool = fields.next().ok_or_else(|| invalid("missing pool"))?;
+        let generation: u64 = fields
+            .next()
+            .ok_or_else(|| invalid("missing generation"))?
+            .parse()?;
+        let slot: usize = fields
+            .next()
+            .ok_or_else(|| invalid("missing slot"))?
+            .parse()?;
+        let relative = Path::new(
+            fields
+                .next()
+                .ok_or_else(|| invalid("missing relative address"))?,
+        );
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(invalid("unsafe logical address"));
+        }
+        let root = roots
+            .iter()
+            .find(|r| {
+                r.member.as_ref().is_some_and(|m| {
+                    m.pool_id == pool && m.generation == generation && m.slot == slot
+                })
+            })
+            .ok_or_else(|| invalid("logical address outside restore membership"))?;
+        return Ok(Path::new(&root.path).join(relative));
+    }
+    Ok(PathBuf::from(path))
+}
+
 fn remap_part(part: &mut PartMetadata, source: &[Root], target: &[Root]) -> Result<()> {
     let mut domains = HashSet::new();
     for shard in &mut part.shards {
         shard.absolute_path = remap_path(&shard.absolute_path, source, target)?;
+        let resolved = resolve_target(&shard.absolute_path, target)?;
         let root = target
             .iter()
-            .find(|root| Path::new(&shard.absolute_path).starts_with(&root.path))
+            .find(|root| resolved.starts_with(&root.path))
             .ok_or_else(|| invalid("restored placement outside roots"))?;
         if !root.blob || !domains.insert(std::fs::metadata(&root.path)?.dev()) {
             return Err(invalid(
@@ -46,6 +100,11 @@ fn remap_part(part: &mut PartMetadata, source: &[Root], target: &[Root]) -> Resu
 pub fn remap(relative: &str, bytes: Vec<u8>, source: &[Root], target: &[Root]) -> Result<Vec<u8>> {
     let path = PathBuf::from(relative);
     if relative == ".n1-pool.json" {
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("member_format").is_some() {
+            let _: crate::core::storage_pool::MemberDescriptor = serde_json::from_value(value)?;
+            return Ok(bytes);
+        }
         let mut pool: crate::core::storage_pool::StoragePool = serde_json::from_slice(&bytes)?;
         for root in &mut pool.roots {
             *root = PathBuf::from(remap_path(&root.to_string_lossy(), source, target)?);

@@ -9,7 +9,6 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use chrono::{SecondsFormat, Utc};
-use md4::{Digest as Md4Digest, Md4};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
@@ -170,21 +169,6 @@ fn hash_key_to_phc(key: &str) -> Result<String, AppError> {
     Ok(phc)
 }
 
-fn hash_key_to_nt_hash_hex(key: &str) -> String {
-    let mut hasher = Md4::new();
-    hasher.update(&utf16le_bytes(key));
-    let digest = hasher.finalize();
-    hex::encode(digest)
-}
-
-fn utf16le_bytes(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() * 2);
-    for codepoint in text.encode_utf16() {
-        out.extend_from_slice(&codepoint.to_le_bytes());
-    }
-    out
-}
-
 pub async fn init_fragment_metadata(
     fragment_hash: &str,
     key: &str,
@@ -197,7 +181,7 @@ pub async fn init_fragment_metadata(
         engine_format_version: N1_ENGINE_FORMAT_VERSION,
         stable_fragment_id: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
-        nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
+        nt_hash_hex: None,
         index_partition_count: configured_index_partition_count(),
         created: now_utc_rfc3339(),
         updated: None,
@@ -219,7 +203,7 @@ pub async fn init_fragment_metadata_strict(
         engine_format_version: N1_ENGINE_FORMAT_VERSION,
         stable_fragment_id: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
-        nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
+        nt_hash_hex: None,
         index_partition_count: configured_index_partition_count(),
         created: now_utc_rfc3339(),
         updated: None,
@@ -399,21 +383,10 @@ pub async fn rotate_fragment_key(fragment_hash: &str, new_key: &str) -> Result<(
         return Err(AppError::BadRequest("new_key must not be empty".into()));
     }
 
-    let mut meta = match read_fragment_metadata(fragment_hash).await {
-        Ok(m) => m,
-        Err(_) => FragmentMetadata {
-            engine_format_version: N1_ENGINE_FORMAT_VERSION,
-            stable_fragment_id: fragment_hash.to_string(),
-            key_phc: String::new(),
-            nt_hash_hex: None,
-            index_partition_count: configured_index_partition_count(),
-            created: now_utc_rfc3339(),
-            updated: None,
-        },
-    };
+    let mut meta = read_fragment_metadata(fragment_hash).await?;
 
     meta.key_phc = hash_key_to_phc(new_key)?;
-    meta.nt_hash_hex = Some(hash_key_to_nt_hash_hex(new_key));
+    meta.nt_hash_hex = None;
     meta.updated = Some(now_utc_rfc3339());
     write_fragment_metadata(&meta).await
 }
@@ -425,6 +398,10 @@ pub async fn verify_fragment_key(fragment_hash: &str, key: &str) -> Result<bool,
 
     let meta = read_fragment_metadata(fragment_hash).await?;
 
+    verify_metadata_key(&meta, key)
+}
+
+pub(crate) fn verify_metadata_key(meta: &FragmentMetadata, key: &str) -> Result<bool, AppError> {
     if meta.key_phc.is_empty() {
         return Ok(false);
     }
@@ -435,30 +412,6 @@ pub async fn verify_fragment_key(fragment_hash: &str, key: &str) -> Result<bool,
     Ok(Argon2::default()
         .verify_password(key.as_bytes(), &parsed)
         .is_ok())
-}
-
-pub async fn backfill_fragment_nt_hash_if_missing(
-    fragment_hash: &str,
-    key: &str,
-) -> Result<bool, AppError> {
-    if key.is_empty() {
-        return Ok(false);
-    }
-
-    let mut meta = read_fragment_metadata(fragment_hash).await?;
-    if meta
-        .nt_hash_hex
-        .as_ref()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return Ok(false);
-    }
-
-    meta.nt_hash_hex = Some(hash_key_to_nt_hash_hex(key));
-    meta.updated = Some(now_utc_rfc3339());
-    write_fragment_metadata(&meta).await?;
-    Ok(true)
 }
 
 #[cfg(test)]

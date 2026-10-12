@@ -83,7 +83,10 @@ Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
 not add empty-trash, hard-delete, or per-version-delete semantics.
 
 Snapshot is a read-authorized NDJSON projection feed with a completion marker.
-Search proxies to optional Accel; unavailable Accel affects search only.
+Search proxies to optional Accel. Optional `N1_ACCEL_READ_URL` also accelerates
+version-pinned object bytes after N1 authorization/resolution, including existing
+Console media URLs. Pre-header failure falls back to N1; mid-stream failure
+terminates the response. Accel never becomes namespace or durability authority.
 Exports pin immutable versions, build durable ZIP/TAR artifacts and support
 stable length/ETag, range resume and scoped signed downloads. Cancellation and
 artifact retention do not delete source objects.
@@ -117,6 +120,7 @@ for mixed results. There is no durable batch route.
 
 ```text
 GET  /noa/v1/maintenance/health
+GET  /noa/v1/maintenance/pools/health
 GET  /noa/v1/maintenance/fragments/{fragment}/health
 GET  /noa/v1/objects/status/{object_key}
 POST /noa/v1/objects/repair/{object_key}
@@ -142,6 +146,11 @@ POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
 ```
 
 ## Conformance
+
+Maintenance starts require write/modify/delete. Fragment tokens are scoped to
+their own fragment; explicit all-fragment work, restrictive modes and global
+stops require master-key operator authentication. Pool content diagnostics stay
+read-authorized and fragment-scoped. See the maintenance reference for details.
 
 Conformance requires matching request meaning, authentication, responses,
 errors and retry behavior, not just route names. N1's workspace tests and the

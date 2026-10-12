@@ -5,6 +5,317 @@ dated evidence, not guarantees for every server. Older versions' passes do not
 certify the current namespace/pool design. Personal test paths and credentials
 are intentionally omitted.
 
+## Optional Accel read integration — October 13, 2026
+
+All 299 engine unit tests pass, including private read-proxy authority, range
+forwarding, response validation and pre-header fallback. The release engine and
+Accel also passed an isolated USB/XFS 1+0 proof using an 84 MiB AVI and PNG:
+full/range/image hashes matched, cached rename reads fetched no additional
+payload, the old key returned 404, and committed object NDX/payload bytes and
+modification times stayed unchanged. N1 still read the correct USB-backed range
+after Accel stopped. Original drive contents were not formatted or removed.
+
+This adds optional HTTP delivery only, not an object cache inside N1 or storage
+format changes. HTTP accepted sockets enable TCP_NODELAY. Cache activation,
+budgets and bounded measurements are documented in the Accel repository's
+TESTING.md and [integration guide](DOCUMENTATION.md#accel-integration). The proof
+used loopback networking and does not qualify redundant EC recovery or an LTS
+release. Earlier candidate hashes below identify their historical builds, not
+this newer binary.
+
+## Production-hardening candidate — October 12, 2026
+
+Engine SHA-256:
+fb4f46fe47adf90c0f62b4be8f0e43cc5dd4574be9249ea5e0a29e254b8456d8.
+Shell SHA-256:
+2b6a6f84a98338775642aede5338323be5531a62bee6e747ca03831bf6cb52d7.
+
+Local candidate validation: 297 engine, 2 EC integration, 9 proof-runner,
+12 Shell and 8 CLI tests passed (328 total) in warning-denied parallel execution.
+Before the extra proof assertion, two 327-test parallel runs also passed.
+Locked release Engine/Shell/helper/proof builds, warning-denied
+all-target checking, formatting and whitespace checks passed.
+
+New checks cover strict directory-sync error propagation, standard part retry/
+finalization durability, independent HTTP/native mutation permissions,
+operator-only/global/cross-fragment maintenance, rotation-bound refresh,
+oversized JSON/part-count/slot admission, native raw-body rejection before
+allocation, WebSocket read authority and expiry, inode warnings, TLS defaults,
+and corrupt backup/replica rejection without replacing the last valid snapshot.
+Console pool regressions passed 10 cases across five viewports; the full desktop
+suite passed 51 cases with 5 unavailable/inapplicable cases skipped.
+
+Failures retained: an HTTP POSIX permission test initially exposed a second
+handler missing its checks; both HTTP and native paths now enforce the same
+permissions. A body-limit fixture initially used a nonexistent fragment and
+hit the existing upload existence gate before JSON extraction; a real isolated
+fragment now exercises the limit without weakening the 413 assertion.
+Parallel positive backup captures exposed transient fork-inherited CLOEXEC
+leases again. Their fixture-only bounded acquisition helper now covers positive
+captures while active-engine/overlap rejection tests remain immediate and
+production locking is unchanged. Both final parallel reruns passed.
+
+The main-server matrix runs headlessly on isolated roots on four XFS HDDs.
+Accepted passes so far: NCX-only copy/delete, root relocation/reordering,
+3+1 data/parity member replacement, 2+1 replacement, 1+0 migration, encrypted
+backup/replication/interrupted restore in 3+1 and 1+0 layouts, pool expansion,
+and 2 GiB durable multipart restart/resume. These do not certify a deployment.
+
+Direct workstation-to-server LAN HTTPS passed restricted mutation/global-job
+denials, huge-part-count refusal, 128-key pagination, repeated NCX mutation and
+all final payload hashes. The three live Console tests passed against that
+server: prefix rename preserving a same-named object, TAR download, multipart
+resume and standard batch routing. The initial LAN latency sample ran during
+simultaneous disk-intensive restore; it is a contention result, not a quiet
+baseline. Quiet performance qualification is still pending.
+
+Three initial hardware runner failures retained: the healing case expected
+reconfiguration of enrolled EC geometry; native and NOA cases expected empty
+mkdir. N1 correctly rejected those pre-v4 assumptions. The runner now asserts
+enrolled-geometry rejection and uses upload-backed virtual prefixes. Its typed
+native-error assertions require both the exact status and `ok=false`.
+The corrected healing/native reruns and the final NOA rerun subsequently passed.
+The last NOA failure was another pre-v4 parent-folder STAT assumption; the test
+now verifies the actual trashed child binding before recovery. All 14 selected
+hardware cases have accepted passes on the same candidate Engine/Shell binaries;
+the initial failures above are retained. Five-second fixture-process sampling
+observed approximately 174.3 MiB peak RSS and 88 peak file descriptors across
+the matrix (including offline helpers); this is not a long-soak guarantee.
+
+### Physical power-cut recovery — October 12, 2026
+
+PASS after retry on the same candidate binaries. The operator physically cut
+power during repeated 128-key prefix moves; the independent LAN client recorded
+an interrupted request. After power restoration, all four XFS members replayed
+their logs and the isolated N1 instance started automatically.
+
+| Check | Result |
+| --- | --- |
+| Immediate committed-object readback | All 128 moved objects and the single-object baseline were reachable with matching SHA-256 hashes |
+| Strict standard multipart | Finalized 16 MiB object retained its expected hash |
+| Durable multipart | Both previously acknowledged 4 MiB parts survived; remaining parts uploaded and final 16 MiB hash matched |
+| Interrupted namespace | 16 objects had both names; complete, ordered pagination returned 144 bindings for 128 objects |
+| First offline integrity check | REFUSED: 13 incomplete NCX replica pairs; no committed NDX replica was missing. Automatic healing was disabled in this fixture |
+| Retry of interrupted move | PASS: 54 remaining source bindings moved without conflicts; all 128 destination objects hash-correct, old names absent |
+| Mutation-only immutable inventory | All 11,088 files under object storage had identical inventories/SHA-256 hashes before and after retry; this baseline was taken after the power cut |
+| Final complete offline pool verification | PASS, exit 0: 1,381 versions and 2,700 physical NCX replicas checked, recorded payload-piece checksums verified, zero reconstructed shards |
+
+The initial replica failure is retained, not relabeled as an immediate healthy
+pool. Copy/delete can leave duplicate names or incomplete replica pairs when
+interrupted; ordinary retry completed this operation without engine changes,
+tombstones or a journal. Test-only boot automation was removed afterward;
+existing production services and storage were not replaced.
+
+This is one physical power-cut recovery drill on a four-HDD 3+1 deployment,
+not every fsync stage, storage controller or failure topology. Broader power-cut
+coverage and a longer soak of this exact candidate remain release gates.
+
+## Earlier pool health, Shell and Console integration — October 12, 2026
+
+Engine SHA-256:
+a183c39818399637e16a2aec704e486a0620627db7d6f7b2e36343259be926ae.
+Shell SHA-256:
+8608c21e150bcf76f070353511534db422b4f9b910c9bb8007ce2ddd4a15e90f.
+
+| Gate | Result |
+| --- | --- |
+| Workspace/all-target tests | PASS: 276 engine, 2 EC integration, 8 proof-runner, 11 Shell, 8 CLI; 305 total, including a repeated parallel run |
+| Release build, all-target check, formatting and whitespace | PASS |
+| Console integration/responsive regression subset | PASS: 84 cases; 121 viewport-inapplicable cases skipped, not counted as passes |
+| Complete desktop Console suite | PASS on final rerun: 51 cases, 5 unavailable/inapplicable cases skipped |
+| New pool UI checks | PASS across five desktop/tablet/phone viewports; explicit selection, deep scan, member/fragment identity, failure clearing and offline workflows |
+| Mixed-pool real-device expansion | PASS on isolated MCH fixtures: A 1+0 plus B 2+1; existing fragment credentials enrolled, old committed bytes retained, new allocation and restart verified |
+| Existing key after expansion | PASS: newer version placed in B, NCX remained in A, history spanned pools; A's namespace check passed with its old object directory temporarily unavailable and the newer version in B |
+| HTTPS/native pool diagnostics | PASS: independent pool selection, correct replica counts and current allocation pool; no authentication, no read permission and cross-fragment content requests refused |
+| Failure isolation | PASS: fenced B member reported degraded/unavailable; A still verified, and the diagnostic did not clear the fence |
+| Content integrity vs readiness | PASS: same-sized parity corruption left readiness ready but failed CRC verification; no automatic repair or committed-byte rewrite by the diagnostic |
+| Offline Shell selection | PASS: complete A verification while a B member was fenced; full verification passed afterward (3 versions, 3 physical NCX replicas) |
+| Encrypted mixed-pool backup | PASS: offline Shell capture and authenticated snapshot verification; 107 records, approximately 4 MiB source bytes |
+| Backup cross-pool reference regression | PASS: NCX in A with remaining metadata/payload only in B verified without global engine initialization; corrupt pieces and dangling references refused |
+
+Only new private fixtures on MCH's four mounted XFS HDDs were used. Existing
+production services stayed active; production data/configuration/binaries were
+not changed. No formatting, remounting or production deployment occurred.
+Server checks used loopback HTTPS/native ports, bounded CPU/memory and idle I/O
+priority; they do not establish LAN latency or full-drive throughput.
+
+Failures retained: the first native run exposed a u128 elapsed-time field's
+binary MessagePack encoding; u64 and a serialization regression fixed it before
+the complete rerun passed. Inspection also found a pool-local dangling-reference
+assumption; the verifier now recognizes stable-object version history across
+known pools, including the offline backup catalog. Two parallel backup unit
+tests encountered transient flock inheritance during other tests' fork/exec
+windows. Their positive fixture-reopen helper now waits boundedly; production
+locks and immediate overlapping-run refusal assertions are unchanged, and the
+parallel rerun passed. The extra backup script initially read `id` instead of
+the capture result's `snapshot`; capture succeeded and the corrected verification
+passed. Initial development checks also caught Shell query tuple types and an
+undeclared proof-only walker; both were corrected before hardware validation.
+The broader desktop Console run initially hit an async evaluation-context error
+in its NOA-shell test and a window-animation timing assertion. The shell test
+now submits through the real command input and asserts output/path state;
+the geometry test polls the same size bounds instead of sleeping a fixed delay.
+No production shell/window behavior was changed; the complete desktop rerun
+passed without weakening command-routing or geometry assertions.
+
+Quick identity/access readiness is not full content integrity. Online scans are
+read-only live observations, not atomic snapshots; concurrent mutations can
+invalidate them. Complete offline verification remains the maintenance gate.
+Console presents diagnostics and host-side Shell workflows, not browser-executed
+physical migration/backup automation. This is not a new long-soak or power-cut
+qualification.
+
+## Self-identifying roots and location independence — October 12, 2026
+
+Final workspace-build engine SHA-256:
+2313745a4feac9db93992494ccafac10707475255ada3f8027b17b16e536441b.
+Matching Shell SHA-256:
+ce520565709bd605000c494a24060cfeecea0c043df3444e0e89b734418f3054.
+
+MCH was used only through new private fixtures on its four existing XFS HDDs
+and NVMe filesystem. No production contents/configuration/binaries were changed,
+no existing service was stopped, and no device was formatted or remounted.
+Tests used loopback HTTPS/native ports and temporary self-signed certificates,
+with a two-core CPU quota, 1.5 GiB cgroup limit and idle I/O priority. Physical
+I/O remained shared with production. These are not client-LAN latency results.
+
+| Gate | Result |
+| --- | --- |
+| Workspace/all-target regression tests | PASS: 271 engine, 2 EC integration, 8 proof-runner, 11 Shell, 7 CLI; 299 total |
+| Warnings-denied check, formatting and whitespace | PASS |
+| Existing path-bound v4 data | PASS: seeded with the previous engine, descriptor upgrade preserved committed bytes |
+| 3+1 data and parity members | PASS: verified HDD-to-NVMe cloning, different root locations, reversed discovery order, original paths unavailable |
+| Cold degraded restart after relocation | PASS: readback/listing remained available within parity limits; missing directories were not recreated |
+| Wrong identity and unfinished copy | Rejected; marker recognition never bypassed the activation fence |
+| Replacement at a new location | PASS for data/parity: SIGKILL after actual piece publication, startup refusal, explicit resume and full verification |
+| Relocated operation | PASS: recursive paginated listing, versions, trash recovery, durable upload continuation, batch/native uploads, new write/rename |
+| Recover-on-read and autonomous healing | PASS on relocated 3+1 storage: removed data piece recovered on read; removed parity piece healed by the background controller |
+| Healthy 1+0 relocation | PASS: verified cross-device clone and new-location operation; lost-member reconstruction correctly refused |
+| Committed immutability | Complete NDX/data/parity inventories and SHA-256 hashes unchanged through upgrade, relocation and reconstruction |
+| Encrypted backup/portable restore | PASS: capture, incremental capture, replication, original paths hidden, restore interruption after 3,920 files, fenced refusal/resume, hashes, credentials, versions, trash, durable continuation, ranges and retention |
+| Backup after legacy-data relocation | PASS: full capture and authenticated verification of the relocated mixed legacy/logical-address corpus |
+
+The final five-mode matrix completed in 5m 04s, exit 0. Its 329.3 MiB peak
+is whole-cgroup accounting, not engine RSS. Small-fixture data/parity rebuilds
+observed 4.18/4.03 s and 19.8/21.5 MiB peak backend RSS, ending with six FDs.
+Clones observed approximately 0.26 s, 8.5–8.8 MiB RSS and four final FDs;
+these are not full-drive bandwidth claims. Backup phases observed 25.29 s
+capture, 4.25 s incremental capture, 45.85 s replication and 83.04 s interrupted
+restore/refusal/resume.
+
+Matched four-HDD upload comparison against the pre-portability build used five
+samples per transport/multipart case: 1 MiB one-shot, 8 MiB multipart with 2 MiB
+parts, and four concurrent 64-object batches of 16 KiB objects. Median upload
+rates are shown below; batch rate covers the entire four-client request group.
+
+| Measure | Before | Self-identifying roots |
+| --- | ---: | ---: |
+| HTTPS one-shot | 11.08 MiB/s | 11.15 MiB/s |
+| HTTPS sequential multipart | 32.09 MiB/s | 40.69 MiB/s |
+| Native one-shot | 10.71 MiB/s | 17.18 MiB/s |
+| Native sequential multipart | 7.04 MiB/s | 7.37 MiB/s |
+| Native pipelined multipart | 7.14 MiB/s | 8.36 MiB/s |
+| Concurrent batch | 28.90 objects/s | 29.75 objects/s |
+| Maximum sampled engine RSS | 80.4 MiB | 81.5 MiB |
+
+No consistent throughput regression was observed. Shared-I/O variance is large:
+the candidate's native sequential mean was 3.9% lower despite its higher median.
+Neither the speedups nor the roughly 1.1 MiB sampled RSS difference establish
+universal throughput or memory behavior. No object cache was added.
+
+Failed attempts remain evidence: the first relocation invocation exposed an
+obsolete proof-argument dependency; the first new-location replacement safely
+refused an old path-keyed authorization lookup. That lookup was removed and the
+descriptor was included in the replacement activation inventory before the final
+matrix. A reused fixture directory caused another refusal; unique replacement
+names fixed the harness without overwriting prior evidence. A diagnostic started
+before its binary transfer finished returned ETXTBSY; it performed no repair.
+An extra backup-verification script initially used an unsupported `--all` flag;
+capture completed, and verification passed when given its explicit snapshot ID.
+Physical power cuts, hot relocation and multiple simultaneous member replacement
+are not certified by these tests. Production deployment was not performed.
+
+## Pool portability and integrated backups — October 12, 2026
+
+Final engine SHA-256:
+c96bcf269cedcc0a5a1b8ec4c083c7660b5d86fed4815a626993d78cdbb7089e.
+Matching Shell SHA-256:
+ce520565709bd605000c494a24060cfeecea0c043df3444e0e89b734418f3054.
+
+The main server was used as disposable test hardware: four independent XFS
+HDDs, with an independent NVMe filesystem also available as a replacement
+target. Tests used isolated roots and server-local HTTPS without Accel;
+the harness accepts its temporary self-signed certificates. Physical I/O was
+shared between test jobs; production services were restarted before the extra
+cross-device restore drill. Existing production binaries were not replaced.
+
+| Gate | Result |
+| --- | --- |
+| Serial workspace/all-target tests | PASS: 263 engine, 2 EC integration, 7 proof-runner, 11 shell, 7 CLI; 290 total |
+| Warnings-denied all-target check, formatting and whitespace | PASS |
+| 3+1 data-member and parity-member replacement | PASS: blank replacement on a different filesystem, SIGKILL after actual piece publication, startup rejection, explicit resume and verified activation |
+| 2+1 replacement onto another HDD | PASS: interrupted reconstruction/resume and full integrity checks |
+| Healthy 1+0 cloning onto another HDD | PASS: interrupted copy/resume, same-path cutover, complete readback and new operations |
+| Lost 1+0 reconstruction | Correctly refused; requires a verified backup, not an invented healthy member |
+| Copy and replica validation | Partial copies, same-size payload corruption, divergent durable manifests and missing receipt replicas rejected |
+| All four pool cases | PASS: 133 final visible objects each, recursive 17-entry pagination, version history, empty object, trash recovery, durable 64 MiB upload continuation and new upload/rename |
+| Immutability | Complete committed NDX/data/parity inventories and SHA-256 hashes preserved through clone/reconstruction; healthy source copying did not recode pieces |
+| Portable encrypted restore, 3+1 and 1+0 | PASS: original source paths hidden, 3+1 target member paths deliberately reversed, restore SIGKILL after piece publication, fenced startup refusal and explicit resume; all baseline hashes, versions, separate fragment credentials, trash, durable uploads, range reads, new writes and retained snapshots verified |
+| 1+0 migration onto another HDD through backup | PASS: replica and restored member on an independent device, original paths unavailable, restore SIGKILL/retry and all end-to-end checks; 5m 24s overall, exit 0 |
+| Integrated LAN SSH replication | PASS: sender SIGKILL after five destination blocks; no completed snapshot published; retry, authenticated verification and repeat transfer passed |
+| Integrated scheduled backup | PASS: real systemd stop/capture/restart, verification, replication and source/destination retention through Shell |
+| Whole backup-job interruption | PASS: whole-cgroup SIGKILL after 24 capture pins; supervised recovery restarted the test engine, cleared restart intent and recorded interruption rather than success; subsequent full pool verification passed |
+
+Small-fixture offline measurements below include explicit resume after a
+deliberate interruption. They are not full-drive throughput or online mutation
+benchmarks; device choice and concurrent I/O explain why they cannot be compared
+as an architecture speedup.
+
+| Operation / target | Completion time | Peak backend RSS |
+| --- | ---: | ---: |
+| 3+1 data-member clone / NVMe | 0.92 s | 12.0 MiB |
+| 3+1 data-member rebuild / NVMe | 2.56 s | 22.7 MiB |
+| 3+1 parity-member rebuild / NVMe | 2.48 s | 24.5 MiB |
+| 2+1 data-member rebuild / HDD | 35.47 s | 23.6 MiB |
+| 1+0 clone / HDD, concurrent backup traffic | 108.01 s | 11.7 MiB |
+
+Offline verify/clone processes ended with four open FDs; rebuild processes
+ended with six. An earlier isolated 1+0 clone observed 10.31 s; it does not
+erase the slower shared-I/O result. Process RSS is distinct from systemd's
+whole-cgroup memory peak.
+
+The 3+1 snapshot observed 54.46 s capture, 14.22 s incremental capture,
+52.97 s initial replication and 243.75 s interrupted restore/rejection/resume.
+The 1+0 snapshot observed 40.41/11.36/85.72/65.31 s respectively. These are
+small-fixture wall times, not bulk-media bandwidth or instantaneous-backup
+claims. The six-mode final hardware matrix completed in 16m 51s, exit 0;
+its 1011.3 MiB peak is the whole cgroup including successive test processes
+and kernel accounting, not engine RSS.
+The separate cross-device 1+0 drill observed 43.35 s capture, 9.48 s incremental
+capture, 121.67 s initial replication and 20.78 s interrupted restore/resume.
+Its 233.1 MiB memory peak is likewise whole-cgroup accounting.
+
+Failures were retained, not counted as passes: the first hardware harness
+incorrectly compared non-recursive listing with nested keys; another omitted
+Content-Length on an empty upload. Corrected reruns preserved those checks.
+The first real offline reconstruction exposed uninitialized repair-reader
+topology; it stayed fenced and was fixed before the complete matrix above.
+The scheduled-backup fixture initially exposed a stale pre-cutover member
+instead of the activated replacement. Capture refused it and restarted N1;
+binding the verified replacement restored full pool integrity before retry.
+An SSH fixture with non-private repository permissions was also refused before
+the corrected owner-only run. The extra cross-device backup run initially
+stopped at argument parsing because the spare flag still required the pool-only
+mode; a parser regression now covers independent-spare backup selection.
+Local regressions cover integrated job child
+arguments, logical slot mapping and missing/divergent upload replicas.
+
+These are process interruption and real cross-filesystem cutover tests, not
+physical power cuts, physically unplugged members, a long memory soak or
+multi-node automatic failover. Replacement currently handles one missing
+member with all other peers verified; continuous writable standby replication
+is not implemented.
+
 ## Headless release-gate soak — October 8, 2026
 
 **FAIL after 6h 1m 41s; six-hour continuous-PID resource gate PASS.** The isolated
@@ -325,6 +636,13 @@ acceptance uses 2 GiB or larger; small fixtures do not establish throughput.
 An extended --gc-workload-timeout-seconds run must not hide a failed default
 300-second performance gate.
 
+For offline member replacement, run `--pool-maintenance-proof` with
+`--pool-member 0` and `--spare-root /mnt/SPARE` as root with a genuinely
+independent spare filesystem. Repeat data/parity slots and 2+1/1+0 layouts.
+On a 1+0 fixture, `--backup-proof` with `--spare-root /mnt/SPARE` additionally
+places the replica and restored member on that other device. Tests must never
+bind over a live storage root.
+
 Required regressions cover immutable pool enrollment, zero-decode LIST, same-key
 lineage/cancellation, NCX-only mutation, destination-before-source barriers,
 joined workers, conflicts, process restart, standard/durable upload boundaries,
@@ -334,12 +652,13 @@ flat key/prefix behavior and partial results.
 
 ## Remaining gates and evidence
 
-Physical power-cut/fsync-stage testing, enrolled-member replacement/restore,
+Repeated power cuts at different fsync stages, simultaneous multi-member replacement,
 broader pool/failure topologies, capacity exhaustion under format 4, longer
 memory/FD soaks on the patched candidate,
-larger/cold namespaces, complete live consumer integration, and format-4
-automatic-backup failure recovery remain release gates. Renaming an isolated
-member directory is not physical device-loss or controller-cache testing.
+larger/cold namespaces, complete live consumer integration, and backup failure
+cases beyond the verified interruption/retry matrix remain release gates.
+Cross-filesystem bind cutovers and process kills are not physical device-loss
+or controller-cache tests.
 
 This document summarizes accepted results, failures and remaining gates.
 Raw hardware and deployment reports are local-only and excluded from version

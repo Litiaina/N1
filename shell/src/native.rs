@@ -38,7 +38,9 @@ pub async fn run_native(cli: Cli) -> Result<(), DynError> {
         .with_request_prefix("n1-cli");
 
     match &cli.command {
-        Commands::Serve(_) => unreachable!("serve is handled before native dispatch"),
+        Commands::Serve(_) | Commands::Pool(_) | Commands::Backup(_) => {
+            unreachable!("local commands are handled before native dispatch")
+        }
         Commands::Shell => {
             authenticate_native_cli(&mut client, &cli, &secret).await?;
             native_shell(&mut client, &cli).await
@@ -179,7 +181,9 @@ async fn handle_native_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
-        Commands::Serve(_) => unreachable!("serve is handled before native dispatch"),
+        Commands::Serve(_) | Commands::Pool(_) | Commands::Backup(_) => {
+            unreachable!("local commands are handled before native dispatch")
+        }
         Commands::Shell => native_shell(client, cli).await,
         Commands::Fragment { command } => {
             handle_native_fragment_command(client, cli, command).await
@@ -200,6 +204,16 @@ async fn handle_native_authenticated_command(
                 let health: HealthResponse = client.mapped_json(Method::GET, &path, None).await?;
                 print_output(cli.json, &health, &format_health(&health))
             }
+        }
+        Commands::Pools { pool, deep_scan } => {
+            let mut query = vec![("deep_scan".to_string(), deep_scan.to_string())];
+            if let Some(pool) = pool {
+                query.push(("pool".to_string(), pool.clone()));
+            }
+            let path = path_with_query("/noa/v1/maintenance/pools/health", &query);
+            let response: cli_core::models::PoolHealthResponse =
+                client.mapped_json(Method::GET, &path, None).await?;
+            print_output(cli.json, &response, &crate::output::format_pools(&response))
         }
         Commands::Namespace { command } => match command {
             NamespaceCommands::List { path, limit } => {
@@ -529,6 +543,16 @@ async fn handle_shell_line(
                 .await?;
             print_output(cli.json, &health, &format_health(&health))
         }
+        ["pools"] | ["pools", _] => {
+            let query = parts
+                .get(1)
+                .map(|pool| vec![("pool".to_string(), (*pool).to_string())])
+                .unwrap_or_default();
+            let path = path_with_query("/noa/v1/maintenance/pools/health", &query);
+            let response: cli_core::models::PoolHealthResponse =
+                client.mapped_json(Method::GET, &path, None).await?;
+            print_output(cli.json, &response, &crate::output::format_pools(&response))
+        }
         ["usage"] => {
             let value: Value = client
                 .mapped_json(Method::GET, "/noa/v1/capacity/fragment", None)
@@ -839,6 +863,7 @@ fn native_op_from_mapped_call(
         }
         (Method::GET, "/noa/v1/capacity/fragment") => "fragment.usage",
         (Method::GET, "/noa/v1/maintenance/health") => "maintenance.health",
+        (Method::GET, "/noa/v1/maintenance/pools/health") => "maintenance.pools.health",
         (Method::GET, "/noa/v1/posix/list") => "namespace.list",
         (Method::GET, "/noa/v1/posix/stat") => "namespace.stat",
         (Method::GET, "/noa/v1/upload/multipart") => "uploads.list",

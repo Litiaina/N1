@@ -228,7 +228,7 @@ impl Proof {
                 "{}/noa/v1/maintenance/fragments/{}/gc/start?mode=scrub&fast_mode=true",
                 self.base_url, self.fragment
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.operator_token)
             .send()
             .await?;
         if response.status() != StatusCode::ACCEPTED {
@@ -255,7 +255,7 @@ impl Proof {
                 "{}/noa/v1/maintenance/fragments/{}/repair/start?mode=scrub&fast_mode=true&meta_concurrency=4&repair_concurrency=2&batch=128",
                 self.base_url, self.fragment
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.operator_token)
             .send()
             .await?;
         if response.status() != StatusCode::ACCEPTED {
@@ -323,7 +323,7 @@ impl Proof {
                 self.base_url,
                 encode_path(object_key)
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.operator_token)
             .send()
             .await?;
         if response.status() != StatusCode::ACCEPTED {
@@ -348,7 +348,7 @@ impl Proof {
                 "{}/noa/v1/maintenance/fragments/{}/redistribution/start?mode=scrub&fast_mode=true&durability=batched&object_concurrency=8&status_batch=512",
                 self.base_url, self.fragment
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.operator_token)
             .send()
             .await?;
         if response.status() != StatusCode::ACCEPTED {
