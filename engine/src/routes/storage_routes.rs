@@ -43,7 +43,8 @@ use crate::core::upload::{
     finalize_object_upload_direct as durable_finalize_object_upload_direct,
     finalize_standard_upload_direct, find_reusable_standard_upload,
     get_standard_upload_status_direct, get_upload_status as durable_get_upload_status_impl,
-    initiate_object_upload as durable_initiate_object_upload_impl, initiate_standard_upload_direct,
+    initiate_object_upload as durable_initiate_object_upload_impl,
+    initiate_standard_upload_direct_with_reuse,
     list_active_uploads as durable_list_active_uploads_impl, list_standard_uploads_direct,
     object_upload_part as durable_object_upload_part_impl, object_upload_part_standard_body_direct,
     upload_object_one_shot as upload_object_one_shot_impl, upload_object_one_shot_body_direct,
@@ -920,18 +921,35 @@ async fn rename_object_scoped(
     Ok(StatusCode::OK)
 }
 
+#[derive(Default, Deserialize)]
+struct UploadInitiationQuery {
+    /// Editors know their own session ID; never adopt another same-sized save.
+    #[serde(default)]
+    fresh: bool,
+}
+
 async fn initiate_object_upload_scoped(
     claims: Claims,
     Path(object_key): Path<String>,
+    Query(options): Query<UploadInitiationQuery>,
     AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    if let Some(existing) = find_reusable_standard_upload(&fragment, &object_key, &params)? {
-        return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
+    if !options.fresh {
+        if let Some(existing) = find_reusable_standard_upload(&fragment, &object_key, &params)? {
+            return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
+        }
     }
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
-    let response =
-        initiate_standard_upload_direct(claims, fragment, physical, object_key, params).await?;
+    let response = initiate_standard_upload_direct_with_reuse(
+        claims,
+        fragment,
+        physical,
+        object_key,
+        params,
+        !options.fresh,
+    )
+    .await?;
     Ok((StatusCode::CREATED, AxumJson(response)).into_response())
 }
 
@@ -1063,11 +1081,16 @@ async fn cancel_upload_session_scoped(
 async fn initiate_object_upload_durable_scoped(
     claims: Claims,
     Path(object_key): Path<String>,
+    Query(options): Query<UploadInitiationQuery>,
     AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    if let Some(existing) = find_reusable_pending_upload(&fragment, &object_key, &params).await? {
-        return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
+    if !options.fresh {
+        if let Some(existing) =
+            find_reusable_pending_upload(&fragment, &object_key, &params).await?
+        {
+            return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
+        }
     }
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let response = durable_initiate_object_upload_impl(
@@ -2043,6 +2066,15 @@ async fn removed_manual_reclamation_route() -> impl IntoResponse {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn independent_upload_initiation_is_explicit_and_defaults_to_reuse() {
+        let normal: UploadInitiationQuery = serde_json::from_str("{}").unwrap();
+        let independent: UploadInitiationQuery = serde_json::from_str(r#"{"fresh":true}"#).unwrap();
+        assert!(!normal.fresh);
+        assert!(independent.fresh);
+        assert!(serde_json::from_str::<UploadInitiationQuery>(r#"{"fresh":"yes"}"#).is_err());
+    }
 
     #[tokio::test]
     async fn restricted_http_tokens_cannot_mutate_objects_or_start_global_jobs() {

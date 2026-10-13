@@ -227,6 +227,25 @@ pub async fn initiate_standard_upload_direct(
     logical_path: String,
     params: InitiateUploadParams,
 ) -> Result<InitiateUploadResponse, AppError> {
+    initiate_standard_upload_direct_with_reuse(
+        claims,
+        fragment,
+        physical_object_key,
+        logical_path,
+        params,
+        true,
+    )
+    .await
+}
+
+pub async fn initiate_standard_upload_direct_with_reuse(
+    claims: Claims,
+    fragment: String,
+    physical_object_key: String,
+    logical_path: String,
+    params: InitiateUploadParams,
+    reuse_pending: bool,
+) -> Result<InitiateUploadResponse, AppError> {
     ensure_user_mutations_allowed()?;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
@@ -234,8 +253,10 @@ pub async fn initiate_standard_upload_direct(
     if claims.fragment != fragment {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
-    if let Some(existing) = find_reusable_standard_upload(&fragment, &logical_path, &params)? {
-        return Ok(existing);
+    if reuse_pending {
+        if let Some(existing) = find_reusable_standard_upload(&fragment, &logical_path, &params)? {
+            return Ok(existing);
+        }
     }
 
     let manifest = prepare_upload_manifest(&fragment, &physical_object_key, &params).await?;
@@ -247,6 +268,7 @@ pub async fn initiate_standard_upload_direct(
     let mut registry = standard_registry_write()?;
     if let Some(existing) = registry
         .values()
+        .filter(|_| reuse_pending)
         .filter(|existing| existing.manifest.fragment == fragment)
         .find(|existing| standard_request_matches(existing, &logical_path, &params))
     {

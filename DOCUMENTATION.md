@@ -835,6 +835,12 @@ resume state.
 POST /noa/v1/upload/multipart/init/{object_key}
 ```
 
+Initiation accepts optional `fresh=true` to allocate an independent session
+instead of adopting a same-sized pending upload. The default retains existing
+resume discovery. Editors should use `fresh=true` for a new save and retain the
+returned version/session IDs for retries. This applies to durable initiation
+too; it is not an atomic expected-version/conflict check.
+
 Body:
 
 ```json

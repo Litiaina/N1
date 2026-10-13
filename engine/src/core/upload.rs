@@ -381,8 +381,9 @@ pub use sessions::{
     active_standard_upload_versions, cancel_standard_upload_direct, complete_standard_upload,
     finalize_standard_upload_direct, find_reusable_standard_upload,
     get_standard_upload_status_direct, initiate_object_upload, initiate_object_upload_direct,
-    initiate_standard_upload_direct, list_standard_uploads_direct,
-    object_upload_part_standard_body_direct, object_upload_part_standard_reader_direct,
+    initiate_standard_upload_direct, initiate_standard_upload_direct_with_reuse,
+    list_standard_uploads_direct, object_upload_part_standard_body_direct,
+    object_upload_part_standard_reader_direct,
 };
 
 #[allow(unused_imports)]

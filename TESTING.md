@@ -5,6 +5,21 @@ dated evidence, not guarantees for every server. Older versions' passes do not
 certify the current namespace/pool design. Personal test paths and credentials
 are intentionally omitted.
 
+## Console Office upload integration — October 13, 2026
+
+All 300 engine library tests pass. Real USB/XFS 1+0 verification confirms that
+standard and durable `fresh=true` initiation allocate independent sessions for
+identical sizing, while default resume discovery remains unchanged.
+
+The real browser Office adapter created a native N1 DOCX version and reconciled
+a lost finalize acknowledgement to that exact version without another upload.
+The original bytes remained readable; 42 previously committed NDX/payload files
+retained their SHA-256 and modification times. Accel served a pinned-version HIT.
+No storage format, mutable version head, business database or NCX mutation
+semantics were added. The Console's native spreadsheet input failure is recorded
+in its testing document; it is not a failure of N1's committed-byte verification.
+This localhost 1+0 run does not test redundancy or physical power loss.
+
 ## Optional Accel read integration — October 13, 2026
 
 All 299 engine unit tests pass, including private read-proxy authority, range

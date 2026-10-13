@@ -5,6 +5,10 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## 4.0.0 — development, storage format 4
 
+- Multipart initiation accepts `fresh=true` for independent editor saves while
+  retaining default pending-session discovery. Retries use their original
+  session/version IDs; no storage format or namespace mutation changes.
+
 - Optional private Accel read proxy accelerates existing Console/API images,
   video ranges and downloads after authoritative authorization/version lookup.
   Cache-origin reads prevent recursive proxying without bypassing authorization;
