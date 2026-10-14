@@ -5,6 +5,19 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## 4.0.0 — development, storage format 4
 
+- Add committed-state online backup through the running engine's authenticated
+  HTTP/native endpoint. Pin the namespace and immutable version files at a
+  bounded capture boundary, then copy with N1 serving traffic. Unfinished upload
+  progress remains offline-only. Shell scheduling and Console expose both modes;
+  ordinary NCX copy/delete and max-ULID version selection remain unchanged.
+
+- Replace SSH-dependent remote snapshot replication with N1-owned HTTP(S) and
+  native N1(S) transport. Shell's optional operator endpoint executes existing
+  backup/restore/replication jobs for Console Maintenance, with dedicated
+  authentication, configured aliases, bounded streaming and explicit confirmations.
+  Backup repository format and ordinary NCX/NDX/payload semantics are unchanged.
+  Old SSH job fields/flags are rejected; configure the owned destination endpoint.
+
 - Multipart initiation accepts `fresh=true` for independent editor saves while
   retaining default pending-session discovery. Retries use their original
   session/version IDs; no storage format or namespace mutation changes.

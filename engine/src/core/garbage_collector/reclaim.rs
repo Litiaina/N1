@@ -16,6 +16,7 @@ pub(crate) fn reclaim_object_versions(
     ttl: Duration,
     mut keep_running: impl FnMut() -> bool,
 ) -> io::Result<u64> {
+    let _snapshot_boundary = crate::core::backup::barrier::mutation();
     let metadata = match fs::symlink_metadata(object_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),

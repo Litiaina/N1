@@ -348,6 +348,12 @@ async fn execute_native_op_inner(
     payload: Value,
     _body: Option<Vec<u8>>,
 ) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError> {
+    if op == "backup.operation" {
+        let value = crate::core::backup::network::live_native_operation(payload)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        return Ok(Some(native_body(value)));
+    }
     if native_operation_requires_write_safe_topology(op) {
         ensure_user_mutations_allowed()?;
     }

@@ -867,6 +867,12 @@ fn ndx_file_name(metadata: &ObjectMetadata) -> String {
     )
 }
 
+pub(crate) fn backup_version_from_ndx_name(name: &str) -> Option<String> {
+    let summary = parse_ndx_file_name(name)?;
+    ulid::Ulid::from_string(&summary.version_id).ok()?;
+    Some(summary.version_id)
+}
+
 fn parse_ndx_file_name(name: &str) -> Option<NdxSummary> {
     let stem = name.strip_suffix(".ndx")?;
     let mut parts = stem.split('.');
@@ -1238,6 +1244,7 @@ fn write_metadata_to_roots_with_durability(
     metadata: &ObjectMetadata,
     strict_durability: bool,
 ) -> Result<(), AppError> {
+    let _snapshot_boundary = crate::core::backup::barrier::mutation();
     ensure_fragment_dirs(&metadata.fragment)?;
     let bytes = encode(metadata)?;
     let file_name = ndx_file_name(metadata);

@@ -69,8 +69,8 @@ impl Driver for Fake {
         self.active = true;
         Ok(())
     }
-    fn capture(&mut self, _: &Config) -> Result<String> {
-        assert!(!self.active);
+    fn capture(&mut self, config: &Config) -> Result<String> {
+        assert!(!self.active || config.online_source.is_some());
         self.call("capture")?;
         Ok(ulid::Ulid::new().to_string())
     }
@@ -90,6 +90,32 @@ fn config() -> Config {
     Config {
         enabled: true,
         ..Config::default()
+    }
+}
+
+#[test]
+fn online_jobs_never_stop_or_restart_the_engine_even_on_failure() {
+    for failure in ["", "capture", "verify", "replicate"] {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let mut config = config();
+        config.online_source = Some(crate::core::backup::network::Destination {
+            url: "https://storage.example:21001".into(),
+            repository: "primary".into(),
+            token_file: "/private/operator.token".into(),
+            ca_file: None,
+            allow_plaintext: false,
+        });
+        let mut driver = Fake {
+            active: true,
+            fail: failure,
+            ..Fake::default()
+        };
+        let result = workflow::execute(&mut state, &config, &mut driver);
+        assert_eq!(result.is_ok(), !matches!(failure, "capture" | "verify"));
+        assert!(driver.active);
+        assert!(!driver.calls.contains(&"stop") && !driver.calls.contains(&"start"));
+        assert!(state.status.restart.is_none());
     }
 }
 
@@ -160,10 +186,10 @@ fn failed_replication_retries_same_snapshot_without_another_outage_or_retention(
     cfg.replica = Some(super::config::Replica {
         repository: "/backup/replica".into(),
         key_file: "/backup/key".into(),
-        ssh: None,
-        ssh_config: None,
-        remote_binary: "backup".into(),
-        remote_backup_subcommand: false,
+        url: None,
+        token_file: None,
+        ca_file: None,
+        allow_plaintext: false,
         keep_last: 2,
     });
     let mut driver = Fake {

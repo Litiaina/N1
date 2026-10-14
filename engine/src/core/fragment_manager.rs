@@ -158,6 +158,20 @@ async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppEr
 
 pub async fn create_fragment(
     Json(payload): Json<CreateFragmentRequest>,
+) -> Result<axum::response::Response, AppError> {
+    // The owned task retains admission even if the requesting client leaves.
+    tokio::spawn(async move {
+        let _boundary = crate::core::backup::barrier::mutation_async().await;
+        create_fragment_inner(payload)
+            .await
+            .map(IntoResponse::into_response)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?
+}
+
+async fn create_fragment_inner(
+    payload: CreateFragmentRequest,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_user_mutations_allowed()?;
     if payload.secret != *MASTER_KEY {
@@ -224,6 +238,22 @@ pub async fn update_fragment(
     claims: Claims,
     Path(fragment_hash): Path<String>,
     Json(payload): Json<UpdateFragmentRequest>,
+) -> Result<axum::response::Response, AppError> {
+    tokio::spawn(async move {
+        let _boundary = crate::core::backup::barrier::mutation_async().await;
+        update_fragment_inner(state, claims, fragment_hash, payload)
+            .await
+            .map(IntoResponse::into_response)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?
+}
+
+async fn update_fragment_inner(
+    state: Arc<AppState>,
+    claims: Claims,
+    fragment_hash: String,
+    payload: UpdateFragmentRequest,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_user_mutations_allowed()?;
     let is_admin = payload
@@ -350,6 +380,7 @@ pub async fn delete_fragment(
     let lifecycle_guard = crate::core::fragment_lifecycle::acquire(&stable_owned).await?;
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let _snapshot_boundary = crate::core::backup::barrier::mutation();
         // Keep exclusion in the worker even if the HTTP request is cancelled.
         let _lifecycle_guard = lifecycle_guard;
         global_namespace_runtime().evict_fragment(&stable_owned);

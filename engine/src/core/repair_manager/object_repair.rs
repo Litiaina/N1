@@ -176,6 +176,21 @@ pub(super) async fn repair_fragment_metadata_replicas(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
+    let roots = index_roots.to_vec();
+    let fragment = fragment.to_owned();
+    tokio::spawn(async move {
+        let _boundary = crate::core::backup::barrier::mutation_async().await;
+        repair_fragment_metadata_replicas_inner(&roots, &fragment, dry_run).await
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(e.to_string()))?
+}
+
+async fn repair_fragment_metadata_replicas_inner(
+    index_roots: &[PathBuf],
+    fragment: &str,
+    dry_run: bool,
+) -> Result<(u64, u64, u64), AppError> {
     let paths: Vec<PathBuf> = index_roots
         .iter()
         .map(|r| fragment_root_on(r, fragment).join(FRAGMENT_METADATA_FILE))

@@ -1,5 +1,6 @@
 {
   "enabled": false,
+  "online_source": null,
   "service": { "unit": "litiaina-n1.service", "user": false },
   "engine_config": "/opt/litiaina/n1/n1_config.ini",
   "repository": "/backup/n1-primary",
@@ -13,12 +14,12 @@
   "keep_last": 4,
   "max_age_seconds": 691200,
   "replica": {
-    "repository": "/backup/n1-replica",
+    "repository": "replica",
     "key_file": "/etc/litiaina/n1/backup.key",
-    "ssh": "n1-backup@backup-host",
-    "ssh_config": "/etc/litiaina/n1/backup-ssh.conf",
-    "remote_binary": "/opt/litiaina/n1/litiaina-n1-shell",
-    "remote_backup_subcommand": true,
+    "url": "https://backup-host:50902",
+    "token_file": "/etc/litiaina/n1/replica.token",
+    "ca_file": "/etc/litiaina/n1/backup-ca.pem",
+    "allow_plaintext": false,
     "keep_last": 8
   }
 }

@@ -85,7 +85,7 @@ pub fn recover(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn status(path: &Path) -> Result<()> {
+pub fn status_value(path: &Path) -> Result<serde_json::Value> {
     let config = config::Config::load(path)?;
     let status = state::State::read(&config.state_dir)?;
     let age = status
@@ -95,12 +95,44 @@ pub fn status(path: &Path) -> Result<()> {
         && status.phase == "complete"
         && status.restart.is_none()
         && age.is_some_and(|age| age >= 0 && age as u64 <= config.max_age_seconds);
-    println!(
-        "{}",
+    Ok(
         serde_json::json!({"enabled":config.enabled,"healthy":healthy,
-        "max_age_seconds":config.max_age_seconds,"last_success_age_seconds":age,"status":status})
+        "max_age_seconds":config.max_age_seconds,"last_success_age_seconds":age,"status":status}),
+    )
+}
+pub fn run_enabled(path: &Path) -> Result<serde_json::Value> {
+    if !config::Config::load(path)?.enabled {
+        return Err(super::invalid("configured backup job is disabled"));
+    }
+    run(path)?;
+    status_value(path)
+}
+/// Restart recovery depends on the recorded service intent, not live network
+/// credentials, certificates, repository availability or the enabled setting.
+pub fn recover_configured(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::symlink_metadata(path)?.permissions().mode() & 0o022 != 0 {
+        return Err(super::invalid("unsafe backup job configuration"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&super::fs::read_regular(path, 65536)?)?;
+    let state = Path::new(
+        value["state_dir"]
+            .as_str()
+            .unwrap_or("/var/lib/litiaina/n1-backup"),
     );
-    if config.enabled && !healthy {
+    if !state.is_absolute()
+        || state
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(super::invalid("invalid recovery state path"));
+    }
+    recover(state)
+}
+pub fn status(path: &Path) -> Result<()> {
+    let value = status_value(path)?;
+    println!("{value}");
+    if value["enabled"] == true && value["healthy"] != true {
         return Err(super::invalid(
             "automatic backup is overdue, incomplete or failed",
         ));

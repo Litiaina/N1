@@ -1485,16 +1485,17 @@ and never requires payload EC recoding when logical pool geometry is unchanged.
 
 ## Backup and restore
 
-`litiaina-n1-shell backup` creates encrypted offline recovery points, not
+`litiaina-n1-shell backup` creates encrypted recovery points, not
 live replication or a writable standby. It delegates to the matching engine;
-the legacy `litiaina-n1-backup` helper remains available for existing jobs and
-SSH receivers. Both use the same implementation and repository format.
-Capture requires all configured roots, initialized leases and a stopped engine
+the legacy `litiaina-n1-backup` helper remains available for local jobs.
+Both use the same implementation and repository format. Remote transfer uses
+N1-owned HTTP(S) or native N1(S); no SSH client/daemon is used.
+Offline capture requires all configured roots, initialized leases and a stopped engine
 for the entire scan; quiesce application writers first. Source leases reject an
 active updated engine, but cannot protect against unrelated filesystem writes.
 Do not remount/edit roots or overlap maintenance during capture.
 
-Capture includes pool/fragment identities and credentials, live/trash NCX,
+Offline capture includes pool/fragment identities and credentials, live/trash NCX,
 NDX/payload, durable multipart progress, directories/symlinks and timestamps.
 It excludes runtime leases/physical-root identity, control workspace, config/env,
 TLS/service files, refresh-token sessions, exports, Accel and application DBs.
@@ -1528,6 +1529,75 @@ Use an account with source/repository access. Incremental capture reuses blocks
 but still reads/hashes the tree; downtime scales with dataset and storage.
 Workers are bounded at 1–32, default four, with streamed 4 MiB blocks.
 
+### Online committed-state capture
+
+Online capture is coordinated by the **running N1 engine**, not an unguarded
+filesystem scan from Shell. Configure private repository aliases, a dedicated
+operator token and `engine_config` using
+[backup-operator.json.example](deploy/backup-operator.json.example), then set
+`N1_BACKUP_OPERATOR_CONFIG=/etc/litiaina/n1/backup-operator.json` in N1's service
+environment and restart once to enable it. Initialize the repository/key first.
+N1 uses its existing HTTPS/native listeners; no extra engine listener is needed.
+
+```bash
+litiaina-n1-shell backup create-online \
+  --source-url https://storage-host:21001 --repository primary \
+  --token-file /secure/operator.token --ca-file /secure/storage-ca.pem
+```
+
+Native `n1://` control is also supported with explicit `--allow-plaintext` on a
+trusted network. TLS verification is not disabled. The engine endpoint accepts
+`create-online`, `capabilities` and `operations` only, using the dedicated token;
+fragment/master JWTs alone cannot run backup jobs. Paths come from private
+configuration, never API callers.
+
+The engine briefly queues mutations while it pins the exact committed namespace
+and version set. `capture_boundary_seconds` defaults to 30 (1–300), bounding
+admission and traversal; timeout abandons the view rather than publishing a
+partial point. Payload verification, hashing, encryption and copying occur after
+mutation admission reopens. The completed result reports `boundary_ms` and
+`capture_mode: "online_committed"`. Hard links retain selected files across later
+rename, deletion and GC; no payload copy happens under the capture boundary.
+The deadline is checked between filesystem calls; it cannot forcibly cancel a
+kernel-blocked device call. Complete redistribution and manual filesystem/mount
+maintenance before capture.
+
+Scope: committed objects/all committed versions, trash, pool/fragment identities
+and credentials. **No unfinished upload sessions, receipts or temporary pieces.**
+Full durable-upload continuation is the separate offline mode. Application DBs,
+configuration/env, keys, TLS and runtime workspaces still need separate protection.
+A consistent N1 point is not an application database transaction snapshot.
+Backup requires a complete healthy pool; missing/corrupt files fail closed.
+Keep byte/inode headroom for scratch links and repository blocks. The view is
+not an independent backup until the encrypted repository snapshot is complete.
+
+Shell's separate operator config can set `online_source` to a `Destination`
+(`url`, source repository alias, private `token_file`, optional `ca_file`,
+`allow_plaintext`). It forwards capture to N1, waits for real completion, and
+continues to provide repository verification/replication/restore while N1 runs.
+An automated job uses the same optional `online_source` field: no engine stop,
+restart intent or service-state transition is made in online mode. Omit it for
+full offline capture. Retention follows verification and required replication.
+
+For online mode, place this object in the Shell operator and job configuration
+(replace the source alias/CA/token with your configured values):
+
+```json
+"online_source": {
+  "url": "https://127.0.0.1:21001",
+  "repository": "primary",
+  "token_file": "/etc/litiaina/n1/operator.token",
+  "ca_file": "/etc/litiaina/n1/source-ca.pem",
+  "allow_plaintext": false
+}
+```
+
+The running engine's preset needs the repository alias and dedicated token;
+it captures locally and does not forward `create-online` to itself. The standalone
+Shell endpoint uses `online_source` to reach that engine. Keep source and Shell
+repository configuration aligned. Offline supervision requires service-management
+permissions; online-only jobs do not need permission to stop/start N1.
+
 ### Replicate recovery points
 
 Initialize the destination with a protected copy of the same key. Put it on an
@@ -1543,19 +1613,88 @@ litiaina-n1-shell backup replicate \
 
 litiaina-n1-shell backup replicate \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key \
-  --snapshot SNAPSHOT_ID --ssh backup@backup-host \
-  --remote-binary /opt/litiaina/n1/litiaina-n1-shell --remote-backup-subcommand \
-  --target-repository /backup/n1-replica \
-  --target-key-file /secure/n1-backup.key
+  --snapshot SNAPSHOT_ID --target-url https://backup-host:50902 \
+  --target-repository replica --token-file /secure/replica-operator.token \
+  --ca-file /secure/backup-ca.pem
 ```
 
-Install the matching Engine/Shell pair remotely and configure SSH keys/known_hosts.
-`--remote-backup-subcommand` selects their `backup receive` entrypoint; omit it
-only when explicitly using the legacy standalone helper. Normal
-host-key verification applies; --ssh-config can select a dedicated config.
+Run the matching Engine/Shell pair's own operator endpoint on the destination
+(see below). The remote repository is a configured **alias**, not a caller-supplied
+path. The backup encryption key stays on each host; only the dedicated operator
+token authenticates the connection. HTTPS validates the hostname/certificate;
+use a trusted CA file for private certificates. Native `n1s://backup-host:50903`
+uses the same operations and built-in TLS (requires `--ca-file`). Explicit trusted
+network testing can use `http://` or `n1://` with `--allow-plaintext`; these expose
+credentials/data in transit and must not be used on an untrusted network.
+HTTP transfer is a bounded binary WebSocket stream upgraded on the N1-owned
+endpoint. Native transfer starts with an N1 MessagePack operation frame. Both
+carry the existing snapshot/block verification protocol, not live root copying.
 Interrupted transfer is retried with the same snapshot; verified blocks are
 reused. A partial transfer is not a committed recovery point. Replication does
 not propagate source deletion or retention; choose destination retention separately.
+
+For planned server migration, pre-copy a verified online recovery point to the
+new server over the same owned protocol. At cutover, pause application writes,
+capture and replicate the final point, verify it, then restore into empty stopped
+target roots with matching pool geometry/member slots. Keep the old authority
+stopped before enabling writes on the new server. Online pre-copy shortens the
+handoff; it is not live mirroring, automatic failover or a zero-downtime restore.
+
+### Shell-owned operator API and Console
+
+The endpoint runs independently of the storage engine so offline capture/restore
+does not disconnect Console. It uses the existing backup implementation; it
+does not create another namespace, live replica, or storage coordinator.
+
+```bash
+litiaina-n1-shell backup operator-keygen --token-file /secure/operator.token
+# Adapt deploy/backup-operator.json.example; protect it with chmod 600.
+litiaina-n1-shell backup serve --config /etc/litiaina/n1/backup-operator.json
+```
+
+Configure fixed repository aliases/key files, source engine config, optional
+replica aliases, empty restore-target configs and supervised-job configs. Only
+the configured paths/operations are accepted; no terminal/remote commands,
+formatting or arbitrary filesystem paths are accepted from clients. Keep the
+operator token separate from the backup encryption key and fragment credentials.
+TLS is required unless plaintext is explicitly enabled. The same certificate
+secures HTTP and native listeners. Exact Console origins must be listed in
+`allowed_origins`; tokens never belong in URLs or browser storage.
+
+`POST /noa/v1/maintenance/backups/operation` on this endpoint accepts JSON
+`operation` plus configured `repository`, `snapshot`, `target` or `job` aliases.
+Operations: `capabilities`, `list`, `operations`, `init`, `create`, `create-online`, `verify`,
+`replicate`, `restore`, `forget`, `gc`, `prune`, `run-job`, `job-status`.
+Mutating/offline operations require `confirm=true`. Restore resumes only with
+`resume=true` and matching existing fences. Long jobs return `operation_id`;
+query `operations` for actual completion/failure. Acceptance is not success.
+Native operation `backup.operation` uses the same payload plus the operator
+`token`; `backup.receive` opens the snapshot transfer stream after authentication.
+API job history is bounded and process-local; after an endpoint restart inspect
+repository verification, restore fences and durable supervised-job status rather
+than assuming an interrupted request succeeded. Repository leases/pins/fences,
+not this UI history, enforce recovery safety.
+
+Console → Maintenance → Backups & snapshot replication connects to this endpoint
+and executes capture/verify/replicate/restore and retention operations. `create`
+remains full offline capture; `create-online` forwards to the configured running
+N1 source and excludes unfinished uploads. Target restore remains offline.
+A configured `run-job` follows its online/offline source setting, then verifies
+and replicates; it does not quiesce application databases. Scheduling remains the
+optional configured backup timer, not a browser timer. The supplied optional
+`litiaina-n1-operator.service` starts the Shell-owned endpoint; it is not an
+external software dependency. An ordinary static Console cannot host operations
+on another machine without that machine's N1-owned endpoint.
+Install its matching `litiaina-n1-operator-recover.service` too: ExecStopPost and
+independent failure/boot recovery restore recorded engine restart intent after
+an interrupted supervised job. Endpoint startup also checks that intent. When
+running without a supervisor, after the killed process and children have exited,
+run `backup recover-operator --config backup-operator.json` before further work.
+Recovery does not label an interrupted backup successful. Do not remove its
+job state or restore fences to force readiness. Disabled jobs cannot be launched
+through the API; configure and approve their service/settings first.
+Repository admission failure is reported before transfer acceptance (HTTP 409
+or native `repository_unavailable`); wait/retry without bypassing the lease.
 
 ### Portable restore
 
@@ -1606,12 +1745,13 @@ administrators can still erase it.
 default. Initialize repositories/key first, configure exact paths/service,
 private state outside roots/repositories, timeouts and independent retention,
 then set enabled=true for an approved maintenance window. Protect the config,
-state, binaries and SSH settings from untrusted writes. The source engine must
+state, binaries and destination token/CA settings from untrusted writes. The source engine must
 have initialized its root leases before capture.
 
 Install the supplied units in /etc/systemd/system and the matching Engine/Shell
-pair at their configured executable paths. Integrated remote replicas set
-`remote_backup_subcommand=true`; legacy helper receivers leave it false.
+pair at their configured executable paths. Remote replicas set `url`,
+`repository` (destination alias), `token_file` and optional `ca_file`; local
+replicas retain repository/key paths. Old SSH fields/CLI flags are rejected.
 
 ```bash
 sudo install -m 644 deploy/systemd/litiaina-n1-backup.service \
@@ -1625,7 +1765,7 @@ sudo /opt/litiaina/n1/litiaina-n1-shell backup job-status \
 sudo systemctl enable --now litiaina-n1-backup.timer
 ```
 
-The supervisor preserves the original N1 service state, records restart intent
+In offline mode the supervisor preserves the original N1 service state, records restart intent
 before stopping, restarts before verify/replication, and applies retention only
 after required success. Pending replication retries reuse the snapshot without
 another capture. ExecStopPost plus separate-cgroup OnFailure/boot recovery handle

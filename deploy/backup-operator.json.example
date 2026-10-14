@@ -1,0 +1,27 @@
+{
+  "bind": "0.0.0.0:50902",
+  "native_bind": "0.0.0.0:50903",
+  "token_file": "/etc/litiaina/n1/operator.token",
+  "tls_cert": "/etc/litiaina/n1/cert.pem",
+  "tls_key": "/etc/litiaina/n1/key.pem",
+  "allow_plaintext": false,
+  "allowed_origins": ["https://console.example:8443"],
+  "engine_config": "/etc/litiaina/n1/n1_config.ini",
+  "online_source": null,
+  "capture_boundary_seconds": 30,
+  "capture_timeout_seconds": 3600,
+  "repositories": {
+    "primary": {"path": "/backup/n1-primary", "key_file": "/etc/litiaina/n1/backup.key"}
+  },
+  "replicas": {
+    "offsite": {
+      "url": "https://backup-host:50902",
+      "repository": "replica",
+      "token_file": "/etc/litiaina/n1/offsite-operator.token",
+      "ca_file": "/etc/litiaina/n1/backup-ca.pem",
+      "allow_plaintext": false
+    }
+  },
+  "restore_targets": {},
+  "jobs": {"scheduled": "/etc/litiaina/n1/backup-job.json"}
+}

@@ -29,6 +29,7 @@ include!("proof_client.rs");
 include!("proof_native.rs");
 include!("proof_noa.rs");
 include!("proof_backup.rs");
+include!("proof_online_backup.rs");
 include!("proof_pool_maintenance.rs");
 include!("proof_pool_relocation.rs");
 include!("proof_flat_namespace.rs");
@@ -56,7 +57,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.pool_relocation_proof {
+    let result = if proof.args.online_backup_proof {
+        proof.run_online_backup_proof().await
+    } else if proof.args.pool_relocation_proof {
         proof.run_pool_relocation_proof().await
     } else if proof.args.pool_maintenance_proof {
         proof.run_pool_maintenance_proof().await

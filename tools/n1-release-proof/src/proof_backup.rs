@@ -1,3 +1,11 @@
+struct BackupReceiverGuard(std::process::Child);
+impl Drop for BackupReceiverGuard {
+    fn drop(&mut self) {
+        // Only this fixture's dedicated process group, never a deployed service.
+        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL); }
+        let _ = self.0.wait();
+    }
+}
 impl Proof {
     fn interrupt_backup_restore(
         &self,
@@ -83,7 +91,20 @@ impl Proof {
         if operation != "keygen" {
             command.arg("--repository").arg(repo);
         }
-        let output = command.args(args).output()?;
+        if operation == "replicate" && self.args.backup_transport != "local" {
+            let mut index = 0;
+            while index < args.len() {
+                if matches!(args[index], "--target-repository" | "--target-key-file") { index += 2; }
+                else { command.arg(args[index]); index += 1; }
+            }
+            command.arg("--target-repository").arg("replica")
+                .arg("--target-url").arg(fs::read_to_string(self.args.out_dir.join("backup-operator.url"))?.trim())
+                .arg("--token-file").arg(self.args.out_dir.join("backup-operator.token"));
+            if matches!(self.args.backup_transport.as_str(), "https" | "native-tls") {
+                command.arg("--ca-file").arg(self.args.out_dir.join("backup-ca.pem"));
+            } else { command.arg("--allow-plaintext"); }
+        } else { command.args(args); }
+        let output = command.output()?;
         if output.status.success() != success {
             return Err(format!(
                 "backup {operation}: status={} stdout={} stderr={}",
@@ -135,6 +156,43 @@ impl Proof {
         self.backup_cli(&repo, &key, "keygen", &[], true)?;
         self.backup_cli(&repo, &key, "init", &[], true)?;
         self.backup_cli(&replica, &key, "init", &[], true)?;
+        let _owned_receiver = if self.args.backup_transport != "local" {
+            use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+            let reserve = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let http = reserve.local_addr()?; drop(reserve);
+            let reserve = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let native = reserve.local_addr()?; drop(reserve);
+            let token = evidence.join("backup-operator.token");
+            fs::write(&token, format!("{}{}",ulid::Ulid::new(),ulid::Ulid::new()))?;
+            fs::set_permissions(&token,fs::Permissions::from_mode(0o600))?;
+            let receiver_config = evidence.join("backup-operator.json");
+            let secure=matches!(self.args.backup_transport.as_str(), "https" | "native-tls");
+            let mut settings=json!({"bind":http.to_string(),"native_bind":native.to_string(),"allow_plaintext":!secure,"token_file":token,"repositories":{"replica":{"path":replica,"key_file":key}}});
+            if secure {
+                let cert=evidence.join("backup-cert.pem");let tls_key=evidence.join("backup-tls.key");
+                let ca=evidence.join("backup-ca.pem");let ca_key=evidence.join("backup-ca.key");let csr=evidence.join("backup.csr");
+                // Fixture provisioning only. Runtime transfer/server uses built-in Rust TLS.
+                let status=Command::new("openssl").args(["req","-x509","-newkey","rsa:2048","-sha256","-days","1","-nodes","-keyout"]).arg(&ca_key).arg("-out").arg(&ca).args(["-subj","/CN=N1 Backup Test CA","-addext","basicConstraints=critical,CA:TRUE","-addext","keyUsage=critical,keyCertSign,cRLSign"]).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+                if !status.success(){return Err("fixture CA creation failed".into());}
+                let status=Command::new("openssl").args(["req","-new","-newkey","rsa:2048","-sha256","-nodes","-keyout"]).arg(&tls_key).arg("-out").arg(&csr).args(["-subj","/CN=localhost","-addext","basicConstraints=critical,CA:FALSE","-addext","subjectAltName=DNS:localhost,IP:127.0.0.1","-addext","extendedKeyUsage=serverAuth","-addext","keyUsage=digitalSignature,keyEncipherment"]).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+                if !status.success(){return Err("fixture CSR creation failed".into());}
+                let status=Command::new("openssl").args(["x509","-req","-in"]).arg(&csr).arg("-CA").arg(&ca).arg("-CAkey").arg(&ca_key).args(["-CAcreateserial","-days","1","-sha256","-copy_extensions","copy","-out"]).arg(&cert).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+                if !status.success(){return Err("fixture leaf signing failed".into());}
+                settings["tls_cert"]=json!(cert);settings["tls_key"]=json!(tls_key);
+            }
+            fs::write(&receiver_config, serde_json::to_vec(&settings)?)?;
+            fs::set_permissions(&receiver_config,fs::Permissions::from_mode(0o600))?;
+            let native_transport=matches!(self.args.backup_transport.as_str(), "native"|"native-tls");
+            let scheme=match self.args.backup_transport.as_str(){"native"=>"n1","native-tls"=>"n1s","https"=>"https",_=>"http"};
+            let endpoint = format!("{scheme}://{}",if native_transport {native}else{http});
+            fs::write(evidence.join("backup-operator.url"),endpoint)?;
+            let log=fs::File::create(evidence.join("backup-operator.log"))?;
+            let child=Command::new(&self.args.binary).args(["backup","serve","--config"]).arg(&receiver_config).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).process_group(0).spawn()?;
+            let guard=BackupReceiverGuard(child);
+            let deadline=Instant::now()+Duration::from_secs(30);
+            loop { if std::net::TcpStream::connect(http).is_ok() {break;} if Instant::now()>deadline {return Err("owned backup receiver did not start".into());} std::thread::sleep(Duration::from_millis(20)); }
+            Some(guard)
+        } else { None };
         self.start_server("backup-source").await?;
         self.create_fragment().await?;
         self.auth().await?;
@@ -477,7 +535,7 @@ impl Proof {
         self.summary = json!({"status":"PASS","proof":"encrypted_offline_backup_and_snapshot_replication","ec":[self.data_shards,self.parity_shards],
             "first_snapshot":first,"second_snapshot":second,"capture_seconds":capture_seconds,"incremental_capture_seconds":incremental_seconds,
             "replication_seconds":replication_seconds,"restore_seconds":restore_seconds,"restore_interrupted_files":restore_interrupted_files,
-            "physical_power_cut":false,"lineage":lineage,"small_objects":storm,
+            "physical_power_cut":false,"backup_transport":self.args.backup_transport,"lineage":lineage,"small_objects":storm,
             "single_member_cross_device_restore":portable_spare.is_some(),
             "checks":["online_capture_rejected","encrypted_capture_verified","incremental_snapshot","replication_idempotent","original_roots_offline",
                 "portable_restore","sigkill_after_restore_piece_publication","interrupted_restore_startup_rejected","explicit_restore_resume",

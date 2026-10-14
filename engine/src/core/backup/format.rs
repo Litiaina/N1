@@ -40,6 +40,8 @@ pub struct Snapshot {
     pub engine_format: u16,
     pub id: String,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_mode: Option<String>,
     pub roots: Vec<Root>,
     pub records: u64,
     pub source_bytes: u64,

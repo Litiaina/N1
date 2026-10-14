@@ -8,6 +8,9 @@ name = "n1-release-proof"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
+walkdir.workspace = true
+ulid.workspace = true
 async_zip.workspace = true
 clap.workspace = true
 futures-util.workspace = true

@@ -16,7 +16,11 @@ pub fn reserved(path: &str) -> bool {
     path.split('/').next().is_some_and(|name| {
         matches!(
             name,
-            WORK | COMPLETE | RESTORE_PENDING | LEASE_FILE | ".n1-root-id"
+            WORK | COMPLETE
+                | RESTORE_PENDING
+                | LEASE_FILE
+                | ".n1-root-id"
+                | super::online::VIEW_DIR
         )
     })
 }

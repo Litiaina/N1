@@ -33,20 +33,16 @@ pub struct Replica {
     pub repository: PathBuf,
     pub key_file: PathBuf,
     #[serde(default)]
-    pub ssh: Option<String>,
+    pub url: Option<String>,
     #[serde(default)]
-    pub ssh_config: Option<PathBuf>,
-    #[serde(default = "remote_binary")]
-    pub remote_binary: String,
-    /// True for litiaina-n1 or litiaina-n1-shell; false for the legacy helper.
+    pub token_file: Option<PathBuf>,
     #[serde(default)]
-    pub remote_backup_subcommand: bool,
+    pub ca_file: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_plaintext: bool,
     /// Zero disables automatic destination retention, independently of source.
     #[serde(default)]
     pub keep_last: usize,
-}
-fn remote_binary() -> String {
-    "litiaina-n1-backup".into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -66,6 +62,8 @@ pub struct Config {
     pub keep_last: usize,
     pub max_age_seconds: u64,
     pub replica: Option<Replica>,
+    /// Some = committed-state online capture; None = full offline recovery.
+    pub online_source: Option<super::super::network::Destination>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -87,6 +85,7 @@ impl Default for Config {
             keep_last: 0,
             max_age_seconds: 172800,
             replica: None,
+            online_source: None,
         }
     }
 }
@@ -103,6 +102,9 @@ impl Config {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(source) = &self.online_source {
+            source.validate()?;
+        }
         self.service.validate()?;
         for path in [
             &self.engine_config,
@@ -123,24 +125,33 @@ impl Config {
             return Err(invalid("backup job limits are outside supported bounds"));
         }
         if let Some(replica) = &self.replica {
-            absolute(&replica.repository)?;
-            absolute(&replica.key_file)?;
-            if replica.keep_last > 10000 || replica.remote_binary.is_empty() {
+            if replica.url.is_none() {
+                absolute(&replica.repository)?;
+                absolute(&replica.key_file)?;
+            } else if replica.token_file.is_none() {
+                return Err(invalid("remote replica requires an operator token file"));
+            }
+            if replica.keep_last > 10000 {
                 return Err(invalid("invalid replica settings"));
             }
-            if replica.ssh_config.is_some() && replica.ssh.is_none() {
-                return Err(invalid("replica ssh_config requires an SSH destination"));
-            }
-            if let Some(path) = &replica.ssh_config {
+            if let Some(path) = &replica.token_file {
                 absolute(path)?;
             }
-            if let Some(host) = &replica.ssh
-                && (host.is_empty()
-                    || host.starts_with('-')
-                    || host.contains(char::is_whitespace)
-                    || host.contains('\0'))
-            {
-                return Err(invalid("invalid replica SSH destination"));
+            if let Some(path) = &replica.ca_file {
+                absolute(path)?;
+            }
+            if let Some(url) = &replica.url {
+                super::super::network::Destination {
+                    url: url.clone(),
+                    repository: replica.repository.to_string_lossy().into_owned(),
+                    token_file: replica
+                        .token_file
+                        .clone()
+                        .ok_or_else(|| invalid("missing replica token"))?,
+                    ca_file: replica.ca_file.clone(),
+                    allow_plaintext: replica.allow_plaintext,
+                }
+                .validate()?;
             }
         }
         Ok(())

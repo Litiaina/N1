@@ -80,6 +80,11 @@ struct Args {
     noa_api_proof: bool,
     #[arg(long, default_value_t = false)]
     backup_proof: bool,
+    #[arg(long, default_value_t = false)]
+    online_backup_proof: bool,
+    /// Exercise owned network replication instead of local repository transfer.
+    #[arg(long, default_value = "local", value_parser = ["local", "http", "native", "https", "native-tls"])]
+    backup_transport: String,
     /// Offline byte-exact clone, same-path device cutover and missing-member reconstruction.
     #[arg(long, default_value_t = false)]
     pool_maintenance_proof: bool,

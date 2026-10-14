@@ -17,7 +17,7 @@ pub fn run(operation: &str, args: &OfflineArgs) -> Result<(), cli_core::client::
         .args(&args.arguments)
         .status()?;
     if !status.success() {
-        return Err(io::Error::other(format!("offline {operation} exited with {status}")).into());
+        return Err(io::Error::other(format!("N1 {operation} task exited with {status}")).into());
     }
     Ok(())
 }

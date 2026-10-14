@@ -1,0 +1,16 @@
+[Unit]
+Description=N1 Shell-owned backup and maintenance endpoint
+After=network.target
+OnFailure=litiaina-n1-operator-recover.service
+
+[Service]
+Type=simple
+ExecStart=/opt/litiaina/n1/litiaina-n1-shell backup serve --config /etc/litiaina/n1/backup-operator.json
+ExecStopPost=/opt/litiaina/n1/litiaina-n1-shell backup recover-operator --config /etc/litiaina/n1/backup-operator.json
+Restart=on-failure
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=360
+
+[Install]
+WantedBy=multi-user.target

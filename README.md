@@ -23,7 +23,7 @@
 
 N1 is a single-node object store for durable data on local storage. It provides
 authenticated fragments, immutable object versions, streaming erasure coding,
-trash/recovery, repair, exports and encrypted offline backups.
+trash/recovery, repair, exports and encrypted online/offline backups.
 
 N1 favors few moving parts and bounded-memory processing. Accel is an optional,
 disposable search/cache layer, not part of storage authority. N1 is not N2 and
@@ -160,7 +160,19 @@ litiaina-n1-shell backup init \
   --repository /backup/n1-primary --key-file /secure/n1-backup.key
 ```
 
-Quiesce writers first. N1 must remain stopped throughout capture:
+For online capture, configure N1's dedicated backup operator preset/token and
+set `N1_BACKUP_OPERATOR_CONFIG` before startup. This includes committed objects,
+versions and trash, not unfinished uploads. N1 remains running; mutations may
+briefly wait while the view is pinned. See the [online setup](DOCUMENTATION.md#online-committed-state-capture).
+
+```bash
+litiaina-n1-shell backup create-online \
+  --source-url https://storage-host:21001 --repository primary \
+  --token-file /secure/operator.token --ca-file /secure/storage-ca.pem
+```
+
+For full offline recovery including unfinished durable-upload progress, quiesce
+writers first. N1 must remain stopped throughout this capture:
 
 ```bash
 sudo systemctl stop litiaina-n1.service
@@ -181,6 +193,15 @@ Back up configuration, secrets, TLS keys and application databases separately.
 Test restoration before relying on a recovery point. Replication, portable
 restore, retention and disabled-by-default scheduled jobs are documented in
 [Backup and restore](DOCUMENTATION.md#backup-and-restore).
+
+Remote replication uses N1-owned HTTP(S) or native N1(S), not SSH/SCP. Run
+`litiaina-n1-shell backup serve --config backup-operator.json` on the destination;
+configure its allowed repositories and a separate operator token. The same
+optional Shell endpoint provides Console Maintenance's working backup, verification,
+replication, restore and job-status controls, including online capture when a
+running N1 source is configured. Only offline capture and target restore need
+the relevant engine stopped.
+See [operator API](DOCUMENTATION.md#shell-owned-operator-api-and-console).
 
 ## Documentation
 

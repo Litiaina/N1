@@ -804,6 +804,16 @@ pub async fn run_server() {
             std::process::exit(1);
         });
     tracing::info!("Storage mode: N1 4 flat object namespace on independent unified storage pools");
+    crate::core::backup::online::cleanup_interrupted_views(&instance_roots).unwrap_or_else(
+        |error| {
+            tracing::error!("Cannot clean interrupted online backup views: {error}");
+            std::process::exit(1);
+        },
+    );
+    crate::core::backup::network::initialize_live_source().unwrap_or_else(|error| {
+        tracing::error!("Cannot configure online backup source: {error}");
+        std::process::exit(1);
+    });
 
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();

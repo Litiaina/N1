@@ -439,6 +439,7 @@ fn gc_cleanup_version_dir_unix(
     gc_ttl: Duration,
     is_manual: bool,
 ) {
+    let _snapshot_boundary = crate::core::backup::barrier::mutation();
     let rd = match fs::read_dir(version_dir) {
         Ok(r) => r,
         Err(_) => return,
@@ -586,6 +587,7 @@ fn orphan_version_reclaimable(
 }
 
 fn prune_orphan_object_dir(object_dir: &Path, now: SystemTime, ttl: Duration) -> bool {
+    let _snapshot_boundary = crate::core::backup::barrier::mutation();
     let Ok(metadata) = fs::symlink_metadata(object_dir) else {
         return false;
     };

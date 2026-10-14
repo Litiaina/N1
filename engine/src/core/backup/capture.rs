@@ -133,9 +133,36 @@ pub fn create(repo: &Repository, roots: Vec<Root>, workers: usize) -> Result<Sna
             return Err(invalid("cannot back up an incomplete restore"));
         }
     }
-    // Kept until every read and the durable snapshot publication complete.
-    // A crashed capture releases this OS lease but has no committed snapshot.
     let _source = InstanceLease::acquire(&paths, true)?;
+    create_from_view(
+        repo,
+        roots.clone(),
+        roots,
+        workers,
+        chrono::Utc::now().timestamp(),
+        None,
+    )
+}
+
+/// The running engine owns and pins this view; it is not a scan of live roots.
+pub(crate) fn create_from_view(
+    repo: &Repository,
+    roots: Vec<Root>,
+    recorded_roots: Vec<Root>,
+    workers: usize,
+    created_at: i64,
+    capture_mode: Option<String>,
+) -> Result<Snapshot> {
+    repo.ensure_writable()?;
+    validate_roots(&roots)?;
+    validate_roots(&recorded_roots)?;
+    if roots.len() != recorded_roots.len() {
+        return Err(invalid("view membership differs"));
+    }
+    let paths = roots
+        .iter()
+        .map(|r| PathBuf::from(&r.path))
+        .collect::<Vec<_>>();
     crate::core::storage_admin::verify_backup_roots(&roots)?;
     let id = ulid::Ulid::new().to_string();
     let pending = repo.pending(&id)?;
@@ -193,7 +220,12 @@ pub fn create(repo: &Repository, roots: Vec<Root>, workers: usize) -> Result<Sna
                         !(entry.depth() == 1
                             && matches!(
                                 entry.file_name().to_str(),
-                                Some(LEASE_FILE | ".n1-root-id" | super::restore_guard::COMPLETE)
+                                Some(
+                                    LEASE_FILE
+                                        | ".n1-root-id"
+                                        | super::restore_guard::COMPLETE
+                                        | super::online::VIEW_DIR
+                                )
                             ))
                     })
                 {
@@ -244,8 +276,9 @@ pub fn create(repo: &Repository, roots: Vec<Root>, workers: usize) -> Result<Sna
         format: FORMAT.to_owned(),
         engine_format: ENGINE_FORMAT,
         id,
-        created_at: chrono::Utc::now().timestamp(),
-        roots,
+        created_at,
+        roots: recorded_roots,
+        capture_mode,
         records: writer.count,
         source_bytes: source_bytes.load(Ordering::Relaxed),
         manifest: writer.blocks,

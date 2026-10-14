@@ -256,7 +256,14 @@ fn reserved(entry: &DirEntry) -> bool {
     entry.depth() == 1
         && matches!(
             entry.file_name().to_str(),
-            Some(LEASE_FILE | RESTORE_PENDING | WORK | ".n1-restore-work" | ".n1-restore-complete")
+            Some(
+                LEASE_FILE
+                    | RESTORE_PENDING
+                    | WORK
+                    | ".n1-restore-work"
+                    | ".n1-restore-complete"
+                    | crate::core::backup::online::VIEW_DIR
+            )
         )
 }
 fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {

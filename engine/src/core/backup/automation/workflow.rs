@@ -72,7 +72,7 @@ fn execute_inner(state: &mut State, config: &Config, driver: &mut impl Driver) -
         }
         snapshot
     } else {
-        let was_active = driver.active(&config.service)?;
+        let was_active = config.online_source.is_none() && driver.active(&config.service)?;
         if was_active {
             state.status.restart = Some(config.service.clone());
             state.phase("stopping")?;

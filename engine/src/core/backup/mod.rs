@@ -1,12 +1,16 @@
-//! Encrypted, incremental offline snapshots and one-way snapshot replication.
-//! Does not mutate engine placement, add upload receipts, or rely on live scans.
+//! Encrypted incremental snapshots and one-way snapshot replication.
+//! Online capture pins a committed view inside the engine; offline capture also
+//! preserves durable-upload progress. Neither introduces mutable version heads.
 pub mod automation;
+pub(crate) mod barrier;
 pub mod capture;
 pub mod cli;
 mod crypto;
 pub(crate) mod format;
 mod fs;
 mod metadata;
+pub mod network;
+pub mod online;
 pub mod repository;
 pub mod restore;
 mod restore_guard;

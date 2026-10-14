@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover N1 restart intent after interrupted Shell operator work
+After=network.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/opt/litiaina/n1/litiaina-n1-shell backup recover-operator --config /etc/litiaina/n1/backup-operator.json
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target

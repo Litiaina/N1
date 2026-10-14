@@ -5,6 +5,229 @@ dated evidence, not guarantees for every server. Older versions' passes do not
 certify the current namespace/pool design. Personal test paths and credentials
 are intentionally omitted.
 
+## Online committed-state backup — October 14, 2026
+
+The final locked release passed all 315 engine library tests, two EC tests,
+nine proof-CLI tests, 12 Shell unit tests and eight Shell integration tests.
+Formatting and whitespace checks passed. Console's production build/type checks
+and ten backup UI checks across five viewports passed separately.
+
+On MCH's four distinct SATA/XFS drives, EC 3+1, all 20 online recovery checks
+passed. The engine stayed running during capture. Rename, new upload/version,
+trash recovery and whole-fragment deletion after pinning did not alter the
+captured point. The restored point retained committed versions and trash but
+excluded acknowledged parts of both new-key and existing-key unfinished durable
+uploads, plus post-selection objects. Original roots were unavailable and
+restored members were relocated/reversed; 132 object checks and all hashes,
+listing and history passed.
+
+Actual engine SIGKILL during another capture exposed no completed partial point.
+Startup cleaned its owned scratch view and retained the last completed snapshot.
+A scheduled online capture with a deliberately nonexistent service name passed
+capture, verification and replication without a service-state transition.
+Separately, real systemd supervision killed both controller processes during
+capture: N1's PID stayed unchanged, recovery reported interruption rather than
+success, and retry completed verified replication with healthy protection status.
+
+All eight sender/receiver SIGKILL-and-retry cases passed on HTTP, native, HTTPS
+and TLS-native. Fresh replication across two physical hosts also passed on all
+four protocols, including full verification, repeat transfer and wrong-token
+refusal. Native backup traffic did not use SSH. HTTPS/TLS-native used explicit
+CA validation, not an insecure TLS bypass.
+
+The real production-built Console submitted online capture, verification, both
+secure replication modes and four-member restore over LAN. All 808 restored
+NCX/payload files matched the source inventory. No operator token was stored in
+browser storage and no JavaScript execution errors were observed.
+
+Bounded observations under concurrent test load:
+
+| Observation | Result |
+| --- | ---: |
+| Captured view | 3,870 records / 97,924,820 bytes |
+| First / second mutation-pinning boundary | 51 / 31 ms |
+| Four mutations and fragment deletion after pinning, combined | 367 ms |
+| Entire 20-check recovery drill | 279.42 s |
+| Fresh LAN replication: HTTP / native / HTTPS / TLS-native | 8.41 / 14.06 / 16.78 / 16.83 s |
+| Sampled engine/backup-process peak RSS / FD count | 145,344 KiB / 87 |
+
+The workload included a 64 MiB object, 128 small objects, history, trash and
+unfinished uploads. The timings are not universal latency or maximum-throughput
+claims; the combined mutation time is not a single-object benchmark. No new
+physical power cut or long memory/descriptor soak was performed for this change.
+
+Failures found and fixed before the final reruns: source HTTPS CA setup could
+panic without explicit rustls provider selection; native engine control replies
+were streamed MessagePack rather than inline JSON; and the native-TLS bridge
+needed to flush pending TLS writes before waiting for protocol acknowledgements.
+The last issue reproduced on the real LAN, not only loopback. Regressions cover
+the codec, completed-capture acknowledgement and flush behavior. Harness-only
+failures included a malformed synthetic version filename, missing secure fixture
+certificates and a controller test that launched before the native listener was
+ready. These failed runs are not counted as passes.
+
+This candidate's Engine / Shell SHA-256:
+
+- `6e844b9fd3cd8369f405593fc4526862f85fbee9897b6bf125ffcd1dc53fa95e`
+- `1bfb6205cf60f1d6a17173216b1e57d3c000496ae054180c545a5dd797c5589b`
+
+### MCH activation
+
+Fresh N1, Accel, Console and Shell operator services were installed after the
+above gates passed. Fifteen deployment checks passed: trusted-CA engine/Console
+proxy access, Office isolation headers, four-member readiness, two immutable
+versions, exact historical hashes, cache cold/warm/range delivery, rename,
+trash/recovery and verified scheduled online capture with unchanged engine PID.
+The deployment's completed recovery point then replicated and independently
+verified over HTTPS and TLS-native to another physical host. A separate LAN
+browser/native smoke passed with no Console JavaScript errors.
+
+The daily online timer keeps seven verified points in a repository on the OS
+NVMe, separate from the four data HDDs. No permanent remote peer was configured;
+same-host backup is not off-host/site protection. Obsolete N1 binaries, configs,
+soaks and disposable test storage were removed; unrelated registries and service
+data were preserved. Keys/configuration remain separately protected operator
+responsibilities. Deployment acceptance is not an LTS declaration.
+
+## MCH four-drive and real LAN verification — October 14, 2026
+
+Fresh locked release binaries were transferred and their SHA-256 checked on
+MCH. With explicit disposable-server authorization, the old N1 instances were
+stopped and their identified storage data purged. The OS and unrelated service
+data were not formatted. All new fixtures used dedicated directories.
+
+- Four separate SATA/XFS drives, EC 3+1: the same 21 recovery checks passed
+  independently over HTTP, native, HTTPS and TLS-native. This includes actual
+  restore-process SIGKILL after a piece appears, activation-fence refusal,
+  explicit resume, remapped roots, version history, listing, full downloads,
+  trash, durable-upload continuation and retention/GC safety. These are 21
+  overlapping checks across four transports, not 84 distinct failure modes.
+- Eight actual sender/receiver process-tree SIGKILL cases passed: both endpoints
+  independently on all four transports, after two committed destination blocks.
+  No completed snapshot was exposed mid-transfer. Retry verified the complete
+  snapshot and preserved the accepted blocks' modification times. Source and
+  receiver repositories were on different physical drives.
+- Separate-host LAN replication passed on all four transports, with destination
+  verification, repeat transfer and wrong-token refusal. Secure transfers used
+  a CA-issued leaf matching the LAN IP, without disabling TLS verification.
+  The receiver used isolated NVMe storage on the other host. SSH administered
+  MCH only; it carried no backup traffic and is not a product dependency.
+- Thirteen pool-relocation checks passed, including a verified HDD-to-NVMe
+  member clone, unavailable original locations, reversed root discovery,
+  wrong-identity/incomplete-copy refusal, interrupted replacement/resume,
+  durable continuation, batch/native uploads, recover-on-read and automatic
+  healing. Committed NDX/payload digests were unchanged.
+- The production-built Console connected directly over LAN to MCH's secured
+  operator endpoint. Initialization, capture, verification, HTTPS/native-TLS
+  replication and four-member restore passed without API mocks. All 812
+  inventoried NCX/payload files matched the source hashes. The operator token
+  was absent from browser storage. Browser trust was scoped to the test leaf;
+  the N1 replication clients still validated the CA normally.
+- Real systemd user-service supervision passed: SIGKILL of all three operator/
+  Shell/capture processes after persisted restart intent and engine stop caused
+  supervision to restart N1 and mark the job interrupted, not successful. A
+  subsequent capture, owned HTTP replication, independent repository verification,
+  retention and healthy protection status passed. Fixture supervisors were
+  stopped before their recovered engine and all fixture unit links removed.
+
+Bounded, shared-drive observations; restore timings include deliberate
+interruption, refused activation and resumed completion:
+
+| Transport | Capture | Incremental capture | Initial replication | Interrupted/resumed restore |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP | 25.72 s | 4.42 s | 39.94 s | 207.21 s |
+| Native | 26.01 s | 4.45 s | 40.97 s | 86.37 s |
+| HTTPS | 25.03 s | 4.55 s | 74.66 s | 134.42 s |
+| TLS-native | 33.65 s | 4.63 s | 75.36 s | 87.85 s |
+
+The source fixture was 64 MiB plus 128 small objects and recovery state. The
+first drill overlapped old-data deletion; later drills overlapped other isolated
+fault tests. These are not controlled throughput comparisons. Sampled
+engine/backup process peaks were at most 100,592 KiB RSS and 94 descriptors,
+observed separately. Console capture/verify/secure replication/restore took
+32.38/1.11/41.42 and 46.52/104.96 seconds. No new physical mains-power cut or
+long memory/descriptor soak is claimed by this run.
+
+Past harness failures retained: the LAN driver initially tried to parse the
+CLI's text acknowledgement as JSON; transfer itself succeeded, and corrected
+verification/repeat checks passed on rerun. MCH's user manager rejected an
+auxiliary group-kill request. The service drill now kills the owned cgroup's
+actual process tree. Its cleanup ordering was also corrected so recovery cannot
+restart a test engine after that engine's unit is unlinked; N1's instance lease
+correctly refused the resulting accidental second writer.
+
+Candidate SHA-256:
+
+- Engine: `d3027d8a9d7ec0902ac1beb53b95312e9982f1003b12acb99ce7af34f32713f7`
+- Shell: `3fba0dd23b0f6d6c4bd6e9e96663b4aba7214560227a3dcbbd9138e2b8aebe24`
+
+## Standalone backup transport and Console operations — October 14, 2026
+
+Remote snapshot replication now uses N1-owned HTTP(S) or native N1(S).
+There is no SSH process/daemon requirement. The matching Shell delegates to
+the engine's built-in operator endpoint and existing repository implementation.
+Backup format, ordinary NCX mutation and committed-source NDX/payload semantics
+are unchanged. These results do not reuse SSH passes as native qualification.
+
+- Final library regression: 307 passed, zero failures; the seven network tests
+  used isolated directories on a real USB-attached XFS HDD. Other library
+  fixtures used local temporary storage. EC compatibility: two passed.
+  Shell/CLI: 12 unit and eight integration tests passed. Locked release builds
+  and Console's production build/type checks passed.
+- Real N1-object recovery corpus: all 21 end-to-end checks passed separately
+  over HTTP, native, HTTPS and TLS-native transfer. Each run used 1+0 storage,
+  a 64 MiB multipart source and 128 small objects, plus independent fragment
+  credentials, versions and trash. Checks included active-engine capture refusal,
+  incremental capture, repeat replication, original source paths unavailable,
+  SIGKILL after actual restore-piece publication, fenced startup refusal,
+  explicit resume, listing/history, full hashes, ranges, durable continuation,
+  new writes/deletion and independent retention. Protocol counts overlap; they
+  are not 84 unique failure modes.
+- Network fault tests rejected wrong operator tokens/origins/repository aliases,
+  wrong encryption keys and corrupt blocks. Truncated network streams published
+  no snapshot; retries reused verified blocks without changing their mtimes.
+- Final optimized binaries passed four actual process-SIGKILL cases: sender and
+  receiver independently, over HTTP and native, after two committed destination
+  blocks. No completed point was exposed before retry. Retry and complete
+  snapshot verification passed, preserving accepted block mtimes.
+- Real browser → real secured operator API: repository initialization, offline
+  capture, verification, HTTPS/native-TLS replication and restore passed. All
+  272 inventoried payload/NCX files matched the source hashes. Dedicated operator
+  credentials were absent from browser storage. UI mock regressions separately
+  passed ten checks across five viewports, plus the desktop pool-health checks.
+
+Bounded USB observations (debug recovery matrix, variable concurrent host load):
+
+| Transport | Whole recovery drill | Initial capture | Incremental capture | Initial replication |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP | 200.74 s | 28.28 s | 5.67 s | 40.79 s |
+| Native | 284.95 s | 37.86 s | 8.44 s | 88.77 s |
+| HTTPS | 289.15 s | 37.62 s | 10.87 s | 87.57 s |
+| TLS-native | 200.71 s | 32.02 s | 6.99 s | 68.18 s |
+
+The real Console API sample took 45.49 s capture, 3.11 s verify, 95.95/91.91 s
+replication and 56.61 s restore. Sampled operator peak RSS was 91,300 KiB and
+33 descriptors. Secure matrix descendants peaked at 118,536 KiB and 76
+descriptors across engine/backup phases; these are sampled process peaks,
+not a long memory-leak soak or bulk-media bandwidth claim.
+
+Past failures retained: a native bridge initially borrowed sockets, so failed
+bridging could leave the blocking sender waiting for its inactivity timeout.
+Owning/closing endpoints fixed it; the original interruption deadline and hash/
+mtime assertions were retained and the full regression rerun passed. A TLS
+fixture incorrectly used a CA certificate as a server leaf and was correctly
+rejected; it now uses a CA-issued non-CA leaf, without disabling verification.
+The hard-kill harness initially counted transient atomic-write files; its gate
+now selects committed SHA-256 block filenames. Immediate retries can encounter
+a receiver still unwinding fsync; admission now reports repository unavailability
+before accepting a stream, and bounded retries preserve its lease instead of
+bypassing it.
+
+Scope: isolated directories on one USB/XFS device and loopback networking.
+Existing user data/services were not formatted, stopped or replaced. This run
+does not requalify multi-device EC failures, separate-host LAN transport, physical
+power loss or the retired server. Historical results below remain historical.
+
 ## Console Office upload integration — October 13, 2026
 
 All 300 engine library tests pass. Real USB/XFS 1+0 verification confirms that

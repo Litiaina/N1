@@ -55,6 +55,7 @@ pub fn with_keys<T>(
     keys: &[&str],
     action: impl FnOnce() -> Result<T, AppError>,
 ) -> Result<T, AppError> {
+    let _snapshot_boundary = crate::core::backup::barrier::mutation();
     let fragment = index_store::stable_fragment_id_for_fragment(fragment);
     let names = keys
         .iter()

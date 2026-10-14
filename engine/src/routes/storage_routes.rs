@@ -1986,6 +1986,10 @@ pub fn build_storage_routes_unbound_with_options(
     let ws_routes = { Router::new().route("/noa/v1/ws", get(ws_handler)) };
 
     let global_routes = Router::new()
+        .route(
+            "/noa/v1/maintenance/backups/operation",
+            post(crate::core::backup::network::live_operation),
+        )
         .route("/noa/v1/fragments/check", get(verify_fragment_existence))
         .route("/noa/v1/fragments/hash", get(get_fragment_hash))
         .route(

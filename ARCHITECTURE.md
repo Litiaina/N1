@@ -172,7 +172,15 @@ GC/TTL removes expired trash and safely unreferenced immutable versions.
 Active uploads, overlapping scans and retained exports must remain protected;
 uncertain authority causes preservation/reporting, not guessed deletion.
 
-Backup captures every pool member offline under exclusive leases. Restore
+Offline backup captures every pool member under exclusive leases, including
+unfinished durable-upload progress. Online backup instead pins committed NCX,
+version NDX and pieces inside the running engine. Shared mutation admission stays
+concurrent; a bounded exclusive capture boundary freezes namespace/version
+selection while hard links are made. Hashing/copying runs after that boundary.
+No object-count memory cache, mutable head or namespace mutation journal is added.
+GC and fragment deletion cannot remove pinned inodes; abandoned scratch views
+are cleaned only after startup owns the member leases. Online recovery excludes
+all unfinished uploads. Restore
 maps by pool ID/generation/geometry/member slot, never mount-path sorting;
 it preserves logical identities and uses startup fences until complete. Config,
 secrets and application databases require separate backup. Accel can be rebuilt
@@ -199,5 +207,9 @@ credential-bound refresh sessions; access tokens retain their normal expiry.
 Native connections/control frames and multipart temporary metadata have bounded
 admission. Pool warnings reuse capacity probes and report byte/inode headroom;
 they add no upload free-space scan, placement reservation or object cache.
-Replication copies authenticated, committed offline recovery points to optional
+Replication copies authenticated, completed recovery points to optional
 independent storage. It does not add a live second writer or distributed failover.
+The receiver and operator API belong to N1's own Engine/Shell binaries. HTTP(S)
+and native N1(S) carry the same bounded snapshot transfer; no SSH daemon/client
+or external backup service is required. Offline operator work is separate from
+the running storage engine and reuses repository leases, pins and restore fences.

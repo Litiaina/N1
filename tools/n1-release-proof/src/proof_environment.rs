@@ -20,7 +20,7 @@ impl Proof {
         }
         let roots = self.disk_roots()?;
         self.active_disk_count = roots.len();
-        let focused_single_root_functional = (self.args.noa_api_proof || self.args.export_proof || self.args.pool_maintenance_proof || self.args.pool_relocation_proof || self.args.backup_proof)
+        let focused_single_root_functional = (self.args.noa_api_proof || self.args.export_proof || self.args.pool_maintenance_proof || self.args.pool_relocation_proof || self.args.backup_proof || self.args.online_backup_proof)
             && self.data_shards == 1
             && self.parity_shards == 0
             && roots.len() == 1;
@@ -138,7 +138,7 @@ impl Proof {
                 .arg(&key)
                 .arg("-out")
                 .arg(&cert)
-                .args(["-subj", "/CN=127.0.0.1"])
+                .args(["-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()?;
@@ -305,8 +305,11 @@ stripe_block_size=262144
     async fn start_server(&mut self, label: &str) -> ProofResult<()> {
         let log = fs::File::create(self.args.out_dir.join(format!("server-{label}.log")))?;
         let err = log.try_clone()?;
-        let child = Command::new(&self.args.binary)
-            .current_dir(&self.args.out_dir)
+        let mut command = Command::new(&self.args.binary);
+        if self.args.out_dir.join("live-operator.json").is_file() {
+            command.env("N1_BACKUP_OPERATOR_CONFIG", self.args.out_dir.join("live-operator.json"));
+        } else { command.env_remove("N1_BACKUP_OPERATOR_CONFIG"); }
+        let child = command.current_dir(&self.args.out_dir)
             .env("RUST_LOG", "info")
             .env("RUST_BACKTRACE", "1")
             .env("N1_REFRESH_STORE_ROOT", self.args.out_dir.join("refresh"))

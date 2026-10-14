@@ -1,20 +1,17 @@
 use super::repository::Repository;
 use super::{Result, invalid};
 use clap::{Args, Parser, Subcommand};
-use std::io::BufReader;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 #[derive(Parser)]
 #[command(
     name = "litiaina-n1-backup",
-    about = "Encrypted offline N1 snapshots and one-way snapshot replication"
+    about = "Encrypted offline N1 snapshots and N1-owned snapshot replication"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Operation,
 }
-
 #[derive(Args)]
 struct RepoArgs {
     #[arg(long)]
@@ -27,25 +24,50 @@ impl RepoArgs {
         Repository::open(&self.repository, &self.key_file, writable)
     }
 }
-
 #[derive(Subcommand)]
 enum Operation {
-    /// Run an optional configured offline backup/replication workflow.
+    /// Committed-state snapshot through the running engine; excludes unfinished uploads.
+    CreateOnline {
+        #[arg(long)]
+        source_url: String,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        token_file: PathBuf,
+        #[arg(long)]
+        ca_file: Option<PathBuf>,
+        #[arg(long)]
+        allow_plaintext: bool,
+        #[arg(long, default_value_t = 3600)]
+        timeout_seconds: u64,
+    },
+    /// N1-owned HTTP/native operator endpoint. No external server or SSH required.
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Recover recorded restart intent after an interrupted operator job.
+    RecoverOperator {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Generate a separate owner-only operator API token (never printed).
+    OperatorKeygen {
+        #[arg(long)]
+        token_file: PathBuf,
+    },
     RunJob {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Recover service restart intent after a killed backup job (ExecStopPost).
     RecoverJob {
         #[arg(long)]
         state_dir: PathBuf,
     },
-    /// Print job status; exits nonzero for enabled jobs with overdue/failed protection.
     JobStatus {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Verify retained points, keep at least N including the protected point, then GC.
     Prune {
         #[command(flatten)]
         repo: RepoArgs,
@@ -54,17 +76,15 @@ enum Operation {
         #[arg(long)]
         protect: String,
     },
-    /// Generate a random 256-bit encryption key. Keep a separate protected copy.
     Keygen {
         #[arg(long)]
         key_file: PathBuf,
     },
-    /// Initialize an empty owner-only repository.
     Init {
         #[command(flatten)]
         repo: RepoArgs,
     },
-    /// Capture configured roots. The cooperating N1 engine MUST be stopped.
+    /// Capture configured roots. N1 must remain stopped.
     Create {
         #[command(flatten)]
         repo: RepoArgs,
@@ -83,7 +103,6 @@ enum Operation {
         #[arg(long)]
         snapshot: String,
     },
-    /// Restore to empty roots; use --resume only for an interrupted matching restore.
     Restore {
         #[command(flatten)]
         repo: RepoArgs,
@@ -94,7 +113,7 @@ enum Operation {
         #[arg(long)]
         resume: bool,
     },
-    /// Replicate a snapshot to a local/mounted repository or an SSH receiver.
+    /// Local repository or N1-owned HTTP(S)/N1(S) destination.
     Replicate {
         #[command(flatten)]
         repo: RepoArgs,
@@ -103,27 +122,22 @@ enum Operation {
         #[arg(long)]
         target_repository: PathBuf,
         #[arg(long)]
-        target_key_file: PathBuf,
-        /// SSH target user@host; uses standard SSH keys/config/host verification.
+        target_key_file: Option<PathBuf>,
         #[arg(long)]
-        ssh: Option<String>,
-        /// Optional OpenSSH configuration, useful for dedicated backup identities.
-        #[arg(long, requires = "ssh")]
-        ssh_config: Option<PathBuf>,
-        #[arg(long, default_value = "litiaina-n1-backup")]
-        remote_binary: String,
-        /// Prefix receiver arguments with backup for the integrated Engine or Shell.
-        #[arg(long, requires = "ssh")]
-        remote_backup_subcommand: bool,
+        target_url: Option<String>,
+        #[arg(long, requires = "target_url")]
+        token_file: Option<PathBuf>,
+        #[arg(long, requires = "target_url")]
+        ca_file: Option<PathBuf>,
+        #[arg(long)]
+        allow_plaintext: bool,
     },
-    /// Forget one completed snapshot; refuses to remove the last recovery point.
     Forget {
         #[command(flatten)]
         repo: RepoArgs,
         #[arg(long)]
         snapshot: String,
     },
-    /// Reclaim unreferenced blocks. Interrupted job pins are retained unless requested.
     Gc {
         #[command(flatten)]
         repo: RepoArgs,
@@ -136,81 +150,42 @@ enum Operation {
         repo: RepoArgs,
     },
 }
-
-fn quoted(value: &str) -> Result<String> {
-    if value.contains('\0') || value.contains('\n') || value.is_empty() {
-        return Err(invalid("invalid SSH command argument"));
-    }
-    Ok(format!("'{}'", value.replace('\'', "'\\''")))
-}
-
-pub(crate) fn ssh_command(
-    host: &str,
-    config: Option<&std::path::Path>,
-    binary: &str,
-    args: &[String],
-) -> Result<Command> {
-    if host.is_empty()
-        || host.starts_with('-')
-        || host.contains(char::is_whitespace)
-        || host.contains('\0')
-    {
-        return Err(invalid("invalid SSH target"));
-    }
-    let mut remote = quoted(binary)?;
-    for arg in args {
-        remote.push(' ');
-        remote.push_str(&quoted(arg)?);
-    }
-    let mut command = Command::new("ssh");
-    if let Some(config) = config {
-        command.arg("-F").arg(config);
-    }
-    command.args([
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-        "--",
-        host,
-        &remote,
-    ]);
-    Ok(command)
-}
-
 pub fn run() -> Result<()> {
     run_from(std::env::args_os().collect())
 }
-
-#[cfg(test)]
-mod invocation_tests {
-    use super::*;
-
-    #[test]
-    fn integrated_receiver_is_an_explicit_quoted_subcommand() {
-        let args = vec![
-            "backup".into(),
-            "receive".into(),
-            "--repository".into(),
-            "/backup/with space".into(),
-        ];
-        let command =
-            ssh_command("operator@backup", None, "/opt/n1/litiaina-n1-shell", &args).unwrap();
-        let remote = command.get_args().last().unwrap().to_str().unwrap();
-        assert_eq!(
-            remote,
-            "'/opt/n1/litiaina-n1-shell' 'backup' 'receive' '--repository' '/backup/with space'"
-        );
-        assert!(ssh_command("-bad", None, "engine", &args).is_err());
-    }
-}
-
 pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
     match Cli::parse_from(args).command {
+        Operation::CreateOnline {
+            source_url,
+            repository,
+            token_file,
+            ca_file,
+            allow_plaintext,
+            timeout_seconds,
+        } => {
+            let destination = super::network::Destination {
+                url: source_url,
+                repository: repository.clone(),
+                token_file,
+                ca_file,
+                allow_plaintext,
+            };
+            let result = super::network::run_async(super::network::completed_operation(
+                &destination,
+                super::network::Request {
+                    operation: "create-online".into(),
+                    repository,
+                    confirm: true,
+                    ..Default::default()
+                },
+                timeout_seconds,
+            ))?;
+            super::online::validate_result(&result)?;
+            println!("{result}");
+        }
+        Operation::Serve { config } => super::network::serve(&config)?,
+        Operation::RecoverOperator { config } => super::network::recover_operator(&config)?,
+        Operation::OperatorKeygen { token_file } => super::network::generate_token(&token_file)?,
         Operation::RunJob { config } => super::automation::run(&config)?,
         Operation::RecoverJob { state_dir } => super::automation::recover(&state_dir)?,
         Operation::JobStatus { config } => super::automation::status(&config)?,
@@ -227,23 +202,21 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
             workers,
         } => {
             let repo = repo.open(true)?;
-            let roots = super::capture::roots_from_config(&config)?;
-            eprintln!(
-                "Capturing {} offline roots with {} workers",
-                roots.len(),
-                workers.clamp(1, 32)
-            );
-            let snapshot = super::capture::create(&repo, roots, workers)?;
+            let s = super::capture::create(
+                &repo,
+                super::capture::roots_from_config(&config)?,
+                workers,
+            )?;
             println!(
                 "{}",
-                serde_json::json!({"snapshot": snapshot.id, "records": snapshot.records, "source_bytes": snapshot.source_bytes})
+                serde_json::json!({"snapshot":s.id,"records":s.records,"source_bytes":s.source_bytes})
             );
         }
         Operation::List { repo } => {
-            for snapshot in repo.open(false)?.list()? {
+            for s in repo.open(false)?.list()? {
                 println!(
                     "{}",
-                    serde_json::json!({"snapshot":snapshot.id,"created_at":snapshot.created_at,"roots":snapshot.roots.len(),"records":snapshot.records,"source_bytes":snapshot.source_bytes})
+                    serde_json::json!({"snapshot":s.id,"created_at":s.created_at,"roots":s.roots.len(),"records":s.records,"source_bytes":s.source_bytes})
                 );
             }
         }
@@ -259,8 +232,12 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
             resume,
         } => {
             let repo = repo.open(false)?;
-            let target = super::capture::roots_from_config(&target_config)?;
-            super::restore::restore(&repo, &repo.snapshot(&snapshot)?, target, resume)?;
+            super::restore::restore(
+                &repo,
+                &repo.snapshot(&snapshot)?,
+                super::capture::roots_from_config(&target_config)?,
+                resume,
+            )?;
             println!("Restored {snapshot}; configure the destination engine before starting it");
         }
         Operation::Replicate {
@@ -268,69 +245,41 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
             snapshot,
             target_repository,
             target_key_file,
-            ssh,
-            ssh_config,
-            remote_binary,
-            remote_backup_subcommand,
+            target_url,
+            token_file,
+            ca_file,
+            allow_plaintext,
         } => {
-            let repo = repo.open(false)?;
-            let snapshot = repo.snapshot(&snapshot)?;
-            if let Some(host) = ssh {
-                if host.starts_with('-')
-                    || host.contains(char::is_whitespace)
-                    || host.contains('\0')
-                {
-                    return Err(invalid("invalid SSH target"));
-                }
-                let mut args = vec![
-                    "receive".into(),
-                    "--repository".into(),
-                    target_repository
-                        .to_str()
-                        .ok_or_else(|| invalid("invalid remote path"))?
-                        .into(),
-                    "--key-file".into(),
-                    target_key_file
-                        .to_str()
-                        .ok_or_else(|| invalid("invalid remote key path"))?
-                        .into(),
-                ];
-                if remote_backup_subcommand {
-                    args.insert(0, "backup".into());
-                }
-                let mut command = ssh_command(&host, ssh_config.as_deref(), &remote_binary, &args)?;
-                let mut child = command
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
-                    .spawn()?;
-                let result = super::transfer::send(
-                    &repo,
+            if let Some(url) = target_url {
+                let destination = super::network::Destination {
+                    url,
+                    repository: target_repository.to_string_lossy().into_owned(),
+                    token_file: token_file
+                        .ok_or_else(|| invalid("remote replication requires --token-file"))?,
+                    ca_file,
+                    allow_plaintext,
+                };
+                let store = super::network::Store {
+                    path: repo.repository,
+                    key_file: repo.key_file,
+                };
+                super::network::run_async(super::network::replicate(
+                    store,
                     &snapshot,
-                    &mut BufReader::new(
-                        child
-                            .stdout
-                            .take()
-                            .ok_or_else(|| invalid("missing SSH output"))?,
-                    ),
-                    &mut child
-                        .stdin
-                        .take()
-                        .ok_or_else(|| invalid("missing SSH input"))?,
-                );
-                if result.is_err() {
-                    let _ = child.kill();
-                }
-                let status = child.wait()?;
-                result?;
-                if !status.success() {
-                    return Err(invalid("SSH receiver failed"));
-                }
+                    &destination,
+                ))?;
             } else {
-                let target = Repository::open(&target_repository, &target_key_file, true)?;
-                super::transfer::local(&repo, &snapshot, &target)?;
+                let repo = repo.open(false)?;
+                let s = repo.snapshot(&snapshot)?;
+                let target = Repository::open(
+                    &target_repository,
+                    &target_key_file
+                        .ok_or_else(|| invalid("local replication requires --target-key-file"))?,
+                    true,
+                )?;
+                super::transfer::local(&repo, &s, &target)?;
             }
-            println!("Replicated {}", snapshot.id);
+            println!("Replicated {snapshot}");
         }
         Operation::Forget { repo, snapshot } => {
             super::retention::forget(&repo.open(true)?, &snapshot)?
@@ -338,12 +287,10 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
         Operation::Gc {
             repo,
             discard_incomplete,
-        } => {
-            println!(
-                "{}",
-                serde_json::json!({"reclaimed_bytes":super::retention::gc(&repo.open(true)?, discard_incomplete)?})
-            );
-        }
+        } => println!(
+            "{}",
+            serde_json::json!({"reclaimed_bytes":super::retention::gc(&repo.open(true)?,discard_incomplete)?})
+        ),
         Operation::Receive { repo } => super::transfer::receive(
             &repo.open(true)?,
             &mut std::io::stdin().lock(),
@@ -351,4 +298,31 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
         )?,
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn owned_transport_parses_without_ssh_and_rejects_ssh_flags() {
+        assert!(
+            Cli::try_parse_from([
+                "backup",
+                "replicate",
+                "--repository",
+                "/repo",
+                "--key-file",
+                "/key",
+                "--snapshot",
+                "id",
+                "--target-repository",
+                "replica",
+                "--target-url",
+                "https://backup:50902",
+                "--token-file",
+                "/token"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["backup", "replicate", "--ssh", "backup@host"]).is_err());
+    }
 }

@@ -1,5 +1,5 @@
 //! Bound every external operation. Children have their own process group so a
-//! timed-out transfer cannot retain repository leases through an orphan SSH child.
+//! timed-out transfer cannot retain repository leases through an orphan child.
 use super::super::{Result, invalid};
 use super::config::{Config, Replica, Service};
 use super::workflow::Driver;
@@ -90,27 +90,30 @@ impl Processes {
         if replica.keep_last == 0 {
             return Ok(());
         }
-        let cmd = if let Some(host) = &replica.ssh {
-            let mut args = vec![
-                "prune".to_owned(),
-                "--repository".into(),
-                replica.repository.to_string_lossy().into_owned(),
-                "--key-file".into(),
-                replica.key_file.to_string_lossy().into_owned(),
-                "--keep-last".into(),
-                replica.keep_last.to_string(),
-                "--protect".into(),
-                snapshot.into(),
-            ];
-            if replica.remote_backup_subcommand {
-                args.insert(0, "backup".into());
-            }
-            super::super::cli::ssh_command(
-                host,
-                replica.ssh_config.as_deref(),
-                &replica.remote_binary,
-                &args,
-            )?
+        let cmd = if let Some(url) = &replica.url {
+            let destination = super::super::network::Destination {
+                url: url.clone(),
+                repository: replica.repository.to_string_lossy().into_owned(),
+                token_file: replica
+                    .token_file
+                    .clone()
+                    .ok_or_else(|| invalid("missing replica token"))?,
+                ca_file: replica.ca_file.clone(),
+                allow_plaintext: replica.allow_plaintext,
+            };
+            super::super::network::run_async(super::super::network::completed_operation(
+                &destination,
+                super::super::network::Request {
+                    operation: "prune".into(),
+                    repository: destination.repository.clone(),
+                    snapshot: snapshot.into(),
+                    keep_last: replica.keep_last,
+                    confirm: true,
+                    ..Default::default()
+                },
+                seconds,
+            ))?;
+            return Ok(());
         } else {
             let mut cmd = self.helper_command();
             cmd.arg("prune")
@@ -155,7 +158,7 @@ impl Driver for Processes {
             return Err(invalid("job state and repository must not overlap"));
         }
         if let Some(replica) = &config.replica
-            && replica.ssh.is_none()
+            && replica.url.is_none()
         {
             let target = super::super::repository::Repository::open(
                 &replica.repository,
@@ -209,6 +212,24 @@ impl Driver for Processes {
         Ok(())
     }
     fn capture(&mut self, config: &Config) -> Result<String> {
+        if let Some(source) = &config.online_source {
+            let result =
+                super::super::network::run_async(super::super::network::completed_operation(
+                    source,
+                    super::super::network::Request {
+                        operation: "create-online".into(),
+                        repository: source.repository.clone(),
+                        confirm: true,
+                        ..Default::default()
+                    },
+                    config.capture_timeout_seconds,
+                ))?;
+            super::super::online::validate_result(&result)?;
+            return Ok(result["snapshot"]
+                .as_str()
+                .ok_or_else(|| invalid("online capture did not return a completed snapshot"))?
+                .into());
+        }
         let mut cmd = self.helper("create", config, None);
         cmd.arg("--config")
             .arg(&config.engine_config)
@@ -234,21 +255,22 @@ impl Driver for Processes {
             .as_ref()
             .ok_or_else(|| invalid("missing replica settings"))?;
         let mut cmd = self.helper("replicate", config, Some(snapshot));
-        cmd.arg("--target-repository")
-            .arg(&replica.repository)
-            .arg("--target-key-file")
-            .arg(&replica.key_file);
-        if let Some(host) = &replica.ssh {
-            cmd.arg("--ssh")
-                .arg(host)
-                .arg("--remote-binary")
-                .arg(&replica.remote_binary);
-            if replica.remote_backup_subcommand {
-                cmd.arg("--remote-backup-subcommand");
+        cmd.arg("--target-repository").arg(&replica.repository);
+        if let Some(url) = &replica.url {
+            cmd.arg("--target-url").arg(url).arg("--token-file").arg(
+                replica
+                    .token_file
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing replica token file"))?,
+            );
+            if let Some(ca) = &replica.ca_file {
+                cmd.arg("--ca-file").arg(ca);
             }
-        }
-        if let Some(path) = &replica.ssh_config {
-            cmd.arg("--ssh-config").arg(path);
+            if replica.allow_plaintext {
+                cmd.arg("--allow-plaintext");
+            }
+        } else {
+            cmd.arg("--target-key-file").arg(&replica.key_file);
         }
         // The receive protocol verifies and fsyncs before its completion ACK.
         self.run(cmd, config.operation_timeout_seconds)?;

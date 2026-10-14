@@ -855,7 +855,10 @@ async fn collect_system_health(
                         .as_ref()
                         .map(|fragment| fragment_root_on(&root, fragment))
                         .unwrap_or_else(|| root.clone());
-                    let walker = WalkDir::new(&scan_root).into_iter();
+                    let walker = WalkDir::new(&scan_root).into_iter().filter_entry(|entry| {
+                        entry.depth() != 1
+                            || entry.file_name() != crate::core::backup::online::VIEW_DIR
+                    });
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
