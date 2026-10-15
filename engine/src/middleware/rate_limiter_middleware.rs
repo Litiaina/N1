@@ -8,9 +8,10 @@ use governor::middleware::NoOpMiddleware;
 use ini::Ini;
 use jsonwebtoken::{Validation, decode};
 use std::sync::OnceLock;
+use std::time::Duration;
 use tower_governor::GovernorLayer;
 use tower_governor::errors::GovernorError;
-use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::governor::{GovernorConfig, GovernorConfigBuilder};
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
 use tracing::error;
@@ -61,9 +62,9 @@ struct RateLimitSettings {
 
 static RATE_LIMIT_CONFIG: OnceLock<RateLimitSettings> = OnceLock::new();
 
-fn get_rate_limit_config() -> RateLimitSettings {
-    *RATE_LIMIT_CONFIG.get_or_init(|| {
-        let defaults = RateLimitSettings {
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        Self {
             enabled: true,
             auth_per_sec: 2,
             auth_burst: 5,
@@ -74,8 +75,14 @@ fn get_rate_limit_config() -> RateLimitSettings {
             transcode_per_sec: 1,
             transcode_burst: 2,
             global_per_sec: 200,
-            global_burst: 300
-        };
+            global_burst: 300,
+        }
+    }
+}
+
+fn get_rate_limit_config() -> RateLimitSettings {
+    *RATE_LIMIT_CONFIG.get_or_init(|| {
+        let defaults = RateLimitSettings::default();
 
         let config_result = Ini::load_from_file(CONFIG_FILE);
 
@@ -129,6 +136,27 @@ fn get_rate_limit_config() -> RateLimitSettings {
     })
 }
 
+fn governor_config<K: KeyExtractor>(
+    requests_per_second: u64,
+    burst: u32,
+    key_extractor: K,
+) -> GovernorConfig<K, NoOpMiddleware> {
+    assert!(
+        (1..=1_000_000_000).contains(&requests_per_second),
+        "rate_limiter_config: requests per second must be between 1 and 1000000000"
+    );
+    assert!(burst > 0, "rate_limiter_config: burst size must be nonzero");
+    // tower_governor's per_second(n) means one token every n seconds, not n RPS.
+    // Round the reciprocal up to a nanosecond, never exceeding the requested rate.
+    let period = Duration::from_nanos(1_000_000_000_u64.div_ceil(requests_per_second));
+    GovernorConfigBuilder::default()
+        .period(period)
+        .burst_size(burst)
+        .key_extractor(key_extractor)
+        .finish()
+        .expect("validated rate and burst must produce a nonzero quota")
+}
+
 pub struct RateLimitLayers {
     pub auth: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
     pub view: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
@@ -138,8 +166,10 @@ pub struct RateLimitLayers {
 
 impl RateLimitLayers {
     pub fn new() -> Self {
-        let limits = get_rate_limit_config();
+        Self::from_settings(get_rate_limit_config())
+    }
 
+    fn from_settings(limits: RateLimitSettings) -> Self {
         if !limits.enabled {
             return Self {
                 auth: None,
@@ -149,40 +179,26 @@ impl RateLimitLayers {
             };
         }
 
-        let build_ip_conf = |per_sec, burst| {
-            GovernorConfigBuilder::default()
-                .per_second(per_sec)
-                .burst_size(burst)
-                .key_extractor(SmartIpKeyExtractor)
-                .finish()
-                .unwrap()
-        };
-
-        let build_user_conf = |per_sec, burst| {
-            GovernorConfigBuilder::default()
-                .per_second(per_sec)
-                .burst_size(burst)
-                .key_extractor(UserKeyExtractor)
-                .finish()
-                .unwrap()
-        };
-
         Self {
-            auth: Some(GovernorLayer::new(build_ip_conf(
+            auth: Some(GovernorLayer::new(governor_config(
                 limits.auth_per_sec,
                 limits.auth_burst,
+                SmartIpKeyExtractor,
             ))),
-            view: Some(GovernorLayer::new(build_user_conf(
+            view: Some(GovernorLayer::new(governor_config(
                 limits.view_per_sec,
                 limits.view_burst,
+                UserKeyExtractor,
             ))),
-            upload: Some(GovernorLayer::new(build_user_conf(
+            upload: Some(GovernorLayer::new(governor_config(
                 limits.upload_per_sec,
                 limits.upload_burst,
+                UserKeyExtractor,
             ))),
-            global: Some(GovernorLayer::new(build_ip_conf(
+            global: Some(GovernorLayer::new(governor_config(
                 limits.global_per_sec,
                 limits.global_burst,
+                SmartIpKeyExtractor,
             ))),
         }
     }
@@ -231,3 +247,6 @@ impl RateLimitLayers {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

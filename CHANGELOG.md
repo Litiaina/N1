@@ -5,6 +5,11 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## 4.0.0 — development, storage format 4
 
+- Fix HTTP auth/view/upload/global limiter configuration: `*_limit_per_second`
+  now means requests per second, not seconds per replenished request. Preserve
+  burst sizes and key scopes; reject zero rates/bursts and unrepresentable rates.
+  Add exhaustion/refill and HTTP middleware regressions.
+
 - Add committed-state online backup through the running engine's authenticated
   HTTP/native endpoint. Pin the namespace and immutable version files at a
   bounded capture boundary, then copy with N1 serving traffic. Unfinished upload

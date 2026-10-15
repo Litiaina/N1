@@ -31,6 +31,21 @@ Jump to [authentication](#authentication-reference), [objects](#object-api),
 - Trash/delete requires `delete`; rename/move/recover requires `modify`.
   Protected object responses use `Cache-Control: private, no-store`.
 
+### HTTP rate limiting
+
+In `[rate_limiter_config]`, `auth`, `view`, `upload` and `global` settings named
+`*_limit_per_second` are sustained **requests per second**, not refill seconds.
+`*_limit_burst_size` is the independent initial/maximum burst. For example,
+`view_limit_per_second=30` and `view_limit_burst_size=100` allow a burst of 100,
+then replenish about one request every 33.33 ms, capped at 100 available tokens.
+
+Auth/global budgets are IP-scoped; view/upload budgets are fragment-scoped and
+shared by clients using that fragment. These are process-local HTTP limits,
+not native-protocol or distributed quotas. Enabled rates must be 1–1,000,000,000
+and bursts nonzero; invalid numeric bounds refuse startup. Use
+`enable_rate_limiting=false` to disable the layers, not zero-valued quotas.
+Settings are loaded at startup; restart after changing them.
+
 ## Quick start
 
 Examples use Bash and placeholders; replace secrets locally and do not commit

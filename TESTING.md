@@ -5,6 +5,45 @@ dated evidence, not guarantees for every server. Older versions' passes do not
 certify the current namespace/pool design. Personal test paths and credentials
 are intentionally omitted.
 
+## HTTP rate-limit correction — October 15, 2026
+
+All ten focused limiter regressions passed, followed by the full locked serial
+workspace/all-targets suite: 325 engine, two EC, nine proof-CLI, 12 Shell unit
+and eight Shell integration tests passed. Formatting and whitespace checks passed.
+The old builder incorrectly passed
+requests/second into a seconds/token API. Auth/view/upload/global now share one
+reciprocal-period conversion, rounded up to nanoseconds, with unchanged burst
+sizes and IP/fragment scopes. Enabled zero rates/bursts and rates exceeding the
+nanosecond precision bound are rejected; explicit disabling still bypasses all
+four layers.
+
+Tests inspect the actual middleware-generated quotas, exercise default/custom
+settings, advance a fake clock through burst exhaustion, just-before/exact refill
+and idle saturation, and check HTTP 429 plus independent IP budgets. Earlier
+large-burst hardware proofs did not qualify replenishment semantics. This fix
+does not change storage, native admission or disk formats.
+
+### MCH limiter deployment — October 15, 2026
+
+The optimized engine was checksum-verified and deployed with a brief engine/
+operator restart. An isolated fragment reproduced the old behavior: after
+exhausting its 30 requests/second, 100-token view budget, all three requests after
+a 167 ms wait still returned 429. On the updated process, the same exhaustion
+and wait were followed by three successful 200 responses. The refill check ran
+locally against the real MCH HTTPS service, not an API mock or LAN latency test.
+
+Both object versions committed before restart retained their source SHA-256
+hashes through cache-bypassed reads afterward. Existing backup points, pool
+identity descriptors, configuration, credentials and certificates were unchanged;
+all four members were ready. The test fragment alone was removed. Shell's
+authenticated operator and scheduled-backup protection checks passed. Console
+and Accel retained their PIDs. Separate-host LAN checks passed for HTTPS/native
+ping, Console health and its N1 proxy, with normal CA verification.
+
+Deployed Engine SHA-256:
+`ed9b24ba787aa28de0616688fc01630afa9c6e2ce7844d9ffce6c130e3028620`.
+No new physical power-loss or long-soak qualification is claimed.
+
 ## Online committed-state backup — October 14, 2026
 
 The final locked release passed all 315 engine library tests, two EC tests,
