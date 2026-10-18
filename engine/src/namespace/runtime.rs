@@ -214,7 +214,7 @@ impl NamespaceRuntime {
 
     pub async fn mkdir(&self, _fragment: &str, _path: &str) -> Result<bool, AppError> {
         Err(AppError::BadRequest(
-            "N1 4 uses object-key prefixes; empty directories are not storage objects".into(),
+            "N1 uses object-key prefixes; empty directories are not storage objects".into(),
         ))
     }
 

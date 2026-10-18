@@ -1126,6 +1126,15 @@ async fn upload_object_one_shot_scoped(
     body: axum::body::Body,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    // Admit before choosing identity, so queued same-key writers resolve the
+    // published identity instead of all staging independent provisional IDs.
+    let io_guard =
+        acquire_upload_io_guard_for_query(query.io_gate, &fragment, "logical one-shot upload")
+            .await?;
+    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let strict_durability = upload_uses_strict_durability(&query);
     let _upload_activity = crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
@@ -1136,9 +1145,14 @@ async fn upload_object_one_shot_scoped(
         Path((fragment.clone(), physical.clone())),
         Query(query),
         body,
+        false,
+        io_progress,
     )
     .await?
     .into_response();
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     if response.status() != StatusCode::CREATED {
         return Ok(response);
     }
@@ -1295,6 +1309,7 @@ async fn upload_standard_batch_object(
         let physical = resolve_logical_write_key(&fragment, &logical_path).await?;
         let _upload_activity =
             crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
+        let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
         let mut metadata = upload_object_one_shot_body_direct(
             claims,
             fragment.clone(),
@@ -1304,8 +1319,14 @@ async fn upload_standard_batch_object(
             Body::from(bytes),
             size_bytes,
             false,
+            io_progress,
         )
         .await?;
+        // The body and EC writer buffers have been consumed. Release payload
+        // admission here; retain lifecycle/upload protection until NCX commits.
+        if let Some(guard) = io_guard {
+            guard.complete();
+        }
         let committed_physical = commit_logical_upload_from_meta_with_durability(
             &fragment,
             &logical_path,
@@ -1322,9 +1343,6 @@ async fn upload_standard_batch_object(
             &committed_physical,
             &metadata,
         );
-        if let Some(guard) = io_guard {
-            guard.complete();
-        }
         Ok::<_, AppError>(metadata)
     })
     .await
@@ -1401,7 +1419,8 @@ async fn upload_standard_batch_scoped(
         checksum: None,
         durability: query.durability,
         strict_durability: query.strict_durability,
-        // The parser's permit spans buffering, EC/NDX and NCX publication.
+        // The parser's permit spans buffering and EC/NDX work. The worker
+        // retains lifecycle/upload protection through NCX publication.
         io_gate: Some(false),
     };
 

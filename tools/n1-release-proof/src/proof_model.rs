@@ -4,7 +4,7 @@ const DEFAULT_MAX_PART_SIZE: u64 = 52_428_800;
 const PROOF_EXPORT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
-#[command(about = "Rust-only N1 release proof matrix runner")]
+#[command(version, about = "Rust-only N1 release proof matrix runner")]
 struct Args {
     #[arg(long)]
     binary: PathBuf,

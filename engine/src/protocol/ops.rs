@@ -39,9 +39,10 @@ use crate::core::retrieve::{get_object_metadata_direct, list_fragments};
 use crate::core::storage_capacity_parser::{get_capacity_usage, get_fragment_usage};
 use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
-    FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
-    get_upload_status, initiate_object_upload_direct, list_active_uploads,
-    object_upload_part_direct, object_upload_part_reader_direct, object_upload_part_stream_direct,
+    AdaptiveIoGuard, FinalizeUploadResult, acquire_upload_io_guard_for_query,
+    cancel_upload_session_direct, finalize_object_upload_direct, get_upload_status,
+    initiate_object_upload_direct, list_active_uploads, object_upload_part_direct,
+    object_upload_part_reader_direct, object_upload_part_stream_direct,
     upload_object_one_shot_direct, upload_object_one_shot_reader_direct,
     upload_object_one_shot_stream_direct,
 };
@@ -208,6 +209,14 @@ where
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
+            let query = upload_part_query_from_payload(&payload)?;
+            let io_guard = acquire_upload_io_guard_for_query(
+                query.io_gate,
+                &fragment,
+                "native logical one-shot upload",
+            )
+            .await?;
+            let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
             let _upload_activity =
                 crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
@@ -215,13 +224,17 @@ where
                 claims,
                 fragment.clone(),
                 physical.clone(),
-                upload_part_query_from_payload(&payload)?,
+                query,
                 string_field(&payload, "content_type"),
                 reader,
                 body_len,
-                true,
+                false,
+                io_progress,
             )
             .await?;
+            if let Some(guard) = io_guard {
+                guard.complete();
+            }
             let committed_physical =
                 commit_logical_upload_from_meta(&fragment, &logical, &physical, &metadata).await?;
             metadata.object_key = logical;
@@ -288,6 +301,14 @@ where
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
+            let query = upload_part_query_from_payload(&payload)?;
+            let io_guard = acquire_upload_io_guard_for_query(
+                query.io_gate,
+                &fragment,
+                "native logical one-shot upload",
+            )
+            .await?;
+            let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
             let _upload_activity =
                 crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
@@ -295,13 +316,17 @@ where
                 claims,
                 fragment.clone(),
                 physical.clone(),
-                upload_part_query_from_payload(&payload)?,
+                query,
                 string_field(&payload, "content_type"),
                 body_stream,
                 body_len,
-                true,
+                false,
+                io_progress,
             )
             .await?;
+            if let Some(guard) = io_guard {
+                guard.complete();
+            }
             let committed_physical =
                 commit_logical_upload_from_meta(&fragment, &logical, &physical, &metadata).await?;
             metadata.object_key = logical;
@@ -574,6 +599,14 @@ async fn execute_native_op_inner(
                 _body.ok_or_else(|| AppError::BadRequest("upload body is required".into()))?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
+            let query = upload_part_query_from_payload(&payload)?;
+            let io_guard = acquire_upload_io_guard_for_query(
+                query.io_gate,
+                &fragment,
+                "native logical one-shot upload",
+            )
+            .await?;
+            let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
             let _upload_activity =
                 crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
@@ -581,12 +614,16 @@ async fn execute_native_op_inner(
                 claims,
                 fragment.clone(),
                 physical.clone(),
-                upload_part_query_from_payload(&payload)?,
+                query,
                 string_field(&payload, "content_type"),
                 body,
-                true,
+                false,
+                io_progress,
             )
             .await?;
+            if let Some(guard) = io_guard {
+                guard.complete();
+            }
             let committed_physical =
                 commit_logical_upload_from_meta(&fragment, &logical, &physical, &metadata).await?;
             metadata.object_key = logical;

@@ -463,7 +463,7 @@ impl InstallShell {
                 );
                 Ok(success_outcome())
             }
-            "assign" | "unassign" => Err("N1 4 uses complete immutable storage pools; use config pool <name> <data> <parity> <roots-comma-list>".into()),
+                "assign" | "unassign" => Err("N1 uses complete immutable storage pools; use config pool <name> <data> <parity> <roots-comma-list>".into()),
             _ => Err("usage: disk <inspect|format|mount|assign|unassign> ...".into()),
         }
     }
@@ -537,7 +537,7 @@ impl InstallShell {
                 );
                 Ok(success_outcome())
             }
-            "ec" => Err("global EC topology was removed in N1 4; use config pool".into()),
+            "ec" => Err("N1 uses pool-local EC topology; use config pool".into()),
             "endpoint" => {
                 self.ensure_service_stopped()?;
                 if arguments.len() != 4 {
@@ -884,7 +884,8 @@ impl InstallShell {
     fn config_summary(&self) -> Result<String, String> {
         let config = self.load_or_create_config()?;
         let mut output = format!(
-            "N1 4 INSTALLATION\n  directory: {}\n  engine: {}\nSTORAGE POOLS\n",
+            "N1 {} INSTALLATION\n  directory: {}\n  engine: {}\nSTORAGE POOLS\n",
+            env!("CARGO_PKG_VERSION"),
             self.settings.install_dir.display(),
             self.settings.engine_binary.display()
         );
@@ -1010,7 +1011,8 @@ impl InstallShell {
             ));
         }
         Ok(format!(
-            "N1 4 installation validated: {pool_count} storage pools, {} members",
+            "N1 {} installation validated: {pool_count} storage pools, {} members",
+            env!("CARGO_PKG_VERSION"),
             all_roots.len()
         ))
     }

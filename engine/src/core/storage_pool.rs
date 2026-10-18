@@ -1,4 +1,4 @@
-//! Immutable, independently expandable N1 4 storage pools.
+//! Immutable, independently expandable N1 storage pools.
 //!
 //! A pool is one EC failure domain. Adding a pool never changes a previously
 //! enrolled pool's members, namespace replica placement, or object geometry.

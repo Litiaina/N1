@@ -41,7 +41,7 @@ pub(crate) fn freeze(seconds: u64) -> super::Result<OwnedRwLockWriteGuard<()>> {
     }
     let waker = Arc::new(Worker(std::thread::current())).into();
     let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(BOUNDARY.clone().write_owned());
+    let mut future = std::pin::pin!(tokio::task::unconstrained(BOUNDARY.clone().write_owned()));
     loop {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(guard) => return Ok(guard),
@@ -65,7 +65,9 @@ fn wait<T>(future: impl Future<Output = T>) -> T {
     }
     let waker = Arc::new(Worker(std::thread::current())).into();
     let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
+    // This adapter parks a thread, not an async task. A cooperative yield
+    // cannot replenish its task budget here; only real contention may wait.
+    let mut future = std::pin::pin!(tokio::task::unconstrained(future));
     loop {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => return value,
@@ -76,6 +78,50 @@ fn wait<T>(future: impl Future<Output = T>) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocking_admission_completes_with_an_exhausted_async_task_budget() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                for _ in 0..1024 {
+                    if !tokio::task::coop::has_budget_remaining() {
+                        break;
+                    }
+                    tokio::task::consume_budget().await;
+                }
+                assert!(!tokio::task::coop::has_budget_remaining());
+                let lock = Arc::new(RwLock::new(()));
+                let mut admission = std::pin::pin!(lock.read_owned());
+                let mut polls = 0;
+                let acquired = wait(std::future::poll_fn(|cx| {
+                    polls += 1;
+                    // Bound the regression itself: the old adapter spins forever
+                    // on cooperative Pending rather than actual lock contention.
+                    if polls > 2 {
+                        return Poll::Ready(None);
+                    }
+                    match admission.as_mut().poll(cx) {
+                        Poll::Ready(guard) => Poll::Ready(Some(guard)),
+                        Poll::Pending => {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }
+                }));
+                assert!(
+                    acquired.is_some(),
+                    "blocking admission spun on Tokio budget exhaustion"
+                );
+                assert_eq!(polls, 1, "an uncontended lock must be acquired immediately");
+            })
+            .await
+            .unwrap()
+        });
+    }
+
     #[test]
     fn admission_timeout_drops_the_queued_writer_without_blocking_future_mutations() {
         let active = mutation();

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "litiaina-n1-backup",
+    version,
     about = "Encrypted offline N1 snapshots and N1-owned snapshot replication"
 )]
 struct Cli {

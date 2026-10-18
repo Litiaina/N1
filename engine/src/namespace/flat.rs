@@ -1,4 +1,4 @@
-//! N1 4 flat namespace. Physical directories organize keys but have no logical
+//! N1 flat namespace. Physical directories organize keys but have no logical
 //! identity, mutation authority, or empty-directory semantics.
 //!
 //! LIST reads names and file types only. HEAD decodes small checksummed NCX
@@ -377,7 +377,20 @@ pub fn publish(
         let exact = holders(&existing, fragment, key)?;
         check_holders(&exact)?;
         on_holders(&exact, |root| {
-            write(root, &path(root, fragment, key), &existing, false)
+            let target = path(root, fragment, key);
+            match read(&target) {
+                Ok(Some(current)) if current == existing => {
+                    // NCX is not a version head: unchanged bytes were synced
+                    // before publication. Confirm the directory entry even
+                    // after an interrupted earlier publication, without
+                    // replacing the inode for every new object version.
+                    sync_directory(target.parent().ok_or_else(|| error("NCX has no parent"))?)
+                }
+                Ok(Some(_)) => Err(AppError::Conflict(format!(
+                    "key '{key}' has another object identity"
+                ))),
+                Ok(None) | Err(_) => write(root, &target, &existing, false),
+            }
         })?;
         return Ok(existing);
     }

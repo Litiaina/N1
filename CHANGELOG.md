@@ -1,9 +1,34 @@
 # Changelog
 
-This is a condensed development history, not an LTS release declaration.
+This is a condensed release and development history, not an LTS declaration.
 Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
-## 4.0.0 — development, storage format 4
+## 1.0.0-RC.1 — October 18, 2026
+
+- Declare the first formal release candidate. Reset private development product
+  numbering to `1.0.0-RC.1` across the workspace; this is not stable or LTS.
+- Formalize the storage-format specification as `1.0.0-RC.1`, retaining encoding
+  identifier 4 and existing data/backups without a rewrite or format migration.
+  NOA v1, native `n1/0.5` and repository `n1-backup-v1` remain unchanged.
+- Expose product/storage/protocol versions through the engine's `--version`;
+  align Shell, backup-helper and proof-tool release reporting. Document candidate,
+  stable and future compatibility/migration rules.
+
+- Honor configured I/O admission for small uploads. Resolve one-shot object
+  identity after admission on HTTP/native paths, preserving progress tracking
+  and explicit overrides. NCX publication does not consume a payload permit.
+- Fix synchronous backup-boundary admission when Tokio's cooperative task
+  budget is exhausted; preserve lock exclusion and capture admission timeouts.
+- Reuse healthy, unchanged NCX inodes when publishing another version. Retain
+  directory syncing and repair missing/corrupt copies; no version head or cache.
+- Add isolated overload/crash/integrity tools and regressions. Make the
+  beyond-parity healing fixture deterministic by injecting the complete cold
+  fault before restart, then verifying automatic recovery while running.
+
+### Private 4.0.0 development baseline (encoding 4)
+
+The features below form RC.1's baseline. Their earlier private development
+version labels are historical, not additional stable releases.
 
 - Fix HTTP auth/view/upload/global limiter configuration: `*_limit_per_second`
   now means requests per second, not seconds per replenished request. Preserve

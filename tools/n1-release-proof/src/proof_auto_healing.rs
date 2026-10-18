@@ -511,9 +511,17 @@ impl Proof {
         for (index, path) in shard_paths.iter().enumerate() {
             let backup = backup_dir.join(format!("shard-{index}"));
             fs::copy(path, &backup)?;
-            fs::remove_file(path)?;
             backups.push((path.clone(), backup));
         }
+        // A live healer can reconstruct a removed shard while another large
+        // backup is copied, or retain a valid open descriptor. Close this owned
+        // engine before injecting the complete cold beyond-parity fault.
+        // Recovery below restores only k pieces while the engine runs.
+        self.stop_server()?;
+        for (path, _) in &backups {
+            fs::remove_file(path)?;
+        }
+        self.start_server("auto-healing-unrecoverable").await?;
         let scan_failure = self
             .wait_for_auto_healing_state(
                 "unrecoverable scan fail-safe",

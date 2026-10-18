@@ -1,13 +1,44 @@
 # N1 programmer and operator documentation
 
-This guide describes the current N1 4.0.0 development API and operational tools.
-Storage format 4 does not migrate older development roots. For internals, see
+This guide describes N1 1.0.0-RC.1 and its API and operational tools. The formal
+storage-format specification is 1.0.0-RC.1, retaining encoding identifier 4;
+unsupported older development roots are not migrated automatically. For internals, see
 [ARCHITECTURE.md](ARCHITECTURE.md); for routes, [NOA.md](NOA.md); for actual test
 results and limitations, [TESTING.md](TESTING.md).
 
 Jump to [authentication](#authentication-reference), [objects](#object-api),
 [uploads](#upload-api), [exports](#archive-download), [native](#native-protocol),
 [backups](#backup-and-restore) or [setup](#operator-setup).
+
+## Release versioning and compatibility
+
+N1's formal release sequence starts at `1.0.0-RC.1` (October 18, 2026).
+Earlier 3.x/4.x versions were private development identifiers, not previous
+stable releases. Engine, Shell, native client and bundled tools inherit the
+same version from the workspace manifest.
+
+- Further candidates are `1.0.0-RC.2`, `1.0.0-RC.3`, etc.; the first stable
+  release is `1.0.0`. RC status is not stable or LTS support. LTS is a separate
+  support declaration, not something inferred from a version number.
+- After stable, patch versions fix compatible behavior, minor versions add
+  compatible capabilities, and major versions declare breaking public changes.
+- The storage specification independently starts at `1.0.0-RC.1`. Existing
+  encoding integer `4`, `N1NCX4` magic, member descriptors and backup format
+  `n1-backup-v1` remain unchanged. They are encoding identifiers, not product
+  release numbers. A product-only update does not bump the storage specification.
+- NOA remains `/noa/v1`; native framing remains `n1/0.5`. Incompatible storage
+  or wire changes require an explicit contract revision and documented migration
+  or compatibility procedure, not silent reuse of the current identifier.
+- The private `4.0.0` to formal `1.0.0-RC.1` transition is a numbering reset,
+  not an on-disk downgrade. Do not use numeric ordering against those private
+  labels to infer update safety. Automatic updates are not introduced by RC.1.
+
+Before updating storage deployments, keep a verified independent recovery point,
+check release/format compatibility, and use the matching Engine/Shell pair.
+Unsupported formats must not be forced by editing stored version markers.
+Check the engine without starting it using `litiaina-n1 --version`; it reports
+the product, storage specification, encoding and protocol versions. Git release
+tags use `v1.0.0-RC.1`; published candidate tags must not be moved to new code.
 
 ## API conventions
 

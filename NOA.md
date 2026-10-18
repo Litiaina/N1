@@ -1,14 +1,15 @@
 # Node Object API (NOA)
 
-NOA v1 is N1's canonical HTTPS/WebSocket interface under /noa/v1. It was
-introduced in N1 3.2.0; its version is separate from the package/storage format.
+NOA v1 is N1's canonical HTTPS/WebSocket interface under /noa/v1. It is the API
+baseline for N1 1.0.0-RC.1; its version is separate from the product and storage
+specification versions. The product numbering reset does not rename API routes.
 The native n1:// transport is N1-specific and is not NOA.
 
 Use Authorization: Bearer <access-token> on protected calls. Fragment permissions
 remain independent: read, write, modify and delete. Signed URLs carry narrowly
 scoped download authority instead of a reusable fragment token.
 
-N1 4 is development: keys are flat, prefixes virtual, empty mkdir rejected and
+In RC.1, keys are flat, prefixes virtual, empty mkdir rejected and
 prefix mutations non-atomic with per-child results. Old /n1 routes are not
 aliases. This inventory names routes; field-level requests, responses, examples
 and retry rules are in [DOCUMENTATION.md](DOCUMENTATION.md).

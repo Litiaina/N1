@@ -5,6 +5,51 @@ use crate::core::disk_manager::{
 use crate::core::index_store;
 use ulid::Ulid;
 
+#[tokio::test]
+async fn unchanged_ncx_publication_preserves_healthy_inodes_and_repairs_bad_copies() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _test_guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let fragment = format!("idempotent-publish-{}", Ulid::new());
+    let key = "versions/item.bin";
+    let object = publish_logical_object(&roots, &fragment, key, 32);
+    let paths = roots
+        .iter()
+        .map(|root| flat::path(root, &fragment, key))
+        .collect::<Vec<_>>();
+    // Keep the old inodes alive so the filesystem cannot recycle their IDs.
+    let open = paths
+        .iter()
+        .map(std::fs::File::open)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let inodes = open
+        .iter()
+        .map(|file| file.metadata().unwrap().ino())
+        .collect::<Vec<_>>();
+    let expected = flat::lookup(&fragment, key).unwrap().unwrap();
+
+    flat::publish(&fragment, key, &object, None).unwrap();
+    for (path, inode) in paths.iter().zip(&inodes) {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().ino(),
+            *inode,
+            "an unchanged NCX must not be replaced for another version"
+        );
+    }
+
+    std::fs::remove_file(&paths[0]).unwrap();
+    flat::publish(&fragment, key, &object, None).unwrap();
+    assert_eq!(flat::read(&paths[0]).unwrap().unwrap(), expected);
+    assert_eq!(std::fs::metadata(&paths[1]).unwrap().ino(), inodes[1]);
+
+    std::fs::write(&paths[0], b"corrupt NCX").unwrap();
+    flat::publish(&fragment, key, &object, None).unwrap();
+    assert_eq!(flat::read(&paths[0]).unwrap().unwrap(), expected);
+    assert_eq!(std::fs::metadata(&paths[1]).unwrap().ino(), inodes[1]);
+}
+
 #[test]
 fn cancelled_request_keeps_namespace_publication_exclusive_until_worker_finishes() {
     use futures_util::FutureExt;

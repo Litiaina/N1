@@ -16,7 +16,7 @@
 </div>
 
 <p align="center">
-  <strong>Current release: N1 4.0.0</strong>
+  <strong>Current release: N1 1.0.0 RC.1</strong>
 </p>
 
 ## Overview
@@ -33,8 +33,26 @@ Optional `N1_ACCEL_READ_URL` enables private Accel caching for existing Console
 and API reads after N1 authorization/version resolution. Accel failures before
 client headers fall back to N1. See [Accel setup](DOCUMENTATION.md#accel-integration).
 
-Current version: **4.0.0 development**, storage format **4**. This is not an LTS
-release. Earlier development storage formats are not migrated automatically.
+Current version: **1.0.0-RC.1**, the first formal release candidate, not stable
+or LTS. Earlier 3.x/4.x numbers were private development labels; formal product
+versioning starts here. Test results and known limits are in [Testing](TESTING.md).
+
+## Release and compatibility versions
+
+| Contract | Current version |
+| --- | --- |
+| N1, Shell, native client and bundled tools | `1.0.0-RC.1` |
+| Storage-format specification | `1.0.0-RC.1` |
+| Embedded storage encoding | `4` (unchanged bytes/markers) |
+| Node Object API | NOA v1, `/noa/v1` |
+| Native wire protocol | `n1/0.5` |
+| Backup repository | `n1-backup-v1` |
+
+The storage-format specification names the existing tested encoding. Resetting
+its formal version does not rewrite files, renumber pools/object versions or
+invalidate existing format-4 data/backups. Older unsupported development formats
+are not migrated automatically. Product, storage and wire versions are separate
+compatibility contracts; see [versioning](DOCUMENTATION.md#release-versioning-and-compatibility).
 
 ## Build and start
 
@@ -206,7 +224,7 @@ See [operator API](DOCUMENTATION.md#shell-owned-operator-api-and-console).
 ## Documentation
 
 - [README](README.md): overview, startup and basic backup.
-- [Changelog](CHANGELOG.md): development changes.
+- [Changelog](CHANGELOG.md): releases and development history.
 - [Contribution policy](CONTRIBUTING.md): bug reports; no pull requests.
 - [Testing](TESTING.md): procedures, measured results, failures and open gates.
 - [NOA](NOA.md): canonical HTTPS/WebSocket route inventory.

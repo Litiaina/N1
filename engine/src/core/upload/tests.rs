@@ -328,6 +328,80 @@ async fn upload_io_gate_helper_bypasses_when_disabled() {
 }
 
 #[tokio::test]
+async fn small_uploads_honor_default_io_admission_and_explicit_override() {
+    let fragment = format!("small-upload-admission-{}", ulid::Ulid::new());
+    for size in [
+        0,
+        1,
+        8192,
+        super::SMALL_BUFFERED_WRITE_LIMIT,
+        super::SMALL_BUFFERED_WRITE_LIMIT + 1,
+    ] {
+        for override_value in [None, Some(true), Some(false)] {
+            let guard = super::acquire_upload_io_guard_for_size(
+                override_value,
+                &fragment,
+                "small-upload-regression",
+                size,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                guard.is_some(),
+                override_value != Some(false),
+                "size {size} must not silently bypass the configured gate"
+            );
+            drop(guard);
+        }
+    }
+}
+
+#[tokio::test]
+async fn saturated_small_upload_waiter_is_cancel_safe_and_capacity_is_reusable() {
+    let fragment = format!("small-upload-saturation-{}", ulid::Ulid::new());
+    let permits =
+        crate::core::io_scheduler::disk_io_scheduler_config().foreground_per_fragment_permits;
+    let mut held = Vec::new();
+    for _ in 0..permits {
+        held.push(
+            super::acquire_upload_io_guard_for_size(
+                None,
+                &fragment,
+                "fill-small-upload-gate",
+                8192,
+            )
+            .await
+            .unwrap()
+            .expect("small upload must acquire a permit"),
+        );
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            super::acquire_upload_io_guard_for_size(
+                None,
+                &fragment,
+                "cancelled-small-upload-waiter",
+                8192
+            ),
+        )
+        .await
+        .is_err(),
+        "saturated small uploads must wait for existing admission"
+    );
+    drop(held.pop());
+    let guard = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        super::acquire_upload_io_guard_for_size(None, &fragment, "retry-small-upload-waiter", 8192),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("cancelled waiter must not leak capacity");
+    drop(guard);
+}
+
+#[tokio::test]
 async fn direct_writer_propagates_background_write_failure() {
     let mut writer = direct_writer_with_failed_task(libc::ENOSPC);
     let error = writer

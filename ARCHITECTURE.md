@@ -1,8 +1,11 @@
 # N1 architecture
 
-N1 4.0.0 is a development single-node object store, not a filesystem or a
-distributed cluster. Storage format 4 has no automatic migration from older
-development formats. API details are in [DOCUMENTATION.md](DOCUMENTATION.md).
+N1 1.0.0-RC.1 is a single-node object store, not a filesystem or a distributed
+cluster. Its storage-format specification is also 1.0.0-RC.1. This formal naming
+reset retains the tested encoding identifier 4 and existing NCX/NDX/payload,
+pool and backup representations; it is not a data migration. Unsupported older
+development formats are not migrated automatically. API details and versioning
+rules are in [DOCUMENTATION.md](DOCUMENTATION.md).
 
 ## Storage pools
 

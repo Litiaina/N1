@@ -559,6 +559,15 @@ enum StartupCommand {
 fn print_version() {
     println!("litiaina-n1 {}", env!("CARGO_PKG_VERSION"));
     println!(
+        "storage_format {}",
+        crate::settings::version::STORAGE_FORMAT_VERSION
+    );
+    println!(
+        "storage_encoding {}",
+        crate::settings::version::STORAGE_ENCODING_VERSION
+    );
+    println!("noa v1");
+    println!(
         "native_protocol {}",
         crate::protocol::types::N1_NATIVE_PROTOCOL_VERSION
     );
@@ -572,7 +581,7 @@ fn print_usage(binary: &str) {
     println!("Offline operations: {binary} pool --help | {binary} backup --help");
     println!();
     println!("Options:");
-    println!("  -V, --version    Print N1 build version and native protocol version");
+    println!("  -V, --version    Print build, storage format and protocol versions");
     println!("  -h, --help       Print this help");
 }
 
@@ -803,7 +812,11 @@ pub async fn run_server() {
             // not a programming panic or a reason to produce a core dump.
             std::process::exit(1);
         });
-    tracing::info!("Storage mode: N1 4 flat object namespace on independent unified storage pools");
+    tracing::info!(
+        "Storage mode: flat object namespace on independent unified storage pools; format {} (encoding {})",
+        crate::settings::version::STORAGE_FORMAT_VERSION,
+        crate::settings::version::STORAGE_ENCODING_VERSION,
+    );
     crate::core::backup::online::cleanup_interrupted_views(&instance_roots).unwrap_or_else(
         |error| {
             tracing::error!("Cannot clean interrupted online backup views: {error}");

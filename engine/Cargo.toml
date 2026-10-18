@@ -1,6 +1,6 @@
 [package]
 name = "n1"
-version = "4.0.0"
+version.workspace = true
 edition = "2024"
 
 [[bin]]

@@ -266,11 +266,10 @@ async fn acquire_upload_io_guard_for_size(
     io_gate_override: Option<bool>,
     fragment: &str,
     context: &str,
-    content_length: u64,
+    _content_length: u64,
 ) -> Result<Option<AdaptiveIoGuard>, AppError> {
-    if content_length <= SMALL_BUFFERED_WRITE_LIMIT && !io_gate_override.unwrap_or(false) {
-        return Ok(None);
-    }
+    // Small payloads still perform EC/NDX publication and strict flushes.
+    // Honor the existing gate for every size; buffering is not admission.
     acquire_upload_io_guard_for_query(io_gate_override, fragment, context).await
 }
 
@@ -1021,6 +1020,7 @@ async fn upload_object_one_shot_inner(
     Query(query): Query<UploadPartQuery>,
     body: Body,
     acquire_io_gate: bool,
+    external_io_progress: Option<IoProgress>,
 ) -> Result<Response, AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
@@ -1039,7 +1039,10 @@ async fn upload_object_one_shot_inner(
     } else {
         None
     };
-    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
+    let io_progress = io_guard
+        .as_ref()
+        .map(AdaptiveIoGuard::progress_handle)
+        .or(external_io_progress);
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Ok((
@@ -1145,8 +1148,20 @@ pub async fn upload_object_one_shot(
     path: AxumPath<(String, String)>,
     query: Query<UploadPartQuery>,
     body: Body,
+    acquire_io_gate: bool,
+    external_io_progress: Option<IoProgress>,
 ) -> Result<impl IntoResponse, AppError> {
-    upload_object_one_shot_inner(state, claims, headers, path, query, body, true).await
+    upload_object_one_shot_inner(
+        state,
+        claims,
+        headers,
+        path,
+        query,
+        body,
+        acquire_io_gate,
+        external_io_progress,
+    )
+    .await
 }
 
 pub async fn upload_object_one_shot_direct(
@@ -1157,6 +1172,7 @@ pub async fn upload_object_one_shot_direct(
     content_type: Option<String>,
     body: Vec<u8>,
     acquire_io_gate: bool,
+    external_io_progress: Option<IoProgress>,
 ) -> Result<ObjectMetadata, AppError> {
     let content_length = body.len() as u64;
     upload_object_one_shot_body_direct(
@@ -1168,6 +1184,7 @@ pub async fn upload_object_one_shot_direct(
         Body::from(body),
         content_length,
         acquire_io_gate,
+        external_io_progress,
     )
     .await
 }
@@ -1181,6 +1198,7 @@ pub async fn upload_object_one_shot_body_direct(
     body: Body,
     content_length: u64,
     acquire_io_gate: bool,
+    external_io_progress: Option<IoProgress>,
 ) -> Result<ObjectMetadata, AppError> {
     let body_stream = body.into_data_stream().map(|chunk_result| {
         chunk_result.map_err(|e| {
@@ -1199,6 +1217,7 @@ pub async fn upload_object_one_shot_body_direct(
         body_stream,
         content_length,
         acquire_io_gate,
+        external_io_progress,
     )
     .await
 }
@@ -1212,6 +1231,7 @@ pub async fn upload_object_one_shot_stream_direct<S>(
     body_stream: S,
     content_length: u64,
     acquire_io_gate: bool,
+    external_io_progress: Option<IoProgress>,
 ) -> Result<ObjectMetadata, AppError>
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
@@ -1233,7 +1253,10 @@ where
     } else {
         None
     };
-    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
+    let io_progress = io_guard
+        .as_ref()
+        .map(AdaptiveIoGuard::progress_handle)
+        .or(external_io_progress);
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge(
@@ -1337,6 +1360,7 @@ pub async fn upload_object_one_shot_reader_direct<R>(
     reader: &mut R,
     content_length: u64,
     acquire_io_gate: bool,
+    external_io_progress: Option<IoProgress>,
 ) -> Result<ObjectMetadata, AppError>
 where
     R: AsyncRead + Unpin + Send,
@@ -1358,7 +1382,10 @@ where
     } else {
         None
     };
-    let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
+    let io_progress = io_guard
+        .as_ref()
+        .map(AdaptiveIoGuard::progress_handle)
+        .or(external_io_progress);
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge(

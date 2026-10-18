@@ -1,9 +1,137 @@
 # N1 testing and results
 
-N1 4.0.0 / storage format 4 remains development, not LTS. Results below are
-dated evidence, not guarantees for every server. Older versions' passes do not
-certify the current namespace/pool design. Personal test paths and credentials
-are intentionally omitted.
+N1 1.0.0-RC.1 is the first formal release candidate, not stable or LTS. The
+storage-format specification is 1.0.0-RC.1 with unchanged encoding identifier 4.
+Results below are dated evidence, not guarantees for every server. Older
+versions' passes do not certify the current namespace/pool design. Personal test
+paths and credentials are intentionally omitted. Historical 3.x/4.x labels and
+binary checksums identify the private builds actually tested; they are not
+retroactively renamed or presented as newly rebuilt RC binaries.
+
+## RC.1 declaration verification — October 18, 2026
+
+After the numbering reset, the locked, offline, warnings-denied workspace/
+all-targets suite passed serially and in parallel: 329 engine, two EC, two
+release-reporting, nine proof-CLI, 12 Shell unit and nine Shell integration
+tests (363 distinct Rust tests). All six Python fixture-safety tests passed.
+The new checks exercise real engine/backup/Shell binaries; version reporting
+does not initialize storage or require network credentials. Product version,
+storage specification, unchanged encoding 4 and existing wire versions are
+checked separately.
+
+The locked, offline, warnings-denied optimized workspace/binary build passed.
+Engine, Shell, backup helper and proof tool all reported `1.0.0-RC.1`. A fresh
+isolated USB-HDD/NVMe EC 1+1 native-protocol smoke passed on the rebuilt engine,
+including object/version readback. Existing deployed processes were unchanged.
+RC.1 optimized Engine SHA-256:
+`2b1623ff6abd25dac592780ba41b23d2d446014e95ce11076f0d48b40eed0485`.
+
+The declaration changes version metadata, reporting and documentation, not
+NCX/NDX/payload encoding or mutation/durability rules. The hardware matrix below
+retains its actual pre-reset build checksum and limitations. Its results do not
+claim a fresh physical power cut or long soak of a renamed/rebuilt binary.
+
+## RC concurrency investigation — October 17–18, 2026
+
+The locked workspace/all-targets suite passed both serially and in parallel:
+329 engine, two EC, nine proof-CLI, 12 Shell unit and eight Shell integration
+tests (360 distinct tests). Six Python fixture-safety tests also passed. Four new
+regressions were reproduced failing before their fixes: small-upload admission,
+saturated/cancelled admission with capacity reuse,
+blocking boundary admission with exhausted Tokio budget, and unnecessary NCX
+inode replacement. The latter also checks missing/corrupt replica repair without
+replacing the healthy copy.
+
+Fixtures use an isolated EC 1+1 pool on a USB rotational HDD and the internal
+NVMe, with loopback HTTPS/native traffic. The Python stress tools verify their
+fixture CA; the older Rust proof client's lab connections disable certificate
+validation. Online backup separately exercises source CA validation.
+Existing services and enrolled roots are untouched. The host also ran ordinary
+applications; these are not uncontended throughput benchmarks or four-drive,
+LAN, physical power-cut or long-soak qualifications.
+
+Failures retained during iteration:
+
+- Baseline small writes bypassed configured admission. Extreme load produced
+  120-second request deadlines; independent restart verification still hashed
+  all 9,450 acknowledged versions and 1,015 additional unacknowledged versions.
+  A timeout is not proof that a write did not commit.
+- GC overlap stalled at its unchanged 120-second deadline. The synchronous
+  backup-boundary adapter could not replenish Tokio's exhausted cooperative
+  budget. Its focused regression failed before the fix; the unchanged GC proof
+  then completed in 56.65 seconds.
+- Admission-only iteration: all three mixed-load waves completed, but shared-key
+  contention still produced 84 timeouts. All 2,404 acknowledged versions survived
+  three inflight SIGKILL cycles and complete hash verification.
+- The next iteration passed the complete 2,048-concurrent overload/crash gate:
+  2,418 acknowledged versions, zero unexpected errors, paginated listing and
+  absence of admission-refused unique writes verified. Shared-key latency still
+  approached the 120-second client deadline.
+- Holding payload permits through NCX publication reduced small-write throughput
+  on this shared host; that boundary was withdrawn. Admission now precedes
+  identity selection, and payload permits are released after EC/NDX work, with
+  lifecycle/upload protection retained through logical publication.
+- The 16-client, 64-object/client, 16 KiB batch workload exceeded its original
+  60-second deadline in intermediate builds. It was progressing, not hung; the
+  deadline has not been raised or the workload reduced.
+
+Harness failures are not engine passes: a renamed binary lacked Shell's expected
+sibling engine, and sequential copy/remove fault injection allowed the live
+healer to reconstruct the supposedly unrecoverable object. The backup fixture
+now uses the normal Engine/Shell pairing. Beyond-parity loss is injected cold,
+then fail-safe entry and automatic recovery from only k restored pieces are
+checked while running, with unchanged recovery deadlines.
+
+The revised optimized candidate
+(`1313b5034777749bb343b39a1684a30e79bd7c60ab908aae7639a33860e8b4f8`)
+passed all eight primary hardware gates, without changing their original
+workloads or acceptance deadlines:
+
+| Gate | Result |
+| --- | --- |
+| Original 16-client batch, 1,024 × 16 KiB | PASS: 19.256 s, 53.177 objects/s; all requests completed in 17.275–19.240 s |
+| Full concurrent upload/mutation/restart phase | PASS: 96.715 s; 1,968 expected live objects; sampled peak RSS 158,604 KiB / 149 FDs |
+| GC overlap, original workload/deadlines | PASS: 56.132 s |
+| Recover-on-read, healing and cold beyond-parity fail-safe/live recovery | PASS: 28.052 s |
+| Native protocol operations | PASS: 5.511 s |
+| HTTP/native 2 GiB interrupted multipart/resume | PASS: 183.321 s |
+| Online committed-state backup | PASS: all 20 checks, 168.311 s; 132 restored objects/history/trash verified; pending uploads excluded |
+| Strict upload ramps, namespace isolation and interrupted prefix copy/delete | PASS: 282.519 s; all 1,915 acknowledged versions hashed across restarts; 7,660 immutable files unchanged by NCX mutations |
+| Extreme offered load and three inflight SIGKILL cycles | PASS: 321.826 s; 20,480 primary requests, up to 2,048 concurrent clients; all 2,229 acknowledged versions hashed after restart; zero unexpected errors |
+
+Overload PASS means correct bounded admission and recovery, not acceptance of
+every offered write. Normal waves returned explicit scheduler-admission 503s;
+disconnects were expected only after deliberate SIGKILL. Accepted shared-key
+writes reached p99 31.915 s / maximum 32.357 s, versus maximum 116.883 s in the
+earlier passing iteration. Successful mixed-load read/LIST p95 was 1.701–1.822 s.
+Peak sampled engine RSS across the primary matrix was 268,012 KiB (261.8 MiB),
+with 2,081 FDs; post-crash quiescent listing sampled 16 FDs. Restarts mean these
+numbers are not evidence of a long-duration leak-free soak.
+
+The batch row retains the proof's original relaxed payload durability default;
+NCX publication remains strict. A separate strict-default batch with the same
+16 clients × 64 objects × 16 KiB passed full hash checks for all 1,024 versions
+before and after SIGKILL. Its slowest batch took 117.899 s, with peak RSS
+57,444 KiB / 140 FDs: it did not meet 60 seconds. This additional durability test
+uses a separate 300-second client limit and does not replace or extend the
+original acceptance gate. The larger strict batch (32 clients × 16 objects ×
+1 MiB, 512 MiB total) also passed every version hash before and after SIGKILL;
+its slowest batch took 97.515 s, with peak RSS 102,352 KiB / 140 FDs. Neither
+strict case proves a sub-60-second batch SLA. Strict batch latency on this
+rotational member remains a performance limitation; durability was not relaxed
+to improve the result.
+
+The corrected healing proof also passed three additional fresh-fixture repeats.
+Online backup covered local HTTPS/native capture and local repository
+replication/relocated restore; no new cross-host replication result is claimed.
+No cache, version head, tombstone or storage-format change was introduced.
+
+Reproduction tools: `tools/n1-rc-stress.py` and `tools/n1-rc-overload.py` accept
+`--binary`, a new `--root`, and one `--member-parent` per EC member. Read `--help`
+first. They bind loopback only, reject existing fixtures, enrolled ancestors and
+same-filesystem members, monitor resource/free-space ceilings, and only stop
+their own engine. They never connect to a deployed service. Run fixture-safety
+checks with `python3 -m unittest discover -s tools -p test_n1_rc_stress.py`.
 
 ## HTTP rate-limit correction — October 15, 2026
 
@@ -885,16 +1013,17 @@ unchanged. This proves a process-crash case, not power-cut/cache-loss durability
 ## Reproduce validation
 
 ```bash
-RUSTFLAGS='-D warnings' cargo test --workspace --all-targets -- --test-threads=1
-RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
+RUSTFLAGS='-D warnings' cargo test --locked --workspace --all-targets -- --test-threads=1
+RUSTFLAGS='-D warnings' cargo check --locked --workspace --all-targets
 cargo fmt --all -- --check
 git diff --check
-cargo build --release -p n1 --bins -p n1-release-proof
+cargo build --locked --release -p n1 --bins -p n1-release-proof
 ```
 
-Default parallel test execution has intermittently failed backup automation's
-immediate lease-reacquisition assertions. A serial pass is not a parallel pass.
-A warning-free full Clippy gate is also not claimed.
+Earlier default parallel execution intermittently failed backup automation's
+immediate lease-reacquisition assertions. Those failures remain part of the
+history; both current RC.1 execution modes passed as recorded above. A serial
+pass alone is not a parallel pass. A warning-free full Clippy gate is not claimed.
 
 Run optimized hardware proofs only in new isolated children of mounted members,
 with unique output directories/unused ports. Never reuse live storage roots:
@@ -927,13 +1056,15 @@ kernel capacity failures, original-layout repair, GC protection and portable
 backup recovery. Live Console/Accel/native/NOA/WebSocket tests must also exercise
 flat key/prefix behavior and partial results.
 
-## Remaining gates and evidence
+## Remaining stable/LTS qualification and evidence
 
 Repeated power cuts at different fsync stages, simultaneous multi-member replacement,
 broader pool/failure topologies, capacity exhaustion under format 4, longer
 memory/FD soaks on the patched candidate,
 larger/cold namespaces, complete live consumer integration, and backup failure
-cases beyond the verified interruption/retry matrix remain release gates.
+cases beyond the verified interruption/retry matrix remain qualification work
+for stable/LTS decisions. RC.1 is available for wider validation, not a claim
+that these gates have all passed.
 Cross-filesystem bind cutovers and process kills are not physical device-loss
 or controller-cache tests.
 

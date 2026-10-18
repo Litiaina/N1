@@ -23,6 +23,21 @@ const ROTATED_REFRESH_TOKEN: &str = "refresh-token-2";
 const AUTH_FRAGMENT_NAME: &str = "mainframe";
 const AUTH_FRAGMENT_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+#[test]
+fn version_reports_the_workspace_release_without_authentication() {
+    let output = Command::cargo_bin("litiaina-n1-shell")
+        .unwrap()
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("litiaina-n1-shell {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 #[derive(serde::Deserialize)]
 struct AuthPayload {
     fragment: String,
