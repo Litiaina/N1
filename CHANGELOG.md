@@ -5,6 +5,9 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## Unreleased — bounded maintenance and upload performance
 
+- Isolate the namespace key-lock cleanup regression from unrelated parallel
+  tests; preserve the failed qualification and require a fresh complete rerun.
+  This changes no runtime behavior, storage format or RC version.
 - Add a request-owned strict small-file batch path: at most 64 objects / 8 MiB
   per commit group, bounded payload parallelism and shared filesystem durability
   barriers before NDX, before NCX and before ACK. Keep ordinary independent

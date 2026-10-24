@@ -8,8 +8,23 @@ commit implementation. It is not a million-object pass. Production services
 and all existing test evidence remain untouched.
 
 The replacement headless supervisor started **October 24 at 17:27 Manila** with
-frozen candidate `a6415893` and verified package hashes. Its initial phase is the
-final 426-test suite; no completed final suite or scale pass is claimed at launch.
+frozen candidate `a6415893` and verified package hashes. Its first gate stopped
+with **425 passes / one failure**: a key-lock cleanup test required the shared
+registry to be empty while other tests could hold unrelated locks. The isolated
+test passed, but the failed parallel gate remains preserved. The comparison and
+million-object stages never started.
+
+The assertion now checks its own canonical keys while an unrelated key remains
+held. This test-only correction leaves the engine binary unchanged. The fresh
+frozen test executable started headlessly on MCH at **17:47 Manila**; all 426
+library tests passed together in 257.603 seconds. Backend selection passed
+four cases with two opt-in cases ignored, and the separately required native
+io_uring integration passed. The full-64-object strict-batch gate passed all six
+error/kill rounds across four filesystems, with 106 successful ACKs and 960
+historical hash checks; no injected-fault operation falsely succeeded.
+Scheduled GC passed, and RC concurrency stress is running. Later native-protocol,
+read-repair, comparison and scale gates remain pending. No scale pass is claimed.
+Production service PIDs were unchanged at launch.
 The final warning-denied build, focused executor/backup tests, explicit native
 integration and 109 harness/shim regressions passed locally. Production N1,
 Accel and Console remain running unchanged.

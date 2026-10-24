@@ -1842,7 +1842,26 @@ mod tests {
         with_keys(&fragment, &["b"], || Ok(())).unwrap();
         release_tx.send(()).unwrap();
         worker.join().unwrap().unwrap();
-        assert!(KEY_LOCKS.lock().unwrap().is_empty());
+        let stable_fragment = index_store::stable_fragment_id_for_fragment(&fragment);
+        let unrelated_fragment = Ulid::new().to_string();
+        let unrelated_name = format!(
+            "{}\0unrelated",
+            index_store::stable_fragment_id_for_fragment(&unrelated_fragment)
+        );
+        // Other tests legitimately hold unrelated namespace locks in parallel.
+        // Keep one live here so this assertion cannot depend on global idleness.
+        with_keys(&unrelated_fragment, &["unrelated"], || {
+            let registry = KEY_LOCKS.lock().unwrap();
+            assert!(registry.contains_key(&unrelated_name));
+            for key in ["a", "b"] {
+                assert!(
+                    !registry.contains_key(&format!("{stable_fragment}\0{key}")),
+                    "completed test key {key} remained in the registry"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

@@ -15,8 +15,24 @@ cases and the separately invoked native io_uring integration case. Subsequent
 harness/shim regressions total 109 passes. Executor hardening added two-worker
 pool saturation and queued-backup cases. The final warning-denied release build,
 both focused executor/backup regressions and explicit native integration passed.
-Its frozen 426-test executable started on MCH at **17:27 Manila**; the complete
-final suite is pending, not inferred from the earlier candidate's pass.
+Its frozen 426-test executable started on MCH at **17:27 Manila** and stopped
+with **425 passes / one failure**. The failing key-lock cleanup test asserted
+that the entire shared registry was empty while unrelated tests could hold
+locks. It passed alone, but that does not qualify the parallel suite. The failed
+run is preserved; neither its comparison nor its million-object stage started.
+
+The test now checks removal of its own canonical keys while deliberately holding
+an unrelated key. This is a test-isolation correction, not an engine change.
+A fresh frozen test executable started headlessly on MCH at **17:47 Manila**.
+The complete parallel rerun passed **426/426 library tests** in 257.603 seconds.
+Backend-selection tests passed **4/4** with two opt-in cases ignored; the
+separately required native io_uring case also passed. The full-64-object
+strict-batch fault gate passed on all four filesystems: three injected-error
+rounds and three process-kill rounds, 106 successful ACKs and 960 historical
+hash checks, with no false successful fault ACK. Scheduled GC also passed.
+RC concurrency stress is running; subsequent native-protocol/read-repair,
+comparison and million-object stages remain pending. These injected errors
+follow real synchronization and do not certify physical power loss.
 
 An initial two-physical-HDD EC 1+1 gate passed boundary sizes, count/byte limits,
 duplicate keys, partial errors, concurrent rename and upload, unchanged NCX
@@ -33,8 +49,9 @@ counted as a pass. Another intermediate library run recorded 425 passes and one
 isolated-fixture setup `ENOENT`; its mutable build executable was subsequently
 absent. The precise deletion timing is unproven. That run is unqualified, and
 the final full-suite run uses immutable copies outside the compiler output tree.
-The final candidate (`a6415893`, full SHA-256 retained with the frozen package)
-now has an independent headless supervisor on four SATA/XFS members, EC 3+1.
+The final engine candidate (`a6415893`, full SHA-256 retained with the frozen
+package) is unchanged by the test correction. The active replacement uses an
+independent headless supervisor on four SATA/XFS members, EC 3+1.
 It requires the final full regressions, full-64-object fault gates, scheduled
 GC/concurrency/native/read-repair gates and a matched old/new/new/old comparison
 before one million single-folder uploads, followed by one million mutations.
