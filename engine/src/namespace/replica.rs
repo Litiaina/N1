@@ -41,7 +41,13 @@ pub async fn inspect_namespace_replicas(
     fragment: &str,
     index_roots: &[PathBuf],
 ) -> Result<NamespaceReplicaInspection, AppError> {
-    let inspection = index_store::inspect_fragment_partition_replicas(fragment, index_roots);
+    let fragment_owned = fragment.to_string();
+    let roots = index_roots.to_vec();
+    let inspection = tokio::task::spawn_blocking(move || {
+        index_store::inspect_fragment_partition_replicas(&fragment_owned, &roots)
+    })
+    .await
+    .map_err(|err| AppError::InternalServerError(format!("namespace inspection worker: {err}")))?;
     Ok(NamespaceReplicaInspection {
         fragment: fragment.to_string(),
         expected_replicas: inspection.expected_replicas,

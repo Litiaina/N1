@@ -56,9 +56,12 @@ impl InstanceLease {
             let mut bytes = Vec::new();
             (&mut file).take(128).read_to_end(&mut bytes)?;
             if bytes.is_empty() && !require_initialized {
+                let started = std::time::Instant::now();
+                tracing::info!(root = %root.display(), "Synchronizing new N1 instance lease");
                 file.write_all(FORMAT)?;
                 file.sync_all()?;
                 File::open(&root)?.sync_all()?;
+                tracing::info!(root = %root.display(), elapsed_ms = started.elapsed().as_millis(), "New N1 instance lease synchronized");
             } else if bytes != FORMAT {
                 return Err(io::Error::other(
                     "unrecognized instance lease; refuse unsafe offline capture",

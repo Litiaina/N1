@@ -28,6 +28,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use ulid::Ulid;
 
@@ -777,34 +778,117 @@ pub(crate) fn local_object_dirs_under_root(
     root: &Path,
     fragment: &str,
 ) -> Result<Vec<(PathBuf, String)>, AppError> {
-    let objects_root = blob_fragment_root_on(root, fragment).join(OBJECTS_DIR);
-    if !objects_root.is_dir() {
-        return Ok(Vec::new());
+    let mut out = Vec::new();
+    visit_local_object_dirs(root, fragment, |path, object_id| {
+        out.push((path.to_path_buf(), object_id.to_string()));
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+/// The fixed two-level payload fanout needs at most three open ReadDirs, not
+/// a Vec of every object. False stops immediately; no sibling inventory first.
+pub(crate) fn visit_local_object_dirs(
+    root: &Path,
+    fragment: &str,
+    mut visit: impl FnMut(&Path, &str) -> Result<bool, AppError>,
+) -> Result<(), AppError> {
+    let mut cursor = LocalObjectDirCursor::new(root, fragment)?;
+    while let Some((path, object_id)) = cursor.next_object()? {
+        if !visit(&path, &object_id)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Resume the fixed fanout without collecting a pool-wide object inventory.
+/// Entries are inspected without following symlinks; only three ReadDirs live.
+pub(crate) struct LocalObjectDirCursor {
+    directories: Vec<fs::ReadDir>,
+}
+
+impl LocalObjectDirCursor {
+    pub(crate) fn new(root: &Path, fragment: &str) -> Result<Self, AppError> {
+        let fragment_root = blob_fragment_root_on(root, fragment);
+        match fs::symlink_metadata(&fragment_root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(AppError::Conflict(
+                    "physical fragment is not a real directory".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    directories: Vec::new(),
+                });
+            }
+            Err(error) => return Err(io_err(error, "inspect physical fragment")),
+        }
+        let objects_root = fragment_root.join(OBJECTS_DIR);
+        let mut directories = Vec::new();
+        match fs::symlink_metadata(&objects_root) {
+            Ok(metadata) if metadata.file_type().is_dir() => directories.push(
+                fs::read_dir(&objects_root).map_err(|e| io_err(e, "enumerate object fanout"))?,
+            ),
+            Ok(_) => {
+                return Err(AppError::InternalServerError(
+                    "object fanout is not a real directory".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(error, "inspect object fanout")),
+        }
+        Ok(Self { directories })
     }
 
-    let mut out = Vec::new();
-    for fanout_a in read_dir_names(&objects_root)? {
-        let fanout_a_dir = objects_root.join(&fanout_a);
-        if !fanout_a_dir.is_dir() {
-            continue;
-        }
-        for fanout_b in read_dir_names(&fanout_a_dir)? {
-            let fanout_b_dir = fanout_a_dir.join(&fanout_b);
-            if !fanout_b_dir.is_dir() {
+    pub(crate) fn next_object(&mut self) -> Result<Option<(PathBuf, String)>, AppError> {
+        while let Some(directory) = self.directories.last_mut() {
+            let Some(entry) = directory.next() else {
+                self.directories.pop();
+                continue;
+            };
+            let entry = entry.map_err(|e| io_err(e, "read object fanout"))?;
+            if !entry
+                .file_type()
+                .map_err(|e| io_err(e, "inspect object fanout entry"))?
+                .is_dir()
+            {
                 continue;
             }
-            for name in read_dir_names(&fanout_b_dir)? {
-                let Some(object_id) = object_id_from_dir_name(&name) else {
-                    continue;
-                };
-                let object_dir = fanout_b_dir.join(&name);
-                if object_dir.is_dir() {
-                    out.push((object_dir, object_id));
+            let path = entry.path();
+            if self.directories.len() == 3 {
+                let name = entry.file_name();
+                if let Some(object_id) = name.to_str().and_then(object_id_from_dir_name) {
+                    return Ok(Some((path, object_id)));
+                }
+            } else {
+                match fs::read_dir(&path) {
+                    Ok(children) => self.directories.push(children),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(io_err(error, "open object fanout directory")),
                 }
             }
         }
+        Ok(None)
     }
-    Ok(out)
+}
+
+pub(crate) fn local_root_has_blob_payload(root: &Path, fragment: &str) -> bool {
+    let mut found = false;
+    let _ = visit_local_object_dirs(root, fragment, |object_dir, _| {
+        found = fs::read_dir(object_dir).ok().is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry.path().is_dir()
+                    && fs::read_dir(entry.path())
+                        .ok()
+                        .and_then(|mut files| files.next())
+                        .is_some()
+            })
+        });
+        Ok(!found)
+    });
+    found
 }
 
 fn ensure_fragment_dirs(fragment: &str) -> Result<(), AppError> {
@@ -1245,8 +1329,11 @@ fn write_metadata_to_roots_with_durability(
     strict_durability: bool,
 ) -> Result<(), AppError> {
     let _snapshot_boundary = crate::core::backup::barrier::mutation();
-    ensure_fragment_dirs(&metadata.fragment)?;
-    let bytes = encode(metadata)?;
+    // Ordinary NDX publication uses the already-created shard placement. It
+    // must not initialize .uploads/.trash on every namespace root per object.
+    // All shard-bearing version directories are checked below before any NDX
+    // is written; foreground callers also retain live-fragment admission.
+    let bytes = Arc::new(encode(metadata)?);
     let file_name = ndx_file_name(metadata);
     let shard_paths = metadata
         .parts
@@ -1254,7 +1341,7 @@ fn write_metadata_to_roots_with_durability(
         .flat_map(|part| part.shards.iter())
         .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut written = 0usize;
+    let mut targets = Vec::new();
     for root in blob_roots() {
         let object_dir = object_index_dir(&root, &metadata.fragment, &metadata.object_key)?;
         let participates = shard_paths
@@ -1290,15 +1377,25 @@ fn write_metadata_to_roots_with_durability(
                 root.display()
             )));
         }
-        write_atomic_with_durability(&object_dir.join(&file_name), &bytes, strict_durability)?;
-        written += 1;
+        targets.push(object_dir.join(&file_name));
     }
-    if written == 0 {
+    if targets.is_empty() {
         return Err(AppError::ServiceUnavailable(format!(
             "no shard-bearing blob placement exists for object {} version {}",
             metadata.object_key, metadata.version_id
         )));
     }
+    // Independent members publish in parallel within the existing bounded
+    // holder executor. Its join-all phase retains the snapshot boundary and
+    // cannot return early while another member is still writing immutable NDX.
+    crate::namespace::flat::on_holders(&targets, |path| {
+        linux_io::atomic_write_shared_blocking_with_durability(
+            path,
+            Arc::clone(&bytes),
+            strict_durability,
+        )
+        .map_err(|e| io_err(e, "atomic write N1 file"))
+    })?;
     Ok(())
 }
 
@@ -1691,6 +1788,41 @@ pub fn scan_live_full_metadata_page(
     })
 }
 
+/// Batch ownership stays with the caller. Directory enumeration is resumed,
+/// not repeated, and there is no background producer occupying a blocking
+/// worker while the consumer waits for other filesystem operations.
+pub(crate) struct MetadataScan {
+    fragment: String,
+    namespace: crate::namespace::flat::Scan,
+}
+
+impl MetadataScan {
+    pub(crate) fn new(fragment: &str, trash: bool) -> Result<Self, AppError> {
+        Ok(Self {
+            fragment: stable_fragment_id_for_fragment(fragment),
+            namespace: crate::namespace::flat::Scan::new(fragment, trash)?,
+        })
+    }
+
+    pub(crate) fn next_batch(&mut self, limit: usize) -> Result<Vec<ObjectMetadata>, AppError> {
+        let limit = limit.clamp(1, 4096);
+        let mut batch = Vec::with_capacity(limit);
+        while batch.len() < limit {
+            let Some(record) = self.namespace.next_record()? else {
+                break;
+            };
+            // Live and trash NCX refer to the same immutable version store.
+            if let Some(metadata) =
+                read_current_live_head(&self.fragment, &record.pointer.object_id)?
+            {
+                batch.push(metadata);
+            }
+        }
+        Ok(batch)
+    }
+}
+
+pub(crate) mod batch;
 mod replicas;
 mod sessions;
 mod trash;

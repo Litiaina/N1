@@ -470,36 +470,20 @@ pub(super) async fn run_redistribution_job_reserved(
                 last_error: None,
             };
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-            let mut continuation_token = None;
+            let mut scan = index::MetadataScan::new(&fragment_hash, is_trash).await?;
             loop {
                 if should_stop() {
                     break;
                 }
                 io_guard.heartbeat();
 
-                let page = if is_trash {
-                    index::scan_fragment_trash_metadata_page(
-                        &fragment_hash,
-                        None,
-                        None,
-                        usize::try_from(status_batch.max(1)).unwrap_or(usize::MAX),
-                        continuation_token.clone(),
-                        true,
-                    )
-                    .await?
-                } else {
-                    index::scan_fragment_live_metadata_page(
-                        &fragment_hash,
-                        None,
-                        None,
-                        usize::try_from(status_batch.max(1)).unwrap_or(usize::MAX),
-                        continuation_token.clone(),
-                        true,
-                    )
-                    .await?
-                };
-
-                for meta in page.objects {
+                let objects = scan
+                    .next_batch(usize::try_from(status_batch.max(1)).unwrap_or(4096))
+                    .await?;
+                if objects.is_empty() {
+                    break;
+                }
+                for meta in objects {
                     io_guard.heartbeat();
                     let is_trash_flag = is_trash;
                     let id = dedupe_id_from_metadata(&meta, is_trash_flag);
@@ -688,11 +672,6 @@ pub(super) async fn run_redistribution_job_reserved(
                             flush_status_delta(&ws_manager, start_time, &mut delta).await;
                         }
                     }
-                }
-
-                match page.continuation_token {
-                    Some(token) => continuation_token = Some(token),
-                    None => break,
                 }
             }
 
@@ -1013,7 +992,7 @@ pub(super) async fn redistribute_object_streaming(
     let new_block_size = target_stripe_size_for_metadata(meta, target_stripe_size);
     let verify_tmp_crc = strict_durability;
 
-    let mut file_cache: HashMap<String, File> = HashMap::new();
+    let mut file_cache: HashMap<String, crate::core::recovery::ShardReadHandle> = HashMap::new();
 
     let old_parts = std::mem::take(&mut meta.parts);
     let mut new_parts: Vec<PartMetadata> = Vec::with_capacity(old_parts.len());

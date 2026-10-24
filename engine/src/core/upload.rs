@@ -13,7 +13,7 @@ use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -350,6 +350,7 @@ pub(crate) fn upload_uses_strict_durability(query: &UploadPartQuery) -> bool {
 mod activity;
 mod data_plane;
 mod sessions;
+pub(crate) mod small_batch;
 pub(crate) use activity::{UploadActivityGuard, UploadGcScan};
 
 /// TTL reclamation is not session expiry. An idle resumable upload remains
@@ -1012,8 +1013,7 @@ where
     Ok(())
 }
 
-async fn upload_object_one_shot_inner(
-    State(_state): State<Arc<AppState>>,
+pub(crate) async fn upload_object_one_shot_metadata(
     claims: Claims,
     headers: HeaderMap,
     AxumPath((fragment, object_key)): AxumPath<(String, String)>,
@@ -1021,128 +1021,34 @@ async fn upload_object_one_shot_inner(
     body: Body,
     acquire_io_gate: bool,
     external_io_progress: Option<IoProgress>,
-) -> Result<Response, AppError> {
+) -> Result<ObjectMetadata, AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
     if claims.fragment != fragment {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
-
-    let durability_mode = parse_upload_durability_mode(&query);
-    let strict_durability = durability_mode.strict();
     let content_length = request_content_length(&headers)?;
-    let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
-    let io_guard = if acquire_io_gate {
-        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
-            .await?
-    } else {
-        None
-    };
-    let io_progress = io_guard
-        .as_ref()
-        .map(AdaptiveIoGuard::progress_handle)
-        .or(external_io_progress);
-    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
-    if content_length > max_part_size {
-        return Ok((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Object too large for one-shot upload",
-        )
-            .into_response());
-    }
-
-    let stripe_size = choose_upload_stripe_size_for_len(content_length);
-
-    let version_id = Ulid::new().to_string();
-    let _upload_activity = UploadActivityGuard::begin(&fragment, &object_key)?;
-    let session_id = Ulid::new().to_string();
-    let expected_checksum = query
-        .checksum
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let content_type =
-        request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
-
-    let path_manager = ObjectPathManager::new();
-    let (data_shards, parity_shards, placement_roots) =
-        data_plane::upload_layout(&fragment, &object_key, &version_id)?;
-    let created_at = Utc::now().timestamp();
-    let part_meta = match write_part_blob_to_disk(
-        &path_manager,
-        &fragment,
-        &object_key,
-        &version_id,
-        0,
-        content_length,
-        data_shards,
-        parity_shards,
-        stripe_size,
-        Some(&placement_roots),
+    let content_type = request_content_type(&headers);
+    // Reuse the streaming writer and return its typed commit result. Internal
+    // callers need placement for NCX publication, not an HTTP response to
+    // serialize, parse and reconstruct by reopening the just-written NDX.
+    upload_object_one_shot_body_direct(
+        claims,
+        fragment,
+        object_key,
+        query,
+        content_type,
         body,
-        expected_checksum,
-        strict_durability,
-        io_progress.as_ref(),
+        content_length,
+        acquire_io_gate,
+        external_io_progress,
     )
     .await
-    {
-        Ok(part_meta) => part_meta,
-        Err(err) => {
-            cleanup_blob_version_dirs_for_version(
-                &path_manager,
-                &fragment,
-                &object_key,
-                &version_id,
-            )
-            .await;
-            return Err(err);
-        }
-    };
-
-    let object_meta = ObjectMetadata {
-        object_key: object_key.clone(),
-        fragment: fragment.clone(),
-        version_id: version_id.clone(),
-        upload_session_id: session_id,
-        owner_uid: fragment.clone(),
-        content_type,
-        total_size_bytes: content_length,
-        created_at,
-        data_shards: data_shards as u16,
-        parity_shards: parity_shards as u16,
-        placement_generation: 0,
-        parts: vec![part_meta],
-        is_delete_marker: false,
-        stripe_size_bytes: stripe_size,
-    };
-
-    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let index_write_durability = if strict_durability {
-        index::IndexWriteDurability::Strict
-    } else {
-        index::IndexWriteDurability::Relaxed
-    };
-    if let Err(err) =
-        index::publish_object_with_durability(&object_meta, index_write_durability).await
-    {
-        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id)
-            .await;
-        return Err(err);
-    }
-
-    let response_body = serde_json::to_value(object_meta.clone().without_internal_layout())
-        .map_err(|e| {
-            AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
-        })?;
-    if let Some(guard) = io_guard {
-        guard.complete();
-    }
-    Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
 }
 
 pub async fn upload_object_one_shot(
-    state: State<Arc<AppState>>,
+    _state: State<Arc<AppState>>,
     claims: Claims,
     headers: HeaderMap,
     path: AxumPath<(String, String)>,
@@ -1151,8 +1057,7 @@ pub async fn upload_object_one_shot(
     acquire_io_gate: bool,
     external_io_progress: Option<IoProgress>,
 ) -> Result<impl IntoResponse, AppError> {
-    upload_object_one_shot_inner(
-        state,
+    let metadata = upload_object_one_shot_metadata(
         claims,
         headers,
         path,
@@ -1161,7 +1066,11 @@ pub async fn upload_object_one_shot(
         acquire_io_gate,
         external_io_progress,
     )
-    .await
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        AxumJson(metadata.without_internal_layout()),
+    ))
 }
 
 pub async fn upload_object_one_shot_direct(

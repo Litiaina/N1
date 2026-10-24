@@ -228,6 +228,14 @@ impl ObjectPathManager {
     }
 
     pub fn resolve_stable_fragment_id(&self, fragment_hash: &str) -> String {
+        let stable = fragment_hash
+            .strip_prefix(fragment_identity::PHYSICAL_FRAGMENT_PREFIX)
+            .unwrap_or(fragment_hash);
+        if ulid::Ulid::from_string(stable).is_ok() {
+            // Already-resolved storage identities require no filesystem lookup.
+            // Placement and publication still validate their enrolled members.
+            return stable.to_string();
+        }
         for root in self.get_all_index_roots() {
             if let Some(stable) =
                 fragment_identity::stable_fragment_id_for_root(&root, fragment_hash)
@@ -304,6 +312,22 @@ fn blob_root_failure_domain(root: &PathBuf) -> String {
 mod placement_tests {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn stable_fragment_path_resolution_does_not_discover_roots() {
+        let stable = ulid::Ulid::new().to_string();
+        let paths = super::ObjectPathManager::new();
+        assert_eq!(paths.resolve_stable_fragment_id(&stable), stable);
+        assert_eq!(
+            paths.resolve_stable_fragment_id(&format!("@f_{stable}")),
+            stable
+        );
+        let root = PathBuf::from("/not-an-enrolled-member");
+        let object = ulid::Ulid::new().to_string();
+        let path = paths.get_object_dir_on_disk(&root, &stable, &object);
+        assert!(path.starts_with(root.join(format!("@f_{stable}/.objects"))));
+        assert!(path.ends_with(format!("@o_{object}")));
+    }
 
     fn rank(
         roots: &[PathBuf],

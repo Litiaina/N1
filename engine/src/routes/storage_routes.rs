@@ -1,4 +1,7 @@
 use crate::core::adaptive_concurrency::run_adaptive_concurrency_loop;
+
+mod small_batch;
+mod small_batch_request;
 use crate::core::archive::{
     download_logical_archive as download_logical_archive_impl,
     download_manifest_archive as download_manifest_archive_impl,
@@ -18,7 +21,7 @@ use crate::core::garbage_collector::{
     get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
 };
 use crate::core::maintenance::sync_fragment_metadata;
-use crate::core::monitoring::{get_system_health, run_system_monitor};
+use crate::core::monitoring::get_system_health;
 use crate::core::operation_gate::{
     enforce_quiesced_mode_on_reads, enforce_read_only_fast_mode_on_mutations,
 };
@@ -47,7 +50,7 @@ use crate::core::upload::{
     initiate_standard_upload_direct_with_reuse,
     list_active_uploads as durable_list_active_uploads_impl, list_standard_uploads_direct,
     object_upload_part as durable_object_upload_part_impl, object_upload_part_standard_body_direct,
-    upload_object_one_shot as upload_object_one_shot_impl, upload_object_one_shot_body_direct,
+    upload_object_one_shot_body_direct, upload_object_one_shot_metadata,
     upload_uses_strict_durability,
 };
 use crate::core::{index, index_store};
@@ -1138,8 +1141,7 @@ async fn upload_object_one_shot_scoped(
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let strict_durability = upload_uses_strict_durability(&query);
     let _upload_activity = crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
-    let response = upload_object_one_shot_impl(
-        State(state.clone()),
+    let mut parsed = upload_object_one_shot_metadata(
         claims,
         headers,
         Path((fragment.clone(), physical.clone())),
@@ -1148,18 +1150,7 @@ async fn upload_object_one_shot_scoped(
         false,
         io_progress,
     )
-    .await?
-    .into_response();
-    if let Some(guard) = io_guard {
-        guard.complete();
-    }
-    if response.status() != StatusCode::CREATED {
-        return Ok(response);
-    }
-    let public_meta: crate::core::disk_manager::ObjectMetadata =
-        parse_json_response(response, "one-shot upload").await?;
-    let mut parsed =
-        index::read_object_version(&fragment, &physical, &public_meta.version_id).await?;
+    .await?;
     let committed_physical = commit_logical_upload_from_meta_with_durability(
         &fragment,
         &object_key,
@@ -1176,6 +1167,9 @@ async fn upload_object_one_shot_scoped(
         &committed_physical,
         &parsed,
     );
+    if let Some(guard) = io_guard {
+        guard.complete();
+    }
     parsed.strip_internal_layout();
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
@@ -1310,7 +1304,8 @@ async fn upload_standard_batch_object(
         let _upload_activity =
             crate::core::upload::UploadActivityGuard::begin(&fragment, &physical)?;
         let io_progress = io_guard.as_ref().map(AdaptiveIoGuard::progress_handle);
-        let mut metadata = upload_object_one_shot_body_direct(
+        let payload_started = std::time::Instant::now();
+        let payload_result = upload_object_one_shot_body_direct(
             claims,
             fragment.clone(),
             physical.clone(),
@@ -1321,20 +1316,33 @@ async fn upload_standard_batch_object(
             false,
             io_progress,
         )
-        .await?;
-        // The body and EC writer buffers have been consumed. Release payload
-        // admission here; retain lifecycle/upload protection until NCX commits.
-        if let Some(guard) = io_guard {
-            guard.complete();
-        }
-        let committed_physical = commit_logical_upload_from_meta_with_durability(
+        .await;
+        record_io_latency(
+            "upload.batch.payload_ndx",
+            payload_started.elapsed(),
+            size_bytes,
+            payload_result.is_ok(),
+        );
+        let mut metadata = payload_result?;
+        // Namespace publication performs physical I/O and strict file/directory
+        // syncs too. The detached operation owns admission through the complete
+        // object commit, not just through payload and NDX publication.
+        let namespace_started = std::time::Instant::now();
+        let namespace_result = commit_logical_upload_from_meta_with_durability(
             &fragment,
             &logical_path,
             &physical,
             &metadata,
             strict_durability,
         )
-        .await?;
+        .await;
+        record_io_latency(
+            "upload.batch.ncx",
+            namespace_started.elapsed(),
+            0,
+            namespace_result.is_ok(),
+        );
+        let committed_physical = namespace_result?;
         metadata.object_key = logical_path.clone();
         emit_logical_file_uploaded(
             &state,
@@ -1343,6 +1351,9 @@ async fn upload_standard_batch_object(
             &committed_physical,
             &metadata,
         );
+        if let Some(guard) = io_guard {
+            guard.complete();
+        }
         Ok::<_, AppError>(metadata)
     })
     .await
@@ -1394,11 +1405,35 @@ async fn collect_standard_batch_result(
     }
 }
 
-/// Streams a bounded set of small objects through the standard one-shot path.
+/// Streams small objects through bounded request-owned persistence groups.
 /// Each multipart field is named `object`; its filename is the percent-encoded
 /// logical object key. Objects commit independently; one failure never
 /// publishes an incomplete object and does not cancel unrelated entries.
 async fn upload_standard_batch_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Query(query): Query<StandardBatchUploadQuery>,
+    multipart: Multipart,
+) -> Result<Response, AppError> {
+    let durability = crate::core::disk_manager::UploadPartQuery {
+        checksum: None,
+        durability: query.durability.clone(),
+        strict_durability: query.strict_durability,
+        io_gate: Some(true),
+    };
+    if upload_uses_strict_durability(&durability)
+        && !crate::core::storage_pool::configured().is_empty()
+    {
+        return small_batch_request::upload(state, claims, query, multipart).await;
+    }
+    Ok(
+        upload_standard_batch_legacy(State(state), claims, Query(query), multipart)
+            .await?
+            .into_response(),
+    )
+}
+
+async fn upload_standard_batch_legacy(
     State(state): State<Arc<AppState>>,
     claims: Claims,
     Query(query): Query<StandardBatchUploadQuery>,
@@ -1415,12 +1450,13 @@ async fn upload_standard_batch_scoped(
     let mut workers = JoinSet::new();
     let mut results = Vec::<IndexedStandardBatchUploadResult>::new();
     let mut requested = 0usize;
+    let mut admission_failure: Option<(StatusCode, String)> = None;
     let upload_query = crate::core::disk_manager::UploadPartQuery {
         checksum: None,
         durability: query.durability,
         strict_durability: query.strict_durability,
-        // The parser's permit spans buffering and EC/NDX work. The worker
-        // retains lifecycle/upload protection through NCX publication.
+        // The parser admits buffering and payload/NDX work. Lifecycle and
+        // activity protection continue through independent NCX publication.
         io_gate: Some(false),
     };
 
@@ -1456,6 +1492,19 @@ async fn upload_standard_batch_scoped(
             .content_type()
             .map(ToString::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
+        if let Some((status, message)) = &admission_failure {
+            results.push(IndexedStandardBatchUploadResult {
+                index,
+                result: StandardBatchUploadEntryResult {
+                    object_key: logical_path,
+                    status: status.as_u16(),
+                    version_id: None,
+                    size_bytes: None,
+                    error: Some(message.clone()),
+                },
+            });
+            continue;
+        }
         while workers.len() >= concurrency {
             collect_standard_batch_result(&mut workers, &mut results).await;
         }
@@ -1466,7 +1515,29 @@ async fn upload_standard_batch_scoped(
             claims.fragment
         );
         let io_guard =
-            acquire_upload_io_guard_for_query(Some(true), &claims.fragment, &context).await?;
+            match acquire_upload_io_guard_for_query(Some(true), &claims.fragment, &context).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let status = batch_error_status(&error);
+                    let message = batch_error_message(&error);
+                    results.push(IndexedStandardBatchUploadResult {
+                        index,
+                        result: StandardBatchUploadEntryResult {
+                            object_key: logical_path,
+                            status: status.as_u16(),
+                            version_id: None,
+                            size_bytes: None,
+                            error: Some(message.clone()),
+                        },
+                    });
+                    // Stop adding work after backpressure, but retain and join
+                    // every admitted worker. The response reports committed
+                    // versions plus explicit rejections instead of losing them
+                    // behind a whole-request 503 halfway through the batch.
+                    admission_failure = Some((status, message));
+                    continue;
+                }
+            };
         let mut body = BytesMut::new();
         let mut too_large = false;
         while let Some(chunk) = field
@@ -1740,11 +1811,6 @@ pub fn build_storage_routes_unbound_with_options(
     let lifecycle_state = Arc::clone(&app_state);
     tokio::spawn(async move {
         run_lifecycle_manager(lifecycle_state).await;
-    });
-
-    let monitoring_state = Arc::clone(&app_state);
-    tokio::spawn(async move {
-        run_system_monitor(monitoring_state).await;
     });
 
     let auto_healing_state = Arc::clone(&app_state);
@@ -2089,6 +2155,361 @@ async fn removed_manual_reclamation_route() -> impl IntoResponse {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    pub(super) fn upload_test_fixture() -> (String, Claims, Arc<AppState>) {
+        use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+        use crate::core::upload::{
+            DATA_SHARDS_ATOMIC, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC,
+            WRITER_BUFFER_SIZE_ATOMIC,
+        };
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        let base = std::env::temp_dir().join(format!("n1-batch-admission-{}", ulid::Ulid::new()));
+        for cell in [&INDEX_STORE_DISKS, &BLOB_STORE_DISKS] {
+            for root in cell.get_or_init(|| {
+                (0..2)
+                    .map(|i| base.join(format!("member-{i}")).display().to_string())
+                    .collect()
+            }) {
+                std::fs::create_dir_all(root).unwrap();
+            }
+        }
+        let control = FS_STORAGE_ROOT.get_or_init(|| base.join("control").display().to_string());
+        let roots = BLOB_STORE_DISKS
+            .get()
+            .unwrap()
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        crate::core::root_identity::reconcile_roots_for_test(
+            &std::path::Path::new(control).join(".n1/topology-roots.json"),
+            &roots,
+        )
+        .unwrap();
+        MAX_PART_SIZE_ATOMIC.get_or_init(|| AtomicU64::new(1024 * 1024));
+        DATA_SHARDS_ATOMIC.get_or_init(|| AtomicUsize::new(1));
+        PARITY_SHARDS_ATOMIC.get_or_init(|| AtomicUsize::new(0));
+        WRITER_BUFFER_SIZE_ATOMIC.get_or_init(|| AtomicUsize::new(4096));
+        STRIPE_SIZE_ATOMIC.get_or_init(|| AtomicUsize::new(4096));
+        let fragment = ulid::Ulid::new().to_string();
+        for root in INDEX_STORE_DISKS.get().unwrap() {
+            let root = crate::core::fragment_identity::physical_fragment_root_on(
+                std::path::Path::new(root),
+                &fragment,
+            );
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(".fragment.ndx"), b"test-owned live fragment").unwrap();
+        }
+        let claims = Claims {
+            fragment: fragment.clone(),
+            fragment_alias: None,
+            operator: true,
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            exp: usize::MAX,
+        };
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+        (fragment, claims, state)
+    }
+
+    pub(super) fn remove_upload_test_fixture(fragment: &str) {
+        use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+        for root in INDEX_STORE_DISKS
+            .get()
+            .unwrap()
+            .iter()
+            .chain(BLOB_STORE_DISKS.get().unwrap())
+        {
+            let path = crate::core::fragment_identity::physical_fragment_root_on(
+                std::path::Path::new(root),
+                fragment,
+            );
+            if path.exists() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_publishes_typed_metadata_without_upload_workspace_or_public_layout() {
+        use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata};
+        let _test_guard = crate::test_support::global_test_lock().lock().await;
+        let (fragment, claims, state) = upload_test_fixture();
+        let payload = b"straight through strict object";
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-length", payload.len().to_string().parse().unwrap());
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        let query = crate::core::disk_manager::UploadPartQuery {
+            checksum: Some(format!("{:08x}", crc32fast::hash(payload))),
+            durability: None,
+            strict_durability: Some(true),
+            io_gate: Some(true),
+        };
+        let response = upload_object_one_shot_scoped(
+            State(state),
+            claims,
+            headers,
+            Path("direct.bin".into()),
+            Query(query),
+            Body::from(payload.as_slice()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let public: ObjectMetadata = parse_json_response(response, "one-shot test")
+            .await
+            .unwrap();
+        assert_eq!(public.object_key, "direct.bin");
+        assert_eq!(public.total_size_bytes, payload.len() as u64);
+        assert!(
+            public.parts.is_empty(),
+            "public response must not expose placement"
+        );
+        let pointer = crate::namespace::flat::lookup(&fragment, "direct.bin")
+            .unwrap()
+            .unwrap();
+        let committed =
+            index::read_object_version(&fragment, &pointer.object_id, &public.version_id)
+                .await
+                .unwrap();
+        assert_eq!(committed.parts.len(), 1);
+        assert!(!committed.parts[0].shards.is_empty());
+        for shard in &committed.parts[0].shards {
+            let path = crate::core::storage_pool::resolve_address(&shard.absolute_path).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(format!("{:08x}", crc32fast::hash(&bytes)), shard.checksum);
+        }
+        for root in INDEX_STORE_DISKS
+            .get()
+            .unwrap()
+            .iter()
+            .chain(BLOB_STORE_DISKS.get().unwrap())
+        {
+            let path = crate::core::fragment_identity::physical_fragment_root_on(
+                std::path::Path::new(root),
+                &fragment,
+            );
+            assert!(
+                !path.join(".uploads").exists(),
+                "one-shot must not create resumable state"
+            );
+        }
+        remove_upload_test_fixture(&fragment);
+    }
+
+    #[tokio::test]
+    async fn one_shot_rejections_never_publish_namespace_or_leave_payload_files() {
+        use crate::core::disk_manager::BLOB_STORE_DISKS;
+        let _test_guard = crate::test_support::global_test_lock().lock().await;
+        let (fragment, claims, state) = upload_test_fixture();
+        for (name, length, checksum, payload, expected) in [
+            (
+                "missing",
+                None,
+                None,
+                b"x".as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "invalid",
+                Some("bad"),
+                None,
+                b"x".as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "short",
+                Some("2"),
+                None,
+                b"x".as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "excess",
+                Some("1"),
+                None,
+                b"xy".as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "checksum",
+                Some("1"),
+                Some("00000000"),
+                b"x".as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "limit",
+                Some("1048577"),
+                None,
+                b"".as_slice(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(length) = length {
+                headers.insert("content-length", length.parse().unwrap());
+            }
+            let query = crate::core::disk_manager::UploadPartQuery {
+                checksum: checksum.map(str::to_owned),
+                durability: None,
+                strict_durability: Some(true),
+                io_gate: Some(true),
+            };
+            let result = upload_object_one_shot_scoped(
+                State(state.clone()),
+                claims.clone(),
+                headers,
+                Path(name.into()),
+                Query(query),
+                Body::from(payload),
+            )
+            .await;
+            let response = match result {
+                Ok(response) => response.into_response(),
+                Err(error) => error.into_response(),
+            };
+            assert_eq!(response.status(), expected, "case {name}");
+            assert!(
+                crate::namespace::flat::lookup(&fragment, name)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for root in BLOB_STORE_DISKS.get().unwrap() {
+            let path = crate::core::fragment_identity::physical_fragment_root_on(
+                std::path::Path::new(root),
+                &fragment,
+            );
+            for entry in walkdir::WalkDir::new(path.join(".objects")) {
+                match entry {
+                    Ok(entry) => assert!(
+                        !entry.file_type().is_file(),
+                        "leaked rejected payload: {}",
+                        entry.path().display()
+                    ),
+                    Err(error)
+                        if error
+                            .io_error()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                    Err(error) => panic!("failed to inspect rejection cleanup: {error}"),
+                }
+            }
+            assert!(!path.join(".uploads").exists());
+        }
+        remove_upload_test_fixture(&fragment);
+    }
+
+    #[tokio::test]
+    async fn batch_commit_keeps_disk_admission_until_ncx_after_caller_cancellation() {
+        use crate::core::disk_manager::BLOB_STORE_DISKS;
+        use crate::core::io_scheduler::disk_io_scheduler_snapshot;
+        use std::time::Duration;
+        let _test_guard = crate::test_support::global_test_lock().lock().await;
+        let (fragment, claims, state) = upload_test_fixture();
+        let key = "item.bin";
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let blocked_fragment = fragment.clone();
+        let blocker = tokio::spawn(async move {
+            crate::namespace::runtime::hold_publication_for_test(
+                &blocked_fragment,
+                key,
+                ready_tx,
+                release_rx,
+            )
+            .await;
+        });
+        ready_rx.await.unwrap();
+        let context = format!("batch-commit-test-{fragment}");
+        let guard = acquire_upload_io_guard_for_query(Some(true), &fragment, &context)
+            .await
+            .unwrap();
+        let query = crate::core::disk_manager::UploadPartQuery {
+            checksum: None,
+            durability: None,
+            strict_durability: Some(true),
+            io_gate: Some(false),
+        };
+        let mut caller = tokio::spawn(upload_standard_batch_object(
+            state,
+            claims,
+            key.into(),
+            "application/octet-stream".into(),
+            bytes::Bytes::from_static(b"strict payload"),
+            guard,
+            query,
+        ));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let has_ndx = BLOB_STORE_DISKS.get().unwrap().iter().any(|root| {
+                    let fragment_root = crate::core::fragment_identity::physical_fragment_root_on(
+                        std::path::Path::new(root),
+                        &fragment,
+                    );
+                    walkdir::WalkDir::new(fragment_root.join(".objects"))
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .any(|entry| {
+                            entry.file_type().is_file()
+                                && entry.file_name().to_string_lossy().ends_with(".ndx")
+                        })
+                });
+                if has_ndx {
+                    break;
+                }
+                if caller.is_finished() {
+                    panic!(
+                        "batch ended before publication gate: {:?}",
+                        (&mut caller).await.unwrap()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("strict payload/NDX must reach the blocked namespace publisher");
+        assert!(!caller.is_finished());
+        assert!(
+            disk_io_scheduler_snapshot()
+                .active_operations
+                .iter()
+                .any(|op| op.context == context),
+            "namespace publication must still own foreground admission"
+        );
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            disk_io_scheduler_snapshot()
+                .active_operations
+                .iter()
+                .any(|op| op.context == context),
+            "cancelling the caller must not release the detached commit's permit"
+        );
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while disk_io_scheduler_snapshot()
+                .active_operations
+                .iter()
+                .any(|op| op.context == context)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed publication must release admission");
+        assert!(
+            crate::namespace::flat::lookup(&fragment, key)
+                .unwrap()
+                .is_some()
+        );
+        remove_upload_test_fixture(&fragment);
+    }
 
     #[test]
     fn independent_upload_initiation_is_explicit_and_defaults_to_reuse() {

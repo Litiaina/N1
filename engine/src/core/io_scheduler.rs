@@ -11,13 +11,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
-pub static DISK_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
-
 static SCHEDULER_CONFIG: OnceCell<DiskIoSchedulerConfig> = OnceCell::new();
 static TOTAL_GATE: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(scheduler_config().total_permits)));
-static FOREGROUND_GATE: Lazy<Arc<Semaphore>> =
-    Lazy::new(|| Arc::new(Semaphore::new(scheduler_config().foreground_permits)));
+static FOREGROUND_GATE: Lazy<FairIoGate> =
+    Lazy::new(|| FairIoGate::new(scheduler_config().foreground_permits));
 static BACKGROUND_GATE: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(scheduler_config().background_permits)));
 static FOREGROUND_FRAGMENT_GATES: Lazy<Mutex<HashMap<String, Arc<Semaphore>>>> =
@@ -132,6 +130,64 @@ struct ActiveIoOperation {
     stall_reported: AtomicBool,
 }
 
+/// Resize the existing FIFO semaphore without making waiters surrender their
+/// queue position. A lower target retires idle permits immediately, then takes
+/// any remainder from finishing operations; in-flight work is never cancelled.
+struct FairIoGate {
+    semaphore: Arc<Semaphore>,
+    maximum: usize,
+    state: Mutex<FairIoGateState>,
+}
+
+struct FairIoGateState {
+    target: usize,
+    reserved: Vec<OwnedSemaphorePermit>,
+}
+
+impl FairIoGate {
+    fn new(maximum: usize) -> Self {
+        let maximum = maximum.max(1);
+        Self {
+            semaphore: Arc::new(Semaphore::new(maximum)),
+            maximum,
+            state: Mutex::new(FairIoGateState {
+                target: maximum,
+                reserved: Vec::new(),
+            }),
+        }
+    }
+
+    fn target(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .target
+    }
+
+    fn set_target(&self, target: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.target = target.clamp(1, self.maximum);
+        let reserve = self.maximum - state.target;
+        while state.reserved.len() > reserve {
+            drop(state.reserved.pop());
+        }
+        while state.reserved.len() < reserve {
+            let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                break;
+            };
+            state.reserved.push(permit);
+        }
+    }
+
+    fn release(&self, permit: OwnedSemaphorePermit) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.reserved.len() < self.maximum - state.target {
+            state.reserved.push(permit);
+        }
+        // Otherwise `permit` returns to the semaphore's existing FIFO queue.
+    }
+}
+
 #[derive(Clone)]
 pub struct IoProgress {
     progress: Arc<ProgressTracker>,
@@ -152,7 +208,7 @@ pub struct DiskIoGuard {
     started: Instant,
     completed: bool,
     _total: OwnedSemaphorePermit,
-    _class: OwnedSemaphorePermit,
+    _class: Option<OwnedSemaphorePermit>,
     _fragment: Option<OwnedSemaphorePermit>,
 }
 
@@ -206,6 +262,11 @@ impl Drop for DiskIoGuard {
             snapshot.bytes,
             self.completed,
         );
+        if self.operation.class.is_foreground()
+            && let Some(permit) = self._class.take()
+        {
+            FOREGROUND_GATE.release(permit);
+        }
     }
 }
 
@@ -246,8 +307,11 @@ pub fn configure_disk_io_scheduler(config: DiskIoSchedulerConfig) -> Result<(), 
     SCHEDULER_CONFIG
         .set(config)
         .map_err(|_| "disk IO scheduler was already configured")?;
-    let _ = DISK_IO_TARGET_ATOMIC.set(AtomicUsize::new(config.foreground_permits));
     Ok(())
+}
+
+pub fn set_foreground_io_target(target: usize) {
+    FOREGROUND_GATE.set_target(target);
 }
 
 pub fn disk_io_scheduler_config() -> DiskIoSchedulerConfig {
@@ -348,7 +412,7 @@ pub fn disk_io_scheduler_snapshot() -> DiskIoSchedulerSnapshot {
         queued_foreground,
         queued_background,
         total_available: TOTAL_GATE.available_permits(),
-        foreground_available: FOREGROUND_GATE.available_permits(),
+        foreground_available: FOREGROUND_GATE.semaphore.available_permits(),
         background_available: BACKGROUND_GATE.available_permits(),
         classes,
         active_operations,
@@ -393,11 +457,23 @@ pub async fn acquire_disk_io(
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(AppError::ServiceUnavailable(format!(
-                "disk scheduler admission timed out for {} after {}ms",
-                class.label(),
-                foreground_wait_timeout().as_millis()
-            ))),
+            Err(_) => {
+                // Capture permit owners at the failure, not after the caller
+                // has drained workers. This reads bounded in-memory counters;
+                // it does not start a health scan or touch the storage roots.
+                warn!(
+                    class = class.label(),
+                    context,
+                    waited_ms = queued_at.elapsed().as_millis() as u64,
+                    scheduler = ?disk_io_scheduler_snapshot(),
+                    "N1 foreground admission deadline exceeded"
+                );
+                Err(AppError::ServiceUnavailable(format!(
+                    "disk scheduler admission timed out for {} after {}ms",
+                    class.label(),
+                    foreground_wait_timeout().as_millis()
+                )))
+            }
         }
     } else {
         loop {
@@ -480,44 +556,38 @@ async fn acquire_disk_io_inner(
     fragment: Option<&str>,
     context: &str,
 ) -> Result<DiskIoGuard, AppError> {
-    loop {
-        let fragment_permit = match fragment {
-            Some(fragment) => Some(
-                fragment_gate(class, fragment)?
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| {
-                        AppError::InternalServerError("disk scheduler fragment gate closed".into())
-                    })?,
-            ),
-            None => None,
-        };
-        let total = TOTAL_GATE
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::InternalServerError("disk scheduler closed".into()))?;
-        let class_permit = class_gate(class)
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::InternalServerError("disk scheduler class closed".into()))?;
+    let fragment_permit = match fragment {
+        Some(fragment) => Some(
+            fragment_gate(class, fragment)?
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    AppError::InternalServerError("disk scheduler fragment gate closed".into())
+                })?,
+        ),
+        None => None,
+    };
+    // Do not occupy the shared lane while waiting for a class whose adaptive
+    // capacity is lower. Background work retains its configured lane.
+    let class_permit = class_gate(class)
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::InternalServerError("disk scheduler class closed".into()))?;
+    let total = TOTAL_GATE
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::InternalServerError("disk scheduler closed".into()))?;
 
-        match register_active(
-            class,
-            fragment,
-            context,
-            total,
-            class_permit,
-            fragment_permit,
-        ) {
-            Ok(guard) => return Ok(guard),
-            Err(AppError::ServiceUnavailable(_)) if class.is_foreground() => {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
+    register_active(
+        class,
+        fragment,
+        context,
+        total,
+        class_permit,
+        fragment_permit,
+    )
 }
 
 fn register_active(
@@ -529,21 +599,7 @@ fn register_active(
     fragment_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<DiskIoGuard, AppError> {
     if class.is_foreground() {
-        loop {
-            let target = foreground_target();
-            let active = ACTIVE_FOREGROUND_IO.load(Ordering::Relaxed);
-            if active >= target {
-                return Err(AppError::ServiceUnavailable(
-                    "foreground disk IO target is saturated".into(),
-                ));
-            }
-            if ACTIVE_FOREGROUND_IO
-                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
+        ACTIVE_FOREGROUND_IO.fetch_add(1, Ordering::Relaxed);
     } else {
         ACTIVE_BACKGROUND_IO.fetch_add(1, Ordering::Relaxed);
     }
@@ -565,7 +621,7 @@ fn register_active(
         started: Instant::now(),
         completed: false,
         _total: total,
-        _class: class_permit,
+        _class: Some(class_permit),
         _fragment: fragment_permit,
     })
 }
@@ -629,7 +685,7 @@ fn class_counters(class: DiskIoClass) -> &'static ClassCounters {
 
 fn class_gate(class: DiskIoClass) -> &'static Arc<Semaphore> {
     if class.is_foreground() {
-        &FOREGROUND_GATE
+        &FOREGROUND_GATE.semaphore
     } else {
         &BACKGROUND_GATE
     }
@@ -663,12 +719,7 @@ fn fragment_gate(class: DiskIoClass, fragment: &str) -> Result<Arc<Semaphore>, A
 }
 
 fn foreground_target() -> usize {
-    DISK_IO_TARGET_ATOMIC
-        .get()
-        .map(|target| target.load(Ordering::Relaxed))
-        .unwrap_or_else(|| scheduler_config().foreground_permits)
-        .max(1)
-        .min(scheduler_config().foreground_permits)
+    FOREGROUND_GATE.target()
 }
 
 fn scheduler_config() -> DiskIoSchedulerConfig {
@@ -702,7 +753,90 @@ fn derive_scheduler_config(max_concurrent_io: usize, blob_roots: usize) -> DiskI
 
 #[cfg(test)]
 mod tests {
-    use super::{DiskIoClass, DiskIoPressure, calculate_pressure, derive_scheduler_config};
+    use super::{
+        DiskIoClass, DiskIoPressure, FairIoGate, calculate_pressure, derive_scheduler_config,
+    };
+
+    #[tokio::test]
+    async fn adaptive_shrink_preserves_waiters_fifo_position() {
+        let gate = FairIoGate::new(2);
+        let held_a = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let held_b = gate.semaphore.clone().acquire_owned().await.unwrap();
+        gate.set_target(1);
+
+        let mut first = Box::pin(gate.semaphore.clone().acquire_owned());
+        assert!(futures_util::poll!(&mut first).is_pending());
+        gate.release(held_a);
+        assert!(futures_util::poll!(&mut first).is_pending());
+
+        let mut later = Box::pin(gate.semaphore.clone().acquire_owned());
+        assert!(futures_util::poll!(&mut later).is_pending());
+        gate.release(held_b);
+        // A new arrival cannot take the finishing operation's slot ahead of
+        // the already-queued request, even at a target below the hard limit.
+        assert!(futures_util::poll!(&mut later).is_pending());
+        let first = first.await.unwrap();
+        assert_eq!(gate.semaphore.available_permits(), 0);
+        gate.release(first);
+        gate.release(later.await.unwrap());
+        assert_eq!(gate.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn adaptive_growth_wakes_waiters_without_a_finishing_operation() {
+        let gate = FairIoGate::new(3);
+        gate.set_target(1);
+        let held = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let mut first = Box::pin(gate.semaphore.clone().acquire_owned());
+        let mut second = Box::pin(gate.semaphore.clone().acquire_owned());
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        gate.set_target(3);
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert!(gate.semaphore.clone().try_acquire_owned().is_err());
+        gate.release(first);
+        gate.release(second);
+        gate.release(held);
+        assert_eq!(gate.semaphore.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_adaptive_waiter_does_not_lose_capacity_or_block_successor() {
+        let gate = FairIoGate::new(2);
+        gate.set_target(1);
+        let held = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let mut cancelled = Box::pin(gate.semaphore.clone().acquire_owned());
+        let mut successor = Box::pin(gate.semaphore.clone().acquire_owned());
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        assert!(futures_util::poll!(&mut successor).is_pending());
+        drop(cancelled);
+        gate.release(held);
+        gate.release(successor.await.unwrap());
+        gate.set_target(2);
+        assert_eq!(gate.semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn adaptive_capacity_changes_never_leak_or_exceed_hard_limit() {
+        let gate = FairIoGate::new(3);
+        let a = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let b = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let c = gate.semaphore.clone().acquire_owned().await.unwrap();
+        gate.set_target(1);
+        gate.set_target(3);
+        gate.release(a);
+        gate.release(b);
+        gate.release(c);
+        for target in (0..10000).map(|value| value % 5) {
+            gate.set_target(target);
+            let expected = target.clamp(1, 3);
+            assert_eq!(gate.target(), expected);
+            assert_eq!(gate.semaphore.available_permits(), expected);
+            assert_eq!(gate.state.lock().unwrap().reserved.len(), 3 - expected);
+        }
+        assert_eq!(FairIoGate::new(0).target(), 1);
+    }
 
     #[test]
     fn scheduler_config_reserves_small_background_lane() {

@@ -19,6 +19,40 @@ use super::{
     ACTIVE_DOWNLOADS, ActiveDownloadLease, export_has_active_downloads, validate_create_request,
 };
 
+fn pending_export(fragment: &str) -> super::models::PersistedExport {
+    super::models::PersistedExport {
+        id: ulid::Ulid::new().to_string(),
+        fragment: fragment.to_string(),
+        request: DownloadArchiveRequest {
+            keys: vec!["source.bin".to_string()],
+            entries: Vec::new(),
+            prefix: None,
+            prefixes: Vec::new(),
+            format: "tar".to_string(),
+            filename: None,
+            export_all: false,
+            include_internal: false,
+        },
+        phase: super::ExportPhase::Queued,
+        format: "tar".to_string(),
+        filename: "export.tar".to_string(),
+        created_at_unix: super::now_unix(),
+        updated_at_unix: super::now_unix(),
+        expires_at_unix: super::now_unix() + 3600,
+        manifest_ready: false,
+        objects_total: 1,
+        objects_completed: 0,
+        source_bytes_total: 16,
+        source_bytes_completed: 0,
+        artifact_bytes_completed: 0,
+        reserved_bytes: 0,
+        artifact_size_bytes: None,
+        etag_sha256: None,
+        chunks: Vec::new(),
+        error: None,
+    }
+}
+
 fn test_root(name: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -273,4 +307,210 @@ async fn cancelled_artifact_does_not_begin_writing() {
     let entries = std::fs::read_dir(&base).expect("scan test root").count();
     assert_eq!(entries, 0);
     let _ = tokio::fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
+async fn late_export_admission_cannot_cross_gc_unlink_or_a_later_reclaim_batch() {
+    let _global = crate::test_support::global_test_lock().lock().await;
+    crate::core::disk_manager::FS_STORAGE_ROOT.get_or_init(|| {
+        std::env::temp_dir()
+            .join(format!("n1-matrix-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    });
+    let fragment = format!("late-export-gc-{}", ulid::Ulid::new());
+    let state = pending_export(&fragment);
+    let directory = super::store::job_directory(&state.id).unwrap();
+    let fixture = test_root("late-gc-admission");
+    tokio::fs::create_dir_all(&fixture).await.unwrap();
+    let first = fixture.join("first-unreferenced-version");
+    let second = fixture.join("later-export-source");
+    tokio::fs::write(&first, b"first bounded GC batch")
+        .await
+        .unwrap();
+    tokio::fs::write(&second, b"must survive export admission")
+        .await
+        .unwrap();
+
+    let guard = super::gc_reclaim_guard(&fragment)
+        .await
+        .unwrap()
+        .expect("no export was admitted before this GC batch");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let admitted_state = state.clone();
+    let admission = tokio::spawn(async move {
+        entered_tx.send(()).unwrap();
+        super::admit_new_export(&admitted_state).await
+    });
+    entered_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        !admission.is_finished(),
+        "export admission must wait until the current destructive GC batch ends"
+    );
+    assert!(
+        !directory.join("state.json").exists(),
+        "an export cannot publish protection through the held GC guard"
+    );
+    // Only the test-owned first candidate is unlinked. The real guard remains
+    // held across this destructive action, exactly as required in GC.
+    tokio::fs::remove_file(&first).await.unwrap();
+    assert!(!admission.is_finished());
+    assert!(second.exists());
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), admission)
+        .await
+        .expect("export admission progresses after the GC batch releases its guard")
+        .unwrap()
+        .unwrap();
+
+    assert!(directory.join("state.json").is_file());
+    assert!(
+        super::gc_reclaim_guard(&fragment).await.unwrap().is_none(),
+        "the next GC batch must recheck late export admission, not trust an earlier empty snapshot"
+    );
+    assert_eq!(
+        tokio::fs::read(&second).await.unwrap(),
+        b"must survive export admission"
+    );
+    // Protection is fragment-scoped rather than a permanent node-wide GC ban.
+    let unrelated = format!("unrelated-export-gc-{}", ulid::Ulid::new());
+    assert!(super::gc_reclaim_guard(&unrelated).await.unwrap().is_some());
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+    tokio::fs::remove_dir_all(fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_protects_every_nonterminal_export_phase_and_releases_terminal_jobs() {
+    let _global = crate::test_support::global_test_lock().lock().await;
+    crate::core::disk_manager::FS_STORAGE_ROOT.get_or_init(|| {
+        std::env::temp_dir()
+            .join(format!("n1-matrix-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    });
+    let fragment = format!("export-gc-phases-{}", ulid::Ulid::new());
+    let mut state = pending_export(&fragment);
+    let directory = super::store::job_directory(&state.id).unwrap();
+    for phase in [
+        super::ExportPhase::Queued,
+        super::ExportPhase::CapturingManifest,
+        super::ExportPhase::Building,
+    ] {
+        state.phase = phase;
+        super::save_state(&state).await.unwrap();
+        assert!(
+            super::gc_reclaim_guard(&fragment).await.unwrap().is_none(),
+            "nonterminal export {phase:?} must protect its source fragment"
+        );
+    }
+    for phase in [
+        super::ExportPhase::Ready,
+        super::ExportPhase::Failed,
+        super::ExportPhase::Cancelled,
+    ] {
+        state.phase = phase;
+        super::save_state(&state).await.unwrap();
+        assert!(
+            super::gc_reclaim_guard(&fragment).await.unwrap().is_some(),
+            "terminal export {phase:?} must not retain original source data forever"
+        );
+    }
+    tokio::fs::remove_dir_all(directory).await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_export_protection_enumeration_fails_closed_on_corrupt_or_unreadable_state() {
+    let base = test_root("gc-strict-state-errors");
+    let state = pending_export("protected-fragment");
+    let directory = base.join(&state.id);
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    let path = directory.join("state.json");
+    tokio::fs::write(&path, b"{not a decodable durable export}")
+        .await
+        .unwrap();
+    assert!(
+        super::store::list_states_for_gc_at(&base).await.is_err(),
+        "corrupt export authority must not be logged and silently skipped by GC"
+    );
+    tokio::fs::remove_file(&path).await.unwrap();
+    // EISDIR is a real read error even for a root test runner; a chmod-only
+    // unreadable-file test would incorrectly pass when run with CAP_DAC_OVERRIDE.
+    tokio::fs::create_dir(&path).await.unwrap();
+    assert!(
+        super::store::list_states_for_gc_at(&base).await.is_err(),
+        "an unreadable export state must stop destructive reclamation"
+    );
+    tokio::fs::remove_dir(&path).await.unwrap();
+    tokio::fs::write(&path, serde_json::to_vec(&state).unwrap())
+        .await
+        .unwrap();
+    let states = super::store::list_states_for_gc_at(&base).await.unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].id, state.id);
+    assert_eq!(states[0].fragment, state.fragment);
+    tokio::fs::remove_dir_all(base).await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_export_protection_rejects_mismatched_job_identity_but_tolerates_removed_jobs() {
+    let base = test_root("gc-strict-state-identity");
+    let mut state = pending_export("protected-fragment");
+    let directory = base.join(&state.id);
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    let path = directory.join("state.json");
+    // A missing state file can be the ordinary atomic-publication/removal
+    // window; it is not evidence that a different job owns this directory.
+    assert!(
+        super::store::list_states_for_gc_at(&base)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    state.id = ulid::Ulid::new().to_string();
+    tokio::fs::write(&path, serde_json::to_vec(&state).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        super::store::list_states_for_gc_at(&base).await.is_err(),
+        "a decoded state from another job must not grant GC permission to unlink"
+    );
+    tokio::fs::remove_file(&path).await.unwrap();
+    assert!(
+        super::store::list_states_for_gc_at(&base)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    tokio::fs::remove_dir_all(&base).await.unwrap();
+    assert!(
+        super::store::list_states_for_gc_at(&base)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn gc_export_protection_rejects_redirected_job_or_state() {
+    let base = test_root("gc-strict-state-redirect");
+    let state = pending_export("protected-fragment");
+    let external = base.join("external");
+    tokio::fs::create_dir_all(&external).await.unwrap();
+    let state_path = external.join("state.json");
+    tokio::fs::write(&state_path, serde_json::to_vec(&state).unwrap())
+        .await
+        .unwrap();
+    let job = base.join(&state.id);
+    std::os::unix::fs::symlink(&external, &job).unwrap();
+    assert!(super::store::list_states_for_gc_at(&base).await.is_err());
+    tokio::fs::remove_file(&job).await.unwrap();
+    tokio::fs::create_dir(&job).await.unwrap();
+    std::os::unix::fs::symlink(&state_path, job.join("state.json")).unwrap();
+    assert!(super::store::list_states_for_gc_at(&base).await.is_err());
+    assert_eq!(
+        tokio::fs::read(&state_path).await.unwrap(),
+        serde_json::to_vec(&state).unwrap()
+    );
+    tokio::fs::remove_dir_all(base).await.unwrap();
 }

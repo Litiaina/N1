@@ -1,4 +1,4 @@
-use crate::core::io_scheduler::{DISK_IO_TARGET_ATOMIC, DiskIoPressure, disk_io_pressure};
+use crate::core::io_scheduler::{DiskIoPressure, disk_io_pressure, set_foreground_io_target};
 use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
@@ -57,6 +57,33 @@ fn clamp_next_aligned(
     ((next.max(4096) + 4095) / 4096) * 4096
 }
 
+// Queued demand alone must not pin a reduced target forever. Recover within
+// existing bounds; saturation, stalls and host resource pressure still apply.
+fn adjustment(
+    io_pressure: DiskIoPressure,
+    cpu_usage_percent: f64,
+    ram_usage_percent: f64,
+    load_ratio: f64,
+) -> (usize, usize) {
+    if io_pressure == DiskIoPressure::Stalled
+        || cpu_usage_percent >= 95.0
+        || ram_usage_percent >= 95.0
+        || load_ratio >= 2.0
+    {
+        (50, 0)
+    } else if cpu_usage_percent >= 85.0 || ram_usage_percent >= 90.0 || load_ratio >= 1.3 {
+        (25, 0)
+    } else if io_pressure <= DiskIoPressure::Pressured
+        && cpu_usage_percent <= 55.0
+        && ram_usage_percent <= 75.0
+        && load_ratio <= 0.8
+    {
+        (0, 10)
+    } else {
+        (0, 0)
+    }
+}
+
 pub async fn run_adaptive_concurrency_loop() {
     let io_max = *MAX_IO_SEMAPHORE.get().unwrap_or(&128usize);
     let stream_max = *STREAM_MAX_CONCURRENCY.get().unwrap_or(&128usize);
@@ -97,31 +124,18 @@ pub async fn run_adaptive_concurrency_loop() {
         let load_ratio = m.load_avg_1m / cores;
 
         let io_pressure = disk_io_pressure();
-        let (down_pct, up_pct) = if io_pressure == DiskIoPressure::Stalled
-            || m.cpu_usage_percent >= 95.0
-            || m.ram_usage_percent >= 95.0
-            || load_ratio >= 2.0
-        {
-            (50, 0)
-        } else if m.cpu_usage_percent >= 85.0 || m.ram_usage_percent >= 90.0 || load_ratio >= 1.3 {
-            (25, 0)
-        } else if io_pressure <= DiskIoPressure::Normal
-            && m.cpu_usage_percent <= 55.0
-            && m.ram_usage_percent <= 75.0
-            && load_ratio <= 0.8
-        {
-            (0, 10)
-        } else {
-            (0, 0)
-        };
+        let (down_pct, up_pct) = adjustment(
+            io_pressure,
+            m.cpu_usage_percent,
+            m.ram_usage_percent,
+            load_ratio,
+        );
 
         if let Some(io_target) = ADAPTIVE_IO_TARGET_ATOMIC.get() {
             let cur = io_target.load(Ordering::Relaxed);
             let next = clamp_next(cur, io_min, io_max, down_pct, up_pct);
             io_target.store(next, Ordering::Relaxed);
-            if let Some(disk_target) = DISK_IO_TARGET_ATOMIC.get() {
-                disk_target.store(next, Ordering::Relaxed);
-            }
+            set_foreground_io_target(next);
         }
 
         if let Some(stream_target) = ADAPTIVE_STREAM_TARGET_ATOMIC.get() {
@@ -159,7 +173,48 @@ pub async fn run_adaptive_concurrency_loop() {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_next;
+    use super::{adjustment, clamp_next};
+    use crate::core::io_scheduler::DiskIoPressure;
+
+    #[test]
+    fn healthy_queued_work_recovers_capacity_without_waiting_for_an_empty_queue() {
+        let mut target = 4;
+        for expected in [5, 6, 6] {
+            let (down, up) = adjustment(DiskIoPressure::Pressured, 35.0, 48.0, 0.7);
+            target = clamp_next(target, 4, 6, down, up);
+            assert_eq!(target, expected);
+        }
+    }
+
+    #[test]
+    fn saturation_or_resource_pressure_does_not_trigger_growth() {
+        assert_eq!(
+            adjustment(DiskIoPressure::Saturated, 35.0, 48.0, 0.7),
+            (0, 0)
+        );
+        assert_eq!(
+            adjustment(DiskIoPressure::Stalled, 35.0, 48.0, 0.7),
+            (50, 0)
+        );
+        for (cpu, ram, load) in [(95.0, 48.0, 0.7), (35.0, 95.0, 0.7), (35.0, 48.0, 2.0)] {
+            assert_eq!(
+                adjustment(DiskIoPressure::Pressured, cpu, ram, load),
+                (50, 0)
+            );
+        }
+        for (cpu, ram, load) in [(85.0, 48.0, 0.7), (35.0, 90.0, 0.7), (35.0, 48.0, 1.3)] {
+            assert_eq!(
+                adjustment(DiskIoPressure::Pressured, cpu, ram, load),
+                (25, 0)
+            );
+        }
+        for (cpu, ram, load) in [(56.0, 48.0, 0.7), (35.0, 76.0, 0.7), (35.0, 48.0, 0.9)] {
+            assert_eq!(
+                adjustment(DiskIoPressure::Pressured, cpu, ram, load),
+                (0, 0)
+            );
+        }
+    }
 
     #[test]
     fn upward_recovery_always_advances_below_the_maximum() {

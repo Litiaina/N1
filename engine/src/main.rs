@@ -10,6 +10,7 @@ use crate::core::auto_healing::arm_topology_safety_gate;
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::core::fragment_metadata::set_configured_index_partition_count;
 use crate::core::io_scheduler::{DiskIoSchedulerConfig, configure_disk_io_scheduler};
+use crate::core::linux_io::initialize_backend;
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -42,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -676,12 +677,30 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
     raise_open_file_limit_for_storage();
 
+    let io_backend = match initialize_backend() {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::error!("N1 I/O backend initialization failed: {error}");
+            drop(_guard);
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        backend = %io_backend.backend,
+        requested = %io_backend.requested,
+        queue_capacity = io_backend.queue_capacity,
+        "N1 I/O backend initialized"
+    );
+    if let Some(reason) = &io_backend.fallback_reason {
+        tracing::warn!("N1 I/O backend fallback: {reason}");
+    }
+
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     tracing::info!("╔════════════════════════════════════════════════╗");
     tracing::info!("║              L I T I A I N A  N 1              ║");
     tracing::info!("╚════════════════════════════════════════════════╝");
     tracing::info!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
-    tracing::info!("│ Status         : ONLINE");
+    tracing::info!("│ Status         : STARTING");
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ PID            : {}", std::process::id());
     tracing::info!(
@@ -707,9 +726,16 @@ pub async fn run_server() {
     let config =
         Ini::load_from_file(CONFIG_FILE).expect(format!("Failed to load {}", CONFIG_FILE).as_str());
 
+    let phase_started = Instant::now();
+    tracing::info!(phase = "runtime_paths", "N1 startup phase started");
     if let Err(err) = validate_runtime_paths(&config) {
         panic!("N1 startup validation failed: {}", err);
     }
+    tracing::info!(
+        phase = "runtime_paths",
+        elapsed_ms = phase_started.elapsed().as_millis(),
+        "N1 startup phase completed"
+    );
 
     let server_section = config.section(Some("server")).unwrap_or_else(|| {
         panic!("Missing [server] section in {}", CONFIG_FILE);
@@ -752,6 +778,8 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
+    let phase_started = Instant::now();
+    tracing::info!(phase = "pool_locations", "N1 startup phase started");
     let pools = crate::core::storage_pool::parse(&config)
         .and_then(|pools| {
             crate::core::storage_pool::bind_locations(pools, Path::new(fs_storage_path))
@@ -760,6 +788,11 @@ pub async fn run_server() {
             tracing::error!("Invalid N1 storage pools: {error}");
             std::process::exit(1);
         });
+    tracing::info!(
+        phase = "pool_locations",
+        elapsed_ms = phase_started.elapsed().as_millis(),
+        "N1 startup phase completed"
+    );
     let blob_disks = pools
         .iter()
         .flat_map(|pool| pool.roots.iter())
@@ -805,6 +838,8 @@ pub async fn run_server() {
         .filter(|root| root.is_dir())
         .collect::<Vec<_>>();
     instance_roots.push(PathBuf::from(FS_STORAGE_ROOT.get().unwrap()));
+    let phase_started = Instant::now();
+    tracing::info!(phase = "instance_leases", "N1 startup phase started");
     let _instance_lease = crate::core::instance_lease::InstanceLease::engine(&instance_roots)
         .unwrap_or_else(|error| {
             tracing::error!("Cannot acquire N1 storage instance lease: {error}");
@@ -812,6 +847,11 @@ pub async fn run_server() {
             // not a programming panic or a reason to produce a core dump.
             std::process::exit(1);
         });
+    tracing::info!(
+        phase = "instance_leases",
+        elapsed_ms = phase_started.elapsed().as_millis(),
+        "N1 startup phase completed"
+    );
     tracing::info!(
         "Storage mode: flat object namespace on independent unified storage pools; format {} (encoding {})",
         crate::settings::version::STORAGE_FORMAT_VERSION,
@@ -1151,7 +1191,7 @@ pub async fn run_server() {
         .expect("Double initialization of MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC");
 
     tracing::info!(
-        "Monitoring tuning: interval={}s deep_scan_interval={}s",
+        "Health diagnostics are explicit; legacy interval={}s deep_scan_interval={}s do not schedule storage scans",
         monitor_interval_seconds,
         monitor_deep_scan_interval_seconds
     );

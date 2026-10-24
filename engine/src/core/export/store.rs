@@ -166,9 +166,28 @@ pub(super) async fn load_state(id: &str) -> Result<PersistedExport, AppError> {
 }
 
 pub(super) async fn list_states() -> Result<Vec<PersistedExport>, AppError> {
+    list_states_with_policy(false).await
+}
+
+/// GC may only reclaim when absence of an active export is proven. Unlike
+/// operator listings, it must not turn a corrupt/unreadable job into absence.
+pub(super) async fn list_states_for_gc() -> Result<Vec<PersistedExport>, AppError> {
+    list_states_with_policy(true).await
+}
+
+async fn list_states_with_policy(strict: bool) -> Result<Vec<PersistedExport>, AppError> {
     let root = state_root()?;
+    list_states_at(&root, strict).await
+}
+
+#[cfg(test)]
+pub(super) async fn list_states_for_gc_at(root: &Path) -> Result<Vec<PersistedExport>, AppError> {
+    list_states_at(root, true).await
+}
+
+async fn list_states_at(root: &Path, strict: bool) -> Result<Vec<PersistedExport>, AppError> {
     let mut states = Vec::new();
-    let mut entries = match fs::read_dir(&root).await {
+    let mut entries = match fs::read_dir(root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(states),
         Err(error) => return Err(AppError::Io(error, "scan N1 export states".to_string())),
@@ -178,21 +197,51 @@ pub(super) async fn list_states() -> Result<Vec<PersistedExport>, AppError> {
         .await
         .map_err(|error| AppError::Io(error, "scan N1 export state entry".to_string()))?
     {
-        if !entry
+        let kind = entry
             .file_type()
             .await
-            .map_err(|error| AppError::Io(error, "stat N1 export state entry".to_string()))?
-            .is_dir()
-        {
-            continue;
-        }
+            .map_err(|error| AppError::Io(error, "stat N1 export state entry".to_string()))?;
         let id = entry.file_name().to_string_lossy().to_string();
         if validate_export_id(&id).is_err() {
             continue;
         }
-        match load_state(&id).await {
+        if !kind.is_dir() {
+            if strict {
+                return Err(AppError::Conflict(
+                    "export job is not a real directory; preserving GC candidates".into(),
+                ));
+            }
+            continue;
+        }
+        let path = entry.path().join(STATE_FILE);
+        if strict {
+            match fs::symlink_metadata(&path).await {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => {
+                    return Err(AppError::Conflict(
+                        "export state is not a real file; preserving GC candidates".into(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(AppError::Io(error, "stat N1 export state".into())),
+            }
+        }
+        let state = match fs::read(path).await {
+            Ok(bytes) => serde_json::from_slice::<PersistedExport>(&bytes).map_err(|error| {
+                AppError::InternalServerError(format!("decode N1 export state: {error}"))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(AppError::NotFound),
+            Err(error) => Err(AppError::Io(error, "read N1 export state".into())),
+        };
+        match state {
+            Ok(state) if strict && state.id != id => {
+                return Err(AppError::Conflict(
+                    "export state identity mismatch; preserving GC candidates".into(),
+                ));
+            }
             Ok(state) => states.push(state),
             Err(AppError::NotFound) => {}
+            Err(error) if strict => return Err(error),
             Err(error) => {
                 tracing::error!(export_id = %id, error = %error, "failed to load N1 export state")
             }

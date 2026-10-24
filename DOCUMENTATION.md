@@ -112,6 +112,37 @@ Keep the generated configuration sections. The `auto_healing` section is
 required; invalid values fail startup. This example shows selected settings,
 not a replacement for the complete generated configuration.
 
+Read paths validate the existing shard checksum before serving that shard and
+reconstruct within parity tolerance when validation fails. Validation/file
+handles are request-local, not an object cache; a new request validates again.
+The unchanged format has whole-shard checksums, so first-byte/range latency can
+include reading the selected shard for verification. This is not block-level
+checksum framing and does not claim zero verification overhead.
+
+Full availability repair and checksum walks run only through explicit repair
+requests. Legacy `auto_healing` scan switches/intervals no longer launch these
+walks. Known-member identity/writability probes and startup safety validation
+remain; they do not enumerate objects. Deep health inspection is explicit,
+not a periodic engine job. The legacy health `auto_healing.enabled` field
+describes full-scan scheduling (false); `phase=on_read_only` identifies the
+read-triggered policy.
+
+Use `refresh=true` for a newly collected health snapshot. Plain health requests
+may return the last cached summary; `sampled_at` identifies its age. No background
+health worker refreshes that summary. Deep content inspection additionally needs
+`deep_scan=true`.
+
+Scheduled GC runs the same conservative collector as manual GC. It expires
+trash using `trash_retention_seconds` and abandoned upload data using
+`file_ttl_seconds`. This includes ordinary-upload pieces left after a restart
+and unpublished versions beneath otherwise live objects. Active uploads and
+committed historical versions are preserved. No per-upload cleanup records are
+added: orphan discovery still needs namespace-reference and object-directory
+traversal. GC shares BackgroundGc I/O admission and yields between object/session
+batches; a low interval is not a free operation at large object counts.
+If member identity, namespace or export protection cannot be established, GC
+preserves data and reports the error through `/maintenance/gc/status`.
+
 Minimal two-member storage pool (1+1):
 
 ```ini
@@ -139,7 +170,7 @@ file_ttl_seconds=3600
 trash_retention_seconds=2592000
 
 [auto_healing]
-enabled=true
+enabled=false
 topology_check_interval_seconds=30
 topology_recovery_stability_seconds=10
 initial_scan_delay_seconds=60
@@ -174,6 +205,21 @@ MASTER_KEY=<independent-random-secret>
 ADMIN_KEY=<independent-random-secret>
 SIGNED_READ_URL_SECRET=<independent-random-secret>
 ```
+
+`N1_IO_BACKEND=auto` (default) selects the built-in io_uring backend when kernel
+support and process permissions allow it. `N1_IO_BACKEND=uring` requires it and
+fails startup if unavailable; `N1_IO_BACKEND=blocking` explicitly selects the
+compatibility backend. Invalid values fail startup. Set the variable in the
+service environment or `n1.env`, then restart N1. Automatic fallback occurs only
+during backend initialization, is logged, and does not mask later storage errors.
+No extra daemon or package is required. The backend does not weaken configured
+durability or change pool/storage formats; throughput gains require measurement.
+The selection governs asynchronous data/read/sync operations. Synchronous
+metadata publication uses direct POSIX writes and syncs in its existing workers;
+health reports this fixed policy as `publication_backend: posix` alongside the
+selected asynchronous backend and its counters. It is not a retry or fallback
+after a native operation fails. A native completion count is not a count of all
+filesystem operations.
 
 `N1_ACCEL_SEARCH_URL` enables the optional authenticated namespace-search
 proxy. The browser continues to authenticate to N1 with its fragment token;
@@ -833,9 +879,11 @@ Each file field must be named `object`, and its multipart filename must be the
 percent-encoded object key. Each object is limited to one MiB; use ordinary
 one-shot or multipart for larger files.
 Requests accept at most 4,096 fields. The server consumes the multipart body
-incrementally and acquires the existing shared I/O permit before buffering
-each object. `concurrency` is optional, clamped to 1–128, and does not override
-global or per-fragment I/O admission.
+incrementally. Strict uploads to enrolled pools acquire the existing shared
+I/O permit before buffering each group (at most 64 objects and 8 MiB). Groups
+use at most 16 concurrent payload writers. `concurrency` is optional, clamped
+to 1–128; neither path bypasses global or per-fragment I/O admission. Relaxed
+uploads retain the independent one-shot path.
 
 ```bash
 curl --fail-with-body "$BASE/noa/v1/upload/batch?concurrency=32" \
@@ -852,6 +900,16 @@ It accepts the same `durability=strict|batched` and `strict_durability` options
 as one-shot upload, falling back to the configured upload default. Strict
 durability and restart-resumable multipart are different features. A disconnect
 may leave complete, unacknowledged objects; list or retry to reconcile.
+
+Strict groups keep ordinary separate shards, immutable NDX and NCX files. The
+server writes payload and private metadata, synchronizes the participating
+filesystems, publishes NDX, synchronizes, then publishes NCX and synchronizes
+before reporting success. Existing healthy NCX is not rewritten for a new
+version. There is no packing, new disk format or cross-request commit queue.
+Linux `syncfs` covers the whole participating filesystem, including unrelated
+writes on it. A filesystem synchronization failure prevents a strict ACK;
+already-published complete versions are preserved. Batches are not all-or-nothing
+transactions. Repeated keys start a new group and retain separate version results.
 
 N1 performs no synchronous free-space scan before one-shot, batch, standard
 multipart, or durable multipart writes. Actual writes to the selected K+P
@@ -1243,6 +1301,13 @@ trash_retention_seconds and trash_versions_expired under maintenance.
 
 ## Health and maintenance
 
+System health includes `io_control.backend`: selected `backend`, `requested`
+mode, optional `fallback_reason`, bounded `queue_capacity`, current `queued`
+and `in_flight` work, and cumulative `submitted`/`completed` operations. Counts
+describe native backend requests, including errors and empty operations, not
+objects or a durability certificate. The blocking backend leaves native counts
+at zero. Ordinary cached health responses are not live queue telemetry.
+
 ```http
 GET /noa/v1/maintenance/health?deep_scan=true&refresh=true
 GET /noa/v1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
@@ -1303,9 +1368,11 @@ to an incomplete namespace-holder set.
 Write readiness requires `maintenance.access_mode == "availability"`,
 `maintenance.auto_healing.write_safe == true` and no `read_only_reason`.
 The healer status includes the live safety gate, not just the last topology
-probe. Restoring roots alone does not clear a failed-repair gate: a successful
-automatic retry must clear it. Health is an observation, not a write reservation;
-clients must still handle a subsequent `503` if availability changes.
+probe. Returning members must pass identity/writability checks and the configured
+stability interval before the topology gate clears. That does not certify their
+contents; use explicit verification/repair for that. Health is an observation,
+not a write reservation; clients must still handle a subsequent `503` if
+availability changes.
 
 Object status includes version_id, status, total_parts/shards, healthy_shards,
 missing_shards, corrupt_shards, repairable, repaired_shards, failed_repairs and
@@ -1316,9 +1383,9 @@ It does not move healthy old-pool objects to a new expansion pool.
 Modes are availability (online placement checks), checksum (checksum checks),
 strict (foreground mutations blocked) and scrub (quiesced work). A read-only
 maintenance mode restricts clients; it does not mean repair writes no data.
-Routine auto-healing uses availability scheduling for both availability checks
-and checksum cycles; unsafe topology or unresolved repair debt keeps writes
-blocked. Do not override identity checks to force service startup.
+Read-triggered repair does not schedule full availability/checksum cycles.
+Start those jobs explicitly. Unsafe topology keeps writes blocked; do not
+override identity checks to force service startup.
 
 ### Start, stop and status
 

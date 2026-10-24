@@ -1,13 +1,6 @@
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
-use crate::core::garbage_collector::get_gc_status;
 use crate::core::operation_gate::{
-    auto_healing_fault_reason, safety_read_only_reason, set_auto_healing_fault,
-    set_safety_read_only, topology_read_only_reason,
-};
-use crate::core::redistribution::get_redist_status;
-use crate::core::repair_manager::{
-    RepairCheckMode, RepairRunConfig, RepairRunOptions, get_repair_status,
-    run_repair_job_with_options,
+    safety_read_only_reason, set_safety_read_only, topology_read_only_reason,
 };
 use crate::core::root_identity::{expected_root_identities, root_matches_expected_identity};
 use crate::core::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC};
@@ -317,7 +310,8 @@ pub async fn assess_current_topology() -> TopologyAssessment {
 
 async fn update_topology_status(assessment: &TopologyAssessment) {
     let mut status = AUTO_HEALING_STATUS.write().await;
-    status.enabled = CONFIG.auto_healing.enabled;
+    // This legacy status field describes automatic full scans, not read repair.
+    status.enabled = false;
     status.write_safe = assessment.write_safe;
     status.read_only_reason = safety_read_only_reason();
     status.configured_blob_roots = assessment.configured_blob_roots;
@@ -331,87 +325,12 @@ async fn update_topology_status(assessment: &TopologyAssessment) {
     status.last_topology_check_at = Some(Utc::now().timestamp());
     if !assessment.write_safe {
         status.phase = "read_only_topology_unsafe".to_string();
-    } else if !CONFIG.auto_healing.enabled {
-        status.phase = "topology_safe_scans_disabled".to_string();
-    } else if status.phase != "scan_failed" && !status.phase.starts_with("running_") {
-        status.phase = "idle".to_string();
+    } else {
+        status.phase = "on_read_only".to_string();
     }
 }
 
-async fn maintenance_is_busy() -> bool {
-    get_repair_status().await.is_running
-        || get_redist_status().await.is_running
-        || get_gc_status().await.is_running
-}
-
-async fn start_automatic_scan(check_mode: RepairCheckMode, state: Arc<AppState>) {
-    let label = match check_mode {
-        RepairCheckMode::Availability => "availability_scan",
-        _ => "checksum_scrub",
-    };
-    {
-        let mut status = AUTO_HEALING_STATUS.write().await;
-        status.phase = format!("running_{label}");
-        status.last_error = None;
-    }
-
-    let cfg = &CONFIG.auto_healing;
-    let run_cfg = RepairRunConfig {
-        dry_run: false,
-        target_fragment: None,
-        check_mode,
-        meta_concurrency: cfg.object_scan_concurrency,
-        shard_repair_concurrency: cfg.shard_repair_concurrency,
-        meta_batch_size: cfg.metadata_batch_size,
-    };
-    // Scheduled availability and checksum work is deliberately online. The
-    // repair manager still enforces read-only/quiesced minimums for strict or
-    // scrub modes, while genuine topology or repair failures use the separate
-    // persistent safety gate below.
-    let access_mode = check_mode.minimum_maintenance_access_mode();
-    let result = run_repair_job_with_options(
-        run_cfg,
-        RepairRunOptions {
-            fast_mode: false,
-            access_mode,
-            replay_pending_redistribution: false,
-        },
-        Arc::new(state.ws_manager.clone()),
-    )
-    .await;
-
-    let mut status = AUTO_HEALING_STATUS.write().await;
-    match result {
-        Ok(()) => {
-            set_auto_healing_fault(None);
-            let now = Utc::now().timestamp();
-            if check_mode == RepairCheckMode::Availability {
-                status.last_availability_scan_at = Some(now);
-            } else {
-                status.last_checksum_scrub_at = Some(now);
-            }
-            status.phase = if status.write_safe {
-                "idle".to_string()
-            } else {
-                "read_only_topology_unsafe".to_string()
-            };
-        }
-        Err(error) => {
-            let message = error.to_string();
-            warn!("Automatic N1 {label} failed: {message}");
-            status.phase = "scan_failed".to_string();
-            status.last_error = Some(message);
-            if !matches!(error, crate::enums::app_error_enum::AppError::Conflict(_)) {
-                set_auto_healing_fault(Some(format!(
-                    "N1 is read-only because automatic {label} failed; the controller will retry: {}",
-                    status.last_error.as_deref().unwrap_or("unknown failure")
-                )));
-            }
-        }
-    }
-}
-
-pub async fn run_auto_healing_controller(state: Arc<AppState>) {
+pub async fn run_auto_healing_controller(_state: Arc<AppState>) {
     if BLOB_STORE_DISKS.get().is_none()
         || INDEX_STORE_DISKS.get().is_none()
         || DATA_SHARDS_ATOMIC.get().is_none()
@@ -425,19 +344,11 @@ pub async fn run_auto_healing_controller(state: Arc<AppState>) {
 
     let cfg = CONFIG.auto_healing.clone();
     let topology_interval = Duration::from_secs(cfg.topology_check_interval_seconds.max(1));
-    let mut availability_due = Instant::now() + Duration::from_secs(cfg.initial_scan_delay_seconds);
-    let mut checksum_due =
-        Instant::now() + Duration::from_secs(cfg.checksum_scrub_interval_seconds);
     let mut safe_since: Option<Instant> = None;
 
     info!(
-        "N1 auto-healing controller started: enabled={} topology={}s availability={}s checksum={}s object_concurrency={} repair_concurrency={}",
-        cfg.enabled,
-        topology_interval.as_secs(),
-        cfg.availability_scan_interval_seconds,
-        cfg.checksum_scrub_interval_seconds,
-        cfg.object_scan_concurrency,
-        cfg.shard_repair_concurrency
+        "N1 read-triggered repair enabled; full object scans require an explicit repair request; member identity probe interval={}s",
+        topology_interval.as_secs()
     );
 
     loop {
@@ -463,35 +374,6 @@ pub async fn run_auto_healing_controller(state: Arc<AppState>) {
             set_safety_read_only(assessment.reason.clone());
         }
         update_topology_status(&assessment).await;
-
-        // A topology check or a running scan can replace the display phase.
-        // The existing persistent fault, not that label, requires a retry.
-        if auto_healing_fault_reason().is_some() {
-            availability_due = Instant::now();
-        }
-
-        if cfg.enabled && !maintenance_is_busy().await {
-            let now = Instant::now();
-            let mode = if now >= checksum_due {
-                checksum_due = now + Duration::from_secs(cfg.checksum_scrub_interval_seconds);
-                availability_due =
-                    now + Duration::from_secs(cfg.availability_scan_interval_seconds);
-                Some(RepairCheckMode::Checksum)
-            } else if now >= availability_due {
-                availability_due =
-                    now + Duration::from_secs(cfg.availability_scan_interval_seconds);
-                Some(RepairCheckMode::Availability)
-            } else {
-                None
-            };
-
-            if let Some(mode) = mode {
-                let scan_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    start_automatic_scan(mode, scan_state).await;
-                });
-            }
-        }
 
         let next_check = if assessment.write_safe {
             safe_since

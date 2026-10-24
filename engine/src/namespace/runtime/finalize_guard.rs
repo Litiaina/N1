@@ -16,14 +16,14 @@ struct Entry {
 static LOCKS: LazyLock<Mutex<HashMap<String, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub(super) struct FinalizeGuard {
+pub(crate) struct FinalizeGuard {
     key: String,
     lock: Arc<AsyncMutex<()>>,
     owned: Option<OwnedMutexGuard<()>>,
 }
 
 impl FinalizeGuard {
-    pub(super) async fn acquire(key: String) -> Result<Self, AppError> {
+    pub(crate) async fn acquire(key: String) -> Result<Self, AppError> {
         // Only bookkeeping is synchronous. No filesystem work, waiting for a
         // path lock, or other await occurs while the registry is locked.
         let lock = {

@@ -3,6 +3,99 @@
 This is a condensed release and development history, not an LTS declaration.
 Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
+## Unreleased — bounded maintenance and upload performance
+
+- Add a request-owned strict small-file batch path: at most 64 objects / 8 MiB
+  per commit group, bounded payload parallelism and shared filesystem durability
+  barriers before NDX, before NCX and before ACK. Keep ordinary independent
+  NCX/immutable NDX/shards, existing per-key coordination and format. Do not
+  rewrite healthy NCX for a new version. GC reclaims only expired private batch
+  staging files in its existing version pass, fenced against active uploads.
+  Correctness and measured performance qualification are separate gates.
+- Add a bounded, in-process Linux io_uring backend with owned completion
+  lifetimes and explicit `auto`, required `uring` and `blocking` selection.
+  Expose the selected backend, initialization fallback and operation counters
+  in startup logs/system health. Preserve publication order and durability
+  barriers across direct/relaxed writes, checksum/recovery reads and metadata
+  publication. Keep asynchronous data/read/sync work native; synchronous
+  publication uses POSIX directly rather than a worker-to-ring reply bridge,
+  reported as `publication_backend: posix`. Share encoded NDX between holders
+  and reuse checksum buffers;
+  storage formats are unchanged. Native XFS/ext4 correctness gates pass;
+  performance qualification is separate.
+- Visit metadata-snapshot holders in the same lexical order used for replica
+  suppression, avoiding a complete non-emitting member walk before the first
+  entry. Keep all-member traversal and EC member order unchanged. Report startup
+  phase timings without weakening lease or publication syncs.
+- Verify existing shard checksums on streaming GET/download/range reads as well
+  as verified chunk reads. Reject unavailable checksum authority; validate
+  reconstructed bytes before repair publication. Keep storage encoding intact.
+- Make full healing/checksum walks and deep health scans explicit. Retain
+  known-member safety checks and bounded, targeted read-triggered repair.
+- Check trash TTL before loading version metadata. Route scheduled and manual
+  GC through the same collector so scheduled runs also reclaim aged abandoned
+  uploads, including unpublished versions beneath live objects. Preserve
+  committed history, active uploads, overlapping namespace mutations and backups.
+- Stream object fanout with bounded directory handles and rejoin BackgroundGc
+  admission between object/session batches. Check every configured member before
+  deletion; reject redirected layouts and uncertain export authority. Recheck
+  export admission between destructive batches. No new upload receipts or format.
+- Prune only known empty trash ancestors after GC expiry, preserving siblings
+  and `.trash` itself. Keep ordinary recovery free of added pruning syncs.
+- Reconstruct short/unaligned reads from recorded EC stripes, and repair every
+  encountered corrupt data target rather than confusing peer rejection with
+  an already-admitted repair. Keep reconstruction memory stripe-bounded.
+- Honor existing whole-fragment deletion admission in read-triggered repair;
+  defer repair during deletion and refuse publication without live identity.
+- Treat unavailable process metrics as telemetry, not storage I/O failure, and
+  stop the sampler before stopping a test engine. Preserve and reconcile timed-out
+  writes without retrying them or relabeling an incomplete run as a scale PASS.
+
+- Preserve and independently recheck failed HDD scale fixtures, including every
+  acknowledged historical version and complete namespace/maximum-ULID inventory.
+- Record bounded, in-memory admission-owner diagnostics on foreground timeout
+  and separate batch payload/NDX and NCX latency classes. Durability, admission
+  deadlines and storage encoding are unchanged.
+- Preserve FIFO admission when adaptive concurrency shrinks: retire existing
+  semaphore permits as operations finish instead of cancelling queue position
+  and retrying every 2 ms. Keep waiting foreground work out of the shared
+  background lane. Hard concurrency and memory limits remain unchanged.
+- Allow adaptive concurrency to recover after host pressure clears even with
+  queued demand. Retain configured ceilings and saturation/stall/resource guards;
+  validate against unchanged strict-durability workloads before claiming gains.
+- Resume one physical NCX walk across internal maintenance batches instead of
+  restarting sorted LIST for every page. Keep live/trash scan state bounded;
+  reuse the cursor for repair, monitoring and redistribution.
+- Remove duplicate NCX repair passes and move namespace inspection off async
+  workers. Namespace/payload/NDX presence probes stop at their first match;
+  object fanout counting streams without a whole-fragment directory inventory.
+- Keep bounded independent-object concurrency and report admitted successes
+  alongside explicit per-object backpressure rejections.
+- Publish independent NDX holders in bounded parallel phases, joining every
+  writer before proceeding. Avoid redundant existing-parent traversal while
+  retaining the existing strict direct-I/O and data/directory barriers.
+- Keep one-shot and batch-upload admission through NCX publication, including detached
+  commits after caller cancellation. Resolve stable fragment IDs without
+  rediscovering roots and create only missing directory suffixes.
+- Reuse the typed streaming commit result for HTTP one-shot uploads instead of
+  serializing/parsing an internal response and rereading the just-written NDX.
+  Share stream/reader shard setup, open independent members in bounded parallel,
+  and omit redundant small-shard pre-sizing. Keep strict direct I/O and all
+  synchronization barriers. NDX publication no longer initializes unused
+  `.uploads` and `.trash` directories.
+- Collect GC references from each physical NCX in cooperative batches. Preserve
+  conflicting references and defer reclamation on unreadable authority; reuse
+  one object-directory inventory and lazy cross-member NDX authority per object.
+  Give queued foreground work a bounded service window between GC batches.
+- Separate shard setup, direct-write drain, data sync and directory-sync timing.
+  These changes require fresh HDD integrity and matched-population performance
+  verification; the failed 300k run is not relabeled as a pass.
+- Retain server-stage/scheduler telemetry at scale checkpoints and separate
+  client source preparation, HTTP and acknowledgement-ledger timing. Keep the
+  real source files, FULL acknowledgement database and strict workload unchanged.
+- No disk-format, NCX copy/delete, immutable version, backup or cache changes.
+  Performance and integrity qualification are recorded separately below.
+
 ## 1.0.0-RC.1 — October 18, 2026
 
 - Declare the first formal release candidate. Reset private development product

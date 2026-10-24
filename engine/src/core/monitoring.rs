@@ -65,24 +65,6 @@ static REDIST_INTENT_DEBT_CACHE: LazyLock<
 > = LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 const REDIST_INTENT_DEBT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
-fn monitor_interval() -> Duration {
-    let secs = MONITOR_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(2)
-        .clamp(1, 3600);
-    Duration::from_secs(secs)
-}
-
-fn deep_scan_interval() -> Duration {
-    let secs = MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(60)
-        .clamp(5, 24 * 3600);
-    Duration::from_secs(secs)
-}
-
 fn is_fragment_scoped_health_request(params: &HashMap<String, String>) -> bool {
     params
         .get("fragment")
@@ -490,26 +472,9 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let fragment = fragment.to_string();
     let roots = blob_roots.to_vec();
     tokio::task::spawn_blocking(move || {
-        for root in roots {
-            let Ok(object_dirs) = index_store::local_object_dirs_under_root(&root, &fragment)
-            else {
-                continue;
-            };
-            for (object_dir, _) in object_dirs {
-                if std::fs::read_dir(&object_dir).ok().is_some_and(|entries| {
-                    entries.filter_map(Result::ok).any(|entry| {
-                        entry.path().is_dir()
-                            && std::fs::read_dir(entry.path())
-                                .ok()
-                                .and_then(|mut files| files.next())
-                                .is_some()
-                    })
-                }) {
-                    return true;
-                }
-            }
-        }
-        false
+        roots
+            .iter()
+            .any(|root| index_store::local_root_has_blob_payload(root, &fragment))
     })
     .await
     .unwrap_or(false)
@@ -519,10 +484,20 @@ async fn fragment_has_indexed_payload(
     fragment: &str,
     _active_index_roots: &[PathBuf],
 ) -> Result<bool, AppError> {
-    Ok(global_namespace_runtime()
-        .reachability_snapshot_if_present(fragment)
-        .await?
-        .is_some_and(|snapshot| !snapshot.referenced_object_ids.is_empty()))
+    let fragment = fragment.to_string();
+    tokio::task::spawn_blocking(move || {
+        for trash in [false, true] {
+            if crate::namespace::flat::Scan::new(&fragment, trash)?
+                .next_record()?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|error| AppError::InternalServerError(format!("namespace probe worker: {error}")))?
 }
 
 async fn fragment_has_sampled_redundancy_debt(
@@ -535,22 +510,16 @@ async fn fragment_has_sampled_redundancy_debt(
     active_index_roots: &[PathBuf],
 ) -> Result<SampledObjectDebt, AppError> {
     let page_limit = if deep_scan { 128 } else { 32 };
-    let mut live_token = None;
+    let mut scan = index::MetadataScan::new(fragment, false).await?;
     let mut checked = 0usize;
     let mut sampled = SampledObjectDebt::default();
 
     loop {
-        let page = index::scan_fragment_live_metadata_page(
-            fragment,
-            None,
-            None,
-            page_limit,
-            live_token.clone(),
-            true,
-        )
-        .await?;
-
-        for meta in page.objects {
+        let objects = scan.next_batch(page_limit).await?;
+        if objects.is_empty() {
+            break;
+        }
+        for meta in objects {
             if meta.is_delete_marker {
                 continue;
             }
@@ -589,9 +558,8 @@ async fn fragment_has_sampled_redundancy_debt(
             }
         }
 
-        match page.continuation_token {
-            Some(token) if deep_scan => live_token = Some(token),
-            _ => break,
+        if !deep_scan {
+            break;
         }
     }
 
@@ -1397,40 +1365,6 @@ fn analyze_blob_placement_risk(disk_statuses: &[DiskStatus]) -> BlobPlacementRis
         placement_limiter_path: limiter.as_ref().map(|(_, path, _)| path.clone()),
         placement_limiter_available_bytes: limiter.as_ref().map(|(available, _, _)| *available),
         placement_limiter_usage_percent: limiter.and_then(|(_, _, usage)| usage),
-    }
-}
-
-pub async fn run_system_monitor(state: Arc<AppState>) {
-    let mut ticker = tokio::time::interval(monitor_interval());
-    ticker.tick().await;
-
-    loop {
-        ticker.tick().await;
-
-        let do_deep_scan = {
-            let last = LAST_DEEP_SCAN_AT.read().await;
-            match *last {
-                Some(t) => t.elapsed() >= deep_scan_interval(),
-                None => true,
-            }
-        };
-
-        let mut params = HashMap::new();
-        if do_deep_scan {
-            params.insert("deep_scan".to_string(), "true".to_string());
-        }
-
-        match collect_system_health(&state, &params).await {
-            Ok(snapshot) => {
-                *HEALTH_CACHE.write().await = Some(snapshot);
-                if do_deep_scan {
-                    *LAST_DEEP_SCAN_AT.write().await = Some(Instant::now());
-                }
-            }
-            Err(_) => {
-                // Keep serving the last good snapshot if probe fails.
-            }
-        }
     }
 }
 

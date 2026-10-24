@@ -4,7 +4,9 @@ use std::sync::Barrier;
 use std::time::{Duration, SystemTime};
 
 fn fragment() -> String {
-    format!("activity-test-{}", ulid::Ulid::new())
+    // Activity is keyed by stable fragment identity. Use one directly so
+    // these tests do not depend on another module bootstrapping alias roots.
+    ulid::Ulid::new().to_string()
 }
 
 fn assert_released(fragment: &str) {

@@ -19,7 +19,6 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
 use std::collections::{HashMap, HashSet};
-use std::fs::File as StdFile;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
@@ -951,7 +950,7 @@ pub(crate) fn create_multipart_range_reader(
         blob_dir: PathBuf,
         cursor_in_part: u64,
         remaining_total: u64,
-        file_cache: HashMap<String, StdFile>,
+        file_cache: HashMap<String, crate::core::recovery::ShardReadHandle>,
         stripe_size: usize,
     }
 

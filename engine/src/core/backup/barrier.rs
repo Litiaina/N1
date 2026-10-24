@@ -12,6 +12,18 @@ pub(crate) struct Mutation {
     _guard: Option<OwnedRwLockReadGuard<()>>,
     _local: std::marker::PhantomData<*mut ()>,
 }
+impl Mutation {
+    /// Transfer already-admitted async ownership onto its synchronous
+    /// publisher. Nested namespace/index calls reuse this thread's admission
+    /// instead of queuing another reader behind an exclusive backup waiter.
+    pub(crate) fn from_owned(guard: OwnedRwLockReadGuard<()>) -> Self {
+        DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self {
+            _guard: Some(guard),
+            _local: std::marker::PhantomData,
+        }
+    }
+}
 impl Drop for Mutation {
     fn drop(&mut self) {
         DEPTH.with(|d| d.set(d.get() - 1));
@@ -144,6 +156,31 @@ mod tests {
         .unwrap();
         drop(nested);
         drop(first);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let owned = runtime.block_on(mutation_async());
+        let mut writer = std::pin::pin!(BOUNDARY.clone().write_owned());
+        assert!(
+            writer
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending(),
+            "the exclusive backup writer must be queued behind owned admission"
+        );
+        std::thread::spawn(move || {
+            let adopted = Mutation::from_owned(owned);
+            assert_eq!(DEPTH.with(Cell::get), 1);
+            let nested = mutation();
+            assert_eq!(DEPTH.with(Cell::get), 2);
+            drop(nested);
+            drop(adopted);
+            assert_eq!(DEPTH.with(Cell::get), 0);
+        })
+        .join()
+        .unwrap();
+        drop(runtime.block_on(writer));
         let frozen = freeze(5).unwrap();
         assert!(BOUNDARY.try_read().is_err());
         drop(frozen);

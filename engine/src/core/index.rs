@@ -124,6 +124,79 @@ where
         .map_err(|err| AppError::InternalServerError(format!("N1 index worker failed: {err}")))?
 }
 
+pub(crate) struct MetadataScan {
+    state: Option<index_store::MetadataScan>,
+}
+
+impl MetadataScan {
+    pub(crate) async fn new(fragment: &str, trash: bool) -> Result<Self, AppError> {
+        let fragment = fragment.to_string();
+        let state =
+            run_index_blocking(move || index_store::MetadataScan::new(&fragment, trash)).await?;
+        Ok(Self { state: Some(state) })
+    }
+
+    pub(crate) async fn next_batch(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<ObjectMetadata>, AppError> {
+        let mut state = self.state.take().ok_or_else(|| {
+            AppError::InternalServerError("metadata cursor worker did not return".into())
+        })?;
+        let (state, batch) = run_index_blocking(move || {
+            let batch = state.next_batch(limit);
+            Ok((state, batch))
+        })
+        .await?;
+        self.state = Some(state);
+        batch
+    }
+}
+
+#[cfg(test)]
+mod metadata_cursor_tests {
+    #[test]
+    fn paused_cursor_does_not_occupy_a_blocking_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _guard = crate::test_support::global_test_lock().lock().await;
+            let base =
+                std::env::temp_dir().join(format!("cursor-worker-test-{}", std::process::id()));
+            for (cell, role) in [
+                (&crate::core::disk_manager::INDEX_STORE_DISKS, "index"),
+                (&crate::core::disk_manager::BLOB_STORE_DISKS, "blob"),
+            ] {
+                for root in cell.get_or_init(|| {
+                    (0..2)
+                        .map(|i| base.join(format!("{role}-{i}")).display().to_string())
+                        .collect()
+                }) {
+                    std::fs::create_dir_all(root).unwrap();
+                }
+            }
+            let mut scan =
+                super::MetadataScan::new(&format!("empty-cursor-{}", ulid::Ulid::new()), false)
+                    .await
+                    .unwrap();
+            assert!(scan.next_batch(1).await.unwrap().is_empty());
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::task::spawn_blocking(|| true)
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            );
+            assert!(scan.next_batch(1).await.unwrap().is_empty());
+        });
+    }
+}
+
 pub async fn open_session(
     manifest: &UploadSessionManifest,
     reservation: Option<ReservationReceipt>,

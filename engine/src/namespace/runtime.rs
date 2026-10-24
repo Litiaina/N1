@@ -12,9 +12,11 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
+#[cfg(test)]
+use crate::core::index_store::scan_trash_records;
 use crate::core::index_store::{
     self, PendingUploadBinding, TrashRecord, new_object_id, reject_reserved_user_path,
-    scan_trash_records, write_pending_binding,
+    write_pending_binding,
 };
 #[cfg(test)]
 use crate::core::index_store::{TRASH_DIR, fragment_root_on, publish_namespace_link};
@@ -29,8 +31,22 @@ use crate::namespace::{
 };
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
-mod finalize_guard;
+pub(crate) mod finalize_guard;
 use finalize_guard::FinalizeGuard;
+
+#[cfg(test)]
+pub(crate) async fn hold_publication_for_test(
+    fragment: &str,
+    path: &str,
+    ready: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    let _guard = FinalizeGuard::acquire(format!("{fragment}\0{path}"))
+        .await
+        .unwrap();
+    let _ = ready.send(());
+    let _ = release.await;
+}
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
 }
@@ -483,10 +499,27 @@ impl NamespaceRuntime {
             let mut result = TrashLifecycleSweepSummary::default();
             let retention = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
             let mut candidates = BTreeSet::new();
-            for record in scan_trash_records(&fragment)? {
+            let mut scan = flat::Scan::new(&fragment, true)?;
+            while let Some(entry) = scan.next_record()? {
+                let Some(mut record) = entry.trash else {
+                    continue;
+                };
                 if now_unix < record.deleted_at_unix.saturating_add(retention) {
                     continue;
                 }
+                // TTL eligibility needs only the small trash NCX. Do not open
+                // immutable version metadata for an unexpired entry. Preserve
+                // the existing fail-closed metadata and reference checks once
+                // an entry actually becomes a reclamation candidate.
+                let mut versions = BTreeSet::new();
+                for object_id in &record.object_keys {
+                    versions.extend(
+                        index_store::list_live_versions(&fragment, object_id)?
+                            .into_iter()
+                            .map(|metadata| metadata.version_id),
+                    );
+                }
+                record.version_ids = versions.into_iter().collect();
                 if flat::remove_trash(&fragment, &record)? {
                     result.expired_versions = result
                         .expired_versions
@@ -512,9 +545,14 @@ impl NamespaceRuntime {
         &self,
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
-        Ok(Some(NamespaceReachabilitySnapshot {
-            referenced_object_ids: flat::referenced_objects(fragment)?,
-        }))
+        let fragment = fragment.to_string();
+        tokio::task::spawn_blocking(move || {
+            Ok(Some(NamespaceReachabilitySnapshot {
+                referenced_object_ids: flat::referenced_objects(&fragment)?,
+            }))
+        })
+        .await
+        .map_err(worker_error)?
     }
 
     pub async fn resolve_live_object_id(
@@ -598,8 +636,10 @@ impl NamespaceRuntime {
             let _activity = activity;
             let _guard = guard;
             flat::with_keys(&fragment, &[&logical_path], || {
-                let final_id = flat::lookup(&fragment, &logical_path)?
-                    .map(|p| p.object_id)
+                let existing = flat::lookup(&fragment, &logical_path)?;
+                let final_id = existing
+                    .as_ref()
+                    .map(|p| p.object_id.clone())
                     .unwrap_or_else(|| physical_object_id.clone());
                 let _target =
                     crate::core::upload::UploadActivityGuard::begin(&fragment, &final_id)?;
@@ -615,7 +655,9 @@ impl NamespaceRuntime {
                             .ok()
                             .and_then(|path| crate::core::storage_pool::pool_for_root(&path))
                     });
-                flat::publish(&fragment, &logical_path, &final_id, pool)?;
+                // This fresh lookup and publication share the exact-key gate;
+                // repeating all-member lookup here would not add authority.
+                flat::publish_with_existing(&fragment, &logical_path, &final_id, pool, existing)?;
                 Ok(final_id)
             })
         })

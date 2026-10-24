@@ -12,7 +12,6 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
-use std::fs::File;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -135,7 +134,7 @@ pub(crate) async fn download_object_chunk_from_metadata(
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;
     let mut checksum_header: Option<String> = None;
-    let mut file_cache: HashMap<String, File> = HashMap::new();
+    let mut file_cache: HashMap<String, crate::core::recovery::ShardReadHandle> = HashMap::new();
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
@@ -264,7 +263,7 @@ where
 
     let stripe_block_size = metadata.stripe_size_bytes;
     let mut current_global_pos = 0u64;
-    let mut file_cache: HashMap<String, File> = HashMap::new();
+    let mut file_cache: HashMap<String, crate::core::recovery::ShardReadHandle> = HashMap::new();
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();

@@ -78,10 +78,8 @@ impl Proof {
 
         let base = format!("{}trash-maintenance-directory", self.args.prefix);
         let nested = format!("{base}/nested");
-        self.posix_post("/noa/v1/posix/mkdir", json!({"path": &base}))
-            .await?;
-        self.posix_post("/noa/v1/posix/mkdir", json!({"path": &nested}))
-            .await?;
+        // N1's flat namespace has no empty directory objects. Uploading the
+        // keys below establishes these prefixes; mkdir is correctly rejected.
 
         let direct_key = format!("{}trash-maintenance-direct.bin", self.args.prefix);
         let direct_payload = deterministic_payload(8 * 1024, b"n1-trash-direct");
@@ -114,51 +112,33 @@ impl Proof {
             .last()
             .ok_or("trash maintenance proof created no directory objects")?
             .2;
-        let removed_after_page_boundary =
-            self.remove_one_shard_matching(last_version, |path| {
-                path.extension().and_then(|ext| ext.to_str()) == Some("parity")
-            })?;
+        let removed_after_page_boundary = self.remove_one_shard_matching(last_version, |path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("parity")
+        })?;
 
         self.stop_server()?;
         self.start_server("trash-maintenance-after-restart").await?;
         self.auth().await?;
+        self.wait_for_write_safe("trash restart topology validation").await?;
+        self.explicit_repair_and_wait("availability").await?;
         self.wait_for_path(&removed_direct, true, Duration::from_secs(30))
             .await?;
-        self.wait_for_path(
-            &removed_after_page_boundary,
-            true,
-            Duration::from_secs(30),
-        )
-        .await?;
-        let scan_health = self
-            .wait_for_auto_healing_state(
-                "successful restarted trash maintenance scan",
-                Duration::from_secs(30),
-                |snapshot| {
-                    snapshot
-                        .pointer("/maintenance/auto_healing/last_availability_scan_at")
-                        .is_some_and(Value::is_number)
-                        && snapshot
-                            .pointer("/maintenance/auto_healing/write_safe")
-                            .and_then(Value::as_bool)
-                            == Some(true)
-                        && snapshot
-                            .pointer("/maintenance/access_mode")
-                            .and_then(Value::as_str)
-                            == Some("availability")
-                },
-            )
+        self.wait_for_path(&removed_after_page_boundary, true, Duration::from_secs(30))
             .await?;
+        let scan_health = self.auto_healing_health().await?;
 
         self.posix_post("/noa/v1/posix/recover", json!({"path": &direct_key}))
             .await?;
         self.posix_post("/noa/v1/posix/recover", json!({"path": &base}))
             .await?;
-        self.assert_download_sha256(&direct_key, &direct_sha).await?;
+        self.assert_download_sha256(&direct_key, &direct_sha)
+            .await?;
         for (key, sha, _) in &directory_objects {
             self.assert_download_sha256(key, sha).await?;
         }
-        let final_health = self.wait_for_write_safe("post-recovery write safety").await?;
+        let final_health = self
+            .wait_for_write_safe("post-recovery write safety")
+            .await?;
 
         self.summary = json!({
             "status": "PASS",
@@ -292,54 +272,260 @@ impl Proof {
         Ok(json!({"status": status.as_u16(), "body": body}))
     }
 
-    async fn prove_scheduled_checksum_remains_online(&self) -> ProofResult<Value> {
-        let deadline = Instant::now() + Duration::from_secs(45);
-        let mut last = json!(null);
-        let mut attempt = 0usize;
-        while Instant::now() < deadline {
-            last = self.auto_healing_health().await?;
-            let automatic_checksum_running = last
-                .pointer("/maintenance/auto_healing/phase")
-                .and_then(Value::as_str)
-                == Some("running_checksum_scrub");
-            if automatic_checksum_running {
-                let access_mode = last
-                    .pointer("/maintenance/access_mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("missing");
-                if access_mode != "availability" {
+    async fn explicit_repair_and_wait(&self, mode: &str) -> ProofResult<Value> {
+        self.start_manual_repair_mode(mode).await?;
+        let result = self
+            .wait_job("/noa/v1/maintenance/repair/status", mode)
+            .await?;
+        if result
+            .get("failed_repairs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            != 0
+        {
+            return Err(format!("explicit repair left failed objects: {result}").into());
+        }
+        Ok(result)
+    }
+
+    async fn prove_read_bitrot_paths(&self) -> ProofResult<Value> {
+        let mut results = Vec::new();
+        for endpoint in [
+            "get",
+            "stream",
+            "download",
+            "range",
+            "chunk",
+            "native-full",
+            "native-stream",
+            "native-chunk",
+            "archive",
+        ] {
+            let key = format!("{}integrity/{endpoint}.bin", self.args.prefix);
+            let payload = deterministic_payload(65_537, endpoint.as_bytes());
+            let expected_sha = sha256_bytes(&payload);
+            let version = self
+                .upload_bytes(&key, payload.clone(), "application/octet-stream")
+                .await?;
+            self.assert_download_sha256(&key, &expected_sha).await?;
+            let paths = self.version_shard_paths(&version)?;
+            let path = paths
+                .iter()
+                .find(|path| path.extension().and_then(|value| value.to_str()) == Some("shard"))
+                .ok_or("no actual data shard to corrupt")?;
+            let raw = fs::read(path)?;
+            let raw_sha = sha256_bytes(&raw);
+            let mut metadata_before = Vec::new();
+            for shard in &paths {
+                for entry in fs::read_dir(
+                    shard
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or("missing object parent")?,
+                )? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file()
+                        && entry.path().extension().and_then(|value| value.to_str()) == Some("ndx")
+                    {
+                        metadata_before
+                            .push((entry.path(), sha256_bytes(&fs::read(entry.path())?)));
+                    }
+                }
+            }
+            if metadata_before.is_empty() {
+                return Err("no NDX replicas to check immutability".into());
+            }
+            let mut damaged = raw.clone();
+            damaged[17] ^= 0x80;
+            fs::write(path, &damaged)?;
+            let started = Instant::now();
+            let mut expected = payload.clone();
+            if endpoint.starts_with("native-") {
+                let mut connection =
+                    TcpStream::connect(("127.0.0.1", self.args.native_port)).await?;
+                let auth = native_round_trip(&mut connection, "integrity-auth", "auth.fragment",
+                    json!({"fragment":self.fragment,"secret":self.args.fragment_key,"read":true,"expires_in":21600}), None).await?;
+                ensure_native_ok(&auth, "integrity native auth")?;
+                if endpoint == "native-stream" {
+                    let result = native_round_trip_stream_hash(
+                        &mut connection,
+                        "integrity-stream",
+                        "object.download_stream",
+                        json!({"object_key":key,"version_id":version,"chunk_size":4096}),
+                    )
+                    .await?;
+                    ensure_native_status(&result.response, 200, "verified native stream")?;
+                    if result.bytes_read != payload.len() || result.sha256 != expected_sha {
+                        return Err(
+                            format!("native stream returned corrupted data for {key}").into()
+                        );
+                    }
+                } else {
+                    let (op, request) = if endpoint == "native-chunk" {
+                        expected = payload[3..1003].to_vec();
+                        (
+                            "object.download_chunk",
+                            json!({"object_key":key,"version_id":version,"offset":3,"chunk_size":1000}),
+                        )
+                    } else {
+                        (
+                            "object.download",
+                            json!({"object_key":key,"version_id":version}),
+                        )
+                    };
+                    let result =
+                        native_round_trip(&mut connection, "integrity-read", op, request, None)
+                            .await?;
+                    ensure_native_status(&result, 200, "verified native read")?;
+                    if result.body.as_ref().map(|body| body.as_slice()) != Some(expected.as_slice())
+                    {
+                        return Err(format!("native read returned corrupted data for {key}").into());
+                    }
+                }
+            } else {
+                let mut request = match endpoint {
+                    "get" => self.client.get(format!("{}/noa/v1/objects/get/{}", self.base_url, encode_path(&key))),
+                    "stream" => self.client.get(format!("{}/noa/v1/objects/stream/{}", self.base_url, encode_path(&key))),
+                    "chunk" => self.client.get(format!("{}/noa/v1/objects/download/chunk", self.base_url))
+                        .query(&[("object_key",key.clone()),("version_id",version.clone()),("offset","3".into()),("chunk_size","1000".into())]),
+                    "archive" => self.client.post(format!("{}/noa/v1/objects/archive",self.base_url))
+                        .json(&json!({"format":"tar","keys":[key]})),
+                    _ => self.client.get(format!("{}/noa/v1/objects/download",self.base_url))
+                        .query(&[("object_key",key.clone()),("version_id",version.clone())]),
+                };
+                if endpoint == "range" {
+                    request = request.header("Range", "bytes=3-1002");
+                    expected = payload[3..1003].to_vec();
+                } else if endpoint == "chunk" {
+                    expected = payload[3..1003].to_vec();
+                }
+                let response = request.bearer_auth(&self.token).send().await?;
+                let expected_status = if endpoint == "range" {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+                if response.status() != expected_status {
+                    return Err(format!("{endpoint} bitrot read failed: {} {}", response.status(), response.text().await?).into());
+                }
+                let bytes = response.bytes().await?;
+                if endpoint == "archive" {
+                    if tar_payload_hashes(&bytes)?.get(&key) != Some(&expected_sha) {
+                        return Err("archive exposed corrupt payload".into());
+                    }
+                } else if bytes.as_ref() != expected.as_slice() {
+                    return Err(format!("{endpoint} exposed corrupt payload").into());
+                }
+            }
+            let read_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if fs::read(path).is_ok_and(|bytes| sha256_bytes(&bytes) == raw_sha) {
+                    break;
+                }
+                if Instant::now() >= deadline {
                     return Err(format!(
-                        "scheduled checksum entered {access_mode} instead of preserving availability: {last}"
+                        "{endpoint}: bytes recovered but physical shard not repaired"
                     )
                     .into());
                 }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            for (metadata, before) in metadata_before {
+                if sha256_bytes(&fs::read(metadata)?) != before {
+                    return Err("read repair rewrote committed NDX".into());
+                }
+            }
+            results.push(
+                json!({"endpoint":endpoint,"same_length_bitrot":true,"returned_bytes_verified":true,
+                "physical_shard_repaired":true,"ndx_unchanged":true,"read_ms":read_ms}),
+            );
+        }
+        Ok(json!({"paths":results}))
+    }
 
+    async fn prove_concurrent_bitrot_reads(&self) -> ProofResult<Value> {
+        const OBJECTS: usize = 16;
+        const READERS: usize = 64;
+        let mut fixtures = Vec::new();
+        for index in 0..OBJECTS {
+            let key = format!("{}integrity/burst-{index:03}.bin", self.args.prefix);
+            let payload = deterministic_payload(65_537, key.as_bytes());
+            let digest = sha256_bytes(&payload);
+            let version = self.upload_bytes(&key, payload, "application/octet-stream").await?;
+            let path = self.version_shard_paths(&version)?.into_iter()
+                .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("shard"))
+                .ok_or("burst fixture has no data shard")?;
+            let original = fs::read(&path)?;
+            let raw_digest = sha256_bytes(&original);
+            let mut damaged = original;
+            damaged[17] ^= 0x80;
+            fs::write(&path, damaged)?;
+            fixtures.push((key, version, digest, path, raw_digest));
+        }
+        let started = Instant::now();
+        // Poll all futures together: distinct corrupt targets and duplicate
+        // readers compete for the same bounded repair admission.
+        let reads = (0..READERS).map(|index| {
+            let (key, version, digest, _, _) = &fixtures[index % OBJECTS];
+            async move {
+                let response = self.client.get(format!("{}/noa/v1/objects/download", self.base_url))
+                    .bearer_auth(&self.token)
+                    .query(&[("object_key", key), ("version_id", version)])
+                    .send().await?.error_for_status()?;
+                let bytes = response.bytes().await?;
+                if bytes.len() != 65_537 || sha256_bytes(&bytes) != *digest {
+                    return Err(format!("concurrent bitrot read returned bad bytes: {key}").into());
+                }
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            }
+        });
+        for read in join_all(reads).await {
+            read?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if fixtures.iter().all(|(_, _, _, path, digest)| {
+                fs::read(path).is_ok_and(|bytes| sha256_bytes(&bytes) == *digest)
+            }) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("concurrent reads returned but not all corrupt shards were physically repaired".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(json!({"corrupt_objects":OBJECTS,"concurrent_readers":READERS,
+            "all_responses_sha256_verified":true,"all_shards_physically_repaired":true,
+            "elapsed_seconds":started.elapsed().as_secs_f64()}))
+    }
+
+    async fn prove_explicit_checksum_gate(&self) -> ProofResult<Value> {
+        self.start_manual_repair_mode("checksum").await?;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            let health = self.auto_healing_health().await?;
+            let running = health
+                .pointer("/maintenance/repair_running")
+                .and_then(Value::as_bool)
+                == Some(true);
+            if running {
                 let key = format!(
-                    "{}auto-healing/online-checksum-write-{attempt:03}.txt",
+                    "{}integrity/concurrent-checksum-write.bin",
                     self.args.prefix
                 );
                 let (status, body) = self.raw_one_shot_mutation(&key).await?;
-                if status != StatusCode::CREATED {
+                if status != StatusCode::FORBIDDEN {
                     return Err(format!(
-                        "scheduled checksum blocked a foreground mutation: status={status} body={body} health={last}"
+                        "explicit checksum must preserve its read-only gate: {status} {body}"
                     )
                     .into());
                 }
-                let after_write = self.auto_healing_health().await?;
-                return Ok(json!({
-                    "running_health": last,
-                    "write_status": status.as_u16(),
-                    "write_object_key": key,
-                    "health_after_write": after_write,
-                }));
+                return Ok(json!({"running_health":health,"write_status":status.as_u16()}));
             }
-            attempt += 1;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Err(format!(
-            "timed out observing a scheduled checksum while online; last={last}"
-        )
-        .into())
+        Err("explicit checksum was not observed running".into())
     }
 
     async fn run_auto_healing_proof(&mut self) -> ProofResult<()> {
@@ -364,7 +550,15 @@ impl Proof {
         self.create_fragment().await?;
         self.auth().await?;
 
-        let startup = self.wait_for_write_safe("startup topology validation").await?;
+        let startup = self
+            .wait_for_write_safe("startup topology validation")
+            .await?;
+        let read_integrity = self.prove_read_bitrot_paths().await?;
+        let concurrent_read_integrity = self.prove_concurrent_bitrot_reads().await?;
+        fs::write(self.args.out_dir.join("read-integrity.json"), serde_json::to_vec_pretty(&json!({
+            "status":"PASS", "scope":"read paths only; not the complete fault matrix or scale qualification",
+            "read_integrity":&read_integrity,"concurrent_read_integrity":&concurrent_read_integrity,
+        }))?)?;
         let object_key = format!("{}auto-healing/source.bin", self.args.prefix);
         let payload = deterministic_payload(2 * 1024 * 1024, b"n1-auto-healing-proof");
         let payload_sha = sha256_bytes(&payload);
@@ -381,7 +575,8 @@ impl Proof {
         }
 
         let removed_on_read = self.remove_one_data_shard(&version_id)?;
-        self.assert_download_sha256(&object_key, &payload_sha).await?;
+        self.assert_download_sha256(&object_key, &payload_sha)
+            .await?;
         self.wait_for_path(&removed_on_read, true, Duration::from_secs(30))
             .await?;
         self.assert_object_status_clean(&object_key, "recover_on_read")
@@ -390,51 +585,44 @@ impl Proof {
         let removed_by_scan = self.remove_one_shard_matching(&version_id, |path| {
             path.extension().and_then(|ext| ext.to_str()) == Some("parity")
         })?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if removed_by_scan.exists() {
+            return Err("cold parity was repaired by an unsolicited scan".into());
+        }
+        let quiet = self.auto_healing_health().await?;
+        if quiet
+            .pointer("/maintenance/auto_healing/last_availability_scan_at")
+            .is_some_and(|value| !value.is_null())
+            || quiet
+                .pointer("/maintenance/auto_healing/last_checksum_scrub_at")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err("periodic full scan ran without an operator request".into());
+        }
+        let scheduled_repair = self.explicit_repair_and_wait("availability").await?;
         self.wait_for_path(&removed_by_scan, true, Duration::from_secs(30))
             .await?;
-        let scheduled_repair = self
-            .wait_for_auto_healing_state(
-                "scheduled availability repair",
-                Duration::from_secs(30),
-                |snapshot| {
-                    snapshot
-                        .pointer("/maintenance/auto_healing/last_availability_scan_at")
-                        .is_some_and(Value::is_number)
-                },
-            )
-            .await?;
-        self.assert_object_status_clean(&object_key, "scheduled_auto_repair")
+        self.assert_object_status_clean(&object_key, "explicit_repair")
             .await?;
 
         let checksum_key = format!("{}auto-healing/checksum-baseline.bin", self.args.prefix);
         let checksum_payload =
             deterministic_payload(128 * 1024 * 1024, b"n1-online-checksum-proof");
         let checksum_sha = sha256_bytes(&checksum_payload);
-        self.upload_complete_multipart_payload(
-            &checksum_key,
-            &checksum_payload,
-            32 * 1024 * 1024,
-        )
-        .await?;
-        let scheduled_checksum_online = self.prove_scheduled_checksum_remains_online().await?;
-        self.wait_for_auto_healing_state(
-            "completed scheduled online checksum",
-            Duration::from_secs(45),
-            |snapshot| {
-                snapshot
-                    .pointer("/maintenance/auto_healing/last_checksum_scrub_at")
-                    .is_some_and(Value::is_number)
-                    && snapshot
-                        .pointer("/maintenance/auto_healing/phase")
-                        .and_then(Value::as_str)
-                        == Some("idle")
-                    && snapshot
-                        .pointer("/maintenance/access_mode")
-                        .and_then(Value::as_str)
-                        == Some("availability")
-            },
-        )
-        .await?;
+        self.upload_complete_multipart_payload(&checksum_key, &checksum_payload, 32 * 1024 * 1024)
+            .await?;
+        let explicit_checksum_gate = self.prove_explicit_checksum_gate().await?;
+        let checksum_result = self
+            .wait_job("/noa/v1/maintenance/repair/status", "explicit checksum")
+            .await?;
+        if checksum_result
+            .get("failed_repairs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            != 0
+        {
+            return Err(format!("checksum repair left failures: {checksum_result}").into());
+        }
         self.assert_download_sha256(&checksum_key, &checksum_sha)
             .await?;
 
@@ -460,7 +648,8 @@ impl Proof {
                 },
             )
             .await?;
-        self.assert_download_sha256(&object_key, &payload_sha).await?;
+        self.assert_download_sha256(&object_key, &payload_sha)
+            .await?;
         let rejected_mutation = self
             .assert_mutation_service_unavailable(&format!(
                 "{}auto-healing/rejected.bin",
@@ -469,7 +658,8 @@ impl Proof {
             .await?;
         missing.restore()?;
         let restored_health = self.wait_for_write_safe("restored-root recovery").await?;
-        self.assert_download_sha256(&object_key, &payload_sha).await?;
+        self.assert_download_sha256(&object_key, &payload_sha)
+            .await?;
 
         let replacement = DisplacedProofRoot::new(&root, "identity-mismatch")?;
         replacement.install_empty_replacement()?;
@@ -522,33 +712,35 @@ impl Proof {
             fs::remove_file(path)?;
         }
         self.start_server("auto-healing-unrecoverable").await?;
-        let scan_failure = self
-            .wait_for_auto_healing_state(
-                "unrecoverable scan fail-safe",
-                Duration::from_secs(30),
-                |snapshot| {
-                    snapshot
-                        .pointer("/maintenance/auto_healing/phase")
-                        .and_then(Value::as_str)
-                        == Some("scan_failed")
-                        && snapshot
-                            .pointer("/maintenance/access_mode")
-                            .and_then(Value::as_str)
-                            == Some("read_only")
-                },
-            )
+        self.wait_for_write_safe("root identity validation after cold damage")
             .await?;
+        let response = self
+            .client
+            .get(format!("{}/noa/v1/objects/download", self.base_url))
+            .query(&[("object_key", object_key.clone())])
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = response.status();
+        if status.is_success() && response.bytes().await.is_ok() {
+            return Err("beyond-parity damage was returned as a successful complete body".into());
+        }
+        let scan_failure = self.auto_healing_health().await?;
         for (path, backup) in backups.iter().take(usize::from(original_data_shards)) {
             fs::copy(backup, path)?;
         }
+        self.assert_download_sha256(&object_key, &payload_sha)
+            .await?;
+        self.explicit_repair_and_wait("availability").await?;
         for (path, _) in &backups {
             self.wait_for_path(path, true, Duration::from_secs(30))
                 .await?;
         }
         let recovered_from_fault = self
-            .wait_for_write_safe("successful automatic retry after repair became possible")
+            .wait_for_write_safe("explicit recovery after restoring k shards")
             .await?;
-        self.assert_download_sha256(&object_key, &payload_sha).await?;
+        self.assert_download_sha256(&object_key, &payload_sha)
+            .await?;
 
         let old_layout_before = self.object_version_dirs(&version_id)?.len();
         self.stop_server()?;
@@ -564,10 +756,12 @@ impl Proof {
         self.data_shards = original_data_shards;
         self.parity_shards = original_parity_shards;
         self.write_config()?;
-        self.start_server("auto-healing-original-geometry-restored").await?;
+        self.start_server("auto-healing-original-geometry-restored")
+            .await?;
         self.auth().await?;
         let ec_change_startup = self.wait_for_write_safe("EC change startup").await?;
-        self.assert_download_sha256(&object_key, &payload_sha).await?;
+        self.assert_download_sha256(&object_key, &payload_sha)
+            .await?;
         let new_key = format!("{}auto-healing/new-ec-object.bin", self.args.prefix);
         let new_payload = deterministic_payload(256 * 1024, b"n1-new-ec-object");
         let new_sha = sha256_bytes(&new_payload);
@@ -575,16 +769,7 @@ impl Proof {
             .upload_bytes(&new_key, new_payload, "application/octet-stream")
             .await?;
         self.assert_download_sha256(&new_key, &new_sha).await?;
-        self.wait_for_auto_healing_state(
-            "post-EC-change autonomous scan",
-            Duration::from_secs(30),
-            |snapshot| {
-                snapshot
-                    .pointer("/maintenance/auto_healing/last_availability_scan_at")
-                    .is_some_and(Value::is_number)
-            },
-        )
-        .await?;
+        self.explicit_repair_and_wait("availability").await?;
         let old_layout_after = self.object_version_dirs(&version_id)?.len();
         let new_layout = self.object_version_dirs(&new_version)?.len();
         if old_layout_before != original_width
@@ -606,8 +791,10 @@ impl Proof {
             "version_id": version_id,
             "startup": startup,
             "recover_on_read": {"removed_and_restored": removed_on_read},
-            "scheduled_repair": {"removed_and_restored": removed_by_scan, "health": scheduled_repair},
-            "scheduled_checksum_online": scheduled_checksum_online,
+            "explicit_repair": {"removed_and_restored": removed_by_scan, "status": scheduled_repair},
+            "read_integrity": read_integrity,
+            "concurrent_read_integrity": concurrent_read_integrity,
+            "explicit_checksum_gate": explicit_checksum_gate,
             "missing_root": {"root": root, "health": missing_health, "mutation": rejected_mutation, "restored": restored_health},
             "identity_mismatch": {"health": replacement_health, "restored": identity_restored_health},
             "unrecoverable_fail_safe": {"health": scan_failure, "recovered": recovered_from_fault},

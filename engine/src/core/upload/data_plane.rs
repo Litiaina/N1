@@ -65,15 +65,22 @@ pub struct DirectWriter {
 
 enum UploadShardWriter {
     Direct(DirectWriter),
-    Buffered(tokio_fs::File),
+    Buffered(DirectWriter),
 }
 
 impl UploadShardWriter {
     async fn sync_data(&self) -> Result<(), std::io::Error> {
-        match self {
-            Self::Direct(writer) => writer.sync_data().await,
-            Self::Buffered(file) => file.sync_data().await,
-        }
+        let started = Instant::now();
+        let result = match self {
+            Self::Direct(writer) | Self::Buffered(writer) => writer.sync_data().await,
+        };
+        record_io_latency(
+            "upload.shard.sync_data",
+            started.elapsed(),
+            0,
+            result.is_ok(),
+        );
+        result
     }
 }
 
@@ -84,8 +91,7 @@ impl AsyncWrite for UploadShardWriter {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         match &mut *self {
-            Self::Direct(writer) => Pin::new(writer).poll_write(cx, buf),
-            Self::Buffered(file) => Pin::new(file).poll_write(cx, buf),
+            Self::Direct(writer) | Self::Buffered(writer) => Pin::new(writer).poll_write(cx, buf),
         }
     }
 
@@ -94,8 +100,7 @@ impl AsyncWrite for UploadShardWriter {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         match &mut *self {
-            Self::Direct(writer) => Pin::new(writer).poll_flush(cx),
-            Self::Buffered(file) => Pin::new(file).poll_flush(cx),
+            Self::Direct(writer) | Self::Buffered(writer) => Pin::new(writer).poll_flush(cx),
         }
     }
 
@@ -104,19 +109,25 @@ impl AsyncWrite for UploadShardWriter {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         match &mut *self {
-            Self::Direct(writer) => Pin::new(writer).poll_shutdown(cx),
-            Self::Buffered(file) => Pin::new(file).poll_shutdown(cx),
+            Self::Direct(writer) | Self::Buffered(writer) => Pin::new(writer).poll_shutdown(cx),
         }
     }
 }
 
 impl DirectWriter {
     pub fn new(file: StdFile) -> Self {
+        Self::with_buffer_limit(file, None)
+    }
+
+    fn with_buffer_limit(file: StdFile, buffer_limit: Option<u64>) -> Self {
         let configured = WRITER_BUFFER_SIZE_ATOMIC
             .get()
             .map(|v| v.load(Ordering::Relaxed))
             .unwrap_or(256 * 1024);
-        let aligned = ((configured.max(4096) + 4095) / 4096) * 4096;
+        let requested = buffer_limit
+            .map(|limit| limit.min(configured as u64) as usize)
+            .unwrap_or(configured);
+        let aligned = ((requested.max(4096) + 4095) / 4096) * 4096;
         Self {
             file: Arc::new(file),
             write_buffer: AlignedBuffer::new(aligned),
@@ -153,11 +164,11 @@ impl DirectWriter {
 
         let file = self.file.clone();
         let offset = self.next_offset;
-        let mut to_write = std::mem::replace(&mut self.write_buffer, AlignedBuffer::new(0));
+        let to_write = std::mem::replace(&mut self.write_buffer, AlignedBuffer::new(0));
         self.next_offset = self.next_offset.saturating_add(to_write.len() as u64);
 
-        let task = tokio::task::spawn_blocking(move || {
-            linux_io::pwrite_all_at(&*file, to_write.as_slice(), offset)?;
+        let task = tokio::spawn(async move {
+            let mut to_write = linux_io::write_aligned_at_async(file, to_write, offset).await?;
             to_write.clear();
             Ok::<AlignedBuffer, std::io::Error>(to_write)
         });
@@ -167,7 +178,7 @@ impl DirectWriter {
 
     pub async fn sync_data(&self) -> Result<(), std::io::Error> {
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || linux_io::fdatasync_blocking(&*file)).await?
+        linux_io::fdatasync_async(file).await
     }
 }
 
@@ -225,11 +236,6 @@ impl AsyncWrite for DirectWriter {
 
 pub async fn create_direct_file(path: &PathBuf) -> Result<StdFile, AppError> {
     linux_io::open_direct_write(path).await
-}
-
-async fn create_buffered_file(path: &PathBuf) -> Result<tokio_fs::File, AppError> {
-    let file = linux_io::open_buffered_write(path).await?;
-    Ok(tokio_fs::File::from_std(file))
 }
 
 pub async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), AppError> {
@@ -746,6 +752,139 @@ pub(super) async fn write_part_blob_to_disk(
     .await
 }
 
+struct PartShardWriters {
+    writers: Vec<Option<UploadShardWriter>>,
+    tmp_paths: Vec<PathBuf>,
+    stable_paths: Vec<PathBuf>,
+    stable_names: Vec<String>,
+}
+
+async fn open_part_shard_writer(
+    path: &PathBuf,
+    buffered: bool,
+    pre_size: Option<u64>,
+    buffer_limit: Option<u64>,
+) -> Result<UploadShardWriter, AppError> {
+    if buffered {
+        return linux_io::open_buffered_write(path)
+            .await
+            .map(|file| {
+                UploadShardWriter::Buffered(DirectWriter::with_buffer_limit(file, buffer_limit))
+            });
+    }
+    let mut file = create_direct_file(path).await?;
+    if let Some(length) = pre_size {
+        let context = format!("pre-size shard {}", path.display());
+        file = tokio::task::spawn_blocking(move || {
+            file.set_len(length)
+                .map_err(|error| AppError::Io(error, context))?;
+            Ok::<_, AppError>(file)
+        })
+        .await
+        .map_err(|error| {
+            AppError::InternalServerError(format!("pre-size shard task: {error}"))
+        })??;
+    }
+    Ok(UploadShardWriter::Direct(DirectWriter::with_buffer_limit(
+        file,
+        buffer_limit,
+    )))
+}
+
+async fn prepare_part_shard_writers(
+    path_manager: &ObjectPathManager,
+    blob_roots: &[PathBuf],
+    fragment: &str,
+    object_key: &str,
+    version_id: &str,
+    part_index: u64,
+    attempt_id: &str,
+    data_shards: usize,
+    content_length: u64,
+    final_shard_len: u64,
+    strict_durability: bool,
+) -> Result<PartShardWriters, AppError> {
+    let started = Instant::now();
+    let total_shards = blob_roots.len();
+    let buffered = !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
+    // New temporary files start truncated. Complete aligned writes grow small
+    // shards to their exact length; a separate ftruncate only repeats inode
+    // work. Large strict streams retain their existing pre-sizing behavior.
+    let pre_size = (strict_durability && content_length > SMALL_BUFFERED_WRITE_LIMIT)
+        .then_some(final_shard_len);
+    // A tiny shard never needs the large streaming buffer. Keep alignment and
+    // existing I/O/durability semantics; large streams retain their full buffer.
+    let buffer_limit =
+        (content_length <= SMALL_BUFFERED_WRITE_LIMIT).then_some(final_shard_len);
+    let mut prepared = PartShardWriters {
+        writers: Vec::with_capacity(total_shards),
+        tmp_paths: Vec::with_capacity(total_shards),
+        stable_paths: Vec::with_capacity(total_shards),
+        stable_names: Vec::with_capacity(total_shards),
+    };
+    for (index, root) in blob_roots.iter().enumerate() {
+        let name = stable_shard_name(part_index, index, data_shards);
+        let directory = path_manager.get_shard_dir_on_disk(root, fragment, object_key, version_id);
+        prepared
+            .tmp_paths
+            .push(directory.join(format!("{name}.tmp.{attempt_id}")));
+        prepared.stable_paths.push(directory.join(&name));
+        prepared.stable_names.push(name);
+    }
+
+    let mut capacity_error = None;
+    // Member files are independent. Bound setup fanout without another queue
+    // or admission mechanism, and join every open before any error cleanup.
+    for paths in prepared.tmp_paths.chunks(4) {
+        for (path, result) in paths.iter().zip(
+            join_all(
+                paths
+                    .iter()
+                    .map(|path| open_part_shard_writer(path, buffered, pre_size, buffer_limit)),
+            )
+            .await,
+        ) {
+            match result {
+                Ok(writer) => prepared.writers.push(Some(writer)),
+                Err(error) => {
+                    warn!("blob shard setup failed for {}: {}", path.display(), error);
+                    if capacity_error.is_none() && error.is_capacity_error() {
+                        capacity_error = Some(error);
+                    }
+                    prepared.writers.push(None);
+                }
+            }
+        }
+    }
+    let successful_opens = prepared
+        .writers
+        .iter()
+        .filter(|writer| writer.is_some())
+        .count();
+    record_io_latency(
+        "upload.shard.setup",
+        started.elapsed(),
+        content_length,
+        successful_opens == total_shards,
+    );
+    if successful_opens != total_shards {
+        // Close all successful holders before removing their attempt files.
+        prepared.writers.clear();
+        cleanup_files_best_effort(&prepared.tmp_paths).await;
+        if let Some(error) = capacity_error {
+            return Err(error);
+        }
+        return Err(AppError::ServiceUnavailable(format!(
+            "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
+            data_shards,
+            total_shards - data_shards,
+            total_shards,
+            successful_opens
+        )));
+    }
+    Ok(prepared)
+}
+
 pub(super) async fn write_part_blob_to_disk_from_stream<S>(
     path_manager: &ObjectPathManager,
     fragment: &str,
@@ -805,134 +944,25 @@ where
         )));
     }
     ensure_registered_placement_roots(&blob_roots)?;
-    let use_buffered_small_write =
-        !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
-    let mut writers: Vec<Option<UploadShardWriter>> = Vec::with_capacity(total_shards);
-    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
-    let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
-    let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
-    let mut successful_opens = 0usize;
-    let mut capacity_open_error = None;
-
-    for i in 0..total_shards {
-        let is_parity = i >= data_shards;
-        let ext = if is_parity {
-            PARITY_SUFFIX
-        } else {
-            SHARD_SUFFIX
-        };
-
-        let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
-        let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
-        let target_disk = &blob_roots[i];
-        let shard_dir =
-            path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
-
-        let tmp_path = shard_dir.join(&tmp_name);
-        let stable_path = shard_dir.join(&stable_name);
-
-        if use_buffered_small_write {
-            match create_buffered_file(&tmp_path).await {
-                Ok(file) => {
-                    writers.push(Some(UploadShardWriter::Buffered(file)));
-                    successful_opens += 1;
-                }
-                Err(err) => {
-                    warn!(
-                        "blob shard open failed for {} on {}: {}",
-                        stable_name,
-                        target_disk.display(),
-                        err
-                    );
-                    if capacity_open_error.is_none() && err.is_capacity_error() {
-                        capacity_open_error = Some(err);
-                    }
-                    writers.push(None);
-                }
-            }
-        } else {
-            match create_direct_file(&tmp_path).await {
-                Ok(file) => {
-                    if strict_durability {
-                        let file_clone = file
-                            .try_clone()
-                            .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                        let prealloc_result = tokio::task::spawn_blocking(move || {
-                            file_clone.set_len(final_shard_len)
-                        })
-                        .await;
-
-                        match prealloc_result {
-                            Ok(Ok(())) => {
-                                writers
-                                    .push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
-                                successful_opens += 1;
-                            }
-                            Ok(Err(err)) => {
-                                warn!(
-                                    "blob shard preallocation failed for {} on {}: {}",
-                                    stable_name,
-                                    target_disk.display(),
-                                    err
-                                );
-                                if capacity_open_error.is_none()
-                                    && matches!(
-                                        err.raw_os_error(),
-                                        Some(libc::ENOSPC) | Some(libc::EDQUOT)
-                                    )
-                                {
-                                    capacity_open_error = Some(AppError::Io(
-                                        err,
-                                        format!("preallocate shard {}", tmp_path.display()),
-                                    ));
-                                }
-                                writers.push(None);
-                            }
-                            Err(err) => {
-                                warn!(
-                                    "blob shard preallocation task failed for {} on {}: {}",
-                                    stable_name,
-                                    target_disk.display(),
-                                    err
-                                );
-                                writers.push(None);
-                            }
-                        }
-                    } else {
-                        writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
-                        successful_opens += 1;
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "blob shard open failed for {} on {}: {}",
-                        stable_name,
-                        target_disk.display(),
-                        err
-                    );
-                    if capacity_open_error.is_none() && err.is_capacity_error() {
-                        capacity_open_error = Some(err);
-                    }
-                    writers.push(None);
-                }
-            }
-        }
-
-        tmp_paths.push(tmp_path);
-        stable_paths.push(stable_path);
-        stable_names.push(stable_name);
-    }
-
-    if successful_opens < total_shards {
-        cleanup_files_best_effort(&tmp_paths).await;
-        if let Some(error) = capacity_open_error {
-            return Err(error);
-        }
-        return Err(AppError::ServiceUnavailable(format!(
-            "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
-            data_shards, parity_shards, total_shards, successful_opens
-        )));
-    }
+    let PartShardWriters {
+        writers,
+        tmp_paths,
+        stable_paths,
+        stable_names,
+    } = prepare_part_shard_writers(
+        path_manager,
+        &blob_roots,
+        fragment,
+        object_key,
+        version_id,
+        part_index,
+        &attempt_id,
+        data_shards,
+        content_length,
+        final_shard_len,
+        strict_durability,
+    )
+    .await?;
 
     let write_result = async {
         let calc_total_checksum = expected_checksum.is_some();
@@ -972,7 +1002,10 @@ where
             )));
         }
 
-        stream_writer.finalize().await?;
+        let drain_started = Instant::now();
+        let drain = stream_writer.finalize().await;
+        record_io_latency("upload.shard.write_drain", drain_started.elapsed(), content_length, drain.is_ok());
+        drain?;
 
         if let Some(expected) = expected_checksum {
             let calculated = stream_writer.get_total_checksum();
@@ -1135,134 +1168,25 @@ where
         )));
     }
     ensure_registered_placement_roots(&blob_roots)?;
-    let use_buffered_small_write =
-        !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
-    let mut writers: Vec<Option<UploadShardWriter>> = Vec::with_capacity(total_shards);
-    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
-    let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
-    let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
-    let mut successful_opens = 0usize;
-    let mut capacity_open_error = None;
-
-    for i in 0..total_shards {
-        let is_parity = i >= data_shards;
-        let ext = if is_parity {
-            PARITY_SUFFIX
-        } else {
-            SHARD_SUFFIX
-        };
-
-        let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
-        let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
-        let target_disk = &blob_roots[i];
-        let shard_dir =
-            path_manager.get_shard_dir_on_disk(target_disk, fragment, object_key, version_id);
-
-        let tmp_path = shard_dir.join(&tmp_name);
-        let stable_path = shard_dir.join(&stable_name);
-
-        if use_buffered_small_write {
-            match create_buffered_file(&tmp_path).await {
-                Ok(file) => {
-                    writers.push(Some(UploadShardWriter::Buffered(file)));
-                    successful_opens += 1;
-                }
-                Err(err) => {
-                    warn!(
-                        "blob shard open failed for {} on {}: {}",
-                        stable_name,
-                        target_disk.display(),
-                        err
-                    );
-                    if capacity_open_error.is_none() && err.is_capacity_error() {
-                        capacity_open_error = Some(err);
-                    }
-                    writers.push(None);
-                }
-            }
-        } else {
-            match create_direct_file(&tmp_path).await {
-                Ok(file) => {
-                    if strict_durability {
-                        let file_clone = file
-                            .try_clone()
-                            .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                        let prealloc_result = tokio::task::spawn_blocking(move || {
-                            file_clone.set_len(final_shard_len)
-                        })
-                        .await;
-
-                        match prealloc_result {
-                            Ok(Ok(())) => {
-                                writers
-                                    .push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
-                                successful_opens += 1;
-                            }
-                            Ok(Err(err)) => {
-                                warn!(
-                                    "blob shard preallocation failed for {} on {}: {}",
-                                    stable_name,
-                                    target_disk.display(),
-                                    err
-                                );
-                                if capacity_open_error.is_none()
-                                    && matches!(
-                                        err.raw_os_error(),
-                                        Some(libc::ENOSPC) | Some(libc::EDQUOT)
-                                    )
-                                {
-                                    capacity_open_error = Some(AppError::Io(
-                                        err,
-                                        format!("preallocate shard {}", tmp_path.display()),
-                                    ));
-                                }
-                                writers.push(None);
-                            }
-                            Err(err) => {
-                                warn!(
-                                    "blob shard preallocation task failed for {} on {}: {}",
-                                    stable_name,
-                                    target_disk.display(),
-                                    err
-                                );
-                                writers.push(None);
-                            }
-                        }
-                    } else {
-                        writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
-                        successful_opens += 1;
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "blob shard open failed for {} on {}: {}",
-                        stable_name,
-                        target_disk.display(),
-                        err
-                    );
-                    if capacity_open_error.is_none() && err.is_capacity_error() {
-                        capacity_open_error = Some(err);
-                    }
-                    writers.push(None);
-                }
-            }
-        }
-
-        tmp_paths.push(tmp_path);
-        stable_paths.push(stable_path);
-        stable_names.push(stable_name);
-    }
-
-    if successful_opens < total_shards {
-        cleanup_files_best_effort(&tmp_paths).await;
-        if let Some(error) = capacity_open_error {
-            return Err(error);
-        }
-        return Err(AppError::ServiceUnavailable(format!(
-            "N1 refused an under-protected write. The {}D+{}P object requires all {} shard roots, but only {} opened.",
-            data_shards, parity_shards, total_shards, successful_opens
-        )));
-    }
+    let PartShardWriters {
+        writers,
+        tmp_paths,
+        stable_paths,
+        stable_names,
+    } = prepare_part_shard_writers(
+        path_manager,
+        &blob_roots,
+        fragment,
+        object_key,
+        version_id,
+        part_index,
+        &attempt_id,
+        data_shards,
+        content_length,
+        final_shard_len,
+        strict_durability,
+    )
+    .await?;
 
     let write_result = async {
         let calc_total_checksum = expected_checksum.is_some();
@@ -1414,23 +1338,16 @@ pub(super) async fn cleanup_blob_version_dirs_for_version(
 }
 
 async fn crc32_file_hex(path: &Path) -> Result<String, AppError> {
-    let file = linux_io::open_read(path).await?;
+    let file = Arc::new(linux_io::open_read(path).await?);
     let mut hasher = Hasher::new();
     let mut offset = 0u64;
+    let mut chunk = vec![0; 256 * 1024];
 
     loop {
-        let cloned = file
-            .try_clone()
-            .map_err(|e| AppError::Io(e, format!("clone for crc32 {}", path.display())))?;
-        let chunk = tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; 256 * 1024];
-            let read = linux_io::pread_at(&cloned, &mut buf, offset)?;
-            buf.truncate(read);
-            Ok::<_, std::io::Error>(buf)
-        })
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("crc32 read task: {}", e)))?
-        .map_err(|e| AppError::Io(e, format!("read crc32 {}", path.display())))?;
+        chunk.resize(256 * 1024, 0);
+        chunk = linux_io::read_at_async(Arc::clone(&file), chunk, offset)
+            .await
+            .map_err(|e| AppError::Io(e, format!("read crc32 {}", path.display())))?;
         if chunk.is_empty() {
             break;
         }
@@ -1478,7 +1395,15 @@ async fn publish_one_shard(
 
 pub(super) async fn sync_published_directories(dirs: &[PathBuf]) -> Result<(), AppError> {
     // Join every holder before returning an error; no durability queue.
-    for result in join_all(dirs.iter().map(|dir| sync_dir(dir))).await {
+    let started = Instant::now();
+    let results = join_all(dirs.iter().map(|dir| sync_dir(dir))).await;
+    record_io_latency(
+        "upload.shard.directory_sync",
+        started.elapsed(),
+        0,
+        results.iter().all(Result::is_ok),
+    );
+    for result in results {
         result?;
     }
     Ok(())
@@ -1530,4 +1455,326 @@ pub(super) async fn cleanup_blob_tmp_attempt_files_for_version(
     });
 
     let _ = join_all(futs).await;
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn boundary_members() -> Vec<PathBuf> {
+        use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT};
+
+        let base = std::env::temp_dir().join(format!("n1-part-boundaries-{}", Ulid::new()));
+        let roots = BLOB_STORE_DISKS
+            .get_or_init(|| {
+                (0..2)
+                    .map(|index| base.join(format!("member-{index}")).display().to_string())
+                    .collect()
+            })
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        assert!(
+            roots.len() >= 2,
+            "boundary fixture requires two shard members"
+        );
+        for root in &roots {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let control = FS_STORAGE_ROOT.get_or_init(|| base.join("control").display().to_string());
+        crate::core::root_identity::reconcile_roots_for_test(
+            &Path::new(control).join(".n1/topology-roots.json"),
+            &roots,
+        )
+        .unwrap();
+        roots.into_iter().take(2).collect()
+    }
+
+    async fn write_boundary_part(
+        reader_path: bool,
+        roots: &[PathBuf],
+        fragment: &str,
+        object: &str,
+        version: &str,
+        payload: &[u8],
+        declared: u64,
+        checksum: &str,
+    ) -> Result<PartMetadata, AppError> {
+        let manager = ObjectPathManager::new();
+        let placements = roots
+            .iter()
+            .map(|root| crate::core::storage_pool::record_address(root))
+            .collect::<Vec<_>>();
+        if reader_path {
+            let mut reader = std::io::Cursor::new(payload);
+            write_part_blob_to_disk_from_reader(
+                &manager,
+                fragment,
+                object,
+                version,
+                3,
+                declared,
+                1,
+                1,
+                4096,
+                Some(&placements),
+                &mut reader,
+                Some(checksum),
+                true,
+                None,
+            )
+            .await
+        } else {
+            // Exercise fragmented input, not only one already-buffered chunk.
+            let chunks = payload
+                .chunks(769)
+                .map(|bytes| Ok::<_, AppError>(Bytes::copy_from_slice(bytes)))
+                .collect::<Vec<_>>();
+            write_part_blob_to_disk_from_stream(
+                &manager,
+                fragment,
+                object,
+                version,
+                3,
+                declared,
+                1,
+                1,
+                4096,
+                Some(&placements),
+                futures_util::stream::iter(chunks),
+                Some(checksum),
+                true,
+                None,
+            )
+            .await
+        }
+    }
+
+    fn remove_boundary_fragment(roots: &[PathBuf], fragment: &str) {
+        for root in roots {
+            let directory =
+                crate::core::fragment_identity::physical_fragment_root_on(root, fragment);
+            if directory.exists() {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    async fn assert_strict_boundary_publication(reader_path: bool) {
+        let _test = crate::test_support::global_test_lock().lock().await;
+        let roots = boundary_members();
+        let fragment = Ulid::new().to_string();
+        let manager = ObjectPathManager::new();
+        for length in [
+            0,
+            1,
+            511,
+            4095,
+            4096,
+            4097,
+            SMALL_BUFFERED_WRITE_LIMIT as usize - 1,
+            SMALL_BUFFERED_WRITE_LIMIT as usize,
+            SMALL_BUFFERED_WRITE_LIMIT as usize + 1,
+        ] {
+            let object = crate::core::index_store::new_object_id();
+            let version = Ulid::new().to_string();
+            let payload = (0..length)
+                .map(|offset| ((offset * 31 + 17) % 251) as u8)
+                .collect::<Vec<_>>();
+            let checksum = format!("{:08x}", crc32fast::hash(&payload));
+            let part = write_boundary_part(
+                reader_path,
+                &roots,
+                &fragment,
+                &object,
+                &version,
+                &payload,
+                length as u64,
+                &checksum,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("strict boundary length {length}: {error}"));
+            assert_eq!(part.part_index, 3);
+            assert_eq!(part.size_bytes, length as u64);
+            assert_eq!(part.checksum.as_deref(), Some(checksum.as_str()));
+            assert_eq!(part.shards.len(), 2);
+            let mut expected = payload;
+            expected.resize(length.div_ceil(4096) * 4096, 0);
+            for (index, shard) in part.shards.iter().enumerate() {
+                assert_eq!(shard.shard_index, index);
+                assert_eq!(shard.is_parity, index == 1);
+                assert_eq!(shard.size_bytes, expected.len() as u64);
+                let path =
+                    crate::core::storage_pool::resolve_address(&shard.absolute_path).unwrap();
+                assert!(path.starts_with(&roots[index]));
+                let bytes = std::fs::read(&path).unwrap();
+                // EC 1+1 has one systematic data piece and its parity copy.
+                assert_eq!(bytes, expected, "strict member {index}, length {length}");
+                assert_eq!(shard.checksum, format!("{:08x}", crc32fast::hash(&bytes)));
+                let directory =
+                    manager.get_shard_dir_on_disk(&roots[index], &fragment, &object, &version);
+                let names = std::fs::read_dir(directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    vec![shard.file_name.clone()],
+                    "attempt files must be gone"
+                );
+            }
+        }
+        remove_boundary_fragment(&roots, &fragment);
+    }
+
+    #[tokio::test]
+    async fn strict_stream_publication_preserves_zero_alignment_and_one_mib_boundaries() {
+        assert_strict_boundary_publication(false).await;
+    }
+
+    #[tokio::test]
+    async fn strict_reader_publication_preserves_zero_alignment_and_one_mib_boundaries() {
+        assert_strict_boundary_publication(true).await;
+    }
+
+    #[tokio::test]
+    async fn strict_stream_and_reader_reject_incomplete_or_corrupt_input_without_shard_leaks() {
+        let _test = crate::test_support::global_test_lock().lock().await;
+        let roots = boundary_members();
+        let fragment = Ulid::new().to_string();
+        let manager = ObjectPathManager::new();
+        let payload = (0..4097)
+            .map(|offset| (offset % 251) as u8)
+            .collect::<Vec<_>>();
+        let correct = crc32fast::hash(&payload);
+        for (reader_path, declared, checksum) in [
+            (false, 4098, correct),
+            (true, 4098, correct),
+            (false, 4096, correct),
+            (false, 4097, correct ^ 1),
+            (true, 4097, correct ^ 1),
+        ] {
+            let object = crate::core::index_store::new_object_id();
+            let version = Ulid::new().to_string();
+            let result = write_boundary_part(
+                reader_path,
+                &roots,
+                &fragment,
+                &object,
+                &version,
+                &payload,
+                declared,
+                &format!("{checksum:08x}"),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::BadRequest(_))),
+                "rejected input must not become a committed part: {result:?}"
+            );
+            for root in &roots {
+                let directory = manager.get_shard_dir_on_disk(root, &fragment, &object, &version);
+                assert!(directory.is_dir());
+                assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+            }
+        }
+        remove_boundary_fragment(&roots, &fragment);
+    }
+
+    #[tokio::test]
+    async fn direct_setup_preserves_flags_exact_bytes_and_large_pre_sizing() {
+        let base = std::env::temp_dir().join(format!("n1-shard-setup-{}", Ulid::new()));
+        for (index, pre_size, written) in [(0, None, 0), (1, None, 4096), (2, Some(8192), 8192)] {
+            let path = base.join(format!("member-{index}/attempt"));
+            let mut writer = open_part_shard_writer(&path, false, pre_size, None)
+                .await
+                .unwrap();
+            let UploadShardWriter::Direct(direct) = &writer else {
+                panic!("strict setup must retain O_DIRECT");
+            };
+            assert!(
+                rustix::fs::fcntl_getfl(direct.file.as_ref())
+                    .unwrap()
+                    .contains(rustix::fs::OFlags::DIRECT)
+            );
+            assert_eq!(direct.file.metadata().unwrap().len(), pre_size.unwrap_or(0));
+            let data = vec![index as u8 + 17; written];
+            writer.write_all(&data).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.sync_data().await.unwrap();
+            drop(writer);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), written as u64);
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_setup_uses_owned_backend_without_direct_flag_or_padding() {
+        let base = std::env::temp_dir().join(format!("n1-buffered-setup-{}", Ulid::new()));
+        for size in [0, 1, 4095, 4096, 4097, 32769] {
+            let path = base.join(format!("member-{size}/attempt"));
+            let mut writer = open_part_shard_writer(&path, true, None, None).await.unwrap();
+            let UploadShardWriter::Buffered(buffered) = &writer else {
+                panic!("relaxed small setup must retain buffered I/O");
+            };
+            assert!(
+                !rustix::fs::fcntl_getfl(buffered.file.as_ref())
+                    .unwrap()
+                    .contains(rustix::fs::OFlags::DIRECT)
+            );
+            let bytes = vec![37; size];
+            for chunk in bytes.chunks(173) {
+                writer.write_all(chunk).await.unwrap();
+            }
+            writer.flush().await.unwrap();
+            writer.sync_data().await.unwrap();
+            drop(writer);
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_member_setup_joins_later_groups_and_cleans_all_attempts() {
+        let base = std::env::temp_dir().join(format!("n1-shard-setup-failure-{}", Ulid::new()));
+        std::fs::create_dir_all(&base).unwrap();
+        let roots = (0..6)
+            .map(|index| base.join(format!("member-{index}")))
+            .collect::<Vec<_>>();
+        std::fs::write(&roots[1], b"not a directory; preserve").unwrap();
+        let fragment = Ulid::new().to_string();
+        let object = crate::core::index_store::new_object_id();
+        let version = Ulid::new().to_string();
+        let manager = ObjectPathManager::new();
+        let result = prepare_part_shard_writers(
+            &manager,
+            &roots,
+            &fragment,
+            &object,
+            &version,
+            0,
+            "test-attempt",
+            4,
+            1024,
+            4096,
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::ServiceUnavailable(_))));
+        for (index, root) in roots.iter().enumerate() {
+            if index == 1 {
+                assert_eq!(std::fs::read(root).unwrap(), b"not a directory; preserve");
+                continue;
+            }
+            let directory = manager.get_shard_dir_on_disk(root, &fragment, &object, &version);
+            assert!(directory.is_dir(), "later setup groups must have completed");
+            assert_eq!(
+                std::fs::read_dir(directory).unwrap().count(),
+                0,
+                "no opened attempt may leak"
+            );
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

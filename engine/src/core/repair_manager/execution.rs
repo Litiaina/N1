@@ -2,7 +2,7 @@
 
 use super::object_repair::{
     fragment_is_present, list_all_fragments, process_object_repair, reachable_dir_roots,
-    repair_fragment_index_db, repair_fragment_metadata_replicas,
+    repair_fragment_metadata_replicas,
 };
 use super::*;
 
@@ -241,28 +241,6 @@ async fn run_repair_job_inner(
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
-        let (pmiss, pdiv, pcorrupt) =
-            repair_fragment_index_db(&index_roots, &fragment_hash, cfg.dry_run).await?;
-
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.missing_meta_repaired += pmiss;
-            status.divergent_meta_repaired += pdiv;
-            status.corrupt_found += pcorrupt;
-            status.total_repaired += pmiss + pdiv;
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-        }
-
-        if !cfg.dry_run && (pmiss > 0 || pdiv > 0 || pcorrupt > 0) {
-            global_namespace_runtime().evict_fragment(&fragment_hash);
-        }
-
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing N1 index replicas {}", fragment_hash);
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-        }
-
         let namespace_report =
             repair_namespace_replicas(&fragment_hash, &index_roots, cfg.dry_run).await?;
 
@@ -305,36 +283,18 @@ async fn run_repair_job_inner(
                 break;
             }
 
-            let mut continuation_token = None;
+            let mut scan = index::MetadataScan::new(&fragment_hash, is_trash).await?;
             loop {
-                let page = if is_trash {
-                    index::scan_fragment_trash_metadata_page(
-                        &fragment_hash,
-                        None,
-                        None,
-                        cfg.meta_batch_size,
-                        continuation_token.clone(),
-                        true,
-                    )
-                    .await?
-                } else {
-                    index::scan_fragment_live_metadata_page(
-                        &fragment_hash,
-                        None,
-                        None,
-                        cfg.meta_batch_size,
-                        continuation_token.clone(),
-                        true,
-                    )
-                    .await?
-                };
-
-                if page.objects.is_empty() && page.continuation_token.is_none() {
+                if should_stop() {
+                    break;
+                }
+                let objects = scan.next_batch(cfg.meta_batch_size).await?;
+                if objects.is_empty() {
                     break;
                 }
 
                 let d = apply_meta_batch(
-                    &page.objects,
+                    &objects,
                     blob_roots.clone(),
                     cfg.clone(),
                     shard_repair_sem.clone(),
@@ -357,11 +317,6 @@ async fn run_repair_job_inner(
                 let _fragment_touched = d.repaired_shards > 0
                     || d.missing_meta_repaired > 0
                     || d.divergent_meta_repaired > 0;
-
-                match page.continuation_token {
-                    Some(token) => continuation_token = Some(token),
-                    None => break,
-                }
             }
         }
     }

@@ -4,34 +4,34 @@ use super::*;
 
 pub fn fragment_has_object_index_records(fragment: &str, roots: &[PathBuf]) -> bool {
     for root in roots {
-        let Ok(object_dirs) = local_object_dirs_under_root(root, fragment) else {
-            continue;
-        };
-        for (object_dir, _) in object_dirs {
+        let mut found = false;
+        let _ = visit_local_object_dirs(root, fragment, |object_dir, _| {
             let Ok(records) = fs::read_dir(object_dir) else {
-                continue;
+                return Ok(true);
             };
             for record in records.filter_map(|entry| entry.ok()) {
                 let Some(name) = record.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
                 if parse_ndx_file_name(&name).is_some() {
-                    return true;
+                    found = true;
+                    return Ok(false);
                 }
             }
+            Ok(true)
+        });
+        if found {
+            return true;
         }
     }
     false
 }
 
 pub(super) fn count_object_index_records(root: &Path, fragment: &str) -> u64 {
-    let Ok(object_dirs) = local_object_dirs_under_root(root, fragment) else {
-        return 0;
-    };
     let mut count = 0u64;
-    for (object_dir, _) in object_dirs {
+    let scan = visit_local_object_dirs(root, fragment, |object_dir, _| {
         let Ok(records) = fs::read_dir(object_dir) else {
-            continue;
+            return Ok(true);
         };
         for record in records.filter_map(|entry| entry.ok()) {
             if record
@@ -42,8 +42,9 @@ pub(super) fn count_object_index_records(root: &Path, fragment: &str) -> u64 {
                 count += 1;
             }
         }
-    }
-    count
+        Ok(true)
+    });
+    if scan.is_ok() { count } else { 0 }
 }
 
 #[cfg(test)]

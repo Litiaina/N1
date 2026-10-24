@@ -214,19 +214,6 @@ async fn repair_fragment_metadata_replicas_inner(
     Ok((m, d, 0))
 }
 
-pub(super) async fn repair_fragment_index_db(
-    _index_roots: &[PathBuf],
-    fragment: &str,
-    dry_run: bool,
-) -> Result<(u64, u64, u64), AppError> {
-    let fragment = fragment.to_string();
-    tokio::task::spawn_blocking(move || {
-        index_store::repair_fragment_all_partition_replicas(&fragment, dry_run)
-    })
-    .await
-    .map_err(|err| AppError::InternalServerError(format!("N1 repair worker: {err}")))?
-}
-
 pub(super) async fn process_object_repair(
     meta: ObjectMetadata,
     writable_blob_roots: &[PathBuf],

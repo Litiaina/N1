@@ -269,6 +269,81 @@ fn publish_logical_object(
 }
 
 #[test]
+fn ordinary_metadata_publication_does_not_initialize_unused_fragment_directories() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let index_roots = ensure_test_index_roots();
+    let blob_roots = ensure_test_blob_roots();
+    let fragment = Ulid::new().to_string();
+    let object_id = new_object_id();
+    let metadata = test_metadata(&fragment, &object_id, 4096);
+    let shard = PathBuf::from(&metadata.parts[0].shards[0].absolute_path);
+    let before = fs::read(&shard).expect("read committed payload fixture");
+    let mut roots = index_roots;
+    roots.extend(blob_roots);
+    roots.sort();
+    roots.dedup();
+    for root in &roots {
+        let fragment_root = fragment_root_on(root, &fragment);
+        assert!(!fragment_root.join(UPLOADS_DIR).exists());
+        assert!(!fragment_root.join(TRASH_DIR).exists());
+    }
+
+    upsert_live_version(&metadata).expect("publish strict NDX at existing shard placement");
+    let saved = read_live_version(&fragment, &object_id, &metadata.version_id)
+        .expect("read published NDX")
+        .expect("published NDX exists");
+    assert_eq!(encode(&saved).unwrap(), encode(&metadata).unwrap());
+    assert_eq!(fs::read(&shard).unwrap(), before);
+    for root in &roots {
+        let fragment_root = fragment_root_on(root, &fragment);
+        assert!(
+            !fragment_root.join(UPLOADS_DIR).exists(),
+            "ordinary metadata publication must not create an upload workspace"
+        );
+        assert!(
+            !fragment_root.join(TRASH_DIR).exists(),
+            "ordinary metadata publication must not initialize trash"
+        );
+        if fragment_root.exists() {
+            fs::remove_dir_all(fragment_root).expect("remove owned metadata fixture");
+        }
+    }
+}
+
+#[test]
+fn metadata_publication_rejects_missing_payload_without_recreating_fragment() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let index_roots = ensure_test_index_roots();
+    let blob_roots = ensure_test_blob_roots();
+    let fragment = Ulid::new().to_string();
+    let object_id = new_object_id();
+    let metadata = test_metadata(&fragment, &object_id, 4096);
+    let mut roots = index_roots;
+    roots.extend(blob_roots);
+    roots.sort();
+    roots.dedup();
+    for root in &roots {
+        let fragment_root = fragment_root_on(root, &fragment);
+        if fragment_root.exists() {
+            fs::remove_dir_all(fragment_root).expect("remove owned shard placement");
+        }
+    }
+
+    for durability in [IndexWriteDurability::Strict, IndexWriteDurability::Relaxed] {
+        assert!(matches!(
+            upsert_live_version_with_durability(&metadata, durability),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        for root in &roots {
+            assert!(
+                !fragment_root_on(root, &fragment).exists(),
+                "failed NDX publication must not recreate a removed fragment"
+            );
+        }
+    }
+}
+
+#[test]
 fn colocated_metadata_exists_only_on_shard_bearing_roots_and_repairs_without_payload_rewrite() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let index_roots = ensure_test_index_roots();
@@ -857,25 +932,47 @@ fn bounded_live_pagination_covers_a_wide_replicated_directory_without_skips() {
         fs::create_dir_all(fragment_root_on(root, &fragment).join("wide"))
             .expect("create wide namespace directory");
     }
-    for index in (0..total).rev() {
-        let object_id = new_object_id();
-        let logical_name = format!("item-{index:05}.bin");
-        let object_dir =
-            live_object_dir(&blob_root, &fragment, &object_id).expect("wide object dir");
-        fs::create_dir_all(&object_dir).expect("create wide object dir");
-        let ndx_name = format!(
-            "{version}.{}.{}.{}.ndx",
-            index + 1,
-            1_777_905_000_000_000_000i128 + index as i128,
-            packed_extension_key(&logical_name)
-        );
-        fs::write(object_dir.join(ndx_name), b"zero-decode-page-test")
-            .expect("write zero-decode ndx name");
-        for root in &index_roots {
-            publish_namespace_link(root, &fragment, &format!("wide/{logical_name}"), &object_id)
-                .unwrap();
+    // Only fixture construction is parallel: every holder keeps its real
+    // publication barriers, and pagination starts after all workers join.
+    std::thread::scope(|scope| {
+        let workers = (0..8)
+            .map(|worker| {
+                let index_roots = &index_roots;
+                let blob_root = &blob_root;
+                let fragment = &fragment;
+                let version = &version;
+                scope.spawn(move || {
+                    for index in (0..total).rev().skip(worker).step_by(8) {
+                        let object_id = new_object_id();
+                        let logical_name = format!("item-{index:05}.bin");
+                        let object_dir = live_object_dir(blob_root, fragment, &object_id)
+                            .expect("wide object dir");
+                        fs::create_dir_all(&object_dir).expect("create wide object dir");
+                        let ndx_name = format!(
+                            "{version}.{}.{}.{}.ndx",
+                            index + 1,
+                            1_777_905_000_000_000i128 + index as i128,
+                            packed_extension_key(&logical_name)
+                        );
+                        fs::write(object_dir.join(ndx_name), b"zero-decode-page-test")
+                            .expect("write zero-decode ndx name");
+                        for root in index_roots {
+                            publish_namespace_link(
+                                root,
+                                fragment,
+                                &format!("wide/{logical_name}"),
+                                &object_id,
+                            )
+                            .unwrap();
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("wide fixture worker");
         }
-    }
+    });
 
     let mut cursor = None;
     let mut observed = Vec::with_capacity(total);
@@ -919,6 +1016,220 @@ fn full_metadata_scan_uses_current_filesystem_path_after_rename() {
             .expect("full metadata page");
     assert_eq!(page.objects.len(), 1);
     assert_eq!(page.objects[0].object_key, object_id);
+}
+
+#[test]
+fn maintenance_object_fanout_streams_and_presence_probes_do_not_decode_ndx() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_blob_roots();
+    let root = &roots[0];
+    let fragment = Ulid::new().to_string();
+    let version = Ulid::new().to_string();
+    let mut expected = BTreeSet::new();
+    let mut first = None;
+    for _ in 0..257 {
+        let object_id = new_object_id();
+        let directory = object_index_dir(root, &fragment, &object_id).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        expected.insert(object_id);
+        first.get_or_insert(directory);
+    }
+    let mut visits = 0;
+    visit_local_object_dirs(root, &fragment, |_, _| {
+        visits += 1;
+        Ok(false)
+    })
+    .unwrap();
+    assert_eq!(visits, 1, "presence probing must stop at its first result");
+    let observed = local_object_dirs_under_root(root, &fragment)
+        .unwrap()
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(observed, expected);
+    assert!(!local_root_has_blob_payload(root, &fragment));
+    assert!(!fragment_has_object_index_records(&fragment, &roots));
+    let directory = first.unwrap();
+    fs::write(
+        directory.join(format!("{version}.1.1.0.ndx")),
+        b"not decoded by presence probe",
+    )
+    .unwrap();
+    assert!(fragment_has_object_index_records(&fragment, &roots));
+    assert_eq!(replicas::count_object_index_records(root, &fragment), 1);
+    assert!(!local_root_has_blob_payload(root, &fragment));
+    let payload = directory.join(&version);
+    fs::create_dir(&payload).unwrap();
+    fs::write(payload.join("part_0_shard_0.blob"), b"payload probe").unwrap();
+    assert!(local_root_has_blob_payload(root, &fragment));
+    assert!(visit_local_object_dirs(root, &fragment, |_, _| Err(AppError::NotFound)).is_err());
+}
+
+#[test]
+fn object_directory_cursor_resumes_without_inventory_and_does_not_follow_links() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_blob_roots();
+    let root = &roots[0];
+    let fragment = Ulid::new().to_string();
+    let mut expected = BTreeSet::new();
+    for _ in 0..259 {
+        let object_id = new_object_id();
+        fs::create_dir_all(object_index_dir(root, &fragment, &object_id).unwrap()).unwrap();
+        expected.insert(object_id);
+    }
+    let external = std::env::temp_dir().join(format!("n1-gc-external-{}", Ulid::new()));
+    fs::create_dir_all(external.join("aa").join("@o_external")).unwrap();
+    let objects = blob_fragment_root_on(root, &fragment).join(OBJECTS_DIR);
+    std::os::unix::fs::symlink(&external, objects.join("escape")).unwrap();
+    let first = expected.first().unwrap();
+    let first_dir = object_index_dir(root, &fragment, first).unwrap();
+    std::os::unix::fs::symlink(&external, first_dir.parent().unwrap().join("@o_external")).unwrap();
+    let mut cursor = LocalObjectDirCursor::new(root, &fragment).unwrap();
+    let mut observed = BTreeSet::new();
+    while let Some((path, id)) = cursor.next_object().unwrap() {
+        assert!(path.starts_with(&objects));
+        assert!(cursor.directories.len() <= 3);
+        assert!(observed.insert(id));
+        // The same cursor is retained across arbitrary caller batch boundaries.
+        if observed.len() % 7 == 0 {
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(observed, expected);
+    assert!(cursor.next_object().unwrap().is_none());
+    assert!(cursor.directories.is_empty());
+    fs::remove_dir_all(external).unwrap();
+}
+
+#[test]
+fn object_directory_cursor_rejects_a_redirected_objects_root() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_blob_roots();
+    let root = &roots[0];
+    let fragment = Ulid::new().to_string();
+    let objects = blob_fragment_root_on(root, &fragment).join(OBJECTS_DIR);
+    fs::create_dir_all(objects.parent().unwrap()).unwrap();
+    let external = std::env::temp_dir().join(format!("n1-gc-root-external-{}", Ulid::new()));
+    fs::create_dir_all(&external).unwrap();
+    std::os::unix::fs::symlink(&external, &objects).unwrap();
+    assert!(LocalObjectDirCursor::new(root, &fragment).is_err());
+    fs::remove_dir_all(external).unwrap();
+}
+
+#[test]
+fn object_directory_cursor_rejects_a_redirected_physical_fragment() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_blob_roots();
+    let root = &roots[0];
+    let fragment = Ulid::new().to_string();
+    let physical = blob_fragment_root_on(root, &fragment);
+    let external = std::env::temp_dir().join(format!("n1-gc-fragment-external-{}", Ulid::new()));
+    fs::create_dir_all(external.join(OBJECTS_DIR)).unwrap();
+    std::os::unix::fs::symlink(&external, &physical).unwrap();
+    assert!(LocalObjectDirCursor::new(root, &fragment).is_err());
+    assert!(external.join(OBJECTS_DIR).is_dir());
+    fs::remove_file(physical).unwrap();
+    fs::remove_dir_all(external).unwrap();
+}
+
+#[test]
+fn maintenance_cursor_batches_are_single_pass_and_deduplicate_surviving_replicas() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("n1-maintenance-cursor-{}", Ulid::new());
+    let mut expected = BTreeSet::new();
+    for i in 0..137 {
+        let key = format!("projects/p{:03}/file-{i:04}.bin", i / 16);
+        let object = publish_logical_object(&roots, &fragment, &key, i + 1);
+        expected.insert(object);
+        // A missing lexical-first replica must not hide a live object.
+        if i % 7 == 0 {
+            let first = roots.iter().min().unwrap();
+            fs::remove_file(crate::namespace::flat::path(first, &fragment, &key)).unwrap();
+        }
+    }
+    let mut scan = MetadataScan::new(&fragment, false).unwrap();
+    let mut observed = BTreeSet::new();
+    loop {
+        let batch = scan.next_batch(7).unwrap();
+        assert!(batch.len() <= 7);
+        if batch.is_empty() {
+            break;
+        }
+        for metadata in batch {
+            assert!(
+                observed.insert(metadata.object_key),
+                "replica emitted twice"
+            );
+        }
+    }
+    assert_eq!(observed, expected);
+    assert!(
+        scan.namespace.entries_visited() < 137 * roots.len() + 64,
+        "batch advancement must not re-walk earlier entries"
+    );
+    let visited = scan.namespace.entries_visited();
+    assert!(scan.next_batch(7).unwrap().is_empty());
+    assert_eq!(
+        scan.namespace.entries_visited(),
+        visited,
+        "completed cursor must stay complete"
+    );
+}
+
+#[test]
+fn maintenance_trash_cursor_survives_missing_and_corrupt_copies_without_rewriting_ndx() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let roots = ensure_test_index_roots();
+    let fragment = format!("n1-trash-cursor-{}", Ulid::new());
+    let mut expected = BTreeSet::new();
+    for i in 0..9 {
+        let key = format!("old/project/file-{i}.txt");
+        let object = publish_logical_object(&roots, &fragment, &key, 42);
+        expected.insert(object);
+        let record = crate::namespace::flat::trash_key(&fragment, &key)
+            .unwrap()
+            .unwrap();
+        let first = fragment_root_on(roots.iter().min().unwrap(), &fragment)
+            .join(TRASH_DIR)
+            .join(record.source_relative_path);
+        if i % 2 == 0 {
+            fs::remove_file(first).unwrap();
+        } else {
+            fs::write(first, b"corrupt NCX replica").unwrap();
+        }
+    }
+    assert!(
+        MetadataScan::new(&fragment, false)
+            .unwrap()
+            .next_batch(1)
+            .unwrap()
+            .is_empty()
+    );
+    let ndx_before = expected
+        .iter()
+        .flat_map(|object| all_live_version_paths(&fragment, object).unwrap())
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    let mut scan = MetadataScan::new(&fragment, true).unwrap();
+    let mut observed = BTreeSet::new();
+    loop {
+        let batch = scan.next_batch(2).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for meta in batch {
+            assert_eq!(meta.total_size_bytes, 42);
+            assert!(observed.insert(meta.object_key));
+        }
+    }
+    assert_eq!(observed, expected);
+    for (path, bytes) in ndx_before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
 }
 
 #[test]

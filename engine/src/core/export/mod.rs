@@ -112,12 +112,25 @@ async fn remove_job_when_idle(id: &str) -> bool {
 }
 
 pub(crate) async fn gc_protected_fragments() -> Result<HashSet<String>, AppError> {
-    Ok(list_states()
+    Ok(store::list_states_for_gc()
         .await?
         .into_iter()
         .filter(|state| !state.phase.is_terminal())
         .map(|state| state.fragment)
         .collect())
+}
+
+/// Serialize one GC batch with existing export admission, not object writes.
+/// The collector drops this guard before yielding/rejoining its I/O lane and
+/// rechecks afterwards; a newly admitted export then protects its source data.
+pub(crate) async fn gc_reclaim_guard(
+    fragment: &str,
+) -> Result<Option<tokio::sync::MutexGuard<'static, ()>>, AppError> {
+    let guard = EXPORT_QUOTA_LOCK.lock().await;
+    if gc_protected_fragments().await?.contains(fragment) {
+        return Ok(None);
+    }
+    Ok(Some(guard))
 }
 
 fn now_unix() -> i64 {

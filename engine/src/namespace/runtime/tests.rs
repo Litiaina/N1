@@ -442,6 +442,64 @@ async fn n1_soft_delete_ttl_reclaims_only_after_namespace_expiry() {
 }
 
 #[tokio::test]
+async fn unexpired_trash_does_not_read_version_metadata() {
+    let _guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let fragment = format!("trash-ttl-first-{}", Ulid::new());
+    let object = publish_logical_object(&roots, &fragment, "retained.bin", 123);
+    let deleted = global_namespace_runtime()
+        .trash(&fragment, "retained.bin")
+        .await
+        .unwrap();
+    let mut metadata_files = 0;
+    for root in roots
+        .iter()
+        .cloned()
+        .chain(ObjectPathManager::new().get_blob_roots())
+    {
+        let directory = index_store::live_object_dir(&root, &fragment, &object).unwrap();
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ndx")
+            {
+                std::fs::write(entry.path(), b"unreadable version metadata").unwrap();
+                metadata_files += 1;
+            }
+        }
+    }
+    assert!(
+        metadata_files > 0,
+        "fault injection must hit actual NDX replicas"
+    );
+    let sweep = global_namespace_runtime()
+        .sweep_expired_trash(&fragment, 60, deleted.deleted_at_unix.unwrap() + 59)
+        .await
+        .expect("unexpired trash eligibility must not inspect NDX");
+    assert_eq!(sweep.expired_entries, 0);
+    assert_eq!(sweep.reclaimed_objects, 0);
+    assert!(
+        global_namespace_runtime()
+            .sweep_expired_trash(&fragment, 60, deleted.deleted_at_unix.unwrap() + 60,)
+            .await
+            .is_err(),
+        "unreadable expired metadata must preserve data, not guess"
+    );
+    assert!(
+        flat::trash_records(&fragment)
+            .unwrap()
+            .iter()
+            .any(|record| record.original_path == "retained.bin")
+    );
+}
+
+#[tokio::test]
 async fn trash_sweep_reports_logical_versions_without_counting_physical_replicas() {
     let _guard = crate::test_support::global_test_lock().lock().await;
     let roots = ensure_test_index_roots();

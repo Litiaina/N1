@@ -234,6 +234,8 @@ if __name__=='__main__':
         while not args.wait_for.exists():
             assert time.monotonic()<deadline,'Previous gate did not complete'
             time.sleep(2)
+        previous = json.loads(args.wait_for.read_text())
+        assert previous.get('status') == 'PASS', 'Previous gate failed; investigate before escalating load'
     args.binary=args.binary.resolve(strict=True)
     os.umask(0o077)
     test=Overload(args)

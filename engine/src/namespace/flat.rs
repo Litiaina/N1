@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -21,6 +21,8 @@ use crate::core::disk_manager::ObjectPathManager;
 use crate::core::index_store::{self, TrashKind, TrashRecord};
 use crate::core::storage_pool::{self, StoragePool};
 use crate::enums::app_error_enum::AppError;
+
+pub(crate) mod batch;
 
 pub const LIVE_DIR: &str = ".namespace";
 pub const SUFFIX: &str = ".ncx";
@@ -175,6 +177,10 @@ pub fn read(path: &Path) -> Result<Option<Pointer>, AppError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io(e, "read N1 NCX")),
     };
+    decode_pointer(path, &bytes).map(Some)
+}
+
+fn decode_pointer(path: &Path, bytes: &[u8]) -> Result<Pointer, AppError> {
     let offset = MAGIC.len() + 32;
     if bytes.len() < offset
         || &bytes[..MAGIC.len()] != MAGIC
@@ -190,13 +196,11 @@ pub fn read(path: &Path) -> Result<Option<Pointer>, AppError> {
     if pointer.format != 4 || index_store::normalize_object_id(&pointer.object_id).is_err() {
         return Err(error(format!("invalid NCX at '{}'", path.display())));
     }
-    Ok(Some(pointer))
+    Ok(pointer)
 }
 
 fn sync_directory(path: &Path) -> Result<(), AppError> {
-    File::open(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| io(e, "sync namespace directory"))
+    crate::core::linux_io::sync_dir_blocking(path).map_err(|e| io(e, "sync namespace directory"))
 }
 
 /// Parent creation is durable too: syncing only the leaf parent would lose a
@@ -251,14 +255,14 @@ pub fn write(root: &Path, path: &Path, pointer: &Pointer, exclusive: bool) -> Re
     durable_parents(parent, root)?;
     let temporary = parent.join(format!(".ncx-{}.tmp", Ulid::new()));
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
             .map_err(|e| io(e, "create staged NCX"))?;
-        file.write_all(&encode(pointer)?)
+        crate::core::linux_io::write_bytes_at_blocking(&file, &encode(pointer)?, 0)
             .map_err(|e| io(e, "write NCX"))?;
-        file.sync_all().map_err(|e| io(e, "sync NCX"))?;
+        crate::core::linux_io::fsync_blocking(&file).map_err(|e| io(e, "sync NCX"))?;
         if exclusive {
             fs::hard_link(&temporary, path).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -304,7 +308,7 @@ fn check_holders(holders: &[PathBuf]) -> Result<(), AppError> {
 /// complete until *every* worker has joined. In particular, a failed destination
 /// publication must never let a later source-fencing phase start early. Bound
 /// fanout even for large pool geometries; this is execution, not a data cache.
-fn on_holders<T: Send>(
+pub(crate) fn on_holders<T: Send>(
     roots: &[PathBuf],
     action: impl Fn(&Path) -> Result<T, AppError> + Sync,
 ) -> Result<Vec<T>, AppError> {
@@ -368,7 +372,22 @@ pub fn publish(
 ) -> Result<Pointer, AppError> {
     let identity = index_store::stable_fragment_id_for_fragment(fragment);
     let fragment = identity.as_str();
-    if let Some(existing) = lookup(fragment, key)? {
+    publish_with_existing(fragment, key, object_id, pool, lookup(fragment, key)?)
+}
+
+/// Publish after the caller's fresh lookup while it still holds this exact
+/// key's `with_keys` guard. Do not repeat the same all-replica lookup during
+/// upload finalization; holder checks and durable publication remain here.
+pub(crate) fn publish_with_existing(
+    fragment: &str,
+    key: &str,
+    object_id: &str,
+    pool: Option<&StoragePool>,
+    existing: Option<Pointer>,
+) -> Result<Pointer, AppError> {
+    let identity = index_store::stable_fragment_id_for_fragment(fragment);
+    let fragment = identity.as_str();
+    if let Some(existing) = existing {
         if existing.object_id != object_id {
             return Err(AppError::Conflict(format!(
                 "key '{key}' has another object identity"
@@ -509,39 +528,160 @@ pub fn visit(
     prefix: &str,
     mut emit: impl FnMut(&str) -> Result<bool, AppError>,
 ) -> Result<(), AppError> {
-    let identity = index_store::stable_fragment_id_for_fragment(fragment);
-    let fragment = identity.as_str();
-    ensure_readable()?;
-    for root in roots() {
-        let base = namespace_root(&root, fragment);
-        if !base.is_dir() {
-            continue;
+    let mut scan = Scan::new(fragment, false)?;
+    scan.prefix = prefix.to_string();
+    while let Some(record) = scan.next_record()? {
+        if record.key.starts_with(prefix) && !emit(&record.key)? {
+            break;
         }
-        for entry in WalkDir::new(&base).min_depth(1).follow_links(false) {
-            let entry = entry.map_err(|e| error(format!("enumerate flat objects: {e}")))?;
-            if !entry.file_type().is_file() {
+    }
+    Ok(())
+}
+
+/// An unsorted maintenance walk retains only its directory stack and one NCX.
+/// Unlike LIST continuation pages, advancing a batch never restarts the walk.
+/// A cursor performs no work while its consumer is processing the last batch.
+pub(crate) struct Scan {
+    fragment: String,
+    roots: Vec<PathBuf>,
+    next_root: usize,
+    current_root: PathBuf,
+    base: PathBuf,
+    walker: Option<walkdir::IntoIter>,
+    trash: bool,
+    prefix: String,
+    #[cfg(test)]
+    entries_visited: usize,
+}
+
+pub(crate) struct ScanRecord {
+    pub key: String,
+    pub pointer: Pointer,
+    pub trash: Option<TrashRecord>,
+}
+
+impl Scan {
+    pub(crate) fn new(fragment: &str, trash: bool) -> Result<Self, AppError> {
+        ensure_readable()?;
+        Ok(Self::on_roots(
+            index_store::stable_fragment_id_for_fragment(fragment),
+            roots(),
+            trash,
+        ))
+    }
+
+    fn on_roots(fragment: String, mut roots: Vec<PathBuf>, trash: bool) -> Self {
+        // Replica suppression below emits from the lexical first surviving
+        // holder. Visit holders in that same order, otherwise a replicated
+        // pool can walk an entire non-emitting member before its first frame.
+        // This sorts only this cursor's discovery list, never EC member slots.
+        roots.sort();
+        Self {
+            fragment,
+            roots,
+            next_root: 0,
+            current_root: PathBuf::new(),
+            base: PathBuf::new(),
+            walker: None,
+            trash,
+            prefix: String::new(),
+            #[cfg(test)]
+            entries_visited: 0,
+        }
+    }
+
+    pub(crate) fn next_record(&mut self) -> Result<Option<ScanRecord>, AppError> {
+        loop {
+            if self.walker.is_none() {
+                let Some(root) = self.roots.get(self.next_root) else {
+                    ensure_readable()?;
+                    return Ok(None);
+                };
+                self.next_root += 1;
+                self.current_root = root.clone();
+                self.base =
+                    index_store::fragment_root_on(root, &self.fragment).join(if self.trash {
+                        index_store::TRASH_DIR
+                    } else {
+                        LIVE_DIR
+                    });
+                if !self.base.is_dir() {
+                    continue;
+                }
+                self.walker = Some(
+                    WalkDir::new(&self.base)
+                        .min_depth(1)
+                        .follow_links(false)
+                        .into_iter(),
+                );
+            }
+            let Some(entry) = self.walker.as_mut().unwrap().next() else {
+                self.walker = None;
+                continue;
+            };
+            let entry = entry.map_err(|e| error(format!("enumerate flat namespace: {e}")))?;
+            #[cfg(test)]
+            {
+                self.entries_visited += 1;
+            }
+            if !entry.file_type().is_file()
+                || !entry.file_name().to_string_lossy().ends_with(SUFFIX)
+            {
                 continue;
             }
             let relative = entry
                 .path()
-                .strip_prefix(&base)
-                .map_err(|_| error("object scan escaped root"))?;
-            let Some(key) = decoded_key(relative).filter(|key| key.starts_with(prefix)) else {
-                continue;
+                .strip_prefix(&self.base)
+                .map_err(|_| error("namespace scan escaped root"))?;
+            let (key, pointer, trash) = if self.trash {
+                let id = relative.to_string_lossy();
+                let Some(record) = trash_record_by_id(&self.fragment, &id)? else {
+                    continue;
+                };
+                let Some(pointer) = trash_pointer(&self.fragment, &record)? else {
+                    continue;
+                };
+                (record.original_path.clone(), pointer, Some(record))
+            } else {
+                let Some(key) = decoded_key(relative).filter(|key| key.starts_with(&self.prefix))
+                else {
+                    continue;
+                };
+                let Some(pointer) = lookup(&self.fragment, &key)? else {
+                    continue;
+                };
+                (key, pointer, None)
             };
-            let Some(pointer) = lookup(fragment, &key)? else {
-                continue;
-            };
-            let first = holders(&pointer, fragment, &key)?
+            // Fixed holders and surviving names, not a growing de-duplication
+            // set. A missing first holder must not hide its surviving replica.
+            let first = holders(&pointer, &self.fragment, &key)?
                 .into_iter()
-                .filter(|r| storage_pool::root_available(r) && path(r, fragment, &key).is_file())
+                .filter(|root| {
+                    storage_pool::root_available(root) && {
+                        let candidate = match &trash {
+                            Some(record) => index_store::fragment_root_on(root, &self.fragment)
+                                .join(index_store::TRASH_DIR)
+                                .join(&record.source_relative_path),
+                            None => path(root, &self.fragment, &key),
+                        };
+                        candidate.is_file()
+                    }
+                })
                 .min();
-            if first.as_ref() == Some(&root) && !emit(&key)? {
-                return Ok(());
+            if first.as_ref() == Some(&self.current_root) {
+                return Ok(Some(ScanRecord {
+                    key,
+                    pointer,
+                    trash,
+                }));
             }
         }
     }
-    Ok(())
+
+    #[cfg(test)]
+    pub(crate) fn entries_visited(&self) -> usize {
+        self.entries_visited
+    }
 }
 
 /// Copy an already committed NCX without changing its contents. A local hard
@@ -591,7 +731,7 @@ fn copy_ncx(
             .open(&temporary)
             .map_err(|e| io(e, "create NCX copy"))?;
         std::io::copy(&mut input, &mut output).map_err(|e| io(e, "copy NCX bytes"))?;
-        output.sync_all().map_err(|e| io(e, "sync copied NCX"))?;
+        crate::core::linux_io::fsync_blocking(&output).map_err(|e| io(e, "sync copied NCX"))?;
         fs::hard_link(&temporary, destination).map_err(|e| io(e, "publish copied NCX"))?;
         fs::remove_file(&temporary).map_err(|e| io(e, "remove staged NCX copy"))?;
         sync_directory(parent)
@@ -902,12 +1042,16 @@ pub(crate) fn recover(fragment: &str, record: &TrashRecord) -> Result<bool, AppE
                 &pointer,
             )
         })?;
-        remove_trash_unlocked(fragment, record)?;
+        remove_trash_unlocked(fragment, record, false)?;
         Ok(true)
     })
 }
 
-fn remove_trash_unlocked(fragment: &str, record: &TrashRecord) -> Result<bool, AppError> {
+fn remove_trash_unlocked(
+    fragment: &str,
+    record: &TrashRecord,
+    prune_organizers: bool,
+) -> Result<bool, AppError> {
     // A lost holder can still contain a recoverable trash record. Never expire
     // it or reclaim its payload until the complete recorded set participates.
     let Some(pointer) = trash_pointer(fragment, record)? else {
@@ -918,40 +1062,280 @@ fn remove_trash_unlocked(fragment: &str, record: &TrashRecord) -> Result<bool, A
         return Ok(false);
     }
     let removed = on_holders(&exact, |root| {
-        let source = index_store::fragment_root_on(root, fragment)
-            .join(index_store::TRASH_DIR)
-            .join(&record.source_relative_path);
-        match fs::remove_file(&source) {
-            Ok(()) => {
-                sync_directory(source.parent().unwrap())?;
-                Ok(true)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(io(e, "remove trash NCX")),
-        }
+        let trash = index_store::fragment_root_on(root, fragment).join(index_store::TRASH_DIR);
+        remove_trash_replica(
+            root,
+            &trash,
+            Path::new(&record.source_relative_path),
+            prune_organizers,
+        )
     })?;
     Ok(removed.into_iter().any(|removed| removed))
+}
+
+/// Only the just-removed record's known ancestor chain is eligible. Never walk
+/// other trash entries, follow redirected parents, or remove the trash root.
+/// `remove_dir` itself establishes emptiness, so concurrent/unknown siblings
+/// preserve their organizer rather than granting recursive deletion authority.
+fn remove_trash_replica(
+    root: &Path,
+    trash: &Path,
+    relative: &Path,
+    prune_organizers: bool,
+) -> Result<bool, AppError> {
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || relative.as_os_str().is_empty()
+    {
+        return Err(error("unsafe trash namespace path"));
+    }
+    let source = trash.join(relative);
+    let parent = source
+        .parent()
+        .ok_or_else(|| error("trash NCX has no parent"))?;
+    let parents = parent
+        .strip_prefix(root)
+        .map_err(|_| error("trash namespace escaped storage root"))?;
+    let mut current = root.to_path_buf();
+    for component in parents.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(error("unsafe trash namespace parent"));
+        }
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => (),
+            Ok(_) => return Err(error("unsafe trash namespace parent")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(io(e, "inspect trash namespace parent")),
+        }
+    }
+    let removed = match fs::remove_file(&source) {
+        Ok(()) => {
+            sync_directory(parent)?;
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(io(e, "remove trash NCX")),
+    };
+    if !prune_organizers {
+        return Ok(removed);
+    }
+    let mut empty = parent;
+    while empty != trash {
+        // Both containment and the stop boundary are checked before rmdir;
+        // only kernel-confirmed empty directories can be removed.
+        if !empty.starts_with(trash) {
+            return Err(error("trash organizer escaped trash root"));
+        }
+        let ancestor = empty
+            .parent()
+            .ok_or_else(|| error("trash organizer has no parent"))?;
+        match fs::remove_dir(empty) {
+            Ok(()) => sync_directory(ancestor)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(e) => return Err(io(e, "remove empty trash organizer")),
+        }
+        empty = ancestor;
+    }
+    Ok(removed)
 }
 
 pub(crate) fn remove_trash(fragment: &str, record: &TrashRecord) -> Result<bool, AppError> {
     let identity = index_store::stable_fragment_id_for_fragment(fragment);
     let fragment = identity.as_str();
     with_keys(fragment, &[&record.original_path], || {
-        remove_trash_unlocked(fragment, record)
+        remove_trash_unlocked(fragment, record, true)
     })
 }
 
-pub fn referenced_objects(fragment: &str) -> Result<BTreeSet<String>, AppError> {
-    let identity = index_store::stable_fragment_id_for_fragment(fragment);
-    let fragment = identity.as_str();
-    let mut objects = BTreeSet::new();
-    for key in keys(fragment, "")? {
-        if let Some(pointer) = lookup(fragment, &key)? {
-            objects.insert(pointer.object_id);
+/// GC needs a conservative union of physical references, not a sorted LIST or
+/// one chosen namespace holder. Read every NCX once, including misplaced and
+/// conflicting surviving copies. Their object IDs all protect data. A corrupt
+/// or unreadable copy makes absence uncertain and defers reclamation instead.
+/// Root identity/layout proofs are batch-local, never an object-data cache.
+pub(crate) struct GcReferenceScan {
+    fragment: String,
+    roots: Vec<PathBuf>,
+    next_scope: usize,
+    walker: Option<walkdir::IntoIter>,
+    done: bool,
+    #[cfg(test)]
+    entries_visited: usize,
+    #[cfg(test)]
+    pointers_read: usize,
+}
+
+impl GcReferenceScan {
+    pub(crate) fn new(fragment: &str) -> Result<Self, AppError> {
+        // Unlike foreground roots(), absence authority may not filter out an
+        // unavailable member that could hold the only surviving reference.
+        let roots = crate::core::disk_manager::INDEX_STORE_DISKS
+            .get()
+            .ok_or_else(|| error("namespace roots are not initialized"))?
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        Self::on_roots(fragment, roots)
+    }
+
+    fn on_roots(fragment: &str, roots: Vec<PathBuf>) -> Result<Self, AppError> {
+        let scan = Self {
+            fragment: index_store::stable_fragment_id_for_fragment(fragment),
+            roots,
+            next_scope: 0,
+            walker: None,
+            done: false,
+            #[cfg(test)]
+            entries_visited: 0,
+            #[cfg(test)]
+            pointers_read: 0,
+        };
+        scan.validate_roots()?;
+        Ok(scan)
+    }
+
+    fn validate_roots(&self) -> Result<(), AppError> {
+        if self.roots.is_empty() {
+            return Err(AppError::ServiceUnavailable(
+                "cannot prove namespace references without enrolled roots".into(),
+            ));
+        }
+        for root in &self.roots {
+            if !storage_pool::root_available(root) {
+                return Err(AppError::ServiceUnavailable(
+                    "an enrolled namespace member is unavailable; preserving objects".into(),
+                ));
+            }
+            let fragment =
+                crate::core::fragment_identity::physical_fragment_root_on(root, &self.fragment);
+            for directory in [
+                fragment.clone(),
+                fragment.join(LIVE_DIR),
+                fragment.join(index_store::TRASH_DIR),
+            ] {
+                match fs::symlink_metadata(&directory) {
+                    Ok(metadata) if metadata.file_type().is_dir() => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Ok(_) => {
+                        return Err(AppError::Conflict(
+                            "redirected namespace authority; preserving objects".into(),
+                        ));
+                    }
+                    Err(e) => return Err(io(e, "inspect GC namespace authority")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bound filesystem entries, not just emitted pointers: a directory-only
+    /// namespace also yields. Some(empty) is a valid unfinished work batch;
+    /// None means both live/trash scopes on every enrolled root are exhausted.
+    pub(crate) fn next_batch(&mut self, limit: usize) -> Result<Option<Vec<String>>, AppError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.validate_roots()?;
+        let mut objects = Vec::new();
+        for _ in 0..limit.clamp(1, 4096) {
+            if self.walker.is_none() {
+                if self.next_scope >= self.roots.len().saturating_mul(2) {
+                    self.done = true;
+                    break;
+                }
+                let root = &self.roots[self.next_scope / 2];
+                let internal = if self.next_scope % 2 == 0 {
+                    LIVE_DIR
+                } else {
+                    index_store::TRASH_DIR
+                };
+                self.next_scope += 1;
+                let base =
+                    crate::core::fragment_identity::physical_fragment_root_on(root, &self.fragment)
+                        .join(internal);
+                match fs::symlink_metadata(&base) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        self.walker = Some(
+                            WalkDir::new(base)
+                                .min_depth(1)
+                                .follow_links(false)
+                                .into_iter(),
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Ok(_) => return Err(AppError::Conflict("unsafe namespace traversal".into())),
+                    Err(e) => return Err(io(e, "open GC namespace traversal")),
+                }
+            }
+            let Some(entry) = self.walker.as_mut().unwrap().next() else {
+                self.walker = None;
+                continue;
+            };
+            let entry = entry.map_err(|e| error(format!("scan GC namespace references: {e}")))?;
+            #[cfg(test)]
+            {
+                self.entries_visited += 1;
+            }
+            if entry.file_type().is_symlink() {
+                return Err(AppError::Conflict(
+                    "redirected namespace reference; preserving objects".into(),
+                ));
+            }
+            if !entry.file_name().to_string_lossy().ends_with(SUFFIX) {
+                continue;
+            }
+            if !entry.file_type().is_file() {
+                return Err(AppError::Conflict(
+                    "unsafe NCX authority type; preserving objects".into(),
+                ));
+            }
+            // Do not follow a leaf swapped to a symlink after enumeration.
+            let fd = rustix::fs::openat(
+                rustix::fs::CWD,
+                entry.path(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|e| io(e.into(), "open GC NCX reference"))?;
+            let mut file = File::from(fd);
+            if !file
+                .metadata()
+                .map_err(|e| io(e, "inspect GC NCX reference"))?
+                .is_file()
+            {
+                return Err(AppError::Conflict(
+                    "unsafe NCX authority type; preserving objects".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| io(e, "read GC NCX reference"))?;
+            let pointer = decode_pointer(entry.path(), &bytes)?;
+            #[cfg(test)]
+            {
+                self.pointers_read += 1;
+            }
+            objects.push(pointer.object_id);
+        }
+        self.validate_roots()?;
+        if self.done && objects.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(objects))
         }
     }
-    for record in trash_records(fragment)? {
-        objects.extend(record.object_keys);
+}
+
+pub fn referenced_objects(fragment: &str) -> Result<BTreeSet<String>, AppError> {
+    let mut objects = BTreeSet::new();
+    let mut scan = GcReferenceScan::new(fragment)?;
+    while let Some(batch) = scan.next_batch(128)? {
+        objects.extend(batch);
     }
     Ok(objects)
 }
@@ -964,9 +1348,10 @@ pub fn repair(fragment: &str, dry_run: bool) -> Result<(u64, u64, u64), AppError
     let identity = index_store::stable_fragment_id_for_fragment(fragment);
     let fragment = identity.as_str();
     ensure_readable()?;
-    let candidates = keys(fragment, "")?;
     let mut report = (0u64, 0u64, 0u64);
-    for key in candidates {
+    let mut live_scan = Scan::new(fragment, false)?;
+    while let Some(record) = live_scan.next_record()? {
+        let key = record.key;
         let counts = with_keys(fragment, &[&key], || {
             let mut live = Vec::new();
             let mut corrupt = 0u64;
@@ -1023,7 +1408,11 @@ pub fn repair(fragment: &str, dry_run: bool) -> Result<(u64, u64, u64), AppError
         report.1 += counts.1;
         report.2 += counts.2;
     }
-    for record in trash_records(fragment)? {
+    let mut trash_scan = Scan::new(fragment, true)?;
+    while let Some(entry) = trash_scan.next_record()? {
+        let record = entry
+            .trash
+            .ok_or_else(|| error("trash cursor returned a live entry"))?;
         let counts = with_keys(fragment, &[&record.original_path], || {
             let mut canonical = None;
             let mut corrupt = 0u64;
@@ -1083,6 +1472,215 @@ pub fn repair(fragment: &str, dry_run: bool) -> Result<(u64, u64, u64), AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_scan_visits_canonical_holders_before_duplicate_replicas() {
+        let configured = vec![
+            PathBuf::from("/mnt/member-0"),
+            PathBuf::from("/media/member-1"),
+            PathBuf::from("/srv/member-2"),
+        ];
+        for trash in [false, true] {
+            let scan = Scan::on_roots("fragment".into(), configured.clone(), trash);
+            assert_eq!(scan.roots.first(), configured.iter().min());
+            assert!(scan.roots.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!(scan.next_root, 0);
+            assert!(scan.walker.is_none());
+            assert_eq!(scan.trash, trash);
+        }
+        assert_eq!(configured[0], PathBuf::from("/mnt/member-0"));
+    }
+
+    #[test]
+    fn gc_reference_cursor_unions_all_physical_copies_without_holder_filtering() {
+        let base = std::env::temp_dir().join(format!("n1-gc-ref-union-{}", Ulid::new()));
+        let roots = vec![base.join("member-a"), base.join("member-b")];
+        let fragment = Ulid::new().to_string();
+        let first = Ulid::new().to_string();
+        let other = Ulid::new().to_string();
+        for (root, object) in roots.iter().zip([&first, &other]) {
+            let live = root.join(format!("@f_{fragment}/{LIVE_DIR}/organizer"));
+            fs::create_dir_all(&live).unwrap();
+            fs::write(
+                live.join("different-holder.ncx"),
+                encode(&Pointer {
+                    format: 4,
+                    pool_id: "not-current-placement".into(),
+                    object_id: object.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let trash_object = Ulid::new().to_string();
+        let trash = roots[0].join(format!("@f_{fragment}/.trash/unknown-organizer"));
+        fs::create_dir_all(&trash).unwrap();
+        fs::write(
+            trash.join("retained.ncx"),
+            encode(&Pointer {
+                format: 4,
+                pool_id: String::new(),
+                object_id: trash_object.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut scan = GcReferenceScan::on_roots(&fragment, roots).unwrap();
+        let mut seen = BTreeSet::new();
+        let mut batches = 0;
+        while let Some(batch) = scan.next_batch(1).unwrap() {
+            assert!(batch.len() <= 1);
+            batches += 1;
+            seen.extend(batch);
+        }
+        assert!(batches >= 3);
+        assert_eq!(scan.pointers_read, 3, "each physical NCX must be read once");
+        assert_eq!(seen, BTreeSet::from([first, other, trash_object]));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_reference_cursor_rejects_corruption_symlinks_and_lost_members() {
+        let base = std::env::temp_dir().join(format!("n1-gc-ref-safety-{}", Ulid::new()));
+        let root = base.join("member");
+        let fragment = Ulid::new().to_string();
+        let live = root.join(format!("@f_{fragment}/{LIVE_DIR}"));
+        fs::create_dir_all(&live).unwrap();
+        let pointer_path = live.join("bad.ncx");
+        fs::write(&pointer_path, b"corrupt").unwrap();
+        let mut scan = GcReferenceScan::on_roots(&fragment, vec![root.clone()]).unwrap();
+        assert!(scan.next_batch(128).is_err());
+        fs::remove_file(&pointer_path).unwrap();
+        std::os::unix::fs::symlink(base.join("external"), &pointer_path).unwrap();
+        let mut scan = GcReferenceScan::on_roots(&fragment, vec![root.clone()]).unwrap();
+        assert!(scan.next_batch(128).is_err());
+        fs::remove_file(&pointer_path).unwrap();
+        let mut scan = GcReferenceScan::on_roots(&fragment, vec![root.clone()]).unwrap();
+        fs::rename(&root, base.join("disconnected")).unwrap();
+        assert!(scan.next_batch(128).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn removing_real_trash_prunes_nested_organizers_but_keeps_trash_root() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let configured = crate::core::disk_manager::INDEX_STORE_DISKS.get_or_init(|| {
+            let base = std::env::temp_dir().join(format!("n1-index-{}", std::process::id()));
+            [base.join("index-0"), base.join("index-1")]
+                .into_iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect()
+        });
+        for root in configured {
+            fs::create_dir_all(root).unwrap();
+        }
+        let fragment = Ulid::new().to_string();
+        let object = Ulid::new().to_string();
+        let key = "nested/organizer/document.bin";
+        publish(&fragment, key, &object, None).unwrap();
+        let record = trash_key(&fragment, key).unwrap().unwrap();
+        let generation = Path::new(&record.source_relative_path)
+            .components()
+            .next()
+            .unwrap();
+        for root in roots() {
+            let trash =
+                index_store::fragment_root_on(&root, &fragment).join(index_store::TRASH_DIR);
+            assert!(trash.join(&record.source_relative_path).is_file());
+            assert!(trash.join(generation).is_dir());
+        }
+        assert!(remove_trash(&fragment, &record).unwrap());
+        // Ordinary recovery retains its existing copy/unlink work: pruning
+        // belongs to expiration, not the foreground mutation path.
+        publish(&fragment, key, &object, None).unwrap();
+        let recovered = trash_key(&fragment, key).unwrap().unwrap();
+        let recovered_generation = Path::new(&recovered.source_relative_path)
+            .components()
+            .next()
+            .unwrap();
+        assert!(recover(&fragment, &recovered).unwrap());
+        for root in roots() {
+            let fragment_root = index_store::fragment_root_on(&root, &fragment);
+            let trash = fragment_root.join(index_store::TRASH_DIR);
+            assert!(
+                trash.is_dir(),
+                "the trash root is not an eligible organizer"
+            );
+            assert!(!trash.join(generation).exists());
+            assert!(trash.join(recovered_generation).is_dir());
+            assert!(!trash.join(&recovered.source_relative_path).exists());
+            assert_eq!(
+                read(&path(&root, &fragment, key))
+                    .unwrap()
+                    .unwrap()
+                    .object_id,
+                object
+            );
+            assert!(fragment_root.join(LIVE_DIR).is_dir());
+            fs::remove_dir_all(fragment_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn trash_parent_pruning_preserves_siblings_and_retries_missing_replica() {
+        let root = std::env::temp_dir().join(format!("n1-trash-prune-{}", Ulid::new()));
+        let trash = root.join(".trash");
+        let relative = Path::new("generation/a.ncp/b.ncp/expired.ncx");
+        let parent = trash.join(relative).parent().unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(trash.join(relative), b"expired pointer").unwrap();
+        fs::write(parent.join("retained.ncx"), b"retained pointer").unwrap();
+        fs::write(parent.join("unknown"), b"unknown data").unwrap();
+        assert!(remove_trash_replica(&root, &trash, relative, true).unwrap());
+        assert_eq!(
+            fs::read(parent.join("retained.ncx")).unwrap(),
+            b"retained pointer"
+        );
+        assert_eq!(fs::read(parent.join("unknown")).unwrap(), b"unknown data");
+        assert!(parent.is_dir());
+        fs::remove_file(parent.join("retained.ncx")).unwrap();
+        // An unknown sibling still prevents pruning, including on retry when
+        // this member's NCX was already removed by an interrupted operation.
+        assert!(!remove_trash_replica(&root, &trash, relative, true).unwrap());
+        assert!(parent.is_dir());
+        fs::remove_file(parent.join("unknown")).unwrap();
+        assert!(!remove_trash_replica(&root, &trash, relative, true).unwrap());
+        assert!(!trash.join("generation").exists());
+        assert!(trash.is_dir());
+        assert!(root.is_dir());
+        assert!(remove_trash_replica(&root, &trash, Path::new("../outside.ncx"), true).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_parent_pruning_rejects_redirected_generation_and_trash_root() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("n1-trash-link-{}", Ulid::new()));
+        let outside = root.join("outside");
+        let trash = root.join(".trash");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir(&trash).unwrap();
+        fs::write(outside.join("keep.ncx"), b"outside pointer").unwrap();
+        symlink(&outside, trash.join("generation")).unwrap();
+        assert!(
+            remove_trash_replica(&root, &trash, Path::new("generation/keep.ncx"), true).is_err()
+        );
+        assert_eq!(
+            fs::read(outside.join("keep.ncx")).unwrap(),
+            b"outside pointer"
+        );
+        fs::remove_file(trash.join("generation")).unwrap();
+        fs::remove_dir(&trash).unwrap();
+        symlink(&outside, &trash).unwrap();
+        assert!(remove_trash_replica(&root, &trash, Path::new("keep.ncx"), true).is_err());
+        assert_eq!(
+            fs::read(outside.join("keep.ncx")).unwrap(),
+            b"outside pointer"
+        );
+        fs::remove_file(trash).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn organizer_encoding_is_injective_for_internal_looking_names() {
@@ -1161,7 +1759,10 @@ mod tests {
     fn cross_filesystem_ncx_copy_is_byte_exact_and_does_not_remove_the_source() {
         use std::os::unix::fs::MetadataExt;
         let disk = std::env::temp_dir().join(format!("n1-ncx-xdev-{}", Ulid::new()));
-        let ram = PathBuf::from("/dev/shm").join(format!("n1-ncx-xdev-{}", Ulid::new()));
+        let second_filesystem = std::env::var_os("N1_TEST_SECOND_FILESYSTEM")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/dev/shm"));
+        let ram = second_filesystem.join(format!("n1-ncx-xdev-{}", Ulid::new()));
         fs::create_dir_all(&disk).unwrap();
         fs::create_dir_all(&ram).unwrap();
         assert_ne!(

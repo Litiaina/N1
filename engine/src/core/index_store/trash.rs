@@ -24,10 +24,7 @@ pub fn read_latest_trash(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let versions = list_trash_versions(fragment, object_key)?;
-    Ok(versions
-        .into_iter()
-        .max_by(|a, b| a.version_id.cmp(&b.version_id)))
+    read_current_live_head(fragment, object_key)
 }
 
 pub fn list_trash_versions(
@@ -57,7 +54,11 @@ pub(crate) fn visit_trash_records(
     fragment: &str,
     mut visit: impl FnMut(TrashRecord) -> Result<bool, AppError>,
 ) -> Result<(), AppError> {
-    for mut record in crate::namespace::flat::trash_records(fragment)? {
+    let mut scan = crate::namespace::flat::Scan::new(fragment, true)?;
+    while let Some(entry) = scan.next_record()? {
+        let Some(mut record) = entry.trash else {
+            continue;
+        };
         // NCX owns the logical name/object identity, not immutable version
         // metadata. Derive the maintenance catalog from authoritative NDX,
         // deduplicating physical replicas rather than reporting an empty
@@ -441,6 +442,14 @@ pub(crate) fn delete_unreferenced_object_indexes_batch(
         pending.insert(normalize_object_id(&session.manifest.object_key)?);
     }
     let referenced = referenced_object_ids(fragment)?;
+    // Destructive absence checks must include enrolled members that foreground
+    // placement filters out because their identity is missing or stale.
+    let roots = crate::core::disk_manager::BLOB_STORE_DISKS
+        .get()
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     let mut removed = Vec::new();
     for object_id in candidates.iter().collect::<BTreeSet<_>>() {
         let object_id = normalize_object_id(object_id)?;
@@ -450,19 +459,48 @@ pub(crate) fn delete_unreferenced_object_indexes_batch(
         let Some(_reclaim_guard) = upload_scan.try_reclaim(&object_id)? else {
             continue;
         };
-        let mut object_removed = false;
-        for dir in object_dir_candidates(fragment, &object_id)? {
-            if !dir.exists() {
-                continue;
-            }
-            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "reclaim N1 expired trash object"))?;
-            object_removed = true;
-            if let Some(parent) = dir.parent() {
-                sync_dir(parent);
-            }
-        }
-        if object_removed {
+        if delete_unreferenced_object_from_roots(fragment, &object_id, &roots)? {
             removed.push(object_id);
+        }
+    }
+    Ok(removed)
+}
+
+fn delete_unreferenced_object_from_roots(
+    fragment: &str,
+    object_id: &str,
+    roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    // One object's reclamation participates in online capture, not the entire
+    // potentially large trash batch. The caller already fences this object
+    // against uploads and has established the absence of namespace references.
+    let _snapshot_boundary = crate::core::backup::barrier::mutation();
+    if roots.is_empty()
+        || roots
+            .iter()
+            .any(|root| !crate::core::storage_pool::root_available(root))
+    {
+        return Err(AppError::ServiceUnavailable(
+            "cannot prove every enrolled member before expired-object reclamation".into(),
+        ));
+    }
+    let mut directories = Vec::with_capacity(roots.len());
+    for root in roots {
+        let directory = object_index_dir(root, fragment, object_id)?;
+        // Check ALL member paths before unlinking ANY. A symlinked fanout
+        // ancestor redirects remove_dir_all even when its final object is a
+        // real directory; the shared path proof rejects that static layout.
+        if crate::core::garbage_collector::object_directory_present(root, &directory)? {
+            directories.push(directory);
+        }
+    }
+    let mut removed = false;
+    for directory in directories {
+        fs::remove_dir_all(&directory)
+            .map_err(|error| io_err(error, "reclaim N1 expired trash object"))?;
+        removed = true;
+        if let Some(parent) = directory.parent() {
+            sync_dir(parent);
         }
     }
     Ok(removed)
@@ -662,4 +700,75 @@ pub fn has_any_fragment_index(fragment: &str) -> Result<bool, AppError> {
     }) || blob_roots()
         .iter()
         .any(|root| count_object_index_records(root, fragment) > 0))
+}
+
+#[cfg(test)]
+mod expired_trash_path_safety_tests {
+    use super::*;
+
+    #[test]
+    fn fanout_redirection_preserves_foreign_and_healthy_member_objects() {
+        let base = std::env::temp_dir().join(format!("n1-trash-fanout-{}", Ulid::new()));
+        let roots = vec![base.join("healthy"), base.join("redirected")];
+        let fragment = Ulid::new().to_string();
+        let object = Ulid::new().to_string();
+        let healthy = object_index_dir(&roots[0], &fragment, &object).unwrap();
+        fs::create_dir_all(&healthy).unwrap();
+        fs::write(healthy.join("retained"), b"healthy member bytes").unwrap();
+
+        let redirected = object_index_dir(&roots[1], &fragment, &object).unwrap();
+        let second_fanout = redirected.parent().unwrap();
+        let first_fanout = second_fanout.parent().unwrap();
+        fs::create_dir_all(first_fanout.parent().unwrap()).unwrap();
+        let foreign = base.join("foreign");
+        let foreign_object = foreign
+            .join(second_fanout.file_name().unwrap())
+            .join(redirected.file_name().unwrap());
+        fs::create_dir_all(&foreign_object).unwrap();
+        fs::write(foreign_object.join("retained"), b"foreign bytes").unwrap();
+        unix_fs::symlink(&foreign, first_fanout).unwrap();
+        for root in &roots {
+            assert!(crate::core::storage_pool::root_available(root));
+        }
+
+        assert!(matches!(
+            delete_unreferenced_object_from_roots(&fragment, &object, &roots),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            fs::read(healthy.join("retained")).unwrap(),
+            b"healthy member bytes"
+        );
+        assert_eq!(
+            fs::read(foreign_object.join("retained")).unwrap(),
+            b"foreign bytes"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn absent_member_defers_reclamation_but_absent_object_on_available_member_is_safe() {
+        let base = std::env::temp_dir().join(format!("n1-trash-member-{}", Ulid::new()));
+        let roots = vec![base.join("healthy"), base.join("missing")];
+        let fragment = Ulid::new().to_string();
+        let object = Ulid::new().to_string();
+        let healthy = object_index_dir(&roots[0], &fragment, &object).unwrap();
+        fs::create_dir_all(&healthy).unwrap();
+        fs::write(
+            healthy.join("retained"),
+            b"protected until all members present",
+        )
+        .unwrap();
+        assert!(matches!(
+            delete_unreferenced_object_from_roots(&fragment, &object, &roots),
+            Err(AppError::ServiceUnavailable(_))
+        ));
+        assert!(healthy.join("retained").is_file());
+        fs::create_dir(&roots[1]).unwrap();
+        assert!(delete_unreferenced_object_from_roots(&fragment, &object, &roots).unwrap());
+        assert!(!healthy.exists());
+        assert!(!delete_unreferenced_object_from_roots(&fragment, &object, &roots).unwrap());
+        assert!(delete_unreferenced_object_from_roots(&fragment, &object, &[]).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
 }

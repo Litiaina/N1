@@ -49,9 +49,9 @@ Pre-portability absolute addresses resolve through each slot's original prefix;
 relocation does not rewrite committed NDX or payload or grow an alias history.
 Locations remain fixed during a running engine; cutover is offline.
 Existing path-bound v4 members first acquire descriptors at their old locations.
-Identity/topology readiness is not a full content-integrity claim: existing
-health gates, recover-on-read and background scans remain responsible for their
-respective checks. A valid marker alone does not prove a complete or fresh copy.
+Identity/topology readiness is not a full content-integrity claim: health gates,
+verified recover-on-read and explicit content scans have separate roles.
+A valid marker alone does not prove a complete or fresh copy.
 
 ## Stored representation
 
@@ -111,8 +111,19 @@ share a name. Encoded key components prevent suffix and physical-path collisions
 Live LIST reads entry names/types without decoding NCX, NDX or payload. Page
 memory is bounded by page size and traversal depth. Sorted continuation pages
 can rescan matching directories: listing is not an O(1) seek or a snapshot.
-Export enumeration is a separate linear walk. Maintenance reachability snapshots
+Export enumeration is a separate linear walk. Its cursor visits a sorted copy
+of the roots to match lexical replica suppression; this does not reorder pool
+members, omit replica traversal or add a whole-namespace deduplication cache.
+Maintenance reachability snapshots
 are not claimed constant-memory at arbitrary object counts.
+
+Repair, monitoring and redistribution resume an internal directory cursor across
+bounded metadata batches rather than restarting sorted LIST for every batch.
+Replica selection uses the existing holders; no object catalog or cache is added.
+Filesystem work runs outside async workers, and a paused cursor occupies no
+blocking worker. Public LIST ordering and continuation semantics are unchanged.
+Payload/NDX presence probes stream the existing two-level object fanout and stop
+at their first match; they do not allocate an inventory of every object directory.
 
 ## Namespace mutation
 
@@ -158,6 +169,21 @@ the recorded parity tolerance, but missing members do not authorize silently
 rebinding or rewriting an enrolled pool. Repair uses the object's original
 geometry; a newer pool is not an automatic repair/rebalance destination.
 
+Reads validate the existing whole-shard checksum before exposing bytes; the
+streaming path does not bypass verification on a successful filesystem read.
+Validated descriptors and rejected candidates are retained only for the current
+request/part. Read-triggered repair uses the existing bounded repair capacity;
+reconstruction is checksum-checked before replacement and directory-sync errors
+propagate. Range recovery decodes a recorded EC stripe before slicing the
+requested bytes; it never treats an arbitrary byte slice as a separately encoded
+shard. A peer's failed validation does not suppress repair when that peer becomes
+a read target. Read repair reuses whole-fragment lifecycle admission and checks
+the fragment still exists before writing. It defers to pending deletion rather
+than waiting behind it or recreating a deleted fragment. Healthy committed NDX
+is not rewritten by this repair path.
+Full availability/checksum walks and deep health inspection are explicit.
+Periodic known-member safety probes do not enumerate namespace or payload.
+
 Whole-fragment deletion takes exclusive per-fragment admission. Uploads and
 repair share admission, so different uploads still run concurrently. Each
 rechecks on-disk existence after admission; stale tokens or repair snapshots
@@ -166,14 +192,69 @@ through publication/cleanup even after disconnect. Deletion errors propagate
 and aliases remain available for retry until all members are removed.
 Ordinary object/NCX mutations do not acquire this guard.
 
-Upload NCX holders publish in parallel with bounded fanout and all workers
-joined before success. Batch buffering takes the existing shared I/O permit
-before allocating each object body; request concurrency is not extra capacity.
-Batch result memory is bounded by a 4,096-object request limit.
+Independent NDX and NCX holders publish in bounded parallel phases with all
+workers joined before proceeding. Ordinary strict uploads retain their direct-I/O
+path and every data/publication barrier; small relaxed writes may use buffered I/O.
+Strict small-file batches use request-local groups bounded to 64 objects / 8 MiB,
+not a global writer. Payloads and private metadata are written in the existing
+version directories. Pinned participating filesystem handles are opened before
+writing; a group synchronization makes contents durable before NDX publication,
+another precedes NCX publication, and a final one precedes strict ACK. Healthy
+existing NCX is reused for a new immutable version. Sorted object guards precede
+the existing namespace/backup mutation boundary, avoiding lock inversion. GC's
+existing version pass removes expired private staging only when no upload owns
+the object. Lock waits and payload I/O remain asynchronous; only synchronous
+publication occupies a blocking worker, so admitted groups cannot exhaust the
+workers needed to open their own files. No packing, new receipts, version heads
+or disk format are introduced.
+The Linux I/O backend uses a bounded in-process io_uring completion queue when
+available. Submitted buffers and descriptors remain owned until completion,
+including after caller cancellation. Writes must complete before data sync;
+data sync precedes publication and the existing directory-sync barriers. Queue
+submission alone is not durability. Backend selection happens at startup;
+automatic compatibility fallback is reported, not a retry of failed storage I/O.
+This adds no service, cache, storage representation or relaxed acknowledgement.
+One driver thread owns the ring, with at most 128 queued and 128 active
+requests; it does not busy-poll. Asynchronous direct and buffered shard writes,
+exact/chunked checksum reads and file/directory syncs use this backend.
+Synchronous publication workers perform their writes and durability syncs
+directly through POSIX, avoiding a second queue-and-wait handoff. Opens and
+renames also retain their blocking helpers. This is a fixed operation policy,
+reported separately as `publication_backend: posix`, not fallback after a failed
+native request. Publication ordering and every required sync are unchanged.
+Replicated NDX writes share one immutable encoded allocation, and checksum walks
+reuse a bounded chunk buffer rather than allocating per chunk.
+Batch buffering takes the existing shared I/O permit before allocating each
+object body; request concurrency is not extra payload capacity. That permit,
+lifecycle and activity protection remain held through NCX publication, including
+after disconnect. This bounds the complete commit, not only payload/NDX work.
+Admission failure preserves already-admitted results and reports explicit
+per-object rejections. Batch result memory is bounded by a 4,096-object request
+limit; these per-request bounds are not a universal process-memory guarantee.
 
-GC/TTL removes expired trash and safely unreferenced immutable versions.
-Active uploads, overlapping scans and retained exports must remain protected;
-uncertain authority causes preservation/reporting, not guessed deletion.
+Adaptive I/O capacity uses the existing FIFO semaphore. Reducing capacity retires
+permits as admitted work finishes; increasing capacity returns those permits.
+Waiters retain their queue position instead of cancelling and polling. Waiting
+for foreground capacity does not occupy the shared background lane. The hard
+configured concurrency bound and foreground admission deadline remain in force.
+
+Scheduled and manual GC use the same collector. It expires trash NCX by TTL,
+expires abandoned durable sessions and reclaims aged, inactive upload versions.
+Trash TTL is checked before reading version NDX. Ordinary uploads have no new
+cleanup receipt: restart discovery walks object/version directory names and
+checks namespace references, upload activity and existing NDX authority. An
+abandoned new version under a live object is eligible; committed history is not.
+
+GC uses BackgroundGc admission, rejoining between groups of 128 objects/sessions
+and fragments. The fanout cursor retains at most three open directories rather
+than collecting every object directory. Trash expiration and the namespace
+reference snapshot remain separate traversal phases; the reference set grows
+with the namespace. This is not constant-memory or constant-time collection.
+All configured members, not only the foreground-eligible subset, must establish
+safe deletion authority. Unavailable identities, unreadable authority or unsafe
+layout cause preservation/reporting. Existing upload/mutation fences protect
+overlap; export admission is rechecked between destructive batches. Backup pins
+remain protected. No payload relocation or new cleanup-record encoding is added.
 
 Offline backup captures every pool member under exclusive leases, including
 unfinished durable-upload progress. Online backup instead pins committed NCX,

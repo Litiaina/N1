@@ -44,8 +44,41 @@ def distribution(values):
             for name, q in [('median_ms', .5), ('p95_ms', .95), ('p99_ms', .99), ('max_ms', 1)]} if values else {}
 
 
+def fixture_certificate_days(deadline_seconds):
+    # Trust must outlive the complete run, including fresh TLS connections at
+    # later checkpoints. Never turn certificate validation off for a long soak.
+    return max(2, math.ceil(deadline_seconds / 86400) + 1)
+
+
+def requested_io_backend(args):
+    mode = getattr(args, 'io_backend', 'auto')
+    assert mode in ('auto', 'uring', 'blocking'), 'Invalid requested I/O backend'
+    return mode
+
+
+def verify_io_backend(health, args):
+    mode = requested_io_backend(args)
+    backend = health['io_control'].get('backend')
+    assert isinstance(backend, dict), 'Engine did not report its I/O backend'
+    assert backend.get('requested') == mode, f'Engine ignored requested I/O backend: {backend}'
+    selected = backend.get('backend')
+    if mode == 'uring':
+        assert selected == 'io_uring', f'Required io_uring was not selected: {backend}'
+    elif mode == 'blocking':
+        assert selected == 'blocking', f'Required blocking backend was not selected: {backend}'
+    else:
+        assert selected in ('io_uring', 'blocking'), f'Unavailable I/O backend: {backend}'
+    if mode == 'auto' and selected == 'blocking':
+        assert isinstance(backend.get('fallback_reason'), str) and backend['fallback_reason'], (
+            f'Automatic fallback must report its initialization reason: {backend}')
+    else:
+        assert backend.get('fallback_reason') is None, f'Unexpected I/O fallback: {backend}'
+    return backend
+
+
 class Stress:
     def __init__(self, args):
+        self.io_backend = requested_io_backend(args)
         self.args = args
         self.root = args.root.resolve()
         assert not self.root.exists(), 'Use a new, nonexistent fixture directory'
@@ -70,6 +103,9 @@ class Stress:
         self.roots = roots
         for root in self.roots:
             root.mkdir(mode=0o700)
+        # A removable member must never silently become a directory on the OS
+        # filesystem after unplug/reconnect. Stop only our disposable engine.
+        self.storage_devices = {path: path.stat().st_dev for path in [self.root] + self.roots}
         self.config = configparser.ConfigParser(interpolation=None)
         self.config.read(Path(__file__).resolve().parents[1] / 'shell/web/n1_config.default.ini')
         self.config['server'].update(host='127.0.0.1', https_port=str(args.port), native_port=str(args.port+1),
@@ -83,9 +119,10 @@ class Stress:
         self.config['rate_limiter_config']['enable_rate_limiting'] = 'false'
         self.write_config()
         self.master = secrets.token_hex(32)
-        (self.root/'n1.env').write_text(f'MASTER_KEY={self.master}\nAUTH_KEY={secrets.token_hex(32)}\nADMIN_KEY={secrets.token_hex(32)}\nJWT_SECRET={secrets.token_hex(32)}\n')
+        (self.root/'n1.env').write_text(f'MASTER_KEY={self.master}\nAUTH_KEY={secrets.token_hex(32)}\nADMIN_KEY={secrets.token_hex(32)}\nJWT_SECRET={secrets.token_hex(32)}\nN1_IO_BACKEND={self.io_backend}\n')
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
-                        '-nodes', '-days', '2', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
+                        '-nodes', '-days', str(fixture_certificate_days(args.deadline_seconds)),
+                        '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
                         '-keyout', str(self.root/'key.pem'), '-out', str(self.root/'cert.pem')],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.tls = ssl.create_default_context(cafile=str(self.root/'cert.pem'))
@@ -106,6 +143,7 @@ class Stress:
         self.ambiguous = []
         self.started = time.monotonic()
         self.report = {'status': 'RUNNING', 'engine_sha256': digest(args.binary.read_bytes()),
+                       'requested_io_backend': self.io_backend,
                        'scope': 'isolated loopback HTTPS; distinct member filesystems; no physical power-cut qualification',
                        'topology': {'data_shards': args.data_shards, 'parity_shards': args.parity_shards, 'roots': list(map(str, self.roots))},
                        'strict_uploads': True, 'automatic_write_retries': False, 'phases': self.phases}
@@ -121,6 +159,11 @@ class Stress:
             process = self.process
             if process is None or process.poll() is not None:
                 continue
+            problem = self.storage_problem()
+            if problem:
+                self.fault = problem
+                process.kill()
+                return
             try:
                 status = dict(line.split(':', 1) for line in Path(f'/proc/{process.pid}/status').read_text().splitlines() if ':' in line)
                 sample = {'seconds': round(time.monotonic()-self.started, 3), 'phase': self.phase,
@@ -139,7 +182,17 @@ class Stress:
             except (FileNotFoundError, ProcessLookupError, KeyError):
                 pass
 
+    def storage_problem(self):
+        for path, device in self.storage_devices.items():
+            try:
+                if path.stat().st_dev != device:
+                    return f'Test filesystem changed or unmounted: {path}'
+            except OSError as error:
+                return f'Test filesystem unavailable: {path}: {error}'
+        return None
+
     def start(self, label):
+        assert not self.storage_problem(), self.storage_problem()
         log = (self.root/f'engine-{label}.log').open('wb')
         environment = {key: value for key, value in os.environ.items() if not key.startswith('N1_')}
         environment.update(RUST_LOG='info', RUST_BACKTRACE='1', N1_REFRESH_STORE_ROOT=str(self.root/'refresh'))
@@ -159,11 +212,13 @@ class Stress:
 
     def stop(self):
         process = self.process
+        # The sampler must not mistake our intentional SIGKILL/restart for an
+        # unexpected engine exit while wait() reaps this owned child.
+        self.process = None
         if process is not None:
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=15)
-            self.process = None
 
     def call(self, method, route, data=None, token=None, record=True, headers=None):
         if self.fault:
@@ -172,7 +227,8 @@ class Stress:
         if connection is None or generation != self.generation:
             if connection:
                 connection.close()
-            connection = http.client.HTTPSConnection('127.0.0.1', self.args.port, context=self.tls, timeout=90)
+            connection = http.client.HTTPSConnection('127.0.0.1', self.args.port, context=self.tls,
+                                                     timeout=getattr(self.args, 'request_timeout_seconds', 90))
             self.local.connection = (connection, self.generation)
         headers = dict(headers or {})
         if token is None:
@@ -445,6 +501,7 @@ class Stress:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
+    parser.add_argument('--io-backend', choices=('auto', 'uring', 'blocking'), default='auto')
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--member-parent', type=Path, action='append', required=True)
     parser.add_argument('--data-shards', type=int, default=1)

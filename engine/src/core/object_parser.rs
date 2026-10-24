@@ -10,7 +10,6 @@ use chrono::{TimeZone, Utc};
 use futures_util::stream;
 use once_cell::sync::{Lazy, OnceCell};
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -165,8 +164,8 @@ fn shard_dir_with_locality_hint<'a>(
 }
 
 async fn read_chunk_with_retries(
-    file_cache: &mut HashMap<String, File>,
-    recovery_file_cache: &mut HashMap<String, File>,
+    file_cache: &mut HashMap<String, crate::core::recovery::ShardReadHandle>,
+    recovery_file_cache: &mut HashMap<String, crate::core::recovery::ShardReadHandle>,
     shard_dir: &PathBuf,
     part: Arc<PartMetadata>,
     shard_index: usize,
@@ -291,8 +290,8 @@ pub async fn stream_object_logic(
         end: u64,
         parts: Vec<Arc<PartMetadata>>,
         shard_dirs: Vec<PathBuf>,
-        file_cache: HashMap<String, File>,
-        recovery_file_cache: HashMap<String, File>,
+        file_cache: HashMap<String, crate::core::recovery::ShardReadHandle>,
+        recovery_file_cache: HashMap<String, crate::core::recovery::ShardReadHandle>,
         current_part_idx: usize,
         current_part_offset: u64,
         stripe_size: usize,

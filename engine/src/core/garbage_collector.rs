@@ -5,7 +5,7 @@ use crate::core::fragment_identity::{
 };
 use crate::core::index;
 use crate::core::index_store;
-use crate::core::io_scheduler::{DiskIoClass, IoProgress, acquire_disk_io};
+use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, IoProgress, acquire_disk_io};
 use crate::core::operation_gate::safety_read_only_reason;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 mod reclaim;
-pub(crate) use reclaim::reclaim_object_versions;
+pub(crate) use reclaim::{object_directory_present, reclaim_object_versions};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GcJobStatus {
@@ -84,17 +84,6 @@ impl GcExecutionMode {
             Self::Scrub => MaintenanceAccessMode::Quiesced,
         }
     }
-
-    fn file_ttl(self, is_manual_run: bool) -> Duration {
-        if !is_manual_run {
-            return Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
-        }
-        match self {
-            Self::Availability => Duration::from_secs(1),
-            Self::Strict => Duration::from_secs(1),
-            Self::Scrub => Duration::ZERO,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,14 +103,21 @@ impl Default for GcRunOptions {
 
 impl GcRunOptions {
     fn file_ttl(self, is_manual_run: bool) -> Duration {
-        if !self.fast_mode {
-            return self.execution_mode.file_ttl(is_manual_run);
-        }
+        let configured_ttl = if is_manual_run {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds)
+        };
+        self.file_ttl_with_config(is_manual_run, configured_ttl)
+    }
+
+    fn file_ttl_with_config(self, is_manual_run: bool, configured_ttl: Duration) -> Duration {
         if !is_manual_run {
-            return Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+            return configured_ttl;
         }
         match self.execution_mode {
-            GcExecutionMode::Availability => Duration::from_secs(5),
+            GcExecutionMode::Availability if self.fast_mode => Duration::from_secs(5),
+            GcExecutionMode::Availability => Duration::from_secs(1),
             GcExecutionMode::Strict => Duration::from_secs(1),
             GcExecutionMode::Scrub => Duration::ZERO,
         }
@@ -161,6 +157,59 @@ where
     f(&mut st);
 }
 
+fn begin_gc_job(is_manual_run: bool, target_fragment: Option<&str>) -> bool {
+    if GC_RUNNING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
+    // Publish admission before returning 202 or beginning a scheduled run.
+    // Both entry points must share the same mutual exclusion and status.
+    with_gc_status_write(|st| {
+        *st = GcJobStatus {
+            is_running: true,
+            phase: "Initializing".to_string(),
+            is_manual_run,
+            current_fragment: target_fragment.unwrap_or_default().to_string(),
+            start_timestamp: Utc::now().timestamp(),
+            ..Default::default()
+        };
+    });
+    true
+}
+
+fn finalize_gc_status(status: &mut GcJobStatus, stopped: bool) {
+    status.is_running = false;
+    if stopped && status.phase != "Failed" {
+        status.phase = "Stopped by User".to_string();
+    } else if status.phase != "Failed" && status.phase != "Stopped by User" {
+        status.phase = if status.total_errors > 0 {
+            "Completed with errors"
+        } else {
+            "Completed"
+        }
+        .to_string();
+    }
+}
+
+async fn run_gc_job(
+    state: Arc<AppState>,
+    is_manual_run: bool,
+    target_fragment: Option<String>,
+    options: GcRunOptions,
+) {
+    if let Err(err) = run_gc_scan_offthread(state, is_manual_run, target_fragment, options).await {
+        error!("GC scan failed (manual={}): {}", is_manual_run, err);
+        with_gc_status_write(|st| {
+            st.total_errors = st.total_errors.saturating_add(1);
+            st.last_error = Some(err.to_string());
+            st.phase = "Failed".to_string();
+        });
+    }
+    with_gc_status_write(|st| finalize_gc_status(st, should_stop_gc()));
+    GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
+    GC_RUNNING.store(false, Ordering::SeqCst);
+}
+
 async fn run_gc_scan_offthread(
     state: Arc<AppState>,
     is_manual_run: bool,
@@ -195,102 +244,19 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     };
     let cleanup_interval = Duration::from_secs(interval_secs);
 
-    let _ = state;
     loop {
         if safety_read_only_reason().is_some() {
             sleep(cleanup_interval).await;
             continue;
         }
-        if GC_RUNNING.swap(true, Ordering::SeqCst) {
+        if !begin_gc_job(false, None) {
             sleep(cleanup_interval).await;
             continue;
         }
-        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
-
-        let path_manager = ObjectPathManager::new();
-        let index_roots = path_manager.get_all_index_roots();
-        let mut fragments = collect_gc_fragments(&index_roots)
-            .into_iter()
-            .collect::<Vec<_>>();
-        fragments.sort();
-        let started = std::time::Instant::now();
-        with_gc_status_write(|st| {
-            *st = GcJobStatus {
-                is_running: true,
-                phase: "Scanning trash lifecycle namespace".to_string(),
-                is_manual_run: false,
-                total_fragments: fragments.len() as u64,
-                start_timestamp: Utc::now().timestamp(),
-                ..Default::default()
-            };
-        });
-
-        for fragment in fragments {
-            if should_stop_gc() {
-                break;
-            }
-            with_gc_status_write(|st| {
-                st.current_fragment = fragment.clone();
-                st.phase = format!("Scanning .trash for fragment {fragment}");
-            });
-            match index_store::fragment_meta(&fragment) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    with_gc_status_write(|st| {
-                        st.total_errors = st.total_errors.saturating_add(1);
-                        st.last_error =
-                            Some(format!("fragment {fragment} has no N1 3 engine metadata"));
-                    });
-                    continue;
-                }
-                Err(err) => {
-                    with_gc_status_write(|st| {
-                        st.total_errors = st.total_errors.saturating_add(1);
-                        st.last_error = Some(format!(
-                            "fragment {fragment} failed the N1 3 engine-format gate: {err}"
-                        ));
-                    });
-                    continue;
-                }
-            }
-            match global_namespace_runtime()
-                .sweep_expired_trash(
-                    &fragment,
-                    CONFIG.garbage_collector.trash_retention_seconds,
-                    Utc::now().timestamp(),
-                )
-                .await
-            {
-                Ok(summary) => with_gc_status_write(|st| {
-                    st.total_fragments_scanned = st.total_fragments_scanned.saturating_add(1);
-                    st.total_trash_versions_expired = st
-                        .total_trash_versions_expired
-                        .saturating_add(summary.expired_versions);
-                    st.duration_seconds = started.elapsed().as_secs();
-                }),
-                Err(err) => {
-                    error!("Trash lifecycle scan failed for {}: {}", fragment, err);
-                    with_gc_status_write(|st| {
-                        st.total_errors = st.total_errors.saturating_add(1);
-                        st.last_error = Some(err.to_string());
-                    });
-                }
-            }
-        }
-
-        with_gc_status_write(|st| {
-            st.is_running = false;
-            st.phase = if should_stop_gc() {
-                "Stopped by User".to_string()
-            } else if st.total_errors > 0 {
-                "Completed with errors".to_string()
-            } else {
-                "Trash lifecycle completed".to_string()
-            };
-            st.duration_seconds = started.elapsed().as_secs();
-        });
-        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
-        GC_RUNNING.store(false, Ordering::SeqCst);
+        // Scheduled GC is the same conservative collector as manual GC, not
+        // a separate trash-only loop. It also expires durable sessions and
+        // discovers abandoned normal-upload versions using configured TTLs.
+        run_gc_job(state.clone(), false, None, GcRunOptions::default()).await;
         sleep(cleanup_interval).await;
     }
 }
@@ -353,49 +319,14 @@ pub async fn run_garbage_collector(
         execution_mode,
         fast_mode,
     };
-    if GC_RUNNING.swap(true, Ordering::SeqCst) {
+    if !begin_gc_job(true, target_fragment.as_deref()) {
         return (
             StatusCode::CONFLICT,
             "GC is already running. Check /noa/v1/maintenance/gc/status.".to_string(),
         );
     }
-    GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
-    // Publish admission before returning 202: immediate status polling must
-    // never mistake the preceding job's completion for this job's completion.
-    with_gc_status_write(|st| {
-        *st = GcJobStatus {
-            is_running: true,
-            phase: "Initializing".to_string(),
-            is_manual_run: true,
-            current_fragment: target_fragment.clone().unwrap_or_default(),
-            start_timestamp: Utc::now().timestamp(),
-            ..Default::default()
-        };
-    });
     tokio::spawn(async move {
-        if let Err(err) = run_gc_scan_offthread(state.clone(), true, target_fragment, options).await
-        {
-            error!("Manual GC Scan failed: {}", err);
-            with_gc_status_write(|st| {
-                st.total_errors += 1;
-                st.last_error = Some(err.to_string());
-                st.phase = "Failed".to_string();
-            });
-        }
-
-        with_gc_status_write(|st| {
-            st.is_running = false;
-            if st.phase != "Failed" && st.phase != "Stopped by User" {
-                st.phase = if st.total_errors > 0 {
-                    "Completed with errors"
-                } else {
-                    "Completed"
-                }
-                .to_string();
-            }
-        });
-        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
-        GC_RUNNING.store(false, Ordering::SeqCst);
+        run_gc_job(state, true, target_fragment, options).await;
     });
 
     (StatusCode::ACCEPTED, "GC started".to_string())
@@ -438,6 +369,7 @@ fn gc_cleanup_version_dir_unix(
     now: SystemTime,
     gc_ttl: Duration,
     is_manual: bool,
+    cleanup_batch_temps: bool,
 ) {
     let _snapshot_boundary = crate::core::backup::barrier::mutation();
     let rd = match fs::read_dir(version_dir) {
@@ -456,15 +388,53 @@ fn gc_cleanup_version_dir_unix(
             None => continue,
         };
 
-        let md = match fs::symlink_metadata(&p) {
-            Ok(m) => m,
+        let file_type = match ent.file_type() {
+            Ok(kind) => kind,
             Err(_) => continue,
         };
 
-        if md.file_type().is_symlink() {
+        if is_batch_temporary_name(&name) {
+            // Request-owned private metadata can remain below an otherwise
+            // committed version after interruption. Reuse this existing pass,
+            // under the caller's object reclaim guard. No immutable payload or
+            // authority names match this exact private-file grammar.
+            if cleanup_batch_temps
+                && file_type.is_file()
+                && version_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| ulid::Ulid::from_string(name).is_ok())
+            {
+                if let Ok(metadata) = fs::symlink_metadata(&p) {
+                    if metadata.file_type().is_file() {
+                        if let Ok(modified) = metadata.modified() {
+                            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+                            // Manual compatibility cleanup does not bypass the
+                            // provided orphan TTL for private batch files.
+                            if orphan_blob_age_expired(age, gc_ttl) {
+                                let _ = fs::remove_file(&p);
+                            }
+                        }
+                    }
+                }
+            }
+            // Never follow batch-name symlinks or treat them as legacy links.
+            continue;
+        }
+
+        if file_type.is_symlink() {
             symlinks.push(p);
             continue;
         }
+        // Ordinary immutable shards do not need a metadata lookup merely
+        // because GC visits their version directory for legacy artifacts.
+        if !name.ends_with(GC_SUFFIX) && !name.contains(".preexisting.") {
+            continue;
+        }
+        let md = match fs::symlink_metadata(&p) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
 
         if name.ends_with(GC_SUFFIX) {
             let modified = md.modified().unwrap_or(now);
@@ -565,7 +535,14 @@ fn gc_cleanup_version_dir_unix(
     _now: SystemTime,
     _gc_ttl: Duration,
     _is_manual: bool,
+    _cleanup_batch_temps: bool,
 ) {
+}
+
+fn is_batch_temporary_name(name: &str) -> bool {
+    name.strip_prefix(".n1-batch-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .is_some_and(|id| ulid::Ulid::from_string(id).is_ok_and(|parsed| parsed.to_string() == id))
 }
 
 #[inline]
@@ -614,6 +591,250 @@ fn record_gc_preservation_error(fragment: &str, context: &str, error: impl std::
     });
 }
 
+// Rejoin the existing scheduler between bounded groups of objects instead of
+// holding one background permit for an entire storage-pool traversal. This is
+// admission cooperation, not a claim that filesystem IOPS have a fixed cost.
+const GC_OBJECTS_PER_ADMISSION: usize = 128;
+
+struct GcIoScope {
+    guard: Option<DiskIoGuard>,
+    fragment: Option<String>,
+    objects_in_admission: usize,
+    admission_started: std::time::Instant,
+}
+
+fn foreground_yield_duration(work: Duration, queued_foreground: usize) -> Duration {
+    if queued_foreground == 0 {
+        Duration::ZERO
+    } else {
+        work.min(Duration::from_millis(250))
+    }
+}
+
+impl GcIoScope {
+    async fn new(fragment: Option<&str>) -> Result<Option<Self>, AppError> {
+        Ok(acquire_gc_io(fragment).await?.map(|guard| Self {
+            guard: Some(guard),
+            fragment: fragment.map(str::to_string),
+            objects_in_admission: 0,
+            admission_started: std::time::Instant::now(),
+        }))
+    }
+
+    fn heartbeat(&self) {
+        if let Some(guard) = &self.guard {
+            guard.heartbeat();
+        }
+    }
+
+    fn progress_handle(&self) -> IoProgress {
+        self.guard
+            .as_ref()
+            .expect("GC work requires a scheduler admission")
+            .progress_handle()
+    }
+
+    fn record_progress(&self, bytes: u64) {
+        if let Some(guard) = &self.guard {
+            guard.record_progress(bytes);
+        }
+    }
+
+    fn rejoin_due(&self) -> bool {
+        self.objects_in_admission.saturating_add(1) >= GC_OBJECTS_PER_ADMISSION
+    }
+
+    async fn cooperate(&mut self, fragment_boundary: bool) -> Result<bool, AppError> {
+        self.heartbeat();
+        if should_stop_gc() {
+            return Ok(false);
+        }
+        self.objects_in_admission = self.objects_in_admission.saturating_add(1);
+        if !fragment_boundary && self.objects_in_admission < GC_OBJECTS_PER_ADMISSION {
+            return Ok(true);
+        }
+        let work = self.admission_started.elapsed();
+        self.complete();
+        let foreground = crate::core::io_scheduler::disk_io_scheduler_snapshot().queued_foreground;
+        // Returning a reserved background permit alone cannot give the same
+        // physical drive a foreground-only service window. Give queued clients
+        // a bounded window, while guaranteeing GC can continue under load.
+        let pause = foreground_yield_duration(work, foreground);
+        if pause.is_zero() {
+            tokio::task::yield_now().await;
+        } else {
+            sleep(pause).await;
+        }
+        self.guard = acquire_gc_io(self.fragment.as_deref()).await?;
+        self.objects_in_admission = 0;
+        self.admission_started = std::time::Instant::now();
+        Ok(self.guard.is_some())
+    }
+
+    fn complete(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.complete();
+        }
+    }
+}
+
+async fn acquire_gc_io(fragment: Option<&str>) -> Result<Option<DiskIoGuard>, AppError> {
+    if should_stop_gc() {
+        return Ok(None);
+    }
+    let admission = acquire_disk_io(DiskIoClass::BackgroundGc, fragment, "garbage collection");
+    tokio::pin!(admission);
+    loop {
+        tokio::select! {
+            result = &mut admission => return result.map(Some),
+            _ = sleep(Duration::from_millis(100)) => {
+                if should_stop_gc() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+async fn continue_fragment_gc(
+    io_scope: &mut GcIoScope,
+    export_guard: &mut Option<tokio::sync::MutexGuard<'static, ()>>,
+    fragment: &str,
+    blob_roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    if let Some(reason) = safety_read_only_reason() {
+        record_gc_preservation_error(fragment, "node entered safety read-only mode", reason);
+        return Ok(false);
+    }
+    let rejoining = io_scope.rejoin_due();
+    if rejoining {
+        // Never wait for another I/O admission while preventing a new export
+        // from being admitted. Recheck durable export protection afterwards.
+        drop(export_guard.take());
+    }
+    if !io_scope.cooperate(false).await? {
+        return Ok(false);
+    }
+    if rejoining && !gc_members_available(fragment, blob_roots) {
+        return Ok(false);
+    }
+    if export_guard.is_none() {
+        *export_guard = crate::core::export::gc_reclaim_guard(fragment).await?;
+    }
+    Ok(export_guard.is_some())
+}
+
+async fn collect_fragment_references(
+    fragment: &str,
+    blob_roots: &[PathBuf],
+    io_scope: &mut GcIoScope,
+    export_guard: &mut Option<tokio::sync::MutexGuard<'static, ()>>,
+) -> Result<Option<BTreeSet<String>>, AppError> {
+    let mut scan = crate::namespace::flat::GcReferenceScan::new(fragment)?;
+    let mut objects = BTreeSet::new();
+    loop {
+        // Physical directory/NCX reads can block on a busy HDD. Retain the
+        // cursor across bounded blocking jobs instead of occupying an async
+        // request worker or rebuilding a sorted inventory for every batch.
+        let (next_scan, batch) = tokio::task::spawn_blocking(move || {
+            let batch = scan.next_batch(GC_OBJECTS_PER_ADMISSION);
+            (scan, batch)
+        })
+        .await
+        .map_err(|error| AppError::InternalServerError(format!("GC reference worker: {error}")))?;
+        scan = next_scan;
+        let Some(batch) = batch? else {
+            break;
+        };
+        objects.extend(batch);
+        io_scope.heartbeat();
+        // Preparation yields after bounded physical entries too, not only
+        // after later object reclamation. Never retain export admission while
+        // queued for the next I/O batch; late exports still defer reclamation.
+        io_scope.objects_in_admission = GC_OBJECTS_PER_ADMISSION - 1;
+        if !continue_fragment_gc(io_scope, export_guard, fragment, blob_roots).await? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(objects))
+}
+
+fn gc_members_available(fragment: &str, blob_roots: &[PathBuf]) -> bool {
+    if let Some(reason) = safety_read_only_reason() {
+        record_gc_preservation_error(fragment, "node is safety read-only", reason);
+        return false;
+    }
+    if blob_roots.is_empty() {
+        record_gc_preservation_error(fragment, "storage members unavailable", "no enrolled roots");
+        return false;
+    }
+    if let Some(root) = blob_roots
+        .iter()
+        .find(|root| !crate::core::storage_pool::root_available(root))
+    {
+        record_gc_preservation_error(
+            fragment,
+            "storage member identity or availability cannot be proven",
+            root.display(),
+        );
+        return false;
+    }
+    gc_fragment_roots_are_directories(fragment, blob_roots)
+}
+
+fn gc_fragment_roots_are_directories(fragment: &str, blob_roots: &[PathBuf]) -> bool {
+    for root in blob_roots {
+        let physical_root =
+            crate::core::fragment_identity::physical_fragment_root_on(root, fragment);
+        match fs::symlink_metadata(&physical_root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            // A fragment need not exist in every storage pool. A missing
+            // fragment is not permission to traverse a redirected one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                record_gc_preservation_error(
+                    fragment,
+                    "physical fragment root is redirected or is not a directory",
+                    physical_root.display(),
+                );
+                return false;
+            }
+            Err(error) => {
+                record_gc_preservation_error(
+                    fragment,
+                    "cannot inspect physical fragment root",
+                    error,
+                );
+                return false;
+            }
+        }
+        for internal in [".trash", ".namespace", ".uploads", ".objects"] {
+            let path = physical_root.join(internal);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    record_gc_preservation_error(
+                        fragment,
+                        "internal fragment root is redirected or is not a directory",
+                        path.display(),
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    record_gc_preservation_error(
+                        fragment,
+                        "cannot inspect internal fragment root",
+                        error,
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 async fn perform_gc_scan(
     state: Arc<AppState>,
     is_manual_run: bool,
@@ -622,9 +843,18 @@ async fn perform_gc_scan(
 ) -> Result<(), AppError> {
     let _maintenance_gate =
         acquire_maintenance_mode(options.execution_mode.maintenance_access_mode());
+    let Some(mut io_scope) = GcIoScope::new(target_fragment.as_deref()).await? else {
+        return Ok(());
+    };
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
-    let blob_roots = path_manager.get_blob_roots();
+    // Foreground placement filters unavailable roots. Reclamation must not:
+    // omitting a failed member could hide the only surviving reference and
+    // turn an incomplete namespace view into destructive orphan evidence.
+    let blob_roots = crate::core::disk_manager::BLOB_STORE_DISKS
+        .get()
+        .map(|roots| roots.iter().map(PathBuf::from).collect::<Vec<_>>())
+        .unwrap_or_default();
 
     let mut fragments = collect_gc_fragments(&index_roots)
         .into_iter()
@@ -645,18 +875,6 @@ async fn perform_gc_scan(
     );
     let fragment_count = fragments.len() as u64;
     let start = std::time::Instant::now();
-    let scheduler_fragment = if fragments.len() == 1 {
-        fragments.first().map(String::as_str)
-    } else {
-        None
-    };
-    let io_guard = acquire_disk_io(
-        DiskIoClass::BackgroundGc,
-        scheduler_fragment,
-        "garbage collection",
-    )
-    .await?;
-    let io_progress = io_guard.progress_handle();
     with_gc_status_write(|st| {
         st.is_running = true;
         st.phase = format!(
@@ -694,7 +912,7 @@ async fn perform_gc_scan(
                 st.total_errors = st.total_errors.saturating_add(1);
                 st.duration_seconds = start.elapsed().as_secs();
             });
-            io_guard.complete();
+            io_scope.complete();
             return Ok(());
         }
     };
@@ -703,7 +921,7 @@ async fn perform_gc_scan(
         if should_stop_gc() {
             break;
         }
-        io_guard.heartbeat();
+        io_scope.heartbeat();
         with_gc_status_write(|st| {
             st.current_fragment = fragment.clone();
             st.phase = format!("Processing fragment {}", fragment);
@@ -717,11 +935,11 @@ async fn perform_gc_scan(
             is_manual_run,
             options,
             &state,
-            &io_progress,
+            &mut io_scope,
             &export_gc_protection,
         )
-        .await;
-        io_guard.record_progress(stats.refund_bytes);
+        .await?;
+        io_scope.record_progress(stats.refund_bytes);
 
         with_gc_status_write(|st| {
             st.total_fragments_scanned += 1;
@@ -732,6 +950,9 @@ async fn perform_gc_scan(
             st.total_refund_bytes += stats.refund_bytes;
             st.duration_seconds = start.elapsed().as_secs();
         });
+        if !io_scope.cooperate(true).await? {
+            break;
+        }
     }
 
     if should_stop_gc() {
@@ -740,7 +961,7 @@ async fn perform_gc_scan(
             st.phase = "Stopped by User".to_string();
             st.duration_seconds = start.elapsed().as_secs();
         });
-        io_guard.complete();
+        io_scope.complete();
         return Ok(());
     }
 
@@ -749,7 +970,7 @@ async fn perform_gc_scan(
         st.phase = "Finalizing".to_string();
         st.duration_seconds = start.elapsed().as_secs();
     });
-    io_guard.complete();
+    io_scope.complete();
     Ok(())
 }
 
@@ -774,10 +995,20 @@ async fn process_fragment_gc(
     is_manual_run: bool,
     _options: GcRunOptions,
     _state: &Arc<AppState>,
-    io_progress: &IoProgress,
+    io_scope: &mut GcIoScope,
     export_gc_protection: &HashSet<String>,
-) -> FragmentGcStats {
+) -> Result<FragmentGcStats, AppError> {
     let mut stats = FragmentGcStats::default();
+    if !gc_members_available(fragment, blob_roots) {
+        return Ok(stats);
+    }
+    let _fragment_lifecycle = match crate::core::fragment_lifecycle::acquire_live(fragment).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            record_gc_preservation_error(fragment, "fragment lifecycle unavailable", error);
+            return Ok(stats);
+        }
+    };
 
     match index_store::fragment_meta(fragment) {
         Ok(Some(_)) => {}
@@ -787,11 +1018,11 @@ async fn process_fragment_gc(
                 "engine metadata unavailable",
                 "missing N1 3 metadata",
             );
-            return stats;
+            return Ok(stats);
         }
         Err(err) => {
             record_gc_preservation_error(fragment, "engine-format gate failed", err);
-            return stats;
+            return Ok(stats);
         }
     }
 
@@ -800,7 +1031,11 @@ async fn process_fragment_gc(
             "GC: preserving fragment {} while a durable export is active",
             fragment
         );
-        return stats;
+        return Ok(stats);
+    }
+    let mut export_guard = crate::core::export::gc_reclaim_guard(fragment).await?;
+    if export_guard.is_none() {
+        return Ok(stats);
     }
 
     let now = SystemTime::now();
@@ -809,7 +1044,7 @@ async fn process_fragment_gc(
         Ok(scan) => scan,
         Err(error) => {
             record_gc_preservation_error(fragment, "cannot track concurrent uploads", error);
-            return stats;
+            return Ok(stats);
         }
     };
     let now_ts = Utc::now().timestamp();
@@ -824,7 +1059,7 @@ async fn process_fragment_gc(
                 "cannot establish durable upload protection",
                 error,
             );
-            return stats;
+            return Ok(stats);
         }
     };
     for session in active_sessions {
@@ -848,7 +1083,7 @@ async fn process_fragment_gc(
                 "cannot establish standard upload protection",
                 error,
             );
-            return stats;
+            return Ok(stats);
         }
     }
 
@@ -856,106 +1091,152 @@ async fn process_fragment_gc(
     // protected while namespace publication proceeds. This ordering is not a
     // transactionally consistent snapshot of every concurrent mutation.
     // Do not begin destructive cleanup until both session sources were read.
-    match global_namespace_runtime()
+    let trash_started = std::time::Instant::now();
+    let trash_expiration = global_namespace_runtime()
         .sweep_expired_trash(fragment, retention.as_secs(), now_unix)
-        .await
-    {
+        .await;
+    crate::io_control::record_io_latency(
+        "gc.trash.expiration",
+        trash_started.elapsed(),
+        0,
+        trash_expiration.is_ok(),
+    );
+    match trash_expiration {
         Ok(summary) => stats.trash_versions_expired = summary.expired_versions,
         Err(err) => {
             record_gc_preservation_error(fragment, "trash lifecycle failed", err);
-            return stats;
+            return Ok(stats);
         }
     }
-    let protected_object_ids = match global_namespace_runtime()
-        .reachability_snapshot_if_present(fragment)
-        .await
-    {
-        Ok(Some(snapshot)) => snapshot.referenced_object_ids,
+    let references_started = std::time::Instant::now();
+    let references =
+        collect_fragment_references(fragment, blob_roots, io_scope, &mut export_guard).await;
+    crate::io_control::record_io_latency(
+        "gc.namespace.references",
+        references_started.elapsed(),
+        0,
+        references.is_ok(),
+    );
+    let protected_object_ids = match references {
+        Ok(Some(objects)) => objects,
         Ok(None) => {
-            record_gc_preservation_error(
-                fragment,
-                "namespace reachability unavailable",
-                "missing snapshot",
-            );
-            return stats;
+            // Stop or late export admission deliberately deferred this pass.
+            return Ok(stats);
         }
         Err(err) => {
             record_gc_preservation_error(fragment, "namespace reachability unavailable", err);
-            return stats;
+            return Ok(stats);
         }
     };
 
     for (version_id, amount, object_id) in &sessions_to_delete {
-        io_progress.heartbeat();
+        if !continue_fragment_gc(io_scope, &mut export_guard, fragment, blob_roots).await? {
+            return Ok(stats);
+        }
         if should_stop_gc() {
-            return stats;
+            return Ok(stats);
         }
         let _reclaim_guard = match upload_scan.try_reclaim(object_id) {
             Ok(Some(guard)) => guard,
             Ok(None) => continue,
             Err(error) => {
                 record_gc_preservation_error(fragment, "cannot fence expired session", error);
-                return stats;
+                return Ok(stats);
             }
         };
         if let Err(error) = index::remove_session(fragment, version_id, "gc-expired").await {
             record_gc_preservation_error(fragment, "cannot expire durable upload session", error);
-            return stats;
+            return Ok(stats);
         }
         stats.sessions_deleted = stats.sessions_deleted.saturating_add(1);
         stats.refund_bytes = stats.refund_bytes.saturating_add(*amount);
     }
 
     for root in blob_roots {
-        io_progress.heartbeat();
+        io_scope.heartbeat();
         if should_stop_gc() {
-            return stats;
+            return Ok(stats);
         }
-        let object_dirs = match index_store::local_object_dirs_under_root(root, fragment) {
+        let mut object_dirs = match index_store::LocalObjectDirCursor::new(root, fragment) {
             Ok(dirs) => dirs,
             Err(error) => {
                 record_gc_preservation_error(fragment, "object directory scan failed", error);
                 continue;
             }
         };
-        for (object_dir, object_id) in object_dirs {
-            io_progress.heartbeat();
-            if should_stop_gc() {
-                return stats;
+        loop {
+            if !continue_fragment_gc(io_scope, &mut export_guard, fragment, blob_roots).await? {
+                return Ok(stats);
             }
-            let object_is_referenced = protected_object_ids.contains(&object_id);
-            let _reclaim_guard = if object_is_referenced {
-                None
-            } else {
-                match upload_scan.try_reclaim(&object_id) {
-                    Ok(Some(guard)) => Some(guard),
-                    Ok(None) => continue,
-                    Err(error) => {
-                        record_gc_preservation_error(
-                            fragment,
-                            "cannot fence orphan reclamation",
-                            error,
-                        );
-                        return stats;
-                    }
+            let (object_dir, object_id) = match object_dirs.next_object() {
+                Ok(Some(object)) => object,
+                Ok(None) => break,
+                Err(error) => {
+                    record_gc_preservation_error(fragment, "object directory scan failed", error);
+                    break;
                 }
             };
-            if let Ok(entries) = std::fs::read_dir(&object_dir) {
-                for entry in entries.filter_map(Result::ok) {
-                    if should_stop_gc() {
-                        return stats;
-                    }
-                    let path = entry.path();
-                    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                        continue;
-                    }
-                    gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
-                    if object_is_referenced {
-                        stats.live_versions_seen = stats.live_versions_seen.saturating_add(1);
+            let object_is_referenced = protected_object_ids.contains(&object_id);
+            let _reclaim_guard = match upload_scan.try_reclaim(&object_id) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => continue,
+                Err(error) => {
+                    record_gc_preservation_error(
+                        fragment,
+                        "cannot fence orphan reclamation",
+                        error,
+                    );
+                    return Ok(stats);
+                }
+            };
+            let io_progress = io_scope.progress_handle();
+            // The reclaim helpers inspect compatibility artifacts during their
+            // existing version-directory pass, not a separate object walk.
+            // Explicit manual GC retains its existing immediate-artifact
+            // cleanup policy, independent of the configured orphan TTL.
+            if is_manual_run {
+                if let Ok(entries) = fs::read_dir(&object_dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        io_progress.heartbeat();
+                        if should_stop_gc() {
+                            return Ok(stats);
+                        }
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                            let version = entry.file_name().to_string_lossy().into_owned();
+                            gc_cleanup_version_dir_unix(
+                                &entry.path(),
+                                now,
+                                file_ttl,
+                                true,
+                                !active_session_versions.contains(&version),
+                            );
+                        }
                     }
                 }
             }
             if object_is_referenced {
+                match reclaim::reclaim_unpublished_versions(
+                    fragment,
+                    &object_id,
+                    &object_dir,
+                    &active_session_versions,
+                    now,
+                    file_ttl,
+                    || {
+                        io_progress.heartbeat();
+                        !should_stop_gc()
+                    },
+                ) {
+                    Ok((removed, live_seen)) => {
+                        stats.orphan_blob_dirs_deleted += removed;
+                        stats.live_versions_seen += live_seen;
+                    }
+                    Err(error) => record_gc_preservation_error(
+                        fragment,
+                        "unpublished-version reclamation incomplete",
+                        error,
+                    ),
+                }
                 continue;
             }
 
@@ -977,23 +1258,415 @@ async fn process_fragment_gc(
         }
     }
 
-    stats
+    Ok(stats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        GcExecutionMode, GcRunOptions, collect_gc_fragments, orphan_version_reclaimable,
-        parse_gc_execution_mode,
+        GcExecutionMode, GcJobStatus, GcRunOptions, collect_gc_fragments,
+        orphan_version_reclaimable, parse_gc_execution_mode,
     };
     use crate::core::constants::FRAGMENT_METADATA_FILE;
     use crate::core::fragment_identity::{
         fragment_alias_dir, physical_fragment_dir_name, physical_fragment_root_on,
     };
     use std::fs;
+
+    #[test]
+    fn gc_foreground_service_window_is_bounded_and_never_disables_collection() {
+        assert_eq!(
+            super::foreground_yield_duration(Duration::from_secs(5), 0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::foreground_yield_duration(Duration::from_millis(10), 8),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            super::foreground_yield_duration(Duration::from_secs(30), 8),
+            Duration::from_millis(250)
+        );
+    }
     use std::os::unix::fs::symlink;
     use std::time::Duration;
     use ulid::Ulid;
+
+    #[test]
+    fn gc_defers_reclamation_when_any_storage_member_is_missing_or_restore_pending() {
+        let base = std::env::temp_dir().join(format!("n1-gc-member-safety-{}", Ulid::new()));
+        fs::create_dir_all(&base).unwrap();
+        let missing = base.join("missing-member");
+        assert!(!crate::core::storage_pool::root_available(&missing));
+        assert!(!super::gc_members_available("test-fragment", &[missing]));
+        let pending = base.join("restore-pending-member");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join(crate::core::instance_lease::RESTORE_PENDING),
+            b"restore not yet verified",
+        )
+        .unwrap();
+        assert!(!crate::core::storage_pool::root_available(&pending));
+        assert!(!super::gc_members_available("test-fragment", &[pending]));
+        assert!(!super::gc_members_available("test-fragment", &[]));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn gc_rejects_redirected_or_non_directory_fragment_roots_before_trash_cleanup() {
+        let base = std::env::temp_dir().join(format!("n1-gc-fragment-root-{}", Ulid::new()));
+        let roots = vec![base.join("member-a"), base.join("member-b")];
+        for root in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        let fragment = Ulid::new().to_string();
+        let physical_a = physical_fragment_root_on(&roots[0], &fragment);
+        let physical_b = physical_fragment_root_on(&roots[1], &fragment);
+        fs::create_dir_all(&physical_a).unwrap();
+        assert!(super::gc_fragment_roots_are_directories(&fragment, &roots));
+
+        let outside = base.join("outside-fragment");
+        fs::create_dir_all(outside.join(".trash")).unwrap();
+        let preserved = outside.join(".trash/must-not-be-reclaimed.ncx");
+        fs::write(&preserved, b"outside enrolled physical fragment").unwrap();
+        symlink(&outside, &physical_b).unwrap();
+        assert!(!super::gc_fragment_roots_are_directories(&fragment, &roots));
+        assert_eq!(
+            fs::read(&preserved).unwrap(),
+            b"outside enrolled physical fragment"
+        );
+        fs::remove_file(&physical_b).unwrap();
+
+        fs::write(&physical_b, b"not a directory").unwrap();
+        assert!(!super::gc_fragment_roots_are_directories(&fragment, &roots));
+        fs::remove_file(&physical_b).unwrap();
+        symlink(base.join("missing-outside-target"), &physical_b).unwrap();
+        assert!(!super::gc_fragment_roots_are_directories(&fragment, &roots));
+        fs::remove_file(&physical_b).unwrap();
+        fs::create_dir_all(&physical_b).unwrap();
+        assert!(super::gc_fragment_roots_are_directories(&fragment, &roots));
+        for internal in [".trash", ".namespace", ".uploads", ".objects"] {
+            let child = physical_b.join(internal);
+            symlink(&outside, &child).unwrap();
+            assert!(
+                !super::gc_fragment_roots_are_directories(&fragment, &roots),
+                "redirected {internal} must prevent destructive fragment traversal"
+            );
+            assert_eq!(
+                fs::read(&preserved).unwrap(),
+                b"outside enrolled physical fragment"
+            );
+            fs::remove_file(&child).unwrap();
+            fs::write(&child, b"not a directory").unwrap();
+            assert!(!super::gc_fragment_roots_are_directories(&fragment, &roots));
+            fs::remove_file(&child).unwrap();
+            fs::create_dir_all(&child).unwrap();
+            assert!(super::gc_fragment_roots_are_directories(&fragment, &roots));
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_releases_export_protection_before_queued_io_and_defers_for_late_export() {
+        use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, disk_io_scheduler_config};
+        use std::sync::atomic::Ordering;
+        use tokio::time::timeout;
+
+        let _global = crate::test_support::global_test_lock().lock().await;
+        super::GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
+        crate::core::disk_manager::FS_STORAGE_ROOT.get_or_init(|| {
+            std::env::temp_dir()
+                .join(format!("n1-matrix-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        });
+        let fragment = format!("gc-late-export-{}", Ulid::new());
+        let fixture = std::env::temp_dir().join(format!("n1-gc-queued-{}", Ulid::new()));
+        fs::create_dir_all(&fixture).unwrap();
+        assert!(crate::core::storage_pool::root_available(&fixture));
+
+        let mut io_scope = super::GcIoScope::new(Some(&fragment))
+            .await
+            .unwrap()
+            .unwrap();
+        io_scope.objects_in_admission = super::GC_OBJECTS_PER_ADMISSION - 1;
+        let export_guard = crate::core::export::gc_reclaim_guard(&fragment)
+            .await
+            .unwrap();
+        assert!(export_guard.is_some());
+        let mut blockers = Vec::new();
+        for _ in 1..disk_io_scheduler_config().background_per_fragment_permits {
+            blockers.push(
+                acquire_disk_io(
+                    DiskIoClass::BackgroundGc,
+                    Some(&fragment),
+                    "GC regression blocker",
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let (blocker_acquired_tx, blocker_acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_blocker_tx, release_blocker_rx) = tokio::sync::oneshot::channel();
+        let blocker_fragment = fragment.clone();
+        let blocker = tokio::spawn(async move {
+            let guard = acquire_disk_io(
+                DiskIoClass::BackgroundGc,
+                Some(&blocker_fragment),
+                "queued ahead of GC re-admission",
+            )
+            .await
+            .unwrap();
+            blocker_acquired_tx.send(()).unwrap();
+            let _ = release_blocker_rx.await;
+            guard.complete();
+        });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if crate::core::io_scheduler::disk_io_scheduler_snapshot().queued_background > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocker must queue behind the current GC admission");
+
+        let gc_fragment = fragment.clone();
+        let gc_root = fixture.clone();
+        let collector = tokio::spawn(async move {
+            let mut export_guard = export_guard;
+            let result = super::continue_fragment_gc(
+                &mut io_scope,
+                &mut export_guard,
+                &gc_fragment,
+                &[gc_root],
+            )
+            .await;
+            io_scope.complete();
+            (result, export_guard.is_none())
+        });
+        timeout(Duration::from_secs(5), blocker_acquired_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !collector.is_finished(),
+            "GC must be queued behind the admitted blocker"
+        );
+        let unrelated = format!("late-export-admission-{}", Ulid::new());
+        let admission_guard = timeout(
+            Duration::from_secs(5),
+            crate::core::export::gc_reclaim_guard(&unrelated),
+        )
+        .await
+        .expect(
+            "GC must release the existing export quota lock BEFORE waiting for I/O re-admission",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!collector.is_finished());
+
+        // Publish a valid, test-owned queued export under the same admission
+        // lock production export creation uses. No export worker is needed.
+        let export_id = Ulid::new().to_string();
+        let job_directory =
+            std::path::Path::new(crate::core::disk_manager::FS_STORAGE_ROOT.get().unwrap())
+                .join(".n1-exports")
+                .join(&export_id);
+        fs::create_dir_all(&job_directory).unwrap();
+        let state = serde_json::json!({
+            "id": export_id,
+            "fragment": fragment,
+            "request": {
+                "keys": ["source.bin"], "entries": [], "prefix": null,
+                "prefixes": [], "format": "tar", "filename": null,
+                "export_all": false, "include_internal": false
+            },
+            "phase": "queued", "format": "tar", "filename": "export.tar",
+            "created_at_unix": 1, "updated_at_unix": 1,
+            "expires_at_unix": chrono::Utc::now().timestamp() + 3600
+        });
+        fs::write(
+            job_directory.join("state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        drop(admission_guard);
+        release_blocker_tx.send(()).unwrap();
+        timeout(Duration::from_secs(5), blocker)
+            .await
+            .unwrap()
+            .unwrap();
+        let (continued, guard_released) = timeout(Duration::from_secs(5), collector)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !continued.unwrap(),
+            "late export protection must defer the next reclaim batch"
+        );
+        assert!(guard_released);
+        for guard in blockers {
+            guard.complete();
+        }
+        fs::remove_dir_all(job_directory).unwrap();
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn compatibility_cleanup_expires_redistribution_artifacts_without_touching_shards() {
+        let version = std::env::temp_dir().join(format!("n1-gc-compatibility-{}", Ulid::new()));
+        fs::create_dir_all(&version).unwrap();
+        let now = std::time::SystemTime::now();
+        let old = now - Duration::from_secs(120);
+        let shard = version.join("part_0_shard_0.shard");
+        let retired = version.join("part_0_shard_1.shard.gc");
+        let preexisting = version.join("part_0_shard_2.shard.preexisting.old");
+        let fresh_preexisting = version.join("part_0_shard_3.shard.preexisting.fresh");
+        fs::write(&shard, b"immutable committed payload").unwrap();
+        fs::write(&retired, b"retired redistribution piece").unwrap();
+        fs::write(&preexisting, b"expired replaced piece").unwrap();
+        fs::write(&fresh_preexisting, b"still protected by TTL").unwrap();
+        for file in [&retired, &preexisting] {
+            fs::File::open(file)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let shard_before = fs::metadata(&shard).unwrap().modified().unwrap();
+        super::gc_cleanup_version_dir_unix(&version, now, Duration::from_secs(60), false, true);
+        assert!(!retired.exists());
+        assert!(!preexisting.exists());
+        assert_eq!(
+            fs::read(&fresh_preexisting).unwrap(),
+            b"still protected by TTL"
+        );
+        assert_eq!(fs::read(&shard).unwrap(), b"immutable committed payload");
+        assert_eq!(
+            fs::metadata(&shard).unwrap().modified().unwrap(),
+            shard_before
+        );
+        fs::remove_dir_all(version).unwrap();
+    }
+
+    #[test]
+    fn scheduled_gc_uses_availability_and_never_shortens_configured_orphan_ttl() {
+        let scheduled = GcRunOptions::default();
+        assert_eq!(scheduled.execution_mode, GcExecutionMode::Availability);
+        assert!(!scheduled.fast_mode);
+        for configured in [
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Duration::from_secs(86_400),
+        ] {
+            for execution_mode in [
+                GcExecutionMode::Availability,
+                GcExecutionMode::Strict,
+                GcExecutionMode::Scrub,
+            ] {
+                for fast_mode in [false, true] {
+                    assert_eq!(
+                        GcRunOptions {
+                            execution_mode,
+                            fast_mode,
+                        }
+                        .file_ttl_with_config(false, configured),
+                        configured,
+                        "scheduled collection must not inherit aggressive manual TTLs",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_gc_finalization_preserves_failure_stop_and_error_results() {
+        for (phase, errors, stopped, expected) in [
+            ("Finalizing", 0, false, "Completed"),
+            ("Finalizing", 1, false, "Completed with errors"),
+            ("Processing fragment", 0, true, "Stopped by User"),
+            ("Stopped by User", 0, false, "Stopped by User"),
+            ("Failed", 1, false, "Failed"),
+            ("Failed", 1, true, "Failed"),
+        ] {
+            for is_manual_run in [false, true] {
+                let mut status = GcJobStatus {
+                    is_running: true,
+                    phase: phase.to_string(),
+                    total_errors: errors,
+                    is_manual_run,
+                    ..Default::default()
+                };
+                super::finalize_gc_status(&mut status, stopped);
+                assert!(!status.is_running);
+                assert_eq!(status.phase, expected);
+                assert_eq!(status.is_manual_run, is_manual_run);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_and_manual_gc_share_admission_and_count_cooperative_io_units() {
+        use std::sync::atomic::Ordering;
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
+                super::GC_RUNNING.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+        assert!(super::begin_gc_job(false, None));
+        let admitted = super::gc_status_read_clone();
+        assert!(admitted.is_running);
+        assert!(!admitted.is_manual_run);
+        assert_eq!(admitted.phase, "Initializing");
+        assert!(!super::begin_gc_job(true, Some("manual-conflict")));
+        assert!(!super::gc_status_read_clone().is_manual_run);
+
+        let fragment = format!("gc-admission-test-{}", Ulid::new());
+        let completed_units = || {
+            crate::core::io_scheduler::disk_io_scheduler_snapshot()
+                .classes
+                .into_iter()
+                .find(|class| class.class == "background_gc")
+                .unwrap()
+                .completed
+        };
+        let completed_before = completed_units();
+        let mut scope = super::GcIoScope::new(Some(&fragment))
+            .await
+            .unwrap()
+            .unwrap();
+        let own_operation = || {
+            crate::core::io_scheduler::disk_io_scheduler_snapshot()
+                .active_operations
+                .into_iter()
+                .find(|operation| operation.fragment.as_deref() == Some(fragment.as_str()))
+        };
+        let first = own_operation().expect("background GC admission is observable");
+        assert_eq!(first.class, "background_gc");
+        for _ in 1..super::GC_OBJECTS_PER_ADMISSION {
+            assert!(scope.cooperate(false).await.unwrap());
+            assert_eq!(own_operation().unwrap().operation_id, first.operation_id);
+        }
+        assert!(scope.cooperate(false).await.unwrap());
+        assert_ne!(own_operation().unwrap().operation_id, first.operation_id);
+        scope.complete();
+        assert!(own_operation().is_none());
+        assert!(completed_units() >= completed_before + 2);
+
+        super::GC_STOP_SIGNAL.store(true, Ordering::Relaxed);
+        assert!(
+            super::acquire_gc_io(Some(&fragment))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(own_operation().is_none());
+    }
 
     #[test]
     fn orphan_parent_pruning_preserves_unexpired_child() {

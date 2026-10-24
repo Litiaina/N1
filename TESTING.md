@@ -8,6 +8,861 @@ paths and credentials are intentionally omitted. Historical 3.x/4.x labels and
 binary checksums identify the private builds actually tested; they are not
 retroactively renamed or presented as newly rebuilt RC binaries.
 
+## Strict small-file groups — October 24, 2026
+
+The initial grouped candidate passed **426 library tests**, four backend-selection
+cases and the separately invoked native io_uring integration case. Subsequent
+harness/shim regressions total 109 passes. Executor hardening added two-worker
+pool saturation and queued-backup cases. The final warning-denied release build,
+both focused executor/backup regressions and explicit native integration passed.
+Its frozen 426-test executable started on MCH at **17:27 Manila**; the complete
+final suite is pending, not inferred from the earlier candidate's pass.
+
+An initial two-physical-HDD EC 1+1 gate passed boundary sizes, count/byte limits,
+duplicate keys, partial errors, concurrent rename and upload, unchanged NCX
+inodes/old immutable files, and 960 historical hash checks. Injected errors and
+process kills at each of the three observed synchronization boundaries produced
+no false successful ACK. Errors were injected **after real synchronization**;
+this is not a physical power-loss result.
+
+The stronger full-64-object fault rerun initially failed **before upload**:
+instance-lease synchronization took 41,323 ms on one USB HDD and exceeded the
+fixture's 45-second startup timeout. Its later 15-second kill/reap limit also
+expired; process absence was subsequently confirmed. Logs are preserved, not
+counted as a pass. Another intermediate library run recorded 425 passes and one
+isolated-fixture setup `ENOENT`; its mutable build executable was subsequently
+absent. The precise deletion timing is unproven. That run is unqualified, and
+the final full-suite run uses immutable copies outside the compiler output tree.
+The final candidate (`a6415893`, full SHA-256 retained with the frozen package)
+now has an independent headless supervisor on four SATA/XFS members, EC 3+1.
+It requires the final full regressions, full-64-object fault gates, scheduled
+GC/concurrency/native/read-repair gates and a matched old/new/new/old comparison
+before one million single-folder uploads, followed by one million mutations.
+The supervisor stops on failures or resource/deadline limits, without automatic
+write retries. It has a 50-hour controller bound, 4 GiB whole-service memory
+ceiling, no swap, and per-filesystem reserve/growth limits. Production services
+and earlier populations remain unchanged. No new throughput or million-object
+success is claimed until the corresponding recorded gates complete.
+
+## Native Linux I/O backend — October 23–24, 2026
+
+The first-class io_uring backend passed the following focused correctness gates.
+These are not throughput, million-object or new power-loss qualifications.
+
+| Gate | Result |
+| --- | --- |
+| Locked, offline build with warnings denied | PASS |
+| 60 distinct focused unit regressions, including the snapshot-holder ordering regression | PASS |
+| Four compatibility/selection integration cases | PASS |
+| Required native backend on the XFS HDD | PASS; 3,679 backend requests completed |
+| Required native backend on the ext4 HDD | PASS; 3,679 backend requests completed |
+
+Native checks explicitly required `uring`, asserted no fallback, and drained
+the queue and in-flight work to zero. Coverage includes 2,048 concurrent empty
+operations, 768 positioned direct-write blocks, exact readback, short reads/EOF,
+caller cancellation, strict metadata publication, directory sync and propagated
+read-only/ENOSPC errors. Unit regressions cover strict/relaxed writer boundaries,
+shared NDX allocation and replica placement, NCX copies across filesystems,
+checksum boundaries, bitrot reconstruction and read-triggered repair. Child-only
+seccomp tests deny ring setup to prove reported `auto` fallback and required
+`uring` startup refusal; host security settings are unchanged.
+
+The initial two-job compiler attempt exceeded its 4 GiB build cgroup; the final
+single-job build passed. An intermediate source-manifest mismatch was not
+counted as qualified evidence; the final build verified unchanged sources.
+No storage test failed in this focused run.
+
+Early build/test overlap with the old-binary 300k run is recorded and must
+be excluded from isolated throughput comparisons. That run was subsequently
+stopped and preserved as described below, not switched to the new backend.
+The completed matched optimized-build comparison below found a regression;
+focused correctness passes do not establish a speedup. Large-scale qualification
+remains pending.
+
+The native integration gate is deliberately opt-in on restricted CI:
+
+```sh
+N1_IO_BACKEND=uring cargo test --locked -p n1 --test linux_io_backend -- \
+  --exact io_uring_backend_preserves_positioned_io_and_publication --ignored --nocapture
+```
+
+Set `TMPDIR` and `N1_TEST_IO_DIR` to an owned test directory on the intended
+mounted test filesystem. Run separately on each filesystem to verify both.
+Raw manifests and logs remain local test artifacts, not repository content.
+
+October 24 follow-up: at the operator's request, the old upload-only run was
+stopped and preserved with 66,832 acknowledged objects (975,159,808 bytes).
+The harness records the injected SIGTERM as a failure; preservation records
+operator interruption separately. This is not a completed 300k qualification.
+All 66,832 acknowledged versions passed exact size/SHA-256 verification. The
+following namespace-snapshot phase failed the auxiliary audit's 20-second
+socket read deadline. The failure is retained, and no new stress gate was
+started by that sequence.
+
+Investigation found a snapshot/export first-frame inefficiency: configured
+root traversal can visit a non-selected NCX replica before the lexical holder
+chosen for duplicate suppression. With every key replicated in EC 1+1, that
+can walk one whole member without emitting an entry. Snapshot/export resolves
+NCX and authoritative NDX; it is not ordinary zero-decode LIST. A separate
+original-binary instrumented
+inventory diagnostic used the existing scale harness's 120-second socket
+deadline and a 900-second total bound. HTTP headers arrived in 1 ms, but no
+entry frame arrived before that 120-second deadline. Neither failure is relabeled.
+
+The candidate now sorts only its metadata cursor's root copy to match the
+existing lexical duplicate-holder selection. Pool-member/EC slot order, all
+replica traversal and ordinary LIST are unchanged. Its regression passed. An
+initial inventory emitted its first frame in 0.437 s and reached 18,944 entries
+before operator interruption; that partial inventory is not a pass. The next
+complete audit passed: all 66,832 keys/heads, no extra live keys, and the terminal
+frame verified in 731.144 s. Its first frame took 0.004 s on the partially warmed
+population; the longest inter-frame gap, including the duplicate-replica tail,
+was 11.913 s. This is not an isolated cold-cache throughput benchmark.
+The 20-second first-frame requirement and 120-second socket-idle deadline were
+unchanged. A separate bounded 3,600-second total correctness budget accounted
+for the full authoritative-metadata walk. All prior failures remain recorded.
+
+The optimized io_uring candidate built successfully with warnings denied.
+The initial headless sequences correctly stopped at the failed inventory gate.
+A headless continuation first requires the complete corrected inventory, then
+runs scheduled-GC/interruption, native-protocol and read-repair proofs and
+compares the same optimized binary in four fresh, equal
+2,048-object strict-upload trials: blocking, uring, uring, blocking. No write
+retries, concurrent benchmark workloads or reduced durability are used.
+The required-native scheduled-GC proof passed on both HDDs: expired trash,
+synthetic orphan cases, real SIGKILL-interrupted uploads/new versions and
+historical-hash verification. Its last native snapshot reported 411 submitted
+and completed backend requests, no fallback and no queued/in-flight requests;
+no manual GC or unsolicited full healing/health scan ran. A controller port-reuse
+preflight then stopped the sequence before the next proof. That orchestration
+failure is retained; a fresh sequence assigns distinct ports to its phases.
+
+Another fresh sequence failed to reach readiness within its unchanged
+45-second startup deadline. Its cause remains unconfirmed. Two separate
+instrumented matrices each passed 32 fresh starts, alternating native and
+blocking modes with the same 45-second deadline; the second matrix used the
+current frozen candidate. The first matrix's slowest native start spent
+4.95 seconds in ordinary instance-lease fsyncs, not native queue operations.
+These later passes do not explain or erase the earlier timeout. Startup now
+reports phase timings and says STARTING until readiness; no sync barrier was
+removed.
+
+On the corrected frozen candidate, scheduled GC passed again, including both
+real interrupted-upload cases, active standard/durable protection and all
+historical hashes. Its run took 33.232 s, with 50,852 KiB peak RSS and 23 peak
+descriptors. Native protocol and read-repair proofs also passed; the latter
+verified 64 concurrent readers across 16 corrupt objects and physical repair.
+These protocol/read-repair fixtures include relaxed/batched uploads; strict
+acknowledgement evidence comes from the GC and matched upload trials.
+
+The first blocking comparison passed all 2,048 strict uploads, exact hashes and
+complete namespace/head verification before and after SIGKILL/restart. Upload
+phases took 579.497 s (3.534 objects/s). The first native trial also passed all
+2,048 uploads, hashes and post-restart inventory: 646.455 s (3.168 objects/s),
+with 52,950 native operations submitted/completed at the final population
+checkpoint and no fallback or outstanding work. It was approximately 10.4%
+slower than the first blocking trial. The reverse-order trials also passed:
+679.831 s (3.013 objects/s) native, then 656.660 s (3.119 objects/s) blocking.
+Across both trials per backend, native throughput was 3.088 objects/s versus
+3.313 objects/s blocking: approximately **6.8% slower**, not a performance win.
+Each trial verified every acknowledged version and the complete namespace
+before and after SIGKILL; native-counter evidence passed separately. Peak RSS
+was 94,540 KiB native versus 82,036 KiB blocking across these trials. This is
+a bounded strict-small-object comparison on two USB-attached HDDs, not a
+general claim about io_uring or a completed scale qualification.
+
+The targeted native NCX interruption proof passed separately: a real SIGKILL
+after destination links appeared while source links and the rename request
+remained live. All 144 acknowledged historical versions survived across the
+128 keys; all 576 committed NDX/payload files retained their paths, inodes,
+timestamps, lengths and hashes. An explicit recovery retry completed the
+operation. This tests process interruption, not physical power loss.
+
+The old candidate's full 402-test library attempt was intentionally cancelled
+during the 4,097-key pagination fixture, without an assertion failure. It is
+not a full-suite pass. The replacement candidate must pass its complete
+discovered test inventory. Its fixture retains all 4,097 keys, real replica
+publication and durability barriers, and every pagination assertion; eight
+bounded workers prepare the population before listing starts. Fixture setup
+time is not an upload-throughput result.
+
+The revised candidate removes the synchronous worker-to-ring-to-worker bridge:
+asynchronous payload/read/sync operations remain native, while synchronous
+publication uses POSIX directly with the same durability barriers. This fixed
+operation policy is not fallback after an I/O error. Its locked, offline,
+warnings-denied test build passed; the complete 402-test library suite passed
+with native I/O required (zero failures, ignored or filtered tests; 542.30 s).
+The four compatibility/selection cases and separate required-native XFS/ext4
+gates also passed. Each native run completed 3,679 requests, reported POSIX
+publication, and drained queued/in-flight work to zero without fallback.
+The revised tests require strict metadata publication to leave native counters
+unchanged, then require three explicit asynchronous syncs to advance them.
+They also check POSIX write/sync errors and required-native initialization
+refusal. Its optimized release build and 32 fresh starts passed with the same
+45-second readiness bound. Its complete 66,832-entry namespace audit passed in
+555.062 s, with first-frame and terminal-frame requirements retained. This
+repeated inventory is not an isolated cold-cache speed comparison. The full
+physical recovery and 2,048-object backend comparison subsequently completed
+as recorded below.
+Test harnesses now persist an explicit backend selection in their owned environment files
+and verify the selected backend at existing health checkpoints; all 66 harness
+regressions passed.
+
+### Short before/after upload benchmark — October 24, 2026
+
+Compared frozen optimized builds `7a37820c` (native synchronous publication
+bridge) and `ad139db1` (direct POSIX synchronous publication), both requiring
+io_uring for their asynchronous paths. Four fresh trials ran old/new/new/old,
+128 objects each, on the two USB-SATA HDDs with EC 1+1 and loopback HTTPS.
+Each trial used eight concurrent 16-object batches, server concurrency 16,
+strict acknowledgement and the same deterministic 0–64 KiB size mix. No write
+retries, cache flushes, durability changes or overlapping N1 workload were used.
+
+| Metric | Previous build | Revised build |
+| --- | --- | --- |
+| Aggregate objects / upload time | 256 / 88.599 s | 256 / 67.092 s |
+| Aggregate upload throughput | 2.889 objects/s | 3.816 objects/s |
+| Mean 16-object batch HTTP request | 41.148 s | 31.528 s |
+| Sampled peak engine RSS | 58.52 MiB | 58.57 MiB |
+| Sampled peak descriptors / quiescent descriptors | 105 / 18 | 55 / 18 |
+
+Throughput was 32.1% higher in this short comparison; memory was effectively
+unchanged. Individual upload phases were 38.078, 30.833, 36.259 and 50.521 s,
+so variability is visible rather than hidden by choosing the fastest run.
+Upload timing includes client source preparation and acknowledgement logging;
+batch latency is not individual-object acknowledgement latency. All 512 strict
+uploads, 1,024 historical payload-hash checks and complete namespace/head
+inventories before and after real SIGKILL/restart passed. The long audit
+finished before the first trial, and its controller resumed afterward without
+changing its deadlines. This is a small-object result, not streaming-bandwidth,
+LAN, million-object, physical-power-loss or stable-release qualification.
+
+Separate source-review finding: the existing atomic-metadata helper can leave
+an unpublished hidden temporary sibling if its write or file sync fails before
+rename. The previously committed target is not replaced on that path. This is
+not introduced by native I/O, but temporary-file reclamation on that error path
+is not certified by these backend tests.
+
+### Completed local sequence and MCH launch — October 24, 2026
+
+The frozen revised candidate `ad139db1` completed the local controller's
+correctness sequence: full library/selection/native-filesystem gates, optimized
+build, 32 fresh starts, the complete 66,832-entry namespace audit, scheduled GC,
+native protocol, read repair and NCX interruption checks. No disk-format or
+NCX/NDX architecture change was made for the server test.
+
+Its longer matched 2,048-object blocking/uring/uring/blocking comparison also
+passed correctness in all four trials. Aggregate upload throughput was
+**3.5907 objects/s blocking versus 3.3400 objects/s native**: native was about
+**7.0% slower** on the two USB HDDs. This same-binary backend comparison and
+the short old/new implementation comparison above answer different questions;
+neither establishes MCH throughput or million-object scale.
+
+MCH's fresh headless sequence started on four independent physical SATA HDDs
+with XFS and EC 3+1. The uploaded engine/proof/helpers were SHA-256 verified;
+the engine and storage format were not rebuilt or changed on the server.
+The scheduled-GC gate passed with required-native initialization on all three
+owned starts. RC stress was running at the first launch check. Native protocol
+and physical read-repair gates precede one million upload-first objects, then
+one million hot-set mutations and final hash/inventory/restart verification.
+Those later gates remain pending until their recorded results complete.
+
+The supervisor runs independently of the SSH session, with no automatic write
+retries or restart loop, a 4 GiB memory ceiling and a 49-hour overall bound.
+It guards four mount/device/UUID/serial identities, preserves at least 140 GiB
+or 15% free per filesystem and stops at 64 GiB growth per filesystem. Existing
+production N1, Accel and Console PIDs were unchanged after launch. Their shared
+hardware load means this is not a dedicated-server benchmark. No production
+storage was formatted, restarted or used as the fixture. A launched workload
+is not a million-object, RC.2 or stable-release PASS.
+
+At the operator's subsequent request for an isolated large-file measurement,
+this sequence was stopped and preserved at **10,000 acknowledged objects,
+145,867,264 bytes**, during the 10k integrity checkpoint. The last progress
+snapshot recorded 5,509 historical downloads verified. The controller records
+the injected SIGTERM as a failure; the accompanying interruption record
+identifies the operator stop. This is not an engine-failure diagnosis or a
+completed million-object qualification. All four prerequisite gates had passed.
+
+### On-server strict 5 GB throughput — October 24, 2026
+
+The same optimized `ad139db1` binary ran in a separate fresh EC 3+1 fixture on
+MCH's four SATA/XFS members. The scale workload was stopped first; production
+services were left running. Payload traffic stayed on CA-validated loopback
+HTTPS, not the LAN. Each object was exactly **5,000,000,000 bytes** (decimal
+5 GB), with strict acknowledgement, no write retry and required native I/O.
+Only this disposable fixture's request/file-size limit was raised to 5 GB;
+the default 50 MiB one-shot part limit would otherwise reject the request.
+No engine code, storage format or durability barrier changed for the benchmark.
+
+| Measurement | Elapsed | Throughput |
+| --- | --- | --- |
+| Upload from a real file on member 0's HDD | 48.185 s | 103.767 MB/s; 98.960 MiB/s |
+| Upload identical bytes from a bounded-memory generator | 27.182 s | 183.944 MB/s; 175.423 MiB/s |
+| Historical GET + SHA-256, first object | 37.746 s | 132.463 MB/s |
+| Historical GET + SHA-256, second object | 40.397 s | 123.771 MB/s |
+| First object's GET + SHA-256 after SIGKILL/restart | 37.656 s | 132.782 MB/s |
+| Second object's GET + SHA-256 after SIGKILL/restart | 40.267 s | 124.173 MB/s |
+
+Upload time runs from connection establishment through the complete HTTP 201
+acknowledgement, including strict commit and client-side source hashing.
+Generating, hashing and fsyncing the source file took 30.013 s separately and
+is excluded. Both input methods use bounded 1 MiB buffers, not a 5 GB in-memory
+file. Post-body response waits were 0.369 s and 0.318 s respectively.
+
+All **10 GB uploaded and 20 GB read back** passed exact version-specific length
+and SHA-256 checks, including both objects after a real owned-process SIGKILL.
+Peak engine RSS was **46.059 MiB**, peak externally observed descriptors 26,
+and quiescent descriptors 20. Engine CPU time during the uploads was 12.09 s
+and 10.72 s, about 25% and 39% of one core averaged over each upload. Each
+upload advanced native completions by 8,488 with no fallback. Whole-device
+counters showed approximately 1.667 GB written to each of the four HDDs per
+upload; the file-source trial also read 4.664 GB from member 0's drive.
+
+The generated-input trial removes source-HDD read contention; it is not an
+old/new build or blocking/native comparison. Source and historical reads may
+use filesystem cache; strict payload writes use direct I/O. No host cache was
+dropped, and no cold-cache claim is made. Whole-drive counters also include
+unchanged production services. These two uploads demonstrate this fixture's
+large-object throughput and bounded memory, not repeated statistical coverage,
+physical-power-loss durability, tiny-object throughput or million-object scale.
+
+### Fresh small-object million-scale baseline — October 24, 2026
+
+After the large-file benchmark, a new isolated headless sequence was launched
+on the same four physical SATA/XFS members with the same `ad139db1` engine.
+Scheduled GC passed; RC stress was running at the initial launch check. The
+remaining native/read-repair gates precede **one million 0–64 KiB objects**
+with eight clients, 64-object batches and server concurrency 16. The fixed
+offered load, strict acknowledgement, required-native policy and no-write-retry
+rule are unchanged. This is a current-build small-object baseline, not a claim
+that small-file performance was fixed or that a new optimization was compared.
+
+The scale stage retains its 48-hour bound; the controller has 50 hours overall
+to accommodate prerequisite gates and cleanup. The service's 4 GiB cgroup
+limit includes client, engine and charged filesystem cache/slab, rather than
+being an engine-RSS measurement. Mount/physical identities and the existing
+free-space/growth reserves remain guarded. The interrupted 10k population,
+large-file fixtures and all production data/services were preserved. Final
+million-object and churn results are pending.
+
+## RC.2 qualification plan — October 22, 2026
+
+Preparation is not a release declaration. The current release remains RC.1.
+The next server target is MCH: four independent physical members, EC 3+1,
+inside new disposable directories. Existing production roots and services must
+remain untouched. Test-service isolation does not remove shared disk/CPU load;
+record that interference rather than claiming a dedicated-server benchmark.
+The [MCH launch runbook](tools/N1-MCH-SCALE.md) records the prepared workload,
+hardware/capacity checks and exact coverage limits. Preparation does not mean
+the server was contacted or its hardware passed preflight.
+October 24 preparation checks passed: 28 synthetic result-validator regressions
+and 45 existing scale-harness regressions. They launched no engine and are not
+MCH or million-object results. The validator pins the engine hash and checks
+the fixed offered load, full population/verification phase order, immutable
+churn inventory, process-local native evidence and resource bounds; it does
+not replace hardware preflight or independently rehash the stored objects.
+
+First run the same population-then-churn workload locally with a 300,000-object
+target on the two HDDs, EC 1+1. This is an early-defect gate, not qualification
+of the four-member topology or the million-object target. Run it headlessly;
+retain automatic resource samples, acknowledgements and failure evidence, with
+no automatic write retries or restart-on-failure loop.
+
+The server sequence is:
+
+1. Verify physical member identities, mount/filesystem identities, free space,
+   existing N1 roots, unused ports and descriptor limits. Freeze the tested
+   engine, harness and configuration. Set a free-space reserve and growth
+   budget before launch; never fill production storage to literal exhaustion.
+2. Repeat scheduled-only GC and the recovery matrix at EC 3+1. Checksum/read
+   repair must physically restore damaged fixture shards without changing
+   committed NDX. No production-device removal, reboot or power cut is implied.
+3. Upload one million distinct objects first, with strict durability and no
+   concurrent namespace churn. Keep the eight clients, 64-object batches,
+   server batch concurrency 16 and 300-second request deadlines explicit.
+   At population milestones verify all acknowledged historical versions,
+   paginated prefixes, complete namespace/max-ULID inventory and resources.
+4. Only after population verification, exercise the populated store: concurrent
+   rename/move/trash/recover, additional uploads, GC overlap, exports/backups,
+   targeted corruption/read repair and process-interruption recovery. Distinguish
+   checks performed on this population from smaller separate recovery fixtures.
+5. Check all expected historical bytes and namespace state after restart, and
+   hold the population through a sustained mixed-load soak and an idle period.
+   Compare quiescent memory/descriptors and retained bytes before/after cleanup.
+
+One million is the first scale gate, not a supported-object-count ceiling.
+For larger capacity runs, use successive 2/5/10-million-style milestones and
+extend toward the server's predeclared safe capacity. Estimate limits from
+measured per-member allocated bytes, file/directory counts, available inodes,
+namespace/ledger overhead and recovery reserve, not payload size alone. No
+hundred-million-object claim follows from a smaller population or extrapolation.
+Select the next target and duration from actual server measurements; a space,
+time or resource stop is an incomplete qualification, never a PASS.
+
+Record objects/s, bytes/s, phase duration, request latency distributions and
+errors alongside engine/client CPU, RSS, descriptors, memory/I/O pressure,
+disk latency/utilization and filesystem growth. Source-file generation and the
+synchronous acknowledgement ledger also consume fixture I/O: end-to-end ingest
+includes those costs. Loopback HTTPS is not a LAN, native-protocol or Console
+benchmark. Keep those integration results separate.
+
+Two scale questions remain explicit gates: listing currently scans the relevant
+namespace again per page, so bounded page memory does not imply bounded scan
+work; GC reachability preparation also uses population-sized state. Measure
+both at large populations. Three small-prefix listing checks plus a full
+streamed snapshot do not certify a complete flat million-key paginated listing.
+Any full-population verifier must itself be disk-backed/bounded in memory.
+Require a completed GC cycle at the populated workload, not merely enabled GC.
+
+The scale runner's population-then-churn mode is `--churn-after-upload`.
+`--upload-only` remains a separate no-churn workload. The recovery runner accepts
+explicit `--data-shards 3 --parity-shards 1` with four member parents; the older
+two-member `n1-hdd-qualify.py` wrapper must not be used unchanged for MCH.
+Interrupted fixtures retain their ledgers for reconciliation; this is not an
+automatic in-place resume or permission to retry ambiguous writes.
+
+Preparation validation passed 67 Python harness checks. The engine was not
+changed for this preparation: the local scale run uses the same
+`5b77e3a116d5abd15360d1027fce9388af5c8b7cf19c49a87957756dd113e66d`
+binary as the completed integrity gates below. A separate 64-object physical
+smoke must pass before the headless 300,000-object stage starts. That stage
+retains a one-million-mutation hardening target, all-version hashes, full
+snapshot inventory and SIGKILL/restart verification. It reserves 128 GiB per
+filesystem and stops at an 80-GiB filesystem-growth budget, including unrelated
+writers. The overall workload deadline is 48 hours; per-request limits remain
+300 seconds. These are predeclared limits, not passed results. Automatic GC
+retains its normal settings; this scale runner does not by itself certify a
+completed GC cycle, backup overlap or bitrot injection at 300,000 objects.
+The physical smoke passed: 64 source objects, eight probes, 128 namespace
+mutations and integrity/inventory checks after restart. The 300,000-object
+stage then started under a detached service. Its live report is RUNNING, not a
+completed scale PASS. An earlier launcher-only sleep-inhibitor timeout occurred
+before any engine/fixture started and is retained separately in launch evidence.
+
+RC.2 requires zero lost/corrupt acknowledged data, correct complete inventory,
+successful restart/recovery and GC protection, and no unresolved engine crash,
+deadlock, resource leak or unexpected timeout/refusal at the declared sustained
+load. Record saturation/refusals separately in deliberately excessive overload
+tests and verify recovery afterward. Performance acceptance must be set against
+the recorded workload/hardware before judging the result; a slow operation is
+not automatically a hardware fault. Every discovered defect follows reproduce,
+minimal patch, regression, rerun; changed candidates need new evidence.
+
+Stable is a separate decision after the planned scale, soak, backup/restore,
+pool replacement, capacity-pressure and integration gates. Previously completed
+power-loss tests remain dated evidence for their actual builds; SIGKILL is not
+a new physical power-loss certification. No RC.2 or stable claim is made yet.
+
+## Maintenance/upload optimization — October 21–22, 2026
+
+### Scheduled GC integration — two-HDD integrity gates passed
+
+Scheduled and manual GC now share the orphan/trash collector. The candidate
+adds configured-member and path validation, late-export protection, unpublished
+version cleanup beneath live objects and cooperative BackgroundGc admission.
+The bounded integrity gates below passed. Million-object scale qualification
+remains separate and was not run in this session.
+
+The local two-HDD EC 1+1 harness passed ten safety/reporting checks. Its first attempt
+against the old binary failed before any upload: engine startup exceeded the
+unchanged 45-second limit, and SIGKILL cleanup exceeded its 15-second wait.
+Kernel SCSI timeout counters increased on both USB-attached members during the
+attempt. No kernel log was available without administrator access, so the exact
+device/bridge cause is not established. The attempt does not reproduce the GC
+defect or certify the corrected candidate. Logs were retained and disk-load
+testing was stopped pending a stable storage connection. Cleanup-timeout reporting
+now preserves the original failure and writes a failed result rather than losing
+the report; both added mocked regressions pass. No million-object test or
+production-server update was started.
+
+After reconnecting the drives, a new attempt used the project HDD's XFS volume
+and the separately formatted test HDD's ext4 volume. All 369 engine tests passed
+in 1,252.90 seconds, with zero failures, ignored or filtered tests. All 56 harness
+checks and nine proof-tool tests passed; the optimized build denied warnings.
+That intermediate engine SHA-256 was
+`edae7bd4065035d5a9cfb15a9034b66a181f40ff2fb0be0c2a7335bc5f920e97`.
+
+The physical scheduled-only proof reproduced the old binary's orphan-reclaim
+gap. The intermediate candidate reclaimed expired object data and six abandoned
+version directories, reporting no GC errors, but failed the unchanged proof
+because empty expired-trash generation directories remained. This is a failed
+cleanup gate, not a completed integrity PASS. Its logs and fixtures are retained.
+GC expiry now prunes only known empty trash ancestors, without adding pruning
+syncs to ordinary recovery. All 11 focused namespace tests passed, including
+three new expiry/retry/path-safety regressions. The corrected optimized engine
+SHA-256 is
+`5b77e3a116d5abd15360d1027fce9388af5c8b7cf19c49a87957756dd113e66d`.
+
+Its scheduled-only two-HDD proof passed in 20.496 seconds, without any manual
+GC request. It reclaimed two expired trash versions and their four NDX replicas,
+four real SIGKILL-interrupted upload directories (including a new version under
+a live object) and two synthetic expired orphan directories. Six young, future
+or unknown candidates survived; active standard and durable uploads finalized.
+All 16 retained historical versions hash-verified after restart; 56 committed
+NDX/payload files retained identical bytes, inodes and mtimes. Sampled peak RSS
+was 50,644 KiB and peak descriptors 18. No unsolicited full health/healing walk
+was observed despite legacy scan settings being enabled in this fixture.
+
+The complete corrected-candidate suite passed all 372 tests in 1,198.57 seconds,
+with zero failures, ignored or filtered tests. The physical read-integrity proof
+passed in 47.037 seconds: all nine HTTP/native/archive bitrot paths returned
+verified bytes, physically repaired the damaged shard and left NDX unchanged.
+A 64-reader burst verified and physically repaired all 16 corrupted objects in
+0.466 seconds. Trash maintenance passed in 76.061 seconds, covering 140
+directory objects across the 128-entry maintenance batch boundary.
+
+The concurrent GC/export/upload proof passed in 1,159.913 seconds under the
+explicit 7,200-second aggregate budget (not the earlier failed 300-second
+budget). It retained four actors with 1,000 files each plus 1,000 background
+uploads, standard/durable multipart, namespace mutations, archive validation
+and GC overlap. The mixed actors finished in 1,067.841 seconds. An injected
+corrupt durable manifest caused preservation with a reported error; removing
+that fault allowed a clean reclaim pass. Restart visibility and the log scan
+passed; the final engine RSS sample was 144,988 KiB. Per-request deadlines and
+workload sizes were not shortened for this rerun.
+
+Maintenance-mode coverage subsequently passed in 40.038 seconds. The final
+concurrent standard-multipart/batch/mutation proof passed in 111.092 seconds,
+including 716 expected live objects and restart visibility. All five physical
+recovery/maintenance gates passed on the same frozen engine; total recovery
+runner time was 1,434.168 seconds. Both member kernel timeout counters remained
+unchanged throughout the completed run. Test engines exited and no production
+deployment or million-object stage was started.
+
+The focused read timings above are small warm-fixture correctness observations,
+not a general latency or throughput guarantee. The original failed attempts are
+retained; their results are not retroactively converted into passes.
+
+### Read-integrity/maintenance follow-up (in progress)
+
+The latest 100,000-target run failed at 19,216 source objects/19,344 acknowledged
+versions with a 300-second batch response timeout. Its sampler also recorded an
+unavailable process FD directory as a storage fault. These remain distinct:
+the saved report does not prove that the sampler caused the request timeout.
+No OOM was recorded; sampled peak engine RSS was 207,588 KiB.
+
+An exact-binary restart against same-filesystem reflink copies independently
+verified all 19,344 acknowledged historical versions. The 16 ambiguous batches
+covered 1,024 source keys: 900 additional versions were committed and hashed,
+124 were not published. Complete namespace/max-ULID inventory matched all 20,244
+visible versions. No upload was retried; original reports/ledgers were unchanged.
+This is an integrity reconciliation PASS, not a sustained-load PASS.
+
+A new same-length byte-flip regression reproduced the unverified streaming read
+and then passed after routing it through existing checksum validation. A second
+regression reproduced NDX inspection before trash TTL and passed after moving
+eligibility ahead of version metadata reads. A two-data/two-parity fault case
+then reproduced incorrect short-range reconstruction and suppression of a second
+target's repair after rejecting it as a peer. Recovery now decodes the recorded
+stripe before slicing; request-local handles distinguish rejection from repair
+admission. The strengthened test covers two stripes and unaligned ranges and
+verifies both files are physically repaired.
+
+All six focused recovery tests passed; 20 HDD-harness, seven RC-harness and nine
+Rust proof-tool checks passed. The earlier intermediate build passed all 340
+engine tests. The preceding candidate passed all 343 tests in 1,306.98 seconds, with
+zero failed, ignored or filtered tests. Candidate engine SHA-256:
+`d79369c29af2c9760456fac26f4fab489918c9b7196953981a3c8cd737fcd364`.
+That candidate's nine public read paths passed same-length bitrot recovery, physical
+repair and NDX-immutability checks. A 64-reader burst recovered and physically
+repaired all 16 corrupted objects in 1.437 seconds. Native-path elapsed samples
+include connection/authentication; these small, warm-fixture correctness checks
+are not a controlled throughput or cold-read benchmark.
+
+A separate harness smoke run passed 64 source uploads, eight probe objects,
+352 namespace mutations, complete inventory and post-SIGKILL checks. Sampled
+engine peak RSS was 50,148 KiB and peak descriptors 61. These bounded results do
+not substitute for the million-object population.
+
+That candidate's matched strict-batch gate accepted all 2,048 new objects on a
+12,438-object fixture, then hashed all 14,486 acknowledged versions and verified
+complete inventory. Ingest took 398.879 seconds versus the saved baseline's
+581.495 seconds; foreground queue p99 was 4.173 versus 10.789 seconds. The
+overload/crash gate also passed. These observations belong to the recorded
+candidate and are not universal latency guarantees.
+
+The expanded mixed GC/export/upload run failed its 300-second aggregate
+deadline with roughly 5,000 files plus multipart and namespace work. Saved logs
+show completed GC runs and continuing uploads, not proof of a deadlock. Its
+unchanged workload subsequently passed in 1,063.778 seconds under an explicit
+7,200-second aggregate completion budget. Per-request limits stayed unchanged;
+this proves completion, not compliance with the original 300-second deadline.
+The original failure remains recorded.
+
+A subsequent regression reproduced read repair bypassing whole-fragment deletion
+admission. The correction reuses existing shared lifecycle admission without
+waiting behind deletion, and checks live fragment identity before publication.
+The regression verifies deferral, subsequent physical repair and no recreation
+after removing identity. The latest warnings-denied optimized build completed
+and passed all 344 engine tests in 1,326.76 seconds, with zero failed, ignored
+or filtered tests. Latest engine SHA-256:
+`ffadcc396fc9e714348759f6057b6af2bdea3ef59fdcf204f92e9218362a8fa4`.
+Its matched strict-batch gate accepted 2,048 new objects and hash-verified all
+14,486 acknowledged versions. Ingest took 477.631 seconds versus the saved
+581.495-second baseline; foreground queue p99 fell from 10.789 to 4.745 seconds.
+The overload/crash gate and all five recovery/maintenance gates passed, including
+the complete mixed GC workload above. These are bounded two-HDD results.
+
+The subsequent extreme-overload gate failed in the load generator: its user
+service inherited a 1,024-descriptor soft limit while attempting up to 2,048
+concurrent connections. Client-side EMFILE errors prevented the intended load;
+all 570 acknowledged versions still hash-verified after the three crash rounds.
+That gate is not a PASS, and the million-object stage did not start. A fresh
+headless continuation now checks descriptor capacity before creating fixtures
+and runs with a 65,536-descriptor test-service limit. The preflight rejects the
+original 1,024 limit. With that launcher correction, unchanged extreme overload
+passed in 342.084 seconds: 1,181 acknowledged versions, zero unexpected failures
+and three inflight SIGKILL rounds with hash verification. The operator then
+stopped the subsequent million-object attempt during probe setup; it had not
+begun source population. Earlier failure and interruption evidence is retained.
+
+After reboot, the first restart exposed a separate load-generator bug before
+any acknowledged upload: its zero-initialized authentication timestamp skipped
+initial login when host uptime was under ten minutes. Two new checks reproduced
+the failure; the two-condition harness correction passed all 23 harness tests,
+including concurrent initial login and the unchanged refresh interval. N1's
+binary and all engine sources are unchanged. The resumed mixed run was stopped
+at the operator's request after 8,680 source objects, 1,024 probe versions and
+112,383 namespace mutations. Termination produced connection-refused/ambiguous
+batch results; those reports and ledgers are preserved, not relabeled as a
+completed qualification. Its launch manifest records the changed harness files
+and original completed gates.
+
+The current priority is a separate upload-only million-object gate. It retains
+the same engine, two HDDs, EC 1+1, eight strict batch clients, 64-object batches,
+server batch concurrency 16 and 300-second request deadlines. No mutation probes
+or churn workers run; listing, full historical hashes and resource checkpoints
+run between ingestion milestones. Final inventory and SIGKILL/restart hash
+verification remain required. Two additional harness checks prove upload-only
+mode cannot start probe/churn work; all 25 harness tests pass. A fresh 64-object
+physical-HDD smoke passed in 17.649 seconds, including all hashes before/after
+restart and zero namespace mutations. At the operator's request, the subsequent
+run was stopped at 32,528 acknowledged source objects. Its interruption report
+is preserved, not a million-object PASS. Exact-old-binary verification on cloned
+members hashed all 32,528 acknowledged versions. The 16 interrupted batches
+contained 148 additional committed-and-hashed objects and 876 unpublished keys;
+none were retried. Complete namespace/max-ULID inventory matched all 32,676
+committed versions; original reports and ledgers remained unchanged.
+
+Live diagnostics showed a foreground target of four against a configured six,
+with eight queued operations and healthy host growth thresholds. The adaptive
+growth condition rejected queued demand itself. A new regression reproduced
+that behavior with the old condition (target stayed four instead of increasing
+to five). The candidate permits bounded recovery under queued demand while
+retaining saturation, stall and host-pressure guards. All six adaptive-controller
+tests pass with the candidate, as do all 27 HDD-harness checks, including distinct
+accounting for reconciled, unacknowledged commits. The full candidate suite passed
+all 346 engine tests in 1,244.86 seconds, with no failed, ignored or filtered
+tests. The warnings-denied release build and subsequent overload/crash gate
+passed. Candidate SHA-256:
+`b4dda771f981cd87280c0a8591d5b7901c47291c2a9abfb1e967b8acf862c396`.
+
+The sequential matched comparison uploaded 2,048 strict objects in 535.168 seconds
+on the old build and 535.453 seconds on the candidate: effectively unchanged
+throughput. Each independently cloned population then passed hashes and complete
+inventory for all 34,724 known versions. Both builds stayed at six foreground
+permits throughout the sampled workload, so this comparison does not demonstrate
+the recovery-from-four improvement. Strict durability and request deadlines were
+unchanged. The subsequent laptop million-object attempt was stopped to relocate
+testing; its ledger contains 3,048 acknowledgements. Its partial evidence is
+retained, not a completed scale qualification.
+
+Testing moved to an isolated four-HDD XFS server fixture, EC 3+1, while existing
+production N1 continued running. Only disposable test directories are writable
+inside the test service; production storage directories are inaccessible. A
+6-GiB service memory limit, 768-GiB minimum free space per member filesystem and
+80-GiB filesystem-growth budget protect the shared server. Growth includes other
+writers; crossing a limit stops the test rather than qualifying it. Four new
+harness checks cover topology, mounted child-directory placement and space limits;
+all 31 harness tests pass. The 64-object server smoke passed in 5.06 seconds,
+including all hashes/inventory before and after restarting only the test engine.
+The fresh million-object upload-only run is active as a system service, independent
+of the client connection. This is shared-server loopback testing, not a direct
+comparison with the USB-HDD topology, a LAN/Console benchmark or a physical
+power-cut test. Production services and existing data were not replaced.
+
+Early fault-matrix attempts stopped on an invalid archive request, an incorrect
+job-status observer field, or a recovery request before restart readiness. Those
+harness failures were preserved and corrected without relaxing engine gates.
+
+The separate mixed-workload design targets one million actual source objects
+and at least one million namespace mutations on two XFS USB HDDs, EC 1+1.
+Strict eight-client batch upload runs alongside 32 namespace clients; subsequent
+churn ramps to 256 clients. Its upload rate is not an upload-only benchmark.
+Every acknowledged historical version, complete quiescent namespace and
+post-SIGKILL state must verify. Existing engine self-reported FD/RSS checkpoints
+supplement external resource samples; unavailable telemetry is not a zero value.
+Timeouts, admission refusals, missing results, resource stops and ambiguous writes
+fail the sustained-load gate without write retries. Source fingerprints and
+frozen binaries prevent mixing revisions within a qualification.
+
+Whole-shard checksum encoding and ordinary copy/delete barriers are unchanged.
+No million-object PASS is recorded. Normal-upload restart cleanup locators and
+eliminating reclamation's existing global reference walk remain unfinished;
+this follow-up must not be described as completing those changes.
+
+Implementation uses persistent single-pass maintenance cursors, preserved upload
+pipeline overlap, parallel NDX-holder publication and fewer existing-parent syscalls.
+Product and storage-format versions are unchanged. This is not a new release
+or a completed million-object qualification.
+
+The final pipeline-preserving build passed the sequential short-gate matrix on
+two physical USB HDDs, EC 1+1, XFS and loopback HTTPS/native transport. It is not
+a LAN, browser/Console folder-drop or physical power-cut qualification.
+Candidate engine SHA-256:
+`4921e039edd15f65a685674e14bf2010da73ab6bb93effd420526711b19ea1f1`.
+
+| Gate | Result |
+| --- | --- |
+| Regression rerun | PASS: 333 engine tests, zero failures; 19 Python harness checks |
+| Strict 64-object batches, eight clients | 4.74 → 4.92 objects/s, matched before/after |
+| Strict 16-object batches, eight clients | 4.16 → 4.76 objects/s, matched before/after |
+| Matched-benchmark integrity | All 1,024 acknowledged versions downloaded and SHA-256 verified before and after SIGKILL |
+| Partial admission results | Three committed versions and 509 explicit refusals; every committed version hashed after restart |
+| 512-client overload/crash gate | PASS, 345.616 s; all 1,432 acknowledged versions hashed after restart; 5,728 immutable NDX/payload files unchanged by NCX mutations |
+| Recover-on-read and automatic healing | PASS, 57.029 s, including missing/foreign roots and cold beyond-parity recovery |
+| Trash traversal beyond 128 entries | PASS, 46.021 s; 141 recovered object hashes checked |
+| Concurrent multipart/batch/mixed users | PASS, 85.042 s; restart visibility verified; standard batch 27.743 objects/s with the proof tool's relaxed payload default |
+| End-to-end scale harness | PASS, 256.444 s: 1,024 source files, 1,032 versions, 160 NCX mutations, full inventory/max-ULID comparison and historical hashes after restart |
+
+Combined strict-upload time fell 8.4% in this small comparison, not a general
+throughput SLA. Peak sampled engine RSS was 65,468 KiB versus 67,760 KiB in the
+matched benchmark, with 140 FDs in both. The overload gate peaked at 133,464 KiB
+and 554 FDs. Refusals never count as successful writes, and ambiguous writes are
+not blindly retried. During the prefix-copy SIGKILL, all 256 source objects
+remained reachable and eight also had destination names; retry converged.
+
+The 333-test rerun excludes only the expensive 4,097-object pagination fixture
+passed earlier on unchanged listing/publication code. It is not a fresh full
+334-test pass. Seven targeted maintenance checks cover cursor advancement,
+replica deduplication, missing/corrupt trash copies, unchanged NDX bytes and
+early-stop fanout probes. Small maintenance timings did not improve measurably:
+regressions prove removal of repeated enumeration, not a measured large-scale gain.
+
+The fresh million-object/million-mutation run FAILED after 3,226.013 seconds.
+It acknowledged 12,310 source objects, plus 128 probe versions, before a batch
+reported 58 explicit HTTP 503 refusals: foreground disk admission exceeded its
+unchanged 30-second deadline. The last in-run full integrity checkpoint checked
+all 10,128 versions at the 10,000-source milestone. Only the 512 preflight NCX
+mutations completed, not the million-mutation target. Peak engine RSS was
+103,832 KiB, with 128 FDs; the 4 GiB/no-swap cgroup recorded no OOM events.
+This is a sustained-ingest failure, not a million-object PASS.
+
+An independent restart of the exact failed candidate then PASSED: all 12,438
+acknowledged historical versions were downloaded and SHA-256 verified, and a
+complete streamed namespace matched every ledgered name and maximum ULID.
+The recheck took 53.502 seconds, including 42.088 seconds for hashes and 4.467
+seconds for the namespace comparison. Original reports and acknowledgement
+ledgers were retained. The first verifier attempt incorrectly used the physical
+fragment ID at an alias-based authentication endpoint; the driver was corrected
+and alias/membership safety regressions added before the completed recheck.
+
+The saved engine log shows the automatic availability scan completed near
+startup in roughly one second, with zero repairs. It does not establish that
+healing or GC caused the later admission failure. Further diagnostics capture
+active permit owners at admission timeout and bounded payload/NDX versus NCX
+latencies without adding storage scans or weakening durability. Maintenance
+policy changes and another million-object qualification remain pending.
+
+A separate reflink clone of the failed population passed a diagnostic baseline:
+2,048 additional strict uploads at eight batch clients, followed by hashes of
+all 14,486 acknowledged versions and a complete namespace/maximum-ULID comparison.
+Ingestion took 581.495 seconds; the original reports and ledgers remained
+byte-identical. This shorter run did not reproduce the original 30-second
+refusal. Its last 1,024 admission samples nevertheless had a 10,789.319 ms p99
+and 19,040.659 ms maximum, compared with a 2,966.905 ms p99 payload/NDX duration.
+
+Inspection found that adaptive admission could surrender semaphore queue
+position and retry every 2 ms. The replacement keeps the existing FIFO
+semaphore, retiring permits as operations finish when capacity shrinks and
+returning them when capacity grows. Nine focused scheduler tests pass, including
+four new checks for FIFO order, cancellation, growth and repeated resizing.
+This establishes the tested admission behavior, not that every cause of the
+original sustained-ingest failure has been eliminated.
+
+That admission change's subsequent 100,000-target qualification produced the
+19,344-acknowledgement timeout and integrity reconciliation described above.
+It did not complete its population/mutation target. The current qualification
+instead targets the full million objects and million mutations after all
+regression, matched-load and fault gates pass. Scaling remains blocked if
+matched strict ingestion regresses by more than 10% or admission p99 does not
+improve. Pending gates are not completed passes.
+
+Earlier attempts remain part of the evidence. The first benchmark stopped after
+512 uploads because the driver sent an unnecessary JSON body to a query-only
+maintenance endpoint, breaking its next keep-alive poll. Bodyless calls passed
+a fresh preflight. An initial candidate passed integrity but regressed strict
+batches by 6–18%; restoring direct I/O alone still left combined time 14% slower.
+Buffered strict writes and the extended payload-permit lifetime were withdrawn,
+preserving the original pipeline and durability barriers. An isolated upload
+test also exposed missing bootstrap settings and a subsequent thread-barrier
+hang; using valid stable fragment IDs removed that test-order dependency without
+changing engine behavior. None of those attempts is relabeled as the final pass.
+
+## Two-HDD RC.1 stress campaign — October 20, 2026
+
+Fresh isolated EC 1+1 fixtures use two physical 1 TB USB HDDs with XFS.
+Test data, generated source folders, reports and build outputs are on those
+HDDs; the internal NVMe is not a pool member. Existing projects are not inputs
+and are not modified. Traffic is loopback, not a LAN benchmark or physical
+power-cut test. The engine is the unchanged October 18 optimized RC.1 binary
+identified below.
+
+Completed gates:
+
+| Gate | Result |
+| --- | --- |
+| Strict uploads, up to 512 concurrent clients, shared-key versions, fragment isolation and production rate-limit refill | PASS, 342.976 s; all 1,341 acknowledged versions hashed across forced restarts |
+| NCX-only mutations and observed mid-prefix-copy SIGKILL | PASS; 5,364 immutable NDX/payload files unchanged; all 256 objects remained available, 8 temporarily had both names, retry converged |
+| Extreme offered load, up to 2,048 concurrent clients, shared-key contention and three inflight SIGKILL rounds | PASS, 342.897 s; all 1,182 acknowledged versions hashed; zero unexpected errors; admission-refused unique names absent |
+| Small end-to-end scale-harness check | PASS; 128 actual source files, 136 total versions, 160 namespace mutations, complete streamed namespace comparison and historical hashes after restart |
+| Recover-on-read, autonomous repair, missing/foreign root fencing and cold beyond-parity fail-safe/live recovery | PASS, 41.040 s in the corrected Rust matrix |
+| Trashed-object repair across the 128-entry boundary and recovery after restart | PASS, 45.041 s; 141 recovered object hashes verified |
+| Concurrent multipart, 4 × 64-object standard batches, mixed users and restart visibility | PASS, 80.566 s; 716 expected live objects; standard batch 5.692 s / 44.978 objects/s, with the Rust proof's relaxed payload default |
+
+Peak sampled engine RSS was 138,940 KiB / 548 FDs in the first gate and
+292,736 KiB / 2,091 FDs in the extreme gate. Overload PASS means bounded
+admission and acknowledged-data integrity, not acceptance of every request.
+Strict small-object upload ramps sustained approximately 4–7 objects/s on this
+fixture and produced scheduler-admission 503s at high concurrency. These results
+do not establish a high-throughput or sub-100-ms upload SLA.
+
+Harness failures are retained separately from engine failures. A queued stage
+initially mistook a RUNNING report for a terminal failure; terminal-state waiting
+was corrected and regression tested. The older trash-maintenance proof also
+requested empty-directory creation. N1 correctly rejected it: object keys
+establish prefixes. That stale setup step was removed and the optimized proof
+tool rebuilt; engine namespace semantics were not changed.
+
+Tightening churn validation also initially used internal summary field names
+instead of the public POSIX response's `affected` field. It was corrected and
+tested against both real responses and no-op fakes. An initial long-run probe
+setup was deliberately stopped after 538 acknowledgements to strengthen that
+verification; its operator-stop report is retained, not an engine failure.
+
+The corrected small scale check passed again with normal background healing
+enabled and exact affected-count assertions. Sixteen Python harness tests and
+nine Rust proof-tool unit tests pass. Tests include real multipart framing,
+partial-success preservation, no-op rejection, mount loss, bounded client
+submission and terminal-result gating.
+Fixture TLS trust also outlives the full soak deadline; certificate validation
+is not disabled to accommodate a longer run. Earlier operator-stopped fixtures
+and their in-flight disconnects are retained separately from completed gates.
+
+The original million-file run failed after 9 h 15 min on a 300-second batch
+response timeout. It acknowledged 111,904 source objects; the last completed
+integrity checkpoint downloaded and hashed all 100,256 versions at that point.
+Two timed-out batches (128 source keys) have unresolved outcomes; they were not
+blindly retried. Only the 1,024 preflight namespace mutations completed, not the
+million-mutation target. No million-object PASS follows from this run.
+
+Each accepted version is recorded in an
+on-disk ledger and fully downloaded/hashed at population checkpoints and after
+final restart. Listing probes cover selected prefixes; a separate complete
+streamed inventory checks all live names and maximum-ULID versions. This is not
+a completed million-object result or a Console folder-drop qualification.
+
 ## RC.1 declaration verification — October 18, 2026
 
 After the numbering reset, the locked, offline, warnings-denied workspace/
@@ -1010,6 +1865,113 @@ unchanged. This proves a process-crash case, not power-cut/cache-loss durability
   ACK/Nagle latency. Later loopback control-call results improved; they are not
   current LAN mutation benchmarks.
 
+## October 23 — failed 300k HDD run and follow-up
+
+The upload-only EC 1+1 run on two USB-attached HDDs stopped after **129,113
+acknowledged objects in 10 h 23 min**. The 100k checkpoint passed its historical
+hash checks. Eight timed-out batches have ambiguous outcomes; the final partial
+batch also reported 29 admission rejections. This is a failed scale/performance
+gate, not evidence that 300k or a million objects passed. Final acknowledged-data
+verification and reconciliation of ambiguous writes remain required.
+
+Follow-up changes retain strict durability, request deadlines, concurrency and
+TTL settings. They cover admission through NCX publication, missing-directory
+creation, stable-ID resolution and cooperative GC reference collection. Separate
+write-drain and sync timings avoid treating direct writes as measured fsync cost.
+
+The candidate `abc1816cba80f5ee683db6515a2ac3b5443f67fa4fc15402e2f77a72fe76cc57`
+passed 382 engine tests, 72 Python harness checks, nine proof-runner tests and
+the two-HDD scheduled reclamation plus five-part recovery matrix. Those are
+integrity gates, not a passed scale or performance test. The admission regression
+confirms that caller cancellation retains the detached commit's foreground
+permit until NCX publication finishes.
+
+The fresh local 300k attempt was operator-stopped at **24,336 acknowledged
+objects after 9,002 seconds** to investigate performance. Its 1k and 10k hash
+checkpoints passed; final reconciliation remains pending. Sixteen batches had
+ambiguous outcomes recorded during interruption. First-1k throughput was
+2.701 objects/s versus 5.048 previously; the next 9k measured 2.825 versus
+4.517. The new run used a shared USB hub, whereas the earlier run recorded
+separate USB controller paths. The regression also predates scheduled GC, so
+it cannot be attributed solely to GC. These are not controlled code-only A/B
+results. Both local populations and the interrupted comparison are preserved.
+
+### MCH SATA follow-up — October 23, 2026
+
+At 16:22 Manila, the same frozen candidate began an isolated **300,000-upload,
+then churn** run on four directly attached SATA/XFS members, EC 3+1. The
+64-object smoke passed, including hashes, mutations and restart checks. The
+first 1,000 strict uploads took **70.225 seconds (14.24 objects/s)** and their
+complete hash checkpoint passed. This is about 5.3 times the local USB run's
+early rate, but hardware, filesystems, member count and EC geometry differ;
+it does not isolate USB as the sole cause or prove large-file throughput.
+
+The run keeps eight clients, 64-object batches, server concurrency 16, strict
+durability, 300-second requests, the 30-second admission deadline and normal
+GC TTL/schedule. Only fresh test directories are writable. Production services
+are not restarted or replaced. A 768-GiB reserve and 80-GiB growth budget per
+filesystem protect shared server capacity. This older-build run was deliberately
+stopped before 300k so the newest implementation could be built and tested first.
+Its interruption is preserved, not counted as a scale pass. Newer hot-path edits
+were not included in that binary.
+
+### New upload hot-path candidate — October 23, 2026
+
+The new implementation removes the HTTP one-shot serialize/parse/NDX-reread
+round trip, shares stream/reader shard setup, opens independent members in bounded
+parallel and omits redundant small-shard pre-sizing. NDX publication no longer
+creates unused upload/trash directories. Strict direct I/O, synchronization,
+publication order, storage format and concurrency limits remain unchanged.
+
+Focused regressions passed: **15 HTTP-route tests**, **five shard setup/data-plane
+tests**, **two metadata-publication tests** and **72 harness tests**. The data-plane
+gate covers 18 real strict stream/reader writes at zero, 4-KiB boundaries and
+1-MiB boundaries, checking exact shard bytes, padding and checksums. Short/excess
+bodies and checksum failures leave no shard files; HTTP failures publish no NCX.
+These results do not establish a throughput improvement or a passed scale gate.
+
+The warnings-denied release build passed with engine SHA-256
+`3e50f648ee8b3b96ed3e0e9902d03ca7dc18643e5bce425c1e7fb9f08d9ce9d0`.
+All 209 frozen source entries and package inputs were independently rechecked.
+The earlier full engine-suite attempt stopped before completion, not PASS.
+
+MCH became unavailable before this new binary could be tested there. Local
+qualification therefore uses two physical USB HDDs, EC 1+1: scheduled reclamation,
+strict zero/unaligned upload/hash/restart checks, then a fresh 391-test engine
+suite. It uses fresh private directories without formatting or contacting another
+server. Scheduled reclamation passed in **39.3 s**, preserving all 16 acknowledged
+historical versions, finalizing both protected upload types and reclaiming real
+SIGKILL-interrupted standard-upload orphans. The strict smoke passed in **59.3 s**,
+including 64 source objects, churn, 12 zero/unaligned one-shot sizes and complete
+hash/inventory verification before and after restart. Both reports identify the
+new engine hash above. The fresh 391-test suite was deliberately stopped, without
+a PASS, to avoid competing disk I/O during the targeted scale investigation.
+
+These are not a four-SATA, 300k or million-object qualification or a demonstrated
+throughput improvement. The prepared four-drive upload-first/churn sequence
+remains deferred.
+
+### Targeted upload-scale investigation — October 23, 2026
+
+A fresh **300,000-object upload-only** run is active on the same two physical
+USB HDDs, EC 1+1, using the new engine hash above. It keeps strict durability,
+normal GC settings, eight clients, 64-object batches, server concurrency 16 and
+300-second request deadlines. No churn or broad regression suite runs alongside
+ingestion. Source files and durable acknowledgement evidence remain part of the
+workload; existing failed populations are preserved.
+
+The harness now separates per-batch source preparation, HTTP request and FULL
+acknowledgement-ledger timing using bounded histograms. Quiescent checkpoints
+retain existing shard setup/drain/sync, payload/NDX, NCX and scheduler telemetry.
+No repeated health scans run during ingestion. All **76 harness regressions**
+passed before freezing these measurement changes. Timers overlap across clients
+and server stages nest, so their durations must not be added as serial costs.
+
+This is a fresh population-growth test, not a controlled old/new comparison.
+Its 6-GiB cgroup includes client/engine memory, filesystem cache and slab; a limit
+event is not automatically an engine RSS leak. Throughput, checkpoint integrity
+and final 300k qualification remain pending until the corresponding gates finish.
+
 ## Reproduce validation
 
 ```bash
@@ -1018,6 +1980,7 @@ RUSTFLAGS='-D warnings' cargo check --locked --workspace --all-targets
 cargo fmt --all -- --check
 git diff --check
 cargo build --locked --release -p n1 --bins -p n1-release-proof
+python3 -B -m unittest discover -s tools -p 'test_n1_*.py'
 ```
 
 Earlier default parallel execution intermittently failed backup automation's
@@ -1027,6 +1990,14 @@ pass alone is not a parallel pass. A warning-free full Clippy gate is not claime
 
 Run optimized hardware proofs only in new isolated children of mounted members,
 with unique output directories/unused ports. Never reuse live storage roots:
+
+`tools/n1-hdd-benchmark.py` compares strict small-file uploads and explicit
+maintenance at two populations. Run identical parameters with before/after
+binaries and fresh fixture roots. `--admission-probe` separately exercises
+partial batch backpressure; refused objects never count as successful uploads.
+`tools/n1-hdd-scale.py` performs larger ingest/churn runs with a durable
+acknowledgement ledger, complete historical hashes and restart checks. Both
+tools require two distinct mounted members; inspect `--help` before running.
 
 ```bash
 n1-release-proof --binary /proof/bin/litiaina-n1 \

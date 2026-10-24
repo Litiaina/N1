@@ -166,6 +166,14 @@ fn create_marker(root: &Path) -> Result<RootMarker, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn reconcile_roots_for_test(
+    registry_path: &Path,
+    roots: &[PathBuf],
+) -> Result<(), String> {
+    reconcile_roots(registry_path, roots).map(|_| ())
+}
+
+#[cfg(test)]
 fn reconcile_roots(registry_path: &Path, roots: &[PathBuf]) -> Result<RootRegistry, String> {
     let mut registry = load_registry_from(registry_path)?;
     let mut changed = false;

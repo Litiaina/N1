@@ -127,11 +127,35 @@ async fn acquire_live_on_roots(
     roots: &[std::path::PathBuf],
 ) -> Result<FragmentLifecycleGuard, AppError> {
     let guard = acquire_shared(&fragment).await?;
+    require_live_on_roots(fragment, roots).await?;
+    Ok(guard)
+}
+
+/// Read-triggered repair must not queue behind a pending deletion while its
+/// caller may itself hold shared admission. Defer instead; a later read retries.
+pub(crate) async fn try_acquire_live(
+    fragment: &str,
+) -> Result<Option<FragmentLifecycleGuard>, AppError> {
+    let fragment = crate::core::index_store::stable_fragment_id_for_fragment(fragment);
+    let mut guard = FragmentLifecycleGuard::new(&fragment)?;
+    let Ok(read) = guard.lock.as_ref().unwrap().clone().try_read_owned() else {
+        return Ok(None);
+    };
+    guard.read = Some(read);
+    let roots = crate::core::disk_manager::ObjectPathManager::new().get_all_index_roots();
+    require_live_on_roots(&fragment, &roots).await?;
+    Ok(Some(guard))
+}
+
+async fn require_live_on_roots(
+    fragment: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<(), AppError> {
     for root in roots {
         let path = crate::core::fragment_identity::physical_fragment_root_on(&root, &fragment)
             .join(".fragment.ndx");
         match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.is_file() => return Ok(guard),
+            Ok(meta) if meta.is_file() => return Ok(()),
             Ok(_) => return Err(AppError::Conflict("invalid fragment identity file".into())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(AppError::Io(e, "check live fragment identity".into())),

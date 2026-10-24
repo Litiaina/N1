@@ -571,26 +571,9 @@ pub(super) async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[Path
     let fragment = fragment.to_string();
     let roots = blob_roots.to_vec();
     tokio::task::spawn_blocking(move || {
-        for root in roots {
-            let Ok(object_dirs) = index_store::local_object_dirs_under_root(&root, &fragment)
-            else {
-                continue;
-            };
-            for (object_dir, _) in object_dirs {
-                if std::fs::read_dir(&object_dir).ok().is_some_and(|entries| {
-                    entries.filter_map(Result::ok).any(|entry| {
-                        entry.path().is_dir()
-                            && std::fs::read_dir(entry.path())
-                                .ok()
-                                .and_then(|mut files| files.next())
-                                .is_some()
-                    })
-                }) {
-                    return true;
-                }
-            }
-        }
-        false
+        roots
+            .iter()
+            .any(|root| index_store::local_root_has_blob_payload(root, &fragment))
     })
     .await
     .unwrap_or(false)
@@ -611,12 +594,15 @@ pub(super) async fn fragment_has_indexed_payload(
         return Ok(true);
     }
 
-    let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
-    if !live.objects.is_empty() {
-        return Ok(true);
+    for trash in [false, true] {
+        if !index::MetadataScan::new(fragment, trash)
+            .await?
+            .next_batch(1)
+            .await?
+            .is_empty()
+        {
+            return Ok(true);
+        }
     }
-
-    let trash =
-        index::scan_fragment_trash_metadata_page(fragment, None, None, 1, None, true).await?;
-    Ok(!trash.objects.is_empty())
+    Ok(false)
 }
