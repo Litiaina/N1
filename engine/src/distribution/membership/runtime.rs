@@ -15,6 +15,15 @@ pub struct ClusterRuntime {
 }
 
 static CLUSTER_RUNTIME: OnceLock<ArcSwap<ClusterRuntime>> = OnceLock::new();
+static BINDING_PUBLICATION: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Only synchronous, already-admitted filesystem work retains this guard.
+/// Ordinary workers share it; rare binding publication drains old workers.
+pub(crate) fn guard_cluster_binding() -> Result<std::sync::RwLockReadGuard<'static, ()>, AppError> {
+    BINDING_PUBLICATION
+        .read()
+        .map_err(|_| AppError::ServiceUnavailable("cluster binding publication is poisoned".into()))
+}
 
 pub fn active_cluster_runtime() -> Result<Arc<ClusterRuntime>, AppError> {
     CLUSTER_RUNTIME
@@ -30,11 +39,44 @@ pub fn try_active_cluster_runtime() -> Option<Arc<ClusterRuntime>> {
 }
 
 pub fn publish_cluster_runtime(runtime: Arc<ClusterRuntime>) -> Result<(), AppError> {
+    let _publication = BINDING_PUBLICATION.write().map_err(|_| {
+        AppError::ServiceUnavailable("cluster binding publication is poisoned".into())
+    })?;
     let current = CLUSTER_RUNTIME.get().ok_or_else(|| {
         AppError::InternalServerError("N2 cluster runtime is not initialized".into())
     })?;
     current.store(runtime);
     Ok(())
+}
+
+#[cfg(test)]
+mod binding_gate_tests {
+    use super::*;
+
+    #[test]
+    fn binding_publication_waits_for_admitted_worker_to_drain() {
+        let worker = guard_cluster_binding().unwrap();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            arrived_tx.send(()).unwrap();
+            let _publish = BINDING_PUBLICATION.write().unwrap();
+            published_tx.send(()).unwrap();
+        });
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            published_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        drop(worker);
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        publisher.join().unwrap();
+    }
 }
 
 pub(super) fn parse_usize(

@@ -25,6 +25,8 @@ pub(super) struct LocalShardWriter {
     expected_len: u64,
     locator: PeerShardTarget,
     deferred_durability: bool,
+    ownership: crate::distribution::upload_lifecycle::UploadReadGuard,
+    runtime: Arc<crate::distribution::membership::ClusterRuntime>,
 }
 
 impl AsyncWrite for LocalShardWriter {
@@ -70,27 +72,17 @@ impl LocalShardWriter {
             })?;
         }
         drop(self.file);
-        if fs::try_exists(&self.stable_path).await.unwrap_or(false) {
-            let _ = fs::remove_file(&self.stable_path).await;
-        }
-        fs::rename(&self.tmp_path, &self.stable_path)
-            .await
-            .map_err(|e| {
-                AppError::Io(
-                    e,
-                    format!(
-                        "publish cluster shard {} -> {}",
-                        self.tmp_path.display(),
-                        self.stable_path.display()
-                    ),
-                )
-            })?;
-        if !self.deferred_durability {
-            crate::core::upload::sync_dir(self.stable_path.parent().ok_or_else(|| {
-                AppError::InternalServerError("cluster shard path has no parent".into())
-            })?)
-            .await?;
-        }
+        crate::distribution::peer::publish_guarded_shard(
+            self.runtime,
+            self.ownership,
+            self.tmp_path,
+            self.stable_path,
+            checksum.clone(),
+            self.expected_len,
+            false,
+            self.deferred_durability,
+        )
+        .await?;
         invalidate_local_usage_cache(Some(&self.locator.fragment));
         Ok(ShardInfo {
             shard_index: self.shard_index,
@@ -358,6 +350,8 @@ pub(super) fn target_for_placement(
         is_parity,
         expected_len: final_shard_len,
         deferred_durability,
+        repair: false,
+        expected_checksum: None,
     }
 }
 
@@ -393,6 +387,14 @@ pub(super) async fn open_local_writer(
             target.node_id
         )));
     }
+    let ownership = crate::distribution::upload_lifecycle::guard_shard_write(
+        &runtime,
+        &target.pool_id,
+        &target.fragment,
+        &target.object_id,
+        &target.version_id,
+    )
+    .await?;
     let pm = ObjectPathManager::new();
     let file_name = stable_name(target.part_index, target.shard_index, target.is_parity);
     let mut failures = Vec::new();
@@ -420,6 +422,8 @@ pub(super) async fn open_local_writer(
                     is_parity: target.is_parity,
                     expected_len: target.expected_len,
                     deferred_durability: target.deferred_durability,
+                    ownership,
+                    runtime,
                     // The immutable locator keeps the deterministic preferred
                     // root. The node resolves it across current local disks.
                     locator: target,

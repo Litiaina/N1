@@ -90,6 +90,42 @@ pub fn list_live_heads(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> 
     Ok(out)
 }
 
+/// Explicit peer inventory is physical immutable metadata, not a legacy
+/// namespace/symlink presentation listing. Include committed headless objects.
+pub fn list_local_committed_heads(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
+    let mut heads = BTreeMap::<String, ObjectMetadata>::new();
+    for root in blob_roots() {
+        for (dir, object_id) in object_record_dirs_under_root(&root, fragment)? {
+            let Some(summary) = latest_summary_in_object_dir(&dir)? else {
+                continue;
+            };
+            let Some(metadata) =
+                decode_metadata_file_as_if_present(&dir.join(summary.file_name), &object_id)?
+            else {
+                continue;
+            };
+            match heads.get(&object_id) {
+                Some(existing) if existing.version_id == metadata.version_id => {
+                    if serde_json::to_vec(existing)
+                        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+                        != serde_json::to_vec(&metadata)
+                            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+                    {
+                        return Err(AppError::Conflict(
+                            "divergent immutable local metadata inventory".into(),
+                        ));
+                    }
+                }
+                Some(existing) if existing.version_id > metadata.version_id => {}
+                _ => {
+                    heads.insert(object_id, metadata);
+                }
+            }
+        }
+    }
+    Ok(heads.into_values().collect())
+}
+
 fn scan_live_heads_direct_page(
     fragment: &str,
     prefix: Option<String>,

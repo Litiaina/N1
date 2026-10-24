@@ -147,10 +147,53 @@ pub fn load_session_part_receipts(
 
 pub fn remove_session(fragment: &str, version_id: &str) -> Result<bool, AppError> {
     let mut removed = false;
-    for dir in session_roots(fragment, version_id) {
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "remove upload session"))?;
-            removed = true;
+    // Ownership is replicated on every enrolled root, independently of the
+    // manifest's preferred session root. Never recursively remove the version
+    // directory: its compact terminal fence must reject delayed writes after
+    // cancellation, successful finalization and restart.
+    for root in index_roots() {
+        let dir = session_dir(&root, fragment, version_id);
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err(error, "inspect upload session cleanup")),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(AppError::Conflict(
+                "upload session cleanup target is not a real directory".into(),
+            ));
+        }
+        for name in read_dir_names(&dir)? {
+            let part_metadata = name
+                .strip_prefix(PART_META_PREFIX)
+                .and_then(|name| name.strip_suffix(".ncdx"))
+                .is_some_and(|index| {
+                    index.len() == 20 && index.bytes().all(|b| b.is_ascii_digit())
+                });
+            let known = name == MANIFEST_FILE
+                || name == BINDING_FILE
+                || part_metadata
+                || parse_shard_receipt_name(&name).is_some()
+                || parse_part_receipt_name(&name).is_some();
+            if known {
+                removed |= remove_file_if_exists(&dir.join(name))?;
+            }
+        }
+        File::open(&dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| io_err(error, "sync cleaned upload session"))?;
+        match fs::remove_dir(&dir) {
+            Ok(()) => {
+                if let Some(parent) = dir.parent() {
+                    File::open(parent)
+                        .and_then(|dir| dir.sync_all())
+                        .map_err(|error| io_err(error, "sync removed upload session parent"))?;
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENOTEMPTY) => {}
+            Err(error) => return Err(io_err(error, "remove empty upload session directory")),
         }
     }
     Ok(removed)
@@ -216,3 +259,7 @@ pub(crate) fn clear_pending_binding(fragment: &str, version_id: &str) -> Result<
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "sessions/tests.rs"]
+mod tests;

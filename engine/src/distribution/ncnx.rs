@@ -23,10 +23,13 @@ use tokio::sync::Semaphore;
 use tokio::time::Duration;
 
 mod batch;
+mod coordination;
 mod healing;
+mod lease;
 mod listing;
 mod local;
 mod mutation;
+mod stage;
 mod transport;
 
 pub use batch::*;
@@ -48,6 +51,8 @@ const PEER_NCNX_BATCH_PATH: &str = "/n2/peer/ncnx-v4/batch";
 const PEER_NCNX_TIMEOUT: Duration = Duration::from_secs(20);
 pub const PEER_NCNX_BATCH_MAX: usize = 128;
 const LOCAL_NCNX_BATCH_CONCURRENCY: usize = 4;
+static LOCAL_NCNX_ADMISSION: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(256)));
 
 static LOCAL_NCNX_BATCH_BUDGET: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(LOCAL_NCNX_BATCH_CONCURRENCY)));
@@ -122,6 +127,8 @@ pub struct PeerNcnxRequest {
     pub after: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,6 +165,8 @@ struct PeerNcnxBatchItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trash: Option<TrashLocator>,
     bytes: ByteBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +312,10 @@ pub fn build_ncnx_layout(
     fragment_id: &str,
     logical_key: &str,
 ) -> Result<NcnxLayout, AppError> {
+    let physical_fragment = coordination::canonical_fragment(fragment_id)?;
+    let fragment_id = physical_fragment
+        .strip_prefix(crate::core::fragment_identity::PHYSICAL_FRAGMENT_PREFIX)
+        .expect("canonical physical fragment");
     let logical_key = validate_logical_key(logical_key)?;
     let required = pool.policy.namespace_replicas();
     let mut nodes = runtime.membership.nodes_for_pool(&pool.id);

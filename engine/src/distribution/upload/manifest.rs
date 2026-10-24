@@ -34,7 +34,7 @@ pub(super) async fn prepare_cluster_upload_manifest(
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(params.total_size_bytes);
-    Ok(UploadSessionManifest {
+    let manifest = UploadSessionManifest {
         fragment: fragment.to_string(),
         object_key,
         packed_ext_u64: params.packed_ext_u64,
@@ -54,7 +54,13 @@ pub(super) async fn prepare_cluster_upload_manifest(
         membership_epoch: runtime.membership.epoch,
         data_shards: layout.data_shards as u16,
         parity_shards: layout.parity_shards as u16,
-    })
+    };
+    crate::distribution::upload_ownership::register_upload(
+        &runtime,
+        &crate::distribution::upload_lifecycle::UploadIdentity::from_manifest(&runtime, &manifest),
+    )
+    .await?;
+    Ok(manifest)
 }
 
 pub async fn initiate_cluster_upload(

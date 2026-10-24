@@ -5,6 +5,7 @@ async fn post_object_metadata(
     binding_epoch: u64,
     metadata: &ObjectMetadata,
     sync_shards_before_publish: bool,
+    repair: bool,
 ) -> Result<(), AppError> {
     let client = peer_http_client()?;
     let url = format!(
@@ -17,6 +18,7 @@ async fn post_object_metadata(
         binding_epoch,
         metadata: metadata.clone(),
         sync_shards_before_publish,
+        repair,
     });
     if let Some(secret) = cluster_secret() {
         request = request.header("x-n2-cluster-secret", secret);
@@ -170,6 +172,29 @@ pub async fn publish_cluster_object_metadata(metadata: &ObjectMetadata) -> Resul
     publish_cluster_object_metadata_mode(metadata, false).await
 }
 
+async fn publish_local_object_metadata(
+    runtime: &ClusterRuntime,
+    metadata: &ObjectMetadata,
+    sync_shards_before_publish: bool,
+    repair: bool,
+) -> Result<(), AppError> {
+    use crate::distribution::upload_lifecycle::{self, UploadIdentity};
+    validate_metadata_pool_contract(runtime, metadata)?;
+    if repair {
+        // Missing local metadata or an old deployment has no trustworthy
+        // ownership record. Only an independently verified K-copy commit can
+        // authorize bootstrapping; never use the incoming JSON as its proof.
+        crate::distribution::upload_ownership::verify_committed_metadata(runtime, metadata).await?;
+        upload_lifecycle::bootstrap_committed(runtime, metadata).await?;
+    }
+    let identity = UploadIdentity::from_metadata(runtime, metadata);
+    let mut ownership = upload_lifecycle::guard_metadata_publication(runtime, &identity).await?;
+    if sync_shards_before_publish {
+        sync_local_object_shards(runtime, metadata).await?;
+    }
+    ownership.publish_metadata(metadata.clone()).await
+}
+
 /// Standard multipart's single durable commit boundary. Every participant
 /// fsyncs its already-written shard files before it publishes the immutable
 /// NCDX replica. NCNX publication remains the caller's final visibility step.
@@ -207,14 +232,24 @@ async fn publish_cluster_object_metadata_mode(
         tasks.push(async move {
             let participant = node_id.clone();
             if node_id == local_node_id {
-                if sync_shards_before_publish {
-                    sync_local_object_shards(&runtime, &metadata).await?;
-                }
-                index::publish_object(&metadata).await.map(|_| participant)
+                publish_local_object_metadata(
+                    &runtime,
+                    &metadata,
+                    sync_shards_before_publish,
+                    false,
+                )
+                .await
+                .map(|_| participant)
             } else {
-                post_object_metadata(&node, binding_epoch, &metadata, sync_shards_before_publish)
-                    .await
-                    .map(|_| participant)
+                post_object_metadata(
+                    &node,
+                    binding_epoch,
+                    &metadata,
+                    sync_shards_before_publish,
+                    false,
+                )
+                .await
+                .map(|_| participant)
             }
         });
     }
@@ -288,9 +323,16 @@ async fn repair_metadata_on_node(
     metadata: &ObjectMetadata,
 ) -> Result<(), AppError> {
     if node.id == runtime.local_node_id {
-        index::publish_object(metadata).await.map(|_| ())
+        publish_local_object_metadata(runtime, metadata, false, true).await
     } else {
-        post_object_metadata(node, runtime.membership.binding_epoch, metadata, false).await
+        post_object_metadata(
+            node,
+            runtime.membership.binding_epoch,
+            metadata,
+            false,
+            true,
+        )
+        .await
     }
 }
 
@@ -525,10 +567,13 @@ pub async fn peer_publish_object_metadata(
         ));
     }
     validate_metadata_pool_contract(&runtime, &request.metadata)?;
-    if request.sync_shards_before_publish {
-        sync_local_object_shards(&runtime, &request.metadata).await?;
-    }
-    index::publish_object(&request.metadata).await?;
+    publish_local_object_metadata(
+        &runtime,
+        &request.metadata,
+        request.sync_shards_before_publish,
+        request.repair,
+    )
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -538,7 +583,7 @@ pub async fn peer_object_inventory(
 ) -> Result<Json<Vec<ObjectMetadata>>, AppError> {
     authorize_peer(&headers)?;
     Ok(Json(
-        index::list_fragment_live_objects(&request.fragment).await?,
+        index::list_fragment_local_committed_heads(&request.fragment).await?,
     ))
 }
 

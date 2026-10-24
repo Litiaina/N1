@@ -245,6 +245,16 @@ membership JSON.
 
 ## Configuration
 
+HTTP rate settings in `[rate_limiter_config]` named `*_limit_per_second` mean
+sustained **requests per second**, not seconds per token. Burst size remains
+independent: a view rate of 30 and burst of 100 permit an initial burst of 100,
+then refill about one request every 33.33 ms, capped at 100 available tokens.
+Auth/global limits are IP-scoped; view/upload limits are fragment-scoped and
+shared by clients using that fragment. These are per-process HTTP budgets, not
+cluster-wide or native-protocol quotas. Enabled rates must be 1–1,000,000,000
+and burst sizes nonzero; invalid numeric bounds refuse startup. Disable with
+`enable_rate_limiting=false`, not zero-valued quotas. Restart after editing.
+
 Every node has a local `n2_config.ini`. Identity, endpoints, and local roots
 differ per node; pool identity, generation, and EC must match membership.
 
@@ -1707,9 +1717,16 @@ POST /noa/v1/maintenance/fragment/cleanup
 Authorization: Bearer <token>
 ```
 
-Use these for operator-controlled fragment storage initialization or metadata
-cleanup. Normal object upload does not require calling them manually when the
-fragment is already provisioned correctly.
+Use `init` for operator-controlled fragment storage initialization. `cleanup`
+requires modify permission and now performs read-only local metadata inspection;
+it does not delete object or upload directories. Its response includes
+`usage_scope: "local_recorded_live_heads"`, `orphan_blob_dirs_removed: 0`, and
+`orphan_reclamation_status: "deferred"`. The usage is not complete cluster or
+historical-version accounting. This endpoint never supplies orphan deletion
+authority. Guarded GC uses the separate upload-ownership protocol below;
+expiring a session record alone is not proof its peer pieces were reclaimed.
+Normal object upload does not require either call when the fragment is already
+provisioned correctly.
 
 ### Fragment Health
 
@@ -1728,14 +1745,29 @@ GET  /noa/v1/maintenance/gc/status
 Authorization: Bearer <token>
 ```
 
-Normal GC scans flat `.trash` records, proves live and unexpired references, and
-reclaims expired object holders before deleting the final trash NCNX. It does
-not use a routine whole-object orphan scan. GC is lockless and idempotent across
-coordinators: a branch concurrently pruned by another completed cleanup is not
-an error. Temporary topology unavailability defers the run without reclaiming
-data; corrupt, conflicting, or malformed records still fail the run. The status
-response distinguishes `Deferred` from `Failed` and exposes the latest job's
-deferred count separately from real errors.
+Normal GC scans flat `.trash` and active `.uploads` ownership records, not the
+whole object payload tree. An expired duplicate trash pointer may be discarded
+while another reference protects the object. Reclaiming the final committed
+trash object is deferred until object-reference exclusion against concurrent
+recovery is implemented; `total_trash_reclamations_deferred` reports this, with
+no reclaimed-byte claim.
+
+For new one-shot, standard, and durable uploads, every holder records version
+ownership before accepting pieces. GC rechecks the idle cutoff under the
+holder's version guard, obtains M+1 durable abort votes, and asks exact holders
+to reclaim only that version. Each receiver independently verifies the votes.
+Cancellation uses the same protocol without the GC idle cutoff. Committed
+NCDX remains protected even without any NCNX. Unknown old payloads and ambiguous
+partial commits are retained. `total_sessions_deleted` counts completed exact
+cleanup; `total_sessions_deferred` counts retained candidates.
+
+This requires a nonempty `N2_CLUSTER_SECRET` and an all-holder coordinated
+upgrade with old writers stopped. Terminal fences survive restart and session
+cleanup; do not manually delete `.uploads/.fences`. See
+[upload ownership](docs/upload-lifecycle.md) for the precise protocol and limits.
+Temporary topology unavailability defers reclamation; corrupt or conflicting
+records remain errors. Completing a GC pass does not mean every deferred
+candidate was reclaimed.
 
 ### Repair
 

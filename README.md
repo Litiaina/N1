@@ -48,10 +48,12 @@ evidence, not the current mutation-authority contract.
 N2 3.4.1 preserves each pool's exact static `K + M` layout and keeps missing
 exact slots as deterministic healing targets. Data remains reconstructable at
 `K`, but the current partition-authority patch acknowledges a new client
-mutation only while the coordinator can reach the complete bound writable
-pool and publish every exact `M + 1` NCNX replica. Ambiguous reachability is
-reported as degraded and fails writes closed rather than manufacturing
-authority from a timeout. It does not add
+mutation only while the coordinator can reach at least
+`max(K, floor((K+M)/2)+1)` bound pool nodes and publish every exact `M + 1`
+NCNX replica for the affected key. This is the implemented admission rule,
+not a claim that reachability alone orders concurrent mutations. Ambiguous
+reachability is reported as degraded and fails writes closed rather than
+manufacturing authority from a timeout. It does not add
 quorum consensus or adaptive placement.
 
 N2 3.5 moves its bounded streaming erasure pipeline into the independently
@@ -74,6 +76,14 @@ A key such as `videos/mhw.mp4` is stored as `videos/mhw.mp4.ncnx` on its
 deterministic replica holders. The `videos/` path is a key prefix, not a
 shared inode, transaction participant, or lock. Exact-key mutations use
 destination-first copy/delete and never rewrite NCDX or object payloads.
+
+Namespace repair and mutations now share exact-key stage ownership. Upload
+cancellation and targeted orphan cleanup use [durable version ownership](docs/upload-lifecycle.md),
+without changing NCNX/NCDX encoding. Upgrade all holders together with old
+writers stopped; these guarantees require a nonempty `N2_CLUSTER_SECRET`.
+Ambiguous legacy payloads and unsafe final-trash reclamation are retained,
+not reported as successful cleanup. Qualification and remaining release gates
+are recorded in [TESTING.md](TESTING.md).
 
 N2 is not an S3 clone and does not use S3 as its core identity. Its public
 surface is the NOA v1 `/noa/v1/...` HTTP API plus the `n2://` native protocol

@@ -184,6 +184,10 @@ pub struct PeerShardTarget {
     /// Standard multipart publishes the stable shard name immediately but
     /// defers file/directory fsync until the single finalize boundary.
     pub deferred_durability: bool,
+    /// Repair is authorized only by exact committed immutable metadata, never
+    /// by an unfinished upload's claim on this version.
+    pub repair: bool,
+    pub expected_checksum: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +198,8 @@ pub struct PeerObjectMetadataRequest {
     pub metadata: ObjectMetadata,
     #[serde(default)]
     pub sync_shards_before_publish: bool,
+    #[serde(default)]
+    pub repair: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -331,6 +337,10 @@ pub struct PeerShardQuery {
     pub length: Option<usize>,
     #[serde(default)]
     pub deferred_durability: bool,
+    #[serde(default)]
+    pub repair: bool,
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 pub(crate) fn cluster_secret() -> Option<String> {

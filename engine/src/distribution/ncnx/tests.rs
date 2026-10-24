@@ -61,6 +61,32 @@ fn runtime() -> ClusterRuntime {
     }
 }
 
+async fn own_local_request(runtime: &ClusterRuntime, request: &mut PeerNcnxRequest) {
+    let grant = lease::run_local_lease(
+        Arc::new(runtime.clone()),
+        lease::PeerNcnxLeaseRequest {
+            action: lease::PeerNcnxLeaseAction::Acquire,
+            cluster_id: runtime.membership.cluster_id.clone(),
+            pool_id: request.pool_id.clone(),
+            pool_generation: request.pool_generation,
+            target_slot_id: request.target_slot_id.clone(),
+            target_instance_id: request.target_instance_id.clone(),
+            binding_epoch: request.binding_epoch,
+            fragment_id: request.fragment_id.clone(),
+            owner_id: Ulid::new().to_string(),
+            ttl_ms: lease::MAX_LEASE_TTL_MS,
+            items: vec![lease::PeerNcnxLeaseKey {
+                logical_key: request.logical_key.clone(),
+                root_id: request.root_id.clone(),
+                token: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    request.lease_token = Some(grant.items[0].token.clone());
+}
+
 #[test]
 fn four_plus_two_derives_three_distinct_ncnx_holders() {
     let runtime = runtime();
@@ -112,6 +138,10 @@ fn ncnx_placement_is_stable_and_key_specific() {
     let retry = build_ncnx_layout(&runtime, pool, "fragment", "videos/a.mp4").unwrap();
     let other = build_ncnx_layout(&runtime, pool, "fragment", "videos/b.mp4").unwrap();
     assert_eq!(first, retry);
+    assert_eq!(
+        first,
+        build_ncnx_layout(&runtime, pool, "@f_fragment", "videos//a.mp4").unwrap()
+    );
     assert_ne!(first.replicas, other.replicas);
 }
 
@@ -189,6 +219,7 @@ fn local_canonical_listing_refills_past_noncanonical_physical_names() {
         bytes: None,
         after: None,
         limit: Some(1),
+        lease_token: None,
     };
     let page = local_list(&runtime, &request).expect("list canonical page");
     assert_eq!(
@@ -308,5 +339,298 @@ async fn one_failed_local_disk_does_not_turn_the_node_into_a_failed_ncnx_replica
     runtime.membership.nodes[0].storage_roots[1].path = failed.display().to_string();
     assert!(run_local_apply(Arc::new(runtime), request).await.is_err());
 
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn delayed_peer_repair_does_not_overwrite_batched_recreated_generation() {
+    let root = std::env::temp_dir().join(format!("n2-stale-peer-repair-{}", Ulid::new()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut runtime = runtime();
+    runtime.local_storage_roots[0].path = root.display().to_string();
+    runtime.membership.nodes[0].storage_roots[0].path = root.display().to_string();
+    crate::core::root_identity::initialize_local_root_identities(&runtime).unwrap();
+    let pool = runtime.membership.pool("pool-a").unwrap();
+    let (key, layout) = (0..20_000)
+        .find_map(|index| {
+            let key = format!("stale/key-{index:05}");
+            let layout = build_ncnx_layout(&runtime, pool, "fragment", &key).ok()?;
+            layout
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == "n0")
+                .then_some((key, layout))
+        })
+        .unwrap();
+    let replica = layout
+        .replicas
+        .iter()
+        .find(|replica| replica.node_id == "n0")
+        .unwrap();
+    let old = NcnxRecord::new("fragment", "object-a", Ulid::new().to_string(), 1)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let new = NcnxRecord::new("fragment", "object-b", Ulid::new().to_string(), 2)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let mut request = request_for_replica(
+        PeerNcnxAction::CreateLive,
+        &layout,
+        replica,
+        "fragment",
+        &key,
+        None,
+        Some(&old),
+    );
+    own_local_request(&runtime, &mut request).await;
+    run_local_apply(Arc::new(runtime.clone()), request.clone())
+        .await
+        .unwrap();
+    let mut batch = PeerNcnxBatchRequest {
+        action: PeerNcnxBatchAction::RemoveLive,
+        pool_id: request.pool_id.clone(),
+        pool_generation: request.pool_generation,
+        target_slot_id: request.target_slot_id.clone(),
+        target_instance_id: request.target_instance_id.clone(),
+        binding_epoch: request.binding_epoch,
+        fragment_id: request.fragment_id.clone(),
+        root_id: request.root_id.clone(),
+        items: vec![PeerNcnxBatchItem {
+            logical_key: key.clone(),
+            trash: None,
+            bytes: ByteBuf::from(old.clone()),
+            lease_token: request.lease_token.clone(),
+        }],
+    };
+    let mut duplicate = batch.clone();
+    let mut alias = duplicate.items[0].clone();
+    alias.logical_key = key.replace('/', "//");
+    duplicate.items.push(alias);
+    assert!(matches!(
+        run_local_batch(Arc::new(runtime.clone()), duplicate).await,
+        Err(AppError::Conflict(_))
+    ));
+    let mut unchanged = request.clone();
+    unchanged.action = PeerNcnxAction::ReadLive;
+    assert_eq!(
+        run_local_apply(Arc::new(runtime.clone()), unchanged)
+            .await
+            .unwrap()
+            .bytes
+            .unwrap()
+            .as_ref(),
+        old.as_slice()
+    );
+    assert_eq!(
+        run_local_batch(Arc::new(runtime.clone()), batch.clone())
+            .await
+            .unwrap()
+            .changed,
+        1
+    );
+    batch.action = PeerNcnxBatchAction::CreateLive;
+    batch.items[0].bytes = ByteBuf::from(new.clone());
+    assert_eq!(
+        run_local_batch(Arc::new(runtime.clone()), batch)
+            .await
+            .unwrap()
+            .changed,
+        1
+    );
+
+    let held = coordination::lock_keys("fragment", [key.as_str()])
+        .await
+        .unwrap();
+    let mut stale = request.clone();
+    stale.action = PeerNcnxAction::RepairLive;
+    let repair_runtime = Arc::new(runtime.clone());
+    let waiting = tokio::spawn(async move { run_local_apply(repair_runtime, stale).await });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+    drop(held);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(AppError::Conflict(_))
+    ));
+    let mut read = request;
+    read.action = PeerNcnxAction::ReadLive;
+    read.bytes = None;
+    assert_eq!(
+        run_local_apply(Arc::new(runtime), read)
+            .await
+            .unwrap()
+            .bytes
+            .unwrap()
+            .into_vec(),
+        new
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn repair_checks_valid_generations_on_every_local_root_before_fallback_publication() {
+    let base = std::env::temp_dir().join(format!("n2-repair-fallback-{}", Ulid::new()));
+    let mut runtime = runtime();
+    let roots = ["root-a", "root-b"]
+        .map(|id| {
+            let path = base.join(id);
+            std::fs::create_dir_all(&path).unwrap();
+            StorageRoot {
+                id: id.into(),
+                physical_id: None,
+                path: path.display().to_string(),
+            }
+        })
+        .to_vec();
+    runtime.local_storage_roots = roots.clone();
+    runtime.membership.nodes[0].storage_roots = roots;
+    crate::core::root_identity::initialize_local_root_identities(&runtime).unwrap();
+    let pool = runtime.membership.pool("pool-a").unwrap();
+    let (key, layout) = (0..20_000)
+        .find_map(|index| {
+            let key = format!("fallback/key-{index}");
+            let layout = build_ncnx_layout(&runtime, pool, "fragment", &key).ok()?;
+            layout
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == "n0")
+                .then_some((key, layout))
+        })
+        .unwrap();
+    let replica = layout
+        .replicas
+        .iter()
+        .find(|replica| replica.node_id == "n0")
+        .unwrap();
+    let preferred = runtime
+        .local_storage_roots
+        .iter()
+        .find(|root| root.id == replica.root_id)
+        .unwrap();
+    let fallback = runtime
+        .local_storage_roots
+        .iter()
+        .find(|root| root.id != replica.root_id)
+        .unwrap();
+    let preferred_store = NcnxStore::new(&preferred.id, PathBuf::from(&preferred.path));
+    let fallback_store = NcnxStore::new(&fallback.id, PathBuf::from(&fallback.path));
+    let old = NcnxRecord::new("fragment", "object-a", Ulid::new().to_string(), 1)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let new = NcnxRecord::new("fragment", "object-b", Ulid::new().to_string(), 2)
+        .unwrap()
+        .encode()
+        .unwrap();
+    fallback_store.create_live("fragment", &key, &new).unwrap();
+    let mut request = request_for_replica(
+        PeerNcnxAction::RepairLive,
+        &layout,
+        replica,
+        "fragment",
+        &key,
+        None,
+        Some(&old),
+    );
+    own_local_request(&runtime, &mut request).await;
+    assert!(matches!(
+        run_local_apply(Arc::new(runtime.clone()), request.clone()).await,
+        Err(AppError::Conflict(_))
+    ));
+    assert!(
+        preferred_store
+            .read_live("fragment", &key)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fallback_store
+            .read_live("fragment", &key)
+            .unwrap()
+            .unwrap()
+            .1,
+        new
+    );
+    request.bytes = Some(ByteBuf::from(new.clone()));
+    let response = run_local_apply(Arc::new(runtime.clone()), request.clone())
+        .await
+        .unwrap();
+    assert!(!response.changed);
+    assert_eq!(response.root_id, fallback.id);
+    assert!(
+        preferred_store
+            .read_live("fragment", &key)
+            .unwrap()
+            .is_none()
+    );
+    // An inaccessible root is not evidence of absence. Hide the valid newer
+    // generation behind a non-directory component without changing its bytes.
+    let retained_root = base.join("retained-fallback");
+    std::fs::rename(&fallback.path, &retained_root).unwrap();
+    std::fs::write(&fallback.path, b"temporarily inaccessible storage root").unwrap();
+    request.bytes = Some(ByteBuf::from(old));
+    assert!(matches!(
+        run_local_apply(Arc::new(runtime.clone()), request.clone()).await,
+        Err(AppError::Io(_, _))
+    ));
+    assert!(
+        preferred_store
+            .read_live("fragment", &key)
+            .unwrap()
+            .is_none()
+    );
+    request.action = PeerNcnxAction::RepairTrash;
+    request.trash = Some(TrashLocator {
+        logical_key: key.clone(),
+        deleted_at_unix_nanos: 100,
+        delete_mutation_id: Ulid::new().to_string(),
+    });
+    assert!(matches!(
+        run_local_apply(Arc::new(runtime.clone()), request.clone()).await,
+        Err(AppError::Io(_, _))
+    ));
+    request.action = PeerNcnxAction::RemoveLive;
+    request.trash = None;
+    request.bytes = Some(ByteBuf::from(new.clone()));
+    assert!(
+        matches!(
+            run_local_apply(Arc::new(runtime.clone()), request.clone()).await,
+            Err(AppError::ServiceUnavailable(_))
+        ),
+        "one readable root cannot certify removal from an inaccessible fallback"
+    );
+    let batch = PeerNcnxBatchRequest {
+        action: PeerNcnxBatchAction::RemoveLive,
+        pool_id: request.pool_id.clone(),
+        pool_generation: request.pool_generation,
+        target_slot_id: request.target_slot_id.clone(),
+        target_instance_id: request.target_instance_id.clone(),
+        binding_epoch: request.binding_epoch,
+        fragment_id: request.fragment_id.clone(),
+        root_id: request.root_id.clone(),
+        items: vec![PeerNcnxBatchItem {
+            logical_key: key.clone(),
+            trash: None,
+            bytes: ByteBuf::from(new.clone()),
+            lease_token: request.lease_token.clone(),
+        }],
+    };
+    assert!(matches!(
+        run_local_batch(Arc::new(runtime.clone()), batch).await,
+        Err(AppError::ServiceUnavailable(_))
+    ));
+    assert_eq!(
+        NcnxStore::new(&fallback.id, &retained_root)
+            .read_live("fragment", &key)
+            .unwrap()
+            .unwrap()
+            .1,
+        new
+    );
     let _ = std::fs::remove_dir_all(base);
 }

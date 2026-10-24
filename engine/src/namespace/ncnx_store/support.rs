@@ -386,8 +386,25 @@ pub(super) fn replace_durable(path: &Path, bytes: &[u8]) -> Result<bool, AppErro
             )
         })?;
     }
-    if fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(false);
+    match fs::read(path) {
+        Ok(existing) if existing == bytes => return Ok(false),
+        Ok(existing) if NcnxRecord::decode(&existing).is_ok() => {
+            // Repair is not permission to overwrite an immutable pointer.
+            // The peer receiver serializes this check and publication with
+            // single and batched mutations for this exact logical key.
+            return Err(AppError::Conflict(format!(
+                "refused to repair a different valid NCNX generation at {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::Io(
+                err,
+                format!("read NCNX repair target {}", path.display()),
+            ));
+        }
     }
     let parent = path
         .parent()

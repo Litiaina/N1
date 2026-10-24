@@ -350,6 +350,13 @@ pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMeta
     run_index_blocking(move || index_store::list_live_heads(&fragment)).await
 }
 
+pub async fn list_fragment_local_committed_heads(
+    fragment: &str,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let fragment = fragment.to_string();
+    run_index_blocking(move || index_store::list_local_committed_heads(&fragment)).await
+}
+
 pub async fn scan_fragment_live_objects_page(
     fragment: &str,
     prefix: Option<String>,

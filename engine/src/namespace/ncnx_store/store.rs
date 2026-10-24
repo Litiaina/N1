@@ -327,7 +327,12 @@ impl NcnxStore {
         logical_key: &str,
         bytes: &[u8],
     ) -> Result<bool, AppError> {
-        NcnxRecord::decode(bytes)?;
+        let record = NcnxRecord::decode(bytes)?;
+        if record.fragment_id != fragment_id {
+            return Err(AppError::Conflict(
+                "NCNX fragment identity differs from repair target".into(),
+            ));
+        }
         replace_durable(&self.live_path(fragment_id, logical_key)?, bytes)
     }
 
@@ -337,7 +342,12 @@ impl NcnxStore {
         locator: &TrashLocator,
         bytes: &[u8],
     ) -> Result<bool, AppError> {
-        NcnxRecord::decode(bytes)?;
+        let record = NcnxRecord::decode(bytes)?;
+        if record.fragment_id != fragment_id {
+            return Err(AppError::Conflict(
+                "NCNX fragment identity differs from repair target".into(),
+            ));
+        }
         replace_durable(
             &self.trash_path(
                 fragment_id,

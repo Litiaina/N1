@@ -8,58 +8,144 @@ use crate::distribution::peer::{PeerShardTarget, parse_peer_shard_locator, put_p
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::time::{Duration, sleep};
 use tracing::warn;
 
 const POST_REPAIR_VERIFY_ATTEMPTS: usize = 3;
 const POST_REPAIR_VERIFY_DELAY: Duration = Duration::from_millis(25);
 
-static CLUSTER_READ_REPAIR_INFLIGHT: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+// Admission never blocks GET and does not create an unbounded repair backlog.
+const MAX_CLUSTER_READ_REPAIR_PARTS: usize = 8;
+
+#[derive(Default)]
+struct PendingReadRepair {
+    owner: Arc<()>,
+    targets: HashSet<usize>,
+}
+
+static CLUSTER_READ_REPAIR_INFLIGHT: LazyLock<Mutex<HashMap<String, PendingReadRepair>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct ClusterReadRepairGuard {
     key: String,
+    owner: Arc<()>,
 }
 
 impl Drop for ClusterReadRepairGuard {
     fn drop(&mut self) {
         if let Ok(mut inflight) = CLUSTER_READ_REPAIR_INFLIGHT.lock() {
-            inflight.remove(&self.key);
+            // A drained worker can finish after a new job for the same part
+            // was admitted. Never remove that new worker's pending targets.
+            remove_owned_read_repair(&mut inflight, &self.key, &self.owner);
         }
     }
 }
 
-fn acquire_cluster_read_repair(
-    part: &crate::core::disk_manager::PartMetadata,
-) -> Option<ClusterReadRepairGuard> {
-    let first = part.shards.first()?;
-    let key = format!("{}\0{}", part.part_index, first.absolute_path);
-    let mut inflight = CLUSTER_READ_REPAIR_INFLIGHT.lock().ok()?;
-    if !inflight.insert(key.clone()) {
-        return None;
+fn remove_owned_read_repair(
+    inflight: &mut HashMap<String, PendingReadRepair>,
+    key: &str,
+    owner: &Arc<()>,
+) {
+    if inflight
+        .get(key)
+        .is_some_and(|pending| Arc::ptr_eq(&pending.owner, owner))
+    {
+        inflight.remove(key);
     }
-    Some(ClusterReadRepairGuard { key })
 }
 
-pub fn schedule_cluster_part_read_repair(part: crate::core::disk_manager::PartMetadata) {
-    let Some(guard) = acquire_cluster_read_repair(&part) else {
+fn enqueue_read_repair_targets(
+    inflight: &mut HashMap<String, PendingReadRepair>,
+    key: &str,
+    targets: HashSet<usize>,
+) -> Option<Arc<()>> {
+    if let Some(pending) = inflight.get_mut(key) {
+        pending.targets.extend(targets);
+        return None;
+    }
+    if inflight.len() >= MAX_CLUSTER_READ_REPAIR_PARTS {
+        warn!("Cluster read repair is at capacity; a later verified read can retry this part");
+        return None;
+    }
+    let owner = Arc::new(());
+    inflight.insert(
+        key.to_string(),
+        PendingReadRepair {
+            owner: owner.clone(),
+            targets,
+        },
+    );
+    Some(owner)
+}
+
+fn take_read_repair_targets(
+    inflight: &mut HashMap<String, PendingReadRepair>,
+    key: &str,
+    owner: &Arc<()>,
+) -> Option<HashSet<usize>> {
+    let pending = inflight.get_mut(key)?;
+    if !Arc::ptr_eq(&pending.owner, owner) {
+        return None;
+    }
+    if pending.targets.is_empty() {
+        inflight.remove(key);
+        return None;
+    }
+    Some(std::mem::take(&mut pending.targets))
+}
+
+fn enqueue_cluster_read_repair(
+    part: &crate::core::disk_manager::PartMetadata,
+    failed_shards: impl IntoIterator<Item = usize>,
+) -> Option<ClusterReadRepairGuard> {
+    let first = part.shards.first()?;
+    let key = format!(
+        "{}\0{}\0{}",
+        part.part_index, first.absolute_path, first.checksum
+    );
+    let targets = failed_shards
+        .into_iter()
+        .filter(|index| part.shards.iter().any(|shard| shard.shard_index == *index))
+        .collect::<HashSet<_>>();
+    if targets.is_empty() {
+        return None;
+    }
+    let mut inflight = CLUSTER_READ_REPAIR_INFLIGHT.lock().ok()?;
+    let owner = enqueue_read_repair_targets(&mut inflight, &key, targets)?;
+    Some(ClusterReadRepairGuard { key, owner })
+}
+
+impl ClusterReadRepairGuard {
+    fn take_targets(&self) -> Option<HashSet<usize>> {
+        let mut inflight = CLUSTER_READ_REPAIR_INFLIGHT.lock().ok()?;
+        take_read_repair_targets(&mut inflight, &self.key, &self.owner)
+    }
+}
+
+pub(crate) fn schedule_cluster_part_read_repair(
+    part: crate::core::disk_manager::PartMetadata,
+    failed_shards: impl IntoIterator<Item = usize>,
+) {
+    let Some(guard) = enqueue_cluster_read_repair(&part, failed_shards) else {
         return;
     };
     tokio::spawn(async move {
-        let _guard = guard;
-        if let Err(err) = repair_cluster_part_after_read(&part).await {
-            warn!(
-                "Cluster read repair failed for part {}: {}",
-                part.part_index, err
-            );
+        while let Some(targets) = guard.take_targets() {
+            if let Err(err) = repair_cluster_part_after_read(&part, &targets).await {
+                warn!(
+                    "Cluster read repair failed for part {}: {}",
+                    part.part_index, err
+                );
+            }
         }
     });
 }
 
 async fn repair_cluster_part_after_read(
     part: &crate::core::disk_manager::PartMetadata,
+    failed_shards: &HashSet<usize>,
 ) -> Result<(), AppError> {
     let block_size = part
         .shards
@@ -67,43 +153,75 @@ async fn repair_cluster_part_after_read(
         .map(|shard| shard.checksum_block_size)
         .find(|size| *size > 0)
         .unwrap_or(256 * 1024);
-    let mut cache = VerifiedShardCache::default();
+    let mut cache = VerifiedShardCache::for_repair();
+    let mut first_error = None;
+    for shard in part
+        .shards
+        .iter()
+        .filter(|shard| failed_shards.contains(&shard.shard_index))
+    {
+        if let Err(error) = repair_cluster_read_target(part, shard, block_size, &mut cache).await {
+            warn!(
+                "Cluster read repair failed for shard {}: {}",
+                shard.shard_index, error
+            );
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
 
-    for shard in &part.shards {
-        match shard_probe(shard, false).await {
-            ShardProbeResult::Healthy | ShardProbeResult::Unavailable => continue,
-            ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {}
-        }
-        let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) else {
-            continue;
-        };
-        let reconstructed =
-            reconstruct_cluster_shard_cached(part, shard.shard_index, block_size, &mut cache)
-                .await?;
-        let target = PeerShardTarget {
-            pool_id: locator.pool_id,
-            pool_generation: locator.pool_generation,
-            node_id: locator.node_id,
-            instance_id: locator.instance_id,
-            binding_epoch: locator.binding_epoch,
-            root_id: locator.root_id,
-            endpoint: locator.endpoint,
-            fragment: locator.fragment,
-            object_id: locator.object_id,
-            version_id: locator.version_id,
-            part_index: locator.part_index,
-            shard_index: locator.shard_index,
-            is_parity: locator.is_parity,
-            expected_len: shard.size_bytes,
-            deferred_durability: false,
-        };
-        let repaired = put_peer_shard_bytes(target, &reconstructed).await?;
-        if !repaired.checksum.eq_ignore_ascii_case(&shard.checksum) {
-            return Err(AppError::InternalServerError(format!(
-                "read-repaired shard {} checksum differed: got {}, expected {}",
-                shard.shard_index, repaired.checksum, shard.checksum
-            )));
-        }
+async fn repair_cluster_read_target(
+    part: &crate::core::disk_manager::PartMetadata,
+    shard: &crate::core::disk_manager::ShardInfo,
+    block_size: usize,
+    cache: &mut VerifiedShardCache,
+) -> Result<(), AppError> {
+    // A readable byte is not evidence that the shard is healthy. Recheck
+    // the exact failed holder's SHA, and never replace an unavailable
+    // holder merely because GET observed a transient transport error.
+    match shard_probe(shard, true).await {
+        ShardProbeResult::Healthy | ShardProbeResult::Unavailable => return Ok(()),
+        ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {}
+    }
+    let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) else {
+        return Ok(());
+    };
+    if locator.part_index != part.part_index
+        || locator.shard_index != shard.shard_index
+        || locator.is_parity != shard.is_parity
+    {
+        return Err(AppError::InternalServerError(
+            "read repair target differs from recorded shard layout".into(),
+        ));
+    }
+    let reconstructed =
+        reconstruct_cluster_shard_cached(part, shard.shard_index, block_size, cache).await?;
+    let target = PeerShardTarget {
+        pool_id: locator.pool_id,
+        pool_generation: locator.pool_generation,
+        node_id: locator.node_id,
+        instance_id: locator.instance_id,
+        binding_epoch: locator.binding_epoch,
+        root_id: locator.root_id,
+        endpoint: locator.endpoint,
+        fragment: locator.fragment,
+        object_id: locator.object_id,
+        version_id: locator.version_id,
+        part_index: locator.part_index,
+        shard_index: locator.shard_index,
+        is_parity: locator.is_parity,
+        expected_len: shard.size_bytes,
+        deferred_durability: false,
+        repair: true,
+        expected_checksum: Some(shard.checksum.clone()),
+    };
+    let repaired = put_peer_shard_bytes(target, &reconstructed).await?;
+    if !repaired.checksum.eq_ignore_ascii_case(&shard.checksum) {
+        return Err(AppError::InternalServerError(format!(
+            "read-repaired shard {} checksum differed: got {}, expected {}",
+            shard.shard_index, repaired.checksum, shard.checksum
+        )));
     }
     Ok(())
 }
@@ -140,7 +258,7 @@ pub async fn repair_cluster_object_shards(
     let mut failed_repairs = 0u64;
 
     for part in &meta.parts {
-        let mut cache = VerifiedShardCache::default();
+        let mut cache = VerifiedShardCache::for_repair();
         for shard in &part.shards {
             match shard_probe(shard, check_mode.verifies_full_integrity()).await {
                 ShardProbeResult::Healthy | ShardProbeResult::Unavailable => continue,
@@ -191,6 +309,8 @@ pub async fn repair_cluster_object_shards(
                 is_parity: locator.is_parity,
                 expected_len: shard.size_bytes,
                 deferred_durability: false,
+                repair: true,
+                expected_checksum: Some(shard.checksum.clone()),
             };
 
             match put_peer_shard_bytes(target, &reconstructed).await {
@@ -233,3 +353,7 @@ pub async fn repair_cluster_object_shards(
     after.failed_repairs = failed_repairs;
     Ok(after)
 }
+
+#[cfg(test)]
+#[path = "repair/tests.rs"]
+mod tests;

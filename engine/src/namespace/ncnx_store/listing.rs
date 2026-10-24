@@ -1,29 +1,22 @@
 use super::*;
+use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, SeekFrom, fstat, openat, seek};
 
-#[derive(Debug)]
-pub(super) enum LexicalEntry {
-    File {
-        sort_key: String,
-        item: NcnxListItem,
-    },
-    Directory {
-        sort_key: String,
-        physical_path: PathBuf,
-        logical_prefix: String,
-    },
+struct DirectoryFrame {
+    physical_directory: PathBuf,
+    logical_parent: String,
+    next_cookie: u64,
+    identity: Option<(u64, u64)>,
 }
 
-impl LexicalEntry {
-    fn sort_key(&self) -> &str {
-        match self {
-            Self::File { sort_key, .. } | Self::Directory { sort_key, .. } => sort_key,
+impl DirectoryFrame {
+    fn new(physical_directory: PathBuf, logical_parent: String) -> Self {
+        Self {
+            physical_directory,
+            logical_parent,
+            next_cookie: 0,
+            identity: None,
         }
     }
-}
-
-#[derive(Debug)]
-pub(super) struct LexicalFrame {
-    pub(super) entries: Vec<LexicalEntry>,
 }
 
 pub(super) fn prefixes_overlap(branch: &str, requested: &str) -> bool {
@@ -51,103 +44,62 @@ pub(super) fn branch_can_exceed(branch: &str, after: Option<&str>) -> bool {
     })
 }
 
-pub(super) fn directory_frame(
-    physical_directory: &Path,
-    logical_parent: &str,
-    requested_prefix: &str,
-    after: Option<&str>,
-    include_after: bool,
-) -> Result<LexicalFrame, AppError> {
-    let mut entries = Vec::new();
-    let directory = match fs::read_dir(physical_directory) {
-        Ok(directory) => directory,
+fn open_directory(frame: &mut DirectoryFrame) -> Result<Option<Dir>, AppError> {
+    let fd = match openat(
+        CWD,
+        &frame.physical_directory,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
         // Namespace listing is deliberately lockless. Another coordinator
         // may remove the last immutable NCNX and prune this branch after its
         // parent was enumerated. That disappearance is an empty branch, not
         // an I/O failure.
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return Ok(LexicalFrame { entries });
+        Err(rustix::io::Errno::NOENT) => {
+            return Ok(None);
         }
         Err(err) => {
             return Err(AppError::Io(
-                err,
-                format!("read NCNX directory {}", physical_directory.display()),
+                err.into(),
+                format!("open NCNX directory {}", frame.physical_directory.display()),
             ));
         }
     };
-    for entry in directory {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(AppError::Io(
-                    err,
-                    format!(
-                        "read NCNX directory entry in {}",
-                        physical_directory.display()
-                    ),
-                ));
-            }
-        };
-        let file_name = entry.file_name().into_string().map_err(|name| {
-            AppError::Conflict(format!(
-                "NCNX path component is not UTF-8: {}",
-                PathBuf::from(name).display()
-            ))
-        })?;
-        if file_name.starts_with(".n2-") {
-            continue;
-        }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(AppError::Io(
-                    err,
-                    format!("inspect NCNX path {}", entry.path().display()),
-                ));
-            }
-        };
-        if file_type.is_dir() {
-            let logical_prefix = format!("{logical_parent}{file_name}/");
-            if prefixes_overlap(&logical_prefix, requested_prefix)
-                && branch_can_exceed(&logical_prefix, after)
-            {
-                entries.push(LexicalEntry::Directory {
-                    sort_key: logical_prefix.clone(),
-                    physical_path: entry.path(),
-                    logical_prefix,
-                });
-            }
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let relative = format!("{logical_parent}{file_name}");
-        let Some(logical_key) = relative.strip_suffix(NCNX_SUFFIX) else {
-            continue;
-        };
-        if !logical_key.starts_with(requested_prefix) {
-            continue;
-        }
-        if let Some(after) = after {
-            if logical_key < after || (!include_after && logical_key == after) {
-                continue;
-            }
-        }
-        entries.push(LexicalEntry::File {
-            sort_key: logical_key.to_string(),
-            item: NcnxListItem {
-                logical_key: logical_key.to_string(),
-                physical_path: entry.path(),
-                trash: None,
-            },
-        });
+    let stat = fstat(&fd).map_err(|err| {
+        AppError::Io(
+            err.into(),
+            format!(
+                "inspect NCNX directory {}",
+                frame.physical_directory.display()
+            ),
+        )
+    })?;
+    let identity = (stat.st_dev as u64, stat.st_ino as u64);
+    if frame.identity.is_some_and(|expected| expected != identity) {
+        return Err(AppError::ServiceUnavailable(format!(
+            "NCNX directory changed while listing {}; retry listing",
+            frame.physical_directory.display()
+        )));
     }
-    // Reverse order lets the streaming walk pop the next lexical entry in O(1).
-    entries.sort_unstable_by(|left, right| right.sort_key().cmp(left.sort_key()));
-    Ok(LexicalFrame { entries })
+    frame.identity = Some(identity);
+    if frame.next_cookie != 0 {
+        seek(&fd, SeekFrom::Start(frame.next_cookie)).map_err(|err| {
+            AppError::Io(
+                err.into(),
+                format!(
+                    "resume NCNX directory {}",
+                    frame.physical_directory.display()
+                ),
+            )
+        })?;
+    }
+    Dir::new(fd).map(Some).map_err(|err| {
+        AppError::Io(
+            err.into(),
+            format!("read NCNX directory {}", frame.physical_directory.display()),
+        )
+    })
 }
 
 pub(super) fn list_names(
@@ -157,38 +109,154 @@ pub(super) fn list_names(
     include_after: bool,
     limit: usize,
 ) -> Result<Vec<NcnxListItem>, AppError> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
+    list_names_observed(root, prefix, after, include_after, limit, |_, _| {})
+}
+
+fn list_names_observed(
+    root: &Path,
+    prefix: &str,
+    after: Option<&str>,
+    include_after: bool,
+    limit: usize,
+    mut observe: impl FnMut(usize, usize),
+) -> Result<Vec<NcnxListItem>, AppError> {
     let limit = limit.clamp(1, 10_000);
-    let mut out = Vec::with_capacity(limit);
-    let mut stack = vec![directory_frame(root, "", &prefix, after, include_after)?];
+    let mut selected = BTreeMap::<String, NcnxListItem>::new();
+    let mut stack = vec![DirectoryFrame::new(root.to_path_buf(), String::new())];
+    let mut active = None;
+    observe(selected.len(), stack.len());
+
+    // Filesystem enumeration is unordered. Keep only the lowest `limit`
+    // matching logical keys, rather than materializing every directory entry
+    // and sorting it. Suspended parent frames keep only a path, inode identity
+    // and an opaque kernel directory cookie. Close the parent before descent
+    // and resume at that cookie, rather than retaining one FD per depth or
+    // restarting a wide directory from its beginning. At most one directory
+    // descriptor is open here, independent of depth and object count.
+    // This bounds memory, not traversal time: without a separate index a page
+    // can still inspect every relevant filename. NCNX bodies are never read.
     while let Some(frame) = stack.last_mut() {
-        let Some(entry) = frame.entries.pop() else {
+        if active.is_none() {
+            active = open_directory(frame)?;
+            if active.is_none() {
+                stack.pop();
+                continue;
+            }
+        }
+        let Some(entry) = active.as_mut().expect("active NCNX directory").read() else {
+            active = None;
             stack.pop();
             continue;
         };
-        match entry {
-            LexicalEntry::File { item, .. } => {
-                out.push(item);
-                if out.len() == limit {
-                    break;
-                }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(err) => {
+                return Err(AppError::Io(
+                    err.into(),
+                    format!(
+                        "read NCNX directory entry in {}",
+                        frame.physical_directory.display()
+                    ),
+                ));
             }
-            LexicalEntry::Directory {
-                physical_path,
-                logical_prefix,
-                ..
-            } => stack.push(directory_frame(
-                &physical_path,
-                &logical_prefix,
-                &prefix,
-                after,
-                include_after,
-            )?),
+        };
+        frame.next_cookie = entry.offset().try_into().map_err(|_| {
+            AppError::Conflict(format!(
+                "NCNX directory has an invalid resume cookie: {}",
+                frame.physical_directory.display()
+            ))
+        })?;
+        let file_name = entry.file_name().to_str().map_err(|_| {
+            AppError::Conflict(format!(
+                "NCNX path component is not UTF-8: {}",
+                entry.file_name().to_string_lossy()
+            ))
+        })?;
+        if matches!(file_name, "." | "..") || file_name.starts_with(".n2-") {
+            continue;
         }
+        let physical_path = frame.physical_directory.join(file_name);
+        let (is_directory, is_file) = match entry.file_type() {
+            FileType::Directory => (true, false),
+            FileType::RegularFile => (false, true),
+            FileType::Unknown => match fs::symlink_metadata(&physical_path) {
+                Ok(metadata) => (metadata.is_dir(), metadata.is_file()),
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(AppError::Io(
+                        err,
+                        format!("inspect NCNX path {}", physical_path.display()),
+                    ));
+                }
+            },
+            _ => (false, false),
+        };
+        if is_directory {
+            let logical_prefix = format!("{}{file_name}/", frame.logical_parent);
+            if !prefixes_overlap(&logical_prefix, prefix)
+                || !branch_can_exceed(&logical_prefix, after)
+            {
+                continue;
+            }
+            // Every descendant sorts after its directory prefix. Once this
+            // lower bound cannot beat the current page maximum, opening the
+            // branch cannot contribute a result.
+            if selected.len() == limit
+                && selected
+                    .last_key_value()
+                    .is_some_and(|(last, _)| logical_prefix.as_str() >= last.as_str())
+            {
+                continue;
+            }
+            if frame.next_cookie == 0 {
+                return Err(AppError::Conflict(format!(
+                    "NCNX directory does not provide resumable entry cookies: {}",
+                    frame.physical_directory.display()
+                )));
+            }
+            active = None;
+            stack.push(DirectoryFrame::new(physical_path, logical_prefix));
+            observe(selected.len(), stack.len());
+            continue;
+        }
+        if !is_file {
+            continue;
+        }
+        let relative = format!("{}{file_name}", frame.logical_parent);
+        let Some(logical_key) = relative.strip_suffix(NCNX_SUFFIX) else {
+            continue;
+        };
+        if !logical_key.starts_with(prefix) {
+            continue;
+        }
+        if let Some(after) = after {
+            if logical_key < after || (!include_after && logical_key == after) {
+                continue;
+            }
+        }
+        if selected.len() == limit {
+            if selected
+                .last_key_value()
+                .is_some_and(|(last, _)| logical_key >= last.as_str())
+            {
+                continue;
+            }
+            // Pop BEFORE inserting, so retained candidates never exceed the
+            // page bound, even temporarily.
+            selected.pop_last();
+        }
+        selected.insert(
+            logical_key.to_string(),
+            NcnxListItem {
+                logical_key: logical_key.to_string(),
+                physical_path,
+                trash: None,
+            },
+        );
+        observe(selected.len(), stack.len());
     }
-    Ok(out)
+    Ok(selected.into_values().collect())
 }
 
 pub fn parse_trash_relative_path(relative: &str) -> Option<TrashLocator> {
@@ -237,9 +305,6 @@ pub(super) fn list_generation_trash_names(
     after: Option<&str>,
     limit: usize,
 ) -> Result<Vec<NcnxListItem>, AppError> {
-    if !trash_root.exists() {
-        return Ok(Vec::new());
-    }
     let limit = limit.clamp(1, 10_000);
     let after = after.map(parse_trash_cursor).transpose()?;
     let after_cursor =
@@ -365,3 +430,7 @@ pub(super) fn prune_empty_trash_parents(path: &Path, trash_root: &Path) -> Resul
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "listing/tests.rs"]
+mod tests;

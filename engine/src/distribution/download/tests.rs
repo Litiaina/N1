@@ -254,3 +254,40 @@ async fn verified_cluster_stripe_reconstructs_a_corrupt_data_block() {
     assert_eq!(restored, b"datamore");
     let _ = tokio::fs::remove_dir_all(root).await;
 }
+
+#[tokio::test]
+async fn shard_reconstruction_rejects_zero_blocks_and_invalid_empty_checksum() {
+    let part = PartMetadata {
+        part_index: 0,
+        size_bytes: 0,
+        created_at: 0,
+        checksum: None,
+        shards: vec![local_shard(
+            std::path::Path::new("/unused-empty-shard"),
+            b"",
+        )],
+    };
+    let mut cache = VerifiedShardCache::for_repair();
+    assert!(
+        reconstruct_cluster_shard_cached(&part, 0, 0, &mut cache)
+            .await
+            .expect_err("zero block size must fail instead of looping")
+            .to_string()
+            .contains("block size is zero")
+    );
+    assert_eq!(
+        reconstruct_cluster_shard_cached(&part, 0, 4096, &mut cache)
+            .await
+            .expect("empty target still has its recorded SHA"),
+        Vec::<u8>::new()
+    );
+    let mut wrong_checksum = part;
+    wrong_checksum.shards[0].checksum = format_sha256(&sha256_digest(b"not empty"));
+    assert!(
+        reconstruct_cluster_shard_cached(&wrong_checksum, 0, 4096, &mut cache)
+            .await
+            .expect_err("even zero-length repair must match the immutable checksum")
+            .to_string()
+            .contains("empty repaired shard checksum is invalid")
+    );
+}

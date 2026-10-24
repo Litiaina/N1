@@ -418,7 +418,8 @@ pub fn build_storage_routes_unbound_with_options(
         .merge(build_auto_healing_peer_routes())
         .merge(build_distributed_maintenance_peer_routes())
         .merge(build_reserve_peer_routes())
-        .merge(build_lifecycle_peer_routes());
+        .merge(build_lifecycle_peer_routes())
+        .merge(crate::distribution::upload_ownership::build_upload_ownership_routes());
 
     let create_fragment_route = Router::new().route("/noa/v1/fragments", post(create_fragment));
     let create_fragment_route = layers

@@ -156,18 +156,19 @@ pub async fn commit_namespace_mutation_controlled(
                 return Err(AppError::NotFound);
             }
             // Prove every destination before publishing any live pointer.
-            // Recovery is strict: any live destination rejects the whole
-            // selected generation, even when it points to the same object.
+            // Exact-byte destinations complete a partial recovery retry;
+            // different generations still reject the selected recovery.
             let mut destinations = FuturesUnordered::new();
             let mut pending_destinations = recovery.iter();
             loop {
                 control.ensure_running()?;
                 while destinations.len() < PREFIX_MUTATION_CONCURRENCY {
-                    let Some((name, _)) = pending_destinations.next() else {
+                    let Some((name, located)) = pending_destinations.next() else {
                         break;
                     };
                     let fragment = request.fragment.clone();
                     let logical_key = name.logical_key.clone();
+                    let expected = located.bytes.clone();
                     destinations.push(async move {
                         let _permit = PREFIX_PLANNING_BUDGET
                             .clone()
@@ -182,7 +183,7 @@ pub async fn commit_namespace_mutation_controlled(
                             logical_key.clone(),
                             find_live_for_survival_write(&fragment, &logical_key)
                                 .await?
-                                .is_some(),
+                                .is_some_and(|existing| existing.bytes != expected),
                         ))
                     });
                 }

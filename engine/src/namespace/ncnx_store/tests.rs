@@ -49,6 +49,97 @@ fn immutable_create_is_idempotent_and_rejects_other_pointer() {
 }
 
 #[test]
+fn delayed_repair_cannot_overwrite_a_recreated_live_generation() {
+    let (root, store) = store();
+    let old = record("fragment-a", "object-a").encode().unwrap();
+    // Even the same object ID can have a different namespace generation.
+    let replacement = record("fragment-a", "object-a").encode().unwrap();
+    store.create_live("fragment-a", "old/key", &old).unwrap();
+    store.create_live("fragment-a", "new/key", &old).unwrap();
+    store
+        .remove_live_if_exact("fragment-a", "old/key", &old)
+        .unwrap();
+    store
+        .create_live("fragment-a", "old/key", &replacement)
+        .unwrap();
+    assert!(matches!(
+        store.repair_live("fragment-a", "old/key", &old),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(
+        store.read_live("fragment-a", "old/key").unwrap().unwrap().1,
+        replacement
+    );
+    assert_eq!(
+        store.read_live("fragment-a", "new/key").unwrap().unwrap().1,
+        old
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn delayed_repair_cannot_overwrite_a_batched_recreation_or_trash_generation() {
+    let (root, store) = store();
+    let old = record("fragment-a", "object-a").encode().unwrap();
+    let replacement = record("fragment-a", "object-b").encode().unwrap();
+    let entries = vec![("old/key".to_string(), old.clone())];
+    store.create_live_batch("fragment-a", &entries).unwrap();
+    let locator = TrashLocator {
+        logical_key: "old/key".into(),
+        deleted_at_unix_nanos: 1,
+        delete_mutation_id: Ulid::new().to_string(),
+    };
+    store
+        .create_trash_batch("fragment-a", &[(locator.clone(), old.clone())])
+        .unwrap();
+    store
+        .remove_live_batch_if_exact("fragment-a", &entries)
+        .unwrap();
+    store
+        .create_live_batch("fragment-a", &[("old/key".into(), replacement.clone())])
+        .unwrap();
+    assert!(store.repair_live("fragment-a", "old/key", &old).is_err());
+    // A valid trash generation is just as immutable as a live pointer.
+    assert!(
+        store
+            .repair_trash("fragment-a", &locator, &replacement)
+            .is_err()
+    );
+    assert_eq!(
+        store.read_live("fragment-a", "old/key").unwrap().unwrap().1,
+        replacement
+    );
+    assert_eq!(
+        store.read_trash("fragment-a", &locator).unwrap().unwrap().1,
+        old
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn repair_still_restores_missing_and_corrupt_replicas_and_is_idempotent() {
+    let (root, store) = store();
+    let bytes = record("fragment-a", "object-a").encode().unwrap();
+    assert!(store.repair_live("fragment-a", "key", &bytes).unwrap());
+    assert!(!store.repair_live("fragment-a", "key", &bytes).unwrap());
+    let path = store.live_path("fragment-a", "key").unwrap();
+    fs::write(&path, b"corrupt namespace record").unwrap();
+    assert!(store.repair_live("fragment-a", "key", &bytes).unwrap());
+    assert_eq!(
+        store.read_live("fragment-a", "key").unwrap().unwrap().1,
+        bytes
+    );
+    let wrong_fragment = record("fragment-b", "object-a").encode().unwrap();
+    assert!(
+        store
+            .repair_live("fragment-a", "other", &wrong_fragment)
+            .is_err()
+    );
+    assert!(store.read_live("fragment-a", "other").unwrap().is_none());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn batched_live_create_requires_exact_idempotence_and_preflights_conflicts() {
     let (root, store) = store();
     let first = record("fragment-a", "object-a");
@@ -513,8 +604,8 @@ fn lockless_listing_treats_a_concurrently_pruned_branch_as_empty() {
     // The parent walk may already hold this path when another GC removes
     // the final NCNX and prunes the branch.
     fs::remove_dir_all(root.join("generation")).unwrap();
-    let frame = directory_frame(&branch, "videos/", "", None, false).unwrap();
-    assert!(frame.entries.is_empty());
+    let entries = list_names(&branch, "", None, false, 10).unwrap();
+    assert!(entries.is_empty());
 
     let _ = fs::remove_dir_all(root);
 }

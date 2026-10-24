@@ -23,6 +23,7 @@ pub(super) fn request_for_replica(
         bytes: bytes.map(|bytes| ByteBuf::from(bytes.to_vec())),
         after: None,
         limit: None,
+        lease_token: None,
     }
 }
 
@@ -34,25 +35,49 @@ pub(super) async fn read_from_layout(
     trash: Option<&TrashLocator>,
     require_complete_absence: bool,
 ) -> Result<Option<(NcnxRecord, Vec<u8>)>, AppError> {
+    read_from_layout_owned(
+        runtime,
+        layout,
+        fragment_id,
+        logical_key,
+        trash,
+        require_complete_absence,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn read_from_layout_owned(
+    runtime: &ClusterRuntime,
+    layout: &NcnxLayout,
+    fragment_id: &str,
+    logical_key: &str,
+    trash: Option<&TrashLocator>,
+    require_complete_absence: bool,
+    ownership: Option<&stage::StageOwnership>,
+) -> Result<Option<(NcnxRecord, Vec<u8>)>, AppError> {
     let action = if trash.is_some() {
         PeerNcnxAction::ReadTrash
     } else {
         PeerNcnxAction::ReadLive
     };
     let calls = layout.replicas.iter().map(|replica| {
-        send_to_replica(
-            runtime,
+        let mut request = request_for_replica(
+            action.clone(),
+            layout,
             replica,
-            request_for_replica(
-                action.clone(),
-                layout,
-                replica,
-                fragment_id,
-                logical_key,
-                trash.cloned(),
-                None,
-            ),
-        )
+            fragment_id,
+            logical_key,
+            trash.cloned(),
+            None,
+        );
+        let attached = ownership
+            .map(|ownership| ownership.attach(&mut request, layout, replica))
+            .transpose();
+        async move {
+            attached?;
+            send_to_replica(runtime, replica, request).await
+        }
     });
     let observations = join_all(calls).await;
     let mut valid = BTreeMap::<Vec<u8>, NcnxRecord>::new();
@@ -161,6 +186,12 @@ async fn apply_at_least(
     minimum_successes: usize,
     allowed_nodes: Option<&BTreeSet<&str>>,
 ) -> Result<(), AppError> {
+    let ownership = stage::StageOwnership::acquire(
+        Arc::new(runtime.clone()),
+        fragment_id,
+        &[(layout.clone(), logical_key.to_string())],
+    )
+    .await?;
     let calls = layout
         .replicas
         .iter()
@@ -168,21 +199,23 @@ async fn apply_at_least(
             allowed_nodes.is_none_or(|nodes| nodes.contains(replica.node_id.as_str()))
         })
         .map(|replica| {
-            send_to_replica(
-                runtime,
+            let mut request = request_for_replica(
+                action.clone(),
+                layout,
                 replica,
-                request_for_replica(
-                    action.clone(),
-                    layout,
-                    replica,
-                    fragment_id,
-                    logical_key,
-                    trash.cloned(),
-                    Some(bytes),
-                ),
-            )
+                fragment_id,
+                logical_key,
+                trash.cloned(),
+                Some(bytes),
+            );
+            let attached = ownership.attach(&mut request, layout, replica);
+            async move {
+                attached?;
+                send_to_replica(runtime, replica, request).await
+            }
         });
-    let results = join_all(calls).await;
+    let results = stage::join_calls(calls).await;
+    ownership.release().await;
     let mut successes = 0usize;
     let mut failures = Vec::new();
     for result in results {
@@ -405,6 +438,7 @@ pub async fn publish_new_batch(
     let mut required_successes = vec![0usize; items.len()];
     let mut failures = vec![Vec::<String>::new(); items.len()];
     let mut groups = BTreeMap::<PeerNcnxBatchTarget, Vec<(usize, PeerNcnxBatchItem)>>::new();
+    let mut ownership_keys = Vec::new();
     let mut authority_by_pool = BTreeMap::<String, BTreeSet<String>>::new();
     authority_by_pool.insert(
         write_pool.id.clone(),
@@ -497,6 +531,7 @@ pub async fn publish_new_batch(
             continue;
         }
         required_successes[index] = exact_replica_count;
+        ownership_keys.push((layout.clone(), logical_key.clone()));
         for replica in layout.replicas {
             groups
                 .entry(PeerNcnxBatchTarget {
@@ -515,12 +550,42 @@ pub async fn publish_new_batch(
                         logical_key: logical_key.clone(),
                         trash: None,
                         bytes: ByteBuf::from(located.bytes.clone()),
+                        lease_token: None,
                     },
                 ));
         }
         prepared[index] = Some(located);
     }
 
+    let ownership = if ownership_keys.is_empty() {
+        None
+    } else {
+        match stage::StageOwnership::acquire(runtime.clone(), fragment_id, &ownership_keys).await {
+            Ok(ownership) => Some(ownership),
+            Err(_) => {
+                // A busy key must not poison independent entries. Re-enter
+                // the bounded per-key path before any grouped write starts.
+                let mut isolated = Vec::with_capacity(items.len());
+                for item in items {
+                    isolated.push(publish_new(fragment_id, &item.logical_key, &item.record).await);
+                }
+                return isolated;
+            }
+        }
+    };
+    if let Some(ownership) = &ownership {
+        for (target, indexed) in &mut groups {
+            for (_, item) in indexed {
+                if let Err(error) = ownership.attach_batch(target, std::slice::from_mut(item)) {
+                    let message = error.to_string();
+                    return items
+                        .iter()
+                        .map(|_| Err(AppError::Conflict(message.clone())))
+                        .collect();
+                }
+            }
+        }
+    }
     let calls = groups.into_iter().map(|(target, indexed)| {
         let runtime = runtime.clone();
         let fragment_id = fragment_id.to_string();
@@ -537,7 +602,7 @@ pub async fn publish_new_batch(
             (target, indexed, result)
         }
     });
-    for (target, indexed, group_result) in join_all(calls).await {
+    for (target, indexed, group_result) in stage::join_calls(calls).await {
         if group_result.is_ok() {
             for (index, _) in indexed {
                 successes[index] = successes[index].saturating_add(1);
@@ -585,6 +650,9 @@ pub async fn publish_new_batch(
         )));
     }
 
+    if let Some(ownership) = ownership {
+        ownership.release().await;
+    }
     prepared
         .into_iter()
         .enumerate()

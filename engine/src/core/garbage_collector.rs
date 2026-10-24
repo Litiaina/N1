@@ -6,7 +6,6 @@ use crate::core::fragment_identity::{
 use crate::core::fragment_metadata::resolve_stable_fragment_id;
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
-use crate::distribution::lifecycle::purge_object_from_holders;
 use crate::distribution::ncnx::{
     key_references_object, list_canonical_names, ncnx_cursor, read_canonical_record, remove_trash,
 };
@@ -40,7 +39,9 @@ pub struct GcJobStatus {
     pub total_fragments_scanned: u64,
     pub total_live_versions_seen: u64,
     pub total_trash_versions_expired: u64,
+    pub total_trash_reclamations_deferred: u64,
     pub total_sessions_deleted: u64,
+    pub total_sessions_deferred: u64,
     pub total_orphan_blob_dirs_deleted: u64,
     pub total_refund_bytes: u64,
     pub total_errors: u64,
@@ -56,7 +57,9 @@ pub struct GcJobStatus {
 struct FragmentGcStats {
     live_objects_seen: u64,
     trash_versions_expired: u64,
+    trash_reclamations_deferred: u64,
     sessions_deleted: u64,
+    sessions_deferred: u64,
     refund_bytes: u64,
 }
 
@@ -264,7 +267,6 @@ async fn reclaim_expired_trash(
     protected: &BTreeSet<String>,
     stats: &mut FragmentGcStats,
 ) -> Result<(), AppError> {
-    let mut reclaimed_objects = BTreeSet::new();
     let mut cursor = None;
     loop {
         let page = list_canonical_names(fragment, "", cursor.as_deref(), PAGE_SIZE, true).await?;
@@ -315,30 +317,7 @@ async fn reclaim_expired_trash(
                 continue;
             }
 
-            if !reclaimed_objects.contains(&object_id) {
-                let versions =
-                    match index::list_live_object_versions_metadata(fragment, &object_id).await {
-                        Ok(versions) => versions,
-                        Err(AppError::NotFound) => Vec::new(),
-                        Err(error) => return Err(error),
-                    };
-                let refund = versions
-                    .iter()
-                    .map(|metadata| metadata.total_size_bytes)
-                    .sum::<u64>();
-                let lifecycle_id = format!("gc-{}-{now_unix}", trash.delete_mutation_id);
-                purge_object_from_holders(fragment, &object_id, &lifecycle_id).await?;
-                reclaimed_objects.insert(object_id);
-                stats.refund_bytes = stats.refund_bytes.saturating_add(refund);
-                stats.trash_versions_expired = stats
-                    .trash_versions_expired
-                    .saturating_add(versions.len().max(1) as u64);
-            }
-            // Object holders are reclaimed first. Keeping NCNX on any failure
-            // makes the entire operation retryable after restart.
-            remove_trash(&located, trash).await.map_err(|error| {
-                defer_if_namespace_changed(error, fragment, "final trash-pointer removal")
-            })?;
+            defer_unproven_expired_reclamation(stats);
         }
         if !full {
             break;
@@ -347,28 +326,137 @@ async fn reclaim_expired_trash(
     Ok(())
 }
 
+fn defer_unproven_expired_reclamation(stats: &mut FragmentGcStats) {
+    // The earlier reference scan is not exclusive object ownership. Recovery,
+    // copy or publication can create a reference after it and before a peer
+    // purge; owning only the final trash-pointer removal cannot fence that.
+    // Until all reference creators and holder-side purge share a proven object
+    // lifecycle protocol, preserve both the last trash pointer and its payload.
+    // A completed GC pass must not claim reclaimed bytes or expired versions.
+    stats.trash_reclamations_deferred = stats.trash_reclamations_deferred.saturating_add(1);
+}
+
 async fn expire_upload_sessions(
     fragment: &str,
     now_unix: i64,
     stats: &mut FragmentGcStats,
 ) -> Result<(), AppError> {
-    let ttl = CONFIG.garbage_collector.file_ttl_seconds as i64;
+    let ttl = i64::try_from(CONFIG.garbage_collector.file_ttl_seconds).unwrap_or(i64::MAX);
+    if let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() {
+        reclaim_owned_uploads(&runtime, fragment, now_unix, ttl, stats).await
+    } else {
+        inspect_expired_upload_sessions(fragment, now_unix, ttl, stats).await
+    }
+}
+
+async fn reclaim_owned_uploads(
+    runtime: &crate::distribution::membership::ClusterRuntime,
+    fragment: &str,
+    now_unix: i64,
+    ttl: i64,
+    stats: &mut FragmentGcStats,
+) -> Result<(), AppError> {
+    use crate::distribution::upload_lifecycle::{self, UploadLifecycleState};
+    let mut cursor = None;
+    loop {
+        let page = upload_lifecycle::list_upload_records(runtime, fragment, cursor.as_deref(), 128)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(|record| record.identity.version_id.clone());
+        for candidate in page {
+            if should_stop_gc() {
+                return Ok(());
+            }
+            if candidate.state == UploadLifecycleState::Committed
+                || now_unix.saturating_sub(candidate.updated_at_unix.max(0)) <= ttl
+            {
+                continue;
+            }
+            let current = upload_lifecycle::inspect_upload(runtime, &candidate.identity).await?;
+            let Some(current) = current else {
+                stats.sessions_deferred = stats.sessions_deferred.saturating_add(1);
+                continue;
+            };
+            if current.state == UploadLifecycleState::Committed
+                || now_unix.saturating_sub(current.updated_at_unix.max(0)) <= ttl
+            {
+                continue;
+            }
+            match crate::distribution::upload_ownership::abort_and_reclaim_if_idle(
+                runtime,
+                &current.identity,
+                Some(now_unix.saturating_sub(ttl)),
+            )
+            .await
+            {
+                Ok(()) => {
+                    // Exact peer cleanup has acknowledged completion. Preserve
+                    // the terminal ownership fence while retiring only this
+                    // coordinator's known manifest/part/binding records.
+                    index::remove_session(
+                        fragment,
+                        &current.identity.version_id,
+                        "gc-certified-abort",
+                    )
+                    .await?;
+                    stats.sessions_deleted = stats.sessions_deleted.saturating_add(1);
+                }
+                Err(error) => {
+                    // A partial abort, committed/headless peer or unavailable
+                    // holder cannot authorize guessing the missing evidence.
+                    // Durable votes and upload records remain retryable.
+                    warn!(
+                        fragment,
+                        version = current.identity.version_id,
+                        "upload reclamation deferred: {error}"
+                    );
+                    stats.sessions_deferred = stats.sessions_deferred.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn inspect_expired_upload_sessions(
+    fragment: &str,
+    now_unix: i64,
+    ttl: i64,
+    stats: &mut FragmentGcStats,
+) -> Result<(), AppError> {
     for session in index::list_active_sessions(fragment).await? {
         if should_stop_gc() {
             break;
         }
-        if now_unix.saturating_sub(session.last_activity_at.max(0)) <= ttl {
+        if now_unix.saturating_sub(session_last_activity(&session)) <= ttl {
             continue;
         }
-        let refund = session
-            .reservation
-            .map(|reservation| reservation.amount)
-            .unwrap_or(0);
-        index::remove_session(fragment, &session.manifest.version_id, "gc-expired").await?;
-        stats.sessions_deleted = stats.sessions_deleted.saturating_add(1);
-        stats.refund_bytes = stats.refund_bytes.saturating_add(refund);
+        // A session may retain a pending logical binding, receipts for peer
+        // shards, or a committed NCDX awaiting NCNX publication. Age is not
+        // upload-abort authority. Even an empty manifest can have an in-flight
+        // part/finalizer, so deleting it would race those writers and lose the
+        // only durable ownership/retry evidence. Retain every expired session
+        // until holder-side lifecycle fencing can prove complete reclamation.
+        stats.sessions_deferred = stats.sessions_deferred.saturating_add(1);
     }
     Ok(())
+}
+
+fn session_last_activity(session: &index::IndexSessionState) -> i64 {
+    // SessionRow.last_activity_at was historically written only at init.
+    // Existing PartMetadata carries completion time; use available state
+    // timestamps without adding a metadata write to the upload hot path.
+    // Compact filename receipts decode with the manifest time, so they are
+    // not evidence of recent activity (nor authority to reclaim anything).
+    std::iter::once(session.last_activity_at)
+        .chain(std::iter::once(session.manifest.created_at))
+        .chain(session.parts.values().map(|part| part.created_at))
+        .chain(session.part_receipts.values().map(|part| part.created_at))
+        .max()
+        .unwrap_or(0)
+        .max(0)
 }
 
 async fn process_fragment_gc(
@@ -443,9 +531,15 @@ async fn perform_gc_scan(
             status.total_trash_versions_expired = status
                 .total_trash_versions_expired
                 .saturating_add(stats.trash_versions_expired);
+            status.total_trash_reclamations_deferred = status
+                .total_trash_reclamations_deferred
+                .saturating_add(stats.trash_reclamations_deferred);
             status.total_sessions_deleted = status
                 .total_sessions_deleted
                 .saturating_add(stats.sessions_deleted);
+            status.total_sessions_deferred = status
+                .total_sessions_deferred
+                .saturating_add(stats.sessions_deferred);
             status.total_refund_bytes =
                 status.total_refund_bytes.saturating_add(stats.refund_bytes);
             status.duration_seconds = started.elapsed().as_secs();
@@ -626,3 +720,7 @@ mod tests {
         assert!(deferred.to_string().contains("retry from the beginning"));
     }
 }
+
+#[cfg(test)]
+#[path = "garbage_collector/tests.rs"]
+mod upload_expiry_tests;

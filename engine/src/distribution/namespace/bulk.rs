@@ -256,7 +256,11 @@ pub(super) async fn bulk_recover_exact(
             });
         }
         match planning.next().await {
-            Some((index, _, Ok((name, located, None)))) => {
+            Some((index, _, Ok((name, located, live))))
+                if live
+                    .as_ref()
+                    .is_none_or(|existing| existing.bytes == located.bytes) =>
+            {
                 let locator = name.trash.expect("trash recovery has locator");
                 let summary = mutation_summary(
                     "recover",
@@ -269,7 +273,7 @@ pub(super) async fn bulk_recover_exact(
                 );
                 work.push((index, NcnxRecoverBatchItem { located, locator }, summary));
             }
-            Some((index, requested, Ok((_, _, Some(_))))) => {
+            Some((index, requested, Ok(_))) => {
                 slots[index] = Some(Err(AppError::Conflict(format!(
                     "cannot recover '{requested}': live key already exists"
                 ))));

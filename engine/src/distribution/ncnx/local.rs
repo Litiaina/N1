@@ -68,6 +68,48 @@ fn local_apply(
         bytes: None,
         names: Vec::new(),
     };
+    if matches!(
+        request.action,
+        PeerNcnxAction::RepairLive | PeerNcnxAction::RepairTrash
+    ) {
+        let desired = required_bytes(request)?;
+        let record = NcnxRecord::decode(desired)?;
+        if record.fragment_id != request.fragment_id {
+            return Err(AppError::Conflict(
+                "NCNX fragment identity differs from repair target".into(),
+            ));
+        }
+        let mut identical_root = None;
+        // Roots are interchangeable routes within one node. A newly writable
+        // preferred root must not receive an obsolete generation when a valid
+        // newer generation already resides on a fallback root.
+        for store in local_stores(runtime, &request.root_id) {
+            let existing = if matches!(request.action, PeerNcnxAction::RepairTrash) {
+                store.read_trash(&request.fragment_id, required_trash(request)?)
+            } else {
+                store.read_live(&request.fragment_id, &request.logical_key)
+            };
+            match existing {
+                Ok(Some((_, existing))) => {
+                    if existing != desired {
+                        return Err(AppError::Conflict(format!(
+                            "refused to repair a different valid NCNX generation on local root '{}'",
+                            store.root_id()
+                        )));
+                    }
+                    identical_root = Some(store.root_id().to_string());
+                }
+                Ok(None) | Err(AppError::Conflict(_)) => {}
+                // Corrupt bytes can be repaired. An I/O failure cannot prove
+                // absence: that root might hold a valid different generation.
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(root_id) = identical_root {
+            response.root_id = root_id;
+            return Ok(response);
+        }
+    }
     match request.action {
         PeerNcnxAction::ReadLive => {
             let mut first_error = None;
@@ -145,7 +187,7 @@ fn local_apply(
                     Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
                 }
             }
-            if successes == 0 {
+            if successes == 0 || !failures.is_empty() {
                 return Err(AppError::ServiceUnavailable(format!(
                     "NCNX removal could not reach any local disk on node '{}': {}",
                     runtime.local_node_id,
@@ -191,7 +233,23 @@ fn validate_batch_contract<'a>(
     }
     let mut keys = BTreeSet::new();
     for item in &request.items {
-        let identity = ncnx_cursor(&item.logical_key, item.trash.as_ref());
+        if let Some(locator) = &item.trash
+            && validate_logical_key(&locator.logical_key)?
+                != validate_logical_key(&item.logical_key)?
+        {
+            return Err(AppError::BadRequest(
+                "NCNX trash locator differs from item key".into(),
+            ));
+        }
+        let normalized_key = validate_logical_key(&item.logical_key)?;
+        let identity = if let Some(locator) = &item.trash {
+            format!(
+                "{normalized_key}\0{:020}\0{}",
+                locator.deleted_at_unix_nanos, locator.delete_mutation_id
+            )
+        } else {
+            normalized_key
+        };
         if !keys.insert(identity) {
             return Err(AppError::Conflict(format!(
                 "duplicate NCNX key '{}' in peer batch",
@@ -318,7 +376,7 @@ fn local_apply_batch(
                     Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
                 }
             }
-            if successes == 0 {
+            if successes == 0 || !failures.is_empty() {
                 return Err(AppError::ServiceUnavailable(format!(
                     "NCNX batch removal could not reach any local disk on node '{}': {}",
                     runtime.local_node_id,
@@ -342,7 +400,7 @@ fn local_apply_batch(
                     Err(error) => failures.push(format!("{}: {}", store.root_id(), error)),
                 }
             }
-            if successes == 0 {
+            if successes == 0 || !failures.is_empty() {
                 return Err(AppError::ServiceUnavailable(format!(
                     "NCNX trash batch removal could not reach any local disk on node '{}': {}",
                     runtime.local_node_id,
@@ -362,13 +420,39 @@ pub(super) async fn run_local_batch(
     runtime: Arc<ClusterRuntime>,
     request: PeerNcnxBatchRequest,
 ) -> Result<PeerNcnxBatchResponse, AppError> {
+    let admission = LOCAL_NCNX_ADMISSION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::ServiceUnavailable("NCNX receiver admission is full".into()))?;
+    validate_batch_contract(&runtime, &request)?;
+    let key_guards = coordination::lock_keys(
+        &request.fragment_id,
+        request.items.iter().map(|item| item.logical_key.as_str()),
+    )
+    .await?;
     let permit = LOCAL_NCNX_BATCH_BUDGET
         .clone()
         .acquire_owned()
         .await
         .map_err(|_| AppError::ServiceUnavailable("NCNX batch budget is closed".into()))?;
     tokio::task::spawn_blocking(move || {
+        let _key_guards = key_guards;
+        let _admission = admission;
         let _permit = permit;
+        let _binding = crate::distribution::membership::guard_cluster_binding()?;
+        lease::validate_tokens(
+            &runtime,
+            &request.pool_id,
+            request.pool_generation,
+            &request.fragment_id,
+            request.items.iter().map(|item| {
+                (
+                    item.logical_key.as_str(),
+                    request.root_id.as_str(),
+                    item.lease_token.as_deref().unwrap_or(""),
+                )
+            }),
+        )?;
         local_apply_batch(&runtime, &request)
     })
     .await
@@ -379,13 +463,40 @@ pub(super) async fn run_local_apply(
     runtime: Arc<ClusterRuntime>,
     request: PeerNcnxRequest,
 ) -> Result<PeerNcnxResponse, AppError> {
+    let admission = LOCAL_NCNX_ADMISSION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::ServiceUnavailable("NCNX receiver admission is full".into()))?;
+    validate_pool_contract(&runtime, &request)?;
+    let key_guards =
+        coordination::lock_keys(&request.fragment_id, [request.logical_key.as_str()]).await?;
     let permit = LOCAL_NCNX_IO_BUDGET
         .clone()
         .acquire_owned()
         .await
         .map_err(|_| AppError::ServiceUnavailable("NCNX filesystem budget is closed".into()))?;
     tokio::task::spawn_blocking(move || {
+        let _key_guards = key_guards;
+        let _admission = admission;
         let _permit = permit;
+        let _binding = crate::distribution::membership::guard_cluster_binding()?;
+        if !matches!(
+            request.action,
+            PeerNcnxAction::ReadLive | PeerNcnxAction::ReadTrash
+        ) || request.lease_token.is_some()
+        {
+            lease::validate_tokens(
+                &runtime,
+                &request.pool_id,
+                request.pool_generation,
+                &request.fragment_id,
+                [(
+                    request.logical_key.as_str(),
+                    request.root_id.as_str(),
+                    request.lease_token.as_deref().unwrap_or(""),
+                )],
+            )?;
+        }
         local_apply(&runtime, &request)
     })
     .await
@@ -396,12 +507,17 @@ pub(super) async fn run_local_list(
     runtime: Arc<ClusterRuntime>,
     request: PeerNcnxRequest,
 ) -> Result<PeerNcnxResponse, AppError> {
+    let admission = LOCAL_NCNX_ADMISSION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::ServiceUnavailable("NCNX receiver admission is full".into()))?;
     let permit = LOCAL_NCNX_IO_BUDGET
         .clone()
         .acquire_owned()
         .await
         .map_err(|_| AppError::ServiceUnavailable("NCNX filesystem budget is closed".into()))?;
     tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         let _permit = permit;
         local_list(&runtime, &request)
     })
@@ -505,10 +621,16 @@ fn required_bytes(request: &PeerNcnxRequest) -> Result<&[u8], AppError> {
 }
 
 fn required_trash(request: &PeerNcnxRequest) -> Result<&TrashLocator, AppError> {
-    request
+    let locator = request
         .trash
         .as_ref()
-        .ok_or_else(|| AppError::BadRequest("NCNX operation requires trash locator".into()))
+        .ok_or_else(|| AppError::BadRequest("NCNX operation requires trash locator".into()))?;
+    if validate_logical_key(&locator.logical_key)? != validate_logical_key(&request.logical_key)? {
+        return Err(AppError::BadRequest(
+            "NCNX trash locator differs from request key".into(),
+        ));
+    }
+    Ok(locator)
 }
 
 async fn peer_handler(
@@ -543,4 +665,5 @@ pub fn build_ncnx_peer_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(PEER_NCNX_PATH, post(peer_handler))
         .route(PEER_NCNX_BATCH_PATH, post(peer_batch_handler))
+        .merge(lease::build_lease_peer_routes())
 }

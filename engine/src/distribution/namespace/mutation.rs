@@ -409,8 +409,11 @@ pub(super) async fn trash_one(
         deleted_at_unix_nanos: now_nanos,
         delete_mutation_id: mutation_id.to_string(),
     };
-    copy_live_to_trash(located, &locator).await?;
-    remove_live(located).await
+    trash_live_batch(&[NcnxTrashBatchItem {
+        located: located.clone(),
+        locator,
+    }])
+    .await
 }
 
 pub(super) async fn recover_one(
@@ -421,15 +424,9 @@ pub(super) async fn recover_one(
         .trash
         .as_ref()
         .ok_or_else(|| AppError::InternalServerError("trash recovery has no locator".into()))?;
-    if find_live_for_survival_write(&located.record.fragment_id, &name.logical_key)
-        .await?
-        .is_some()
-    {
-        return Err(AppError::Conflict(format!(
-            "cannot recover '{}': live key already exists",
-            name.logical_key
-        )));
-    }
-    copy_live_to_key(located, &name.logical_key).await?;
-    remove_trash(located, locator).await
+    recover_trash_batch(&[NcnxRecoverBatchItem {
+        located: located.clone(),
+        locator: locator.clone(),
+    }])
+    .await
 }

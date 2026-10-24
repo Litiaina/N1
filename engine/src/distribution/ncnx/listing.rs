@@ -39,6 +39,7 @@ async fn list_node(
         bytes: None,
         after: after.map(ToOwned::to_owned),
         limit: Some(limit),
+        lease_token: None,
     };
     if node.id == runtime.local_node_id {
         return Ok(run_local_list(Arc::new(runtime.clone()), request)

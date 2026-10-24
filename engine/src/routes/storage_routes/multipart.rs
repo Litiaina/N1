@@ -225,7 +225,7 @@ pub(super) async fn cancel_upload_session_scoped(
     Query(_key_query): Query<crate::core::disk_manager::ObjectKeyQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    cancel_standard_cluster_upload(&claims, &fragment, &version_id)?;
+    cancel_standard_cluster_upload(&claims, &fragment, &version_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

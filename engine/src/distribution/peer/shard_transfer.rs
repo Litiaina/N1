@@ -139,6 +139,8 @@ async fn native_put_peer_shard(
         offset: None,
         length: None,
         deferred_durability: target.deferred_durability,
+        repair: target.repair,
+        expected_checksum: target.expected_checksum.clone(),
     };
     let request = NativeRequest {
         id: format!("peer-put-{}", Ulid::new()),

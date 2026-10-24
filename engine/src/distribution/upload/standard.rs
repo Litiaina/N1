@@ -130,7 +130,8 @@ where
         content_length,
         part.is_ok(),
     );
-    claim.complete(part?.part)
+    let part = part?;
+    claim.complete(part.part)
 }
 
 pub fn get_standard_cluster_upload_status(
@@ -419,7 +420,7 @@ pub fn complete_standard_cluster_upload(fragment: &str, version_id: &str) {
     }
 }
 
-pub fn cancel_standard_cluster_upload(
+pub async fn cancel_standard_cluster_upload(
     claims: &Claims,
     fragment: &str,
     version_id: &str,
@@ -435,7 +436,7 @@ pub fn cancel_standard_cluster_upload(
         .get(&key)
         .map(|entry| Arc::clone(entry.value()))
         .ok_or_else(|| AppError::BadRequest("Standard upload session not found".into()))?;
-    session
+    let prior = session
         .lifecycle
         .compare_exchange(
             STANDARD_SESSION_OPEN,
@@ -443,7 +444,10 @@ pub fn cancel_standard_cluster_upload(
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .map_err(|_| AppError::Conflict("Multipart session is busy".into()))?;
+        .err();
+    if prior.is_some_and(|state| state != STANDARD_SESSION_CANCELLED) {
+        return Err(AppError::Conflict("Multipart session is busy".into()));
+    }
     if session.in_flight_parts.load(Ordering::Acquire) != 0 {
         session
             .lifecycle
@@ -452,6 +456,12 @@ pub fn cancel_standard_cluster_upload(
             "Multipart session has an in-flight part".into(),
         ));
     }
+    let runtime = active_cluster_runtime()?;
+    let identity = crate::distribution::upload_lifecycle::UploadIdentity::from_manifest(
+        &runtime,
+        &session.manifest,
+    );
+    crate::distribution::upload_ownership::abort_and_reclaim(&runtime, &identity).await?;
     STANDARD_UPLOADS.remove(&key);
     Ok(())
 }

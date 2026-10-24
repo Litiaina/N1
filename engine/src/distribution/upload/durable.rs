@@ -101,6 +101,23 @@ where
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
     let stripe_size = choose_upload_stripe_size(content_length);
+    let created_at = Utc::now().timestamp();
+    crate::distribution::upload_ownership::register_upload(
+        &runtime,
+        &crate::distribution::upload_lifecycle::UploadIdentity {
+            cluster_id: runtime.membership.cluster_id.clone(),
+            pool_id: write_pool.id.clone(),
+            pool_generation: write_pool.generation,
+            fragment: fragment.clone(),
+            object_id: object_key.clone(),
+            version_id: version_id.clone(),
+            session_id: session_id.clone(),
+            data_shards: layout.data_shards as u16,
+            parity_shards: layout.parity_shards as u16,
+            created_at_unix: created_at,
+        },
+    )
+    .await?;
     let started = Instant::now();
     let part = write_cluster_part_from_stream(
         &fragment,
@@ -135,7 +152,7 @@ where
         owner_uid: fragment.clone(),
         content_type,
         total_size_bytes: content_length,
-        created_at: Utc::now().timestamp(),
+        created_at,
         pool_id: part.pool_id.clone(),
         pool_generation: part.pool_generation,
         membership_epoch: part.membership_epoch,

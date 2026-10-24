@@ -20,6 +20,8 @@ pub(crate) mod root_routing;
 pub mod routes;
 pub mod status;
 pub mod upload;
+pub mod upload_lifecycle;
+pub mod upload_ownership;
 
 pub use layout::{
     ClusterEcLayout, ClusterLayoutPolicy, resolve_configured_layout, resolve_layout,

@@ -141,7 +141,7 @@ pub fn resolve_peer_shard_locator(
 
 pub(super) fn peer_shard_url(target: &PeerShardTarget) -> String {
     format!(
-        "{}/n2/peer/shards/{}/{}/{}/{}/{}?pool_id={}&pool_generation={}&slot_id={}&instance_id={}&binding_epoch={}&root_id={}&parity={}&expected_len={}&deferred_durability={}",
+        "{}/n2/peer/shards/{}/{}/{}/{}/{}?pool_id={}&pool_generation={}&slot_id={}&instance_id={}&binding_epoch={}&root_id={}&parity={}&expected_len={}&deferred_durability={}&repair={}&expected_checksum={}",
         target.endpoint.trim_end_matches('/'),
         encode_segment(&target.fragment),
         encode_segment(&target.object_id),
@@ -156,7 +156,9 @@ pub(super) fn peer_shard_url(target: &PeerShardTarget) -> String {
         encode_segment(&target.root_id),
         target.is_parity,
         target.expected_len,
-        target.deferred_durability
+        target.deferred_durability,
+        target.repair,
+        encode_segment(target.expected_checksum.as_deref().unwrap_or(""))
     )
 }
 
@@ -289,6 +291,8 @@ async fn native_get_peer_shard(
         offset: Some(offset),
         length: Some(length),
         deferred_durability: false,
+        repair: false,
+        expected_checksum: None,
     };
     let request = NativeRequest {
         id: format!("peer-get-{}", Ulid::new()),
@@ -396,7 +400,6 @@ fn stable_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
 }
 
 struct OpenLocalShard {
-    dir: std::path::PathBuf,
     tmp_path: std::path::PathBuf,
     stable_path: std::path::PathBuf,
     file: std::fs::File,
@@ -429,7 +432,6 @@ async fn open_local_shard_for_write(
         match create_direct_file(&tmp_path).await {
             Ok(file) => {
                 return Ok(OpenLocalShard {
-                    dir,
                     tmp_path,
                     stable_path,
                     file,
@@ -538,6 +540,235 @@ fn validate_peer_binding(
     Ok(runtime)
 }
 
+async fn guard_shard_operation(
+    runtime: &ClusterRuntime,
+    pool_id: &str,
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+    part_index: u64,
+    shard_index: usize,
+    is_parity: bool,
+    expected_len: u64,
+    repair: bool,
+    expected_checksum: Option<&str>,
+    deferred_durability: bool,
+) -> Result<crate::distribution::upload_lifecycle::UploadReadGuard, AppError> {
+    use crate::distribution::upload_lifecycle;
+    if !repair {
+        return upload_lifecycle::guard_shard_write(
+            runtime, pool_id, fragment, object_id, version_id,
+        )
+        .await;
+    }
+    if deferred_durability {
+        return Err(AppError::BadRequest(
+            "committed shard repair cannot defer durability".into(),
+        ));
+    }
+    let expected_checksum = expected_checksum
+        .filter(|checksum| {
+            checksum.len() == 64 && checksum.bytes().all(|value| value.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            AppError::BadRequest("committed shard repair requires its exact SHA-256".into())
+        })?;
+    let fragment_copy = fragment.to_string();
+    let object_copy = object_id.to_string();
+    let version_copy = version_id.to_string();
+    let local = tokio::task::spawn_blocking(move || {
+        index_store::read_live_version(&fragment_copy, &object_copy, &version_copy)
+    })
+    .await
+    .map_err(|error| {
+        AppError::InternalServerError(format!("read repair NCDX worker: {error}"))
+    })??;
+    let metadata = match local {
+        Some(metadata) => metadata,
+        None => resolve_cluster_object_version(fragment, object_id, version_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict("shard repair has no immutable committed metadata".into())
+            })?,
+    };
+    validate_repair_shard_contract(
+        runtime,
+        &metadata,
+        pool_id,
+        fragment,
+        object_id,
+        version_id,
+        part_index,
+        shard_index,
+        is_parity,
+        expected_len,
+        expected_checksum,
+    )?;
+    let ownership =
+        upload_lifecycle::guard_committed_repair(runtime, pool_id, fragment, object_id, version_id)
+            .await;
+    if let Ok(ownership) = ownership {
+        return Ok(ownership);
+    }
+    // Legacy or a missing holder may have no ownership record. A request's
+    // claimed checksum is not authority to create one: independently verify K
+    // identical immutable metadata copies first, outside the exclusive lock.
+    crate::distribution::upload_ownership::verify_committed_metadata(runtime, &metadata).await?;
+    upload_lifecycle::bootstrap_committed(runtime, &metadata).await?;
+    upload_lifecycle::guard_committed_repair(runtime, pool_id, fragment, object_id, version_id)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_repair_shard_contract(
+    runtime: &ClusterRuntime,
+    metadata: &ObjectMetadata,
+    pool_id: &str,
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+    part_index: u64,
+    shard_index: usize,
+    is_parity: bool,
+    expected_len: u64,
+    expected_checksum: &str,
+) -> Result<(), AppError> {
+    let shard = metadata
+        .parts
+        .iter()
+        .find(|part| part.part_index == part_index)
+        .and_then(|part| {
+            part.shards
+                .iter()
+                .find(|shard| shard.shard_index == shard_index)
+        })
+        .ok_or_else(|| AppError::Conflict("repair shard is absent from immutable NCDX".into()))?;
+    let locator = parse_peer_shard_locator(&shard.absolute_path)
+        .ok_or_else(|| AppError::Conflict("repair shard has no exact placement locator".into()))?;
+    if metadata.pool_id != pool_id
+        || metadata.fragment != fragment
+        || metadata.object_key != object_id
+        || metadata.version_id != version_id
+        || locator.pool_id != pool_id
+        || locator.pool_generation != metadata.pool_generation
+        || locator.fragment != fragment
+        || locator.object_id != object_id
+        || locator.version_id != version_id
+        || locator.part_index != part_index
+        || locator.shard_index != shard_index
+        || locator.node_id != runtime.local_node_id
+        || locator.is_parity != is_parity
+        || shard.is_parity != is_parity
+        || shard.size_bytes != expected_len
+        || !shard.checksum.eq_ignore_ascii_case(expected_checksum)
+    {
+        return Err(AppError::Conflict(
+            "repair bytes do not match the exact immutable shard contract".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The final namespace operation runs in one blocking worker retaining the
+/// ownership guard. Cancelling a network/stream future cannot release the
+/// abort fence while a detached filesystem rename is still running.
+pub(crate) async fn publish_guarded_shard(
+    runtime: Arc<ClusterRuntime>,
+    ownership: crate::distribution::upload_lifecycle::UploadReadGuard,
+    temporary: std::path::PathBuf,
+    stable: std::path::PathBuf,
+    checksum: String,
+    expected_len: u64,
+    repair: bool,
+    deferred_durability: bool,
+) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        let _binding = crate::distribution::membership::guard_cluster_binding()?;
+        let expected_state = if repair {
+            crate::distribution::upload_lifecycle::UploadLifecycleState::Committed
+        } else {
+            crate::distribution::upload_lifecycle::UploadLifecycleState::Open
+        };
+        if _ownership.record.state != expected_state {
+            return Err(AppError::Conflict(
+                "shard publication has the wrong ownership state".into(),
+            ));
+        }
+        if let Some(current) = crate::distribution::membership::try_active_cluster_runtime()
+            && (current.membership.cluster_id != runtime.membership.cluster_id
+                || current.membership.binding_epoch != runtime.membership.binding_epoch
+                || current.local_node_id != runtime.local_node_id
+                || current.local_instance_id != runtime.local_instance_id
+                || current.local_is_reserve != runtime.local_is_reserve
+                || current.local_storage_roots != runtime.local_storage_roots)
+        {
+            return Err(AppError::Conflict(
+                "shard receiver binding changed before publication".into(),
+            ));
+        }
+        #[cfg(test)]
+        lifecycle_tests::pause_publication_if_requested(&stable);
+        let result = if repair {
+            std::fs::rename(&temporary, &stable)
+                .map_err(|error| AppError::Io(error, "publish verified repaired shard".into()))
+        } else {
+            match std::fs::hard_link(&temporary, &stable) {
+                Ok(()) => std::fs::remove_file(&temporary).map_err(|error| {
+                    AppError::Io(error, "remove published shard temporary name".into())
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let mut file = std::fs::File::open(&stable).map_err(|error| {
+                        AppError::Io(error, "verify existing immutable shard".into())
+                    })?;
+                    let actual_len = file
+                        .metadata()
+                        .map_err(|error| AppError::Io(error, "stat immutable shard".into()))?
+                        .len();
+                    let mut hasher = Sha256Stream::new();
+                    let mut buffer = vec![0u8; 256 * 1024];
+                    loop {
+                        let count =
+                            std::io::Read::read(&mut file, &mut buffer).map_err(|error| {
+                                AppError::Io(error, "checksum existing immutable shard".into())
+                            })?;
+                        if count == 0 {
+                            break;
+                        }
+                        hasher.update(&buffer[..count]);
+                    }
+                    if actual_len != expected_len
+                        || !format_sha256(&hasher.finalize()).eq_ignore_ascii_case(&checksum)
+                    {
+                        return Err(AppError::Conflict(
+                            "refused to replace a different immutable upload shard".into(),
+                        ));
+                    }
+                    std::fs::remove_file(&temporary).map_err(|error| {
+                        AppError::Io(error, "remove duplicate shard temporary name".into())
+                    })
+                }
+                Err(error) => Err(AppError::Io(error, "publish immutable upload shard".into())),
+            }
+        };
+        result?;
+        if !deferred_durability {
+            let parent = stable
+                .parent()
+                .ok_or_else(|| AppError::Conflict("shard publication has no parent".into()))?;
+            std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| AppError::Io(error, "sync shard publication directory".into()))?;
+        }
+        _ownership.checkpoint_activity_under_binding()?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        AppError::InternalServerError(format!("guarded shard publication worker: {error}"))
+    })?
+}
+
 pub async fn peer_put_shard(
     headers: HeaderMap,
     Path((fragment, object_id, version_id, part_index, shard_index)): Path<(
@@ -562,6 +793,21 @@ pub async fn peer_put_shard(
     let started = Instant::now();
     let is_parity = query.parity.unwrap_or(false);
     let expected_len = query.expected_len.unwrap_or(0);
+    let ownership = guard_shard_operation(
+        &runtime,
+        &query.pool_id,
+        &fragment,
+        &object_id,
+        &version_id,
+        part_index,
+        shard_index,
+        is_parity,
+        expected_len,
+        query.repair,
+        query.expected_checksum.as_deref(),
+        query.deferred_durability,
+    )
+    .await?;
     let file_name = stable_name(part_index, shard_index, is_parity);
     let opened = open_local_shard_for_write(
         &runtime,
@@ -573,7 +819,6 @@ pub async fn peer_put_shard(
         expected_len,
     )
     .await?;
-    let dir = opened.dir;
     let tmp_path = opened.tmp_path;
     let stable_path = opened.stable_path;
     let mut file = DirectWriter::new(opened.file);
@@ -613,28 +858,34 @@ pub async fn peer_put_shard(
             .map_err(|e| AppError::Io(e, format!("sync peer shard {}", tmp_path.display())))?;
     }
     drop(file);
-    if fs::try_exists(&stable_path).await.unwrap_or(false) {
-        let _ = fs::remove_file(&stable_path).await;
+    let checksum = format_sha256(&hasher.finalize());
+    if query
+        .expected_checksum
+        .as_ref()
+        .is_some_and(|expected| !expected.is_empty() && !checksum.eq_ignore_ascii_case(expected))
+    {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(AppError::Conflict(
+            "peer shard body differs from its expected SHA-256".into(),
+        ));
     }
-    fs::rename(&tmp_path, &stable_path).await.map_err(|e| {
-        AppError::Io(
-            e,
-            format!(
-                "publish peer shard {} -> {}",
-                tmp_path.display(),
-                stable_path.display()
-            ),
-        )
-    })?;
-    if !query.deferred_durability {
-        crate::core::upload::sync_dir(&dir).await?;
-    }
+    publish_guarded_shard(
+        runtime,
+        ownership,
+        tmp_path,
+        stable_path.clone(),
+        checksum.clone(),
+        written,
+        query.repair,
+        query.deferred_durability,
+    )
+    .await?;
     let info = ShardInfo {
         shard_index,
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
-        checksum: format_sha256(&hasher.finalize()),
+        checksum,
         block_checksums: Vec::new(),
         checksum_block_size: 0,
         is_parity,
@@ -767,6 +1018,10 @@ pub struct NativePeerShardPayload {
     pub length: Option<usize>,
     #[serde(default)]
     pub deferred_durability: bool,
+    #[serde(default)]
+    pub repair: bool,
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 fn authorize_peer_secret(secret: Option<&str>) -> Result<(), AppError> {
@@ -798,6 +1053,21 @@ where
         &payload.root_id,
     )?;
     let expected_len = payload.expected_len.unwrap_or(body_len);
+    let ownership = guard_shard_operation(
+        &runtime,
+        &payload.pool_id,
+        &payload.fragment,
+        &payload.object_id,
+        &payload.version_id,
+        payload.part_index,
+        payload.shard_index,
+        payload.parity,
+        expected_len,
+        payload.repair,
+        payload.expected_checksum.as_deref(),
+        payload.deferred_durability,
+    )
+    .await?;
     let file_name = stable_name(payload.part_index, payload.shard_index, payload.parity);
     let opened = open_local_shard_for_write(
         &runtime,
@@ -809,7 +1079,6 @@ where
         expected_len,
     )
     .await?;
-    let dir = opened.dir;
     let tmp_path = opened.tmp_path;
     let stable_path = opened.stable_path;
     let mut file = DirectWriter::new(opened.file);
@@ -861,29 +1130,35 @@ where
         })?;
     }
     drop(file);
-    if fs::try_exists(&stable_path).await.unwrap_or(false) {
-        let _ = fs::remove_file(&stable_path).await;
+    let checksum = format_sha256(&hasher.finalize());
+    if payload
+        .expected_checksum
+        .as_ref()
+        .is_some_and(|expected| !expected.is_empty() && !checksum.eq_ignore_ascii_case(expected))
+    {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(AppError::Conflict(
+            "native peer shard body differs from its expected SHA-256".into(),
+        ));
     }
-    fs::rename(&tmp_path, &stable_path).await.map_err(|e| {
-        AppError::Io(
-            e,
-            format!(
-                "publish native peer shard {} -> {}",
-                tmp_path.display(),
-                stable_path.display()
-            ),
-        )
-    })?;
-    if !payload.deferred_durability {
-        crate::core::upload::sync_dir(&dir).await?;
-    }
+    publish_guarded_shard(
+        runtime,
+        ownership,
+        tmp_path,
+        stable_path.clone(),
+        checksum.clone(),
+        written,
+        payload.repair,
+        payload.deferred_durability,
+    )
+    .await?;
     invalidate_local_usage_cache(Some(&payload.fragment));
     Ok(ShardInfo {
         shard_index: payload.shard_index,
         file_name,
         absolute_path: stable_path.to_string_lossy().to_string(),
         size_bytes: written,
-        checksum: format_sha256(&hasher.finalize()),
+        checksum,
         block_checksums: Vec::new(),
         checksum_block_size: 0,
         is_parity: payload.parity,
@@ -992,4 +1267,260 @@ pub fn build_peer_routes() -> Router<Arc<AppState>> {
             "/n2/peer/shards/{:fragment}/{:object_id}/{:version_id}/{:part_index}/{:shard_index}",
             put(peer_put_shard).get(peer_get_shard),
         )
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::distribution::membership::{
+        ClusterMembership, ClusterPolicy, N2_MEMBERSHIP_FORMAT_VERSION, NodeState, PoolState,
+        ServerPool, StorageRoot,
+    };
+    use crate::distribution::upload_lifecycle::{self, UploadIdentity};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Pause {
+        entered: AtomicBool,
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+    static PAUSED: LazyLock<std::sync::Mutex<Option<(std::path::PathBuf, Arc<Pause>)>>> =
+        LazyLock::new(|| std::sync::Mutex::new(None));
+
+    pub(super) fn pause_publication_if_requested(path: &std::path::Path) {
+        let pause = PAUSED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(selected, pause)| (selected == path).then(|| pause.clone()));
+        if let Some(pause) = pause {
+            pause.entered.store(true, Ordering::Release);
+            let mut released = pause.released.lock().unwrap();
+            while !*released {
+                released = pause.changed.wait(released).unwrap();
+            }
+        }
+    }
+
+    struct Fixture {
+        root: std::path::PathBuf,
+        runtime: Arc<ClusterRuntime>,
+        identity: UploadIdentity,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            crate::core::disk_manager::STORAGE_DISKS.get_or_init(|| {
+                let shared = std::env::temp_dir()
+                    .join(format!("n2-shard-fence-index-{}", std::process::id()));
+                std::fs::create_dir_all(&shared).unwrap();
+                vec![shared.to_string_lossy().into_owned()]
+            });
+            let root = std::env::temp_dir().join(format!("n2-shard-ownership-{}", Ulid::new()));
+            std::fs::create_dir_all(&root).unwrap();
+            let storage = StorageRoot {
+                id: "r0".into(),
+                physical_id: None,
+                path: root.to_string_lossy().into_owned(),
+            };
+            let nodes = (0..2)
+                .map(|index| ClusterNode {
+                    id: format!("n{index}"),
+                    instance_id: format!("instance-{index}"),
+                    binding_epoch: 1,
+                    endpoint: format!("http://127.0.0.1:{}", 54000 + index),
+                    native_endpoint: None,
+                    state: Some(NodeState::Online),
+                    weight: 1,
+                    storage_roots: vec![storage.clone()],
+                    joined_epoch: 1,
+                    capacity_bytes: None,
+                    used_bytes: None,
+                    last_seen_unix: None,
+                })
+                .collect::<Vec<_>>();
+            let runtime = Arc::new(ClusterRuntime {
+                local_node_id: "n0".into(),
+                local_instance_id: "instance-0".into(),
+                local_is_reserve: false,
+                local_pool_id: "pool-a".into(),
+                local_storage_roots: vec![storage],
+                membership_path: root.join("membership.json"),
+                layout_policy: crate::distribution::layout::ClusterLayoutPolicy {
+                    data_shards: 1,
+                    parity_shards: 1,
+                },
+                membership: ClusterMembership {
+                    format_version: N2_MEMBERSHIP_FORMAT_VERSION,
+                    cluster_id: "cluster-a".into(),
+                    epoch: 1,
+                    binding_epoch: 1,
+                    pools: vec![ServerPool {
+                        id: "pool-a".into(),
+                        generation: 1,
+                        policy: ClusterPolicy {
+                            object_data_shards: 1,
+                            object_parity_shards: 1,
+                        },
+                        state: PoolState::Writable,
+                        node_ids: vec!["n0".into(), "n1".into()],
+                    }],
+                    nodes,
+                    reserve_nodes: Vec::new(),
+                    retired_instances: Vec::new(),
+                },
+                auto_rebalance: false,
+            });
+            let identity = UploadIdentity {
+                cluster_id: "cluster-a".into(),
+                pool_id: "pool-a".into(),
+                pool_generation: 1,
+                fragment: Ulid::new().to_string(),
+                object_id: "a".repeat(64),
+                version_id: Ulid::new().to_string(),
+                session_id: Ulid::new().to_string(),
+                data_shards: 1,
+                parity_shards: 1,
+                created_at_unix: 100,
+            };
+            Self {
+                root,
+                runtime,
+                identity,
+            }
+        }
+
+        async fn writer(&self) -> upload_lifecycle::UploadReadGuard {
+            upload_lifecycle::guard_shard_write(
+                &self.runtime,
+                &self.identity.pool_id,
+                &self.identity.fragment,
+                &self.identity.object_id,
+                &self.identity.version_id,
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_shard_publication_is_immutable_and_aborted_versions_reject_new_writes() {
+        let fixture = Fixture::new();
+        upload_lifecycle::ensure_open(&fixture.runtime, &fixture.identity)
+            .await
+            .unwrap();
+        let stable = fixture.root.join("piece");
+        for (index, bytes) in [
+            b"original".as_slice(),
+            b"original".as_slice(),
+            b"different".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temporary = fixture.root.join(format!("temporary-{index}"));
+            std::fs::write(&temporary, bytes).unwrap();
+            let result = publish_guarded_shard(
+                fixture.runtime.clone(),
+                fixture.writer().await,
+                temporary,
+                stable.clone(),
+                crate::core::checksum::sha256_hex(bytes),
+                bytes.len() as u64,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(result.is_ok(), index < 2);
+            assert_eq!(std::fs::read(&stable).unwrap(), b"original");
+        }
+        upload_lifecycle::abort_upload(&fixture.runtime, &fixture.identity)
+            .await
+            .unwrap();
+        assert!(
+            upload_lifecycle::guard_shard_write(
+                &fixture.runtime,
+                &fixture.identity.pool_id,
+                &fixture.identity.fragment,
+                &fixture.identity.object_id,
+                &fixture.identity.version_id
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_final_publication_retains_guard_until_disk_worker_finishes() {
+        let fixture = Fixture::new();
+        upload_lifecycle::ensure_open(&fixture.runtime, &fixture.identity)
+            .await
+            .unwrap();
+        let stable = fixture.root.join("cancelled-piece");
+        let temporary = fixture.root.join("temporary-cancelled");
+        let bytes = b"durable bytes";
+        std::fs::write(&temporary, bytes).unwrap();
+        let pause = Arc::new(Pause {
+            entered: AtomicBool::new(false),
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        *PAUSED.lock().unwrap() = Some((stable.clone(), pause.clone()));
+        struct Reset(Arc<Pause>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *self.0.released.lock().unwrap() = true;
+                self.0.changed.notify_all();
+                *PAUSED.lock().unwrap() = None;
+            }
+        }
+        let reset = Reset(pause.clone());
+        let runtime = fixture.runtime.clone();
+        let ownership = fixture.writer().await;
+        let final_path = stable.clone();
+        let publisher = tokio::spawn(async move {
+            publish_guarded_shard(
+                runtime,
+                ownership,
+                temporary,
+                final_path,
+                crate::core::checksum::sha256_hex(bytes),
+                bytes.len() as u64,
+                false,
+                false,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pause.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        publisher.abort();
+        assert!(publisher.await.unwrap_err().is_cancelled());
+        let runtime = fixture.runtime.clone();
+        let identity = fixture.identity.clone();
+        let abort =
+            tokio::spawn(async move { upload_lifecycle::abort_upload(&runtime, &identity).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !abort.is_finished(),
+            "a cancelled network future cannot release a still-running publication fence"
+        );
+        drop(reset);
+        tokio::time::timeout(Duration::from_secs(2), abort)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(stable).unwrap(), bytes);
+    }
 }

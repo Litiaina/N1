@@ -236,7 +236,7 @@ pub async fn cancel_upload_session_direct(
     claims: Claims,
     fragment: String,
     version_id: String,
-    object_key_hint: String,
+    _object_key_hint: String,
 ) -> Result<(), AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
@@ -246,32 +246,165 @@ pub async fn cancel_upload_session_direct(
     }
 
     let path_manager = ObjectPathManager::new();
-    let session = index::load_session(&fragment, &version_id).await?;
-    let object_key = session
-        .as_ref()
-        .map(|state| state.manifest.object_key.clone())
-        .filter(|key| !key.is_empty())
-        .unwrap_or_else(|| {
-            if object_key_hint.is_empty() {
-                version_id.clone()
-            } else {
-                object_key_hint
-            }
-        });
+    let session = index::load_session(&fragment, &version_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest("Upload session not found; no payload removed".into())
+        })?;
+    let object_key = session.manifest.object_key.clone();
+    validate_cancel_payload_identity(&fragment, &object_key, &version_id)?;
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
 
-    if index::read_object_version(&fragment, &object_key, &version_id)
-        .await
-        .is_ok()
+    if let Some(runtime) = crate::distribution::membership::try_active_cluster_runtime() {
+        let identity = crate::distribution::upload_lifecycle::UploadIdentity::from_manifest(
+            &runtime,
+            &session.manifest,
+        );
+        crate::distribution::upload_ownership::abort_and_reclaim(&runtime, &identity).await?;
+        index::remove_session(&fragment, &version_id, "cancelled").await?;
+        return Ok(());
+    }
+
+    // Lookup failure is not absence. In particular, the ordinary distributed
+    // resolver can establish visibility from a subset of metadata holders but
+    // cannot fence a concurrent finalizer. Until holder-side upload ownership
+    // is implemented, cancellation must retain the manifest and peer payload
+    // rather than acknowledge a destructive, unproven abort.
+    cancel_lookup_allows_cleanup(
+        index::read_object_version(&fragment, &object_key, &version_id).await,
+        crate::distribution::membership::try_active_cluster_runtime().is_some(),
+    )?;
+    let current = index::load_session(&fragment, &version_id)
+        .await?
+        .ok_or_else(|| AppError::Conflict("Upload session changed during cancellation".into()))?;
+    if current.manifest.session_id != session.manifest.session_id
+        || current.manifest.object_key != object_key
     {
         return Err(AppError::Conflict(
-            "Cannot cancel: Object is already finalized.".to_string(),
+            "Upload ownership changed during cancellation".into(),
         ));
     }
 
-    cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &version_id).await;
-    let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
-    cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+    cleanup_cancelled_local_payload(&path_manager, &fragment, &object_key, &version_id).await?;
+    // Retain retry/ownership evidence until every local deletion and its parent
+    // durability barrier succeeded. This is local cleanup, not a distributed
+    // peer-payload reclamation acknowledgement.
+    index::remove_session(&fragment, &version_id, "cancelled").await?;
 
     Ok(())
 }
+
+fn cancel_lookup_allows_cleanup(
+    lookup: Result<ObjectMetadata, AppError>,
+    distributed: bool,
+) -> Result<(), AppError> {
+    match lookup {
+        Ok(_) => Err(AppError::Conflict(
+            "Cannot cancel: Object is already finalized.".into(),
+        )),
+        Err(AppError::NotFound) if !distributed => Ok(()),
+        Err(AppError::NotFound) => Err(AppError::ServiceUnavailable(
+            "Distributed upload cancellation is deferred: holder-side ownership and finalization fencing are not yet proven; the session and payload were retained".into(),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_cancel_payload_identity(
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+) -> Result<(), AppError> {
+    let stable_fragment = fragment.strip_prefix("@f_").unwrap_or(fragment);
+    let component = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
+    if !component(stable_fragment)
+        || crate::core::index_store::normalize_object_id(object_id)? != object_id
+        || version_id.len() != 26
+        || Ulid::from_string(version_id).is_err()
+    {
+        return Err(AppError::BadRequest(
+            "Invalid upload payload identity; no payload removed".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn cleanup_cancelled_local_payload(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_id: &str,
+    version_id: &str,
+) -> Result<(), AppError> {
+    validate_cancel_payload_identity(fragment, object_id, version_id)?;
+    let roots = path_manager.get_storage_roots();
+    if roots.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "No local upload holders are available for cancellation".into(),
+        ));
+    }
+    for root in roots {
+        let root_meta = tokio_fs::metadata(&root)
+            .await
+            .map_err(|error| AppError::Io(error, "inspect cancellation storage root".into()))?;
+        if !root_meta.is_dir() {
+            return Err(AppError::Conflict(
+                "Cancellation storage root is not a directory".into(),
+            ));
+        }
+        let target = path_manager.get_shard_dir_on_disk(&root, fragment, object_id, version_id);
+        let relative = target.strip_prefix(&root).map_err(|_| {
+            AppError::Conflict("Cancellation payload escaped its storage root".into())
+        })?;
+        let mut current = root.clone();
+        let mut absent = false;
+        for component in relative.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(AppError::Conflict(
+                    "Invalid cancellation payload path".into(),
+                ));
+            }
+            current.push(component);
+            match tokio_fs::symlink_metadata(&current).await {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(AppError::Conflict(format!(
+                        "Cancellation payload path is not a real directory: {}",
+                        current.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    absent = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(AppError::Io(
+                        error,
+                        "inspect exact cancellation path".into(),
+                    ));
+                }
+            }
+        }
+        if absent {
+            continue;
+        }
+        // The known identity is enough to address this one version directly;
+        // never traverse other objects looking for a matching version name.
+        tokio_fs::remove_dir_all(&target)
+            .await
+            .map_err(|error| AppError::Io(error, "remove exact cancelled local payload".into()))?;
+        if let Some(parent) = target.parent() {
+            sync_dir(parent).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "finalization/tests.rs"]
+mod tests;

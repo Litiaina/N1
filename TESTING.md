@@ -5,6 +5,154 @@ N2 3.5 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Distributed ownership and upload reclamation — October 25, 2026
+
+Final frozen-input validation passed. The locked, offline workspace/all-targets
+build denied Rust warnings. All **330 distinct tests** passed: **281 engine,
+29 gateway, two native-client and 18 Shell**. All 281 engine tests also passed
+with four test threads. No tests were ignored. Formatting and whitespace
+checks passed; all 285 inventoried build/proof inputs remained unchanged.
+
+Real-process qualification used isolated XFS test roots on one HDD, two engine
+processes with EC `1 + 1`, loopback TLS/HTTP and native shard transport. The
+export suite additionally used the actual gateway. No deployment or N1/MCH
+test was changed. This is not independent-host or physical power-loss proof.
+
+| Gate | Result |
+| --- | --- |
+| Namespace ownership, controlled message barriers, restart and concurrent churn | 12 scenarios passed |
+| Upload ownership, abort fencing, exact cleanup and real GET repair | 7 scenarios passed |
+| Export owner crash/restart, durable pins, cancellation and natural expiry | Passed |
+
+The namespace run completed **136/136 acknowledged operations**: 64 uploads
+and 24 each of rename, trash and recovery, overlapping explicit healing. It
+verified all 64 final keys through seven-entry listing pages, empty recovered
+trash, 128 byte-exact GETs across both engines, and unchanged immutable NCDX
+and payload hashes. Expected concurrent uncertainty was deferred, not treated
+as authority to recreate a removed pointer. These debug-build HDD timings are
+not a throughput or universal latency qualification.
+
+The upload scenarios verified:
+
+- An actual streaming shard PUT drains before an abort vote; delayed HTTP,
+  native PUT and metadata publication remain rejected after cleanup/restart.
+- Cleanup independently verifies M+1 distinct current-holder abort votes;
+  caller assertions and duplicate voters cannot authorize deletion.
+- An empty directory left at a detached enrolled root cannot cast an abort
+  vote or receive replacement ownership files on the OS filesystem.
+- Committed NCDX remains protected after every NCNX pointer is removed.
+  Public GET repairs real corrupted and missing data pieces; legacy committed
+  repair bootstraps from K matching binding-checked metadata copies.
+- NCDX committed before logical namespace publication cannot be reclaimed as
+  an orphan. Standard/durable public cancellation removes only the exact
+  unfinished version and preserves permanent abort fences.
+- Explicit GC reclaims an interrupted one-shot upload through its ownership
+  record while preserving unrelated committed history byte-for-byte.
+
+Earlier failures and corrections are retained in the local evidence:
+
+| Finding | Disposition |
+| --- | --- |
+| Recovery published live NCNX but a partial removal left trash; retry rejected the identical live destination (135/136 stress ACKs) | One owner now spans both trash/recover stages; exact-byte recovery retry converges |
+| Peer inventory omitted current-layout committed objects | Explicit inventory decodes physical NCDX heads, including headless versions |
+| Cancelled persistence could lose its weak-registry owner while a blocking worker retained only the inner lock | Workers retain both guard and registry owner; deterministic cancellation regressions pass |
+| Immutable NCDX publication ignored directory-sync errors | Errors propagate; an exact-byte retry repeats the durability barrier |
+| Prior reference scan did not exclude recovery during final-trash payload purge | Unsafe purge is deferred; last trash pointer and payload are preserved, with no claimed refund |
+
+Harness failures were not product passes: missing required cancellation query
+parameters, optional empty-list fields, a plain-text GC-start response, selection
+of an unread parity piece, and standalone fixture storage initialization were
+corrected. Changed-input/interrupted validation attempts were rejected rather
+than combined into the final passing snapshot.
+
+The reproducible process tests are
+`scripts/proof/n2_ncnx_coordination_proof.py` and
+`scripts/proof/n2_upload_lifecycle_proof.py`. Both require `--engine` and `--out`
+paths on the designated test HDD and create new isolated fixtures. Frozen
+binary hashes, source inventory, request outcomes and failed attempts remain in
+the local `20261025-lifecycle/attempt-06` evidence set; deployment-specific files
+and credentials are not repository documentation.
+
+These results qualify the listed same-pool ownership/fencing cases, not all
+N2 failure modes. NCNX/NCDX encoding is unchanged; the new operational ownership
+records and upgrade requirements are described in
+[upload lifecycle](docs/upload-lifecycle.md).
+
+## Safety and bounded-listing hardening — October 24, 2026
+
+The locked, offline workspace/all-targets build passed with Rust warnings
+denied. All **253 engine, 29 gateway, two native-client and 18 Shell tests**
+passed serially; all 253 engine tests also passed with four test threads.
+Formatting and whitespace checks passed. No tests were ignored.
+
+The 24 added engine regressions cover:
+
+- Fragment cleanup no longer interprets `.objects` hash-fanout directories as
+  versions or recursively deletes them by age. The actual handler preserves
+  committed history, live/trash pointers, active upload records, export pins,
+  legacy/unknown directories, file bytes and inodes. Its response explicitly
+  marks distributed orphan reclamation as deferred; it is read-only inspection.
+- Verified stripe and cached/range reads reconstruct correct response bytes
+  **and repair physical missing or same-length corrupted shard files**.
+  Targets found during an active repair are retained; unavailable peers and
+  invalid expected checksums do not authorize replacement writes. The fixture
+  uses production reconstruction/scheduling/HTTP clients with filesystem-backed
+  synthetic peer handlers, not the production shard receiver/public GET route.
+- Receiver-local NCNX guards preserve valid divergent/recreated generations,
+  including copies on fallback roots. Single/batch mutations, cancellation,
+  independent keys and equivalent physical-fragment spellings are covered.
+  An unreadable fallback root defers both live and trash repair instead of
+  being treated as proof that no newer pointer exists.
+- Filename-only LIST paginates all 4,097 names at 17/page with at most 17
+  retained candidates, checks 720 prefix/cursor/reference combinations and
+  291 trash-generation entries, and rejects changed-directory resume cookies.
+  Thirty-two concurrent scans through 128 directory levels complete under a
+  process limit of 48 file descriptors. NCNX bodies are intentionally invalid
+  in filename-only fixtures, so successful listing cannot depend on decoding.
+
+The freshly built runtime also passed `scripts/proof/n2_export_proof.py` with
+two isolated EC 1+1 engine processes and one gateway. It verified exact ZIP64
+and TAR contents, SHA-256 ETags, range resume, fragment isolation, failure of
+incomplete selections, durable export pins across holder restart, coordinator
+SIGKILL/restart with manifest reuse, persistent cancellation, and natural
+120-second artifact expiry without deleting source objects. All fixture
+processes were stopped. Final evidence: `20261024-safety-hardening/attempt-02`;
+the 273 captured compile/proof inputs remained byte-identical throughout.
+
+These are local XFS HDD fixtures and loopback processes, not independent
+physical-node, power-loss or million-object qualification. No N1 test or
+deployment service was changed. Disk formats, EC placement and copy/delete
+semantics remain unchanged.
+
+Important limits: receiver-local locking does not close distributed
+missing-pointer resurrection during removal; the approved
+[key-scoped coordination design](docs/ncnx-key-coordination.md) is separate
+work. Read-repair admission bounds active parts, not whole-shard buffer bytes;
+overflow hints are best-effort, not durable obligations. Pagination bounds
+retained candidates, not per-page scan time or complete prefix mutation plans.
+
+The separate coordination proposal has eight passing in-memory model tests:
+51 reachable states and 34 finite schedules for two holders/two attempts under
+ordered, fail-fast acquisition. A stale-source negative control reproduces
+resurrection. This is design evidence, not runtime implementation or real
+distributed fencing qualification; see the proposal for excluded cases.
+
+## HTTP rate-limit correction — October 15, 2026
+
+All ten focused limiter regressions passed, followed by the full locked serial
+workspace/all-targets suite: 229 engine, 29 gateway, two native-client and 18 Shell
+tests passed. Formatting and whitespace checks passed. Requests/second are now converted
+to a per-token interval, rather than passed as seconds/token. Auth/view/upload/
+global retain their configured bursts and IP/fragment scopes. Enabled zero
+rates/bursts and rates beyond nanosecond precision are rejected; explicit
+disabling still bypasses all four layers.
+
+Tests inspect middleware-generated quotas for default/custom settings, use a
+fake clock for exhaustion, exact refill boundaries and idle saturation, and
+exercise HTTP 429/IP isolation. These are process-local HTTP checks, not new
+cluster, native-protocol, storage-format or hardware qualification. No running
+deployment was changed.
+
 ## Qualification Boundary
 
 N2 3.5 is a clean NCNX/object-NCDX format over the flat NCNX namespace, static
@@ -991,6 +1139,21 @@ write availability or every mid-commit partition timing.
 
 ## Remaining Release Gates
 
+- Extend the passing same-pool key-ownership proof to the wider partition and
+  membership-transition matrix; it is not cross-pool uniqueness, prefix
+  transaction atomicity, mixed-version rolling writes or physical fsync-stall
+  qualification.
+- Resolve the existing physical-key collision between valid keys such as
+  `a` and `a.ncnx/b`; changing component encoding requires an explicit layout
+  compatibility decision, not an unannounced format change.
+- Qualify pre-upgrade upload adoption, minority partial-commit resolution and
+  very large active-upload inventories. Unknown legacy payloads and ambiguous
+  terminal states remain retained, not age-deleted.
+- Complete object-reference exclusion for final committed-trash reclamation
+  against concurrent recovery/copy/publication. That physical purge is
+  deliberately deferred; upload abort fencing alone does not authorize it.
+- Bound whole-shard repair memory and complete prefix mutation work plans;
+  page-bounded LIST alone does not establish those bounds.
 - Repeat on four independent physical nodes for independent failure domains.
 - Complete the remaining mid-commit and wider-topology partition cases above;
   stopped processes alone do not qualify them.

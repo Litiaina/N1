@@ -79,6 +79,8 @@ fn peer_shard_locator_round_trips_endpoint_and_identity() {
         shard_index: 2,
         is_parity: true,
         deferred_durability: false,
+        repair: false,
+        expected_checksum: None,
         expected_len: 128,
     };
     let encoded = encode_peer_shard_locator(&target);
@@ -113,6 +115,8 @@ fn peer_shard_write_propagates_deferred_durability_explicitly() {
         shard_index: 2,
         is_parity: true,
         deferred_durability: true,
+        repair: false,
+        expected_checksum: None,
         expected_len: 128,
     };
 

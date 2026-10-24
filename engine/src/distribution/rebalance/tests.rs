@@ -123,6 +123,8 @@ fn meta_matching_runtime(runtime: &ClusterRuntime) -> ObjectMetadata {
                     is_parity,
                     expected_len: 1,
                     deferred_durability: false,
+                    repair: false,
+                    expected_checksum: None,
                 })
             };
             ShardInfo {

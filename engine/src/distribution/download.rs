@@ -24,6 +24,7 @@ pub struct VerifiedShardCache {
     verified_blocks: HashMap<String, Vec<u8>>,
     block_order: VecDeque<String>,
     max_verified_blocks: usize,
+    schedule_read_repair: bool,
 }
 
 impl Default for VerifiedShardCache {
@@ -34,11 +35,19 @@ impl Default for VerifiedShardCache {
             verified_blocks: HashMap::new(),
             block_order: VecDeque::new(),
             max_verified_blocks: 16,
+            schedule_read_repair: true,
         }
     }
 }
 
 impl VerifiedShardCache {
+    pub(crate) fn for_repair() -> Self {
+        Self {
+            schedule_read_repair: false,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn for_sequential_export() -> Self {
         Self {
             max_verified_blocks: 1,
@@ -269,8 +278,13 @@ pub async fn read_verified_cluster_data_stripe(
         (shard, result)
     });
     let results = join_all(reads).await;
-    if results.iter().any(|(_, result)| result.is_err()) {
-        crate::distribution::repair::schedule_cluster_part_read_repair(part.clone());
+    let failed_shards = results
+        .iter()
+        .filter(|(_, result)| result.is_err())
+        .map(|(shard, _)| shard.shard_index)
+        .collect::<Vec<_>>();
+    if !failed_shards.is_empty() {
+        crate::distribution::repair::schedule_cluster_part_read_repair(part.clone(), failed_shards);
     }
     let mut data = vec![None; data_count];
     let mut readable = 0usize;
@@ -535,6 +549,7 @@ pub async fn read_cluster_data_chunk_cached(
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, recovery_len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
     let mut added = 0usize;
+    let mut failed_shards = vec![target.shard_index];
     for shard in &part.shards {
         let shard = shard.clone();
         let read_len = if shard.shard_index == target.shard_index {
@@ -544,6 +559,7 @@ pub async fn read_cluster_data_chunk_cached(
         };
         let Ok(chunk) = read_verified_shard_slice_cached(&shard, offset, read_len, cache).await
         else {
+            failed_shards.push(shard.shard_index);
             continue;
         };
         if shard.shard_index == target.shard_index {
@@ -581,7 +597,9 @@ pub async fn read_cluster_data_chunk_cached(
     let mut restored = restored;
     restored.truncate(len);
     record_read_recover(restored.len() as u64, missing_observed as u64);
-    crate::distribution::repair::schedule_cluster_part_read_repair(part.clone());
+    if cache.schedule_read_repair {
+        crate::distribution::repair::schedule_cluster_part_read_repair(part.clone(), failed_shards);
+    }
     Ok(restored)
 }
 
@@ -591,6 +609,11 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
     block_size: usize,
     cache: &mut VerifiedShardCache,
 ) -> Result<Vec<u8>, AppError> {
+    if block_size == 0 {
+        return Err(AppError::InternalServerError(
+            "cluster repair block size is zero".into(),
+        ));
+    }
     let target = part
         .shards
         .iter()
@@ -602,7 +625,15 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
         AppError::InternalServerError("cluster repair target shard is too large".into())
     })?;
     if total_len == 0 {
-        return Ok(Vec::new());
+        return if expected_sha256(&target.checksum)
+            .is_some_and(|expected| sha256_matches(&[], &expected))
+        {
+            Ok(Vec::new())
+        } else {
+            Err(AppError::InternalServerError(
+                "empty repaired shard checksum is invalid".into(),
+            ))
+        };
     }
 
     let data_count = data_shards_count(part);

@@ -165,7 +165,9 @@ commits last. Membership is persisted with temporary-file write, file `fsync`,
 atomic rename, and parent-directory `fsync`.
 
 New writes use every available exact holder and may commit reconstructably at
-`K` while bounded autonomous healing restores missing exact slots. The slot returns to
+`K` only after the coordinator satisfies `max(K, strict pool majority)` mutation
+admission and reaches every exact NCNX holder for the affected key. Bounded
+autonomous healing restores missing exact slots. The slot returns to
 `online` only after healing completes with no incomplete, unrecoverable,
 failed, or errored objects. Only one missing slot in a pool is eligible for
 autonomous promotion. Multiple missing slots, incompatible reserve roots,
@@ -400,7 +402,20 @@ Properties:
 - no NCDX open;
 - no shard/parity IO;
 - no full-cluster in-memory listing;
-- bounded memory proportional to the requested page and NCNX replica factor.
+- page-bounded retained candidates; bytes also depend on key length and depth.
+
+Each local walk retains only the lowest requested page of matching names,
+plus one suspended traversal frame per directory level. Frame paths grow with
+key depth and length. Pagination bounds
+retained candidates, not scan time: an unordered filesystem can still require
+examining all relevant filenames for each page. This is not an `O(page size)`
+listing-time guarantee. Prefix mutations that collect a complete work plan
+remain a separate memory-scaling concern.
+
+The local filename walker closes a parent directory before descending and
+resumes it using a kernel directory cookie, keeping one active directory
+descriptor rather than one per nesting level. A changed directory inode is
+reported as a retryable error instead of applying an old cookie to new data.
 
 The coordinator returns a result only while each pool remains within its
 `M`-node NCNX failure budget. An unavailable source is never interpreted as
@@ -533,10 +548,10 @@ reclamation. Repeated deletes create independent generation directories and
 cannot collide. A prefix delete uses one generation directory across every
 key and every deterministic NCNX replica.
 
-Recovery is strict. If the logical key exists live, recovery returns a
-conflict and preserves both records. Otherwise it publishes live NCNX first,
-removes only the selected trash record, and prunes its generation directory
-only when that directory becomes empty.
+Recovery rejects a different live generation and preserves both records.
+Byte-identical live/trash records are an idempotent partial-recovery retry.
+Same-key ownership covers the fresh checks, live publication and selected
+trash removal together. The generation directory is pruned only when empty.
 
 Autonomous healing may inventory immutable objects to report headless data, but
 it preserves those objects because absence of a namespace reference does not
@@ -544,13 +559,23 @@ prove whether the cause was failed publication or catastrophic namespace loss.
 Normal TTL GC never scans all objects and never guesses that a headless object
 is disposable.
 
+The separate fragment-cleanup endpoint is read-only metadata inspection. It
+does not classify `.objects` fanout directories as versions or remove them by
+age. Its response explicitly reports deferred distributed orphan reclamation;
+neither session-record expiry nor this inspection proves that abandoned peer
+shards have been reclaimed.
+
 GC keeps no persistent reference database, `.entries`, `.records`, or global
 transaction state.
 
-GC coordinators remain independent and lockless. A namespace branch or trash
-record that disappears after it was listed is treated as an idempotently
-completed concurrent cleanup, not as engine damage. If a coordinator cannot
-prove the complete live and unexpired reference set because the required
+GC coordinators have no global reference database. A namespace record that
+disappears after listing defers that reference proof rather than being treated
+as damage or silently skipped. Final committed-trash payload reclamation is
+deferred: an earlier reference scan does not exclude a concurrent recovery.
+The last trash pointer and its payload are retained, with a deferred counter
+and no claimed byte refund. Upload reclamation instead uses durable version
+ownership and independently verified abort votes as described above.
+If a coordinator cannot prove the complete reference set because the required
 topology is temporarily unavailable, it defers the entire run without
 reclaiming anything and retries on the next schedule. Malformed records,
 conflicting replicas, and integrity failures remain hard errors. A completed
@@ -576,10 +601,25 @@ NCNX records. For each record it:
 4. recreates missing or corrupt replicas on their exact roots;
 5. emits one disposable JSON report when degradation or repair occurred.
 
-The healer revalidates the exact NCNX state immediately before a critical
-classification or repair. TTL-expired trash is owned by GC and is never
-resurrected by a stale healing observation. A dangling object-reference report
-also revalidates the exact live reference before it is emitted.
+Peer receivers serialize single and batched mutations for the same exact key
+before occupying a blocking filesystem worker. Repair refuses to overwrite an
+existing integrity-valid different NCNX generation, including one on a local
+fallback root. An I/O failure while checking a fallback root defers repair;
+it is not interpreted as absence. Receiver-local guards alone do not establish
+distributed ordering.
+
+The new [key-scoped stage ownership](docs/ncnx-key-coordination.md) implementation
+requires receiver-issued, binding-checked tokens at every exact namespace
+holder. Repair obtains ownership before a fresh source read and retains it
+through publication. Trash/recover retain the same ownership across both copy
+and delete; an exact-byte destination permits a partial recovery retry. Different
+generations remain conflicts. Qualification is recorded in TESTING.md; this is
+not cross-pool uniqueness or a multi-key transaction guarantee.
+
+Upload reclamation uses a separate [durable upload lifecycle](docs/upload-lifecycle.md).
+It must not be confused with namespace-stage leases. Expired committed trash
+without object-reference exclusion is retained rather than purged concurrently
+with recovery.
 
 Reports are not replicated and are not storage truth.
 
@@ -588,6 +628,20 @@ Reports are not replicated and are not storage truth.
 For each canonical live NCNX, the healer resolves NCDX and verifies its exact
 holders, checksums, shards, and parity. Recoverable loss is reconstructed only
 to the recorded layout. Redistribution is a separate explicit re-encode.
+
+Read-triggered repair carries the exact failed shard indices from the verified
+read. It confirms each target with its recorded checksum rather than a one-byte
+presence probe, and preserves targets discovered while that part's worker is
+active. Admission is bounded to eight distinct parts per process; overflow is
+best-effort and can be retried by a later verified read. This is not a durable
+repair queue or a bound on the existing whole-shard reconstruction buffers.
+
+The review used RustFS's [checksum-aware object healing](https://github.com/rustfs/rustfs/blob/40837f67f8484171c523556531981f0ba371d145/crates/ecstore/src/set_disk/ops/heal.rs)
+and [repair-queue ownership](https://github.com/rustfs/rustfs/blob/40837f67f8484171c523556531981f0ba371d145/crates/heal/src/heal/mrf_queue.rs)
+as design references. No RustFS code, dependency, disk format, or S3 namespace
+model was imported. Receiver-local guards and disposable read-repair hints
+must not be confused with distributed mutation ordering or durable repair
+obligations.
 
 ### Survival and safety state
 

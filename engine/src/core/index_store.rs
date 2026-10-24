@@ -795,14 +795,20 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     match fs::hard_link(&temporary, path) {
         Ok(()) => {
             let _ = fs::remove_file(&temporary);
-            sync_dir(parent);
-            Ok(())
+            File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| io_err(error, "sync immutable NCDX publication directory"))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(&temporary);
             let existing = fs::read(path).map_err(|error| io_err(error, "read existing NCDX"))?;
             if existing == bytes {
-                Ok(())
+                // A prior request may have linked the exact bytes and then
+                // failed its directory barrier. Retry must finish that barrier
+                // before this holder can contribute a commit acknowledgement.
+                File::open(parent)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| io_err(error, "sync retried NCDX publication directory"))
             } else {
                 Err(AppError::Conflict(format!(
                     "refused to overwrite divergent immutable NCDX {}",

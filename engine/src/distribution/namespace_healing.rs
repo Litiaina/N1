@@ -100,6 +100,16 @@ pub async fn scan_and_repair_fragment_namespace(
                         }
                     }
                     Err(error) => {
+                        if matches!(
+                            error,
+                            AppError::ServiceUnavailable(_) | AppError::Timeout(_)
+                        ) {
+                            result.complete = false;
+                            result.reports.push(deferred_record_report(
+                                &runtime, fragment, scan_id, &name, error,
+                            ));
+                            continue;
+                        }
                         // Discovery is intentionally lockless. A namespace mutation can
                         // publish its destination and remove this physical name between
                         // the inventory call above and the record read. Revalidate the
@@ -107,8 +117,12 @@ pub async fn scan_and_repair_fragment_namespace(
                         // longer exists, this scan crossed a valid mutation boundary; an
                         // incomplete scan also prevents object healing from making a
                         // false headless-object classification from the mixed view.
-                        if is_all_replicas_unreadable(&error)
-                            && matches!(name_is_still_advertised(fragment, &name).await, Ok(false))
+                        if matches!(error, AppError::NotFound)
+                            || (is_all_replicas_unreadable(&error)
+                                && matches!(
+                                    name_is_still_advertised(fragment, &name).await,
+                                    Ok(false)
+                                ))
                         {
                             result.complete = false;
                             tracing::debug!(
@@ -263,6 +277,20 @@ fn unreadable_record_report(
     report.cluster_read_only_triggered = false;
     report.reason = Some(error.to_string());
     report.completed_at_unix_nanos = now_nanos();
+    report
+}
+
+fn deferred_record_report(
+    runtime: &ClusterRuntime,
+    fragment: &str,
+    scan_id: &str,
+    name: &PeerNcnxName,
+    error: AppError,
+) -> AutoHealingReport {
+    let mut report = unreadable_record_report(runtime, fragment, scan_id, name, error);
+    report.finding = "ncnx_verification_incomplete".into();
+    report.initial_status = "incomplete".into();
+    report.repair_outcome = "deferred".into();
     report
 }
 

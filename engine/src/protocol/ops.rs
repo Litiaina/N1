@@ -709,7 +709,7 @@ pub(super) async fn execute_native_op_inner(
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
-            cancel_standard_cluster_upload(&claims, &fragment, &version_id)?;
+            cancel_standard_cluster_upload(&claims, &fragment, &version_id).await?;
             (op_response(204), Vec::new())
         }
         "multipart.cancel" | "upload.multipart.cancel" | "upload.multipart.durable.cancel" => {

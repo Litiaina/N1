@@ -13,6 +13,7 @@ async fn apply_rename_batch_stage(
     let runtime = active_cluster_runtime()?;
     let mut pool_ids = BTreeSet::new();
     let mut groups = BTreeMap::<PeerNcnxBatchTarget, Vec<PeerNcnxBatchItem>>::new();
+    let mut ownership_keys = Vec::new();
     for item in items {
         if item.located.record.fragment_id != fragment_id
             || item.destination_record.fragment_id != fragment_id
@@ -40,6 +41,7 @@ async fn apply_rename_batch_stage(
             }
         };
         let layout = build_ncnx_layout(&runtime, pool, &fragment_id, logical_key)?;
+        ownership_keys.push((layout.clone(), logical_key.to_string()));
         for replica in layout.replicas {
             groups
                 .entry(PeerNcnxBatchTarget {
@@ -56,6 +58,7 @@ async fn apply_rename_batch_stage(
                     logical_key: logical_key.to_string(),
                     trash: None,
                     bytes: ByteBuf::from(bytes.clone()),
+                    lease_token: None,
                 });
         }
     }
@@ -86,13 +89,19 @@ async fn apply_rename_batch_stage(
         )));
     }
 
+    let ownership =
+        stage::StageOwnership::acquire(runtime.clone(), &fragment_id, &ownership_keys).await?;
+    for (target, entries) in &mut groups {
+        ownership.attach_batch(target, entries)?;
+    }
     let calls = groups.into_iter().map(|(target, entries)| {
         let runtime = runtime.clone();
         let action = action.clone();
         let fragment_id = fragment_id.clone();
         async move { send_batch_to_target(&runtime, &target, action, &fragment_id, entries).await }
     });
-    let results = join_all(calls).await;
+    let results = stage::join_calls(calls).await;
+    ownership.release().await;
     let mut failures = Vec::new();
     for result in results {
         match result {
@@ -121,6 +130,7 @@ pub async fn rename_live_batch(items: &[NcnxRenameBatchItem]) -> Result<(), AppE
 async fn apply_trash_move_batch_stage(
     items: &[(LocatedNcnx, TrashLocator)],
     action: PeerNcnxBatchAction,
+    ownership: &stage::StageOwnership,
 ) -> Result<(), AppError> {
     if items.is_empty() || items.len() > PEER_NCNX_BATCH_MAX {
         return Err(AppError::BadRequest(format!(
@@ -169,6 +179,7 @@ async fn apply_trash_move_batch_stage(
                     logical_key: located.logical_key.clone(),
                     trash: trash.clone(),
                     bytes: ByteBuf::from(located.bytes.clone()),
+                    lease_token: None,
                 });
         }
     }
@@ -199,6 +210,9 @@ async fn apply_trash_move_batch_stage(
         )));
     }
 
+    for (target, entries) in &mut groups {
+        ownership.attach_batch(target, entries)?;
+    }
     let calls = groups.into_iter().map(|(target, entries)| {
         let runtime = runtime.clone();
         let action = action.clone();
@@ -206,7 +220,8 @@ async fn apply_trash_move_batch_stage(
         async move { send_batch_to_target(&runtime, &target, action, &fragment_id, entries).await }
     });
     let mut failures = Vec::new();
-    for result in join_all(calls).await {
+    let results = stage::join_calls(calls).await;
+    for result in results {
         match result {
             Ok(_) => {}
             Err(error @ AppError::Conflict(_)) => return Err(error),
@@ -231,17 +246,95 @@ pub async fn trash_live_batch(items: &[NcnxTrashBatchItem]) -> Result<(), AppErr
         .iter()
         .map(|item| (item.located.clone(), item.locator.clone()))
         .collect::<Vec<_>>();
-    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::CreateTrash).await?;
-    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::RemoveLive).await
+    move_trash_exact(&exact, false).await
 }
 
 /// Restores every immutable live pointer before removing any exact trash
-/// generation. Existing live content remains a strict conflict.
+/// generation. An exact-byte live destination is a retry, not a conflict.
 pub async fn recover_trash_batch(items: &[NcnxRecoverBatchItem]) -> Result<(), AppError> {
     let exact = items
         .iter()
         .map(|item| (item.located.clone(), item.locator.clone()))
         .collect::<Vec<_>>();
-    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::CreateLive).await?;
-    apply_trash_move_batch_stage(&exact, PeerNcnxBatchAction::RemoveTrash).await
+    move_trash_exact(&exact, true).await
+}
+
+async fn move_trash_exact(
+    items: &[(LocatedNcnx, TrashLocator)],
+    recovering: bool,
+) -> Result<(), AppError> {
+    if items.is_empty() || items.len() > PEER_NCNX_BATCH_MAX {
+        return Err(AppError::BadRequest("invalid namespace batch size".into()));
+    }
+    let runtime = active_cluster_runtime()?;
+    let fragment = &items[0].0.record.fragment_id;
+    let layouts = items
+        .iter()
+        .map(|(located, _)| {
+            let pool = pool_for_located(&runtime, located)?;
+            Ok((
+                build_ncnx_layout(&runtime, pool, fragment, &located.logical_key)?,
+                located.logical_key.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    // One owner spans destination publication AND source removal. Otherwise
+    // opposite trash/recover operations could each remove the other's copy.
+    let ownership = stage::StageOwnership::acquire(runtime.clone(), fragment, &layouts).await?;
+    for ((located, locator), (layout, key)) in items.iter().zip(&layouts) {
+        let live = read_from_layout_owned(
+            &runtime,
+            layout,
+            fragment,
+            key,
+            None,
+            true,
+            Some(&ownership),
+        )
+        .await?;
+        let trash = read_from_layout_owned(
+            &runtime,
+            layout,
+            fragment,
+            key,
+            Some(locator),
+            true,
+            Some(&ownership),
+        )
+        .await?;
+        if live
+            .as_ref()
+            .is_some_and(|(_, bytes)| bytes != &located.bytes)
+            || trash
+                .as_ref()
+                .is_some_and(|(_, bytes)| bytes != &located.bytes)
+        {
+            return Err(AppError::Conflict(format!(
+                "namespace generation changed for '{key}'"
+            )));
+        }
+        if recovering && trash.is_none() || !recovering && live.is_none() {
+            // Source absence only completes a retry when the exact destination
+            // is already durable. Never resurrect an unobserved old pointer.
+            let destination = if recovering { &live } else { &trash };
+            if destination.is_none() {
+                return Err(AppError::NotFound);
+            }
+        }
+    }
+    let (create, remove) = if recovering {
+        (
+            PeerNcnxBatchAction::CreateLive,
+            PeerNcnxBatchAction::RemoveTrash,
+        )
+    } else {
+        (
+            PeerNcnxBatchAction::CreateTrash,
+            PeerNcnxBatchAction::RemoveLive,
+        )
+    };
+    apply_trash_move_batch_stage(items, create, &ownership).await?;
+    let result = apply_trash_move_batch_stage(items, remove, &ownership).await;
+    ownership.release().await;
+    result
 }
