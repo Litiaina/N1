@@ -21,7 +21,9 @@ use ulid::Ulid;
 
 const OWNERSHIP_FILE: &str = "ownership.n2";
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
-const MAX_PAGE_SIZE: usize = 1000;
+
+mod inventory;
+pub use inventory::UploadInventory;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UploadIdentity {
@@ -1157,86 +1159,6 @@ pub async fn guard_aborted_cleanup(
         ));
     }
     Ok(guard)
-}
-
-/// Page only the narrow ownership-record directory; never walk `.objects`.
-/// Returned records are candidates, not destructive authority. A caller must
-/// reacquire a version guard and revalidate state before acting.
-pub async fn list_upload_records(
-    runtime: &ClusterRuntime,
-    fragment: &str,
-    after: Option<&str>,
-    limit: usize,
-) -> Result<Vec<UploadLifecycleRecord>, AppError> {
-    let store = OwnershipStore::from_runtime(runtime)?;
-    if fragment.is_empty()
-        || fragment.len() > 128
-        || !fragment
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
-        return Err(AppError::BadRequest(
-            "invalid upload ownership fragment".into(),
-        ));
-    }
-    let fragment = fragment.to_string();
-    let after = after.map(ToOwned::to_owned);
-    let limit = limit.clamp(1, MAX_PAGE_SIZE);
-    tokio::task::spawn_blocking(move || {
-        let _binding = store.guard_binding()?;
-        store.check_roots()?;
-        let mut selected: BTreeMap<String, UploadLifecycleRecord> = BTreeMap::new();
-        for root in &store.roots {
-            let uploads = physical_fragment_root_on(root, &fragment).join(".uploads");
-            let entries = match fs::read_dir(uploads) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(AppError::Io(e, "list upload ownership candidates".into())),
-            };
-            for entry in entries {
-                let entry =
-                    entry.map_err(|e| AppError::Io(e, "read upload ownership candidate".into()))?;
-                let Some(version) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                    continue;
-                };
-                if version.len() != 26
-                    || Ulid::from_string(&version).is_err()
-                    || after.as_ref().is_some_and(|a| version <= *a)
-                    || selected.len() == limit
-                        && selected
-                            .last_key_value()
-                            .is_some_and(|(last, _)| &version > last)
-                {
-                    continue;
-                }
-                if !entry
-                    .file_type()
-                    .map_err(|e| AppError::Io(e, "stat upload ownership candidate".into()))?
-                    .is_dir()
-                {
-                    continue;
-                }
-                if let Some(record) = read_record(&entry.path().join(OWNERSHIP_FILE))? {
-                    if record.identity.fragment != fragment || record.identity.version_id != version
-                    {
-                        return Err(AppError::Conflict(
-                            "upload ownership candidate path differs from identity".into(),
-                        ));
-                    }
-                    let record = store.load(&record.identity)?.ok_or_else(|| {
-                        AppError::Conflict("upload ownership candidate disappeared".into())
-                    })?;
-                    if selected.len() == limit && !selected.contains_key(&version) {
-                        selected.pop_last();
-                    }
-                    selected.insert(version, record);
-                }
-            }
-        }
-        Ok(selected.into_values().collect())
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("upload ownership listing worker: {e}")))?
 }
 
 #[cfg(test)]

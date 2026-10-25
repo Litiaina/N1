@@ -46,10 +46,15 @@ Records contain a versioned, checksummed upload identity and state. Committed
 records are compacted out of the active inventory. Aborted work remains active
 until exact cleanup succeeds; its terminal fence remains afterward. Session
 cleanup must preserve these fences. GC inventories active ownership records,
-not `.objects` or terminal-fence history. Page candidate memory is bounded;
-directory enumeration is not an O(page-size) operation.
-Each page currently re-enumerates the active work directory; cleanup throughput
-at very large numbers of simultaneous abandoned uploads is not qualified.
+not `.objects` or terminal-fence history. A pass resumes directory cookies rather
+than restarting enumeration for each page. Each page has a filename budget,
+including ignored entries; an empty page does not mean the pass is complete.
+Only one directory descriptor is used, with none retained between pages.
+Root binding and directory identity are checked before resuming; destructive
+actions still revalidate current version ownership and abort votes.
+This is not a snapshot: concurrent additions can wait until the next cycle.
+A stable pass enumerates each root once; per-candidate replica checks still
+scale with configured roots. Very large inventory throughput remains unqualified.
 
 ## Boundaries
 

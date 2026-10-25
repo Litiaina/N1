@@ -1,4 +1,4 @@
-use crate::core::checksum::{Sha256Digest, parse_sha256_hex, sha256_matches};
+use crate::core::checksum::{Sha256Digest, Sha256Stream, parse_sha256_hex, sha256_matches};
 use crate::core::disk_manager::{PartMetadata, ShardInfo};
 use crate::distribution::peer::{fetch_peer_shard_chunk, parse_peer_shard_locator};
 use crate::enums::app_error_enum::AppError;
@@ -7,8 +7,18 @@ use ecs_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use futures_util::future::join_all;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
+use std::sync::{Arc, LazyLock};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
+
+/// Repair/inspection payload buffers are independent of immutable shard length.
+pub(crate) const MAX_REPAIR_CHUNK_BYTES: usize = 1024 * 1024;
+pub(crate) const REPAIR_CACHE_BYTES: usize = 4 * MAX_REPAIR_CHUNK_BYTES;
+const DEFAULT_VERIFIED_BLOCK_CACHE_BYTES: usize = 16 * MAX_REPAIR_CHUNK_BYTES;
+const MAX_CHECKSUM_PROBES: usize = 32;
+static CHECKSUM_PROBE_GATE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CHECKSUM_PROBES)));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShardProbeResult {
@@ -24,7 +34,11 @@ pub struct VerifiedShardCache {
     verified_blocks: HashMap<String, Vec<u8>>,
     block_order: VecDeque<String>,
     max_verified_blocks: usize,
+    verified_block_bytes: usize,
+    max_verified_block_bytes: usize,
     schedule_read_repair: bool,
+    streaming_repair: bool,
+    verified_repair_sources: HashSet<String>,
 }
 
 impl Default for VerifiedShardCache {
@@ -35,7 +49,11 @@ impl Default for VerifiedShardCache {
             verified_blocks: HashMap::new(),
             block_order: VecDeque::new(),
             max_verified_blocks: 16,
+            verified_block_bytes: 0,
+            max_verified_block_bytes: DEFAULT_VERIFIED_BLOCK_CACHE_BYTES,
             schedule_read_repair: true,
+            streaming_repair: false,
+            verified_repair_sources: HashSet::new(),
         }
     }
 }
@@ -44,6 +62,8 @@ impl VerifiedShardCache {
     pub(crate) fn for_repair() -> Self {
         Self {
             schedule_read_repair: false,
+            streaming_repair: true,
+            max_verified_block_bytes: REPAIR_CACHE_BYTES,
             ..Self::default()
         }
     }
@@ -60,18 +80,30 @@ impl VerifiedShardCache {
         self.rejected.clear();
         self.verified_blocks.clear();
         self.block_order.clear();
+        self.verified_block_bytes = 0;
+        self.verified_repair_sources.clear();
     }
 
     fn insert_verified_block(&mut self, key: String, bytes: Vec<u8>) {
         if self.verified_blocks.contains_key(&key) {
             return;
         }
-        while self.verified_blocks.len() >= self.max_verified_blocks {
+        while self.verified_blocks.len() >= self.max_verified_blocks
+            || self.verified_block_bytes.saturating_add(bytes.len()) > self.max_verified_block_bytes
+        {
             let Some(oldest) = self.block_order.pop_front() else {
                 break;
             };
-            self.verified_blocks.remove(&oldest);
+            if let Some(old) = self.verified_blocks.remove(&oldest) {
+                self.verified_block_bytes = self.verified_block_bytes.saturating_sub(old.len());
+            }
         }
+        // Oversized recorded checksum blocks use incremental verification instead.
+        // Never let one metadata-controlled block defeat the cache byte bound.
+        if bytes.len() > self.max_verified_block_bytes {
+            return;
+        }
+        self.verified_block_bytes = self.verified_block_bytes.saturating_add(bytes.len());
         self.block_order.push_back(key.clone());
         self.verified_blocks.insert(key, bytes);
     }
@@ -221,6 +253,20 @@ async fn read_verified_shard_range_cached(
     let mut output = Vec::with_capacity(len);
     for block_index in first_block..=last_block {
         let block_start = block_index * block_size_u64;
+        if block_size > cache.max_verified_block_bytes
+            || (cache.streaming_repair && block_size > MAX_REPAIR_CHUNK_BYTES)
+        {
+            let slice_start = offset.max(block_start);
+            let slice_end = request_end.min(
+                block_start
+                    .saturating_add(block_size_u64)
+                    .min(shard.size_bytes),
+            );
+            let bytes =
+                read_verified_large_block_slice(shard, block_start, slice_start, slice_end).await?;
+            output.extend_from_slice(&bytes);
+            continue;
+        }
         let cache_key = format!("{}\0{}", verified_cache_key(shard), block_index);
         if !cache.verified_blocks.contains_key(&cache_key) {
             let bytes = read_verified_shard_block(shard, block_start, block_size).await?;
@@ -250,6 +296,59 @@ async fn read_verified_shard_range_cached(
             shard.file_name,
             output.len(),
             len
+        )));
+    }
+    Ok(output)
+}
+
+/// Verify a recorded block without allocating its metadata-controlled length.
+/// Only the requested slice is retained. This fallback is deliberately allowed
+/// to reread unusually large historical blocks rather than weaken their SHA.
+async fn read_verified_large_block_slice(
+    shard: &ShardInfo,
+    block_start: u64,
+    slice_start: u64,
+    slice_end: u64,
+) -> Result<Vec<u8>, AppError> {
+    let block_size = shard.checksum_block_size as u64;
+    if block_size == 0 || block_start % block_size != 0 || slice_start > slice_end {
+        return Err(AppError::InternalServerError(
+            "cluster shard has invalid large checksum block geometry".into(),
+        ));
+    }
+    let expected = shard
+        .block_checksums
+        .get(
+            usize::try_from(block_start / block_size)
+                .map_err(|_| AppError::BadRequest("checksum block index exceeds usize".into()))?,
+        )
+        .ok_or_else(|| AppError::ServiceUnavailable("recorded checksum block is missing".into()))?;
+    let block_end = block_start.saturating_add(block_size).min(shard.size_bytes);
+    if slice_start < block_start || slice_end > block_end {
+        return Err(AppError::ServiceUnavailable(
+            "requested slice exceeds recorded checksum block".into(),
+        ));
+    }
+    let slice_len = usize::try_from(slice_end - slice_start)
+        .map_err(|_| AppError::BadRequest("checksum block slice exceeds usize".into()))?;
+    let mut output = Vec::with_capacity(slice_len);
+    let mut hasher = Sha256Stream::new();
+    let mut offset = block_start;
+    while offset < block_end {
+        let len = (block_end - offset).min(MAX_REPAIR_CHUNK_BYTES as u64) as usize;
+        let bytes = read_shard_chunk(shard, offset, len).await?;
+        hasher.update(&bytes);
+        let start = slice_start.max(offset);
+        let end = slice_end.min(offset + bytes.len() as u64);
+        if start < end {
+            output.extend_from_slice(&bytes[(start - offset) as usize..(end - offset) as usize]);
+        }
+        offset += bytes.len() as u64;
+    }
+    if hasher.finalize() != *expected || output.len() != slice_len {
+        return Err(AppError::ServiceUnavailable(format!(
+            "cluster shard {} block failed checksum verification",
+            shard.file_name
         )));
     }
     Ok(output)
@@ -399,35 +498,87 @@ async fn read_probe_bytes(shard: &ShardInfo, length: usize) -> Result<Vec<u8>, S
 }
 
 pub async fn shard_probe(shard: &ShardInfo, verify_integrity: bool) -> ShardProbeResult {
-    let probe_length = if verify_integrity {
-        let Ok(length) = usize::try_from(shard.size_bytes) else {
-            return ShardProbeResult::ChecksumMismatch;
-        };
-        length
-    } else if shard.size_bytes == 0 {
-        0
-    } else {
-        1
+    // Status scans may inspect many objects and EC roles concurrently. Acquire
+    // before any payload allocation, independently of repair worker admission.
+    let Ok(_permit) = CHECKSUM_PROBE_GATE.clone().acquire_owned().await else {
+        return ShardProbeResult::Unavailable;
     };
-
-    let bytes = match read_probe_bytes(shard, probe_length).await {
-        Ok(bytes) => bytes,
-        Err(result) => return result,
-    };
-    if bytes.len() != probe_length {
-        return ShardProbeResult::ChecksumMismatch;
-    }
     if !verify_integrity {
-        return ShardProbeResult::Healthy;
+        let probe_length = usize::from(shard.size_bytes != 0);
+        return match read_probe_bytes(shard, probe_length).await {
+            Ok(bytes) if bytes.len() == probe_length => ShardProbeResult::Healthy,
+            Ok(_) => ShardProbeResult::ChecksumMismatch,
+            Err(result) => result,
+        };
     }
     let Some(expected) = expected_sha256(&shard.checksum) else {
         return ShardProbeResult::ChecksumMismatch;
     };
-    if sha256_matches(&bytes, &expected) {
-        ShardProbeResult::Healthy
-    } else {
-        ShardProbeResult::ChecksumMismatch
+    match checksum_recorded_shard(shard).await {
+        Ok(actual) if actual == expected => ShardProbeResult::Healthy,
+        Ok(_) => ShardProbeResult::ChecksumMismatch,
+        Err(result) => result,
     }
+}
+
+async fn checksum_recorded_shard(shard: &ShardInfo) -> Result<Sha256Digest, ShardProbeResult> {
+    let mut hasher = Sha256Stream::new();
+    if let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) {
+        // Even an empty shard must exist on the exact bound holder.
+        if shard.size_bytes == 0 {
+            let bytes = fetch_peer_shard_chunk(&locator, 0, 0)
+                .await
+                .map_err(classify_probe_error)?;
+            if !bytes.is_empty() {
+                return Err(ShardProbeResult::ChecksumMismatch);
+            }
+        }
+        let mut offset = 0u64;
+        while offset < shard.size_bytes {
+            let len = (shard.size_bytes - offset).min(MAX_REPAIR_CHUNK_BYTES as u64) as usize;
+            let bytes = fetch_peer_shard_chunk(&locator, offset, len)
+                .await
+                .map_err(classify_probe_error)?;
+            if bytes.len() != len {
+                return Err(ShardProbeResult::ChecksumMismatch);
+            }
+            hasher.update(&bytes);
+            offset += bytes.len() as u64;
+        }
+    } else {
+        let mut file = File::open(&shard.absolute_path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ShardProbeResult::Missing
+            } else {
+                ShardProbeResult::Unavailable
+            }
+        })?;
+        let info = file
+            .metadata()
+            .await
+            .map_err(|_| ShardProbeResult::Unavailable)?;
+        if !info.is_file() {
+            return Err(ShardProbeResult::Unavailable);
+        }
+        if info.len() != shard.size_bytes {
+            return Err(ShardProbeResult::ChecksumMismatch);
+        }
+        let mut bytes = vec![0u8; shard.size_bytes.min(MAX_REPAIR_CHUNK_BYTES as u64) as usize];
+        let mut offset = 0u64;
+        while offset < shard.size_bytes {
+            let len = (shard.size_bytes - offset).min(bytes.len() as u64) as usize;
+            file.read_exact(&mut bytes[..len]).await.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ShardProbeResult::ChecksumMismatch
+                } else {
+                    ShardProbeResult::Unavailable
+                }
+            })?;
+            hasher.update(&bytes[..len]);
+            offset += len as u64;
+        }
+    }
+    Ok(hasher.finalize())
 }
 
 pub async fn prefetch_verified_data_shards(part: &PartMetadata, cache: &mut VerifiedShardCache) {
@@ -483,6 +634,39 @@ pub(crate) async fn read_verified_shard_slice_cached(
             "cluster shard {} failed checksum verification",
             shard.file_name
         )));
+    }
+    if cache.streaming_repair {
+        // Historical records may have only one SHA for the complete donor.
+        // Verify it once using bounded reads, then stream requested slices.
+        // The target's final immutable SHA is independently checked before the
+        // repair can succeed/publicize it, including a donor changing between
+        // this verification pass and reconstruction. No source payload is kept.
+        if !cache.verified_repair_sources.contains(&key) {
+            match shard_probe(shard, true).await {
+                ShardProbeResult::Healthy => {
+                    cache.verified_repair_sources.insert(key.clone());
+                }
+                ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {
+                    cache.rejected.insert(key);
+                    return Err(AppError::ServiceUnavailable(format!(
+                        "cluster shard {} failed checksum verification",
+                        shard.file_name
+                    )));
+                }
+                ShardProbeResult::Unavailable => {
+                    return Err(AppError::ServiceUnavailable(format!(
+                        "cluster shard {} is unavailable for checksum verification",
+                        shard.file_name
+                    )));
+                }
+            }
+        }
+        if len > MAX_REPAIR_CHUNK_BYTES {
+            return Err(AppError::BadRequest(
+                "repair source read exceeds its bounded chunk size".into(),
+            ));
+        }
+        return read_shard_chunk(shard, offset, len).await;
     }
     if !cache.verified.contains_key(&key) {
         let bytes = read_full_shard(shard).await?;
@@ -603,12 +787,17 @@ pub async fn read_cluster_data_chunk_cached(
     Ok(restored)
 }
 
-pub(crate) async fn reconstruct_cluster_shard_cached(
+/// Reconstruct a shard through a bounded writer. The caller MUST keep its
+/// destination unpublished until this function and destination SHA/length
+/// validation succeed. Production peer writers already stage privately and
+/// verify the immutable expected checksum before atomic publication.
+pub(crate) async fn reconstruct_cluster_shard_into<W: AsyncWrite + Unpin>(
     part: &PartMetadata,
     target_shard_idx: usize,
     block_size: usize,
     cache: &mut VerifiedShardCache,
-) -> Result<Vec<u8>, AppError> {
+    writer: &mut W,
+) -> Result<u64, AppError> {
     if block_size == 0 {
         return Err(AppError::InternalServerError(
             "cluster repair block size is zero".into(),
@@ -621,14 +810,16 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
         .ok_or_else(|| {
             AppError::InternalServerError("cluster repair target shard missing".into())
         })?;
-    let total_len = usize::try_from(target.size_bytes).map_err(|_| {
-        AppError::InternalServerError("cluster repair target shard is too large".into())
+    let total_len = target.size_bytes;
+    let expected = expected_sha256(&target.checksum).ok_or_else(|| {
+        AppError::InternalServerError(format!(
+            "reconstructed shard {} has no valid SHA-256 checksum",
+            target.file_name
+        ))
     })?;
     if total_len == 0 {
-        return if expected_sha256(&target.checksum)
-            .is_some_and(|expected| sha256_matches(&[], &expected))
-        {
-            Ok(Vec::new())
+        return if sha256_matches(&[], &expected) {
+            Ok(0)
         } else {
             Err(AppError::InternalServerError(
                 "empty repaired shard checksum is invalid".into(),
@@ -643,8 +834,23 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
             "cluster shard repair requires data and parity shards".into(),
         ));
     }
-
-    let mut out = Vec::with_capacity(total_len);
+    if part.shards.iter().enumerate().any(|(index, shard)| {
+        shard.shard_index != index
+            || shard.is_parity != (index >= data_count)
+            || shard.size_bytes != total_len
+    }) {
+        return Err(AppError::InternalServerError(
+            "cluster repair requires unique ordered roles with equal recorded shard lengths".into(),
+        ));
+    }
+    if !cache.streaming_repair {
+        cache.clear();
+        cache.streaming_repair = true;
+        cache.schedule_read_repair = false;
+        cache.max_verified_block_bytes = REPAIR_CACHE_BYTES;
+    }
+    let chunk_size = block_size.min(MAX_REPAIR_CHUNK_BYTES);
+    let mut hasher = Sha256Stream::new();
     let mut offset = 0u64;
     let data_nth = part
         .shards
@@ -652,14 +858,22 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
         .filter(|shard| !shard.is_parity)
         .position(|shard| shard.shard_index == target_shard_idx);
 
-    while (offset as usize) < total_len {
-        let remaining = total_len - offset as usize;
-        let cur = remaining.min(block_size);
+    while offset < total_len {
+        let cur = (total_len - offset).min(chunk_size as u64) as usize;
 
         if let Some(data_idx) = data_nth {
             let bytes = read_cluster_data_chunk_cached(part, data_idx, offset, cur, cache).await?;
-            out.extend_from_slice(&bytes);
-            offset = offset.saturating_add(cur as u64);
+            if bytes.len() != cur {
+                return Err(AppError::ServiceUnavailable(
+                    "reconstructed data chunk has an incorrect length".into(),
+                ));
+            }
+            hasher.update(&bytes);
+            writer
+                .write_all(&bytes)
+                .await
+                .map_err(|error| AppError::Io(error, "stream reconstructed data shard".into()))?;
+            offset += cur as u64;
             continue;
         }
 
@@ -683,24 +897,33 @@ pub(crate) async fn reconstruct_cluster_shard_cached(
         let parity = encoded
             .recovery(recovery_idx)
             .ok_or_else(|| AppError::InternalServerError("missing reconstructed parity".into()))?;
-        out.extend_from_slice(&parity[..cur]);
-        offset = offset.saturating_add(cur as u64);
+        hasher.update(&parity[..cur]);
+        writer
+            .write_all(&parity[..cur])
+            .await
+            .map_err(|error| AppError::Io(error, "stream reconstructed parity shard".into()))?;
+        offset += cur as u64;
     }
 
-    out.truncate(total_len);
-    if let Some(expected) = expected_sha256(&target.checksum) {
-        if !sha256_matches(&out, &expected) {
-            return Err(AppError::InternalServerError(format!(
-                "reconstructed shard {} failed checksum validation",
-                target.file_name
-            )));
-        }
-    } else {
+    if hasher.finalize() != expected {
         return Err(AppError::InternalServerError(format!(
-            "reconstructed shard {} has no valid SHA-256 checksum",
+            "reconstructed shard {} failed checksum validation",
             target.file_name
         )));
     }
+    Ok(offset)
+}
+
+/// Small fixtures may collect output; production must use the streaming API.
+#[cfg(test)]
+async fn reconstruct_cluster_shard_cached(
+    part: &PartMetadata,
+    target_shard_idx: usize,
+    block_size: usize,
+    cache: &mut VerifiedShardCache,
+) -> Result<Vec<u8>, AppError> {
+    let mut out = Vec::new();
+    reconstruct_cluster_shard_into(part, target_shard_idx, block_size, cache, &mut out).await?;
     Ok(out)
 }
 

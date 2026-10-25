@@ -1,5 +1,34 @@
 use super::*;
 
+/// Only an attempt's private temporary path is owned here, never the stable
+/// shard. Cancellation/error cleanup therefore needs no object-tree scan.
+struct TemporaryShardCleanup(Option<std::path::PathBuf>);
+
+impl TemporaryShardCleanup {
+    fn new(path: &std::path::Path) -> Self {
+        Self(Some(path.to_owned()))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TemporaryShardCleanup {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else { return };
+        // Never put a failed disk's unlink on a runtime worker. This path is
+        // unique to this failed attempt; late cleanup cannot unlink a retry.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let _ = std::fs::remove_file(path);
+            });
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn encode_segment(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
@@ -231,16 +260,21 @@ async fn http_get_peer_shard(
     })?;
     let status = response.status();
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(AppError::NotFound);
         }
+        let text = collect_peer_shard_body(response, 16 * 1024)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|_| "invalid or oversized peer error body".into());
         return Err(AppError::ServiceUnavailable(format!(
             "peer shard read from {} returned {}: {}",
             locator.node_id, status, text
         )));
     }
-    timeout(PEER_READ_TIMEOUT, response.bytes())
+    // A peer's declared or chunked body is not an allocation authority. Keep
+    // even an erroneous peer response within the range we actually requested.
+    timeout(PEER_READ_TIMEOUT, collect_peer_shard_body(response, length))
         .await
         .map_err(|_| {
             AppError::ServiceUnavailable(format!(
@@ -248,8 +282,35 @@ async fn http_get_peer_shard(
                 locator.node_id
             ))
         })?
-        .map(|bytes| bytes.to_vec())
-        .map_err(|e| AppError::ServiceUnavailable(format!("read peer shard body: {e}")))
+}
+
+async fn collect_peer_shard_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(AppError::ServiceUnavailable(
+            "peer shard response exceeds requested range".into(),
+        ));
+    }
+    // Do not preallocate from untrusted Content-Length or a large caller range.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| AppError::ServiceUnavailable(format!("read peer shard body: {error}")))?
+    {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(AppError::ServiceUnavailable(
+                "peer shard response exceeds requested range".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn native_get_peer_shard(
@@ -331,6 +392,11 @@ async fn native_get_peer_shard(
         ));
     }
     let body_len = response.body_len.unwrap_or(0);
+    if body_len > length as u64 {
+        return Err(AppError::ServiceUnavailable(
+            "native peer shard response exceeds requested range".into(),
+        ));
+    }
     timeout(PEER_READ_TIMEOUT, read_response_body(&mut stream, body_len))
         .await
         .map_err(|_| {
@@ -343,6 +409,10 @@ async fn native_get_peer_shard(
             AppError::ServiceUnavailable(format!("read N2 native peer shard body failed: {e}"))
         })
 }
+
+#[cfg(test)]
+#[path = "shard_access/bounds_tests.rs"]
+mod bounds_tests;
 
 pub(super) async fn read_native_peer_response(
     stream: &mut TcpStream,
@@ -683,6 +753,7 @@ pub(crate) async fn publish_guarded_shard(
     deferred_durability: bool,
 ) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || {
+        let mut temporary_cleanup = TemporaryShardCleanup::new(&temporary);
         let _ownership = ownership;
         let _binding = crate::distribution::membership::guard_cluster_binding()?;
         let expected_state = if repair {
@@ -752,6 +823,7 @@ pub(crate) async fn publish_guarded_shard(
             }
         };
         result?;
+        temporary_cleanup.disarm();
         if !deferred_durability {
             let parent = stable
                 .parent()
@@ -820,6 +892,7 @@ pub async fn peer_put_shard(
     )
     .await?;
     let tmp_path = opened.tmp_path;
+    let mut temporary_cleanup = TemporaryShardCleanup::new(&tmp_path);
     let stable_path = opened.stable_path;
     let mut file = DirectWriter::new(opened.file);
     let mut stream = body.into_data_stream();
@@ -869,6 +942,9 @@ pub async fn peer_put_shard(
             "peer shard body differs from its expected SHA-256".into(),
         ));
     }
+    // The called future installs its worker-owned cleanup before its first
+    // suspension. Do not let caller cancellation unlink an admitted publish.
+    temporary_cleanup.disarm();
     publish_guarded_shard(
         runtime,
         ownership,
@@ -1080,6 +1156,7 @@ where
     )
     .await?;
     let tmp_path = opened.tmp_path;
+    let mut temporary_cleanup = TemporaryShardCleanup::new(&tmp_path);
     let stable_path = opened.stable_path;
     let mut file = DirectWriter::new(opened.file);
     let mut hasher = Sha256Stream::new();
@@ -1141,6 +1218,7 @@ where
             "native peer shard body differs from its expected SHA-256".into(),
         ));
     }
+    temporary_cleanup.disarm();
     publish_guarded_shard(
         runtime,
         ownership,

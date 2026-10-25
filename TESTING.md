@@ -5,6 +5,67 @@ N2 3.5 engine. It covers test scope, procedures, results, failures, fixes, and
 remaining gates. Performance numbers belong in [BENCHMARK.md](BENCHMARK.md);
 the storage laws being tested belong in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Streaming repair and single-pass upload inventory — October 25, 2026
+
+The final frozen-input validation passed: **349 distinct workspace tests**
+(**300 engine**, 29 gateway, two native-client and 18 Shell). All 300 engine
+tests also passed with four test threads. No tests were ignored. The locked,
+offline all-targets build denied warnings; formatting and whitespace passed.
+All 288 inventoried build/proof inputs remained unchanged.
+
+The changes preserve NCNX/NCDX encoding, placement and ownership rules:
+
+- Repair streams into the existing peer writer instead of retaining the whole
+  target. Tests cover data and parity beyond 32 MiB, EC `3 + 2` stripes larger
+  than the streaming buffer, odd final lengths and invalid geometry/checksums.
+- Payload chunks stay at most 1 MiB and retained repair-block cache at most
+  4 MiB. Oversized checksum blocks are verified incrementally. Legacy repair
+  donors use a streamed SHA precheck; changing a donor afterwards must still
+  fail the final target checksum. Ordinary legacy GET caching is unchanged.
+- Full checksum probes hash incrementally. Read, explicit and autonomous
+  repair share eight worker slots; checksum inspection has 32 probe slots.
+  HTTP/native oversized responses are rejected before collecting their bodies.
+- Peer cancellation/error cleanup owns only the attempt's temporary path,
+  including ownership transfer to an admitted publication worker. Stable bytes
+  and another attempt's temporary path are preserved.
+- Upload GC resumes directory cookies rather than restarting each page.
+  Tests enforce bounded filename work even for empty pages, single-pass
+  enumeration, no retained directory FD, replica-conflict detection, missing
+  roots, directory replacement and retirement of returned records.
+- Repair pressure is reported as incomplete/deferred rather than corruption;
+  integrity conflicts remain errors. Existing IO snapshots expose admission,
+  merged hints, capacity deferrals and attempt outcomes.
+
+Real-process qualification passed **eight lifecycle/repair cases per native
+and HTTP-peer fixture**, **12 namespace concurrency/restart scenarios**, and
+the gateway export crash/restart/cancellation/natural-expiry proof. The large
+case creates one 32 MiB multipart shard, verifies full GET SHA, physically
+repairs data bitrot/missing data and missing parity, rejects a wrong-SHA repair,
+and disconnects only after partial repair bytes reach a temporary file. The
+exact temporary is reclaimed; committed shard and immutable NCDX hashes stay
+unchanged. Namespace churn verified 136 acknowledged operations and 128
+byte-exact GETs, with one recover retry converging successfully.
+
+Observed peak RSS during the large case was 99,588/68,988 KiB for the native
+fixture's two engines and 100,216/65,296 KiB for the HTTP-peer fixture. These
+are bounded observations, not universal memory limits or comparative throughput
+results. Decoder work still depends on recorded EC width.
+
+Earlier attempts are retained, not counted as final passes: a test type-inference
+error was corrected; two qualification attempts were interrupted to add edge
+regressions; the first network fixture wrongly sent 32 MiB to the 16 MiB
+one-shot API and was corrected to multipart without relaxing the product limit.
+Smoke testing exposed a stranded repair temporary, prompting targeted cleanup
+and the stronger physically-admitted interruption regression before the final run.
+
+Evidence identifier: `20261025-streaming-hardening/attempt-04`. The lifecycle
+proof script accepts `--peer-transport native|http --large-repair-bytes 33554432`.
+All fixtures used isolated XFS roots on one HDD and loopback child processes;
+no deployment or N1 test was changed. This is not independent-host, power-loss
+or million-object qualification. In-process temporary cleanup is not a durable
+post-crash repair worklist. Final committed-trash reclamation and other release
+gates below remain open.
+
 ## Distributed ownership and upload reclamation — October 25, 2026
 
 Final frozen-input validation passed. The locked, offline workspace/all-targets
@@ -1152,12 +1213,15 @@ write availability or every mid-commit partition timing.
 - Complete object-reference exclusion for final committed-trash reclamation
   against concurrent recovery/copy/publication. That physical purge is
   deliberately deferred; upload abort fencing alone does not authorize it.
-- Bound whole-shard repair memory and complete prefix mutation work plans;
-  page-bounded LIST alone does not establish those bounds.
+- Qualify aggregate repair memory at wider EC widths and bound ordinary legacy
+  GET full-shard caching and complete prefix mutation work plans. Streaming
+  repair payload bounds and page-bounded LIST are not universal RSS bounds.
 - Repeat on four independent physical nodes for independent failure domains.
 - Complete the remaining mid-commit and wider-topology partition cases above;
   stopped processes alone do not qualify them.
 - Exercise sustained disk-full and media replacement on isolated test roots.
+- Qualify post-crash reclamation of repair temporary files; in-process cleanup
+  does not establish a durable crash-recovery inventory for those attempts.
 - Repeat at larger namespace cardinality and with mixed multipart workloads.
 - Continue tracking namespace p95/p99 latency and process CPU/IO during long
   runs.

@@ -1,15 +1,17 @@
-use crate::core::disk_manager::ObjectMetadata;
+use crate::core::disk_manager::{ObjectMetadata, PartMetadata, ShardInfo};
 use crate::core::repair_manager::{ObjectRepairStatus, RepairCheckMode};
 use crate::distribution::download::{
-    ShardProbeResult, VerifiedShardCache, reconstruct_cluster_shard_cached, shard_probe,
+    ShardProbeResult, VerifiedShardCache, reconstruct_cluster_shard_into, shard_probe,
 };
 use crate::distribution::membership::ClusterRuntime;
-use crate::distribution::peer::{PeerShardTarget, parse_peer_shard_locator, put_peer_shard_bytes};
+use crate::distribution::peer::{PeerShardTarget, RemoteShardWriter, parse_peer_shard_locator};
 use crate::distribution::status::inspect_cluster_object_status;
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, sleep};
 use tracing::warn;
 
@@ -18,6 +20,51 @@ const POST_REPAIR_VERIFY_DELAY: Duration = Duration::from_millis(25);
 
 // Admission never blocks GET and does not create an unbounded repair backlog.
 const MAX_CLUSTER_READ_REPAIR_PARTS: usize = 8;
+// Read-triggered, explicit and autonomous repair share admission. Otherwise
+// each entry point's independent task limit can multiply the working set.
+const MAX_CLUSTER_REPAIR_WORKERS: usize = 8;
+static CLUSTER_REPAIR_WORKERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CLUSTER_REPAIR_WORKERS)));
+static READ_REPAIR_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static READ_REPAIR_MERGED: AtomicU64 = AtomicU64::new(0);
+static READ_REPAIR_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static READ_REPAIR_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static READ_REPAIR_FAILED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReadRepairSnapshot {
+    pub admitted_parts: u64,
+    pub merged_hints: u64,
+    pub capacity_deferred: u64,
+    pub completed_attempts: u64,
+    pub failed_attempts: u64,
+    pub active_parts: usize,
+    pub active_streaming_workers: usize,
+    pub streaming_worker_limit: usize,
+}
+
+pub fn read_repair_snapshot() -> ReadRepairSnapshot {
+    ReadRepairSnapshot {
+        admitted_parts: READ_REPAIR_ADMITTED.load(Ordering::Relaxed),
+        merged_hints: READ_REPAIR_MERGED.load(Ordering::Relaxed),
+        capacity_deferred: READ_REPAIR_DEFERRED.load(Ordering::Relaxed),
+        completed_attempts: READ_REPAIR_COMPLETED.load(Ordering::Relaxed),
+        failed_attempts: READ_REPAIR_FAILED.load(Ordering::Relaxed),
+        active_parts: CLUSTER_READ_REPAIR_INFLIGHT
+            .lock()
+            .map(|parts| parts.len())
+            .unwrap_or(0),
+        active_streaming_workers: MAX_CLUSTER_REPAIR_WORKERS
+            .saturating_sub(CLUSTER_REPAIR_WORKERS.available_permits()),
+        streaming_worker_limit: MAX_CLUSTER_REPAIR_WORKERS,
+    }
+}
+
+fn try_repair_worker(gate: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, AppError> {
+    gate.clone().try_acquire_owned().map_err(|_| {
+        AppError::ServiceUnavailable("cluster streaming repair is at capacity; retry later".into())
+    })
+}
 
 #[derive(Default)]
 struct PendingReadRepair {
@@ -63,9 +110,11 @@ fn enqueue_read_repair_targets(
 ) -> Option<Arc<()>> {
     if let Some(pending) = inflight.get_mut(key) {
         pending.targets.extend(targets);
+        READ_REPAIR_MERGED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if inflight.len() >= MAX_CLUSTER_READ_REPAIR_PARTS {
+        READ_REPAIR_DEFERRED.fetch_add(1, Ordering::Relaxed);
         warn!("Cluster read repair is at capacity; a later verified read can retry this part");
         return None;
     }
@@ -77,6 +126,7 @@ fn enqueue_read_repair_targets(
             targets,
         },
     );
+    READ_REPAIR_ADMITTED.fetch_add(1, Ordering::Relaxed);
     Some(owner)
 }
 
@@ -133,11 +183,17 @@ pub(crate) fn schedule_cluster_part_read_repair(
     };
     tokio::spawn(async move {
         while let Some(targets) = guard.take_targets() {
-            if let Err(err) = repair_cluster_part_after_read(&part, &targets).await {
-                warn!(
-                    "Cluster read repair failed for part {}: {}",
-                    part.part_index, err
-                );
+            match repair_cluster_part_after_read(&part, &targets).await {
+                Ok(()) => {
+                    READ_REPAIR_COMPLETED.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    READ_REPAIR_FAILED.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Cluster read repair failed for part {}: {}",
+                        part.part_index, err
+                    );
+                }
             }
         }
     });
@@ -147,6 +203,9 @@ async fn repair_cluster_part_after_read(
     part: &crate::core::disk_manager::PartMetadata,
     failed_shards: &HashSet<usize>,
 ) -> Result<(), AppError> {
+    let _worker = try_repair_worker(&CLUSTER_REPAIR_WORKERS).inspect_err(|_| {
+        READ_REPAIR_DEFERRED.fetch_add(1, Ordering::Relaxed);
+    })?;
     let block_size = part
         .shards
         .iter()
@@ -184,9 +243,18 @@ async fn repair_cluster_read_target(
         ShardProbeResult::Healthy | ShardProbeResult::Unavailable => return Ok(()),
         ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {}
     }
-    let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) else {
-        return Ok(());
-    };
+    stream_repaired_peer_shard(part, shard, block_size, cache).await
+}
+
+async fn stream_repaired_peer_shard(
+    part: &PartMetadata,
+    shard: &ShardInfo,
+    block_size: usize,
+    cache: &mut VerifiedShardCache,
+) -> Result<(), AppError> {
+    let locator = parse_peer_shard_locator(&shard.absolute_path).ok_or_else(|| {
+        AppError::ServiceUnavailable("cluster repair requires a recorded peer shard locator".into())
+    })?;
     if locator.part_index != part.part_index
         || locator.shard_index != shard.shard_index
         || locator.is_parity != shard.is_parity
@@ -195,8 +263,6 @@ async fn repair_cluster_read_target(
             "read repair target differs from recorded shard layout".into(),
         ));
     }
-    let reconstructed =
-        reconstruct_cluster_shard_cached(part, shard.shard_index, block_size, cache).await?;
     let target = PeerShardTarget {
         pool_id: locator.pool_id,
         pool_generation: locator.pool_generation,
@@ -216,7 +282,9 @@ async fn repair_cluster_read_target(
         repair: true,
         expected_checksum: Some(shard.checksum.clone()),
     };
-    let repaired = put_peer_shard_bytes(target, &reconstructed).await?;
+    let mut writer = RemoteShardWriter::spawn(target)?;
+    reconstruct_cluster_shard_into(part, shard.shard_index, block_size, cache, &mut writer).await?;
+    let repaired = writer.finish().await?;
     if !repaired.checksum.eq_ignore_ascii_case(&shard.checksum) {
         return Err(AppError::InternalServerError(format!(
             "read-repaired shard {} checksum differed: got {}, expected {}",
@@ -254,6 +322,8 @@ pub async fn repair_cluster_object_shards(
         return Ok(before);
     }
 
+    let _worker = try_repair_worker(&CLUSTER_REPAIR_WORKERS)?;
+
     let mut repaired_shards = 0u64;
     let mut failed_repairs = 0u64;
 
@@ -265,68 +335,10 @@ pub async fn repair_cluster_object_shards(
                 ShardProbeResult::Missing | ShardProbeResult::ChecksumMismatch => {}
             }
 
-            let Some(locator) = parse_peer_shard_locator(&shard.absolute_path) else {
-                failed_repairs = failed_repairs.saturating_add(1);
-                warn!(
-                    "Cluster object repair cannot target non-peer shard locator for {}/{} shard {}",
-                    meta.fragment, meta.object_key, shard.shard_index
-                );
-                continue;
-            };
-
-            let reconstructed = match reconstruct_cluster_shard_cached(
-                part,
-                shard.shard_index,
-                meta.stripe_size_bytes,
-                &mut cache,
-            )
-            .await
+            match stream_repaired_peer_shard(part, shard, meta.stripe_size_bytes, &mut cache).await
             {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    failed_repairs = failed_repairs.saturating_add(1);
-                    warn!(
-                        "Cluster object repair failed reconstructing {}/{} shard {}: {}",
-                        meta.fragment, meta.object_key, shard.shard_index, err
-                    );
-                    continue;
-                }
-            };
-
-            let target = PeerShardTarget {
-                pool_id: locator.pool_id,
-                pool_generation: locator.pool_generation,
-                node_id: locator.node_id,
-                instance_id: locator.instance_id,
-                binding_epoch: locator.binding_epoch,
-                root_id: locator.root_id,
-                endpoint: locator.endpoint,
-                fragment: locator.fragment,
-                object_id: locator.object_id,
-                version_id: locator.version_id,
-                part_index: locator.part_index,
-                shard_index: locator.shard_index,
-                is_parity: locator.is_parity,
-                expected_len: shard.size_bytes,
-                deferred_durability: false,
-                repair: true,
-                expected_checksum: Some(shard.checksum.clone()),
-            };
-
-            match put_peer_shard_bytes(target, &reconstructed).await {
-                Ok(info) if info.checksum.eq_ignore_ascii_case(&shard.checksum) => {
+                Ok(()) => {
                     repaired_shards = repaired_shards.saturating_add(1);
-                }
-                Ok(info) => {
-                    failed_repairs = failed_repairs.saturating_add(1);
-                    warn!(
-                        "Cluster object repair wrote {}/{} shard {} but checksum differed: got {}, expected {}",
-                        meta.fragment,
-                        meta.object_key,
-                        shard.shard_index,
-                        info.checksum,
-                        shard.checksum
-                    );
                 }
                 Err(err) => {
                     failed_repairs = failed_repairs.saturating_add(1);

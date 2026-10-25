@@ -1,3 +1,4 @@
+use crate::distribution::repair::{ReadRepairSnapshot, read_repair_snapshot};
 use crate::io_control::backpressure::{PeerIoSnapshot, peer_io_snapshot};
 use crate::io_control::capacity_cache::{CapacityCacheSnapshot, capacity_cache_snapshot};
 use crate::io_control::job::{IoJobRegistrySnapshot, io_job_registry_snapshot};
@@ -20,6 +21,7 @@ pub struct IoControlSnapshot {
     pub process: ProcessResourceSnapshot,
     pub scrub: ScrubControlSnapshot,
     pub read_recover: ReadRecoverSnapshot,
+    pub read_repair: ReadRepairSnapshot,
     pub peer_count: usize,
     pub active_peer_reads: usize,
     pub active_peer_writes: usize,
@@ -78,6 +80,7 @@ pub fn io_control_snapshot() -> IoControlSnapshot {
         process: process_resource_snapshot(),
         scrub: scrub_control_snapshot(),
         read_recover: read_recover_snapshot(),
+        read_repair: read_repair_snapshot(),
         peer_io,
     }
 }

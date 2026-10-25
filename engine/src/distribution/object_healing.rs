@@ -145,14 +145,17 @@ pub async fn scan_and_repair_fragment_objects(
                 Ok(status) => status,
                 Err(error) => {
                     result.failed_objects = result.failed_objects.saturating_add(1);
-                    result.reports.push(object_error_report(
-                        &runtime,
-                        fragment,
-                        scan_id,
-                        object_id,
-                        &metadata.version_id,
-                        logical_path.clone(),
-                        &format!("object health inspection failed: {error}"),
+                    result.reports.push(classify_object_operation_error(
+                        object_error_report(
+                            &runtime,
+                            fragment,
+                            scan_id,
+                            object_id,
+                            &metadata.version_id,
+                            logical_path.clone(),
+                            &format!("object health inspection failed: {error}"),
+                        ),
+                        &error,
                     ));
                     continue;
                 }
@@ -166,14 +169,17 @@ pub async fn scan_and_repair_fragment_objects(
                     Ok(status) => status,
                     Err(error) => {
                         result.failed_objects = result.failed_objects.saturating_add(1);
-                        result.reports.push(object_error_report(
-                            &runtime,
-                            fragment,
-                            scan_id,
-                            object_id,
-                            &metadata.version_id,
-                            logical_path.clone(),
-                            &format!("recorded shard-layout repair failed: {error}"),
+                        result.reports.push(classify_object_operation_error(
+                            object_error_report(
+                                &runtime,
+                                fragment,
+                                scan_id,
+                                object_id,
+                                &metadata.version_id,
+                                logical_path.clone(),
+                                &format!("recorded shard-layout repair failed: {error}"),
+                            ),
+                            &error,
                         ));
                         continue;
                     }
@@ -188,14 +194,17 @@ pub async fn scan_and_repair_fragment_objects(
                 Ok(outcome) => outcome,
                 Err(error) => {
                     result.failed_objects = result.failed_objects.saturating_add(1);
-                    result.reports.push(object_error_report(
-                        &runtime,
-                        fragment,
-                        scan_id,
-                        object_id,
-                        &metadata.version_id,
-                        logical_path.clone(),
-                        &format!("NCDX replica inspection failed: {error}"),
+                    result.reports.push(classify_object_operation_error(
+                        object_error_report(
+                            &runtime,
+                            fragment,
+                            scan_id,
+                            object_id,
+                            &metadata.version_id,
+                            logical_path.clone(),
+                            &format!("NCDX replica inspection failed: {error}"),
+                        ),
+                        &error,
                     ));
                     continue;
                 }
@@ -407,6 +416,24 @@ fn object_repair_report(
     report
 }
 
+fn classify_object_operation_error(
+    mut report: AutoHealingReport,
+    error: &crate::enums::app_error_enum::AppError,
+) -> AutoHealingReport {
+    if matches!(
+        error,
+        crate::enums::app_error_enum::AppError::ServiceUnavailable(_)
+            | crate::enums::app_error_enum::AppError::Timeout(_)
+    ) {
+        // Admission pressure and a missing response do not prove immutable
+        // object damage. Count this cycle incomplete and retry a later cycle.
+        report.finding = "object_verification_incomplete".into();
+        report.initial_status = "incomplete".into();
+        report.repair_outcome = "deferred".into();
+    }
+    report
+}
+
 fn object_error_report(
     runtime: &ClusterRuntime,
     fragment: &str,
@@ -566,6 +593,38 @@ mod tests {
     use super::*;
     use crate::core::repair_manager::ObjectRepairStatus;
     use crate::distribution::peer::{MetadataReplicaObservation, MetadataReplicaRepairOutcome};
+
+    #[test]
+    fn repair_admission_pressure_is_deferred_without_hiding_integrity_conflicts() {
+        use crate::enums::app_error_enum::AppError;
+        for (error, deferred) in [
+            (
+                AppError::ServiceUnavailable("stream repair at capacity".into()),
+                true,
+            ),
+            (AppError::Timeout("peer probe".into()), true),
+            (AppError::Conflict("immutable bytes diverge".into()), false),
+            (
+                AppError::InternalServerError("invalid checksum".into()),
+                false,
+            ),
+        ] {
+            let mut report = AutoHealingReport::new(
+                "scan",
+                1,
+                "fragment",
+                "node",
+                "object_repair_failed",
+                "object",
+            );
+            report.initial_status = "critical".into();
+            report.repair_outcome = "repair_failed".into();
+            let report = classify_object_operation_error(report, &error);
+            assert_eq!(report.initial_status == "incomplete", deferred);
+            assert_eq!(report.repair_outcome == "deferred", deferred);
+            assert!(!report.cluster_read_only_triggered);
+        }
+    }
 
     fn metadata_outcome(statuses: &[&str], healthy: bool) -> MetadataReplicaRepairOutcome {
         MetadataReplicaRepairOutcome {

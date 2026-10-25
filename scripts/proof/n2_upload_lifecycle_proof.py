@@ -20,6 +20,7 @@ import ssl
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -104,8 +105,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--peer-transport", choices=("native", "http"), default="native")
+    parser.add_argument("--large-repair-bytes", type=int, default=0,
+                        help="Add a bounded streaming large-shard repair case (0 disables)")
     args = parser.parse_args()
     engine, out = args.engine.resolve(strict=True), args.out.resolve()
+    assert args.large_repair_bytes in (0, 32 * 1024 * 1024), \
+        "This bounded fixture uses exactly one 32 MiB part"
     assert engine.is_relative_to(HDD.resolve()) and out.is_relative_to(HDD.resolve())
     out.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="n2-upload-lifecycle-", dir=out))
@@ -124,6 +130,7 @@ def main():
     processes, logs, results, sockets = {}, [], [], []
     workers = concurrent.futures.ThreadPoolExecutor(max_workers=6)
     report = dict(status="RUNNING", scope="two real processes, one project HDD, loopback HTTP/native",
+                  peer_transport=args.peer_transport,
                   limitations=["not physical power-loss qualification", "not independent failure domains",
                                "not scale or latency qualification"], cases=results)
 
@@ -294,9 +301,11 @@ def main():
             (cwd / "state").mkdir(parents=True)
             (cwd / "disk").mkdir()
             nodes.append(dict(slot_id=f"node-{index}", instance_id=f"node-{index}", binding_epoch=1,
-                              endpoint=bases[index], native_endpoint=f"n2://127.0.0.1:{ports[index*2+1]}",
+                              endpoint=bases[index],
                               state="online", weight=1, joined_epoch=1,
                               storage_roots=[dict(id=f"root-{index}", path=str(cwd / "disk"))]))
+            if args.peer_transport == "native":
+                nodes[-1]["native_endpoint"] = f"n2://127.0.0.1:{ports[index*2+1]}"
             env_path = cwd / "n2.env"
             env_path.write_text(f"JWT_SECRET={secret}\nMASTER_KEY={secret}\nAUTH_KEY={secret}\n"
                                 f"ADMIN_KEY={secret}\nN2_CLUSTER_SECRET={secret}\n")
@@ -506,6 +515,152 @@ stripe_block_size=262144
                         production_get_physically_repaired_bitrot_and_missing_piece=True,
                         legacy_committed_repair_bootstrapped_from_k_matching_metadata=True)
         case("committed NCDX protects immutable data even after every NCNX pointer disappears", committed_protection)
+
+        if args.large_repair_bytes:
+            def large_streaming_repair():
+                def file_hash(path):
+                    with path.open("rb") as stream:
+                        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+                source = root / "large-source.bin"
+                pattern = bytes((index * 13 + 29) % 251 for index in range(65536))
+                with source.open("wb") as stream:
+                    for _ in range(args.large_repair_bytes // len(pattern)):
+                        stream.write(pattern)
+                expected_hash = file_hash(source)
+                peak, baseline = {}, {}
+                sampling_done = threading.Event()
+
+                def sample():
+                    while not sampling_done.is_set():
+                        for index, process in list(processes.items()):
+                            for line in Path(f"/proc/{process.pid}/status").read_text().splitlines():
+                                if line.startswith("VmRSS:"):
+                                    value = int(line.split()[1])
+                                    baseline.setdefault(str(index), value)
+                                    peak[str(index)] = max(value, peak.get(str(index), 0))
+                        sampling_done.wait(0.05)
+
+                sampler = threading.Thread(target=sample, daemon=True)
+                sampler.start()
+                try:
+                    key = "streaming/large.bin"
+                    shape = dict(total_size_bytes=args.large_repair_bytes, expected_parts=1,
+                                 part_size_bytes=args.large_repair_bytes, content_type="application/octet-stream")
+                    initiated = api(0, "/noa/v1/upload/multipart/init/" + key, "POST", shape)
+                    connection = http.client.HTTPSConnection("127.0.0.1", ports[0], timeout=120, context=context)
+                    sockets.append(connection)
+                    connection.putrequest("PUT", f"/noa/v1/upload/multipart/{initiated['version_id']}/0")
+                    connection.putheader("Authorization", f"Bearer {token}")
+                    connection.putheader("Content-Length", str(args.large_repair_bytes))
+                    connection.endheaders()
+                    with source.open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            connection.send(chunk)
+                    response = connection.getresponse()
+                    body = response.read()
+                    assert response.status in (200, 201), (response.status, body[:600])
+                    connection.close()
+                    uploaded = api(0, f"/noa/v1/upload/multipart/{initiated['version_id']}/{initiated['session_id']}/finalize", "POST", shape)
+                    inventory = api(0, "/n2/peer/objects/inventory", "POST", dict(fragment=fragment), peer=True, auth=False)
+                    metadata = next(item for item in inventory if item["version_id"] == uploaded["version_id"])
+                    assert len(metadata["parts"]) == 1, "Fixture must exercise a large single shard, not many tiny parts"
+                    pieces = metadata["parts"][0]["shards"]
+                    assert all(piece["size_bytes"] >= args.large_repair_bytes for piece in pieces)
+                    owned = dict(object_id=metadata["object_key"], version_id=metadata["version_id"])
+                    paths = [path for index in range(2) for path in payload_files(index, owned)]
+                    recorded = {piece["file_name"]: piece for piece in pieces}
+                    physical = {name: next(path for path in paths if path.name == name) for name in recorded}
+                    immutable = {str(path): file_hash(path) for index in range(2)
+                                 for path in (root / f"node-{index}/disk" / f"@f_{fragment}" / ".objects").rglob("*.ncdx")}
+                    assert immutable, "Immutable metadata hashes must actually be checked"
+
+                    def get_hash():
+                        req = urllib.request.Request(bases[0] + "/noa/v1/objects/get/" + key,
+                                                     headers={"Authorization": f"Bearer {token}"})
+                        digest, count = hashlib.sha256(), 0
+                        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+                            while chunk := response.read(1024 * 1024):
+                                digest.update(chunk)
+                                count += len(chunk)
+                        assert count == args.large_repair_bytes and digest.hexdigest() == expected_hash
+
+                    data_piece = next(piece for piece in pieces if not piece["is_parity"])
+                    damaged = physical[data_piece["file_name"]]
+                    with damaged.open("r+b") as stream:
+                        stream.seek(data_piece["size_bytes"] - 123)
+                        old = stream.read(1)
+                        stream.seek(-1, 1)
+                        stream.write(bytes([old[0] ^ 0x5a]))
+                    get_hash()
+                    wait_for(lambda: damaged.is_file() and file_hash(damaged) == data_piece["checksum"],
+                             "32 MiB data bitrot repaired through production GET", timeout=90)
+                    damaged.unlink()
+                    get_hash()
+                    wait_for(lambda: damaged.is_file() and file_hash(damaged) == data_piece["checksum"],
+                             "32 MiB missing data repaired through production GET", timeout=90)
+                    parity_piece = next(piece for piece in pieces if piece["is_parity"])
+                    parity_path = physical[parity_piece["file_name"]]
+                    parity_path.unlink()
+                    repaired = api(0, "/noa/v1/objects/repair/" + key + "?mode=checksum", "POST", {})
+                    assert repaired["repaired_shards"] >= 1 and repaired["failed_repairs"] == 0, repaired
+                    assert file_hash(parity_path) == parity_piece["checksum"]
+                    get_hash()
+                    # A streamed repair is allowed to replace only exact committed
+                    # bytes, even when its sender supplies the valid expected SHA.
+                    holder = next(index for index in range(2) if damaged.is_relative_to(root / f"node-{index}"))
+                    query = dict(pool_id="proof", pool_generation=1, slot_id=f"node-{holder}",
+                                 instance_id=f"node-{holder}", binding_epoch=1, root_id=f"root-{holder}",
+                                 parity="false", expected_len=data_piece["size_bytes"], repair="true",
+                                 expected_checksum=data_piece["checksum"], deferred_durability="false")
+                    path = f"/n2/peer/shards/{fragment}/{owned['object_id']}/{owned['version_id']}/0/{data_piece['shard_index']}?" \
+                        + urllib.parse.urlencode(query)
+                    connection = http.client.HTTPSConnection("127.0.0.1", ports[holder * 2], timeout=120, context=context)
+                    sockets.append(connection)
+                    connection.putrequest("PUT", path)
+                    connection.putheader("x-n2-cluster-secret", secret)
+                    connection.putheader("Content-Length", str(data_piece["size_bytes"]))
+                    connection.endheaders()
+                    with damaged.open("rb") as stream:
+                        chunk = stream.read(1024 * 1024)
+                        connection.send(bytes([chunk[0] ^ 1]) + chunk[1:])
+                        while chunk := stream.read(1024 * 1024):
+                            connection.send(chunk)
+                    response = connection.getresponse()
+                    error = response.read()
+                    assert response.status == 409, (response.status, error[:600])
+                    connection.close()
+                    assert file_hash(damaged) == data_piece["checksum"]
+                    connection = http.client.HTTPSConnection("127.0.0.1", ports[holder * 2], timeout=30, context=context)
+                    sockets.append(connection)
+                    connection.putrequest("PUT", path)
+                    connection.putheader("x-n2-cluster-secret", secret)
+                    connection.putheader("Content-Length", str(data_piece["size_bytes"]))
+                    connection.endheaders()
+                    existing_temporaries = set(damaged.parent.glob(damaged.name + ".tmp.*"))
+                    connection.send(b"interrupted repair" * (2 * 1024 * 1024 // 18))
+                    def admitted_temporaries():
+                        return [entry for entry in damaged.parent.glob(damaged.name + ".tmp.*")
+                                if entry not in existing_temporaries and entry.stat().st_size > 0]
+                    wait_for(lambda: bool(admitted_temporaries()),
+                             "interrupted repair must physically admit bytes before disconnect", timeout=30)
+                    interrupted_paths = admitted_temporaries()
+                    connection.close()
+                    wait_for(lambda: all(not entry.exists() for entry in interrupted_paths),
+                             "interrupted repair removes its exact temporary files", timeout=30)
+                    assert file_hash(damaged) == data_piece["checksum"]
+                    assert all(file_hash(Path(path)) == digest for path, digest in immutable.items())
+                    get_hash()
+                    return dict(shard_bytes=data_piece["size_bytes"], source_sha256=expected_hash,
+                                data_bitrot_and_missing_repaired=True, explicit_parity_repaired=True,
+                                wrong_sha_and_interrupted_repair_preserved_target=True,
+                                admitted_interrupted_repair_temp_reclaimed=True,
+                                immutable_metadata_unchanged=True, peer_transport=args.peer_transport,
+                                baseline_rss_kib=baseline, peak_rss_kib=peak)
+                finally:
+                    sampling_done.set()
+                    sampler.join(timeout=5)
+            case("large streamed repair preserves committed bytes and bounded source generation", large_streaming_repair)
 
         def ncdx_boundary_before_namespace():
             owned = identity()

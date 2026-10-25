@@ -1660,7 +1660,7 @@ Response sections:
 - `object_health`: sampled layout and optional shard health.
 - `redistribution`: plan and current explicit redistribution job.
 - `io_control`: pressure, jobs, latency samples, process resources, and
-  recover-on-read counters.
+  recover-on-read and read-repair admission/outcome counters.
 - `jobs`: cluster repair, rebalance, and local GC status.
 - `namespace_replication`: flat NCNX replication and holder health.
 - `uploads`: aggregated active/stale multipart activity.
@@ -1761,6 +1761,11 @@ NCDX remains protected even without any NCNX. Unknown old payloads and ambiguous
 partial commits are retained. `total_sessions_deleted` counts completed exact
 cleanup; `total_sessions_deferred` counts retained candidates.
 
+Active-upload inventory is a single resumable directory pass, not a new full
+enumeration for each page. Pages bound inspected filenames as well as returned
+records and release directory descriptors before cleanup. Concurrent additions
+may be picked up next cycle; every reclamation still rechecks ownership.
+
 This requires a nonempty `N2_CLUSTER_SECRET` and an all-holder coordinated
 upgrade with old writers stopped. Terminal fences survive restart and session
 cleanup; do not manually delete `.uploads/.fences`. See
@@ -1813,6 +1818,19 @@ Rebalance is an explicit distributed rewrite that commits a new immutable
 version under the current layout.
 
 ### Autonomous Healing
+
+Shard repair streams bounded chunks through the existing HTTP/native peer
+writer and retains expected-length/SHA checks before atomic publication.
+Read-triggered and explicit/autonomous repair share eight worker slots; full
+checksum inspection allows at most 32 probes, each hashing at most 1 MiB at a
+time. These are payload-working-set controls, not an absolute process-memory
+promise. Read-repair counters are available in `io_control.read_repair`:
+admitted parts, merged hints, capacity deferrals, completed/failed attempts,
+active parts and shared streaming-worker usage. Counters reset on restart;
+a completed attempt or successful GET is not proof that every replica healed.
+Capacity pressure and transient repair transport errors are reported as
+incomplete/deferred work, not evidence that immutable data is corrupt. Actual
+integrity conflicts remain errors.
 
 ```http
 GET  /noa/v1/cluster/healing/status

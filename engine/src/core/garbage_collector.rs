@@ -357,15 +357,13 @@ async fn reclaim_owned_uploads(
     stats: &mut FragmentGcStats,
 ) -> Result<(), AppError> {
     use crate::distribution::upload_lifecycle::{self, UploadLifecycleState};
-    let mut cursor = None;
+    let mut inventory = upload_lifecycle::UploadInventory::new(runtime, fragment)?;
     loop {
-        let page = upload_lifecycle::list_upload_records(runtime, fragment, cursor.as_deref(), 128)
-            .await?;
-        if page.is_empty() {
-            break;
+        if should_stop_gc() {
+            return Ok(());
         }
-        cursor = page.last().map(|record| record.identity.version_id.clone());
-        for candidate in page {
+        let page = inventory.next_page(128).await?;
+        for candidate in page.records {
             if should_stop_gc() {
                 return Ok(());
             }
@@ -415,6 +413,9 @@ async fn reclaim_owned_uploads(
                     stats.sessions_deferred = stats.sessions_deferred.saturating_add(1);
                 }
             }
+        }
+        if page.finished {
+            break;
         }
     }
     Ok(())

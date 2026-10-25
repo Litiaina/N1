@@ -634,7 +634,32 @@ read. It confirms each target with its recorded checksum rather than a one-byte
 presence probe, and preserves targets discovered while that part's worker is
 active. Admission is bounded to eight distinct parts per process; overflow is
 best-effort and can be retried by a later verified read. This is not a durable
-repair queue or a bound on the existing whole-shard reconstruction buffers.
+repair queue. Read-triggered, explicit and autonomous shard repair also share
+eight fail-fast streaming-worker slots, rather than multiplying separate limits.
+
+Repair reconstructs into the existing backpressured peer writer, not a
+whole-target `Vec`. Payload chunks are at most 1 MiB; verified repair-block
+cache retention is at most 4 MiB. Full checksum probes hash incrementally with
+at most 32 concurrent probes. Oversized recorded checksum blocks are streamed
+and only the requested slice retained. Legacy repair donors without block
+checksums get a streamed full-SHA precheck instead of whole-shard caching;
+the final target SHA and receiver's immutable checksum/length validation remain
+mandatory before successful publication. Prechecking a donor does not certify
+its future bytes. Ordinary legacy GET caching is not changed by that repair-only
+fallback. Decoder work still scales with recorded EC width; these bounds are
+not a universal process-RSS limit.
+
+Peer receive cancellation/errors clean up only that attempt's private temporary
+shard. Cleanup ownership transfers to the admitted publication worker, so
+cancelling its caller cannot unlink a still-running publication. This is
+in-process cleanup, not a promise to reclaim all temporary files after a hard
+process/power failure.
+
+Read-repair admission, merged hints, capacity deferrals and attempt outcomes
+are exposed in the existing `io_control.read_repair` snapshot. Repair hints
+remain disposable; a completed GET is not proof that physical repair finished.
+Capacity/transport deferrals are incomplete observations rather than critical
+object-corruption findings. Integrity conflicts are not downgraded by this rule.
 
 The review used RustFS's [checksum-aware object healing](https://github.com/rustfs/rustfs/blob/40837f67f8484171c523556531981f0ba371d145/crates/ecstore/src/set_disk/ops/heal.rs)
 and [repair-queue ownership](https://github.com/rustfs/rustfs/blob/40837f67f8484171c523556531981f0ba371d145/crates/heal/src/heal/mrf_queue.rs)
@@ -642,6 +667,11 @@ as design references. No RustFS code, dependency, disk format, or S3 namespace
 model was imported. Receiver-local guards and disposable read-repair hints
 must not be confused with distributed mutation ordering or durable repair
 obligations.
+
+The bounded-stream and single-pass maintenance work also takes design lessons
+from RustFS's [streaming erasure healing](https://github.com/rustfs/rustfs/blob/40837f67f8484171c523556531981f0ba371d145/crates/ecstore/src/erasure/coding/heal.rs)
+and [paged healing workers](https://github.com/rustfs/rustfs/blob/40837f67f8484171c523556531981f0ba371d145/crates/heal/src/heal/erasure_healer.rs).
+N2 retains its own format, exact placement, publication and fencing rules.
 
 ### Survival and safety state
 

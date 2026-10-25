@@ -51,11 +51,19 @@ impl RemoteShardWriter {
                 .await
                 .map_err(|e| AppError::Io(e, "shutdown remote N2 shard upload stream".into()))?;
         }
-        let mut info = self.handle.await.map_err(|e| {
+        let mut info = (&mut self.handle).await.map_err(|e| {
             AppError::InternalServerError(format!("remote N2 shard writer join failed: {e}"))
         })??;
         info.absolute_path = encode_peer_shard_locator(&self.target);
         Ok(info)
+    }
+}
+
+impl Drop for RemoteShardWriter {
+    fn drop(&mut self) {
+        // Dropping JoinHandle alone detaches the transfer. Keep cancellation
+        // bounded instead; receivers still enforce length/SHA before publish.
+        self.handle.abort();
     }
 }
 

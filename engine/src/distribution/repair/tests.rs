@@ -21,6 +21,23 @@ use tokio::sync::Semaphore;
 use ulid::Ulid;
 
 #[test]
+fn all_repair_sources_share_bounded_fail_fast_admission_and_release_on_drop() {
+    let gate = Arc::new(Semaphore::new(MAX_CLUSTER_REPAIR_WORKERS));
+    let mut admitted = Vec::new();
+    for _ in 0..MAX_CLUSTER_REPAIR_WORKERS {
+        admitted.push(try_repair_worker(&gate).expect("admit bounded worker"));
+    }
+    assert!(try_repair_worker(&gate).is_err());
+    assert_eq!(gate.available_permits(), 0);
+    admitted.pop();
+    let next_source = try_repair_worker(&gate).expect("permit reused by any repair source");
+    assert!(try_repair_worker(&gate).is_err());
+    drop(next_source);
+    drop(admitted);
+    assert_eq!(gate.available_permits(), MAX_CLUSTER_REPAIR_WORKERS);
+}
+
+#[test]
 fn active_read_repair_retains_new_targets_and_old_worker_cannot_remove_successor() {
     let mut queue = HashMap::new();
     let owner = enqueue_read_repair_targets(&mut queue, "part", HashSet::from([1])).unwrap();

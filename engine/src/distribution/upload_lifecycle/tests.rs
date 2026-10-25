@@ -462,25 +462,22 @@ async fn ownership_listing_is_page_bounded_and_does_not_walk_object_payloads() {
         ignored.join("unknown-object"),
     )
     .unwrap();
-    let mut after = None;
+    let mut inventory = UploadInventory::new(&fixture.runtime, &fixture.identity.fragment).unwrap();
     let mut found = Vec::new();
+    let mut scanned = 0;
     loop {
-        let page = list_upload_records(
-            &fixture.runtime,
-            &fixture.identity.fragment,
-            after.as_deref(),
-            5,
-        )
-        .await
-        .unwrap();
-        assert!(page.len() <= 5);
-        if page.is_empty() {
+        let page = inventory.next_page(5).await.unwrap();
+        assert!(page.records.len() <= 5);
+        assert!(page.scanned_entries <= 5);
+        scanned += page.scanned_entries;
+        found.extend(page.records.into_iter().map(|r| r.identity.version_id));
+        if page.finished {
             break;
         }
-        after = page.last().map(|r| r.identity.version_id.clone());
-        found.extend(page.into_iter().map(|r| r.identity.version_id));
     }
+    found.sort();
     assert_eq!(found, expected);
+    assert!(scanned <= 37 * 2 + 6, "each root is enumerated once");
 }
 
 #[tokio::test]
@@ -552,18 +549,26 @@ async fn terminal_fences_survive_compaction_without_historical_work_directories(
         );
         assert!(OwnershipStore::terminal_path(root, &fixture.identity).is_file());
     }
-    assert!(
-        list_upload_records(&fixture.runtime, &fixture.identity.fragment, None, 5)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let mut inventory = UploadInventory::new(&fixture.runtime, &fixture.identity.fragment).unwrap();
+    loop {
+        let page = inventory.next_page(5).await.unwrap();
+        assert!(
+            page.records.is_empty(),
+            "terminal fences are not active work"
+        );
+        if page.finished {
+            break;
+        }
+    }
     assert!(
         ensure_open(&fixture.runtime, &fixture.identity)
             .await
             .is_err()
     );
 }
+
+#[path = "inventory_tests.rs"]
+mod inventory_tests;
 
 #[tokio::test]
 async fn commit_probe_waits_for_publication_and_rejects_different_metadata() {
