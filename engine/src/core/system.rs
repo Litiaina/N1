@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct SystemMetrics {
@@ -17,11 +17,80 @@ pub struct SystemMetrics {
     pub process_open_fds: Option<u64>,
 }
 
-static PREV_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
-static PREV_IDLE: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CpuTimes {
+    busy: u64,
+    idle: u64,
+    iowait: u64,
+}
+
+impl CpuTimes {
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "cpu" {
+            return None;
+        }
+
+        // guest/guest_nice are already included in user/nice. Count the first
+        // eight counters only, including steal but not double-counting guests.
+        let mut counters = [0u64; 8];
+        for (index, counter) in counters.iter_mut().enumerate() {
+            match fields.next() {
+                Some(value) => *counter = value.parse().ok()?,
+                None if index < 4 => return None,
+                None => break,
+            }
+        }
+        let busy = [0, 1, 2, 5, 6, 7]
+            .into_iter()
+            .try_fold(0u64, |sum, index| sum.checked_add(counters[index]))?;
+        Some(Self {
+            busy,
+            idle: counters[3],
+            iowait: counters[4],
+        })
+    }
+
+    fn usage_since(self, previous: Self) -> Option<f64> {
+        let busy = self.busy.checked_sub(previous.busy)?;
+        let idle = self.idle.checked_sub(previous.idle)?;
+        // Linux documents that iowait can decrease. It is not CPU execution;
+        // a decreasing counter contributes no waiting ticks to this sample.
+        let iowait = self.iowait.saturating_sub(previous.iowait);
+        let total = busy.checked_add(idle)?.checked_add(iowait)?;
+        (total != 0).then(|| 100.0 * busy as f64 / total as f64)
+    }
+}
+
+#[derive(Default)]
+struct CpuUsageSampler {
+    previous: Option<CpuTimes>,
+    usage: f64,
+}
+
+impl CpuUsageSampler {
+    fn observe(&mut self, current: CpuTimes) -> f64 {
+        if let Some(previous) = self.previous {
+            if let Some(usage) = current.usage_since(previous) {
+                self.usage = usage;
+            } else if current != previous {
+                // Reset or invalid counters must not manufacture saturation.
+                // Keep an unchanged (sub-jiffy) sample at its last value.
+                self.usage = 0.0;
+            }
+        }
+        self.previous = Some(current);
+        self.usage
+    }
+}
+
+// Metrics and adaptive-control callers share one coherent sample. Serialize
+// the read too, so concurrent requests cannot publish older counters later.
+static CPU_USAGE_SAMPLER: LazyLock<Mutex<CpuUsageSampler>> =
+    LazyLock::new(|| Mutex::new(CpuUsageSampler::default()));
 
 pub async fn get_system_metrics() -> SystemMetrics {
-    let (cpu_usage, _) = calculate_cpu_usage().await;
+    let cpu_usage = calculate_cpu_usage().await;
     let (ram_total, ram_available) = get_memory_info().await;
     let load_avg = get_load_avg().await;
     let uptime_seconds = get_uptime_seconds().await;
@@ -51,43 +120,15 @@ pub async fn get_system_metrics() -> SystemMetrics {
     }
 }
 
-async fn calculate_cpu_usage() -> (f64, (u64, u64)) {
+async fn calculate_cpu_usage() -> f64 {
+    let mut sampler = CPU_USAGE_SAMPLER.lock().await;
     if let Ok(content) = fs::read_to_string("/proc/stat").await {
-        if let Some(line) = content.lines().next() {
-            if line.starts_with("cpu ") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    let user: u64 = parts[1].parse().unwrap_or(0);
-                    let nice: u64 = parts[2].parse().unwrap_or(0);
-                    let system: u64 = parts[3].parse().unwrap_or(0);
-                    let idle: u64 = parts[4].parse().unwrap_or(0);
-                    let iowait: u64 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let irq: u64 = parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let softirq: u64 = parts.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-                    let total = user + nice + system + idle + iowait + irq + softirq;
-
-                    let prev_total = PREV_TOTAL.load(Ordering::Relaxed);
-                    let prev_idle = PREV_IDLE.load(Ordering::Relaxed);
-
-                    let total_delta = total.saturating_sub(prev_total);
-                    let idle_delta = idle.saturating_sub(prev_idle);
-
-                    let usage = if total_delta > 0 {
-                        100.0 * (1.0 - (idle_delta as f64 / total_delta as f64))
-                    } else {
-                        0.0
-                    };
-
-                    PREV_TOTAL.store(total, Ordering::Relaxed);
-                    PREV_IDLE.store(idle, Ordering::Relaxed);
-
-                    return (usage, (total, idle));
-                }
-            }
+        if let Some(current) = content.lines().next().and_then(CpuTimes::parse) {
+            return sampler.observe(current);
         }
     }
-    (0.0, (0, 0))
+    // A failed read must not reset the last valid baseline or fake idle CPU.
+    sampler.usage
 }
 
 async fn get_memory_info() -> (u64, u64) {
@@ -172,5 +213,119 @@ async fn get_process_open_fd_count() -> Option<u64> {
             Ok(None) => return Some(count),
             Err(_) => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CpuTimes, CpuUsageSampler};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn times(line: &str) -> CpuTimes {
+        CpuTimes::parse(line).expect("valid CPU fixture")
+    }
+
+    fn assert_percent(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "{actual} != {expected}"
+        );
+    }
+
+    #[test]
+    fn cpu_iowait_is_not_compute_usage() {
+        let previous = times("cpu 100 20 30 1000 200 4 6 0");
+        let current = times("cpu 102 20 33 1010 285 4 6 0");
+        assert_percent(current.usage_since(previous).unwrap(), 5.0);
+
+        let busy = times("cpu 190 20 40 1000 200 4 6 0");
+        assert_percent(busy.usage_since(previous).unwrap(), 100.0);
+
+        let idle = times("cpu 100 20 30 1010 290 4 6 0");
+        assert_percent(idle.usage_since(previous).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn cpu_accounts_for_steal_without_double_counting_guests() {
+        assert_eq!(
+            times("cpu 100 20 30 1000 200 4 6 40 80 10"),
+            CpuTimes {
+                busy: 200,
+                idle: 1000,
+                iowait: 200,
+            }
+        );
+        let previous = times("cpu 0 0 0 0 0 0 0 0");
+        let current = times("cpu 10 0 0 80 0 0 0 10 10 0");
+        assert_percent(current.usage_since(previous).unwrap(), 20.0);
+    }
+
+    #[test]
+    fn cpu_parser_rejects_invalid_counters_and_overflow() {
+        for line in [
+            "",
+            "cpu0 1 2 3 4",
+            "cpu 1 2 3",
+            "cpu 1 nope 3 4",
+            "cpu 1 2 3 4 nope",
+            "cpu 18446744073709551615 1 0 0",
+            "cpu 18446744073709551616 0 0 0",
+        ] {
+            assert!(CpuTimes::parse(line).is_none(), "accepted: {line}");
+        }
+        assert_eq!(times("cpu 1 2 3 4").busy, 6);
+    }
+
+    #[test]
+    fn decreasing_iowait_does_not_reset_or_manufacture_cpu_pressure() {
+        let previous = times("cpu 100 0 0 1000 100");
+        let current = times("cpu 110 0 0 1090 90");
+        assert_percent(current.usage_since(previous).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn cpu_counter_resets_reseed_instead_of_reporting_saturation() {
+        let mut sampler = CpuUsageSampler::default();
+        assert_percent(sampler.observe(times("cpu 100 0 0 1000 100")), 0.0);
+        assert_percent(sampler.observe(times("cpu 190 0 0 1010 100")), 90.0);
+        assert_percent(sampler.observe(times("cpu 1 0 0 10 1")), 0.0);
+        assert_percent(sampler.observe(times("cpu 11 0 0 100 1")), 10.0);
+        // An idle-counter reset must also reseed, even if busy kept growing.
+        assert_percent(sampler.observe(times("cpu 20 0 0 1 1")), 0.0);
+    }
+
+    #[test]
+    fn cpu_sub_jiffy_reads_preserve_the_last_valid_usage() {
+        let mut sampler = CpuUsageSampler::default();
+        let previous = times("cpu 100 0 0 1000 100");
+        let current = times("cpu 150 0 0 1050 100");
+        assert_percent(sampler.observe(previous), 0.0);
+        assert_percent(sampler.observe(current), 50.0);
+        assert_percent(sampler.observe(current), 50.0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_samplers_update_one_coherent_counter_pair() {
+        let sampler = Arc::new(Mutex::new(CpuUsageSampler::default()));
+        sampler.lock().await.observe(times("cpu 0 0 0 0 0"));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let sampler = Arc::clone(&sampler);
+            tasks.spawn(async move {
+                let mut sampler = sampler.lock().await;
+                let previous = sampler.previous.unwrap();
+                tokio::task::yield_now().await;
+                sampler.observe(CpuTimes {
+                    busy: previous.busy + 1,
+                    idle: previous.idle + 9,
+                    iowait: previous.iowait,
+                })
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_percent(result.expect("sampling task"), 10.0);
+        }
+        assert_eq!(sampler.lock().await.previous.unwrap().busy, 32);
     }
 }

@@ -1,5 +1,41 @@
 # MCH scale qualification
 
+## Current investigation — October 26, 2026
+
+The October 24 grouped run stopped at **713,184 acknowledged versions** after
+foreground admission expired; it did not pass the million-object gate. The last
+complete historical-version hash checkpoint covered 500,000 objects. Preserve
+the original members, ledger and failed reports; do not start a new engine on
+those original roots. See [TESTING.md](../TESTING.md) for timings and limitations.
+
+Frozen candidate `6ec60476` retains the format, durability barriers and admission
+deadline. It shares pending flush rounds, corrects CPU/I/O-wait pressure
+accounting and bounds GC work between foreground service windows. Both full
+444-test MCH library runs and required-native checks passed; 150 Python harness
+regressions passed. A first supervisor stopped at its shared 512-task ceiling
+when the 512-client stress test tried to create threads. Preserve that failure.
+The fresh supervisor uses 2,048 tasks, retaining 4 GiB/no swap and unchanged
+engine concurrency/deadlines. Its full fault/correctness gates passed. The
+matched fresh ABBA comparison measured **317.77 → 372.94 objects/s (17.36%)**,
+with all acknowledged hashes checked before/after SIGKILL in all four trials.
+
+The optional aged-population comparison was operator-stopped during its first
+member copy, before reconciliation or comparison completed. Preserve that
+partial fixture and the original failed population. Do not resume copying as
+a prerequisite to scale. Existing results are read directly on MCH.
+
+A fresh million-object supervisor uses the same frozen candidate and validates
+the existing twelve PASS phases and ABBA evidence by pinned hashes. It starts
+new EC 3+1 members, uploads one million files first, then verifies integrity,
+performs at least one million hot-set namespace mutations and verifies restart.
+It does not repeat the prerequisite workloads or copy existing storage roots.
+All earlier strict durability, GC, capacity, 4 GiB/no-swap and deadline policies
+remain. Its shared task ceiling is 2,048. No million-object pass or RC.2 is
+claimed until the scale result and independent evidence checker complete.
+
+The sections below retain earlier launch history and the scale procedure;
+their launch-time states are not the current job status.
+
 ## Dedicated small-file batch candidate
 
 The October 24 relaunch below was intentionally stopped and preserved at
@@ -22,8 +58,9 @@ four cases with two opt-in cases ignored, and the separately required native
 io_uring integration passed. The full-64-object strict-batch gate passed all six
 error/kill rounds across four filesystems, with 106 successful ACKs and 960
 historical hash checks; no injected-fault operation falsely succeeded.
-Scheduled GC passed, and RC concurrency stress is running. Later native-protocol,
-read-repair, comparison and scale gates remain pending. No scale pass is claimed.
+Scheduled GC, RC concurrency stress, native-protocol and read-repair gates
+passed. The matched comparison passed, but the later scale stage stopped at
+the 713,184-object admission failure described above. No scale pass is claimed.
 Production service PIDs were unchanged at launch.
 The final warning-denied build, focused executor/backup tests, explicit native
 integration and 109 harness/shim regressions passed locally. Production N1,

@@ -448,7 +448,8 @@ class HarnessChecks(unittest.TestCase):
                                  'latency': {'classes': {'upload.part.setup': {'count': 2}}}},
                   'io_scheduler': {'foreground_target': 6},
                   'maintenance': {'auto_healing': {'last_availability_scan_at': None, 'last_checksum_scrub_at': None}}}
-        test.api = lambda *args: health
+        test.api = lambda method, route: ({'is_running': False, 'total_errors': 0}
+                                         if route == '/maintenance/gc/status' else health)
         return test, health
 
     def test_resource_checkpoint_rejects_foreign_pid_and_missing_fd_authority(self):
@@ -741,6 +742,48 @@ class HarnessChecks(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, 'refused'):
                 test.upload_batch((0, 6))
             self.assertEqual(len(records), 5)
+
+    def test_failed_batch_captures_only_bounded_read_only_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            test, _ = self.batch_fixture(Path(temporary))
+            test.args.port, test.tls, test.token = 59001, object(), 'never-retain-this-token'
+            test.process = SimpleNamespace(pid=123)
+            connection = MagicMock()
+            health = {'system': {'cpu_usage_percent': 12}, 'io_scheduler': {'active_foreground': 4},
+                      'io_control': {'process': {'pid': 123}}, 'unrelated': 'not retained'}
+            connection.getresponse.side_effect = [
+                SimpleNamespace(status=200, read=Mock(return_value=json.dumps(health).encode())),
+                SimpleNamespace(status=200, read=Mock(return_value=b'{"is_running":true}'))]
+            with patch.object(scale.http.client, 'HTTPSConnection', return_value=connection) as create:
+                test.capture_batch_failure((0, 64), [{'status': 503}] * 64)
+            create.assert_called_once_with('127.0.0.1', 59001, context=test.tls, timeout=2)
+            self.assertEqual([call.args[:2] for call in connection.request.call_args_list], [
+                ('GET', '/noa/v1/maintenance/health'), ('GET', '/noa/v1/maintenance/gc/status')])
+            connection.close.assert_called_once()
+            paths = list(test.root.glob('batch-failure-*.json'))
+            self.assertEqual(len(paths), 1)
+            text = paths[0].read_text()
+            self.assertNotIn(test.token, text)
+            evidence = json.loads(text)
+            self.assertEqual(len(evidence['failure_samples']), 3)
+            self.assertEqual(evidence['refused_objects'], 64)
+            self.assertEqual(evidence['gc'], {'is_running': True})
+            self.assertNotIn('unrelated', evidence['health'])
+
+    def test_failed_batch_diagnostics_do_not_mask_refusal_or_trust_foreign_pid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            test, _ = self.batch_fixture(Path(temporary))
+            test.args.port, test.tls, test.token = 59001, object(), 'token'
+            test.process = SimpleNamespace(pid=123)
+            connection = MagicMock()
+            connection.getresponse.return_value = SimpleNamespace(status=200, read=Mock(
+                return_value=b'{"io_control":{"process":{"pid":999}}}'))
+            with patch.object(scale.http.client, 'HTTPSConnection', return_value=connection):
+                test.capture_batch_failure((0, 64), [{'status': 503}])
+            evidence = json.loads(next(test.root.glob('batch-failure-*.json')).read_text())
+            self.assertIn('another engine', evidence['diagnostic_error'])
+            self.assertNotIn('health', evidence)
+            self.assertEqual(connection.request.call_count, 1, 'Never continue querying a foreign engine')
 
     def test_explicit_admission_probe_never_counts_rejections_as_writes(self):
         with tempfile.TemporaryDirectory() as temporary:

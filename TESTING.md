@@ -8,6 +8,98 @@ paths and credentials are intentionally omitted. Historical 3.x/4.x labels and
 binary checksums identify the private builds actually tested; they are not
 retroactively renamed or presented as newly rebuilt RC binaries.
 
+## Sustained batch admission investigation — October 26, 2026
+
+The October 24 four-SATA/XFS EC 3+1 run stopped at **713,184 acknowledged
+objects / 10,406,776,320 bytes**, not one million. A batch received per-object
+503 refusals after the unchanged 30-second foreground-admission deadline.
+The last complete integrity checkpoint downloaded and SHA-256 checked all
+500,000 acknowledged versions then present. Later acknowledgements still need
+independent verification; churn and final restart gates did not run. The
+original members, acknowledgement ledger and failed results are preserved.
+
+All prerequisite correctness gates passed, including 426 library tests,
+required-native I/O, strict-group fault boundaries, scheduled GC, concurrency,
+native protocol and read repair. The matched fresh 2,048-object ABBA comparison
+measured 12.46 objects/s for the earlier build and 331.39 objects/s for the
+grouped candidate (26.60x); that is not aged-population sustained throughput.
+The subsequent 100k-to-500k population interval achieved 75.97 objects/s,
+including source creation and acknowledgement recording.
+
+At 500k, the retained median payload-persistence barrier took 3.332 seconds,
+versus 27.5 ms for payload/metadata staging and 7.2 ms for NCX publication.
+Scheduled GC began one hour into ingestion and was still collecting namespace
+references at that checkpoint. Slowdown and reduced foreground concurrency
+were already observed before GC began, so GC alone is not a proven cause.
+Near failure, one physical member's mean write latency was about 73 ms while
+two others were about 22–25 ms. These device counters include all writers.
+There were no recorded cgroup OOM events or acknowledged-data checksum failures;
+absence of a full final verification is not a zero-loss qualification.
+
+The new candidate coalesces only pending filesystem flushes, retains all
+payload → NDX → NCX persistence boundaries, paces GC at safe time/count
+boundaries and corrects CPU/I/O-wait accounting. New tests cover late flush
+arrivals, writeback-error fanout, poisoned-state wakeup, GC pacing/reference
+coverage and pressure accounting. Build, fault and performance results are
+recorded only after their respective gates complete. The admission deadline,
+storage encoding and release-candidate version are unchanged; this is not RC.2.
+
+The warning-denied release build passed with unchanged engine sources throughout
+the build. The frozen candidate (`6ec60476`) passed **444/444 library tests** on
+MCH in 267.922 seconds, four backend-selection cases and the separately required
+native io_uring case. A second isolated parallel library run passed **444/444**
+in 269.15 seconds. Required-native integration also passed on the local XFS and
+ext4 HDD filesystems, completing 3,679 operations on each without fallback and
+with drained queues. The first ext4 attempt failed before I/O because its test
+directory was not writable; it is retained as a fixture-setup failure, followed
+by the successful run in an owned test directory. The combined Python harness
+regressions passed **150/150**; four synchronization-shim regressions also passed.
+The four-member strict-batch fault gate and scheduled-GC gate also passed.
+The following concurrency gate stopped when its client could not create the
+512 concurrent request threads: the supervisor allowed only 512 tasks for the
+client and engine combined. All 512 requests in the preceding 256-concurrency
+phase succeeded. This is a preserved harness-resource failure, not a completed
+overload pass. A fresh full rerun gives that shared supervisor 2,048 tasks while
+retaining its 4 GiB/no-swap limit, engine concurrency and request deadlines.
+That rerun passed all 444 library tests again (261.59 seconds), the batch fault
+and scheduled-GC gates, concurrency stress, native protocol and read repair.
+At 512 concurrent clients, 1,024 offered one-shot uploads produced 751 accepts
+and 273 explicit admission refusals. This overload result does not qualify
+refusals during the eight-client scale workload. The 256 same-key publishers
+and mixed fragment/mutation gates passed, followed by complete acknowledged
+integrity checks and restart verification. The stress gate verified 2,127
+acknowledged versions; sampled engine peak RSS was 135.2 MiB and peak FDs 563,
+returning to 19 FDs in its final drain sample. These are bounded-workload values.
+
+The fresh-population comparison then passed: four strict 2,048-object trials,
+old/new/new/old on the same four SATA/XFS filesystems, EC 3+1, eight batch
+clients and 64-object batches. Upload-phase rates were:
+
+| Build | Trial rates, objects/s | Combined objects/s |
+| --- | --- | --- |
+| Previous grouped build (`a6415893`) | 338.12 / 299.72 | 317.77 |
+| Optimized build (`6ec60476`) | 372.77 / 373.11 | 372.94 |
+
+The observed aggregate gain was **17.36%**, with non-overlapping measured trial
+ranges. Every acknowledged version was hashed before and after SIGKILL restart
+in every trial. Candidate sampled peak engine RSS was 92.4–93.4 MiB, with
+64 peak FDs. This is short, loopback, fresh-population evidence on shared
+filesystems, not controlled cold-cache, aged-population or LAN throughput.
+
+The optional copied-population diagnostic was operator-stopped during its first
+member copy. It did not complete reconciliation or compare the builds at that
+population; partial copies and original members/evidence are preserved. The
+existing 500k checkpoint does not require a copy to read its results.
+
+A fresh headless million-object run now reuses the exact candidate's completed
+correctness gates and ABBA comparison, reading those evidence files directly
+on MCH with pinned hashes. It does not clone an old store or repeat those gates.
+The target is one million new files in one logical folder, then full integrity,
+at least one million hot-set namespace mutations, and SIGKILL/restart integrity.
+It keeps EC 3+1, eight batch clients, strict durability, normal scheduled GC,
+the admission deadline, required io_uring and prior capacity/memory limits.
+No million-object pass or RC.2 is claimed while that qualification is incomplete.
+
 ## Strict small-file groups — October 24, 2026
 
 The initial grouped candidate passed **426 library tests**, four backend-selection
@@ -30,9 +122,10 @@ separately required native io_uring case also passed. The full-64-object
 strict-batch fault gate passed on all four filesystems: three injected-error
 rounds and three process-kill rounds, 106 successful ACKs and 960 historical
 hash checks, with no false successful fault ACK. Scheduled GC also passed.
-RC concurrency stress is running; subsequent native-protocol/read-repair,
-comparison and million-object stages remain pending. These injected errors
-follow real synchronization and do not certify physical power loss.
+Concurrency, native-protocol and read-repair gates subsequently passed. The
+comparison and failed population result are recorded in the October 26 section
+above. These injected errors follow real synchronization and do not certify
+physical power loss.
 
 An initial two-physical-HDD EC 1+1 gate passed boundary sizes, count/byte limits,
 duplicate keys, partial errors, concurrent rename and upload, unchanged NCX
@@ -50,7 +143,7 @@ isolated-fixture setup `ENOENT`; its mutable build executable was subsequently
 absent. The precise deletion timing is unproven. That run is unqualified, and
 the final full-suite run uses immutable copies outside the compiler output tree.
 The final engine candidate (`a6415893`, full SHA-256 retained with the frozen
-package) is unchanged by the test correction. The active replacement uses an
+package) is unchanged by the test correction. The replacement used an
 independent headless supervisor on four SATA/XFS members, EC 3+1.
 It requires the final full regressions, full-64-object fault gates, scheduled
 GC/concurrency/native/read-repair gates and a matched old/new/new/old comparison
@@ -59,7 +152,8 @@ The supervisor stops on failures or resource/deadline limits, without automatic
 write retries. It has a 50-hour controller bound, 4 GiB whole-service memory
 ceiling, no swap, and per-filesystem reserve/growth limits. Production services
 and earlier populations remain unchanged. No new throughput or million-object
-success is claimed until the corresponding recorded gates complete.
+success is claimed until the corresponding recorded gates complete. That
+supervisor has now stopped at the preserved admission failure described above.
 
 ## Native Linux I/O backend — October 23–24, 2026
 

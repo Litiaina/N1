@@ -65,18 +65,24 @@ fn adjustment(
     ram_usage_percent: f64,
     load_ratio: f64,
 ) -> (usize, usize) {
+    // Linux load average includes tasks blocked on disk I/O, not just runnable
+    // CPU work. Let the I/O scheduler classify that pressure; load alone must
+    // not repeatedly halve admission or prevent recovery after a slow flush.
+    let cpu_backlog = cpu_usage_percent >= 70.0;
     if io_pressure == DiskIoPressure::Stalled
         || cpu_usage_percent >= 95.0
         || ram_usage_percent >= 95.0
-        || load_ratio >= 2.0
+        || (cpu_backlog && load_ratio >= 2.0)
     {
         (50, 0)
-    } else if cpu_usage_percent >= 85.0 || ram_usage_percent >= 90.0 || load_ratio >= 1.3 {
+    } else if cpu_usage_percent >= 85.0
+        || ram_usage_percent >= 90.0
+        || (cpu_backlog && load_ratio >= 1.3)
+    {
         (25, 0)
     } else if io_pressure <= DiskIoPressure::Pressured
         && cpu_usage_percent <= 55.0
         && ram_usage_percent <= 75.0
-        && load_ratio <= 0.8
     {
         (0, 10)
     } else {
@@ -196,24 +202,51 @@ mod tests {
             adjustment(DiskIoPressure::Stalled, 35.0, 48.0, 0.7),
             (50, 0)
         );
-        for (cpu, ram, load) in [(95.0, 48.0, 0.7), (35.0, 95.0, 0.7), (35.0, 48.0, 2.0)] {
+        for (cpu, ram, load) in [(95.0, 48.0, 0.7), (35.0, 95.0, 0.7), (75.0, 48.0, 2.0)] {
             assert_eq!(
                 adjustment(DiskIoPressure::Pressured, cpu, ram, load),
                 (50, 0)
             );
         }
-        for (cpu, ram, load) in [(85.0, 48.0, 0.7), (35.0, 90.0, 0.7), (35.0, 48.0, 1.3)] {
+        for (cpu, ram, load) in [(85.0, 48.0, 0.7), (35.0, 90.0, 0.7), (75.0, 48.0, 1.3)] {
             assert_eq!(
                 adjustment(DiskIoPressure::Pressured, cpu, ram, load),
                 (25, 0)
             );
         }
-        for (cpu, ram, load) in [(56.0, 48.0, 0.7), (35.0, 76.0, 0.7), (35.0, 48.0, 0.9)] {
+        for (cpu, ram, load) in [(56.0, 48.0, 0.7), (35.0, 76.0, 0.7), (69.0, 48.0, 2.0)] {
             assert_eq!(
                 adjustment(DiskIoPressure::Pressured, cpu, ram, load),
                 (0, 0)
             );
         }
+    }
+
+    #[test]
+    fn io_wait_load_does_not_masquerade_as_cpu_saturation() {
+        for load in [1.3, 2.0, 20.0] {
+            assert_eq!(
+                adjustment(DiskIoPressure::Pressured, 35.0, 48.0, load),
+                (0, 10),
+                "I/O-blocked load must not prevent bounded recovery"
+            );
+            assert_eq!(
+                adjustment(DiskIoPressure::Saturated, 35.0, 48.0, load),
+                (0, 0),
+                "actual disk saturation must still prevent growth"
+            );
+            assert_eq!(
+                adjustment(DiskIoPressure::Stalled, 35.0, 48.0, load),
+                (50, 0),
+                "actual disk stalls must still reduce concurrency"
+            );
+        }
+    }
+
+    #[test]
+    fn busy_cpu_and_load_still_reduce_capacity() {
+        assert_eq!(adjustment(DiskIoPressure::Normal, 70.0, 48.0, 1.3), (25, 0));
+        assert_eq!(adjustment(DiskIoPressure::Normal, 70.0, 48.0, 2.0), (50, 0));
     }
 
     #[test]

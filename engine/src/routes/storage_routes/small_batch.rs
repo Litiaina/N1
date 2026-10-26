@@ -3,7 +3,8 @@
 //! A disconnected HTTP caller cannot cancel an admitted publisher. Exact-key,
 //! fragment, upload-activity and disk-admission guards remain owned until all
 //! admitted payloads have drained and the last shared persistence barrier has
-//! either completed or failed. There is no cross-request/background coordinator.
+//! either completed or failed. Independent groups may share a sealed syncfs
+//! round on the same filesystem, but no background publisher or commit queue.
 
 use super::*;
 use crate::core::disk_manager::ObjectMetadata;

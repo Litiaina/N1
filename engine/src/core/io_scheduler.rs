@@ -314,6 +314,14 @@ pub fn set_foreground_io_target(target: usize) {
     FOREGROUND_GATE.set_target(target);
 }
 
+/// A cheap pacing hint, not an admission decision or a disk-health sample.
+/// Background work shares the physical devices with both admitted and queued
+/// foreground operations, even when its semaphore permits are separate.
+pub(crate) fn foreground_io_pending() -> bool {
+    ACTIVE_FOREGROUND_IO.load(Ordering::Relaxed) != 0
+        || QUEUED_FOREGROUND_IO.load(Ordering::Relaxed) != 0
+}
+
 pub fn disk_io_scheduler_config() -> DiskIoSchedulerConfig {
     scheduler_config()
 }

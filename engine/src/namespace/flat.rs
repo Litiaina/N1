@@ -1234,12 +1234,35 @@ impl GcReferenceScan {
     /// namespace also yields. Some(empty) is a valid unfinished work batch;
     /// None means both live/trash scopes on every enrolled root are exhausted.
     pub(crate) fn next_batch(&mut self, limit: usize) -> Result<Option<Vec<String>>, AppError> {
+        self.next_batch_while(limit, || true)
+    }
+
+    /// Cooperate between physical entries as well as at the count limit. The
+    /// cursor and conservative union are unchanged. An individual filesystem
+    /// call is not preempted; even a zero budget advances at least one entry.
+    pub(crate) fn next_batch_with_budget(
+        &mut self,
+        limit: usize,
+        budget: std::time::Duration,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let started = std::time::Instant::now();
+        self.next_batch_while(limit, || started.elapsed() < budget)
+    }
+
+    fn next_batch_while(
+        &mut self,
+        limit: usize,
+        mut within_budget: impl FnMut() -> bool,
+    ) -> Result<Option<Vec<String>>, AppError> {
         if self.done {
             return Ok(None);
         }
         self.validate_roots()?;
         let mut objects = Vec::new();
-        for _ in 0..limit.clamp(1, 4096) {
+        for slot in 0..limit.clamp(1, 4096) {
+            if slot > 0 && !within_budget() {
+                break;
+            }
             if self.walker.is_none() {
                 if self.next_scope >= self.roots.len().saturating_mul(2) {
                     self.done = true;
@@ -1525,7 +1548,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut scan = GcReferenceScan::on_roots(&fragment, roots).unwrap();
+        let mut scan = GcReferenceScan::on_roots(&fragment, roots.clone()).unwrap();
         let mut seen = BTreeSet::new();
         let mut batches = 0;
         while let Some(batch) = scan.next_batch(1).unwrap() {
@@ -1535,7 +1558,28 @@ mod tests {
         }
         assert!(batches >= 3);
         assert_eq!(scan.pointers_read, 3, "each physical NCX must be read once");
-        assert_eq!(seen, BTreeSet::from([first, other, trash_object]));
+        let expected = BTreeSet::from([first, other, trash_object]);
+        assert_eq!(seen, expected);
+
+        // A zero work budget deterministically exhausts the time slice after
+        // one physical entry. Cursor state must still cover every live/trash
+        // replica, including a conflicting or misplaced surviving pointer.
+        let mut budgeted = GcReferenceScan::on_roots(&fragment, roots).unwrap();
+        let mut seen = BTreeSet::new();
+        let mut prior_entries = 0;
+        let mut batches = 0;
+        while let Some(batch) = budgeted
+            .next_batch_with_budget(128, std::time::Duration::ZERO)
+            .unwrap()
+        {
+            assert!(budgeted.entries_visited.saturating_sub(prior_entries) <= 1);
+            prior_entries = budgeted.entries_visited;
+            batches += 1;
+            assert!(batches <= 32, "time slicing must not starve the cursor");
+            seen.extend(batch);
+        }
+        assert_eq!(budgeted.pointers_read, 3);
+        assert_eq!(seen, expected);
         fs::remove_dir_all(base).unwrap();
     }
 

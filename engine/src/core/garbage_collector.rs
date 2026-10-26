@@ -591,10 +591,12 @@ fn record_gc_preservation_error(fragment: &str, context: &str, error: impl std::
     });
 }
 
-// Rejoin the existing scheduler between bounded groups of objects instead of
-// holding one background permit for an entire storage-pool traversal. This is
-// admission cooperation, not a claim that filesystem IOPS have a fixed cost.
+// Bound each traversal admission by entries AND elapsed work. A single slow
+// syscall or object reclamation cannot be preempted, but it must not buy GC
+// another 127 objects before foreground clients receive service.
 const GC_OBJECTS_PER_ADMISSION: usize = 128;
+const GC_ADMISSION_WORK_BUDGET: Duration = Duration::from_millis(32);
+const GC_FOREGROUND_SERVICE_MAX: Duration = Duration::from_secs(1);
 
 struct GcIoScope {
     guard: Option<DiskIoGuard>,
@@ -603,11 +605,45 @@ struct GcIoScope {
     admission_started: std::time::Instant,
 }
 
-fn foreground_yield_duration(work: Duration, queued_foreground: usize) -> Duration {
-    if queued_foreground == 0 {
+fn foreground_yield_duration(work: Duration, foreground_pending: bool) -> Duration {
+    if !foreground_pending {
         Duration::ZERO
     } else {
-        work.min(Duration::from_millis(250))
+        // Give scheduler-admitted foreground I/O a GC-free service window of
+        // four work units. Include ACTIVE demand: an empty waiter
+        // queue does not mean the physical drives are idle. The finite cap
+        // permits another GC slice even under uninterrupted foreground load.
+        work.saturating_mul(4)
+            .clamp(GC_ADMISSION_WORK_BUDGET, GC_FOREGROUND_SERVICE_MAX)
+    }
+}
+
+fn foreground_service_delay(remaining: Duration, foreground_pending: bool) -> Duration {
+    if foreground_pending {
+        remaining.min(GC_ADMISSION_WORK_BUDGET)
+    } else {
+        Duration::ZERO
+    }
+}
+
+async fn foreground_service_window_with(
+    pause: Duration,
+    mut foreground_pending: impl FnMut() -> bool,
+    mut stopped: impl FnMut() -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + pause;
+    loop {
+        if stopped() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let delay = foreground_service_delay(remaining, foreground_pending());
+        if delay.is_zero() {
+            return true;
+        }
+        // Foreground can drain or GC can be stopped during its service window;
+        // do not impose a full second of artificial delay on an idle server.
+        sleep(delay).await;
     }
 }
 
@@ -642,28 +678,40 @@ impl GcIoScope {
 
     fn rejoin_due(&self) -> bool {
         self.objects_in_admission.saturating_add(1) >= GC_OBJECTS_PER_ADMISSION
+            || self.admission_started.elapsed() >= GC_ADMISSION_WORK_BUDGET
     }
 
     async fn cooperate(&mut self, fragment_boundary: bool) -> Result<bool, AppError> {
+        self.cooperate_at_boundary(fragment_boundary || self.rejoin_due())
+            .await
+    }
+
+    async fn cooperate_at_boundary(&mut self, rejoining: bool) -> Result<bool, AppError> {
         self.heartbeat();
         if should_stop_gc() {
             return Ok(false);
         }
         self.objects_in_admission = self.objects_in_admission.saturating_add(1);
-        if !fragment_boundary && self.objects_in_admission < GC_OBJECTS_PER_ADMISSION {
+        if !rejoining {
             return Ok(true);
         }
         let work = self.admission_started.elapsed();
         self.complete();
-        let foreground = crate::core::io_scheduler::disk_io_scheduler_snapshot().queued_foreground;
+        let foreground = crate::core::io_scheduler::foreground_io_pending();
         // Returning a reserved background permit alone cannot give the same
-        // physical drive a foreground-only service window. Give queued clients
-        // a bounded window, while guaranteeing GC can continue under load.
+        // physical drive a foreground-only service window. Give active OR
+        // queued clients a bounded window; GC resumes even under steady load.
         let pause = foreground_yield_duration(work, foreground);
         if pause.is_zero() {
             tokio::task::yield_now().await;
-        } else {
-            sleep(pause).await;
+        } else if !foreground_service_window_with(
+            pause,
+            crate::core::io_scheduler::foreground_io_pending,
+            should_stop_gc,
+        )
+        .await
+        {
+            return Ok(false);
         }
         self.guard = acquire_gc_io(self.fragment.as_deref()).await?;
         self.objects_in_admission = 0;
@@ -712,7 +760,10 @@ async fn continue_fragment_gc(
         // from being admitted. Recheck durable export protection afterwards.
         drop(export_guard.take());
     }
-    if !io_scope.cooperate(false).await? {
+    // Use the exact same boundary decision that released export protection.
+    // Rechecking elapsed time inside cooperate could cross the time budget
+    // here and otherwise sleep/requeue while still holding that protection.
+    if !io_scope.cooperate_at_boundary(rejoining).await? {
         return Ok(false);
     }
     if rejoining && !gc_members_available(fragment, blob_roots) {
@@ -737,7 +788,8 @@ async fn collect_fragment_references(
         // cursor across bounded blocking jobs instead of occupying an async
         // request worker or rebuilding a sorted inventory for every batch.
         let (next_scan, batch) = tokio::task::spawn_blocking(move || {
-            let batch = scan.next_batch(GC_OBJECTS_PER_ADMISSION);
+            let batch =
+                scan.next_batch_with_budget(GC_OBJECTS_PER_ADMISSION, GC_ADMISSION_WORK_BUDGET);
             (scan, batch)
         })
         .await
@@ -1276,17 +1328,100 @@ mod tests {
     #[test]
     fn gc_foreground_service_window_is_bounded_and_never_disables_collection() {
         assert_eq!(
-            super::foreground_yield_duration(Duration::from_secs(5), 0),
+            super::foreground_yield_duration(Duration::from_secs(5), false),
             Duration::ZERO
         );
         assert_eq!(
-            super::foreground_yield_duration(Duration::from_millis(10), 8),
-            Duration::from_millis(10)
+            super::foreground_yield_duration(Duration::from_millis(10), true),
+            Duration::from_millis(40)
         );
         assert_eq!(
-            super::foreground_yield_duration(Duration::from_secs(30), 8),
-            Duration::from_millis(250)
+            super::foreground_yield_duration(Duration::from_secs(30), true),
+            super::GC_FOREGROUND_SERVICE_MAX
         );
+        assert_eq!(
+            super::foreground_yield_duration(Duration::ZERO, true),
+            super::GC_ADMISSION_WORK_BUDGET
+        );
+    }
+
+    #[test]
+    fn gc_continuous_foreground_gets_service_without_starving_collection() {
+        // Advance a deterministic clock through repeated slices with demand
+        // continuously present. A busy client cannot reset GC's wake deadline.
+        let work = Duration::from_millis(32);
+        let mut elapsed = Duration::ZERO;
+        let mut completed_gc_slices = 0;
+        for _ in 0..100 {
+            elapsed += work;
+            let mut remaining = super::foreground_yield_duration(work, true);
+            let mut polls = 0;
+            loop {
+                let delay = super::foreground_service_delay(remaining, true);
+                if delay.is_zero() {
+                    break;
+                }
+                assert!(delay <= super::GC_ADMISSION_WORK_BUDGET);
+                elapsed += delay;
+                remaining = remaining.saturating_sub(delay);
+                polls += 1;
+                assert!(polls <= 32, "GC must regain service under steady demand");
+            }
+            completed_gc_slices += 1;
+        }
+        assert_eq!(completed_gc_slices, 100);
+        assert_eq!(elapsed, work * 500);
+    }
+
+    #[test]
+    fn gc_foreground_window_ends_as_soon_as_demand_clears() {
+        assert_eq!(
+            super::foreground_service_delay(super::GC_FOREGROUND_SERVICE_MAX, false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::foreground_service_delay(Duration::ZERO, true),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::foreground_service_delay(super::GC_FOREGROUND_SERVICE_MAX, true),
+            super::GC_ADMISSION_WORK_BUDGET
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_service_wait_checks_stop_and_idle_before_sleeping() {
+        assert!(
+            super::foreground_service_window_with(
+                super::GC_FOREGROUND_SERVICE_MAX,
+                || false,
+                || false,
+            )
+            .await
+        );
+        assert!(
+            !super::foreground_service_window_with(
+                super::GC_FOREGROUND_SERVICE_MAX,
+                || panic!("stopping must not inspect demand or wait"),
+                || true,
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn gc_rejoins_after_slow_work_even_before_count_limit() {
+        let mut scope = super::GcIoScope {
+            guard: None,
+            fragment: None,
+            objects_in_admission: 1,
+            admission_started: std::time::Instant::now(),
+        };
+        scope.admission_started -= super::GC_ADMISSION_WORK_BUDGET;
+        assert!(scope.rejoin_due());
+        scope.admission_started = std::time::Instant::now();
+        scope.objects_in_admission = super::GC_OBJECTS_PER_ADMISSION - 1;
+        assert!(scope.rejoin_due());
     }
     use std::os::unix::fs::symlink;
     use std::time::Duration;
@@ -1389,7 +1524,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        io_scope.objects_in_admission = super::GC_OBJECTS_PER_ADMISSION - 1;
+        // Exercise the elapsed-time boundary, not only a full 128-object
+        // admission: a slow first object must release export protection too.
+        io_scope.objects_in_admission = 1;
+        io_scope.admission_started -= super::GC_ADMISSION_WORK_BUDGET;
         let export_guard = crate::core::export::gc_reclaim_guard(&fragment)
             .await
             .unwrap();
@@ -1649,10 +1787,17 @@ mod tests {
         let first = own_operation().expect("background GC admission is observable");
         assert_eq!(first.class, "background_gc");
         for _ in 1..super::GC_OBJECTS_PER_ADMISSION {
-            assert!(scope.cooperate(false).await.unwrap());
+            // Count-only regression: elapsed-time admission has its own test.
+            // Explicit decisions avoid wall-clock flakiness under CI load.
+            assert!(scope.cooperate_at_boundary(false).await.unwrap());
             assert_eq!(own_operation().unwrap().operation_id, first.operation_id);
         }
-        assert!(scope.cooperate(false).await.unwrap());
+        assert!(
+            scope
+                .cooperate_at_boundary(scope.rejoin_due())
+                .await
+                .unwrap()
+        );
         assert_ne!(own_operation().unwrap().operation_id, first.operation_id);
         scope.complete();
         assert!(own_operation().is_none());

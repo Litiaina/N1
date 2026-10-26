@@ -79,6 +79,72 @@ class CommitCompareSafety(unittest.TestCase):
                                   'ambiguous-write-outcomes', 'complete-namespace-ledger-comparison'])
         self.assertEqual(fixture.report['status'], 'PASS')
 
+    def test_initial_comparison_label_does_not_claim_gc_is_absent(self):
+        fixture = compare.Clone.__new__(compare.Clone)
+        fixture.start, fixture.stop, fixture.authenticate = Mock(), Mock(), Mock()
+        fixture.snapshot_verify = Mock()
+        fixture.report, fixture.fault = {}, None
+        fixture.args = SimpleNamespace(objects=2)
+        phases = []
+        fixture.phase_run = lambda name, action: phases.append(name)
+        fixture.compare()
+        self.assertIn('strict-initial-load', phases)
+        self.assertNotIn('strict-foreground-only', phases)
+        self.assertIn('strict-with-normal-scheduled-gc', phases)
+
+    def test_initial_load_reports_observed_gc_independently_of_requirement(self):
+        for running in (False, True):
+            with self.subTest(running=running), tempfile.TemporaryDirectory() as temporary:
+                fixture = compare.Clone.__new__(compare.Clone)
+                fixture.root = Path(temporary)
+                fixture.args = SimpleNamespace(batch_size=2, batch_clients=1, request_timeout_seconds=1)
+                fixture.counts = {'source_objects': 0}
+                observed = threading.Event()
+                def telemetry():
+                    if threading.current_thread() is not threading.main_thread():
+                        observed.set()
+                    return dict(gc=dict(is_running=running, start_timestamp=123))
+                fixture.telemetry = telemetry
+                def upload(interval):
+                    self.assertTrue(observed.wait(2), 'Missing upload-time GC observation')
+                    fixture.counts['source_objects'] += interval[1] - interval[0]
+                fixture.upload_batch = upload
+                result = fixture.ingest(0, 2)
+                self.assertFalse(result['scheduled_gc_required'])
+                self.assertEqual(result['scheduled_gc_overlap'], running)
+                self.assertGreaterEqual(result['telemetry_samples'], 1)
+                self.assertEqual(result['scheduled_gc_overlap_samples'], result['telemetry_samples'] if running else 0)
+
+    def test_required_gc_phase_needs_upload_observation_and_cycle_completion(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap), tempfile.TemporaryDirectory() as temporary:
+                fixture = compare.Clone.__new__(compare.Clone)
+                fixture.root = Path(temporary)
+                fixture.args = SimpleNamespace(batch_size=2, batch_clients=1,
+                                               request_timeout_seconds=1, gc_wait_seconds=1)
+                fixture.counts = {'source_objects': 0}
+                fixture.wait_for_scheduled_gc = Mock(return_value=dict(gc=dict(is_running=True, start_timestamp=123)))
+                observed = threading.Event()
+                def telemetry():
+                    if threading.current_thread() is not threading.main_thread():
+                        observed.set()
+                        return dict(gc=dict(is_running=overlap, start_timestamp=123))
+                    return dict(gc=dict(is_running=False, start_timestamp=123, total_errors=0, last_error=None))
+                fixture.telemetry = telemetry
+                def upload(interval):
+                    self.assertTrue(observed.wait(2))
+                    fixture.counts['source_objects'] += interval[1] - interval[0]
+                fixture.upload_batch = upload
+                if overlap:
+                    result = fixture.ingest(0, 2, require_gc=True)
+                    self.assertTrue(result['scheduled_gc_required'])
+                    self.assertTrue(result['scheduled_gc_overlap'])
+                    self.assertGreaterEqual(result['scheduled_gc_overlap_samples'], 1)
+                else:
+                    with self.assertRaisesRegex(AssertionError, 'No scheduled GC overlapped'):
+                        fixture.ingest(0, 2, require_gc=True)
+                fixture.wait_for_scheduled_gc.assert_called_once_with()
+
 
 if __name__ == '__main__':
     unittest.main()

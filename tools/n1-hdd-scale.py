@@ -459,6 +459,8 @@ class Scale(base.Stress):
         finally:
             self.record_batch_timing(phase, 'acknowledgement_ledger', acknowledged_at)
         assert len(seen) == len(expected), 'Batch response omitted source files'
+        if failures:
+            self.capture_batch_failure(interval, failures)
         if failures and getattr(self.args, 'accept_admission_refusals', False):
             assert all(result['status'] == 503 for result in failures), failures
             with self.lock:
@@ -468,6 +470,51 @@ class Scale(base.Stress):
         else:
             assert not failures, f'Batch refused {len(failures)} objects: {failures[:3]}'
         assert reply['succeeded'] == len(records) and reply['failed'] == len(failures), reply
+
+    def capture_batch_failure(self, interval, failures):
+        """Best-effort, bounded diagnostics; never retry or mask a refused write.
+
+        Keep safety sampling independent of these API reads. A fresh connection
+        has a two-second socket deadline, bounded bodies, and no refresh/deep
+        scan. Successful benchmark requests incur none of this extra work.
+        """
+        evidence = dict(elapsed_seconds=round(time.monotonic()-self.started, 3),
+                        interval=list(interval), refused_objects=len(failures),
+                        failure_samples=failures[:3], automatic_write_retries=False)
+        connection = None
+        try:
+            connection = http.client.HTTPSConnection('127.0.0.1', self.args.port,
+                                                     context=self.tls, timeout=2)
+            headers = {'Authorization': 'Bearer ' + self.token}
+            for label, route in (('health', '/maintenance/health'),
+                                 ('gc', '/maintenance/gc/status')):
+                connection.request('GET', '/noa/v1' + route, headers=headers)
+                response = connection.getresponse()
+                body = response.read(1024 * 1024 + 1)
+                assert response.status == 200 and len(body) <= 1024 * 1024, (
+                    f'{label} diagnostic HTTP {response.status} or oversized response')
+                data = json.loads(body)
+                if label == 'health':
+                    assert data['io_control']['process']['pid'] == self.process.pid, (
+                        'Diagnostic response belongs to another engine')
+                    evidence[label] = {key: data[key] for key in
+                                       ('system', 'io_scheduler', 'io_control') if key in data}
+                else:
+                    evidence[label] = data
+        except Exception as error:
+            evidence['diagnostic_error'] = f'{type(error).__name__}: {error}'
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError as error:
+                    evidence.setdefault('diagnostic_error', f'{type(error).__name__}: {error}')
+        try:
+            path = self.root / ('batch-failure-' + secrets.token_hex(8) + '.json')
+            with path.open('x') as stream:
+                json.dump(evidence, stream, indent=2)
+        except Exception as error:
+            print(f'Unable to retain batch-failure diagnostics: {error}', file=sys.stderr, flush=True)
 
     def verify_row(self, row):
         key, version, expected, size, _ = row
@@ -497,13 +544,17 @@ class Scale(base.Stress):
         assert healer['last_availability_scan_at'] is None and healer['last_checksum_scrub_at'] is None, (
             'An unsolicited full-object scan ran during the scale workload')
         latency, scheduler = health['io_control']['latency'], health['io_scheduler']
+        gc = self.api('GET', '/maintenance/gc/status')
+        assert isinstance(gc, dict) and isinstance(gc.get('is_running'), bool), 'Invalid GC telemetry'
         sample = dict(phase=self.phase, elapsed_seconds=time.monotonic()-self.started,
-                      io_latency=latency, io_scheduler=scheduler, io_backend=backend, **usage)
+                      io_latency=latency, io_scheduler=scheduler, io_backend=backend,
+                      gc=gc, **usage)
         with (self.root / 'engine-resource-checkpoints.jsonl').open('a') as stream:
             stream.write(json.dumps(sample) + '\n')
         return {'engine_reported_resources': usage, 'quiescent_fd_budget': 2048,
                 'no_automatic_object_scans': True, 'engine_io_latency': latency,
-                'engine_io_scheduler': scheduler, 'engine_io_backend': backend}
+                'engine_io_scheduler': scheduler, 'engine_io_backend': backend,
+                'engine_gc_status': gc}
 
     def prefix_keys(self, prefix, limit=73):
         """Stream zero-decode object-prefix pages with O(page) client memory."""

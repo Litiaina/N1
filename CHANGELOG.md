@@ -5,6 +5,20 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## Unreleased — bounded maintenance and upload performance
 
+- Share only pending, sealed filesystem flush rounds between concurrent small
+  batches. Late writers require a new flush; writeback errors fail every live
+  attached group without retry. Keep all three ordered durability barriers,
+  pre/post root validation and ordinary immutable storage files. Add bounded
+  per-device flush timing; this does not eliminate filesystem-wide coupling.
+- Pace GC at entry-count or elapsed-time boundaries. Give active and queued
+  foreground work finite service windows, without disabling collection or
+  weakening reference, upload, export or TTL protection.
+- Separate CPU execution from I/O wait and sample counters coherently. Do not
+  interpret I/O-blocked load average alone as CPU saturation; retain configured
+  concurrency ceilings and actual CPU, memory and stall safeguards.
+- Retain read-only GC/flush diagnostics on a refused scale-test batch, and
+  support exact enrolled EC topology when independently cloning failed test
+  populations for verification and matched comparisons.
 - Isolate the namespace key-lock cleanup regression from unrelated parallel
   tests; preserve the failed qualification and require a fresh complete rerun.
   This changes no runtime behavior, storage format or RC version.
