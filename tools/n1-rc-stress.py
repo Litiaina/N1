@@ -196,9 +196,11 @@ class Stress:
         log = (self.root/f'engine-{label}.log').open('wb')
         environment = {key: value for key, value in os.environ.items() if not key.startswith('N1_')}
         environment.update(RUST_LOG='info', RUST_BACKTRACE='1', N1_REFRESH_STORE_ROOT=str(self.root/'refresh'))
-        self.process = subprocess.Popen([str(self.args.binary)], cwd=self.root, env=environment, stdout=log, stderr=log)
+        process = subprocess.Popen([str(self.args.binary)], cwd=self.root, env=environment, stdout=log, stderr=log)
         log.close()
-        self.generation += 1
+        with self.lock:
+            self.process = process
+            self.generation += 1
         deadline = time.monotonic()+45
         while time.monotonic() < deadline:
             assert self.process.poll() is None, 'Owned engine exited during startup'
@@ -211,10 +213,11 @@ class Stress:
         raise AssertionError('Owned engine startup timeout')
 
     def stop(self):
-        process = self.process
         # The sampler must not mistake our intentional SIGKILL/restart for an
         # unexpected engine exit while wait() reaps this owned child.
-        self.process = None
+        with self.lock:
+            process = self.process
+            self.process = None
         if process is not None:
             if process.poll() is None:
                 process.kill()

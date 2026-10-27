@@ -695,6 +695,12 @@ Streams every live user-facing namespace file exactly once as
 immutable `version_id`, content type, byte size, and creation time. A successful
 stream always ends with one `complete` frame containing the exact entry count.
 
+For long inventories, request `?progress=true` to also receive `progress` frames
+with increasing `scanned_entries` and the `entry_count` emitted so far. These
+report actual traversal, including skipped replicas, not successful completion.
+They keep advancing scans distinguishable from stalled connections without
+increasing an idle timeout. The default stream remains `entry`/`complete` only.
+
 This endpoint is intended for disposable search/index projections such as
 Litiaina Accel. It performs one bounded-memory namespace traversal, does not
 read object payloads, does not expose physical object identities, and requires

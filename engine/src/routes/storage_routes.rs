@@ -60,7 +60,7 @@ use crate::middleware::auth_middleware::{
     authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
-use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
+use crate::namespace::runtime::{NamespaceScanEvent, global_namespace_runtime, logical_not_found};
 use crate::posix::routes::{build_posix_read_routes, build_posix_write_routes};
 use crate::routes::accel_routes::proxy_namespace_search;
 use crate::structs::auth_structs::Claims;
@@ -107,6 +107,16 @@ enum NamespaceSnapshotFrame {
     Complete {
         entry_count: usize,
     },
+    Progress {
+        scanned_entries: u64,
+        entry_count: usize,
+    },
+}
+
+#[derive(Default, Deserialize)]
+struct NamespaceSnapshotOptions {
+    #[serde(default)]
+    progress: bool,
 }
 
 pub struct AppState {
@@ -464,37 +474,77 @@ async fn list_trash_objects_scoped(
     ))
 }
 
-async fn stream_namespace_snapshot_scoped(claims: Claims) -> Result<Response<Body>, AppError> {
+async fn stream_namespace_snapshot_scoped(
+    claims: Claims,
+    Query(options): Query<NamespaceSnapshotOptions>,
+) -> Result<Response<Body>, AppError> {
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
     let fragment = claims.fragment;
-    let mut source = global_namespace_runtime().stream_live_object_refs(
+    let source = global_namespace_runtime().stream_live_object_refs_with_progress(
         &fragment,
         None,
         NAMESPACE_SNAPSHOT_CHANNEL_CAPACITY,
     );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "private, no-store")
+        .body(namespace_snapshot_body(source, options.progress))
+        .map_err(|error| AppError::InternalServerError(error.to_string()))
+}
+
+fn namespace_snapshot_body(
+    mut source: tokio::sync::mpsc::Receiver<Result<NamespaceScanEvent, AppError>>,
+    include_progress: bool,
+) -> Body {
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(
         NAMESPACE_SNAPSHOT_CHANNEL_CAPACITY,
     );
     tokio::spawn(async move {
         let mut entry_count = 0usize;
+        let mut finished = false;
         while let Some(result) = source.recv().await {
-            let object = match result {
-                Ok(object) => object,
+            if sender.is_closed() {
+                return;
+            }
+            if finished {
+                let _ = sender
+                    .send(Err(std::io::Error::other(
+                        "namespace event after completion",
+                    )))
+                    .await;
+                return;
+            }
+            let frame = match result {
+                Ok(NamespaceScanEvent::Finished) => {
+                    finished = true;
+                    continue;
+                }
+                Ok(NamespaceScanEvent::Object(object)) => {
+                    entry_count = entry_count.saturating_add(1);
+                    NamespaceSnapshotFrame::Entry {
+                        object_key: object.path,
+                        version_id: object.version_id,
+                        content_type: object.content_type,
+                        total_size_bytes: object.total_size_bytes,
+                        created_at: object.created_at,
+                    }
+                }
+                Ok(NamespaceScanEvent::Progress { scanned_entries }) if include_progress => {
+                    NamespaceSnapshotFrame::Progress {
+                        scanned_entries,
+                        entry_count,
+                    }
+                }
+                Ok(NamespaceScanEvent::Progress { .. }) => continue,
                 Err(error) => {
                     let _ = sender
                         .send(Err(std::io::Error::other(error.to_string())))
                         .await;
                     return;
                 }
-            };
-            let frame = NamespaceSnapshotFrame::Entry {
-                object_key: object.path,
-                version_id: object.version_id,
-                content_type: object.content_type,
-                total_size_bytes: object.total_size_bytes,
-                created_at: object.created_at,
             };
             let mut encoded = match serde_json::to_vec(&frame) {
                 Ok(encoded) => encoded,
@@ -507,7 +557,14 @@ async fn stream_namespace_snapshot_scoped(claims: Claims) -> Result<Response<Bod
             if sender.send(Ok(Bytes::from(encoded))).await.is_err() {
                 return;
             }
-            entry_count = entry_count.saturating_add(1);
+        }
+        if !finished {
+            let _ = sender
+                .send(Err(std::io::Error::other(
+                    "namespace scan ended without completion",
+                )))
+                .await;
+            return;
         }
         let mut encoded =
             match serde_json::to_vec(&NamespaceSnapshotFrame::Complete { entry_count }) {
@@ -521,12 +578,7 @@ async fn stream_namespace_snapshot_scoped(claims: Claims) -> Result<Response<Bod
         let _ = sender.send(Ok(Bytes::from(encoded))).await;
     });
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/x-ndjson")
-        .header("cache-control", "private, no-store")
-        .body(Body::from_stream(ReceiverStream::new(receiver)))
-        .map_err(|error| AppError::InternalServerError(error.to_string()))
+    Body::from_stream(ReceiverStream::new(receiver))
 }
 
 async fn list_object_versions_scoped(
@@ -2680,18 +2732,106 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_snapshot_requires_read_authority() {
-        let result = stream_namespace_snapshot_scoped(Claims {
-            operator: false,
-            fragment: "@f_snapshot-test-forbidden".into(),
-            fragment_alias: None,
-            read: false,
-            write: true,
-            modify: true,
-            delete: true,
-            exp: usize::MAX,
-        })
+        let result = stream_namespace_snapshot_scoped(
+            Claims {
+                operator: false,
+                fragment: "@f_snapshot-test-forbidden".into(),
+                fragment_alias: None,
+                read: false,
+                write: true,
+                modify: true,
+                delete: true,
+                exp: usize::MAX,
+            },
+            Query(NamespaceSnapshotOptions::default()),
+        )
         .await;
         assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn namespace_snapshot_progress_is_opt_in_and_not_completion() {
+        use crate::namespace::runtime::NamespaceObjectRef;
+        for include_progress in [false, true] {
+            let (sender, source) = tokio::sync::mpsc::channel(4);
+            sender
+                .send(Ok(NamespaceScanEvent::Object(NamespaceObjectRef {
+                    path: "a".into(),
+                    object_id: "private-identity".into(),
+                    version_id: "v1".into(),
+                    content_type: "text/plain".into(),
+                    total_size_bytes: 7,
+                    created_at: 0,
+                })))
+                .await
+                .unwrap();
+            sender
+                .send(Ok(NamespaceScanEvent::Progress {
+                    scanned_entries: 1024,
+                }))
+                .await
+                .unwrap();
+            sender.send(Ok(NamespaceScanEvent::Finished)).await.unwrap();
+            drop(sender);
+            let bytes = to_bytes(namespace_snapshot_body(source, include_progress), 65536)
+                .await
+                .unwrap();
+            let frames: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(frames.len(), if include_progress { 3 } else { 2 });
+            assert_eq!(frames[0]["kind"], "entry");
+            assert!(frames[0].get("object_id").is_none());
+            if include_progress {
+                assert_eq!(frames[1]["kind"], "progress");
+                assert_eq!(frames[1]["entry_count"], 1);
+                assert_eq!(frames[1]["scanned_entries"], 1024);
+            }
+            assert_eq!(frames.last().unwrap()["kind"], "complete");
+            assert_eq!(frames.last().unwrap()["entry_count"], 1);
+        }
+        let (sender, source) = tokio::sync::mpsc::channel(2);
+        sender
+            .send(Ok(NamespaceScanEvent::Progress {
+                scanned_entries: 128,
+            }))
+            .await
+            .unwrap();
+        sender
+            .send(Err(AppError::ServiceUnavailable(
+                "incomplete inventory".into(),
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+        assert!(
+            to_bytes(namespace_snapshot_body(source, true), 65536)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_snapshot_requires_explicit_successful_scan_end() {
+        let (sender, source) = tokio::sync::mpsc::channel(1);
+        drop(sender); // A failed/panicked producer must not publish an empty success.
+        assert!(
+            to_bytes(namespace_snapshot_body(source, false), 65536)
+                .await
+                .is_err()
+        );
+        let (sender, source) = tokio::sync::mpsc::channel(1);
+        sender.send(Ok(NamespaceScanEvent::Finished)).await.unwrap();
+        drop(sender);
+        let bytes = to_bytes(namespace_snapshot_body(source, false), 65536)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "{\"kind\":\"complete\",\"entry_count\":0}\n"
+        );
     }
 
     #[test]

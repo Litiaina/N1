@@ -8,6 +8,7 @@ and recover-on-read retain their normal repair behavior; no uploads are issued.
 import argparse
 from collections import Counter, defaultdict
 import configparser
+import hashlib
 import importlib.util
 import json
 import os
@@ -29,6 +30,12 @@ spec = importlib.util.spec_from_file_location('hdd_scale', Path(__file__).with_n
 scale = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(scale)
 base = scale.base
+
+
+def file_digest(path):
+    """Hash evidence without loading a million-row ledger into client memory."""
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
 def fixture_member(root, parent):
@@ -152,6 +159,9 @@ class Recheck(base.Stress):
     verify_all = scale.Scale.verify_all
     snapshot_verify = scale.Scale.snapshot_verify
 
+    def validate_binary(self, checksum, original):
+        assert checksum == original['engine_sha256'], 'Recheck the exact failed candidate first'
+
     def __init__(self, args):
         self.args, self.root = args, args.root.resolve()
         fixture = args.fixture.resolve(strict=True)
@@ -168,8 +178,8 @@ class Recheck(base.Stress):
                 probe.bind(('127.0.0.1', port))
         original = json.loads((fixture / 'results.json').read_text())
         self.io_backend = args.io_backend = source_io_backend(fixture, original)
-        checksum = base.digest(args.binary.read_bytes())
-        assert checksum == original['engine_sha256'], 'Recheck the exact failed candidate first'
+        checksum = file_digest(args.binary)
+        self.validate_binary(checksum, original)
         self.fragment = fixture_fragment(self.roots)
         destination_parents = getattr(args, 'clone_member_parent', None)
         assert args.clone or not destination_parents, 'Clone destinations require --clone'
@@ -183,7 +193,7 @@ class Recheck(base.Stress):
             assert not any((path / '.n1-pool.json').exists() for path in (parent, *parent.parents)), (
                 'Clone parent must not be inside an enrolled root')
         self.root.mkdir(mode=0o700)
-        self.original_evidence = {fixture / name: base.digest((fixture / name).read_bytes())
+        self.original_evidence = {fixture / name: file_digest(fixture / name)
             for name in ('results.json', 'acknowledgements.sqlite', 'acknowledgements.jsonl',
                          'n1_config.ini', 'n1.env', 'ambiguous-batches.jsonl') if (fixture / name).exists()}
         if args.clone:
@@ -213,7 +223,7 @@ class Recheck(base.Stress):
         self.started = time.monotonic()
         self.storage_devices = {path: path.stat().st_dev for path in [self.root] + self.roots}
         source = source_ledger(fixture)
-        self.db = sqlite3.connect(self.root / 'acknowledgements.sqlite')
+        self.db = sqlite3.connect(self.root / 'acknowledgements.sqlite', check_same_thread=False)
         try:
             source.backup(self.db)
         finally:
@@ -289,7 +299,7 @@ class Recheck(base.Stress):
         self.db.close()
         self.report.update(elapsed_seconds=round(time.monotonic() - self.started, 3), counts=dict(self.counts),
                            latencies={name: histogram.summary() for name, histogram in self.latency.items()})
-        self.report['original_reports_and_ledgers_unchanged'] = all(base.digest(path.read_bytes()) == checksum
+        self.report['original_reports_and_ledgers_unchanged'] = all(file_digest(path) == checksum
             for path, checksum in self.original_evidence.items())
         if not self.report['original_reports_and_ledgers_unchanged']:
             self.report.update(status='FAIL', error='Original evidence changed')

@@ -225,6 +225,220 @@ fn publish_logical_object(
 }
 
 #[tokio::test]
+async fn snapshot_scan_validates_once_per_key_and_reports_duplicate_tail_progress() {
+    let _guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let fragment = format!("snapshot-tail-{}", Ulid::new());
+    let object = publish_logical_object(&roots, &fragment, "base", 17);
+    let pointer_bytes = fs::read(flat::path(&roots[0], &fragment, "base")).unwrap();
+    let mut expected = BTreeSet::from(["base".to_string()]);
+    for i in 0..1024 {
+        let key = format!("tail/item-{i:04}");
+        for root in &roots {
+            let path = flat::path(root, &fragment, &key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &pointer_bytes).unwrap();
+        }
+        expected.insert(key);
+    }
+
+    let mut scan = flat::Scan::new(&fragment, false).unwrap();
+    let mut observed = BTreeSet::new();
+    let mut progress = Vec::new();
+    while let Some(record) = scan
+        .next_record_with_progress(|entries| {
+            progress.push((entries, observed.len()));
+            Ok(true)
+        })
+        .unwrap()
+    {
+        assert_eq!(record.pointer.object_id, object);
+        assert!(observed.insert(record.key));
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(scan.authoritative_lookups(), expected.len());
+    assert!(progress.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(
+        progress.iter().any(|(_, keys)| *keys == expected.len()),
+        "the non-emitting replica suffix must report real physical progress"
+    );
+
+    let runtime = global_namespace_runtime();
+    let mut events = runtime.stream_live_object_refs_with_progress(&fragment, None, 7);
+    let mut streamed = BTreeSet::new();
+    let mut physical = 0;
+    let mut progress_after_last_object = false;
+    let mut finished = false;
+    while let Some(event) = events.recv().await {
+        assert!(!finished, "no events may follow successful exhaustion");
+        match event.unwrap() {
+            NamespaceScanEvent::Object(reference) => {
+                assert_eq!(reference.object_id, object);
+                assert_eq!(reference.total_size_bytes, 17);
+                assert!(streamed.insert(reference.path));
+            }
+            NamespaceScanEvent::Progress { scanned_entries } => {
+                assert!(scanned_entries > physical);
+                physical = scanned_entries;
+                progress_after_last_object |= streamed.len() == expected.len();
+            }
+            NamespaceScanEvent::Finished => finished = true,
+        }
+    }
+    assert_eq!(streamed, expected);
+    assert!(progress_after_last_object);
+    assert!(finished);
+}
+
+#[tokio::test]
+async fn snapshot_scan_retains_corruption_conflict_and_missing_replica_checks() {
+    let _guard = crate::test_support::global_test_lock().lock().await;
+    let mut roots = ensure_test_index_roots();
+    roots.sort();
+    let fragment = format!("snapshot-replicas-{}", Ulid::new());
+    let mut expected = BTreeSet::new();
+    for (i, key) in ["healthy", "missing", "corrupt"].into_iter().enumerate() {
+        expected.insert(publish_logical_object(&roots, &fragment, key, i as u64 + 9));
+    }
+    fs::remove_file(flat::path(&roots[0], &fragment, "missing")).unwrap();
+    fs::write(flat::path(&roots[0], &fragment, "corrupt"), b"bad NCX").unwrap();
+    let mut physical_roots = roots.clone();
+    physical_roots.extend(ObjectPathManager::new().get_blob_roots());
+    physical_roots.sort();
+    physical_roots.dedup();
+    let before = physical_roots
+        .iter()
+        .flat_map(|root| {
+            walkdir::WalkDir::new(fragment_root_on(root, &fragment))
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| (entry.path().to_path_buf(), fs::read(entry.path()).unwrap()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut receiver = global_namespace_runtime().stream_live_object_refs(&fragment, None, 1);
+    let mut observed = BTreeSet::new();
+    while let Some(result) = receiver.recv().await {
+        assert!(observed.insert(result.unwrap().object_id));
+    }
+    assert_eq!(observed, expected);
+    for (path, bytes) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes, "inventory is read-only");
+    }
+
+    let conflicting = flat::Pointer {
+        format: 4,
+        pool_id: String::new(),
+        object_id: new_object_id(),
+    };
+    flat::write(
+        &roots[1],
+        &flat::path(&roots[1], &fragment, "healthy"),
+        &conflicting,
+        false,
+    )
+    .unwrap();
+    let mut scan = flat::Scan::new(&fragment, false).unwrap();
+    let mut conflict = false;
+    loop {
+        match scan.next_record() {
+            Ok(Some(_)) => (),
+            Ok(None) => break,
+            Err(AppError::Conflict(_)) => {
+                conflict = true;
+                break;
+            }
+            Err(error) => panic!("unexpected namespace error: {error}"),
+        }
+    }
+    assert!(
+        conflict,
+        "a conflicting duplicate must not be skipped as healthy"
+    );
+
+    let mut wrong_pool = flat::read(&flat::path(&roots[0], &fragment, "healthy"))
+        .unwrap()
+        .unwrap();
+    wrong_pool.pool_id = "not-the-enrolled-pool".into();
+    flat::write(
+        &roots[1],
+        &flat::path(&roots[1], &fragment, "healthy"),
+        &wrong_pool,
+        false,
+    )
+    .unwrap();
+    let mut scan = flat::Scan::new(&fragment, false).unwrap();
+    loop {
+        match scan.next_record() {
+            Ok(Some(_)) => (),
+            Err(AppError::Conflict(_)) => break,
+            other => panic!(
+                "conflicting pool identity must fail, got {}",
+                match other {
+                    Ok(None) => "completed namespace".to_string(),
+                    Err(error) => error.to_string(),
+                    Ok(Some(_)) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    let all_corrupt = format!("snapshot-all-corrupt-{}", Ulid::new());
+    publish_logical_object(&roots, &all_corrupt, "key", 2);
+    for root in &roots {
+        fs::write(flat::path(root, &all_corrupt, "key"), b"bad NCX").unwrap();
+    }
+    assert!(
+        flat::Scan::new(&all_corrupt, false)
+            .unwrap()
+            .next_record()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn snapshot_reuses_validated_pointer_and_stops_cancelled_duplicate_walk() {
+    let _guard = crate::test_support::global_test_lock().lock().await;
+    let roots = ensure_test_index_roots();
+    let fragment = format!("snapshot-pointer-{}", Ulid::new());
+    let object = publish_logical_object(&roots, &fragment, "key", 23);
+    let mut scan = flat::Scan::new(&fragment, false).unwrap();
+    let record = scan.next_record().unwrap().unwrap();
+    for root in &roots {
+        fs::remove_file(flat::path(root, &fragment, "key")).unwrap();
+    }
+    let reference = object_ref_with_pointer(&fragment, &record.key, record.pointer).unwrap();
+    assert_eq!(reference.object_id, object);
+    assert_eq!(reference.total_size_bytes, 23);
+
+    let cancelled = format!("snapshot-cancel-{}", Ulid::new());
+    // Non-NCX physical entries still permit cancellation before the 128th
+    // entry is processed, without a full inventory allocation.
+    let base = fragment_root_on(&roots[0], &cancelled).join(flat::LIVE_DIR);
+    fs::create_dir_all(&base).unwrap();
+    for i in 0..256 {
+        fs::write(base.join(format!("ignored-{i:04}.tmp")), b"not NCX").unwrap();
+    }
+    let mut cancelled_scan = flat::Scan::new(&cancelled, false).unwrap();
+    assert!(
+        cancelled_scan
+            .next_record_with_progress(|visited| {
+                assert_eq!(visited, 128);
+                Ok(false)
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cancelled_scan.entries_visited(), 128);
+    assert_eq!(cancelled_scan.authoritative_lookups(), 0);
+    assert!(
+        !cancelled_scan.completed(),
+        "cancellation is not successful EOF"
+    );
+}
+
+#[tokio::test]
 async fn n1_file_rename_preserves_object_id_and_version_lineage() {
     let _guard = crate::test_support::global_test_lock().lock().await;
     let roots = ensure_test_index_roots();

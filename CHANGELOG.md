@@ -5,6 +5,16 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## Unreleased — bounded maintenance and upload performance
 
+- Reduce full namespace-inventory I/O: reuse the validated NCX identity, avoid
+  repeated authoritative lookups for duplicate replicas, and select the newest
+  immutable NDX in one directory pass per member. Retain replica-conflict,
+  corruption and maximum-ULID checks; change no storage encoding.
+- Add opt-in, actual-traversal progress to namespace snapshots. Require explicit
+  successful scan exhaustion before emitting completion; a failed producer is
+  not an empty success. Preserve the default entry/completion stream.
+- Continue failed post-upload qualifications in place with pinned source/build
+  evidence, bounded probe discovery and independent results. Preserve original
+  failures; do not clone member storage or repeat the million-object upload.
 - Share only pending, sealed filesystem flush rounds between concurrent small
   batches. Late writers require a new flush; writeback errors fail every live
   attached group without retry. Keep all three ordered durability barriers,

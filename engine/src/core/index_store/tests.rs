@@ -1947,6 +1947,83 @@ fn current_head_uses_max_ulid_across_blob_placements() {
 }
 
 #[test]
+fn current_head_uses_a_valid_latest_replica_but_never_falls_back_to_an_old_version() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let _ = ensure_test_index_roots();
+    let roots = ensure_test_blob_roots();
+    assert!(roots.len() >= 2);
+    let fragment = Ulid::new().to_string();
+    let object_id = new_object_id();
+    let mut old = test_metadata(&fragment, &object_id, 111);
+    old.version_id = "01K00000000000000000000000".to_string();
+    let mut newest = old.clone();
+    newest.version_id = "01K00000000000000000000009".to_string();
+    newest.total_size_bytes = 222;
+    let newest_bytes = encode(&newest).expect("encode latest replica");
+    let mut latest_paths = Vec::new();
+    for root in &roots[..2] {
+        let dir = live_object_dir(root, &fragment, &object_id).expect("object placement");
+        fs::create_dir_all(&dir).expect("create object placement");
+        fs::write(dir.join(ndx_file_name(&old)), encode(&old).unwrap())
+            .expect("write older committed version");
+        let path = dir.join(ndx_file_name(&newest));
+        fs::write(&path, &newest_bytes).expect("write latest replica");
+        latest_paths.push(path);
+    }
+    fs::write(&latest_paths[0], b"corrupt latest replica").expect("corrupt one latest replica");
+
+    let head = read_current_live_head(&fragment, &object_id)
+        .expect("read surviving latest replica")
+        .expect("latest version exists");
+    assert_eq!(head.version_id, newest.version_id);
+    assert_eq!(head.total_size_bytes, 222);
+    assert_eq!(fs::read(&latest_paths[1]).unwrap(), newest_bytes);
+    assert_eq!(
+        fs::read(&latest_paths[0]).unwrap(),
+        b"corrupt latest replica"
+    );
+
+    fs::write(&latest_paths[1], b"second corrupt latest replica")
+        .expect("corrupt final latest replica");
+    assert!(
+        read_current_live_head(&fragment, &object_id).is_err(),
+        "an unreadable newest version must not silently expose an older version"
+    );
+    for root in roots {
+        let _ = fs::remove_dir_all(fragment_root_on(&root, &fragment));
+    }
+}
+
+#[test]
+fn current_head_reads_a_surviving_metadata_placement_without_recreating_missing_data() {
+    let _guard = crate::test_support::global_test_lock().blocking_lock();
+    let _ = ensure_test_index_roots();
+    let roots = ensure_test_blob_roots();
+    assert!(roots.len() >= 2);
+    let fragment = Ulid::new().to_string();
+    let object_id = new_object_id();
+    let metadata = test_metadata(&fragment, &object_id, 333);
+    let missing_dir = live_object_dir(&roots[0], &fragment, &object_id).unwrap();
+    let surviving_dir = live_object_dir(&roots[1], &fragment, &object_id).unwrap();
+    fs::create_dir_all(&surviving_dir).expect("create surviving placement");
+    let bytes = encode(&metadata).expect("encode metadata");
+    let path = surviving_dir.join(ndx_file_name(&metadata));
+    fs::write(&path, &bytes).expect("write surviving metadata");
+    fs::remove_dir_all(&missing_dir).expect("remove failed placement");
+
+    let head = read_current_live_head(&fragment, &object_id)
+        .expect("read metadata from surviving placement")
+        .expect("metadata exists");
+    assert_eq!(head.version_id, metadata.version_id);
+    assert_eq!(head.total_size_bytes, metadata.total_size_bytes);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert!(!missing_dir.exists(), "head lookup must remain read-only");
+    for root in roots {
+        let _ = fs::remove_dir_all(fragment_root_on(&root, &fragment));
+    }
+}
+
+#[test]
 fn object_metadata_uses_highest_placement_generation_and_rejects_ties() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let _ = ensure_test_index_roots();
@@ -1985,6 +2062,11 @@ fn object_metadata_uses_highest_placement_generation_and_rejects_ties() {
         .expect("metadata exists");
     assert_eq!(selected.placement_generation, 5);
     assert_eq!(selected.total_size_bytes, 222);
+    let head = read_current_live_head(&fragment, &object_id)
+        .expect("select authoritative current head")
+        .expect("current head exists");
+    assert_eq!(head.placement_generation, 5);
+    assert_eq!(head.total_size_bytes, 222);
 
     newer.placement_generation = 4;
     write_atomic(
@@ -1994,6 +2076,9 @@ fn object_metadata_uses_highest_placement_generation_and_rejects_ties() {
     .expect("write divergent placement");
     let error = read_live_version(&fragment, &object_id, &version_id)
         .expect_err("same generation divergence must fail closed");
+    assert!(error.to_string().contains("same-generation divergent"));
+    let error = read_current_live_head(&fragment, &object_id)
+        .expect_err("current head must also reject same-generation divergence");
     assert!(error.to_string().contains("same-generation divergent"));
 
     let _ = fs::remove_dir_all(fragment_root_on(&blob_roots[0], &fragment));

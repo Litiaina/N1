@@ -101,6 +101,48 @@ def source_size(index):
     return (0, 512, 1024, 4096, 16384, 65536)[index % 6]
 
 
+def consume_snapshot(response, database, report_progress=lambda count, scanned: None):
+    """Bounded NDJSON audit; progress is never a substitute for completion."""
+    count, complete, scanned, progress_frames = 0, None, 0, 0
+    read_seconds, ledger_seconds = 0.0, 0.0
+    database.execute('DELETE FROM seen')
+    while True:
+        began = time.monotonic()
+        line = response.readline(65537)
+        read_seconds += time.monotonic() - began
+        if not line:
+            break
+        assert len(line) <= 65536 and line.endswith(b'\n'), 'Oversized or truncated snapshot frame'
+        frame = json.loads(line)
+        assert complete is None, 'Frame after snapshot completion'
+        if frame['kind'] == 'complete':
+            complete = frame['entry_count']
+            assert type(complete) is int and complete >= 0, 'Invalid snapshot completion count'
+        elif frame['kind'] == 'progress':
+            following = frame['scanned_entries']
+            assert type(following) is int and following > scanned, 'Snapshot scan did not advance'
+            assert type(frame['entry_count']) is int and frame['entry_count'] == count, 'Snapshot progress count mismatch'
+            scanned = following
+            progress_frames += 1
+            report_progress(count, scanned)
+        else:
+            assert frame['kind'] == 'entry', frame
+            began = time.monotonic()
+            database.execute('INSERT INTO seen VALUES(?,?)', (frame['object_key'], frame['version_id']))
+            count += 1
+            if count % 512 == 0:
+                database.commit()
+                report_progress(count, scanned)
+            ledger_seconds += time.monotonic() - began
+    began = time.monotonic()
+    database.commit()
+    ledger_seconds += time.monotonic() - began
+    report_progress(count, scanned)
+    assert complete == count, f'Incomplete snapshot: count={count}, terminal={complete}'
+    return dict(entries=count, progress_frames=progress_frames, scanned_entries=scanned,
+                stream_read_seconds=round(read_seconds, 3), ledger_seconds=round(ledger_seconds, 3))
+
+
 def population_checkpoints(objects):
     """Logarithmic checkpoint plan, including the exact requested ceiling."""
     assert objects >= 1
@@ -167,6 +209,19 @@ def process_usage(pid):
     if unavailable:
         sample['unavailable'] = unavailable
     return sample
+
+
+def record_unexpected_engine_exit(test, process):
+    """An intentional stop unpublishes ownership before killing the child.
+
+    Poll a stable handle, then decide under the same lock as start/stop. An old
+    generation's exit must not fault its replacement or dereference None.
+    """
+    returncode = process.poll() if process is not None else None
+    with test.lock:
+        if (returncode is not None and test.process is process
+                and not test.stop_monitor.is_set()):
+            test.fault = test.fault or f'Engine exited unexpectedly with code {returncode}'
 
 
 def wait_for_result(path, timeout_seconds=15000, poll_seconds=5):
@@ -259,6 +314,8 @@ class Scale(base.Stress):
             if not self.ready:
                 continue
             try:
+                with self.lock:
+                    process = self.process
                 self.fault = self.fault or self.storage_problem()
                 if time.monotonic() - self.started > self.args.deadline_seconds:
                     self.fault = 'Overall test deadline exceeded; qualification incomplete'
@@ -273,7 +330,7 @@ class Scale(base.Stress):
                 sample['member_device_aggregate_stats'] = {
                     root: list(map(int, path.read_text().split())) for root, path in self.disk_stats.items() if path.exists()
                 }
-                for label, pid in [('runner', os.getpid()), ('engine', getattr(self.process, 'pid', None))]:
+                for label, pid in [('runner', os.getpid()), ('engine', getattr(process, 'pid', None))]:
                     if pid is None:
                         continue
                     usage = process_usage(pid)
@@ -289,21 +346,24 @@ class Scale(base.Stress):
                             self.by_phase[self.phase][label+'_'+metric] = max(self.by_phase[self.phase][label+'_'+metric], value)
                     if usage.get('rss_kib', 0) > (2*1024*1024 if label == 'engine' else 768*1024):
                         self.fault = f'{label} RSS safety ceiling exceeded; inspect resource samples'
-                if self.process is not None and self.process.poll() is not None and not self.stop_monitor.is_set():
-                    self.fault = f'Engine exited unexpectedly with code {self.process.returncode}'
+                record_unexpected_engine_exit(self, process)
                 with (self.root / 'resources.jsonl').open('a') as stream:
                     stream.write(json.dumps(sample) + '\n')
                 if time.monotonic() - last_progress > 10:
                     self.progress()
                     last_progress = time.monotonic()
                 if self.fault:
-                    if self.process is not None and self.process.poll() is None:
-                        self.process.kill()
+                    with self.lock:
+                        current = self.process
+                    if current is not None and current.poll() is None:
+                        current.kill()
                     return
             except OSError as error:
                 self.fault = f'Fixture storage I/O failure: {error}'
-                if self.process is not None and self.process.poll() is None:
-                    self.process.kill()
+                with self.lock:
+                    current = self.process
+                if current is not None and current.poll() is None:
+                    current.kill()
                 return
 
     def progress(self):
@@ -713,32 +773,23 @@ class Scale(base.Stress):
     def snapshot_verify(self):
         self.authenticate()
         connection = http.client.HTTPSConnection('127.0.0.1', self.args.port, context=self.tls, timeout=120)
-        count, complete = 0, None
+        def progress(count, scanned):
+            with self.lock:
+                self.counts['inventory_entries_received'] = count
+                self.counts['inventory_physical_entries_scanned'] = scanned
+        progress(0, 0)
         try:
-            connection.request('GET', '/noa/v1/namespace/snapshot', headers={'Authorization': 'Bearer ' + self.token})
+            connection.request('GET', '/noa/v1/namespace/snapshot?progress=true', headers={'Authorization': 'Bearer ' + self.token})
             response = connection.getresponse()
             assert response.status == 200, f'Snapshot HTTP {response.status}'
-            self.db.execute('DELETE FROM seen')
-            while line := response.readline(65537):
-                assert len(line) <= 65536, 'Oversized snapshot frame'
-                frame = json.loads(line)
-                assert complete is None, 'Frame after snapshot completion'
-                if frame['kind'] == 'complete':
-                    complete = frame['entry_count']
-                else:
-                    assert frame['kind'] == 'entry', frame
-                    self.db.execute('INSERT INTO seen VALUES(?,?)', (frame['object_key'], frame['version_id']))
-                    count += 1
-                    if count % 512 == 0:
-                        self.db.commit()
-            self.db.commit()
-            assert complete == count, f'Incomplete snapshot: count={count}, terminal={complete}'
+            inventory = consume_snapshot(response, self.db, progress)
             mismatch = self.db.execute('''SELECT a.object_key FROM
                 (SELECT object_key, MAX(version_id) version_id FROM acks GROUP BY object_key) a
                 LEFT JOIN seen s USING(object_key) WHERE s.version_id IS NULL OR a.version_id != s.version_id LIMIT 1''').fetchone()
             extra = self.db.execute('SELECT object_key FROM seen EXCEPT SELECT object_key FROM acks LIMIT 1').fetchone()
             assert not mismatch and not extra, f'Quiescent namespace/ledger mismatch: {mismatch}, extra={extra}'
-            return {'all_live_names_and_max_ulid_versions_verified': count, 'completion_frame_verified': True,
+            return {'all_live_names_and_max_ulid_versions_verified': inventory['entries'], 'completion_frame_verified': True,
+                    'inventory_stream': inventory,
                     'note': 'Streamed inventory verification; not a replacement for paginated LIST benchmarks.'}
         finally:
             connection.close()

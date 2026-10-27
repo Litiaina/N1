@@ -1019,21 +1019,26 @@ pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
 }
 
 fn latest_summary_in_object_dir(dir: &Path) -> Result<Option<NdxSummary>, AppError> {
+    Ok(latest_ndx_in_object_dir(dir)?.map(|(_, summary)| summary))
+}
+
+fn latest_ndx_in_object_dir(dir: &Path) -> Result<Option<(PathBuf, NdxSummary)>, AppError> {
     if !dir.is_dir() {
         return Ok(None);
     }
-    let mut latest = None::<NdxSummary>;
-    for name in read_dir_names(dir)? {
+    let mut latest = None::<(PathBuf, NdxSummary)>;
+    visit_dir_names(dir, |name| {
         let Some(summary) = parse_ndx_file_name(&name) else {
-            continue;
+            return Ok(true);
         };
         if latest
             .as_ref()
-            .is_none_or(|current| summary.version_id > current.version_id)
+            .is_none_or(|(_, current)| summary.version_id > current.version_id)
         {
-            latest = Some(summary);
+            latest = Some((dir.join(name), summary));
         }
-    }
+        Ok(true)
+    })?;
     Ok(latest)
 }
 
@@ -1632,22 +1637,29 @@ pub fn read_current_live_head(
     object_key: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
     let object_key = normalize_object_key(object_key)?;
-    let mut latest = None::<(PathBuf, NdxSummary)>;
+    let mut latest = None::<String>;
+    let mut paths = Vec::new();
     for dir in object_dir_candidates(fragment, &object_key)? {
-        let Some(summary) = latest_summary_in_object_dir(&dir)? else {
+        let Some((path, summary)) = latest_ndx_in_object_dir(&dir)? else {
             continue;
         };
-        if latest
+        match latest
             .as_ref()
-            .is_none_or(|(_, current)| summary.version_id > current.version_id)
+            .map(|current| summary.version_id.cmp(current))
         {
-            latest = Some((dir, summary));
+            None | Some(std::cmp::Ordering::Greater) => {
+                latest = Some(summary.version_id);
+                paths.clear();
+                paths.push(path);
+            }
+            Some(std::cmp::Ordering::Equal) => paths.push(path),
+            Some(std::cmp::Ordering::Less) => {}
         }
     }
-    match latest {
-        Some((_, summary)) => read_live_version(fragment, &object_key, &summary.version_id),
-        None => Ok(None),
-    }
+    // The first pass already found every replica of the newest version. Do
+    // not scan each placement again merely to rediscover these immutable NDX
+    // paths; retain the same authoritative decoding and divergence checks.
+    read_authoritative_object_metadata(paths, &object_key)
 }
 
 pub fn list_live_versions(

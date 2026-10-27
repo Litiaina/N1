@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -39,6 +40,7 @@ class ScheduledProofSafety(unittest.TestCase):
         process.poll.return_value = None
         process.wait.side_effect = subprocess.TimeoutExpired('owned-engine', 15)
         test.process = process
+        test.lock = threading.Lock()
         test.stop_monitor = MagicMock()
         test.monitor = MagicMock()
         test.health_observations = [dict(observed=True)]

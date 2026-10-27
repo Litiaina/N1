@@ -1,8 +1,10 @@
 """Harness-only safety/boundedness checks. No engine or existing data touched."""
 from collections import Counter, defaultdict
+from contextlib import closing
 from email import policy
 from email.parser import BytesParser
 import importlib.util
+import io
 import json
 import sqlite3
 import subprocess
@@ -32,6 +34,38 @@ admission_spec.loader.exec_module(admission)
 
 
 class HarnessChecks(unittest.TestCase):
+    def test_snapshot_progress_is_not_completion_and_counts_are_exact(self):
+        frames = [dict(kind='entry', object_key='a', version_id='v1'),
+                  dict(kind='progress', scanned_entries=1024, entry_count=1),
+                  dict(kind='entry', object_key='b', version_id='v2'),
+                  dict(kind='progress', scanned_entries=2048, entry_count=2),
+                  dict(kind='complete', entry_count=2)]
+        with closing(sqlite3.connect(':memory:')) as db:
+            db.execute('CREATE TABLE seen(object_key TEXT PRIMARY KEY, version_id TEXT) WITHOUT ROWID')
+            def consume(values):
+                body = io.BytesIO(b''.join(json.dumps(frame).encode() + b'\n' for frame in values))
+                return scale.consume_snapshot(body, db)
+            report = consume(frames)
+            self.assertEqual(report['entries'], 2)
+            self.assertEqual(report['progress_frames'], 2)
+            self.assertEqual(report['scanned_entries'], 2048)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM seen').fetchone()[0], 2)
+            self.assertEqual(consume([frames[0], dict(kind='complete', entry_count=1)])['progress_frames'], 0)
+            for invalid in (frames[:-1], frames + [frames[1]],
+                            [frames[0], frames[1], frames[1]],
+                            [frames[0], dict(kind='progress', scanned_entries=1024, entry_count=0)],
+                            [frames[0], dict(kind='complete', entry_count=2)],
+                            [dict(kind='complete', entry_count=False)],
+                            [dict(kind='unexpected')]):
+                with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                    consume(invalid)
+            with self.assertRaises(sqlite3.IntegrityError):
+                consume([frames[0], frames[0]])
+            with self.assertRaisesRegex(AssertionError, 'truncated'):
+                scale.consume_snapshot(io.BytesIO(b'{"kind":"complete","entry_count":0}'), db)
+            with self.assertRaisesRegex(AssertionError, 'Oversized'):
+                scale.consume_snapshot(io.BytesIO(b'x' * 65537), db)
+
     def test_flat_source_keys_keep_the_million_names_in_one_directory(self):
         test = scale.Scale.__new__(scale.Scale)
         test.args = SimpleNamespace(flat_folder=True)
@@ -309,7 +343,7 @@ class HarnessChecks(unittest.TestCase):
             test.report['error'] = 'AssertionError: original integrity failure'
         test.ledger = (root / 'ledger.jsonl').open('a')
         test.db = sqlite3.connect(root / 'ledger.sqlite')
-        test.db_lock, test.by_phase = threading.Lock(), {}
+        test.db_lock, test.by_phase, test.lock = threading.Lock(), {}, threading.Lock()
         return test
 
     def test_scale_cleanup_timeout_preserves_original_error_and_failed_witness(self):

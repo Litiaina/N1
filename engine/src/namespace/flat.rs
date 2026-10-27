@@ -550,8 +550,11 @@ pub(crate) struct Scan {
     walker: Option<walkdir::IntoIter>,
     trash: bool,
     prefix: String,
+    scanned_entries: u64,
+    progress_at: std::time::Instant,
+    completed: bool,
     #[cfg(test)]
-    entries_visited: usize,
+    authoritative_lookups: usize,
 }
 
 pub(crate) struct ScanRecord {
@@ -585,16 +588,42 @@ impl Scan {
             walker: None,
             trash,
             prefix: String::new(),
+            scanned_entries: 0,
+            progress_at: std::time::Instant::now(),
+            completed: false,
             #[cfg(test)]
-            entries_visited: 0,
+            authoritative_lookups: 0,
         }
     }
 
+    pub(crate) fn with_prefix(mut self, prefix: String) -> Self {
+        self.prefix = prefix;
+        self
+    }
+
+    pub(crate) fn completed(&self) -> bool {
+        self.completed
+    }
+
     pub(crate) fn next_record(&mut self) -> Result<Option<ScanRecord>, AppError> {
+        self.next_record_with_progress(|_| Ok(true))
+    }
+
+    /// Report physical progress, including non-emitting replica entries. A
+    /// stopped consumer releases this walk within 128 entries; progress is
+    /// never a claim that the namespace has been completely enumerated.
+    pub(crate) fn next_record_with_progress(
+        &mut self,
+        mut progress: impl FnMut(u64) -> Result<bool, AppError>,
+    ) -> Result<Option<ScanRecord>, AppError> {
+        if self.completed {
+            return Ok(None);
+        }
         loop {
             if self.walker.is_none() {
                 let Some(root) = self.roots.get(self.next_root) else {
                     ensure_readable()?;
+                    self.completed = true;
                     return Ok(None);
                 };
                 self.next_root += 1;
@@ -620,9 +649,14 @@ impl Scan {
                 continue;
             };
             let entry = entry.map_err(|e| error(format!("enumerate flat namespace: {e}")))?;
-            #[cfg(test)]
+            self.scanned_entries = self.scanned_entries.saturating_add(1);
+            if self.scanned_entries.is_multiple_of(128)
+                || self.progress_at.elapsed() >= std::time::Duration::from_secs(1)
             {
-                self.entries_visited += 1;
+                self.progress_at = std::time::Instant::now();
+                if !progress(self.scanned_entries)? {
+                    return Ok(None);
+                }
             }
             if !entry.file_type().is_file()
                 || !entry.file_name().to_string_lossy().ends_with(SUFFIX)
@@ -647,6 +681,23 @@ impl Scan {
                 else {
                     continue;
                 };
+                // A healthy duplicate does not need another all-root decode.
+                // The canonical entry still performs the authoritative lookup
+                // below, so conflicting identities (even on non-holders) are
+                // not silently accepted. Corrupt copies must take that same
+                // lookup path: the first filename may own a healthy replica's
+                // emission even when its own bytes are damaged.
+                if let Ok(Some(local)) = read(entry.path()) {
+                    if let Ok(first) = self.first_present_holder(&local, &key, None) {
+                        if first.as_ref() != Some(&self.current_root) {
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(test)]
+                {
+                    self.authoritative_lookups += 1;
+                }
                 let Some(pointer) = lookup(&self.fragment, &key)? else {
                     continue;
                 };
@@ -654,20 +705,7 @@ impl Scan {
             };
             // Fixed holders and surviving names, not a growing de-duplication
             // set. A missing first holder must not hide its surviving replica.
-            let first = holders(&pointer, &self.fragment, &key)?
-                .into_iter()
-                .filter(|root| {
-                    storage_pool::root_available(root) && {
-                        let candidate = match &trash {
-                            Some(record) => index_store::fragment_root_on(root, &self.fragment)
-                                .join(index_store::TRASH_DIR)
-                                .join(&record.source_relative_path),
-                            None => path(root, &self.fragment, &key),
-                        };
-                        candidate.is_file()
-                    }
-                })
-                .min();
+            let first = self.first_present_holder(&pointer, &key, trash.as_ref())?;
             if first.as_ref() == Some(&self.current_root) {
                 return Ok(Some(ScanRecord {
                     key,
@@ -678,9 +716,36 @@ impl Scan {
         }
     }
 
+    fn first_present_holder(
+        &self,
+        pointer: &Pointer,
+        key: &str,
+        trash: Option<&TrashRecord>,
+    ) -> Result<Option<PathBuf>, AppError> {
+        Ok(holders(pointer, &self.fragment, key)?
+            .into_iter()
+            .filter(|root| {
+                storage_pool::root_available(root) && {
+                    let candidate = match trash {
+                        Some(record) => index_store::fragment_root_on(root, &self.fragment)
+                            .join(index_store::TRASH_DIR)
+                            .join(&record.source_relative_path),
+                        None => path(root, &self.fragment, key),
+                    };
+                    candidate.is_file()
+                }
+            })
+            .min())
+    }
+
     #[cfg(test)]
     pub(crate) fn entries_visited(&self) -> usize {
-        self.entries_visited
+        self.scanned_entries.try_into().unwrap_or(usize::MAX)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authoritative_lookups(&self) -> usize {
+        self.authoritative_lookups
     }
 }
 

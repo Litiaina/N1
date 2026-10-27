@@ -8,6 +8,55 @@ paths and credentials are intentionally omitted. Historical 3.x/4.x labels and
 binary checksums identify the private builds actually tested; they are not
 retroactively renamed or presented as newly rebuilt RC binaries.
 
+## Million-object population and inventory investigation — October 27, 2026
+
+The four-SATA/XFS EC 3+1 candidate (`6ec60476`) uploaded **1,000,000 objects /
+14,591,947,264 bytes**. Upload phases totalled 14,531.761 seconds (68.81 objects/s,
+including source creation and acknowledgement recording). The complete million
+version-pinned downloads and SHA-256 checks passed in 2,373.029 seconds.
+
+The overall qualification nevertheless **FAILED** in complete namespace
+inventory after 43,464.231 seconds, on the unchanged 120-second socket-idle
+deadline. Read-only inspection of the frozen ledger found all one million
+inventory entries, with no missing/extra names or version mismatches, but no
+terminal completion frame. This is not a complete inventory PASS. The million
+mutation and final restart gates did not execute. Sampled peak engine RSS was
+493.6 MiB and peak file descriptors 279; no OOM kill was recorded.
+
+The inventory implementation repeated all-member NCX lookups and NDX directory
+enumeration. Its final duplicate-replica walk could make progress without
+emitting an entry, causing the idle timeout. This endpoint reads NDX metadata;
+it is not the filename-only paginated LIST path. GC and shared-device pressure
+overlapped portions of the run; GC alone is not established as the cause.
+
+The next candidate removes redundant lookups/enumeration, retains authoritative
+replica validation and offers opt-in actual-scan progress. An explicit internal
+successful-end marker prevents producer failure from becoming false completion.
+Qualification must reuse the existing population in place, with a new pinned
+candidate and separate results. The original failure remains unchanged. Churn,
+restart and complete inventory remain pending until their new results pass;
+these changes do not declare RC.2.
+
+The warning-denied candidate (`edfe1d04`) then passed **451/451 library tests**
+on MCH in 271.82 seconds, 19 focused snapshot cases, four backend-selection
+cases, the separately required native io_uring case and **192/192 Python
+regressions**. Its isolated four-member EC 3+1 fault gate passed conflicting
+non-holder pointers, corrupt/missing canonical replicas, all-replica corruption
+and checksum-valid pool conflicts. Incomplete streams were rejected; restored
+inventory and both historical payload hashes passed.
+
+Preflight attempts are preserved: one was stopped to correct a missing test
+directory; another incorrectly required Python to raise on incomplete HTTP EOF.
+N1 had withheld completion correctly. The corrected fault test checks the real
+consumer rejects incomplete inventory instead of requiring a transport exception.
+
+The in-place headless continuation is now running with this candidate, a 48-hour
+workload limit, 4 GiB/no swap and per-filesystem space/growth guards. Completed
+regressions are checksum-pinned and reused, not relabelled as new executions.
+No source objects are re-uploaded or member roots cloned. Only a new
+acknowledgement ledger and bounded probe objects are created for the remaining
+inventory, million-mutation, hash and restart gates. Their results remain pending.
+
 ## Sustained batch admission investigation — October 26, 2026
 
 The October 24 four-SATA/XFS EC 3+1 run stopped at **713,184 acknowledged

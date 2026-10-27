@@ -62,6 +62,13 @@ pub struct NamespaceObjectRef {
 }
 
 #[derive(Debug, Clone)]
+pub enum NamespaceScanEvent {
+    Object(NamespaceObjectRef),
+    Progress { scanned_entries: u64 },
+    Finished,
+}
+
+#[derive(Debug, Clone)]
 pub struct NamespaceObjectRefPage {
     pub entries: Vec<NamespaceObjectRef>,
     pub continuation_token: Option<String>,
@@ -775,24 +782,96 @@ impl NamespaceRuntime {
         prefix: Option<&str>,
         channel_capacity: usize,
     ) -> tokio::sync::mpsc::Receiver<Result<NamespaceObjectRef, AppError>> {
-        let f = fragment.to_string();
-        let p = prefix.map(normalize_user_path).transpose();
-        let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity.max(1));
-        tokio::task::spawn_blocking(move || {
-            let result = (|| -> Result<(), AppError> {
-                let p = p?.unwrap_or_default();
-                let prefix = if p.is_empty() { p } else { format!("{p}/") };
-                flat::visit(&f, &prefix, |key| {
-                    Ok(tx.blocking_send(Ok(object_ref(&f, key)?)).is_ok())
-                })?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = tx.blocking_send(Err(error));
-            }
-        });
-        rx
+        stream_live_refs(
+            fragment,
+            prefix,
+            channel_capacity,
+            |object| object,
+            |_| None,
+            None,
+        )
     }
+
+    /// Opt-in physical progress prevents a replica-only suffix from looking
+    /// like a stalled producer. It does not weaken completion or integrity.
+    pub fn stream_live_object_refs_with_progress(
+        &self,
+        fragment: &str,
+        prefix: Option<&str>,
+        channel_capacity: usize,
+    ) -> tokio::sync::mpsc::Receiver<Result<NamespaceScanEvent, AppError>> {
+        stream_live_refs(
+            fragment,
+            prefix,
+            channel_capacity,
+            NamespaceScanEvent::Object,
+            |scanned_entries| Some(NamespaceScanEvent::Progress { scanned_entries }),
+            Some(NamespaceScanEvent::Finished),
+        )
+    }
+}
+
+fn stream_live_refs<T: Send + 'static>(
+    fragment: &str,
+    prefix: Option<&str>,
+    channel_capacity: usize,
+    object_event: impl Fn(NamespaceObjectRef) -> T + Send + 'static,
+    progress_event: impl Fn(u64) -> Option<T> + Send + 'static,
+    finished_event: Option<T>,
+) -> tokio::sync::mpsc::Receiver<Result<T, AppError>> {
+    let fragment = fragment.to_string();
+    let prefix = prefix.map(normalize_user_path).transpose();
+    let (sender, receiver) = tokio::sync::mpsc::channel(channel_capacity.max(1));
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<(), AppError> {
+            let prefix = prefix?.unwrap_or_default();
+            let prefix = if prefix.is_empty() {
+                prefix
+            } else {
+                format!("{prefix}/")
+            };
+            let mut scan = flat::Scan::new(&fragment, false)?.with_prefix(prefix);
+            let mut progress_at = std::time::Instant::now();
+            let mut progress_entries = 0;
+            while let Some(record) = scan.next_record_with_progress(|scanned_entries| {
+                if sender.is_closed() {
+                    return Ok(false);
+                }
+                if scanned_entries.saturating_sub(progress_entries) >= 1024
+                    || progress_at.elapsed() >= std::time::Duration::from_secs(1)
+                {
+                    if let Some(event) = progress_event(scanned_entries) {
+                        if sender.blocking_send(Ok(event)).is_err() {
+                            return Ok(false);
+                        }
+                    }
+                    progress_entries = scanned_entries;
+                    progress_at = std::time::Instant::now();
+                }
+                Ok(true)
+            })? {
+                // The scanner already validated every NCX replica for this
+                // identity. Re-reading the same pointers here doubled work
+                // and could select a different identity during mutation.
+                let object = object_ref_with_pointer(&fragment, &record.key, record.pointer)?;
+                if sender.blocking_send(Ok(object_event(object))).is_err() {
+                    break;
+                }
+            }
+            // A producer channel disappearing is not EOF. This marker follows
+            // actual directory exhaustion and the final readability check.
+            if scan.completed() {
+                if let Some(event) = finished_event {
+                    let _ = sender.blocking_send(Ok(event));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = sender.blocking_send(Err(error));
+        }
+    });
+    receiver
 }
 
 fn worker_error(error: tokio::task::JoinError) -> AppError {
@@ -901,6 +980,14 @@ fn live_entry(
 }
 fn object_ref(fragment: &str, key: &str) -> Result<NamespaceObjectRef, AppError> {
     let pointer = flat::lookup(fragment, key)?.ok_or(AppError::NotFound)?;
+    object_ref_with_pointer(fragment, key, pointer)
+}
+
+fn object_ref_with_pointer(
+    fragment: &str,
+    key: &str,
+    pointer: flat::Pointer,
+) -> Result<NamespaceObjectRef, AppError> {
     let meta = index_store::read_current_live_head(fragment, &pointer.object_id)?
         .ok_or(AppError::NotFound)?;
     Ok(NamespaceObjectRef {
