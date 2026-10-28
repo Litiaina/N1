@@ -2,6 +2,58 @@
 
 use super::*;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionFsBoundary {
+    BindingRead,
+    ManifestRead,
+    SessionEnumerate,
+    SessionRemove,
+    UploadsEnumerate,
+    PartRead,
+    ReceiptWrite,
+}
+
+#[cfg(test)]
+type SessionFsHook = std::rc::Rc<dyn Fn(SessionFsBoundary, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static SESSION_FS_HOOK: std::cell::RefCell<Option<SessionFsHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) struct SessionFsHookGuard {
+    previous: Option<SessionFsHook>,
+}
+
+#[cfg(test)]
+impl Drop for SessionFsHookGuard {
+    fn drop(&mut self) {
+        SESSION_FS_HOOK.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_session_fs_hook(
+    hook: impl Fn(SessionFsBoundary, &Path) + 'static,
+) -> SessionFsHookGuard {
+    let previous = SESSION_FS_HOOK.with(|slot| slot.replace(Some(std::rc::Rc::new(hook))));
+    SessionFsHookGuard { previous }
+}
+
+#[cfg(test)]
+fn session_fs_boundary(boundary: SessionFsBoundary, path: &Path) {
+    // Invoke outside the RefCell borrow so a test may exercise another session
+    // operation at the boundary without introducing a test-only lock.
+    let hook = SESSION_FS_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook(boundary, path);
+    }
+}
+
 pub fn open_session(
     manifest: &UploadSessionManifest,
     reservation: Option<ReservationReceipt>,
@@ -45,10 +97,16 @@ fn session_dir(root: &Path, fragment: &str, version_id: &str) -> PathBuf {
         .join(version_id)
 }
 
-fn session_roots(fragment: &str, version_id: &str) -> Vec<PathBuf> {
+fn session_dirs(fragment: &str, version_id: &str) -> Vec<PathBuf> {
     index_roots()
         .into_iter()
         .map(|root| session_dir(&root, fragment, version_id))
+        .collect()
+}
+
+fn session_roots(fragment: &str, version_id: &str) -> Vec<PathBuf> {
+    session_dirs(fragment, version_id)
+        .into_iter()
         .filter(|dir| dir.is_dir())
         .collect()
 }
@@ -56,31 +114,38 @@ fn session_roots(fragment: &str, version_id: &str) -> Vec<PathBuf> {
 fn load_session_row(fragment: &str, version_id: &str) -> Result<Option<SessionRow>, AppError> {
     let mut selected: Option<SessionRow> = None;
     let mut corrupt = None;
-    for dir in session_roots(fragment, version_id) {
+    for dir in session_dirs(fragment, version_id) {
         let path = dir.join(MANIFEST_FILE);
-        if path.exists() {
-            let row: SessionRow = match fs::read(path)
-                .map_err(|e| io_err(e, "read upload manifest"))
-                .and_then(|bytes| decode(&bytes))
-            {
-                Ok(row) => row,
-                Err(error) => {
-                    corrupt = Some(error);
-                    continue;
-                }
-            };
-            if let Some(current) = &selected {
-                if encode(&current.manifest)? != encode(&row.manifest)? {
-                    return Err(AppError::Conflict(
-                        "conflicting multipart placement manifests".into(),
-                    ));
-                }
-                if current.last_activity_at > row.last_activity_at {
-                    continue;
-                }
+        #[cfg(test)]
+        session_fs_boundary(SessionFsBoundary::ManifestRead, &path);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            // Finalization/cancellation may remove a listed session at any
+            // point. Its absence is not a corrupt manifest or an I/O fault.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                corrupt = Some(io_err(error, "read upload manifest"));
+                continue;
             }
-            selected = Some(row);
+        };
+        let row: SessionRow = match decode(&bytes) {
+            Ok(row) => row,
+            Err(error) => {
+                corrupt = Some(error);
+                continue;
+            }
+        };
+        if let Some(current) = &selected {
+            if encode(&current.manifest)? != encode(&row.manifest)? {
+                return Err(AppError::Conflict(
+                    "conflicting multipart placement manifests".into(),
+                ));
+            }
+            if current.last_activity_at > row.last_activity_at {
+                continue;
+            }
         }
+        selected = Some(row);
     }
     if selected.is_none() {
         if let Some(error) = corrupt {
@@ -111,7 +176,10 @@ pub fn commit_session_part_receipt(
     receipt: &SessionPartReceipt,
 ) -> Result<(), AppError> {
     for dir in session_roots(fragment, version_id) {
-        fs::create_dir_all(&dir).map_err(|e| io_err(e, "create upload receipt dir"))?;
+        #[cfg(test)]
+        session_fs_boundary(SessionFsBoundary::ReceiptWrite, &dir);
+        // These directories were created by open_session. A late part must not
+        // recreate a session retired by finalization or cancellation.
         remove_receipts_for_part(&dir, receipt.part_index)?;
         if let Some(checksum) = receipt.checksum {
             create_empty_marker(&dir.join(part_receipt_name(receipt.part_index, checksum)))?;
@@ -139,7 +207,8 @@ pub fn load_session(
     let mut shard_receipts = BTreeMap::<u64, BTreeMap<usize, u32>>::new();
     let mut part_checksums = BTreeMap::<u64, u32>::new();
     let mut corrupt_part = None;
-    for dir in session_roots(fragment, version_id) {
+    let mut enumerated_any = false;
+    for dir in session_dirs(fragment, version_id) {
         let directory_metadata = match fs::metadata(&dir) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -160,13 +229,28 @@ pub fn load_session(
         state.last_activity_at = state
             .last_activity_at
             .max(i64::try_from(activity).unwrap_or(i64::MAX));
-        for name in read_dir_names(&dir)? {
+        #[cfg(test)]
+        session_fs_boundary(SessionFsBoundary::SessionEnumerate, &dir);
+        let names = match read_dir_names(&dir) {
+            Ok(names) => names,
+            Err(AppError::NotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        enumerated_any = true;
+        for name in names {
             let path = dir.join(&name);
             if name.starts_with(PART_META_PREFIX) && name.ends_with(".ndx") {
-                let part: PartMetadata = match fs::read(path)
-                    .map_err(|e| io_err(e, "read upload part metadata"))
-                    .and_then(|bytes| decode(&bytes))
-                {
+                #[cfg(test)]
+                session_fs_boundary(SessionFsBoundary::PartRead, &path);
+                let bytes = match fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        corrupt_part = Some(io_err(error, "read upload part metadata"));
+                        continue;
+                    }
+                };
+                let part: PartMetadata = match decode(&bytes) {
                     Ok(part) => part,
                     Err(error) => {
                         corrupt_part = Some(error);
@@ -204,6 +288,11 @@ pub fn load_session(
                 }
             }
         }
+    }
+    // A previously read manifest is not resume authority after every session
+    // directory has disappeared during finalization or cancellation.
+    if !enumerated_any {
+        return Ok(None);
     }
     push_receipts_from_filename(&mut state, shard_receipts, part_checksums);
     // A corrupt copy must not hide valid progress elsewhere. If no complete
@@ -244,10 +333,13 @@ pub fn load_session_part_receipts(
 
 pub fn remove_session(fragment: &str, version_id: &str) -> Result<bool, AppError> {
     let mut removed = false;
-    for dir in session_roots(fragment, version_id) {
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "remove upload session"))?;
-            removed = true;
+    for dir in session_dirs(fragment, version_id) {
+        #[cfg(test)]
+        session_fs_boundary(SessionFsBoundary::SessionRemove, &dir);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(error, "remove upload session")),
         }
     }
     Ok(removed)
@@ -258,10 +350,14 @@ pub fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, Ap
     let mut seen = HashSet::new();
     for root in existing_fragment_roots(fragment) {
         let uploads = root.join(UPLOADS_DIR);
-        if !uploads.is_dir() {
-            continue;
-        }
-        for version_id in read_dir_names(&uploads)? {
+        #[cfg(test)]
+        session_fs_boundary(SessionFsBoundary::UploadsEnumerate, &uploads);
+        let version_ids = match read_dir_names(&uploads) {
+            Ok(names) => names,
+            Err(AppError::NotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        for version_id in version_ids {
             if !seen.insert(version_id.clone()) {
                 continue;
             }
@@ -287,12 +383,16 @@ pub(crate) fn read_pending_binding(
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<PendingUploadBinding>, AppError> {
-    for dir in session_roots(fragment, version_id) {
+    for dir in session_dirs(fragment, version_id) {
         let path = dir.join(BINDING_FILE);
-        if path.exists() {
-            return decode(&fs::read(path).map_err(|e| io_err(e, "read pending upload binding"))?)
-                .map(Some);
-        }
+        #[cfg(test)]
+        session_fs_boundary(SessionFsBoundary::BindingRead, &path);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err(error, "read pending upload binding")),
+        };
+        return decode(&bytes).map(Some);
     }
     Ok(None)
 }

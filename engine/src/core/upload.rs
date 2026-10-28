@@ -411,6 +411,9 @@ use sessions::{StandardPartClaimResult, claim_standard_part};
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod session_retirement_tests;
+
 pub async fn list_active_uploads(
     claims: Claims,
     AxumPath(fragment): AxumPath<String>,
@@ -581,6 +584,32 @@ pub async fn object_upload_part(
                 fragment, version_id, part_index
             );
         }
+        // Even a write-once replay must consume its accepted HTTP body before
+        // responding. Dropping an unread body lets HTTP/1 close the connection
+        // while the sender is still transmitting, losing an otherwise valid
+        // idempotent response. Discard chunks without buffering or disk writes.
+        let mut remaining = content_length;
+        let mut chunks = body.into_data_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| {
+                AppError::Io(io::Error::other(error), "read repeated upload part".into())
+            })?;
+            let length = chunk.len() as u64;
+            if length > remaining {
+                return Err(AppError::BadRequest(
+                    "Repeated part body exceeds Content-Length".into(),
+                ));
+            }
+            remaining -= length;
+            if let Some(progress) = io_progress.as_ref() {
+                progress.record(length);
+            }
+        }
+        if remaining != 0 {
+            return Err(AppError::BadRequest(
+                "Repeated part body is shorter than Content-Length".into(),
+            ));
+        }
         if let Err(err) = persist_missing_receipt_from_disk(
             &path_manager,
             &fragment,
@@ -628,14 +657,12 @@ pub async fn object_upload_part(
     )
     .await?;
 
+    #[cfg(test)]
+    session_retirement_tests::part_write_boundary(&fragment, &version_id, false).await;
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(
-            &path_manager,
-            &fragment,
-            &manifest.object_key,
-            &version_id,
-        )
-        .await;
+        // A successful finalizer also retires its session. Session absence
+        // cannot authorize deleting immutable, potentially committed payloads.
+        // GC owns reclamation of genuinely abandoned versions.
         return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
     }
 
@@ -648,14 +675,9 @@ pub async fn object_upload_part(
         );
     }
 
+    #[cfg(test)]
+    session_retirement_tests::part_write_boundary(&fragment, &version_id, true).await;
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(
-            &path_manager,
-            &fragment,
-            &manifest.object_key,
-            &version_id,
-        )
-        .await;
         return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
     }
 
@@ -827,14 +849,11 @@ where
     )
     .await?;
 
+    #[cfg(test)]
+    session_retirement_tests::part_write_boundary(&fragment, &version_id, false).await;
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(
-            &path_manager,
-            &fragment,
-            &manifest.object_key,
-            &version_id,
-        )
-        .await;
+        // Finalization and cancellation both remove the transient session;
+        // only GC can distinguish reclaimable orphan payload from live data.
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -847,14 +866,9 @@ where
         );
     }
 
+    #[cfg(test)]
+    session_retirement_tests::part_write_boundary(&fragment, &version_id, true).await;
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(
-            &path_manager,
-            &fragment,
-            &manifest.object_key,
-            &version_id,
-        )
-        .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -976,14 +990,11 @@ where
     )
     .await?;
 
+    #[cfg(test)]
+    session_retirement_tests::part_write_boundary(&fragment, &version_id, false).await;
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(
-            &path_manager,
-            &fragment,
-            &manifest.object_key,
-            &version_id,
-        )
-        .await;
+        // Do not destroy a finalized version merely because its upload
+        // session was retired while this part was completing.
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -996,14 +1007,9 @@ where
         );
     }
 
+    #[cfg(test)]
+    session_retirement_tests::part_write_boundary(&fragment, &version_id, true).await;
     if index::load_session(&fragment, &version_id).await?.is_none() {
-        cleanup_blob_version_dirs_for_version(
-            &path_manager,
-            &fragment,
-            &manifest.object_key,
-            &version_id,
-        )
-        .await;
         return Err(AppError::Conflict("Upload session was cancelled".into()));
     }
 
@@ -1651,31 +1657,57 @@ pub async fn cancel_upload_session_direct(
 
     let path_manager = ObjectPathManager::new();
     let session = index::load_session(&fragment, &version_id).await?;
-    let object_key = session
+    let object_key = match session
         .as_ref()
         .map(|state| state.manifest.object_key.clone())
         .filter(|key| !key.is_empty())
-        .unwrap_or_else(|| {
-            if object_key_hint.is_empty() {
-                version_id.clone()
+    {
+        Some(key) => key,
+        None => {
+            let hint = if object_key_hint.is_empty() {
+                &version_id
             } else {
-                object_key_hint
+                &object_key_hint
+            };
+            match crate::namespace::runtime::global_namespace_runtime()
+                .resolve_live_object_id(&fragment, hint)
+                .await?
+            {
+                Some(key) => key,
+                None => match crate::core::index_store::normalize_object_id(hint) {
+                    Ok(key) => key,
+                    // A retired session may leave only the original logical
+                    // filename. An absent name is an idempotent cancellation,
+                    // not authority to interpret it as a payload directory.
+                    Err(_) => return Ok(()),
+                },
             }
-        });
+        }
+    };
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
 
-    if index::read_object_version(&fragment, &object_key, &version_id)
-        .await
-        .is_ok()
-    {
-        return Err(AppError::Conflict(
-            "Cannot cancel: Object is already finalized.".to_string(),
-        ));
+    match index::read_object_version(&fragment, &object_key, &version_id).await {
+        Ok(_) => {
+            return Err(AppError::Conflict(
+                "Cannot cancel: Object is already finalized.".to_string(),
+            ));
+        }
+        Err(AppError::NotFound) => {}
+        // An unreadable or corrupt NDX is not evidence that no committed
+        // version exists. Keep its payload and surface the original failure.
+        Err(error) => return Err(error),
+    }
+
+    // Without a live upload manifest, a caller-supplied hint cannot authorize
+    // payload deletion. Keep committed-version checks above, and let GC reclaim
+    // genuinely abandoned data when its existing protections permit it.
+    if session.is_none() {
+        return Ok(());
     }
 
     cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &object_key, &version_id)
         .await;
-    let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
+    index::remove_session(&fragment, &version_id, "cancelled").await?;
     cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &object_key, &version_id).await;
 
     Ok(())

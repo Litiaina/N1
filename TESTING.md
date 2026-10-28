@@ -8,6 +8,82 @@ paths and credentials are intentionally omitted. Historical 3.x/4.x labels and
 binary checksums identify the private builds actually tested; they are not
 retroactively renamed or presented as newly rebuilt RC binaries.
 
+## Pending durable-upload retirement race — October 28, 2026
+
+An MX integration run reported `read pending upload binding: ENOENT` during
+concurrent durable initialization. A session discovered by the reuse scan could
+be finalized/cancelled before its binding was read. This was an upload
+availability failure; the report did not establish committed-data corruption.
+The original incident evidence is preserved.
+
+The original `16dd5c93` code, with test-only filesystem-boundary hooks, fails two
+deterministic regressions with the reported error and a third by recreating a
+retired receipt directory. The patched code passes all **15 session-lifetime
+regressions**. Five additional tests pass, covering six forced part/finalizer
+interleavings, committed/corrupt NDX protection, retired logical-name handling
+and idempotent cancellation. They compare immutable NDX/shard bytes and perform
+explicit-version downloads; absent session state never authorizes payload
+deletion. Existing manifest/part surviving-replica policy remains unchanged.
+
+An initial verification attempt failed because the new payload fixture had not
+enrolled its roots. That failed attempt is retained. The fixture now performs
+real enrollment; disk-identity checks are not bypassed. The initial RED driver
+also incorrectly required the receipt-recreation failure to contain the binding
+error text; its preserved failure is followed by correctly classified original
+code reproductions. Neither is reported as an engine correctness pass.
+
+The warning-denied optimized candidate (`c50ec218`) passed **471/471 library
+tests** in 578.24 seconds on the local HDD fixture, **205/205 Python
+regressions**, four backend-selection cases and the separately required native
+io_uring case on both XFS and ext4. The 20 new library tests above also passed
+as focused runs before the complete suite.
+
+The two-client HTTP/restart smoke test passed. The 100-client run then **failed**
+on a deliberate already-acknowledged part replay after 297 completed versions.
+An independent restart/read-only audit verified all **297/297** acknowledged
+historical payloads (38,928,384 bytes) by SHA-256; original failure evidence is
+unchanged. A paced HTTP reproduction proved a separate pre-existing transport
+bug: the duplicate-part path returned `200 OK` after receiving only 1 KiB of a
+64 KiB body, closed the connection and caused the sending client to fail.
+This is not reported as a completed concurrency pass.
+
+The replay path now drains accepted bodies in bounded chunks before success,
+without rewriting committed part bytes. Its warning-denied optimized build
+(`51594bdd`) and all **21 focused regressions** passed. The paced HTTP proof now
+passes: no early response, all 65,536 replay bytes received, `200 OK`, a ping on
+the same connection, finalization and a matching 131,072-byte object hash.
+This build also passed **472/472 library tests** in 556.29 seconds, **210/210
+Python regressions**, four backend-selection cases and required native io_uring
+integration on both XFS and ext4.
+
+The EC 1+0 HTTP gate passed with 100 concurrent clients: 300 published objects,
+300 cancelled sessions, 602 successful identity-preserving resumptions and 301
+finalized versions including the partial upload resumed after SIGKILL. Complete
+acknowledged hashes and namespace listings passed before/after restart. It ran
+in 140.43 seconds; sampled peak RSS was 75,412 KiB and peak FDs 169.
+
+The same 100-client gate passed on two independent HDDs (XFS/ext4), EC 1+1:
+another **301 finalized versions / 300 cancellations / 602 resumptions**, with
+all acknowledged historical hashes and complete listings verified around the
+restart. It ran in 208.628 seconds; sampled peak RSS was 82,900 KiB and peak FDs
+194. Rate limiting remained enabled, the 30-second foreground admission deadline
+was unchanged and failed writes were never retried in either run.
+
+Scheduled GC also passed on those two filesystems in 28.304 seconds, without
+manual GC requests. Controlled aging of owned fixtures exercised expired trash,
+synthetic orphans and four real SIGKILL-abandoned standard-upload directories
+(new object and unpublished overwrite). All reclaimable paths disappeared;
+56 referenced immutable NDX/payload files remained byte/inode/mtime-identical.
+Young/future/unknown candidates and active standard/durable uploads survived;
+the latter finalized successfully. All 16 retained historical versions passed
+hash checks after restart. No unsolicited full healing/health traversal ran.
+
+These patch-qualification gates passed on the same frozen binary. Production
+has not been replaced. This is not the original mixed MX/Office integration
+rerun, a million-object rerun, physical power-loss qualification or an RC.2/stable
+declaration. Storage encoding and acknowledgement durability barriers are
+unchanged. The owned test engines are stopped; original failures remain intact.
+
 ## Million-object population and inventory investigation — October 27, 2026
 
 The four-SATA/XFS EC 3+1 candidate (`6ec60476`) uploaded **1,000,000 objects /

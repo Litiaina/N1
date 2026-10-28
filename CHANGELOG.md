@@ -5,6 +5,22 @@ Results and known failures are recorded separately in [TESTING.md](TESTING.md).
 
 ## Unreleased — bounded maintenance and upload performance
 
+- Fix pending durable-upload enumeration racing finalization/cancellation. Read
+  bindings and manifests directly; treat only disappearance as a retired
+  session, preserve corruption/conflict handling and surviving-replica policy,
+  and make overlapping session removals idempotent. Late receipts no longer
+  recreate retired session directories.
+- Never delete immutable payload merely because an upload session disappeared:
+  it may already have finalized. Retain existing GC reclamation for abandoned
+  data. Cancellation preserves unreadable committed metadata, resolves retired
+  logical-name hints safely and requires a live session before payload cleanup.
+  Add deterministic filesystem/part-finalization races and isolated concurrent
+  durable-reuse, integrity and restart proofs. Storage encoding, architecture,
+  acknowledgement barriers and RC version remain unchanged.
+- Consume accepted durable-part HTTP replays before returning write-once
+  success. Discard chunks without buffering the entire part or rewriting shards;
+  reject truncated, excess or failed bodies instead of losing the response to
+  an early HTTP/1 connection close. Preserve existing part identity and receipts.
 - Reduce full namespace-inventory I/O: reuse the validated NCX identity, avoid
   repeated authoritative lookups for duplicate replicas, and select the newest
   immutable NDX in one directory pass per member. Retain replica-conflict,

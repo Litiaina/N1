@@ -2,7 +2,7 @@ use super::*;
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata};
 use ulid::Ulid;
 
-fn ensure_test_blob_roots() -> Vec<PathBuf> {
+pub(super) fn ensure_test_blob_roots() -> Vec<PathBuf> {
     if let Some(existing) = BLOB_STORE_DISKS.get() {
         let roots = existing.iter().map(PathBuf::from).collect::<Vec<_>>();
         for root in &roots {
@@ -25,7 +25,7 @@ fn ensure_test_blob_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn ensure_test_index_roots() -> Vec<PathBuf> {
+pub(super) fn ensure_test_index_roots() -> Vec<PathBuf> {
     let _ = ensure_test_blob_roots();
     if let Some(existing) = INDEX_STORE_DISKS.get() {
         let roots = existing.iter().map(PathBuf::from).collect::<Vec<_>>();

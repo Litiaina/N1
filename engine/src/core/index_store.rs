@@ -1880,3 +1880,6 @@ use replicas::{cleanup_stale_index_plane_on_blob_only_roots, same_root};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod session_race_tests;
