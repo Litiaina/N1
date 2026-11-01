@@ -37,6 +37,7 @@ impl Fixture {
                 .iter()
                 .map(|root| root.to_string_lossy().into_owned())
                 .collect(),
+            payload_staged: false,
         };
         let binding = PendingUploadBinding {
             fragment: self.fragment.clone(),

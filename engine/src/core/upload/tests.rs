@@ -108,6 +108,7 @@ fn standard_test_session(part_count: usize) -> StandardUploadSession {
             data_shards: 1,
             parity_shards: 1,
             placement_roots: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
+            payload_staged: false,
         },
         logical_path: "test.bin".to_string(),
         lifecycle: AtomicU8::new(STANDARD_SESSION_OPEN),
@@ -504,6 +505,7 @@ fn multipart_parts_keep_one_fixed_object_ec_set() {
         data_shards: 1,
         parity_shards: 1,
         placement_roots: roots.iter().map(|root| (*root).to_string()).collect(),
+        payload_staged: false,
     };
     let path_manager = ObjectPathManager::new();
     let first = shard_specs_for_part(&path_manager, &manifest, 0).expect("first part");

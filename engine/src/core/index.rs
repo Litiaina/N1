@@ -317,7 +317,13 @@ pub async fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionStat
 
 pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     let metadata = metadata.clone();
-    run_index_blocking(move || index_store::upsert_live_version(&metadata)).await
+    run_index_blocking(move || {
+        super::upload::staging::promote(&metadata, true)?;
+        index_store::upsert_live_version(&metadata)?;
+        super::upload::staging::retire_empty(&metadata);
+        Ok(())
+    })
+    .await
 }
 
 pub async fn publish_object_with_durability(
@@ -326,7 +332,13 @@ pub async fn publish_object_with_durability(
 ) -> Result<(), AppError> {
     let metadata = metadata.clone();
     run_index_blocking(move || {
-        index_store::upsert_live_version_with_durability(&metadata, write_durability)
+        super::upload::staging::promote(
+            &metadata,
+            matches!(write_durability, IndexWriteDurability::Strict),
+        )?;
+        index_store::upsert_live_version_with_durability(&metadata, write_durability)?;
+        super::upload::staging::retire_empty(&metadata);
+        Ok(())
     })
     .await
 }

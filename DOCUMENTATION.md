@@ -119,13 +119,14 @@ The unchanged format has whole-shard checksums, so first-byte/range latency can
 include reading the selected shard for verification. This is not block-level
 checksum framing and does not claim zero verification overhead.
 
-Full availability repair and checksum walks run only through explicit repair
-requests. Legacy `auto_healing` scan switches/intervals no longer launch these
+Full availability repair and checksum walks run through explicit repair
+requests, with an optional calendar schedule for online checksum repair.
+Legacy `auto_healing` scan switches/intervals alone do not launch these
 walks. Known-member identity/writability probes and startup safety validation
 remain; they do not enumerate objects. Deep health inspection is explicit,
 not a periodic engine job. The legacy health `auto_healing.enabled` field
-describes full-scan scheduling (false); `phase=on_read_only` identifies the
-read-triggered policy.
+describes whether calendar scheduling is enabled; the nested `scheduled_scrub`
+field reports its actual phase, errors and last successful completion.
 
 Use `refresh=true` for a newly collected health snapshot. Plain health requests
 may return the last cached summary; `sampled_at` identifies its age. No background
@@ -136,9 +137,10 @@ Scheduled GC runs the same conservative collector as manual GC. It expires
 trash using `trash_retention_seconds` and abandoned upload data using
 `file_ttl_seconds`. This includes ordinary-upload pieces left after a restart
 and unpublished versions beneath otherwise live objects. Active uploads and
-committed historical versions are preserved. No per-upload cleanup records are
-added: orphan discovery still needs namespace-reference and object-directory
-traversal. GC shares BackgroundGc I/O admission and yields between object/session
+committed historical versions are preserved. New unfinished payload is owned by
+`.uploads/<version>/@o_<object-id>/payload`; those candidates are reclaimed before
+the NCX reachability scan. Committed orphan discovery still needs
+namespace-reference and object-directory traversal. GC shares BackgroundGc I/O admission and yields between object/session
 batches; a low interval is not a free operation at large object counts.
 If member identity, namespace or export protection cannot be established, GC
 preserves data and reports the error through `/maintenance/gc/status`.
@@ -171,6 +173,8 @@ trash_retention_seconds=2592000
 
 [auto_healing]
 enabled=false
+scrub_schedule_utc=
+scheduled_scrub_pause_millis=25
 topology_check_interval_seconds=30
 topology_recovery_stability_seconds=10
 initial_scan_delay_seconds=60
@@ -933,7 +937,9 @@ Finalize synchronizes the completed shard set and then publishes the immutable
 object index and namespace entry once according to the parts' effective
 durability. An unfinished standard session does not
 survive process restart; its unreferenced shards remain invisible and are
-reclaimed by the normal orphan TTL scan.
+reclaimed from `.uploads` by the normal upload TTL scan. A legacy durable
+manifest without the staging flag continues to use its original `.objects`
+placement. NDX always records committed addresses, not staging addresses.
 
 Both multipart modes allow at most 131,072 parts. Standard initiation additionally
 caps pending sessions at 1,024 and part-slot allocations at 16 MiB globally;
@@ -1390,8 +1396,33 @@ Modes are availability (online placement checks), checksum (checksum checks),
 strict (foreground mutations blocked) and scrub (quiesced work). A read-only
 maintenance mode restricts clients; it does not mean repair writes no data.
 Read-triggered repair does not schedule full availability/checksum cycles.
-Start those jobs explicitly. Unsafe topology keeps writes blocked; do not
+Start those jobs explicitly or opt into a calendar checksum schedule. Unsafe topology keeps writes blocked; do not
 override identity checks to force service startup.
+
+For an optional weekly online checksum scan, set `enabled=true` and
+`scrub_schedule_utc=Sun 02:00` in `[auto_healing]`, then restart N1. Times are UTC;
+`daily 02:00` is also accepted. Empty/absent schedules are disabled even when
+legacy `enabled` and interval settings are present. Invalid schedule text is
+reported as `scheduled_scrub.phase=invalid_schedule` without starting a scan.
+`initial_scan_delay_seconds` applies after startup; no missed slot is replayed.
+
+Scheduled checks use the existing repair engine in online availability access
+mode, checksum verification, `object_scan_concurrency`,
+`shard_repair_concurrency`, and `metadata_batch_size`. The pause between objects
+defaults to 25 ms (`scheduled_scrub_pause_millis`); foreground I/O can add up to
+one second of backoff before the next object. Manual and scheduled repair share
+one running-job guard. Busy slots are skipped until the next scheduled time.
+This keeps requests available but does not promise unchanged latency or zero
+extra disk I/O. A large in-flight object is not paused halfway through repair.
+
+Poll `/maintenance/repair/status` for scan progress and refreshed health for
+`maintenance.auto_healing.scheduled_scrub`. A stopped or failed scan reports
+`incomplete`; a restart during a scan reports interrupted coverage. The last
+successful completion is retained separately. These outcomes do not assert
+storage failure or make N1 read-only. No whole-scan timeout is imposed. Existing
+per-operation I/O errors and topology safety checks still apply. The existing
+operator repair-stop endpoint can stop a scheduled run. There is no durable
+mid-scan cursor or ZFS-style pause/resume; subsequent runs scan afresh.
 
 ### Start, stop and status
 

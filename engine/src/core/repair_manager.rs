@@ -32,7 +32,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
@@ -98,20 +98,27 @@ pub struct ObjectLayoutStatus {
 static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
     LazyLock::new(|| Arc::new(RwLock::new(RepairJobStatus::default())));
 
-static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
-static REPAIR_RUNNING: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+const REPAIR_IDLE: u8 = 0;
+const REPAIR_ACTIVE: u8 = 1;
+const REPAIR_STOPPING: u8 = 2;
+static REPAIR_STATE: AtomicU8 = AtomicU8::new(REPAIR_IDLE);
 
 struct RepairRunningGuard;
 
 impl Drop for RepairRunningGuard {
     fn drop(&mut self) {
-        REPAIR_RUNNING.store(false, Ordering::Release);
+        REPAIR_STATE.store(REPAIR_IDLE, Ordering::Release);
     }
 }
 
 fn acquire_repair_running() -> Result<RepairRunningGuard, AppError> {
-    REPAIR_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+    REPAIR_STATE
+        .compare_exchange(
+            REPAIR_IDLE,
+            REPAIR_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .map(|_| RepairRunningGuard)
         .map_err(|_| AppError::Conflict("A repair job is already running.".into()))
 }
@@ -302,6 +309,8 @@ pub struct RepairRunOptions {
     pub fast_mode: bool,
     pub access_mode: MaintenanceAccessMode,
     pub replay_pending_redistribution: bool,
+    /// Scheduled online work paces between objects; manual behavior stays unchanged.
+    pub background_pause_millis: u64,
 }
 
 impl Default for RepairRunOptions {
@@ -310,6 +319,7 @@ impl Default for RepairRunOptions {
             fast_mode: false,
             access_mode: MaintenanceAccessMode::Availability,
             replay_pending_redistribution: true,
+            background_pause_millis: 0,
         }
     }
 }
@@ -349,7 +359,18 @@ fn ensure_no_unresolved_repairs(
 
 #[inline]
 fn should_stop() -> bool {
-    STOP_SIGNAL.load(Ordering::Relaxed)
+    REPAIR_STATE.load(Ordering::Acquire) == REPAIR_STOPPING
+}
+
+fn request_stop() {
+    // Admission and cancellation share one atomic state: a stop received while
+    // the worker is queued cannot be erased by a later worker startup/reset.
+    let _ = REPAIR_STATE.compare_exchange(
+        REPAIR_ACTIVE,
+        REPAIR_STOPPING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 #[inline]
@@ -1012,6 +1033,7 @@ pub async fn trigger_repair_job_api(
         fast_mode,
         access_mode,
         replay_pending_redistribution: true,
+        background_pause_millis: 0,
     };
 
     let ws_manager = Arc::new(state.ws_manager.clone());
@@ -1029,7 +1051,7 @@ pub async fn trigger_repair_job_api(
 
     tokio::spawn(async move {
         if let Err(e) =
-            run_repair_job_reserved(cfg, run_opts, ws_manager.clone(), running_guard).await
+            run_repair_job_reserved(cfg, run_opts, ws_manager.clone(), &running_guard).await
         {
             error!("Manual Repair Job Failed: {}", e);
             let mut status = REPAIR_STATUS.write().await;
@@ -1048,6 +1070,33 @@ pub async fn trigger_repair_job_api(
         .into_response())
 }
 
+/// Reserve the SAME singleton as manual repair before recording/admitting a
+/// scheduled run. Dropping the returned future releases the reservation.
+pub(crate) fn reserve_scheduled_scrub(
+    cfg: &crate::settings::config::AutoHealingConfig,
+    ws: Arc<WsConnectionManager>,
+) -> Result<impl std::future::Future<Output = Result<bool, AppError>> + Send + 'static, AppError> {
+    let guard = acquire_repair_running()?;
+    let run = RepairRunConfig {
+        dry_run: false,
+        target_fragment: None,
+        check_mode: RepairCheckMode::Checksum,
+        meta_concurrency: cfg.object_scan_concurrency,
+        shard_repair_concurrency: cfg.shard_repair_concurrency,
+        meta_batch_size: cfg.metadata_batch_size,
+    };
+    let opts = RepairRunOptions {
+        fast_mode: false,
+        access_mode: MaintenanceAccessMode::Availability,
+        replay_pending_redistribution: false,
+        background_pause_millis: cfg.scheduled_scrub_pause_millis,
+    };
+    Ok(async move {
+        run_repair_job_reserved(run, opts, ws, &guard).await?;
+        Ok(!should_stop())
+    })
+}
+
 pub async fn stop_repair_job_api(
     claims: Claims,
     State(state): State<Arc<AppState>>,
@@ -1059,7 +1108,7 @@ pub async fn stop_repair_job_api(
         ));
     }
 
-    STOP_SIGNAL.store(true, Ordering::Relaxed);
+    request_stop();
     let mut status = REPAIR_STATUS.write().await;
     if status.is_running {
         status.phase = "Stopping...".to_string();

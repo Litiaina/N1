@@ -1177,6 +1177,7 @@ async fn idle_durable_session_blocks_ttl_object_reclamation_until_removed() {
         data_shards: 1,
         parity_shards: 0,
         placement_roots: BLOB_STORE_DISKS.get().unwrap().clone(),
+        payload_staged: false,
     };
     index_store::open_session(&manifest, None).unwrap();
     global_namespace_runtime()

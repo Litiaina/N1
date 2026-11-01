@@ -4,8 +4,37 @@ impl Proof {
     fn gc_fixture_versions(&self) -> ProofResult<BTreeSet<PathBuf>> {
         let mut versions = BTreeSet::new();
         for root in &self.blob_roots {
-            let mut stack =
-                vec![physical_fragment_root(root, &self.stable_fragment_id).join(".objects")];
+            let fragment = physical_fragment_root(root, &self.stable_fragment_id);
+            // New uploads own private payload until publication. Include both
+            // layouts so the original paused-body GC race still checks actual
+            // open shard directories rather than timing out looking in .objects.
+            let uploads = fragment.join(".uploads");
+            if uploads.is_dir() {
+                for version in fs::read_dir(uploads)? {
+                    let version = version?;
+                    if !version.file_type()?.is_dir()
+                        || version
+                            .file_name()
+                            .to_str()
+                            .and_then(|s| s.parse::<ulid::Ulid>().ok())
+                            .is_none()
+                    {
+                        continue;
+                    }
+                    for object in fs::read_dir(version.path())? {
+                        let object = object?;
+                        if object.file_type()?.is_dir()
+                            && object.file_name().to_string_lossy().starts_with("@o_")
+                        {
+                            let payload = object.path().join("payload");
+                            if fs::symlink_metadata(&payload).is_ok_and(|m| m.is_dir()) {
+                                versions.insert(payload);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut stack = vec![fragment.join(".objects")];
             while let Some(dir) = stack.pop() {
                 if !dir.is_dir() {
                     continue;

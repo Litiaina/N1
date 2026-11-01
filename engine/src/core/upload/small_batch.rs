@@ -46,6 +46,7 @@ impl Plan {
                 data_shards: data_shards as u16,
                 parity_shards: parity_shards as u16,
                 placement_roots,
+                payload_staged: true,
             },
             bytes,
         })
@@ -82,6 +83,7 @@ impl Plan {
             usize::from(manifest.parity_shards),
             manifest.stripe_size_bytes,
             Some(&manifest.placement_roots),
+            manifest.payload_staged,
             stream,
             None,
             false,
@@ -196,6 +198,17 @@ mod tests {
                 let path =
                     crate::core::storage_pool::resolve_address(&shard.absolute_path).unwrap();
                 assert!(path.starts_with(&planned_roots[slot]));
+                assert!(
+                    !path.exists(),
+                    "private payload must not be committed before group publication"
+                );
+                let staged = staging::payload_dir(
+                    &planned_roots[slot],
+                    &metadata.fragment,
+                    &metadata.object_key,
+                    &metadata.version_id,
+                )
+                .join(&shard.file_name);
                 assert_eq!(shard.shard_index, slot);
                 assert_eq!(shard.is_parity, slot >= usize::from(metadata.data_shards));
                 assert_eq!(shard.size_bytes, expected_len);
@@ -203,15 +216,18 @@ mod tests {
                     shard.file_name,
                     data_plane::stable_shard_name(0, slot, usize::from(metadata.data_shards))
                 );
-                let piece = std::fs::read(&path).unwrap();
+                let piece = std::fs::read(&staged).unwrap();
                 assert_eq!(piece.len() as u64, expected_len);
                 assert_eq!(shard.checksum, format!("{:08x}", crc32fast::hash(&piece)));
                 assert_eq!(
-                    std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                    std::fs::read_dir(staged.parent().unwrap()).unwrap().count(),
                     1
                 );
                 let object_dir = path.parent().unwrap().parent().unwrap();
-                assert_eq!(std::fs::read_dir(object_dir).unwrap().count(), 1);
+                assert!(
+                    !object_dir.exists(),
+                    "payload preparation must not publish an object directory"
+                );
                 pieces.push(piece);
             }
             let stripe = metadata.stripe_size_bytes;

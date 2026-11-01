@@ -143,6 +143,7 @@ async fn finalized_session_retirement_does_not_delete_payload(wrapper: u8) {
                 .take(2)
                 .map(|root| root.display().to_string())
                 .collect(),
+            payload_staged: false,
         };
         index_store::open_session(&manifest, None).unwrap();
         let pause = Arc::new(PartPause {
@@ -345,6 +346,7 @@ async fn cancellation_preserves_data(corrupt: bool, retired: bool) {
             .take(2)
             .map(|root| root.display().to_string())
             .collect(),
+        payload_staged: false,
     };
     index_store::open_session(&manifest, None).unwrap();
     object_upload_part_reader_direct(
@@ -552,6 +554,7 @@ async fn repeated_http_part_consumes_the_body_without_rewriting_shards() {
             .take(2)
             .map(|root| root.display().to_string())
             .collect(),
+        payload_staged: false,
     };
     index_store::open_session(&manifest, None).unwrap();
     let query = UploadPartQuery {

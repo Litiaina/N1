@@ -351,6 +351,7 @@ mod activity;
 mod data_plane;
 mod sessions;
 pub(crate) mod small_batch;
+pub(crate) mod staging;
 pub(crate) use activity::{UploadActivityGuard, UploadGcScan};
 
 /// TTL reclamation is not session expiry. An idle resumable upload remains
@@ -650,6 +651,7 @@ pub async fn object_upload_part(
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
         Some(&manifest.placement_roots),
+        manifest.payload_staged,
         body,
         expected_checksum,
         strict_durability,
@@ -842,6 +844,7 @@ where
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
         Some(&manifest.placement_roots),
+        manifest.payload_staged,
         body_stream,
         expected_checksum,
         strict_durability,
@@ -983,6 +986,7 @@ where
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
         Some(&manifest.placement_roots),
+        manifest.payload_staged,
         reader,
         expected_checksum,
         strict_durability,
@@ -1206,6 +1210,7 @@ where
         parity_shards,
         stripe_size,
         Some(&placement_roots),
+        true,
         body_stream,
         expected_checksum,
         strict_durability,
@@ -1335,6 +1340,7 @@ where
         parity_shards,
         stripe_size,
         Some(&placement_roots),
+        true,
         reader,
         expected_checksum,
         strict_durability,
@@ -1476,10 +1482,19 @@ pub async fn finalize_object_upload_direct(
         .as_ref()
         .map(manifest_data_shards)
         .unwrap_or_else(configured_data_shards);
-    let shard_dir_checks = blob_roots
-        .iter()
-        .map(|root| path_manager.get_shard_dir_on_disk(root, &fragment, &object_key, &version_id));
-    let found_data_roots = join_all(shard_dir_checks.map(tokio_fs::try_exists))
+    let staged_payload = manifest.as_ref().is_some_and(|m| m.payload_staged);
+    let shard_dir_checks = blob_roots.iter().map(|root| {
+        let final_dir =
+            path_manager.get_shard_dir_on_disk(root, &fragment, &object_key, &version_id);
+        let staged = staging::payload_dir(root, &fragment, &object_key, &version_id);
+        async move {
+            if staged_payload && tokio_fs::try_exists(staged).await? {
+                return Ok(true);
+            }
+            tokio_fs::try_exists(final_dir).await
+        }
+    });
+    let found_data_roots = join_all(shard_dir_checks)
         .await
         .into_iter()
         .filter(|result| matches!(result, Ok(true)))

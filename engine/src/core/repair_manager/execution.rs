@@ -15,6 +15,7 @@ pub async fn run_repair_job(
         fast_mode: false,
         access_mode: cfg.check_mode.default_maintenance_access_mode(),
         replay_pending_redistribution: true,
+        background_pause_millis: 0,
     };
     run_repair_job_with_options(cfg, run_opts, ws_manager).await
 }
@@ -25,14 +26,14 @@ pub async fn run_repair_job_with_options(
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
     let running_guard = acquire_repair_running()?;
-    run_repair_job_reserved(cfg, opts, ws_manager, running_guard).await
+    run_repair_job_reserved(cfg, opts, ws_manager, &running_guard).await
 }
 
 pub(super) async fn run_repair_job_reserved(
     cfg: RepairRunConfig,
     opts: RepairRunOptions,
     ws_manager: Arc<WsConnectionManager>,
-    _running_guard: RepairRunningGuard,
+    _running_guard: &RepairRunningGuard,
 ) -> Result<(), AppError> {
     let result = run_repair_job_inner(cfg, opts, ws_manager.clone()).await;
     if let Err(error) = &result {
@@ -50,7 +51,6 @@ async fn run_repair_job_inner(
     opts: RepairRunOptions,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
-    STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
     let effective_access_mode = opts
         .access_mode
@@ -299,6 +299,7 @@ async fn run_repair_job_inner(
                     cfg.clone(),
                     shard_repair_sem.clone(),
                     batch_pacing,
+                    opts.background_pause_millis,
                     ws_manager.clone(),
                     start_time,
                     if is_trash {
@@ -358,6 +359,7 @@ async fn apply_meta_batch(
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
     batch_pacing: Option<Duration>,
+    background_pause_millis: u64,
     ws_manager: Arc<WsConnectionManager>,
     start_time: Instant,
     catalog: MetadataCatalog,
@@ -379,18 +381,35 @@ async fn apply_meta_batch(
         deduped_batch.push(meta.clone());
     }
 
-    let mut stream =
-        stream::iter(deduped_batch.into_iter())
-            .map(|meta| {
-                let blob_roots = blob_roots.clone();
-                let shard_repair_sem = shard_repair_sem.clone();
-                let cfg = cfg.clone();
+    let mut stream = stream::iter(deduped_batch.into_iter())
+        .map(|meta| {
+            let blob_roots = blob_roots.clone();
+            let shard_repair_sem = shard_repair_sem.clone();
+            let cfg = cfg.clone();
 
-                async move {
-                    process_one_metadata(meta, blob_roots, cfg, shard_repair_sem, catalog).await
+            async move {
+                if should_stop() {
+                    return Ok(BatchDelta::default());
                 }
-            })
-            .buffer_unordered(cfg.meta_concurrency);
+                if background_pause_millis != 0 {
+                    tokio::time::sleep(Duration::from_millis(background_pause_millis)).await;
+                    // Bound the backoff so maintenance can still progress
+                    // under sustained foreground traffic. Never preempt an
+                    // in-flight shard write or hold an object lock here.
+                    for _ in 0..10 {
+                        if should_stop() || !crate::core::io_scheduler::foreground_io_pending() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    if should_stop() {
+                        return Ok(BatchDelta::default());
+                    }
+                }
+                process_one_metadata(meta, blob_roots, cfg, shard_repair_sem, catalog).await
+            }
+        })
+        .buffer_unordered(cfg.meta_concurrency);
 
     let mut batch_agg = BatchDelta::default();
     let mut pending_update = BatchDelta::default();

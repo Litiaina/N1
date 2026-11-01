@@ -248,7 +248,7 @@ pub(crate) fn offline_session_parts(
                         shard_index,
                         usize::from(manifest.data_shards),
                     );
-                    let path = Path::new(root)
+                    let committed = Path::new(root)
                         .join(format!("@f_{stable_fragment}"))
                         .join(".objects")
                         .join(&fanout[0])
@@ -256,16 +256,39 @@ pub(crate) fn offline_session_parts(
                         .join(format!("@o_{}", manifest.object_key))
                         .join(&manifest.version_id)
                         .join(&file_name);
-                    super::disk_manager::ShardInfo {
+                    let staged = Path::new(root)
+                        .join(format!("@f_{stable_fragment}"))
+                        .join(UPLOADS_DIR)
+                        .join(&manifest.version_id)
+                        .join(format!("@o_{}", manifest.object_key))
+                        .join("payload")
+                        .join(&file_name);
+                    let path = if manifest.payload_staged {
+                        match fs::symlink_metadata(&staged) {
+                            Ok(metadata) if metadata.is_file() => staged,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => committed,
+                            Err(error) => {
+                                return Err(io_err(error, "inspect offline staged shard"));
+                            }
+                            Ok(_) => {
+                                return Err(AppError::Conflict(
+                                    "redirected offline staged shard".into(),
+                                ));
+                            }
+                        }
+                    } else {
+                        committed
+                    };
+                    Ok(super::disk_manager::ShardInfo {
                         shard_index,
                         is_parity: shard_index >= usize::from(manifest.data_shards),
                         absolute_path: path.to_string_lossy().into_owned(),
                         file_name,
                         size_bytes: size,
                         checksum: format!("{:08x}", checksums[&shard_index]),
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, AppError>>()?;
             Ok(PartMetadata {
                 part_index,
                 size_bytes,

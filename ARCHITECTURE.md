@@ -83,7 +83,11 @@ quiesced offline verification remains the complete maintenance gate.
     .fragment.ndx
     .namespace/<encoded-key>.ncx
     .trash/<time>.d<depth>.<nonce>/<encoded-key>.ncx
-    .uploads/
+    .uploads/<version-ULID>/
+      <durable-session-manifest-binding-and-receipts-if-used>
+      @o_<object-id>/
+        <private-group-NDX-and-NCX-files-if-used>
+        payload/<unfinished-data-and-parity-pieces>
     .objects/<fanout>/@o_<object-id>/
       <version-summary>.ndx
       <version-id>/<data-and-parity-pieces>
@@ -101,6 +105,24 @@ quiesced offline verification remains the complete maintenance gate.
 ECS Core performs bounded-memory encoding, decoding, checksums and recovery.
 N1 owns paths, placement, synchronization, publication and metadata. Its codec
 dependency remains pinned; the namespace revision does not change EC math.
+
+New uploads write payload under their `.uploads` owner. Finalization moves each
+member's payload directory into `.objects/<fanout>/@o_<object-id>/<version-ULID>`
+without copying pieces, then publishes NDX and the logical NCX reference. NDX
+records final addresses from its first publication; it never records temporary
+addresses or mutable logical names. Partial member moves can be retried and
+cannot replace an existing version. Strict small-object groups retain the
+existing three shared filesystem barriers. Strict standalone/multipart writes
+persist their staging organizers and promotion before publishing NDX.
+
+GC considers upload-owned candidates before collecting committed namespace
+references. Existing activity fences, durable and standard session protection,
+TTL, fragment lifecycle, member identity, backup and export protection apply.
+An expired abandoned owner can be removed without an NCX population walk;
+committed orphan versions and trash still require their existing separate
+reachability work. Legacy sessions without the staging flag retain their old
+`.objects` payload placement until completed or reclaimed. This does not migrate
+committed encoding-4 objects or add a namespace catalogue.
 
 ## Flat keys and listing
 
@@ -181,8 +203,28 @@ a read target. Read repair reuses whole-fragment lifecycle admission and checks
 the fragment still exists before writing. It defers to pending deletion rather
 than waiting behind it or recreating a deleted fragment. Healthy committed NDX
 is not rewritten by this repair path.
-Full availability/checksum walks and deep health inspection are explicit.
+Full availability/checksum walks require explicit repair requests or an opt-in
+calendar checksum schedule. Deep health inspection remains explicit.
 Periodic known-member safety probes do not enumerate namespace or payload.
+
+`auto_healing.scrub_schedule_utc` is empty by default. An entry such as
+`Sun 02:00` or `daily 02:00` starts an asynchronous online checksum repair job
+through the existing background repair worker and its shared singleton guard.
+The scheduled job uses availability access rather than the manual API's
+read-only/quiesced modes. It paces between objects and backs off for foreground
+operations, including streamed downloads. In-flight shard I/O is not preempted;
+background scans still consume bandwidth and can increase foreground latency.
+Topology probes run independently while a long scan executes.
+
+The small local `.n1/scheduled-scrub.json` journal records admission and completion
+so a restart cannot duplicate a calendar slot. Missed/busy slots are deferred to
+the next calendar occurrence; there is no catch-up storm. No whole-scan deadline
+declares the engine failed. Stopped/errored/interrupted scans report incomplete
+coverage, retain the last successful completion, and do not set a safety gate.
+Real topology and identity gates remain independent. Progress is visible through
+the existing repair status and the nested `auto_healing.scheduled_scrub` status.
+Persistent mid-scan pause/resume is not implemented; a later run starts a fresh
+scan. This journal is maintenance state, not object or namespace authority.
 
 Whole-fragment deletion takes exclusive per-fragment admission. Uploads and
 repair share admission, so different uploads still run concurrently. Each

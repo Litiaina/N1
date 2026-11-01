@@ -320,6 +320,7 @@ pub fn set_foreground_io_target(target: usize) {
 pub(crate) fn foreground_io_pending() -> bool {
     ACTIVE_FOREGROUND_IO.load(Ordering::Relaxed) != 0
         || QUEUED_FOREGROUND_IO.load(Ordering::Relaxed) != 0
+        || crate::core::object_parser::foreground_streams_active()
 }
 
 pub fn disk_io_scheduler_config() -> DiskIoSchedulerConfig {

@@ -20,6 +20,9 @@ pub struct AutoHealingConfig {
     pub object_scan_concurrency: usize,
     pub shard_repair_concurrency: usize,
     pub metadata_batch_size: usize,
+    /// Empty/absent disables scheduled scans; legacy enabled=true is insufficient.
+    pub scrub_schedule_utc: String,
+    pub scheduled_scrub_pause_millis: u64,
 }
 
 pub struct Config {
@@ -121,6 +124,18 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
                 .clamp(1, 32),
             metadata_batch_size: parse_usize(auto_healing_section, "metadata_batch_size")
                 .clamp(32, 4096),
+            scrub_schedule_utc: auto_healing_section
+                .get("scrub_schedule_utc")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            scheduled_scrub_pause_millis: auto_healing_section
+                .get("scheduled_scrub_pause_millis")
+                .unwrap_or("25")
+                .trim()
+                .parse::<u64>()
+                .expect("scheduled_scrub_pause_millis must be an unsigned integer")
+                .clamp(1, 60_000),
         },
     }
 });

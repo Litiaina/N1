@@ -563,6 +563,42 @@ fn orphan_version_reclaimable(
         && orphan_blob_age_expired(age, ttl)
 }
 
+fn reclaim_upload_candidate(path: &Path, now: SystemTime, ttl: Duration) -> std::io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    let mut modified = metadata.modified()?;
+    match fs::symlink_metadata(path.join("payload")) {
+        Ok(payload) if payload.is_dir() => modified = modified.max(payload.modified()?),
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    let Ok(age) = now.duration_since(modified) else {
+        return Ok(false);
+    };
+    if !orphan_blob_age_expired(age, ttl) {
+        return Ok(false);
+    }
+    // This owner is private upload state. A move into .objects removes payload
+    // from this subtree; deleting its remnants cannot traverse committed data.
+    // Unknown controls or links preserve the owner for operator investigation.
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !((name == "payload" && kind.is_dir())
+            || (name.starts_with(".n1-batch-") && name.ends_with(".tmp") && kind.is_file()))
+        {
+            return Ok(false);
+        }
+    }
+    fs::remove_dir_all(path)?;
+    Ok(true)
+}
+
 fn prune_orphan_object_dir(object_dir: &Path, now: SystemTime, ttl: Duration) -> bool {
     let _snapshot_boundary = crate::core::backup::barrier::mutation();
     let Ok(metadata) = fs::symlink_metadata(object_dir) else {
@@ -1139,6 +1175,103 @@ async fn process_fragment_gc(
         }
     }
 
+    for (version_id, amount, object_id) in &sessions_to_delete {
+        if !continue_fragment_gc(io_scope, &mut export_guard, fragment, blob_roots).await? {
+            return Ok(stats);
+        }
+        if should_stop_gc() {
+            return Ok(stats);
+        }
+        let _reclaim_guard = match upload_scan.try_reclaim(object_id) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => continue,
+            Err(error) => {
+                record_gc_preservation_error(fragment, "cannot fence expired session", error);
+                return Ok(stats);
+            }
+        };
+        if let Err(error) = index::remove_session(fragment, version_id, "gc-expired").await {
+            record_gc_preservation_error(fragment, "cannot expire durable upload session", error);
+            return Ok(stats);
+        }
+        stats.sessions_deleted = stats.sessions_deleted.saturating_add(1);
+        stats.refund_bytes = stats.refund_bytes.saturating_add(*amount);
+    }
+
+    // Upload-owned payload has no NCX reachability dependency. Reclaim only
+    // these candidates before walking the committed namespace. The separate
+    // committed-orphan/trash pass below retains all existing protections.
+    for root in blob_roots {
+        let uploads = fragment_root_on(root, fragment).join(index_store::UPLOADS_DIR);
+        let entries = match fs::read_dir(&uploads) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                record_gc_preservation_error(fragment, "upload candidate scan failed", error);
+                continue;
+            }
+        };
+        for entry in entries {
+            if !continue_fragment_gc(io_scope, &mut export_guard, fragment, blob_roots).await? {
+                return Ok(stats);
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    record_gc_preservation_error(fragment, "upload candidate read failed", error);
+                    continue;
+                }
+            };
+            let version = entry.file_name().to_string_lossy().into_owned();
+            if version.parse::<ulid::Ulid>().is_err()
+                || active_session_versions.contains(&version)
+                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                continue;
+            }
+            let children = match fs::read_dir(entry.path()) {
+                Ok(children) => children,
+                Err(_) => continue,
+            };
+            for child in children {
+                let Ok(child) = child else { continue };
+                let Some(object) = child
+                    .file_name()
+                    .to_str()
+                    .and_then(index_store::object_id_from_dir_name)
+                else {
+                    continue;
+                };
+                if child.file_name() != std::ffi::OsString::from(format!("@o_{object}")) {
+                    continue;
+                }
+                if !child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                let Some(_guard) = upload_scan.try_reclaim(&object)? else {
+                    continue;
+                };
+                let candidate = child.path();
+                let ttl = file_ttl;
+                let removed = tokio::task::spawn_blocking(move || {
+                    let _snapshot_boundary = crate::core::backup::barrier::mutation();
+                    reclaim_upload_candidate(&candidate, now, ttl)
+                })
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("upload GC worker: {e}")))?;
+                match removed {
+                    Ok(true) => stats.orphan_blob_dirs_deleted += 1,
+                    Ok(false) => (),
+                    Err(error) => {
+                        record_gc_preservation_error(fragment, "upload candidate preserved", error)
+                    }
+                }
+            }
+            // Never remove controls/receipts or unknown contents here.
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+
     // Observe sessions before namespace references so captured sessions remain
     // protected while namespace publication proceeds. This ordering is not a
     // transactionally consistent snapshot of every concurrent mutation.
@@ -1180,29 +1313,6 @@ async fn process_fragment_gc(
             return Ok(stats);
         }
     };
-
-    for (version_id, amount, object_id) in &sessions_to_delete {
-        if !continue_fragment_gc(io_scope, &mut export_guard, fragment, blob_roots).await? {
-            return Ok(stats);
-        }
-        if should_stop_gc() {
-            return Ok(stats);
-        }
-        let _reclaim_guard = match upload_scan.try_reclaim(object_id) {
-            Ok(Some(guard)) => guard,
-            Ok(None) => continue,
-            Err(error) => {
-                record_gc_preservation_error(fragment, "cannot fence expired session", error);
-                return Ok(stats);
-            }
-        };
-        if let Err(error) = index::remove_session(fragment, version_id, "gc-expired").await {
-            record_gc_preservation_error(fragment, "cannot expire durable upload session", error);
-            return Ok(stats);
-        }
-        stats.sessions_deleted = stats.sessions_deleted.saturating_add(1);
-        stats.refund_bytes = stats.refund_bytes.saturating_add(*amount);
-    }
 
     for root in blob_roots {
         io_scope.heartbeat();
@@ -1315,6 +1425,34 @@ async fn process_fragment_gc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upload_candidate_cleanup_preserves_committed_payload_unknown_controls_and_redirects() {
+        use super::reclaim_upload_candidate;
+        use std::{
+            fs,
+            time::{Duration, SystemTime},
+        };
+        let root = std::env::temp_dir().join(format!("n1-upload-candidate-{}", ulid::Ulid::new()));
+        let committed = root.join(".objects/object/version");
+        let candidate = root.join(".uploads/version/@o_object");
+        fs::create_dir_all(&committed).unwrap();
+        fs::write(committed.join("shard"), b"immutable").unwrap();
+        fs::create_dir_all(candidate.join("payload")).unwrap();
+        fs::write(candidate.join("payload/shard"), b"unfinished").unwrap();
+        assert!(
+            !reclaim_upload_candidate(&candidate, SystemTime::now(), Duration::from_secs(3600))
+                .unwrap()
+        );
+        fs::write(candidate.join("unknown-control"), b"preserve").unwrap();
+        assert!(!reclaim_upload_candidate(&candidate, SystemTime::now(), Duration::ZERO).unwrap());
+        fs::remove_file(candidate.join("unknown-control")).unwrap();
+        assert!(reclaim_upload_candidate(&candidate, SystemTime::now(), Duration::ZERO).unwrap());
+        assert_eq!(fs::read(committed.join("shard")).unwrap(), b"immutable");
+        std::os::unix::fs::symlink(&committed, &candidate).unwrap();
+        assert!(!reclaim_upload_candidate(&candidate, SystemTime::now(), Duration::ZERO).unwrap());
+        assert_eq!(fs::read(committed.join("shard")).unwrap(), b"immutable");
+        fs::remove_dir_all(root).unwrap();
+    }
     use super::{
         GcExecutionMode, GcJobStatus, GcRunOptions, collect_gc_fragments,
         orphan_version_reclaimable, parse_gc_execution_mode,

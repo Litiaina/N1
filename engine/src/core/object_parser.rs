@@ -29,6 +29,10 @@ static STREAM_READ_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| {
 });
 static ACTIVE_STREAM_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 
+pub(crate) fn foreground_streams_active() -> bool {
+    ACTIVE_STREAM_INFLIGHT.load(Ordering::Relaxed) != 0
+}
+
 struct AdaptiveStreamGuard {
     _permit: OwnedSemaphorePermit,
 }

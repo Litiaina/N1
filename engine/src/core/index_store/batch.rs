@@ -81,14 +81,37 @@ pub(crate) fn stage(metadata: &ObjectMetadata) -> Result<StagedMetadata, AppErro
                     "grouped shard does not match its immutable version".into(),
                 ));
             }
-            let directory = fs::symlink_metadata(payload_dir)
+            let upload = crate::core::upload::staging::payload_dir(
+                root,
+                &metadata.fragment,
+                &metadata.object_key,
+                &metadata.version_id,
+            );
+            let staged = match fs::symlink_metadata(&upload) {
+                Ok(directory) if directory.is_dir() => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(io_err(error, "inspect grouped upload")),
+                Ok(_) => return Err(AppError::Conflict("redirected grouped upload".into())),
+            };
+            let directory = fs::symlink_metadata(if staged { &upload } else { payload_dir })
                 .map_err(|error| io_err(error, "check grouped N1 payload directory"))?;
             if !directory.is_dir() {
                 return Err(AppError::Conflict(
                     "grouped N1 payload directory is not a real directory".into(),
                 ));
             }
-            placements.insert(object_dir, payload_dir.to_path_buf());
+            let private = if staged {
+                crate::core::upload::staging::parents(root, &object_dir, true)?;
+                crate::core::upload::staging::private_dir(
+                    root,
+                    &metadata.fragment,
+                    &metadata.object_key,
+                    &metadata.version_id,
+                )
+            } else {
+                payload_dir.to_path_buf()
+            };
+            placements.insert(object_dir, private);
         }
     }
     stage_on_placements(metadata, placements)

@@ -583,7 +583,9 @@ fn publish_group(
     )?;
     let mut ndx_published = Vec::with_capacity(staged.len());
     for mut entry in staged {
-        match entry.ndx.publish() {
+        match crate::core::upload::staging::promote(&entry.metadata, false)
+            .and_then(|()| entry.ndx.publish())
+        {
             Ok(()) => ndx_published.push(entry),
             Err(error) => results.push(entry.original.failure(&Failure::from(&error))),
         }
@@ -615,6 +617,7 @@ fn publish_group(
         "upload.batch.group_sync_ncx",
     )?;
     for entry in published {
+        crate::core::upload::staging::retire_empty(&entry.metadata);
         emit_logical_file_uploaded(
             state,
             fragment,

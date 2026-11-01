@@ -101,7 +101,7 @@ impl Proof {
         self.backup_cli(&repo,&key,"verify",&["--snapshot",snapshot],true)?;
         // Exercise the same endpoint over N1 native control, not only HTTPS.
         let shell=self.args.binary.parent().ok_or("binary parent")?.join("litiaina-n1-shell");
-        let native_url=format!("n1://127.0.0.1:{}",self.args.native_port);
+        let native_url=format!("n1://127.0.0.1:{}",self.native_port());
         let native=Command::new(&shell).args(["backup","create-online","--source-url",&native_url,"--repository","primary","--token-file"]).arg(&token_file).arg("--allow-plaintext").output()?;
         if !native.status.success() { return Err(format!("native online capture: {}",String::from_utf8_lossy(&native.stderr)).into()); }
         let second:Value=serde_json::from_slice(&native.stdout)?;

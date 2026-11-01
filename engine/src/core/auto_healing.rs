@@ -19,6 +19,9 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+mod schedule;
+pub use schedule::ScheduledScrubStatus;
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AutoHealingStatus {
     pub enabled: bool,
@@ -37,6 +40,7 @@ pub struct AutoHealingStatus {
     pub last_availability_scan_at: Option<i64>,
     pub last_checksum_scrub_at: Option<i64>,
     pub last_error: Option<String>,
+    pub scheduled_scrub: ScheduledScrubStatus,
 }
 
 impl AutoHealingStatus {
@@ -311,7 +315,8 @@ pub async fn assess_current_topology() -> TopologyAssessment {
 async fn update_topology_status(assessment: &TopologyAssessment) {
     let mut status = AUTO_HEALING_STATUS.write().await;
     // This legacy status field describes automatic full scans, not read repair.
-    status.enabled = false;
+    status.enabled =
+        CONFIG.auto_healing.enabled && !CONFIG.auto_healing.scrub_schedule_utc.is_empty();
     status.write_safe = assessment.write_safe;
     status.read_only_reason = safety_read_only_reason();
     status.configured_blob_roots = assessment.configured_blob_roots;
@@ -330,7 +335,7 @@ async fn update_topology_status(assessment: &TopologyAssessment) {
     }
 }
 
-pub async fn run_auto_healing_controller(_state: Arc<AppState>) {
+pub async fn run_auto_healing_controller(state: Arc<AppState>) {
     if BLOB_STORE_DISKS.get().is_none()
         || INDEX_STORE_DISKS.get().is_none()
         || DATA_SHARDS_ATOMIC.get().is_none()
@@ -343,6 +348,7 @@ pub async fn run_auto_healing_controller(_state: Arc<AppState>) {
     }
 
     let cfg = CONFIG.auto_healing.clone();
+    tokio::spawn(schedule::run(state, cfg.clone()));
     let topology_interval = Duration::from_secs(cfg.topology_check_interval_seconds.max(1));
     let mut safe_since: Option<Instant> = None;
 

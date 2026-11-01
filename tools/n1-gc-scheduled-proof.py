@@ -161,6 +161,9 @@ class ScheduledGcProof(base.Stress):
             for path in (fragment / '.objects').glob(f'*/*/@o_*/{version}'):
                 assert path.is_dir() and not path.is_symlink()
                 found.append(require_inside(path, member))
+            for path in (fragment / '.uploads' / version).glob('@o_*/payload'):
+                assert path.is_dir() and not path.is_symlink()
+                found.append(require_inside(path, member))
         return found
 
     def version_summaries(self, version):
@@ -285,8 +288,8 @@ class ScheduledGcProof(base.Stress):
         # An orphan beneath an object that still has committed historical
         # versions must also be reclaimed; a live object is not a blanket pin.
         committed_live_dirs = self.version_directories(self.live_acks[0][2])
-        assert {path.parent for path in interrupted_live['directories']} == {
-            path.parent for path in committed_live_dirs}, 'New version must share the real live object directory'
+        assert {path.parent.name for path in interrupted_live['directories']} == {
+            path.parent.name for path in committed_live_dirs}, 'New version must retain the real live object identity'
         interrupted_uploads = [interrupted, interrupted_live]
         self.report['ordinary_upload_sigkill'] = [dict(
             object_key=upload['key'], version_id=upload['init']['version_id'], acknowledged_part=0,
@@ -300,6 +303,8 @@ class ScheduledGcProof(base.Stress):
         old = time.time() - OLD_SECONDS
         for path in [directory for upload in interrupted_uploads for directory in upload['directories']]:
             os.utime(path, (old, old))
+            if '.uploads' in path.parts:
+                os.utime(path.parent, (old, old))
         expired_trash_paths = []
         for path in expired_generations:
             member = next(member for member in self.roots if member in path.parents)

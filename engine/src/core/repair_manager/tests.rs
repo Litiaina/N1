@@ -12,6 +12,27 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use ulid::Ulid;
 
+#[test]
+fn queued_repair_stop_survives_conflicting_admission_and_clears_only_after_owner_drains() {
+    let _lock = crate::test_support::global_test_lock().blocking_lock();
+    let guard = super::acquire_repair_running().unwrap();
+    assert!(!super::should_stop());
+    super::request_stop();
+    assert!(super::should_stop());
+    assert!(super::acquire_repair_running().is_err());
+    assert!(
+        super::should_stop(),
+        "a rejected admission must not clear another job's stop"
+    );
+    drop(guard);
+    let next = super::acquire_repair_running().unwrap();
+    assert!(
+        !super::should_stop(),
+        "the next admitted job must not inherit a stale stop"
+    );
+    drop(next);
+}
+
 #[tokio::test]
 async fn fragment_deletion_waits_for_healing_and_stale_scan_cannot_resurrect_it() {
     use super::object_repair::{fragment_is_present, repair_fragment_metadata_replicas};

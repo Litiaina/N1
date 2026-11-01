@@ -126,6 +126,7 @@ async fn prepare_upload_manifest(
         data_shards: data_shards as u16,
         parity_shards: parity_shards as u16,
         placement_roots,
+        payload_staged: true,
     };
 
     ensure_registered_placement_roots(
@@ -380,6 +381,29 @@ fn standard_part_metadata(
     })
 }
 
+fn cancelled_part_path(
+    manifest: &UploadSessionManifest,
+    shard: &ShardInfo,
+) -> Result<PathBuf, AppError> {
+    let final_path = crate::core::storage_pool::resolve_address(&shard.absolute_path)?;
+    if !manifest.payload_staged {
+        return Ok(final_path);
+    }
+    let root = final_path
+        .ancestors()
+        .nth(7)
+        .ok_or_else(|| AppError::Conflict("invalid cancelled shard address".into()))?;
+    // Cancellation owns private staging only, even if publication raced or an
+    // I/O error made a committed version impossible to inspect.
+    Ok(staging::payload_dir(
+        root,
+        &manifest.fragment,
+        &manifest.object_key,
+        &manifest.version_id,
+    )
+    .join(&shard.file_name))
+}
+
 pub(super) fn check_standard_retry_durability(
     session: &StandardUploadSession,
     part_index: u64,
@@ -545,6 +569,7 @@ pub async fn object_upload_part_standard_body_direct(
         manifest_parity_shards(&session.manifest),
         session.manifest.stripe_size_bytes,
         Some(&session.manifest.placement_roots),
+        session.manifest.payload_staged,
         body,
         expected_checksum,
         strict,
@@ -557,7 +582,7 @@ pub async fn object_upload_part_standard_body_direct(
             &metadata
                 .shards
                 .iter()
-                .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
+                .map(|shard| cancelled_part_path(&session.manifest, shard))
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await;
@@ -629,6 +654,7 @@ where
         manifest_parity_shards(&session.manifest),
         session.manifest.stripe_size_bytes,
         Some(&session.manifest.placement_roots),
+        session.manifest.payload_staged,
         reader,
         expected_checksum,
         strict,
@@ -640,7 +666,7 @@ where
             &metadata
                 .shards
                 .iter()
-                .map(|shard| crate::core::storage_pool::resolve_address(&shard.absolute_path))
+                .map(|shard| cancelled_part_path(&session.manifest, shard))
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .await;

@@ -155,12 +155,22 @@ impl NamespacePlan {
             let target = path(root, &self.fragment, &self.key);
             let parent = target.parent().ok_or_else(|| error("NCX has no parent"))?;
             parents(parent, root, true)?;
-            let temporary_parent = manager.get_shard_dir_on_disk(
+            let upload = crate::core::upload::staging::private_dir(
                 root,
                 &self.fragment,
                 &self.pointer.object_id,
                 version,
             );
+            let temporary_parent = if upload.is_dir() {
+                upload
+            } else {
+                manager.get_shard_dir_on_disk(
+                    root,
+                    &self.fragment,
+                    &self.pointer.object_id,
+                    version,
+                )
+            };
             // Payload staging has already created this directory. Never make
             // an alternate payload tree merely to publish a namespace key.
             parents(&temporary_parent, root, false)?;

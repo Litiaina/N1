@@ -342,7 +342,7 @@ impl Proof {
             let mut expected = payload.clone();
             if endpoint.starts_with("native-") {
                 let mut connection =
-                    TcpStream::connect(("127.0.0.1", self.args.native_port)).await?;
+                    TcpStream::connect(("127.0.0.1", self.native_port())).await?;
                 let auth = native_round_trip(&mut connection, "integrity-auth", "auth.fragment",
                     json!({"fragment":self.fragment,"secret":self.args.fragment_key,"read":true,"expires_in":21600}), None).await?;
                 ensure_native_ok(&auth, "integrity native auth")?;

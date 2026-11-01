@@ -2286,7 +2286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_publishes_typed_metadata_without_upload_workspace_or_public_layout() {
+    async fn one_shot_publishes_typed_metadata_retires_staging_and_hides_public_layout() {
         use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata};
         let _test_guard = crate::test_support::global_test_lock().lock().await;
         let (fragment, claims, state) = upload_test_fixture();
@@ -2345,10 +2345,14 @@ mod tests {
                 std::path::Path::new(root),
                 &fragment,
             );
-            assert!(
-                !path.join(".uploads").exists(),
-                "one-shot must not create resumable state"
-            );
+            match std::fs::read_dir(path.join(".uploads")) {
+                Ok(mut entries) => assert!(
+                    entries.next().is_none(),
+                    "one-shot must retire its upload owner"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("cannot inspect one-shot staging: {error}"),
+            }
         }
         remove_upload_test_fixture(&fragment);
     }
@@ -2437,7 +2441,10 @@ mod tests {
                 std::path::Path::new(root),
                 &fragment,
             );
-            for entry in walkdir::WalkDir::new(path.join(".objects")) {
+            for entry in [".objects", ".uploads"]
+                .into_iter()
+                .flat_map(|name| walkdir::WalkDir::new(path.join(name)))
+            {
                 match entry {
                     Ok(entry) => assert!(
                         !entry.file_type().is_file(),
@@ -2451,7 +2458,13 @@ mod tests {
                     Err(error) => panic!("failed to inspect rejection cleanup: {error}"),
                 }
             }
-            assert!(!path.join(".uploads").exists());
+            match std::fs::read_dir(path.join(".uploads")) {
+                Ok(mut entries) => {
+                    assert!(entries.next().is_none(), "rejected upload owner leaked")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("cannot inspect rejected staging: {error}"),
+            }
         }
         remove_upload_test_fixture(&fragment);
     }

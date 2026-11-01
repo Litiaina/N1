@@ -1351,6 +1351,7 @@ fn multipart_receipts_are_zero_decode_filename_records() {
             "/blob/1".to_string(),
             "/blob/2".to_string(),
         ],
+        payload_staged: false,
     };
     open_session(&manifest, None).expect("open session");
     let receipt = SessionPartReceipt {
@@ -1409,6 +1410,7 @@ fn offline_receipts_derive_physical_pieces_without_engine_initialization() {
         data_shards: 1,
         parity_shards: 1,
         placement_roots: vec!["/first".into(), "/second".into()],
+        payload_staged: false,
     };
     fs::write(
         dir.join("shard_p00000000000000000000_s0000.11111111.receipt"),
@@ -1472,6 +1474,7 @@ fn multipart_manifest_and_binding_are_stable_session_truth() {
             "/blob/1".to_string(),
             "/blob/2".to_string(),
         ],
+        payload_staged: false,
     };
     let binding = PendingUploadBinding {
         fragment: fragment.clone(),
@@ -1586,6 +1589,7 @@ async fn durable_finalize_retains_resume_truth_until_namespace_commit() {
         data_shards: 1,
         parity_shards: 0,
         placement_roots: vec![blob_roots[0].to_string_lossy().into_owned()],
+        payload_staged: false,
     };
     open_session(&manifest, None).unwrap();
     write_pending_binding(&PendingUploadBinding {
@@ -1689,6 +1693,7 @@ fn removing_multipart_session_clears_manifest_binding_and_receipts_on_all_replic
         data_shards: 1,
         parity_shards: 1,
         placement_roots: vec!["/blob/0".to_string(), "/blob/1".to_string()],
+        payload_staged: false,
     };
     open_session(&manifest, None).expect("open session");
     write_pending_binding(&PendingUploadBinding {
@@ -1733,6 +1738,72 @@ fn removing_multipart_session_clears_manifest_binding_and_receipts_on_all_replic
 }
 
 #[test]
+fn offline_durable_receipts_follow_staging_and_partial_promotion_without_rewriting_addresses() {
+    let root = std::env::temp_dir().join(format!("n1-offline-staging-{}", Ulid::new()));
+    let fragment = Ulid::new().to_string();
+    let object = Ulid::new().to_string();
+    let version = Ulid::new().to_string();
+    let manifest = UploadSessionManifest {
+        fragment: fragment.clone(),
+        object_key: object.clone(),
+        version_id: version.clone(),
+        session_id: Ulid::new().to_string(),
+        total_size_bytes: 1024,
+        expected_parts: 1,
+        part_size_bytes: 1024,
+        content_type: "application/octet-stream".into(),
+        created_at: 1,
+        stripe_size_bytes: 4096,
+        data_shards: 1,
+        parity_shards: 0,
+        placement_roots: vec![root.display().to_string()],
+        payload_staged: true,
+    };
+    let staged = crate::core::upload::staging::payload_dir(&root, &fragment, &object, &version);
+    fs::create_dir_all(&staged).unwrap();
+    let name = crate::core::upload::stable_shard_name(0, 0, 1);
+    let bytes = vec![31; 4096];
+    let crc = crc32fast::hash(&bytes);
+    fs::write(staged.join(&name), &bytes).unwrap();
+    let session = crate::core::upload::staging::owner_dir(&root, &fragment, &version);
+    fs::write(session.join(shard_receipt_name(0, 0, crc)), []).unwrap();
+    let parts = offline_session_parts(&session, manifest.clone(), &fragment)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(
+        Path::new(&parts[0].shards[0].absolute_path),
+        staged.join(&name)
+    );
+    assert_eq!(parts[0].shards[0].checksum, format!("{crc:08x}"));
+    let committed = object_index_dir(&root, &fragment, &object)
+        .unwrap()
+        .join(&version);
+    fs::create_dir_all(committed.parent().unwrap()).unwrap();
+    fs::rename(&staged, &committed).unwrap();
+    let parts = offline_session_parts(&session, manifest.clone(), &fragment)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        Path::new(&parts[0].shards[0].absolute_path),
+        committed.join(&name)
+    );
+    assert_eq!(fs::read(&parts[0].shards[0].absolute_path).unwrap(), bytes);
+    // A redirected staging file must fail verification, even with a valid final copy.
+    fs::create_dir_all(&staged).unwrap();
+    std::os::unix::fs::symlink(committed.join(&name), staged.join(&name)).unwrap();
+    assert!(
+        offline_session_parts(&session, manifest, &fragment)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .is_err()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn durable_receipts_refresh_idle_age_without_rewriting_manifest() {
     let _guard = crate::test_support::global_test_lock().blocking_lock();
     let roots = ensure_test_index_roots();
@@ -1751,6 +1822,7 @@ fn durable_receipts_refresh_idle_age_without_rewriting_manifest() {
         data_shards: 1,
         parity_shards: 0,
         placement_roots: vec![ensure_test_blob_roots()[0].to_string_lossy().into_owned()],
+        payload_staged: false,
     };
     open_session(&manifest, None).unwrap();
     let mut manifests = Vec::new();

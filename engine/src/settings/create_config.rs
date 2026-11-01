@@ -46,6 +46,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     conf.with_section(Some("auto_healing"))
         .set("enabled", "true")
+        .set("scrub_schedule_utc", "")
+        .set("scheduled_scrub_pause_millis", "25")
         .set("topology_check_interval_seconds", "30")
         .set("topology_recovery_stability_seconds", "10")
         .set("initial_scan_delay_seconds", "60")
@@ -147,6 +149,8 @@ mod tests {
             .section(Some("auto_healing"))
             .expect("auto_healing section");
         assert_eq!(auto_healing.get("enabled"), Some("true"));
+        assert_eq!(auto_healing.get("scrub_schedule_utc"), Some(""));
+        assert_eq!(auto_healing.get("scheduled_scrub_pause_millis"), Some("25"));
         assert_eq!(
             auto_healing.get("availability_scan_interval_seconds"),
             Some("3600")

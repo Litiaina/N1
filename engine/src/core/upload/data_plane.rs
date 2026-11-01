@@ -17,6 +17,9 @@ pub struct UploadSessionManifest {
     pub data_shards: u16,
     pub parity_shards: u16,
     pub placement_roots: Vec<String>,
+    /// Missing in legacy sessions, whose payload already lives in .objects.
+    #[serde(default)]
+    pub payload_staged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,7 +505,8 @@ pub(super) async fn part_exists_on_disk(
     let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
 
     for (_, _, stable_path, _) in shard_specs_for_part(path_manager, manifest, part_index)? {
-        let meta = match tokio_fs::metadata(&stable_path).await {
+        let actual = session_payload_path(manifest, &stable_path).await?;
+        let meta = match tokio_fs::metadata(&actual).await {
             Ok(meta) => meta,
             Err(_) => return Ok(false),
         };
@@ -514,6 +518,32 @@ pub(super) async fn part_exists_on_disk(
     Ok(true)
 }
 
+async fn session_payload_path(
+    manifest: &UploadSessionManifest,
+    final_path: &Path,
+) -> Result<PathBuf, AppError> {
+    if manifest.payload_staged {
+        let root = final_path
+            .ancestors()
+            .nth(7)
+            .ok_or_else(|| AppError::Conflict("invalid upload shard address".into()))?;
+        let staged = staging::payload_dir(
+            root,
+            &manifest.fragment,
+            &manifest.object_key,
+            &manifest.version_id,
+        )
+        .join(final_path.file_name().unwrap());
+        match tokio_fs::symlink_metadata(&staged).await {
+            Ok(metadata) if metadata.is_file() => return Ok(staged),
+            Ok(_) => return Err(AppError::Conflict("redirected upload shard".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(AppError::Io(error, "inspect upload shard".into())),
+        }
+    }
+    Ok(final_path.to_path_buf())
+}
+
 pub(super) async fn ensure_version_shard_dirs(
     path_manager: &ObjectPathManager,
     manifest: &UploadSessionManifest,
@@ -521,7 +551,19 @@ pub(super) async fn ensure_version_shard_dirs(
     let mut shard_dirs = BTreeSet::new();
     // Every part of one immutable version shares these same K+M directories.
     for (_, _, shard_path, _) in shard_specs_for_part(path_manager, manifest, 0)? {
-        if let Some(parent) = shard_path.parent() {
+        let actual = if manifest.payload_staged {
+            let root = shard_path.ancestors().nth(7).unwrap();
+            staging::payload_dir(
+                root,
+                &manifest.fragment,
+                &manifest.object_key,
+                &manifest.version_id,
+            )
+            .join(shard_path.file_name().unwrap())
+        } else {
+            shard_path
+        };
+        if let Some(parent) = actual.parent() {
             shard_dirs.insert(parent.to_path_buf());
         }
     }
@@ -598,14 +640,15 @@ pub(super) async fn reconstruct_part_meta_from_disk(
     for (shard_index, is_parity, stable_path, file_name) in
         shard_specs_for_part(path_manager, manifest, part_index)?
     {
-        let meta = match tokio_fs::metadata(&stable_path).await {
+        let actual = session_payload_path(manifest, &stable_path).await?;
+        let meta = match tokio_fs::metadata(&actual).await {
             Ok(meta) => meta,
             Err(_) => return Ok(None),
         };
         if meta.len() != expected_shard_len {
             return Ok(None);
         }
-        let checksum = crc32_file_hex(&stable_path).await?;
+        let checksum = crc32_file_hex(&actual).await?;
         shards.push(ShardInfo {
             shard_index,
             file_name,
@@ -720,6 +763,7 @@ pub(super) async fn write_part_blob_to_disk(
     parity_shards: usize,
     block_size: usize,
     recorded_placement_roots: Option<&[String]>,
+    payload_staged: bool,
     body: Body,
     expected_checksum: Option<&str>,
     strict_durability: bool,
@@ -744,6 +788,7 @@ pub(super) async fn write_part_blob_to_disk(
         parity_shards,
         block_size,
         recorded_placement_roots,
+        payload_staged,
         body_stream,
         expected_checksum,
         strict_durability,
@@ -766,11 +811,9 @@ async fn open_part_shard_writer(
     buffer_limit: Option<u64>,
 ) -> Result<UploadShardWriter, AppError> {
     if buffered {
-        return linux_io::open_buffered_write(path)
-            .await
-            .map(|file| {
-                UploadShardWriter::Buffered(DirectWriter::with_buffer_limit(file, buffer_limit))
-            });
+        return linux_io::open_buffered_write(path).await.map(|file| {
+            UploadShardWriter::Buffered(DirectWriter::with_buffer_limit(file, buffer_limit))
+        });
     }
     let mut file = create_direct_file(path).await?;
     if let Some(length) = pre_size {
@@ -799,6 +842,7 @@ async fn prepare_part_shard_writers(
     version_id: &str,
     part_index: u64,
     attempt_id: &str,
+    payload_staged: bool,
     data_shards: usize,
     content_length: u64,
     final_shard_len: u64,
@@ -814,8 +858,7 @@ async fn prepare_part_shard_writers(
         .then_some(final_shard_len);
     // A tiny shard never needs the large streaming buffer. Keep alignment and
     // existing I/O/durability semantics; large streams retain their full buffer.
-    let buffer_limit =
-        (content_length <= SMALL_BUFFERED_WRITE_LIMIT).then_some(final_shard_len);
+    let buffer_limit = (content_length <= SMALL_BUFFERED_WRITE_LIMIT).then_some(final_shard_len);
     let mut prepared = PartShardWriters {
         writers: Vec::with_capacity(total_shards),
         tmp_paths: Vec::with_capacity(total_shards),
@@ -824,12 +867,32 @@ async fn prepare_part_shard_writers(
     };
     for (index, root) in blob_roots.iter().enumerate() {
         let name = stable_shard_name(part_index, index, data_shards);
-        let directory = path_manager.get_shard_dir_on_disk(root, fragment, object_key, version_id);
+        let directory = if payload_staged {
+            staging::payload_dir(root, fragment, object_key, version_id)
+        } else {
+            path_manager.get_shard_dir_on_disk(root, fragment, object_key, version_id)
+        };
         prepared
             .tmp_paths
             .push(directory.join(format!("{name}.tmp.{attempt_id}")));
         prepared.stable_paths.push(directory.join(&name));
         prepared.stable_names.push(name);
+    }
+
+    if payload_staged {
+        let paths = blob_roots
+            .iter()
+            .zip(&prepared.stable_paths)
+            .map(|(root, path)| (root.clone(), path.parent().unwrap().to_path_buf()))
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            for (root, directory) in paths {
+                staging::parents(&root, &directory, true)?;
+            }
+            Ok::<_, AppError>(())
+        })
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("upload staging: {e}")))??;
     }
 
     let mut capacity_error = None;
@@ -896,6 +959,7 @@ pub(super) async fn write_part_blob_to_disk_from_stream<S>(
     parity_shards: usize,
     block_size: usize,
     recorded_placement_roots: Option<&[String]>,
+    payload_staged: bool,
     mut body_stream: S,
     expected_checksum: Option<&str>,
     strict_durability: bool,
@@ -957,6 +1021,7 @@ where
         version_id,
         part_index,
         &attempt_id,
+        payload_staged,
         data_shards,
         content_length,
         final_shard_len,
@@ -1073,6 +1138,7 @@ where
 
         if strict_durability {
             sync_published_directories(&dirs_to_sync).await?;
+            if payload_staged { sync_upload_ancestors(&dirs_to_sync).await?; }
         }
 
         let mut shards_info = Vec::with_capacity(total_shards);
@@ -1080,7 +1146,9 @@ where
             shards_info.push(ShardInfo {
                 shard_index: i,
                 file_name: stable_names[i].clone(),
-                absolute_path: crate::core::storage_pool::record_address(&stable_paths[i]),
+                absolute_path: crate::core::storage_pool::record_address(
+                    &path_manager.get_shard_dir_on_disk(&blob_roots[i], fragment, object_key, version_id)
+                        .join(&stable_names[i])),
                 size_bytes: final_shard_len,
                 checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
                 is_parity: i >= data_shards,
@@ -1120,6 +1188,7 @@ pub(super) async fn write_part_blob_to_disk_from_reader<R>(
     parity_shards: usize,
     block_size: usize,
     recorded_placement_roots: Option<&[String]>,
+    payload_staged: bool,
     reader: &mut R,
     expected_checksum: Option<&str>,
     strict_durability: bool,
@@ -1181,6 +1250,7 @@ where
         version_id,
         part_index,
         &attempt_id,
+        payload_staged,
         data_shards,
         content_length,
         final_shard_len,
@@ -1275,6 +1345,7 @@ where
 
         if strict_durability {
             sync_published_directories(&dirs_to_sync).await?;
+            if payload_staged { sync_upload_ancestors(&dirs_to_sync).await?; }
         }
 
         let mut shards_info = Vec::with_capacity(total_shards);
@@ -1282,7 +1353,9 @@ where
             shards_info.push(ShardInfo {
                 shard_index: i,
                 file_name: stable_names[i].clone(),
-                absolute_path: crate::core::storage_pool::record_address(&stable_paths[i]),
+                absolute_path: crate::core::storage_pool::record_address(
+                    &path_manager.get_shard_dir_on_disk(&blob_roots[i], fragment, object_key, version_id)
+                        .join(&stable_names[i])),
                 size_bytes: final_shard_len,
                 checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
                 is_parity: i >= data_shards,
@@ -1324,14 +1397,18 @@ pub(super) async fn cleanup_blob_version_dirs_for_version(
     object_key: &str,
     version_id: &str,
 ) {
+    // An error after partial NDX publication cannot prove that a committed
+    // version is absent. Request cleanup owns ONLY private staged payload.
+    // Legacy/promoted leftovers remain under the conservative orphan GC rules.
     let futs = path_manager.get_blob_roots().into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, object_key, version_id);
+        let staged = staging::payload_dir(&root, fragment, object_key, version_id);
         async move {
-            let parent = dir.parent().map(Path::to_path_buf);
-            let _ = tokio_fs::remove_dir_all(&dir).await;
-            if let Some(parent) = parent {
-                let _ = sync_dir(&parent).await;
-            }
+            let _ = tokio_fs::remove_dir_all(&staged).await;
+            let _ = tokio_fs::remove_dir(staging::private_dir(
+                &root, fragment, object_key, version_id,
+            ))
+            .await;
+            let _ = tokio_fs::remove_dir(staging::owner_dir(&root, fragment, version_id)).await;
         }
     });
     let _ = join_all(futs).await;
@@ -1409,6 +1486,25 @@ pub(super) async fn sync_published_directories(dirs: &[PathBuf]) -> Result<(), A
     Ok(())
 }
 
+async fn sync_upload_ancestors(dirs: &[PathBuf]) -> Result<(), AppError> {
+    // Persist new organizer entries from child to parent. Existing parents are
+    // cheap no-ops; strict multipart receipts cannot outlive their payload tree.
+    // Grouped uploads skip this and use the existing shared filesystem barrier.
+    let dirs = dirs.to_vec();
+    tokio::task::spawn_blocking(move || {
+        crate::namespace::flat::on_holders(&dirs, |dir| {
+            for parent in dir.ancestors().skip(1).take(4) {
+                linux_io::sync_dir_blocking(parent)
+                    .map_err(|e| AppError::Io(e, "sync upload organizer".into()))?;
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("upload organizer sync: {e}")))?
+}
+
 fn is_tmp_attempt_shard(name: &str) -> bool {
     if !name.starts_with("part_") || !name.contains("_shard_") || !name.contains(".tmp.") {
         return false;
@@ -1427,8 +1523,14 @@ pub(super) async fn cleanup_blob_tmp_attempt_files_for_version(
     let blob_roots = path_manager.get_blob_roots();
 
     let futs = blob_roots.into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, object_key, version_id);
+        let staged = staging::payload_dir(&root, fragment, object_key, version_id);
+        let final_dir = path_manager.get_shard_dir_on_disk(&root, fragment, object_key, version_id);
         async move {
+            let dir = if tokio_fs::try_exists(&staged).await.unwrap_or(false) {
+                staged
+            } else {
+                final_dir
+            };
             if !tokio_fs::try_exists(&dir).await.unwrap_or(false) {
                 return;
             }
@@ -1461,6 +1563,170 @@ pub(super) async fn cleanup_blob_tmp_attempt_files_for_version(
 mod setup_tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn staged_upload_resumes_partial_promotion_and_publishes_only_final_immutable_addresses()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _lock = crate::test_support::global_test_lock().lock().await;
+        let roots = boundary_members();
+        let manager = ObjectPathManager::new();
+        let fragment = Ulid::new().to_string();
+        let object = Ulid::new().to_string();
+        let version = Ulid::new().to_string();
+        let placements = roots
+            .iter()
+            .map(|root| crate::core::storage_pool::record_address(root))
+            .collect::<Vec<_>>();
+        let bytes = Bytes::from(vec![37; 16384]);
+        let part = write_part_blob_to_disk_from_stream(
+            &manager,
+            &fragment,
+            &object,
+            &version,
+            0,
+            bytes.len() as u64,
+            1,
+            1,
+            4096,
+            Some(&placements),
+            true,
+            futures_util::stream::iter([Ok(bytes)]),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let manifest = UploadSessionManifest {
+            fragment: fragment.clone(),
+            object_key: object.clone(),
+            version_id: version.clone(),
+            session_id: Ulid::new().to_string(),
+            total_size_bytes: 16384,
+            expected_parts: 1,
+            part_size_bytes: 16384,
+            content_type: "application/octet-stream".into(),
+            created_at: 1,
+            stripe_size_bytes: 4096,
+            data_shards: 1,
+            parity_shards: 1,
+            placement_roots: placements,
+            payload_staged: true,
+        };
+        assert!(part_exists_on_disk(&manager, &manifest, 0).await.unwrap());
+        let metadata = ObjectMetadata {
+            fragment: fragment.clone(),
+            object_key: object.clone(),
+            version_id: version.clone(),
+            upload_session_id: manifest.session_id.clone(),
+            owner_uid: fragment.clone(),
+            total_size_bytes: 16384,
+            content_type: manifest.content_type.clone(),
+            created_at: 1,
+            data_shards: 1,
+            parity_shards: 1,
+            placement_generation: 0,
+            stripe_size_bytes: 4096,
+            is_delete_marker: false,
+            parts: vec![part],
+        };
+        let mut inodes = Vec::new();
+        for (slot, root) in roots.iter().enumerate() {
+            let shard = &metadata.parts[0].shards[slot];
+            let final_path =
+                crate::core::storage_pool::resolve_address(&shard.absolute_path).unwrap();
+            assert!(!final_path.exists());
+            let staged =
+                staging::payload_dir(root, &fragment, &object, &version).join(&shard.file_name);
+            inodes.push((
+                std::fs::metadata(&staged).unwrap().ino(),
+                std::fs::read(&staged).unwrap(),
+            ));
+        }
+        let mut ndx = crate::core::index_store::batch::stage(&metadata).unwrap();
+        // Crash cut after one member move, before ANY NDX publication.
+        let target = manager.get_shard_dir_on_disk(&roots[0], &fragment, &object, &version);
+        std::fs::rename(
+            staging::payload_dir(&roots[0], &fragment, &object, &version),
+            &target,
+        )
+        .unwrap();
+        assert!(part_exists_on_disk(&manager, &manifest, 0).await.unwrap());
+        let recovered = reconstruct_part_meta_from_disk(&manager, &manifest, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.shards[0].absolute_path,
+            metadata.parts[0].shards[0].absolute_path
+        );
+        staging::promote(&metadata, true).unwrap();
+        staging::promote(&metadata, true).unwrap(); // replay, without replacing payload
+        ndx.publish().unwrap();
+        drop(ndx);
+        staging::retire_empty(&metadata);
+        for (slot, root) in roots.iter().enumerate() {
+            let shard = &metadata.parts[0].shards[slot];
+            let path = crate::core::storage_pool::resolve_address(&shard.absolute_path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inodes[slot].0);
+            assert_eq!(std::fs::read(&path).unwrap(), inodes[slot].1);
+            assert!(!staging::owner_dir(root, &fragment, &version).exists());
+            let object_dir = path.parent().unwrap().parent().unwrap();
+            let ndx_path = std::fs::read_dir(object_dir)
+                .unwrap()
+                .map(Result::unwrap)
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|e| e == "ndx"))
+                .unwrap();
+            let persisted: ObjectMetadata =
+                rmp_serde::from_slice(&std::fs::read(&ndx_path).unwrap()).unwrap();
+            assert_eq!(
+                persisted.parts[0].shards[slot].absolute_path,
+                shard.absolute_path
+            );
+            // A colliding staged payload cannot overwrite the committed version.
+            let collision = staging::payload_dir(root, &fragment, &object, &version);
+            std::fs::create_dir_all(&collision).unwrap();
+            std::fs::write(collision.join(&shard.file_name), b"collision").unwrap();
+        }
+        assert!(staging::promote(&metadata, true).is_err());
+        for (slot, root) in roots.iter().enumerate() {
+            let path = crate::core::storage_pool::resolve_address(
+                &metadata.parts[0].shards[slot].absolute_path,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), inodes[slot].1);
+            std::fs::remove_dir_all(crate::core::fragment_identity::physical_fragment_root_on(
+                root, &fragment,
+            ))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_compact_manifest_without_staging_field_still_decodes() {
+        // The original 13-field positional MessagePack layout, not a named map.
+        let legacy = (
+            "fragment",
+            "object",
+            "version",
+            "session",
+            1u64,
+            1u64,
+            1u64,
+            "application/octet-stream",
+            1i64,
+            4096usize,
+            1u16,
+            1u16,
+            vec!["/a", "/b"],
+        );
+        let decoded: UploadSessionManifest =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!decoded.payload_staged);
+        assert_eq!(decoded.object_key, "object");
+    }
 
     fn boundary_members() -> Vec<PathBuf> {
         use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT};
@@ -1519,6 +1785,7 @@ mod setup_tests {
                 1,
                 4096,
                 Some(&placements),
+                false,
                 &mut reader,
                 Some(checksum),
                 true,
@@ -1542,6 +1809,7 @@ mod setup_tests {
                 1,
                 4096,
                 Some(&placements),
+                false,
                 futures_util::stream::iter(chunks),
                 Some(checksum),
                 true,
@@ -1714,7 +1982,9 @@ mod setup_tests {
         let base = std::env::temp_dir().join(format!("n1-buffered-setup-{}", Ulid::new()));
         for size in [0, 1, 4095, 4096, 4097, 32769] {
             let path = base.join(format!("member-{size}/attempt"));
-            let mut writer = open_part_shard_writer(&path, true, None, None).await.unwrap();
+            let mut writer = open_part_shard_writer(&path, true, None, None)
+                .await
+                .unwrap();
             let UploadShardWriter::Buffered(buffered) = &writer else {
                 panic!("relaxed small setup must retain buffered I/O");
             };
@@ -1755,6 +2025,7 @@ mod setup_tests {
             &version,
             0,
             "test-attempt",
+            false,
             4,
             1024,
             4096,
