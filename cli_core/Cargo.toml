@@ -4,9 +4,12 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
-reqwest.workspace = true
-rpassword.workspace = true
-rust-ini.workspace = true
+n1_native_client = { path = "../native_client" }
+n1_link = { path = "../link" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+rustls.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

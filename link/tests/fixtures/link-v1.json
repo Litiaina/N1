@@ -1,0 +1,19 @@
+{
+  "description": "Independent Python hashlib/hmac reference; unsigned big-endian fields; unpadded base64url",
+  "pool_id": "000102030405060708090a0b0c0d0e0f",
+  "generation": 72623859790382856,
+  "token": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "fragment_id": "808182838485868788898a8b8c8d8e8f",
+  "signing_secret": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+  "identity_hex": "01000102030405060708090a0b0c0d0e0f0102030405060708202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "fingerprint": "14a38569fcb6e3c012bda9818d159eb43c67a0c72d89101c5eb397c2a94d48f1",
+  "rotation_3_plus_1": 1,
+  "slots_3_plus_1": [
+    1,
+    2,
+    3,
+    0
+  ],
+  "object_key": "N1A1.AQABAgMEBQYHCAkKCwwNDg8BAgMEBQYHCCAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_M--t8rOgAjVMWZ6sHJtoqg",
+  "upload_ticket": "N1U1.AQABAgMEBQYHCAkKCwwNDg8BAgMEBQYHCCAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_AAAAAAAAYAEAAAAAAAAwAAAAAAB3NZQAAQDZ0EeKocBFrFwIGMblvQ4"
+}

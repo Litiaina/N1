@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use ecs_core::{ALIGNMENT, AlignedBuffer};
 use futures_util::poll;
-use n1::core::ec::{ALIGNMENT, AlignedBuffer};
 use n1::core::linux_io;
+use std::os::unix::fs::OpenOptionsExt;
 
 const WORKER_MODE: &str = "N1_TEST_IO_WORKER_MODE";
 const WORKER_CASE: &str = "N1_TEST_IO_WORKER_CASE";
@@ -245,7 +246,7 @@ fn backend_process_worker() {
             zero_length_flood(&root, expected).await;
             concurrent_publication(&root, expected).await;
             streaming_reads_survive_caller_cancellation(&root, expected).await;
-            atomic_metadata_keeps_posix_barriers_and_async_sync_uses_selected_backend(
+            control_publication_keeps_posix_barriers_and_async_sync_uses_selected_backend(
                 &root, expected,
             )
             .await;
@@ -302,9 +303,7 @@ async fn wait_until_drained(file: Option<&Arc<File>>) {
 async fn zero_length_flood(root: &Path, expected: &'static str) {
     const REQUESTS: usize = 2048;
     let path = root.join("empty.bin");
-    let file = Arc::new(
-        linux_io::open_direct_write_blocking(&path).expect("open zero-length flood fixture"),
-    );
+    let file = Arc::new(open_direct_write(&path).expect("open zero-length flood fixture"));
     // Queue-capacity batches of empty operations need no kernel CQEs. The
     // driver must keep draining even when eventfd wakeups have coalesced.
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -320,7 +319,7 @@ async fn zero_length_flood(root: &Path, expected: &'static str) {
                     assert!(returned.is_empty());
                 } else {
                     let file = File::open(path).expect("open empty flood reader");
-                    let (_, returned) = linux_io::pread_exact_at_async(file, 0, 0)
+                    let returned = linux_io::read_exact_at_async(Arc::new(file), 0, 0)
                         .await
                         .expect("empty flood read");
                     assert!(returned.is_empty());
@@ -344,8 +343,7 @@ async fn concurrent_publication(root: &Path, expected: &'static str) {
     const BLOCKS: usize = 768;
     let temporary = root.join("payload.partial");
     let committed = root.join("payload.committed");
-    let file =
-        Arc::new(linux_io::open_direct_write_blocking(&temporary).expect("open O_DIRECT payload"));
+    let file = Arc::new(open_direct_write(&temporary).expect("open O_DIRECT payload"));
     file.set_len((BLOCKS * ALIGNMENT) as u64)
         .expect("size payload");
     let mut writes = tokio::task::JoinSet::new();
@@ -378,25 +376,22 @@ async fn concurrent_publication(root: &Path, expected: &'static str) {
     linux_io::fdatasync_async(file.clone())
         .await
         .expect("persist payload data");
-    linux_io::rename(&temporary, &committed)
-        .await
-        .expect("publish completed payload");
-    linux_io::sync_dir(root)
+    std::fs::rename(&temporary, &committed).expect("publish completed payload");
+    sync_directory(root)
         .await
         .expect("persist publication directory entry");
     wait_until_drained(Some(&file)).await;
     drop(file);
 
-    let mut file = File::open(&committed).expect("reopen committed payload");
+    let file = Arc::new(File::open(&committed).expect("reopen committed payload"));
     for block in (0..BLOCKS).rev() {
-        let (returned_file, bytes) =
-            linux_io::pread_exact_at_async(file, ALIGNMENT, (block * ALIGNMENT) as u64)
+        let bytes =
+            linux_io::read_exact_at_async(file.clone(), ALIGNMENT, (block * ALIGNMENT) as u64)
                 .await
                 .expect("read committed positioned block");
         assert_eq!(bytes, vec![(block % 251 + 1) as u8; ALIGNMENT]);
-        file = returned_file;
     }
-    let (_, empty) = linux_io::pread_exact_at_async(file, 0, 0)
+    let empty = linux_io::read_exact_at_async(file, 0, 0)
         .await
         .expect("empty read");
     assert!(empty.is_empty());
@@ -440,11 +435,11 @@ async fn streaming_reads_survive_caller_cancellation(root: &Path, expected: &str
     assert_bounded_backend(expected);
 }
 
-async fn atomic_metadata_keeps_posix_barriers_and_async_sync_uses_selected_backend(
+async fn control_publication_keeps_posix_barriers_and_async_sync_uses_selected_backend(
     root: &Path,
     expected: &str,
 ) {
-    let path = root.join("metadata.ndx");
+    let path = root.join("service-control.json");
     let old = b"previous committed metadata";
     std::fs::write(&path, old).expect("create old metadata fixture");
     assert_eq!(std::fs::read(&path).expect("read old metadata"), old);
@@ -453,12 +448,10 @@ async fn atomic_metadata_keeps_posix_barriers_and_async_sync_uses_selected_backe
     let before = linux_io::backend_snapshot();
     let task_path = path.clone();
     let task_bytes = replacement.clone();
-    tokio::task::spawn_blocking(move || {
-        linux_io::atomic_write_blocking_with_durability(&task_path, &task_bytes, true)
-    })
-    .await
-    .expect("metadata publication worker")
-    .expect("write, synchronize, and rename strict metadata");
+    tokio::task::spawn_blocking(move || publish_control_fixture(&task_path, &task_bytes))
+        .await
+        .expect("metadata publication worker")
+        .expect("write, synchronize, and rename strict metadata");
     assert_eq!(
         std::fs::read(&path).expect("read committed metadata"),
         replacement
@@ -479,7 +472,7 @@ async fn atomic_metadata_keeps_posix_barriers_and_async_sync_uses_selected_backe
     linux_io::fsync_async(file)
         .await
         .expect("async file sync retains its selected backend");
-    linux_io::sync_dir(root)
+    sync_directory(root)
         .await
         .expect("async directory sync retains its selected backend");
     wait_until_drained(None).await;
@@ -507,8 +500,7 @@ async fn cancellation_keeps_accepted_io_owned(root: &Path, expected: &str) {
     const REQUESTS: usize = 32;
     const REQUEST_BYTES: usize = ALIGNMENT * 16;
     let path = root.join("cancelled-awaiters.bin");
-    let file =
-        Arc::new(linux_io::open_direct_write_blocking(&path).expect("open cancellation fixture"));
+    let file = Arc::new(open_direct_write(&path).expect("open cancellation fixture"));
     file.set_len((REQUESTS * REQUEST_BYTES) as u64)
         .expect("size cancellation fixture");
     let before = linux_io::backend_snapshot();
@@ -544,7 +536,7 @@ async fn cancellation_keeps_accepted_io_owned(root: &Path, expected: &str) {
     }
     drop(file);
     let bytes = std::fs::read(path).expect("read cancellation fixture");
-    for (request, bytes) in bytes.chunks_exact(REQUEST_BYTES).enumerate() {
+    for (request, bytes) in bytes.as_chunks::<REQUEST_BYTES>().0.iter().enumerate() {
         assert!(
             bytes.iter().all(|byte| *byte == (request + 1) as u8),
             "cancelled receiver corrupted write {request}"
@@ -554,21 +546,21 @@ async fn cancellation_keeps_accepted_io_owned(root: &Path, expected: &str) {
     if expected != "io_uring" {
         return;
     }
-    // The exact-read API consumes a File. Dropping its future must not close
-    // the descriptor or free its Vec while the kernel still uses either one.
+    // Exact reads own the descriptor and buffer through completion even when
+    // their caller drops the future while the kernel still uses them.
     let before = linux_io::backend_snapshot();
     let mut abandoned_reads = Vec::new();
     for request in 0..REQUESTS {
         let file = File::open(root.join("cancelled-awaiters.bin"))
             .expect("open cancellation read fixture");
-        let mut operation = Box::pin(linux_io::pread_exact_at_async(
-            file,
+        let mut operation = Box::pin(linux_io::read_exact_at_async(
+            Arc::new(file),
             REQUEST_BYTES,
             (request * REQUEST_BYTES) as u64,
         ));
         match poll!(operation.as_mut()) {
             Poll::Ready(result) => {
-                let (_, bytes) = result.expect("synchronously completed cancellation read");
+                let bytes = result.expect("synchronously completed cancellation read");
                 assert!(bytes.iter().all(|byte| *byte == (request + 1) as u8));
             }
             Poll::Pending => abandoned_reads.push(operation),
@@ -613,10 +605,7 @@ async fn errors_do_not_switch_backends(root: &Path, expected: &str) {
         "POSIX publication propagates capacity exhaustion"
     );
     let null = OpenOptions::new().write(true).open("/dev/null").unwrap();
-    for error in [
-        linux_io::fdatasync_blocking(&null).unwrap_err(),
-        linux_io::fsync_blocking(&null).unwrap_err(),
-    ] {
+    for error in [null.sync_data().unwrap_err(), null.sync_all().unwrap_err()] {
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
     }
     let after_posix_error = linux_io::backend_snapshot();
@@ -662,7 +651,7 @@ async fn errors_do_not_switch_backends(root: &Path, expected: &str) {
     drop(file);
 
     let file = File::open(&path).expect("open EOF fixture");
-    let error = linux_io::pread_exact_at_async(file, 100, 0)
+    let error = linux_io::read_exact_at_async(Arc::new(file), 100, 0)
         .await
         .expect_err("short exact read must fail");
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
@@ -697,4 +686,30 @@ async fn errors_do_not_switch_backends(root: &Path, expected: &str) {
         .expect("backend remains usable after errors");
     wait_until_drained(Some(&file)).await;
     assert_bounded_backend(expected);
+}
+
+// Test fixture publication uses the same POSIX ordering as LINK's anchored
+// publication code, without restoring the removed namespace helper API.
+fn open_direct_write(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_DIRECT | libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+}
+async fn sync_directory(path: &Path) -> io::Result<()> {
+    linux_io::fsync_async(Arc::new(File::open(path)?)).await
+}
+fn publish_control_fixture(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path.with_extension("private");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    linux_io::write_bytes_at_blocking(&file, bytes, 0)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    File::open(path.parent().unwrap())?.sync_all()
 }

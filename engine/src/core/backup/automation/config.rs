@@ -73,7 +73,7 @@ impl Default for Config {
                 unit: "litiaina-n1.service".into(),
                 user: false,
             },
-            engine_config: "/etc/litiaina/n1/n1_config.ini".into(),
+            engine_config: "/etc/litiaina/n1/n1_config.json".into(),
             repository: "/backup/n1-primary".into(),
             key_file: "/etc/litiaina/n1/backup.key".into(),
             state_dir: "/var/lib/litiaina/n1-backup".into(),

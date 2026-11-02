@@ -4,8 +4,19 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
+n1_link = { path = "../link" }
+rustls.workspace = true
+tokio-rustls = "0.26"
+webpki-roots = "1"
 rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_bytes.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+crc32c.workspace = true
+ring = "0.17"
+crc32fast.workspace = true
+sha2.workspace = true
+libc.workspace = true

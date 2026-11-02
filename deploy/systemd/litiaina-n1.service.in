@@ -14,7 +14,7 @@ Environment=RUST_LOG=__RUST_LOG__
 NoNewPrivileges=true
 ExecStartPre=/usr/bin/test -x __BINARY__
 ExecStartPre=/usr/bin/test -f __CONFIG_FILE__
-ExecStart=__BINARY__
+ExecStart=__BINARY__ serve --config __CONFIG_FILE__
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=300

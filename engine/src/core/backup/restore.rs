@@ -1,315 +1,675 @@
-use super::format::{Kind, MAX_METADATA_BYTES, Record, Root, Snapshot};
-use super::fs::{read_regular, restore_dir, safe_relative};
-use super::repository::Repository;
-use super::{Result, invalid};
-use crate::core::instance_lease::InstanceLease;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, symlink};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
-
-pub(crate) fn validate_link(path: &str, target: &str) -> Result<()> {
-    let identity = if path.starts_with(".fragment/") {
-        target.strip_prefix("../@f_")
-    } else {
-        target.strip_prefix("@o_")
+use super::{Result, format::Snapshot, invalid, repository::Repository};
+use crate::core::storage_pool::MemberMarker;
+pub use crate::core::storage_pool::RESTORE_FENCE;
+use n1_link::{
+    Fingerprint,
+    retirement::Retirement,
+    shard::{self, ShardHeader},
+};
+use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
+use sha2::Digest;
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+#[derive(Clone, Copy)]
+pub(crate) enum FileKind {
+    Marker,
+    Final(Fingerprint, u16),
+    Staged(Fingerprint, u16),
+    Retirement(Fingerprint, u16),
+}
+pub(crate) fn allowed_path(
+    path: &str,
+    marker: &MemberMarker,
+    staging: bool,
+) -> Result<Option<FileKind>> {
+    super::fs::safe_relative(path)?;
+    if path == ".n1-arc-pool.json" {
+        return Ok(Some(FileKind::Marker));
+    }
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    if parts[0] == ".uploads" && staging {
+        let Ok(fp) = parts[1].parse::<Fingerprint>() else {
+            return Ok(None);
+        };
+        let shard = marker.layout.shard_at_slot(fp, marker.slot)?;
+        if parts[2] == "retire.tmp" {
+            return Ok(Some(FileKind::Retirement(fp, shard)));
+        }
+        if parts[2] == "shard.tmp" || parts[2] == format!("repair.s{shard}.tmp") {
+            return Ok(Some(FileKind::Staged(fp, shard)));
+        }
+        return Ok(None);
+    }
+    let Some((raw, tail)) = parts[2].split_once(".s") else {
+        return Ok(None);
     };
-    if identity.is_none_or(|id| {
-        id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    }) {
-        return Err(invalid("backup refuses non-N1 symlink targets"));
+    let (Some(shard), Ok(fp)) = (
+        tail.strip_suffix(".shard")
+            .and_then(|s| s.parse::<u16>().ok()),
+        raw.parse::<Fingerprint>(),
+    ) else {
+        return Ok(None);
+    };
+    if fp.shard_path(shard) != path || marker.layout.member_slot(fp, shard)? != marker.slot {
+        return Err(invalid("misplaced LINK shard in recovery point"));
+    }
+    Ok(Some(FileKind::Final(fp, shard)))
+}
+pub(crate) fn validate_member_file(
+    path: &str,
+    marker: &MemberMarker,
+    reader: &mut dyn Read,
+    length: u64,
+    staging: bool,
+) -> Result<()> {
+    let kind = allowed_path(path, marker, staging)?
+        .ok_or_else(|| invalid("unsupported recovery file path"))?;
+    let (fp, index, finalized) = match kind {
+        FileKind::Marker => {
+            if length > 65536 {
+                return Err(invalid("oversized pool marker"));
+            }
+            let mut bytes = vec![0; length as usize];
+            reader.read_exact(&mut bytes)?;
+            if serde_json::from_slice::<MemberMarker>(&bytes)? != *marker {
+                return Err(invalid("recovery pool marker differs from descriptor"));
+            }
+            return Ok(());
+        }
+        FileKind::Final(fp, index) => (fp, index, true),
+        FileKind::Staged(fp, index) => (fp, index, false),
+        FileKind::Retirement(fp, index) => {
+            if length != 96 {
+                return Err(invalid("invalid private retirement length"));
+            }
+            let mut bytes = [0; 96];
+            reader.read_exact(&mut bytes)?;
+            Retirement::decode(&bytes, fp, index)?;
+            return Ok(());
+        }
+    };
+    if finalized && length == 96 {
+        let mut bytes = [0; 96];
+        reader.read_exact(&mut bytes)?;
+        Retirement::decode(&bytes, fp, index)?;
+        return Ok(());
+    }
+    let mut bytes = [0; 128];
+    reader.read_exact(&mut bytes)?;
+    let header = ShardHeader::decode(&bytes, &marker.layout, fp, index)?;
+    if !finalized {
+        if length < 128 || length > header.file_bytes()? {
+            return Err(invalid("invalid staged recovery length"));
+        }
+        // Sparse/missing/torn private frames may be legitimate interrupted parts.
+        // Their exact bytes are authenticated by the repository; resume/status
+        // validates completion after restore. They are never declared finalized.
+        let copied = std::io::copy(&mut reader.take(length - 128), &mut std::io::sink())?;
+        if copied != length - 128 {
+            return Err(invalid("truncated staged recovery file"));
+        }
+        return Ok(());
+    }
+    if length != header.file_bytes()? {
+        return Err(invalid("incorrect finalized recovery length"));
+    }
+    let mut record = vec![0; header.record_bytes() as usize];
+    let mut object = shard::object_hasher(header.format, header.total_bytes, header.part_bytes);
+    for part in 0..header.parts() {
+        let mut root = shard::part_hasher(header.format, part);
+        for stripe in header.part_stripes(part)? {
+            reader.read_exact(&mut record)?;
+            let frame = shard::decode_frame(&header, fp, stripe, &record)?;
+            root.update(frame.source_hash);
+        }
+        object.update(root.finalize());
+    }
+    let mut seal = [0; 96];
+    reader.read_exact(&mut seal)?;
+    if shard::decode_seal(&header, fp, &seal)? != <[u8; 32]>::from(object.finalize()) {
+        return Err(invalid("recovery shard integrity root mismatch"));
     }
     Ok(())
 }
 
-fn validate(record: &Record, snapshot: &Snapshot) -> Result<()> {
-    validate_record(record, snapshot.roots.len())
+pub(crate) struct Target {
+    path: PathBuf,
+    root: Arc<File>,
+    device: u64,
+    inode: u64,
 }
-
-pub(crate) fn validate_record(record: &Record, roots: usize) -> Result<()> {
-    safe_relative(&record.path)?;
-    if record.root >= roots || record.modified_nanos >= 1_000_000_000 || record.modified_seconds < 0
-    {
-        return Err(invalid("invalid backup record root/timestamp"));
+impl Drop for Target {
+    fn drop(&mut self) {
+        // This helper does only synchronous target I/O. Its lease ends when
+        // that work returns, even if a concurrently forked child inherited a
+        // duplicate of this open file description before exec closed it.
+        // Active engine members deliberately keep their separate lease policy.
+        if unsafe { libc::flock(self.root.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            tracing::warn!(
+                "cannot unlock completed restore target {}: {}",
+                self.path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
     }
-    if super::restore_guard::reserved(&record.path) {
-        return Err(invalid(
-            "snapshot attempts to replace an engine safety marker",
-        ));
-    }
-    if let Kind::Link { target } = &record.kind {
-        validate_link(&record.path, target)?;
-    }
-    Ok(())
 }
-
-pub fn verify(repo: &Repository, snapshot: &Snapshot) -> Result<()> {
-    super::capture::validate_roots(&snapshot.roots)?;
-    let mut total = 0u64;
-    repo.records(snapshot, |record| {
-        validate(&record, snapshot)?;
-        if let Kind::File { size, blocks } = record.kind {
-            if super::metadata::requires_remap(&record.path) && size > MAX_METADATA_BYTES as u64 {
-                return Err(invalid(
-                    "internal N1 metadata exceeds the portable backup limit (64 MiB)",
-                ));
-            }
-            let mut actual = 0u64;
-            for hash in blocks {
-                actual = actual
-                    .checked_add(repo.get(&hash)?.len() as u64)
-                    .ok_or_else(|| invalid("size overflow"))?;
-            }
-            if actual != size {
-                return Err(invalid("backup file length mismatch"));
-            }
-            total = total
-                .checked_add(size)
-                .ok_or_else(|| invalid("snapshot size overflow"))?;
+impl Target {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(invalid("restore targets must be absolute"));
+        }
+        let root = File::from(rfs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(invalid("restore member is leased by a running engine"));
+        }
+        let metadata = root.metadata()?;
+        Ok(Self {
+            path: path.into(),
+            root: Arc::new(root),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        let current = std::fs::symlink_metadata(&self.path)?;
+        if !current.is_dir() || current.dev() != self.device || current.ino() != self.inode {
+            return Err(invalid("restore target binding changed"));
         }
         Ok(())
-    })?;
-    if total != snapshot.source_bytes {
-        return Err(invalid("snapshot byte count mismatch"));
     }
-    Ok(())
+    pub(crate) fn parent(&self, path: &Path, create: bool) -> Result<Arc<File>> {
+        self.check()?;
+        let mut dir = self.root.clone();
+        for component in path
+            .parent()
+            .ok_or_else(|| invalid("restore file has no parent"))?
+            .components()
+        {
+            let std::path::Component::Normal(name) = component else {
+                return Err(invalid("unsafe restore directory"));
+            };
+            if create {
+                match rfs::mkdirat(&*dir, name, Mode::RWXU) {
+                    Ok(()) => dir.sync_all()?,
+                    Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            dir = Arc::new(File::from(rfs::openat(
+                &*dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?));
+        }
+        Ok(dir)
+    }
 }
 
-fn ensure_parents(root: &Path, relative: &Path) -> Result<PathBuf> {
-    let mut parent = root.to_path_buf();
-    if let Some(parts) = relative.parent() {
-        for part in parts {
-            parent.push(part);
-            restore_dir(&parent)?;
-        }
-    }
-    Ok(root.join(relative))
+/// Restore only into explicit, empty, independent members. A durable fence on
+/// every target prevents engine startup until the entire recovery point passes.
+pub fn restore(repo: &Repository, snapshot: &Snapshot, paths: &[PathBuf]) -> Result<()> {
+    restore_inner(repo, snapshot, paths, true, false)
 }
-
-fn same_file(a: &Path, b: &Path) -> Result<bool> {
-    let mut a = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(a)?;
-    let mut b = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(b)?;
-    if !b.metadata()?.is_file() || a.metadata()?.len() != b.metadata()?.len() {
-        return Ok(false);
-    }
-    let mut x = vec![0; 256 * 1024];
-    let mut y = vec![0; x.len()];
-    loop {
-        let n = a.read(&mut x)?;
-        if n == 0 {
-            break;
-        }
-        b.read_exact(&mut y[..n])?;
-        if x[..n] != y[..n] {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-pub fn restore(
+fn restore_inner(
     repo: &Repository,
     snapshot: &Snapshot,
-    target: Vec<Root>,
+    paths: &[PathBuf],
+    independent: bool,
     resume: bool,
 ) -> Result<()> {
-    super::capture::validate_roots(&target)?;
-    let target = ordered_targets(&snapshot.roots, target)?;
-    if snapshot.roots.len() != target.len()
-        || snapshot
-            .roots
-            .iter()
-            .zip(&target)
-            .any(|(a, b)| a.index != b.index || a.blob != b.blob)
-    {
+    super::format::validate_snapshot(snapshot)?;
+    if paths.len() != snapshot.roots.len() {
+        return Err(invalid("restore target count mismatch"));
+    }
+    let mut fenced = Vec::new();
+    let mut empty = Vec::new();
+    let mut targets = Vec::new();
+    let mut devices = std::collections::HashSet::new();
+    for path in paths {
+        let target = Target::open(path)?;
+        if independent && !devices.insert(target.device) {
+            return Err(invalid("restore members must use independent filesystems"));
+        }
+        let ordinal = targets.len();
+        let is_empty = std::fs::read_dir(path)?.next().is_none();
+        let expected = restore_owner(repo, snapshot, ordinal)?;
+        let fence = match rfs::openat(
+            &*target.root,
+            RESTORE_FENCE,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                if !resume {
+                    return Err(invalid("restore target is pending; use explicit resume"));
+                }
+                let mut file = File::from(fd);
+                if !file.metadata()?.is_file() || file.metadata()?.len() != expected.len() as u64 {
+                    return Err(invalid("invalid restore fence"));
+                }
+                let mut bytes = vec![0; expected.len()];
+                file.read_exact(&mut bytes)?;
+                if bytes != expected {
+                    return Err(invalid(
+                        "restore fence belongs to another recovery point, root or key",
+                    ));
+                }
+                true
+            }
+            Err(rustix::io::Errno::NOENT) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !resume && !is_empty {
+            return Err(invalid("restore requires empty targets"));
+        }
+        fenced.push(fence);
+        empty.push(is_empty);
+        targets.push(target);
+    }
+    if resume && !fenced.iter().any(|f| *f) {
         return Err(invalid(
-            "restore requires the same ordered root roles/count; EC recoding is a separate operation",
+            "resume requires an owned incomplete recovery point",
         ));
     }
-    let paths = target
+    let writable = fenced
         .iter()
-        .map(|r| PathBuf::from(&r.path))
+        .zip(&empty)
+        .map(|(f, e)| *f || *e)
         .collect::<Vec<_>>();
-    for root in &paths {
-        if repo.path.starts_with(root) || root.starts_with(&repo.path) {
-            return Err(invalid("restore roots overlap backup repository"));
+    for (ordinal, target) in targets.iter().enumerate() {
+        if fenced[ordinal] || !empty[ordinal] {
+            continue;
         }
+        let owner = restore_owner(repo, snapshot, ordinal)?;
+        let mut file = File::from(rfs::openat(
+            &*target.root,
+            RESTORE_FENCE,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        file.write_all(&owner)?;
+        file.sync_all()?;
+        target.root.sync_all()?;
     }
-    // Authenticate everything before creating an engine-visible restore marker.
-    verify(repo, snapshot)?;
-    let marker = serde_json::to_vec(&(snapshot.id.as_str(), repo.key.id.as_str(), &target))?;
-    let _lease = InstanceLease::acquire(&paths, false)?;
-    super::restore_guard::prepare(&paths, &marker, resume)?;
-    super::restore_guard::inventory(repo, snapshot, &paths)?;
-    super::restore_guard::audit(&paths)?;
-    repo.records(snapshot, |record| {
-        validate(&record, snapshot)?;
-        let path = ensure_parents(&paths[record.root], safe_relative(&record.path)?)?;
-        match &record.kind {
-            Kind::Directory => restore_dir(&path)?,
-            Kind::Link { target } => match fs::symlink_metadata(&path) {
-                Ok(meta)
-                    if meta.file_type().is_symlink()
-                        && fs::read_link(&path)? == Path::new(target) => {}
-                Ok(_) => return Err(invalid("restore found a conflicting namespace entry")),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    symlink(target, &path)?;
+    repo.files(snapshot, |ordinal, path, length, reader| {
+        let target = targets
+            .get(ordinal)
+            .ok_or_else(|| invalid("restore root out of range"))?;
+        let relative = super::fs::safe_relative(path)?;
+        let parent = target.parent(relative, writable[ordinal])?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| invalid("restore file has no name"))?;
+        if let Some(FileKind::Final(fp, shard)) =
+            allowed_path(path, &snapshot.marker(ordinal)?, false)?
+            && let Some(record) = read_terminal(target, fp, shard)?
+        {
+            validate_member_file(
+                path,
+                &snapshot.marker(ordinal)?,
+                reader,
+                length,
+                snapshot.capture_mode == "offline_all",
+            )?;
+            let _ = record;
+            return Ok(());
+        }
+        let mut file = if writable[ordinal] {
+            let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let file = match rfs::openat(
+                &*parent,
+                name,
+                flags | OFlags::CREATE | OFlags::EXCL,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(fd) => File::from(fd),
+                Err(rustix::io::Errno::EXIST) if resume => {
+                    File::from(rfs::openat(&*parent, name, flags, Mode::empty())?)
                 }
                 Err(e) => return Err(e.into()),
-            },
-            Kind::File { size, blocks } => {
-                let tmp = paths[record.root]
-                    .join(super::restore_guard::WORK)
-                    .join(format!("temporary-{}", ulid::Ulid::new()));
-                let outcome = (|| -> Result<()> {
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&tmp)?;
-                    let mut count = 0;
-                    for hash in blocks {
-                        let bytes = repo.get(hash)?;
-                        file.write_all(&bytes)?;
-                        count += bytes.len() as u64;
-                    }
-                    if count != *size {
-                        return Err(invalid("restored file length mismatch"));
-                    }
-                    if super::metadata::requires_remap(&record.path) {
-                        file.flush()?;
-                        let mapped = super::metadata::remap(
-                            &record.path,
-                            read_regular(&tmp, MAX_METADATA_BYTES)?,
-                            &snapshot.roots,
-                            &target,
-                        )?;
-                        file.set_len(0)?;
-                        use std::io::{Seek, SeekFrom};
-                        file.seek(SeekFrom::Start(0))?;
-                        file.write_all(&mapped)?;
-                    }
-                    let times = fs::FileTimes::new().set_modified(
-                        UNIX_EPOCH
-                            + Duration::new(record.modified_seconds as u64, record.modified_nanos),
-                    );
-                    file.set_times(times)?;
-                    file.sync_all()?;
-                    match fs::symlink_metadata(&path) {
-                        Ok(_) if resume && same_file(&tmp, &path)? => {
-                            let existing = OpenOptions::new()
-                                .read(true)
-                                .custom_flags(libc::O_NOFOLLOW)
-                                .open(&path)?;
-                            existing.set_times(times)?;
-                            existing.sync_all()?;
-                        }
-                        Ok(_) => return Err(invalid("restore would overwrite an existing file")),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            fs::hard_link(&tmp, &path)?
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    Ok(())
-                })();
-                let _ = fs::remove_file(&tmp);
-                outcome?;
+            };
+            if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
+                return Err(invalid("restore file is not private and regular"));
             }
-        }
+            file.set_len(0)?;
+            let mut file = file;
+            if std::io::copy(reader, &mut file)? != length {
+                return Err(invalid("restore file length differs from manifest"));
+            }
+            file
+        } else {
+            // A fence may have been cleared just before a crash during the
+            // final cleanup. Compare that already-published member, never
+            // truncate or replace it while resuming the remaining members.
+            let mut file = File::from(rfs::openat(
+                &*parent,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            if !file.metadata()?.is_file() || file.metadata()?.len() != length {
+                return Err(invalid("unfenced restored file differs"));
+            }
+            let mut expected = vec![0; 64 * 1024];
+            let mut actual = vec![0; 64 * 1024];
+            let mut left = length;
+            while left > 0 {
+                let n = left.min(expected.len() as u64) as usize;
+                reader.read_exact(&mut expected[..n])?;
+                file.read_exact(&mut actual[..n])?;
+                if expected[..n] != actual[..n] {
+                    return Err(invalid(
+                        "unfenced restored bytes differ; refusing overwrite",
+                    ));
+                }
+                left -= n as u64;
+            }
+            file
+        };
+        file.seek(SeekFrom::Start(0))?;
+        validate_member_file(
+            path,
+            &snapshot.marker(ordinal)?,
+            &mut file,
+            length,
+            snapshot.capture_mode == "offline_all",
+        )?;
+        file.sync_all()?;
+        parent.sync_all()?;
         Ok(())
     })?;
-    // Files have been individually synchronized. Now make ALL directory entries
-    // durable, after their children exist, before committing the restore. A crash
-    // before this boundary may lose unpublished work; resume reconstructs it.
-    // Per-entry parent fsyncs are unnecessary behind persistent start fences.
-    repo.records(snapshot, |record| {
-        if matches!(record.kind, Kind::Directory) {
-            let path = paths[record.root].join(safe_relative(&record.path)?);
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)?;
-            file.set_times(fs::FileTimes::new().set_modified(
-                UNIX_EPOCH + Duration::new(record.modified_seconds as u64, record.modified_nanos),
-            ))?;
-            file.sync_all()?;
-        }
-        Ok(())
-    })?;
-    for root in &paths {
-        File::open(root)?.sync_all()?;
+    preserve_retirements(repo, snapshot, &targets)?;
+    // An empty .uploads organizer is required even for online committed-only
+    // captures; create it before clearing any startup fence.
+    for target in &targets {
+        let _ = target.parent(Path::new(".uploads/placeholder"), true)?;
+        target.root.sync_all()?;
+        target.check()?;
     }
-    crate::core::storage_admin::verify_backup_roots(&target)?;
-    super::restore_guard::audit(&paths)?;
-    super::restore_guard::complete(&paths, &marker)?;
+    for target in &targets {
+        match rfs::unlinkat(&*target.root, RESTORE_FENCE, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+        target.root.sync_all()?;
+    }
     Ok(())
 }
+#[cfg(test)]
+pub(crate) fn restore_fixture(
+    repo: &Repository,
+    snapshot: &Snapshot,
+    paths: &[PathBuf],
+) -> Result<()> {
+    restore_inner(repo, snapshot, paths, false, false)
+}
 
-/// Bind each snapshot ordinal to its logical pool/slot, not its mount name.
-/// Legacy anonymous descriptors are only used by low-level fixtures; do not
-/// mix anonymous and enrolled descriptors or silently guess a live mapping.
-fn ordered_targets(source: &[Root], target: Vec<Root>) -> Result<Vec<Root>> {
-    if source.iter().all(|r| r.member.is_none()) && target.iter().all(|r| r.member.is_none()) {
-        return Ok(target);
+fn restore_owner(repo: &Repository, snapshot: &Snapshot, ordinal: usize) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(
+        &serde_json::json!({"format":"N1-LINK-restore-v1","snapshot":snapshot.id,"root":ordinal,"key_id":repo.key.id}),
+    )?)
+}
+pub fn resume(repo: &Repository, snapshot: &Snapshot, paths: &[PathBuf]) -> Result<()> {
+    restore_inner(repo, snapshot, paths, true, true)
+}
+#[cfg(test)]
+pub(crate) fn resume_fixture(
+    repo: &Repository,
+    snapshot: &Snapshot,
+    paths: &[PathBuf],
+) -> Result<()> {
+    restore_inner(repo, snapshot, paths, false, true)
+}
+
+fn read_terminal(target: &Target, fp: Fingerprint, shard: u16) -> Result<Option<Retirement>> {
+    let path = fp.shard_path(shard);
+    let path = Path::new(&path);
+    let parent = match target.parent(path, false) {
+        Ok(parent) => parent,
+        Err(e)
+            if e.downcast_ref::<rustix::io::Errno>()
+                .is_some_and(|e| *e == rustix::io::Errno::NOENT) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let file = match rfs::openat(
+        &*parent,
+        path.file_name().unwrap(),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(invalid("nonregular restore retirement path"));
     }
-    if source.len() != target.len()
-        || source.iter().any(|r| r.member.is_none())
-        || target.iter().any(|r| r.member.is_none())
+    if file.metadata()?.len() != 96 {
+        return Ok(None);
+    }
+    let mut bytes = [0; 96];
+    crate::core::linux_io::pread_exact_at(&file, &mut bytes, 0)?;
+    Ok(Some(Retirement::decode(&bytes, fp, shard)?))
+}
+fn write_terminal(target: &Target, fp: Fingerprint, record: Retirement) -> Result<()> {
+    let temporary = format!(".uploads/{fp}/retire.tmp");
+    let parent = target.parent(Path::new(&temporary), true)?;
+    match rfs::unlinkat(&*parent, "retire.tmp", AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut file = File::from(rfs::openat(
+        &*parent,
+        "retire.tmp",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    file.write_all(&record.encode(fp))?;
+    file.sync_all()?;
+    let path = fp.shard_path(record.shard);
+    let path = Path::new(&path);
+    let destination = target.parent(path, true)?;
+    rfs::renameat(
+        &*parent,
+        "retire.tmp",
+        &*destination,
+        path.file_name().unwrap(),
+    )?;
+    destination.sync_all()?;
+    parent.sync_all()?;
+    target.root.sync_all()?;
+    Ok(())
+}
+fn retire_recovered(
+    snapshot: &Snapshot,
+    targets: &[Target],
+    pool: usize,
+    fp: Fingerprint,
+    source: Retirement,
+) -> Result<()> {
+    use n1_link::retirement::Phase;
+    let layout = &snapshot.pools[pool].layout;
+    let mut operation = sha2::Sha256::new();
+    operation.update(b"Litiaina/LINK/restore-retirement/v1\0");
+    operation.update(snapshot.id.as_bytes());
+    operation.update(fp.0);
+    let hash = operation.finalize();
+    let nonce: [u8; 16] = hash[..16].try_into().unwrap();
+    let root_for = |shard: u16| -> Result<usize> {
+        let slot = layout.member_slot(fp, shard)?;
+        snapshot
+            .roots
+            .iter()
+            .position(|r| r.pool == pool && r.slot == slot)
+            .ok_or_else(|| invalid("retirement restore target is unavailable"))
+    };
+    // This operation's completed certificate proves every target was made
+    // terminal first. It also deduplicates repeated authority/scan records
+    // without keeping a retirement catalogue in RAM or another on-disk index.
+    if read_terminal(&targets[root_for(0)?], fp, 0)?
+        .is_some_and(|r| r.phase == Phase::Retired && r.nonce == nonce)
     {
-        return Err(invalid(
-            "restore requires matching logical pool/member descriptors",
-        ));
+        let mut terminal = true;
+        for shard in 0..layout.width() {
+            terminal &=
+                read_terminal(&targets[root_for(shard as u16)?], fp, shard as u16)?.is_some();
+        }
+        if terminal {
+            for shard in 0..layout.width() {
+                cleanup_retired_stage(&targets[root_for(shard as u16)?], fp, shard as u16)?;
+            }
+            return Ok(());
+        }
     }
-    source
-        .iter()
-        .map(|root| {
-            target
-                .iter()
-                .find(|candidate| candidate.member == root.member)
-                .cloned()
-                .ok_or_else(|| invalid("restore pool geometry, generation or member slot differs"))
-        })
-        .collect()
+    for phase in [Phase::Retiring, Phase::Retired] {
+        for shard in 0..layout.width() {
+            let record = Retirement {
+                phase,
+                shard: shard as u16,
+                nonce,
+                timestamp: source.timestamp,
+            };
+            write_terminal(&targets[root_for(shard as u16)?], fp, record)?;
+        }
+    }
+    for shard in 0..layout.width() {
+        cleanup_retired_stage(&targets[root_for(shard as u16)?], fp, shard as u16)?;
+    }
+    Ok(())
+}
+fn preserve_retirements(repo: &Repository, snapshot: &Snapshot, targets: &[Target]) -> Result<()> {
+    // Preserve any terminal state left by an earlier interrupted restore before
+    // consulting repository points. This cannot turn a known retired key live.
+    for (ordinal, target) in targets.iter().enumerate() {
+        let marker = snapshot.marker(ordinal)?;
+        for entry in walkdir::WalkDir::new(&target.path)
+            .min_depth(3)
+            .max_depth(3)
+            .follow_links(false)
+            .max_open(16)
+        {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry
+                .path()
+                .strip_prefix(&target.path)?
+                .to_str()
+                .ok_or_else(|| invalid("non-UTF8 retirement scan path"))?;
+            if let Some(FileKind::Final(fp, shard)) = allowed_path(path, &marker, false)?
+                && let Some(record) = read_terminal(target, fp, shard)?
+            {
+                retire_recovered(snapshot, targets, snapshot.roots[ordinal].pool, fp, record)?;
+            }
+        }
+    }
+    // All available recovery points contribute known retirement state. Clock
+    // rollback cannot make a later deletion disappear from this union.
+    repo.walk_snapshots(|point| {
+        for known in &point.pools {
+            if let Some(expected) = snapshot.pools.iter().find(|p| {
+                p.layout.id == known.layout.id && p.layout.generation == known.layout.generation
+            }) && (expected.layout != known.layout || expected.members != known.members)
+            {
+                return Err(invalid(
+                    "recovery points disagree about immutable pool membership",
+                ));
+            }
+        }
+        repo.files(&point, |root, path, length, reader| {
+            let marker = point.marker(root)?;
+            if length == 96
+                && let Some(FileKind::Final(fp, shard)) = allowed_path(path, &marker, false)?
+            {
+                let mut bytes = [0; 96];
+                reader.read_exact(&mut bytes)?;
+                let record = Retirement::decode(&bytes, fp, shard)?;
+                if let Some(pool) = snapshot
+                    .pools
+                    .iter()
+                    .position(|p| p.layout == marker.layout)
+                {
+                    retire_recovered(snapshot, targets, pool, fp, record)?;
+                }
+                return Ok(());
+            }
+            validate_member_file(
+                path,
+                &marker,
+                reader,
+                length,
+                point.capture_mode == "offline_all",
+            )
+        })?;
+        Ok(())
+    })
+}
+
+fn cleanup_retired_stage(target: &Target, fp: Fingerprint, shard: u16) -> Result<()> {
+    let stage = match target.parent(Path::new(&format!(".uploads/{fp}/placeholder")), false) {
+        Ok(stage) => stage,
+        Err(e)
+            if e.downcast_ref::<rustix::io::Errno>()
+                .is_some_and(|e| *e == rustix::io::Errno::NOENT) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    for name in [
+        "shard.tmp".to_owned(),
+        "retire.tmp".to_owned(),
+        format!("repair.s{shard}.tmp"),
+    ] {
+        match rfs::unlinkat(&*stage, &name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    stage.sync_all()?;
+    let uploads = target.parent(Path::new(".uploads/placeholder"), false)?;
+    match rfs::unlinkat(&*uploads, fp.to_string(), AtFlags::REMOVEDIR) {
+        Ok(()) | Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
+        Err(e) => return Err(e.into()),
+    }
+    uploads.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
-mod mapping_tests {
+mod lease_tests {
     use super::*;
-    fn root(path: &str, slot: usize) -> Root {
-        Root {
-            path: path.into(),
-            legacy_path: None,
-            index: true,
-            blob: true,
-            member: Some(super::super::format::Member {
-                pool_id: "A".into(),
-                generation: 1,
-                data_shards: 1,
-                parity_shards: 1,
-                slot,
-            }),
-        }
-    }
     #[test]
-    fn logical_slots_override_mount_path_sort_order() {
-        let source = vec![root("/old/z", 0), root("/old/a", 1)];
-        let target = vec![root("/new/a", 1), root("/new/z", 0)];
-        let ordered = ordered_targets(&source, target).unwrap();
-        assert_eq!(ordered[0].path, "/new/z");
-        assert_eq!(ordered[1].path, "/new/a");
-        let mut wrong = vec![root("/new/a", 0), root("/new/z", 1)];
-        wrong[1].member.as_mut().unwrap().generation = 2;
-        assert!(ordered_targets(&source, wrong).is_err());
+    fn synchronous_restore_lease_ends_before_inherited_descriptors_are_closed() {
+        let path = std::env::temp_dir().join(format!("n1-restore-lease-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&path).unwrap();
+        let owner = Target::open(&path).unwrap();
+        // dup and fork retain the same Linux flock open-file-description owner.
+        let inherited = owner.root.try_clone().unwrap();
+        assert!(Target::open(&path).is_err());
+        drop(owner);
+        let next = Target::open(&path).unwrap();
+        drop(inherited);
+        assert!(Target::open(&path).is_err());
+        drop(next);
+        drop(Target::open(&path).unwrap());
+        std::fs::remove_dir(path).unwrap();
     }
 }

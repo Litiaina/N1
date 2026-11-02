@@ -1,19 +1,18 @@
-use crate::core::disk_manager::FS_STORAGE_ROOT;
-use crate::structs::auth_structs::AuthSessionScope;
+use crate::settings::config::Fragment;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use n1_link::PoolId;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::LazyLock;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-
-const REFRESH_STORE_DIR: &str = ".auth/refresh_sessions";
 
 pub(crate) fn credential_fingerprint(credential: &str) -> String {
     hex::encode(Sha256::digest(credential.as_bytes()))
@@ -21,13 +20,18 @@ pub(crate) fn credential_fingerprint(credential: &str) -> String {
 
 static REFRESH_STORE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(test)]
+pub(crate) async fn hold_session_writes() -> tokio::sync::MutexGuard<'static, ()> {
+    REFRESH_STORE_LOCK.lock().await
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SessionPermissions {
     #[serde(default)]
     pub operator: bool,
     pub read: bool,
     pub write: bool,
-    pub modify: bool,
+    pub repair: bool,
     pub delete: bool,
 }
 
@@ -36,7 +40,7 @@ struct RefreshSessionRecord {
     #[serde(default)]
     credential_fingerprint: Option<String>,
     session_id: String,
-    scope: AuthSessionScope,
+    scope: PoolId,
     permissions: SessionPermissions,
     access_expires_in: u64,
     refresh_expires_at: i64,
@@ -50,13 +54,15 @@ struct RefreshSessionRecord {
 
 #[derive(Debug, Clone)]
 pub struct IssuedRefreshSession {
+    pub session_id: String,
     pub refresh_token: String,
     pub refresh_expires_in: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct RotatedRefreshSession {
-    pub scope: AuthSessionScope,
+    pub session_id: String,
+    pub scope: PoolId,
     pub permissions: SessionPermissions,
     pub access_expires_in: u64,
     pub refresh_token: String,
@@ -85,7 +91,8 @@ impl From<serde_json::Error> for RefreshStoreError {
 }
 
 pub async fn create_refresh_session(
-    scope: AuthSessionScope,
+    root: &Path,
+    scope: PoolId,
     permissions: SessionPermissions,
     access_expires_in: u64,
     refresh_expires_in: u64,
@@ -112,22 +119,25 @@ pub async fn create_refresh_session(
         revoked_at: None,
     };
 
-    write_record(&record).await?;
+    write_record(root, &record).await?;
 
     Ok(IssuedRefreshSession {
+        session_id,
         refresh_token,
         refresh_expires_in,
     })
 }
 
 pub async fn rotate_refresh_session(
+    root: &Path,
+    fragments: &[Fragment],
     refresh_token: &str,
 ) -> Result<RotatedRefreshSession, RefreshStoreError> {
     let _guard = REFRESH_STORE_LOCK.lock().await;
 
     let (session_id, presented_secret) =
         parse_refresh_token(refresh_token).ok_or(RefreshStoreError::InvalidToken)?;
-    let mut record = read_record(&session_id).await?;
+    let mut record = read_record(root, &session_id).await?;
     let now = unix_ts();
 
     if record.revoked_at.is_some() {
@@ -135,25 +145,15 @@ pub async fn rotate_refresh_session(
     }
 
     if now >= record.refresh_expires_at {
-        delete_record_if_present(&session_id).await?;
+        delete_record_if_present(root, &session_id).await?;
         return Err(RefreshStoreError::TokenExpired);
     }
 
-    let current = match &record.scope {
-        AuthSessionScope::Fragment { fragment } => {
-            let meta = crate::core::fragment_metadata::read_fragment_metadata(fragment)
-                .await
-                .map_err(|_| RefreshStoreError::InvalidToken)?;
-            credential_fingerprint(if record.permissions.operator {
-                crate::middleware::auth_middleware::MASTER_KEY.as_str()
-            } else {
-                meta.key_phc.as_str()
-            })
-        }
-        AuthSessionScope::FileSystem { .. } => {
-            credential_fingerprint(crate::middleware::auth_middleware::AUTH_KEY.as_str())
-        }
-    };
+    let fragment = fragments
+        .iter()
+        .find(|f| f.id == record.scope)
+        .ok_or(RefreshStoreError::InvalidToken)?;
+    let current = credential_fingerprint(&fragment.secret_hash);
     if record.credential_fingerprint.as_deref() != Some(current.as_str()) {
         return Err(RefreshStoreError::InvalidToken);
     }
@@ -161,7 +161,7 @@ pub async fn rotate_refresh_session(
     let presented_hash = hash_secret(&presented_secret);
     if record.previous_token_hash.as_deref() == Some(presented_hash.as_str()) {
         record.revoked_at = Some(now);
-        write_record(&record).await?;
+        write_record(root, &record).await?;
         return Err(RefreshStoreError::TokenReuseDetected);
     }
 
@@ -176,9 +176,10 @@ pub async fn rotate_refresh_session(
     record.rotated_at = Some(now);
     record.last_used_at = now;
 
-    write_record(&record).await?;
+    write_record(root, &record).await?;
 
     Ok(RotatedRefreshSession {
+        session_id,
         scope: record.scope,
         permissions: record.permissions,
         access_expires_in: record.access_expires_in,
@@ -187,12 +188,15 @@ pub async fn rotate_refresh_session(
     })
 }
 
-pub async fn revoke_refresh_session(refresh_token: &str) -> Result<(), RefreshStoreError> {
+pub async fn revoke_refresh_session(
+    root: &Path,
+    refresh_token: &str,
+) -> Result<(), RefreshStoreError> {
     let _guard = REFRESH_STORE_LOCK.lock().await;
 
     let (session_id, presented_secret) =
         parse_refresh_token(refresh_token).ok_or(RefreshStoreError::InvalidToken)?;
-    let mut record = read_record(&session_id).await?;
+    let mut record = read_record(root, &session_id).await?;
     let presented_hash = hash_secret(&presented_secret);
 
     if record.current_token_hash != presented_hash
@@ -202,32 +206,32 @@ pub async fn revoke_refresh_session(refresh_token: &str) -> Result<(), RefreshSt
     }
 
     record.revoked_at = Some(unix_ts());
-    write_record(&record).await?;
+    write_record(root, &record).await?;
     Ok(())
 }
 
-fn refresh_store_root() -> PathBuf {
-    if let Ok(root) = std::env::var("N1_REFRESH_STORE_ROOT") {
-        return PathBuf::from(root);
-    }
-    if let Some(root) = FS_STORAGE_ROOT.get() {
-        return PathBuf::from(root).join(REFRESH_STORE_DIR);
-    }
-    std::env::temp_dir()
-        .join(format!("litiaina-n1-auth-{}", std::process::id()))
-        .join(REFRESH_STORE_DIR)
-}
-
-fn session_record_path(session_id: &str) -> PathBuf {
-    refresh_store_root().join(format!("{session_id}.json"))
-}
-
 async fn ensure_store_dir(root: &Path) -> Result<(), std::io::Error> {
-    fs::create_dir_all(root).await
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)?;
+        let meta = std::fs::symlink_metadata(&root)?;
+        if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(
+                "refresh state must be an owner-only directory",
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
-async fn write_record(record: &RefreshSessionRecord) -> Result<(), RefreshStoreError> {
-    let path = session_record_path(&record.session_id);
+async fn write_record(root: &Path, record: &RefreshSessionRecord) -> Result<(), RefreshStoreError> {
+    let path = root.join(format!("{}.json", record.session_id));
     let root = path
         .parent()
         .ok_or_else(|| std::io::Error::other("missing refresh session parent"))?
@@ -239,6 +243,8 @@ async fn write_record(record: &RefreshSessionRecord) -> Result<(), RefreshStoreE
     let mut file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp_path)
         .await?;
     file.write_all(&payload).await?;
@@ -249,17 +255,41 @@ async fn write_record(record: &RefreshSessionRecord) -> Result<(), RefreshStoreE
     Ok(())
 }
 
-async fn read_record(session_id: &str) -> Result<RefreshSessionRecord, RefreshStoreError> {
-    let path = session_record_path(session_id);
-    let payload = fs::read(path).await.map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => RefreshStoreError::InvalidToken,
-        _ => RefreshStoreError::Io(err),
-    })?;
+async fn read_record(
+    root: &Path,
+    session_id: &str,
+) -> Result<RefreshSessionRecord, RefreshStoreError> {
+    if Uuid::parse_str(session_id)
+        .map(|id| id.to_string() != session_id)
+        .unwrap_or(true)
+    {
+        return Err(RefreshStoreError::InvalidToken);
+    }
+    let path = root.join(format!("{session_id}.json"));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => RefreshStoreError::InvalidToken,
+            _ => RefreshStoreError::Io(err),
+        })?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() || meta.len() > 65536 || meta.permissions().mode() & 0o077 != 0 {
+        return Err(RefreshStoreError::InvalidToken);
+    }
+    use tokio::io::AsyncReadExt;
+    let mut payload = Vec::new();
+    (&mut file).take(65537).read_to_end(&mut payload).await?;
+    if payload.len() > 65536 {
+        return Err(RefreshStoreError::InvalidToken);
+    }
     Ok(serde_json::from_slice(&payload)?)
 }
 
-async fn delete_record_if_present(session_id: &str) -> Result<(), RefreshStoreError> {
-    let path = session_record_path(session_id);
+async fn delete_record_if_present(root: &Path, session_id: &str) -> Result<(), RefreshStoreError> {
+    let path = root.join(format!("{session_id}.json"));
     let root = path
         .parent()
         .ok_or_else(|| std::io::Error::other("missing refresh session parent"))?
@@ -293,7 +323,12 @@ fn build_refresh_token(session_id: &str, secret: &str) -> String {
 
 fn parse_refresh_token(token: &str) -> Option<(String, String)> {
     let (session_id, secret) = token.split_once('.')?;
-    if session_id.is_empty() || secret.is_empty() {
+    if Uuid::parse_str(session_id)
+        .map(|id| id.to_string() != session_id)
+        .unwrap_or(true)
+        || secret.len() != 43
+        || URL_SAFE_NO_PAD.decode(secret).ok()?.len() != 32
+    {
         return None;
     }
     Some((session_id.to_string(), secret.to_string()))
@@ -305,8 +340,9 @@ fn hash_secret(secret: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-#[cfg(test)]
-pub async fn clear_refresh_store_for_tests() {
+pub async fn revoke_session(root: &Path, session_id: &str) -> Result<(), RefreshStoreError> {
     let _guard = REFRESH_STORE_LOCK.lock().await;
-    let _ = fs::remove_dir_all(refresh_store_root()).await;
+    let mut record = read_record(root, session_id).await?;
+    record.revoked_at = Some(unix_ts());
+    write_record(root, &record).await
 }

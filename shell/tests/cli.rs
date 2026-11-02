@@ -1,719 +1,261 @@
-use std::net::SocketAddr;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-
-use assert_cmd::Command;
-use axum::{
-    Json, Router,
-    extract::{Path, Query},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-};
+//! CLI file/stream boundary tests. Object integrity, real authentication and TLS
+//! are exercised against the real engine in its native socket test suite.
+use n1_link::noa::{Command, Request, Response};
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, task::JoinHandle};
-
-const SECRET: &str = "test-secret";
-const TOKEN: &str = "cli-token";
-const EXPIRING_TOKEN: &str = "expiring-cli-token";
-const INITIAL_REFRESH_TOKEN: &str = "refresh-token-1";
-const ROTATED_REFRESH_TOKEN: &str = "refresh-token-2";
-const AUTH_FRAGMENT_NAME: &str = "mainframe";
-const AUTH_FRAGMENT_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command as Process, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "n1-link-cli-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&p).unwrap();
+        Self(p)
+    }
+    fn credentials(&self, endpoint: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.0.join("credentials.json");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        write!(
+            file,
+            "{}",
+            json!({"native_url":endpoint,"fragment":"test","secret":"local-cli-test"})
+        )
+        .unwrap();
+        path
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+}
+fn process(args: &[String], cwd: &std::path::Path) -> std::process::Output {
+    let mut child = Process::new(env!("CARGO_BIN_EXE_litiaina-n1-shell"))
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > end {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("CLI timed out: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+async fn request(stream: &mut TcpStream) -> Request {
+    let length = stream.read_u32().await.unwrap();
+    assert!(length < 65536);
+    let mut bytes = vec![0; length as usize];
+    stream.read_exact(&mut bytes).await.unwrap();
+    rmp_serde::from_slice(&bytes).unwrap()
+}
+async fn reply(stream: &mut TcpStream, id: u64, value: Value, length: u64) {
+    let mut response = Response::ok(id, value);
+    response.body_len = length;
+    let bytes = rmp_serde::to_vec_named(&response).unwrap();
+    stream.write_u32(bytes.len() as u32).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    stream.flush().await.unwrap();
+}
+async fn auth(listener: TcpListener) -> TcpStream {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let request = request(&mut stream).await;
+    assert!(matches!(request.command, Command::Login { .. }));
+    reply(&mut stream, request.id, json!({"token":"test"}), 0).await;
+    stream
+}
 
 #[test]
-fn version_reports_the_workspace_release_without_authentication() {
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .arg("--version")
-        .output()
-        .unwrap();
+fn version_does_not_initialize_storage_or_credentials() {
+    let fixture = Fixture::new();
+    let output = process(&["--version".into()], &fixture.0);
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         format!("litiaina-n1-shell {}\n", env!("CARGO_PKG_VERSION"))
     );
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
 }
-
-#[derive(serde::Deserialize)]
-struct AuthPayload {
-    fragment: String,
-    secret: String,
-    read: bool,
-    write: bool,
-    modify: bool,
-    delete: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct RefreshPayload {
-    refresh_token: String,
-}
-
-#[derive(serde::Deserialize)]
-struct FragmentCreatePayload {
-    name: String,
-    key: String,
-    secret: String,
-}
-
-#[derive(serde::Deserialize)]
-struct FragmentHashPayload {
-    fragment: String,
-}
-
-#[derive(serde::Deserialize)]
-struct HealthQuery {
-    deep_scan: Option<String>,
-}
-
-async fn auth_handler(Json(payload): Json<AuthPayload>) -> impl IntoResponse {
-    if payload.fragment != AUTH_FRAGMENT_HASH
-        || payload.secret != SECRET
-        || !payload.read
-        || !payload.write
-        || !payload.modify
-        || !payload.delete
-    {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad auth"}))).into_response();
-    }
-    (StatusCode::OK, Json(json!({ "access_token": TOKEN }))).into_response()
-}
-
-async fn auth_with_refresh_handler(Json(payload): Json<AuthPayload>) -> impl IntoResponse {
-    if payload.fragment != AUTH_FRAGMENT_HASH
-        || payload.secret != SECRET
-        || !payload.read
-        || !payload.write
-        || !payload.modify
-        || !payload.delete
-    {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad auth"}))).into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "access_token": EXPIRING_TOKEN,
-            "expires_in": 0_u64,
-            "refresh_token": INITIAL_REFRESH_TOKEN,
-            "refresh_expires_in": 3600_u64
-        })),
-    )
-        .into_response()
-}
-
-async fn refresh_handler(
-    refresh_calls: axum::extract::State<Arc<AtomicUsize>>,
-    Json(payload): Json<RefreshPayload>,
-) -> impl IntoResponse {
-    if payload.refresh_token != INITIAL_REFRESH_TOKEN {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "bad refresh"})),
-        )
-            .into_response();
-    }
-    refresh_calls.fetch_add(1, Ordering::SeqCst);
-    (
-        StatusCode::OK,
-        Json(json!({
-            "access_token": TOKEN,
-            "expires_in": 900_u64,
-            "refresh_token": ROTATED_REFRESH_TOKEN,
-            "refresh_expires_in": 3600_u64
-        })),
-    )
-        .into_response()
-}
-
-async fn create_fragment_handler(Json(payload): Json<FragmentCreatePayload>) -> impl IntoResponse {
-    if payload.name != "clinic" || payload.key != "clinic-key" || payload.secret != SECRET {
-        return (StatusCode::BAD_REQUEST, "bad fragment payload").into_response();
-    }
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "fragment_hash": "clinic-hash",
-            "name": "clinic"
-        })),
-    )
-        .into_response()
-}
-
-async fn fragment_hash_handler(Json(payload): Json<FragmentHashPayload>) -> impl IntoResponse {
-    if payload.fragment != AUTH_FRAGMENT_NAME && payload.fragment != AUTH_FRAGMENT_HASH {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "fragment not found"})),
-        )
-            .into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "fragment": payload.fragment,
-            "fragment_hash": AUTH_FRAGMENT_HASH
-        })),
-    )
-        .into_response()
-}
-
-async fn fragment_usage_handler(headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "fragment": AUTH_FRAGMENT_HASH,
-            "state": "active",
-            "committed_bytes": 524_288_u64,
-            "reserved_bytes": 0_u64,
-            "trash_bytes": 4096_u64,
-            "used_bytes": 528_384_u64,
-            "capacity_used": 1_048_576_u64,
-            "capacity_allocated": 4_194_304_u64,
-            "capacity_available": 3_145_728_u64,
-            "filesystem_count": 1_u64,
-            "capacity_usage_percent": 25.0_f64,
-            "created_at_unix": 1_i64,
-            "updated_at_unix": 2_i64
-        })),
-    )
-        .into_response()
-}
-
-fn authorized(headers: &HeaderMap) -> bool {
-    authorized_with(headers, TOKEN)
-}
-
-fn authorized_with(headers: &HeaderMap, expected_token: &str) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value == format!("Bearer {expected_token}"))
-        .unwrap_or(false)
-}
-
-async fn health_handler(headers: HeaderMap, Query(query): Query<HealthQuery>) -> impl IntoResponse {
-    if !authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if query.deep_scan.as_deref() != Some("true") {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let body = json!({
-        "sampled_at": 1_710_000_000_i64,
-        "status": "healthy",
-        "disks": [
-            {
-                "path": "/mnt/DISK0",
-                "role": "blob",
-                "status": "online",
-                "total_bytes": 100_u64,
-                "used_bytes": 75_u64,
-                "available_bytes": 25_u64,
-                "usage_percent": 75.0_f64,
-                "latency_ms": 2_u64,
-                "error": null
-            }
-        ],
-        "consistency": {
-            "total_objects_scanned": 0_u64,
-            "index_mirror_health": "healthy",
-            "mirror_counts": null
-        },
-        "system": {
-            "cpu_usage_percent": 10.5_f64,
-            "cpu_cores": 8_u64,
-            "ram_total_bytes": 1024_u64,
-            "ram_used_bytes": 512_u64,
-            "ram_usage_percent": 50.0_f64,
-            "load_avg_1m": 0.3_f64,
-            "uptime_seconds": 100_u64,
-            "process_resident_bytes": 128_u64,
-            "process_virtual_bytes": 256_u64,
-            "process_open_fds": 12_u64
-        },
-        "uploads": {
-            "active_fragments": 1_u64,
-            "active_sessions": 2_u64,
-            "reserved_bytes": 0_u64,
-            "committed_parts": 0_u64,
-            "committed_bytes": 0_u64,
-            "oldest_session_age_seconds": null
-        },
-        "index_runtime": {
-            "loaded_partition_runtimes": 1_u64,
-            "wal_appenders": 1_u64,
-            "prefix_projection_fragments_pending": 0_u64
-        },
-        "storage": {
-            "index_roots_total": 1_u64,
-            "index_roots_online": 1_u64,
-            "blob_devices_total": 1_u64,
-            "blob_devices_online": 1_u64,
-            "raw_total_bytes": 100_u64,
-            "raw_used_bytes": 75_u64,
-            "raw_available_bytes": 25_u64,
-            "heterogeneous_blob_capacity": true,
-            "blob_capacity_imbalance_ratio": 4.0_f64,
-            "placement_limiter_path": "/mnt/DISK0",
-            "placement_limiter_available_bytes": 25_u64,
-            "placement_limiter_usage_percent": 75.0_f64
-        },
-        "maintenance": {
-            "repair_running": false,
-            "repair_phase": "Idle",
-            "redistribution_running": false,
-            "redistribution_phase": "Idle",
-            "gc_running": false,
-            "gc_phase": "Idle"
-        },
-        "summary": "all green"
-    });
-
-    (StatusCode::OK, Json(body)).into_response()
-}
-
-async fn upload_status_handler(
-    headers: HeaderMap,
-    Path(version_id): Path<String>,
-) -> impl IntoResponse {
-    if !authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if version_id != "ver-123" {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let body = json!({
-        "uploaded_parts": [1, 2],
-        "committed_parts": 2_u64,
-        "committed_bytes": 2048_u64,
-        "expected_parts": 2_u64,
-        "total_size_bytes": 2048_u64,
-        "created_at": 1_710_000_000_i64,
-        "session_id": "sess-1",
-        "version_id": "ver-123",
-        "object_key": "images/xray.png"
-    });
-    (StatusCode::OK, Json(body)).into_response()
-}
-
-async fn gc_status_handler(headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "is_running": false,
-            "phase": "Completed",
-            "is_manual_run": true,
-            "total_fragments": 1_u64,
-            "total_fragments_scanned": 1_u64,
-            "total_live_versions_seen": 3_u64,
-            "total_trash_versions_expired": 1_u64,
-            "total_sessions_deleted": 0_u64,
-            "total_orphan_blob_dirs_deleted": 0_u64,
-            "total_refund_bytes": 1024_u64,
-            "total_errors": 0_u64,
-            "current_fragment": "frag-a",
-            "last_error": null,
-            "duration_seconds": 2_u64,
-            "start_timestamp": 1_710_000_000_i64
-        })),
-    )
-        .into_response()
-}
-
-async fn repair_status_handler(headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "is_running": false,
-            "phase": "Completed",
-            "total_scanned": 10_u64,
-            "total_repaired": 1_u64,
-            "corrupt_found": 0_u64,
-            "missing_meta_repaired": 0_u64,
-            "divergent_meta_repaired": 0_u64,
-            "current_fragment": "frag-a",
-            "duration_seconds": 3_u64,
-            "scan_rate_per_sec": 5.0_f64,
-            "last_repaired": null,
-            "last_disagreement": null,
-            "last_error": null,
-            "start_timestamp": 1_710_000_000_i64
-        })),
-    )
-        .into_response()
-}
-
-async fn redistribution_status_handler(headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "is_running": false,
-            "phase": "Completed",
-            "total_fragments_scanned": 1_u64,
-            "total_objects_scanned": 20_u64,
-            "total_objects_need_redistribution": 0_u64,
-            "total_objects_migrated": 0_u64,
-            "total_errors": 0_u64,
-            "current_fragment": "frag-a",
-            "duration_seconds": 4_u64,
-            "scan_rate_per_sec": 5.0_f64,
-            "last_object": null,
-            "last_error": null,
-            "start_timestamp": 1_710_000_000_i64
-        })),
-    )
-        .into_response()
-}
-
-async fn spawn_server(router: Router) -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fragment_create_uses_direct_route() {
-    let router = Router::new().route("/noa/v1/fragments", post(create_fragment_handler));
-    let (base_url, handle) = spawn_server(router).await;
-
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "fragment",
-            "create",
-            "--name",
-            "clinic",
-            "--key",
-            "clinic-key",
-        ])
-        .output()
-        .unwrap();
-
-    handle.abort();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"fragment_hash\":\"clinic-hash\""));
-    assert!(stdout.contains("\"name\":\"clinic\""));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fragment_usage_uses_authenticated_route() {
-    let router = Router::new()
-        .route("/noa/v1/auth/fragment", post(auth_handler))
-        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
-        .route("/noa/v1/capacity/fragment", get(fragment_usage_handler));
-    let (base_url, handle) = spawn_server(router).await;
-
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "fragment",
-            "usage",
-        ])
-        .output()
-        .unwrap();
-
-    handle.abort();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"used_bytes\": 528384"));
-    assert!(stdout.contains("\"capacity_available\": 3145728"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn health_renders_disk_usage_and_health() {
-    let router = Router::new()
-        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
-        .route("/noa/v1/auth/fragment", post(auth_handler))
-        .route("/noa/v1/maintenance/health", get(health_handler));
-    let (base_url, handle) = spawn_server(router).await;
-
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "health",
-            "--deep-scan",
-        ])
-        .output()
-        .unwrap();
-
-    handle.abort();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(stdout.contains("N1 Health"));
-    assert!(stdout.contains("/mnt/DISK0"));
-    assert!(stdout.contains("75.00%"));
-    assert!(stdout.contains("healthy"));
-    assert!(stdout.contains("heterogeneous (4.00x max/min)"));
-    assert!(stdout.contains("placement_limiter"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pools_selects_one_pool_and_distinguishes_readiness_from_integrity() {
-    async fn pool_handler(
-        headers: HeaderMap,
-        Query(query): Query<std::collections::HashMap<String, String>>,
-    ) -> impl IntoResponse {
-        assert_eq!(
-            headers.get("authorization").unwrap(),
-            format!("Bearer {TOKEN}").as_str()
-        );
-        assert_eq!(query.get("pool").map(String::as_str), Some("B"));
-        assert_eq!(query.get("deep_scan").map(String::as_str), Some("true"));
-        Json(
-            json!({"sampled_at":1,"fragment":AUTH_FRAGMENT_HASH,"allocation_policy":"newest_complete_unsealed_pool_no_free_space_balancing","pools":[{
-                "id":"B","generation":2,"data_shards":3,"parity_shards":1,"namespace_replicas":2,"sealed":false,"current_write_pool":true,"readiness":"ready",
-                "members":[{"slot":0,"member_id":"logical-member","path":"/mnt/new-ssd","status":"ready","available_bytes":100,"total_bytes":1000,"error":null}],
-                "estimated_data_available_bytes":300,"fragment_metadata_replicas":1,"fragment_state":"ready",
-                "integrity":{"status":"failed","scope":"selected_fragment_live_not_snapshot","files_scanned":4,"versions_checked":1,"ncx_replicas_checked":2,"elapsed_ms":3,"error":"recorded checksum differs"}
-            }]}),
-        )
-    }
-    let router = Router::new()
-        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
-        .route("/noa/v1/auth/fragment", post(auth_handler))
-        .route("/noa/v1/maintenance/pools/health", get(pool_handler));
-    let (base_url, handle) = spawn_server(router).await;
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "pools",
-            "--pool",
-            "B",
-            "--deep-scan",
-        ])
-        .output()
-        .unwrap();
-    handle.abort();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "stdout={stdout}; stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(stdout.contains("Pool B generation 2: 3+1 EC"));
-    assert!(stdout.contains("logical-member"));
-    assert!(stdout.contains("/mnt/new-ssd"));
-    assert!(stdout.contains("integrity: failed"));
-    assert!(stdout.contains("recorded checksum differs"));
-    assert!(stdout.contains("Readiness is not data integrity"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn uploads_status_can_emit_json() {
-    let router = Router::new()
-        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
-        .route("/noa/v1/auth/fragment", post(auth_handler))
-        .route(
-            "/noa/v1/upload/multipart/{version_id}",
-            get(upload_status_handler),
-        );
-    let (base_url, handle) = spawn_server(router).await;
-
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "--json",
-            "uploads",
-            "status",
-            "--version-id",
-            "ver-123",
-        ])
-        .output()
-        .unwrap();
-
-    handle.abort();
-
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(parsed["version_id"], "ver-123");
-    assert_eq!(parsed["object_key"], "images/xray.png");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn health_auto_refreshes_expiring_access_token() {
-    let refresh_calls = Arc::new(AtomicUsize::new(0));
-    let router = Router::new()
-        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
-        .route("/noa/v1/auth/fragment", post(auth_with_refresh_handler))
-        .route("/noa/v1/auth/refresh", post(refresh_handler))
-        .route("/noa/v1/maintenance/health", get(health_handler))
-        .with_state(refresh_calls.clone());
-    let (base_url, handle) = spawn_server(router).await;
-
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "health",
-            "--deep-scan",
-        ])
-        .output()
-        .unwrap();
-
-    handle.abort();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "stdout={stdout}\nstderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(stdout.contains("N1 Health"));
-    assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maintenance_status_commands_use_noa_routes() {
-    let router = Router::new()
-        .route("/noa/v1/fragments/hash", get(fragment_hash_handler))
-        .route("/noa/v1/auth/fragment", post(auth_handler))
-        .route("/noa/v1/maintenance/gc/status", get(gc_status_handler))
-        .route(
-            "/noa/v1/maintenance/repair/status",
-            get(repair_status_handler),
-        )
-        .route(
-            "/noa/v1/maintenance/redistribution/status",
-            get(redistribution_status_handler),
-        );
-    let (base_url, handle) = spawn_server(router).await;
-
-    for args in [
-        vec![
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "--json",
-            "gc",
-            "--status",
-        ],
-        vec![
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "--json",
-            "repair",
-            "--status",
-        ],
-        vec![
-            "--url",
-            &base_url,
-            "--secret",
-            SECRET,
-            "--fragment",
-            AUTH_FRAGMENT_NAME,
-            "--json",
-            "redistribute",
-            "--status",
-        ],
-    ] {
-        let output = Command::cargo_bin("litiaina-n1-shell")
-            .unwrap()
-            .args(args)
-            .output()
-            .unwrap();
+#[test]
+fn removed_namespace_commands_are_rejected() {
+    let fixture = Fixture::new();
+    for command in ["rename", "move", "list", "ls", "history", "mkdir", "export"] {
+        let output = process(&[command.into()], &fixture.0);
+        assert!(!output.status.success());
         assert!(
-            output.status.success(),
-            "stderr={}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"),
+            "{output:?}"
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(parsed["is_running"], false);
-        assert_eq!(parsed["phase"], "Completed");
     }
-
-    handle.abort();
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn protected_commands_require_fragment_or_auth_fragment() {
-    let output = Command::cargo_bin("litiaina-n1-shell")
-        .unwrap()
-        .args([
-            "--url",
-            "https://storage.example.test",
-            "--secret",
-            SECRET,
-            "health",
-        ])
-        .output()
+async fn get_never_overwrites_an_existing_local_file() {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let credentials = fixture.credentials(&format!("n1://{}", listener.local_addr().unwrap()));
+    let target = fixture.0.join("existing");
+    fs::write(&target, b"preserved").unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = auth(listener).await;
+        let mut byte = [0; 1];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+    });
+    let args = vec![
+        "--credentials".into(),
+        credentials.display().to_string(),
+        "get".into(),
+        "--key".into(),
+        "client-key".into(),
+        "--output".into(),
+        target.display().to_string(),
+    ];
+    let cwd = fixture.0.clone();
+    let output = tokio::task::spawn_blocking(move || process(&args, &cwd))
+        .await
         .unwrap();
-
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("N1 auth is fragment-scoped"));
+    assert_eq!(fs::read(target).unwrap(), b"preserved");
+    server.await.unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_streams_exact_ranges_and_does_not_accept_a_short_body() {
+    for short in [false, true] {
+        let fixture = Fixture::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let credentials = fixture.credentials(&format!("n1://{}", listener.local_addr().unwrap()));
+        let target = fixture.0.join("download");
+        let server = tokio::spawn(async move {
+            let mut stream = auth(listener).await;
+            let req = request(&mut stream).await;
+            assert!(matches!(
+                req.command,
+                Command::ObjectGet {
+                    offset: 5,
+                    length: Some(8),
+                    ..
+                }
+            ));
+            reply(&mut stream, req.id, json!({"total_bytes":100}), 8).await;
+            stream
+                .write_all(if short { b"abc" } else { b"abcdefgh" })
+                .await
+                .unwrap();
+        });
+        let args = vec![
+            "--credentials".into(),
+            credentials.display().to_string(),
+            "get".into(),
+            "--key".into(),
+            "client-key".into(),
+            "--offset".into(),
+            "5".into(),
+            "--length".into(),
+            "8".into(),
+            "--output".into(),
+            target.display().to_string(),
+        ];
+        let cwd = fixture.0.clone();
+        let output = tokio::task::spawn_blocking(move || process(&args, &cwd))
+            .await
+            .unwrap();
+        assert_eq!(output.status.success(), !short, "{output:?}");
+        assert_eq!(
+            fs::read(target).unwrap(),
+            if short { &b"abc"[..] } else { &b"abcdefgh"[..] }
+        );
+        server.await.unwrap();
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_streams_regular_file_bytes_through_native_single_part_completion() {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let credentials = fixture.credentials(&format!("n1://{}", listener.local_addr().unwrap()));
+    let source = fixture.0.join("source");
+    let original = (0..9000).map(|n| (n * 197 % 251) as u8).collect::<Vec<_>>();
+    fs::write(&source, &original).unwrap();
+    let server = tokio::spawn(async move {
+        let mut stream = auth(listener).await;
+        let req = request(&mut stream).await;
+        assert!(matches!(req.command, Command::Pools));
+        reply(&mut stream,req.id,json!({"pools":[{"id":"00000000000000000000000000000000","sealed":false,"data_shards":1,"block_bytes":4096}]}),0).await;
+        let req = request(&mut stream).await;
+        assert!(matches!(
+            req.command,
+            Command::UploadInit {
+                total_bytes: 9000,
+                part_bytes: 12288,
+                ..
+            }
+        ));
+        reply(
+            &mut stream,
+            req.id,
+            json!({"upload_key":"ticket","object_key":"object"}),
+            0,
+        )
+        .await;
+        let req = request(&mut stream).await;
+        assert!(matches!(req.command,Command::UploadPut{upload_key}if upload_key=="ticket"));
+        assert_eq!(req.body_len, 9000);
+        let mut received = vec![0; 9000];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, original);
+        reply(
+            &mut stream,
+            req.id,
+            json!({"object_key":"object","total_bytes":9000}),
+            0,
+        )
+        .await;
+    });
+    let args = vec![
+        "--credentials".into(),
+        credentials.display().to_string(),
+        "put".into(),
+        source.display().to_string(),
+    ];
+    let cwd = fixture.0.clone();
+    let output = tokio::task::spawn_blocking(move || process(&args, &cwd))
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"]["object_key"],
+        "object"
+    );
+    server.await.unwrap();
 }

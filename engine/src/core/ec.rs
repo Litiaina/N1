@@ -1,3 +1,6 @@
+mod stripe;
+pub use stripe::StripeCodec;
+
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -43,7 +43,7 @@ pub fn safe_id(value: &str) -> Result<()> {
 pub fn read_regular(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > max as u64 {
@@ -62,11 +62,6 @@ pub fn sync_parent(path: &Path) -> Result<()> {
 }
 pub fn private_dir(path: &Path) -> Result<()> {
     make_dir(path, true)
-}
-// Only for fenced, unpublished restore work. The restore commit phase must
-// synchronize every final directory before removing any engine-start fence.
-pub fn restore_dir(path: &Path) -> Result<()> {
-    make_dir(path, false)
 }
 fn make_dir(path: &Path, durable: bool) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;

@@ -1,3 +1,293 @@
+# Current LINK RC.2 qualification campaign — November 2–3, 2026
+
+The November 3 `link` branch checkpoint passes a fresh warnings-denied
+`cargo test --workspace --all-targets --offline --locked`: **238 passed,
+0 failed, 4 opt-in/helper cases ignored**, including 185 engine-library tests.
+The total includes the resumable client harness tests added after the earlier
+235-test hybrid run. Log: `reports/link-precommit-workspace213.log` under the
+HDD evidence root. Formatting and staged-diff checks also pass; no engine or
+harness code changed while preparing this checkpoint.
+
+The November 3 **original NCX/NDX versus current CRC32C LINK** comparison passes
+two fresh alternating four-trial native campaigns: 844 verified GETs and
+408 successful removal/absence checks, with clean shutdown throughout.
+No engine or client code changed for these measurements. Small-object timings
+and RSS improve; full-workload large PUT is near parity. Repeated large reads
+remain variable and slower in aggregate with substantial unequal storage reads.
+All trials and limitations are retained in
+[NCX-VS-CRC32C-LINK-20261103.md](/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/NCX-VS-CRC32C-LINK-20261103.md).
+This comparison does not turn the separate new-only 959 MiB/s sample into an
+old/new result, or establish matched population-scale performance.
+
+The hybrid-integrity change passes **235 Rust workspace tests** (185 engine
+library tests), with zero failures in `hybrid-workspace-tests179.log` and
+`hybrid-workspace-tests180.log` under the HDD report root. Strict Clippy passes
+in `hybrid-clippy182.log`. Four physical/helper cases require explicit opt-in;
+these default test counts do not include physical qualification.
+New coverage includes independent CRC32C known answers, segmented/unaligned
+input, canonical reserved bytes, source identity/position/length binding,
+CRC-valid wrong-source rejection before GET/repair, unchanged captured v1 bytes,
+immutable pool-profile enforcement and restart/resume for both profiles.
+
+The Rust headless scale witness is reproducible with a release client:
+
+```sh
+rc2_bench --scale-smoke /absolute/release/litiaina-n1 \
+  /mnt/PROJECT-DISK-1TB /media/altear/TEST-1TB/mx-tests
+rc2_bench --scale /absolute/release/litiaina-n1 \
+  /mnt/PROJECT-DISK-1TB /media/altear/TEST-1TB/mx-tests
+rc2_bench --scale-test-resume /absolute/release/litiaina-n1 \
+  /mnt/PROJECT-DISK-1TB /media/altear/TEST-1TB/mx-tests
+rc2_bench --scale-resume /absolute/release/litiaina-n1 \
+  /mnt/PROJECT-DISK-1TB/n1-scale-<existing-run>
+```
+
+The current smoke case has 4,099 objects to exercise partial batches and uneven
+worker tails; the earlier nonresumable client passed a 1,027-object smoke case.
+The full case has 500,000 mixed 0–64 KiB objects, four native clients,
+durable batches of at most 256, required io_uring and a fresh fixed 64 KiB 1+1
+pool on the two HDDs. Quotas are disabled; adaptive concurrency and admission
+remain enabled. Every intent and acknowledgement is saved outside member roots.
+After SIGKILL/restart every acknowledged object is verified by length/SHA-256;
+the harness also verifies manifest index/order/count and exact batch identities.
+Upload wall time includes init, source generation and client journal barriers.
+Batch PUT latency is reported as batch latency, not individual-object latency.
+`PASSED.json` is written only after all GET checks and clean final shutdown.
+Data and evidence remain in new private HDD directories. Starting the command
+alone does not establish a passing population result.
+
+The resume client copies and validates journal prefixes before changing any
+object. Previously acknowledged keys are never PUT/finalized again; uncertain
+intents retry the same identity. A fingerprint census proves the complete
+population has distinct keys. Journal persistence runs on bounded blocking
+workers rather than the Tokio runtime threads. A physical 4,099-object witness
+passes client/server SIGKILL, intentional acknowledged-header corruption
+rejection without overwriting it, exact injected-byte restoration, repeat resume
+and full verified GETs after another SIGKILL/restart. Original journals stay
+unchanged (`hybrid-resume-physical197.log`); the client also passes five Rust
+harness tests and strict Clippy (`hybrid-resume-tests195.log`,
+`hybrid-resume-clippy198.log`).
+
+The full two-HDD case now **passes: 500,000 distinct durable acknowledgements,
+all 500,000 length/SHA-256 GETs after SIGKILL/restart, and 1,000,000 correctly
+placed shard files with no unreferenced shards or leftover staging**. Final
+shutdown was clean. The initial process stopped before completion; resume
+validated and preserved its 397,568 acknowledgements without PUT/finalize and
+completed the remaining 102,432. All eight original journal hashes still match.
+The temporary user job exited successfully; no service was installed/enabled.
+Initial sampled upload timings and exact resume timings remain separate;
+there is no uninterrupted full-population upload latency result.
+
+Detailed workload, phase timings, RSS/CPU/I/O, allocation and evidence:
+[HEADLESS-500K-20261102-20261103.md](/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/HEADLESS-500K-20261102-20261103.md).
+The hybrid engine's frozen hashes and prerequisite tests remain recorded in
+`reports/HYBRID-INTEGRITY-20261102.md` under the same HDD evidence root.
+
+The standalone Rust `scale_inventory` example performs the post-shutdown
+read-only census. It requires a completed 500,000-object resume checkpoint and
+a new output path on the PROJECT HDD:
+
+```sh
+scale_inventory /mnt/PROJECT-DISK-1TB/n1-scale-<existing-run> \
+  /mnt/PROJECT-DISK-1TB/n1-scale-<existing-run>/resume-<completed-checkpoint> \
+  /mnt/PROJECT-DISK-1TB/scale-inventory-<new-report>.json
+```
+
+It checks distinct client identities, exact member/fanout placement, file
+lengths, no extra/hard-linked shards and empty staging. It reports logical and
+allocated data-file bytes; the latter excludes filesystem metadata. Payload
+verification is established by the preceding full GET pass, not by file counts.
+
+The engine is undergoing a complete LINK redesign. Historical RC.1 results below
+belong to the former engine; they do **not** qualify LINK. The current release
+candidate remains unreleased. See [the implementation ledger](docs/RC2-IMPLEMENTATION.md)
+for current test logs, failures, physical witnesses and outstanding gates.
+
+Current builds and functional fixtures use RAM; durable reports and physical
+fixtures are under `/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01` and the isolated
+TEST HDD run directory. Nothing in a debug or RAM-only test establishes matched
+performance, million-object scale or physical power-loss durability. MCH is
+unavailable. The historical release-proof executable still targets the previous
+API and must be ported before running its acceptance scenarios against LINK.
+
+The November 2 infrastructure-restoration run passes **220 Rust workspace tests**
+(176 in the engine library), with zero failures. Three opt-in/helper cases are
+ignored in that default command; the physical process witness was run explicitly.
+The current engine/LINK/client/CLI also pass strict Clippy on all their targets.
+See `restoration-replacement-tests78.log` and `restoration-final-clippy80.log`
+in the HDD reports. A second full-suite run after the explicit member-lease
+release also passed (`restoration-lease-repeat77.log`).
+
+Coverage includes the original four-slot recovery runtime/admission, coalesced
+read repair under a full budget, cancellation-safe operation/session writes and
+lease retention, real HTTP range/conditional/HEAD downloads, and explicit offline
+single-member reconstruction. Reconstruction tests exercise all logical slots,
+healthy inode preservation, permanent/incomplete retirement, durable multipart
+holes, partial finalization, corrupt peers, unexpected inventory and resume.
+A sparse 1 TiB logical upload with a verified tail frame exercises bounded
+extent traversal; it does not upload or allocate a TiB. The earlier intermittent
+restart WouldBlock is retained in `restoration-replacement-tests72.log`; a
+deterministic duplicate-descriptor test covers the corrected lifetime mechanism.
+
+The Rust-only `engine/tests/headless_recovery.rs` witness runs the actual engine
+with io_uring required on independent XFS/ext4 HDDs. Its final optimized-binary
+run passes SIGKILL during upload, SIGTERM while an admitted upload is paused,
+durable multipart resume, exact native downloads, read repair, permanent
+retirement, byte-exact member cutover, authorized failed-member reconstruction
+and encrypted service-identity recovery. The final report is
+`/mnt/PROJECT-DISK-1TB/n1-restoration-witness-01M6CN0HSMKWTF2N6TA9HMJJBC/result.json`.
+Engine SHA-256:
+`6114956511eccdab5851e84e33eb92f3f900df0d218e3ff6b563ddc965f039f6`.
+The report records device identities; all owned engines are stopped.
+This witness is not a benchmark or physical power-loss qualification.
+
+Reproduce with a RAM `CARGO_TARGET_DIR`/`TMPDIR` and explicitly selected,
+owner-writable directories on two different test filesystems:
+
+```sh
+N1_WITNESS_PROJECT_ROOT=/mnt/PROJECT-DISK-1TB \
+N1_WITNESS_TEST_ROOT=/media/altear/TEST-1TB/mx-tests \
+N1_WITNESS_ENGINE_BINARY=/absolute/path/to/release/litiaina-n1 \
+cargo test -p n1 --test headless_recovery --offline --locked -- \
+  --ignored --exact physical_restart_clone_repair_and_service_identity_recovery --nocapture
+```
+
+The harness creates private, uniquely named directories and retains its data and
+reports for inspection. It signals only child processes it owns. No Python is
+used for current tests, benchmarks or fault orchestration. Historical Python
+results below remain dated evidence of the former engine.
+
+The current Rust release benchmark and full methodology are on the HDD in
+`reports/RESTORATION-PERFORMANCE-20261102.md`. It measures 1 GiB, 100 individual
+4 KiB objects and 100 different batched objects, verified requested-cold/warm
+GETs, stat, deep health and permanent deletion, with CPU/I/O/RSS/VmHWM samples
+and binary hashes. An additional 4 KiB-block pool quantifies the default
+256 KiB pool's excessive tiny-object padding. These measurements do not establish
+a matched NCX/LINK win or million-object qualification; serial small-object
+durability tails remain material. Benchmark and physical-harness clients are
+Rust, and their persistent data/reports are on HDDs.
+
+A four-trial native NCX → LINK → LINK → NCX comparison is now retained in
+`reports/NCX-VS-LINK-BENCHMARK-20261102.md` under the same HDD report root.
+It uses frozen release binaries, the same two HDDs, 1+1 EC, a 1 GiB object
+and 100 individual 4 KiB objects per trial, including LINK initialization in
+upload time. All 808 GETs pass length/SHA-256 checks; all owned servers stop.
+LINK improves small-upload time and process RSS, while warm large reads regress.
+The report records original adaptive tiny-object blocks versus LINK's fixed
+pool blocks, O_DIRECT versus buffered cache residency, different deletion
+guarantees, full latency samples, CPU/process I/O and the two interrupted setup
+attempts. It does not establish total RAM use, batch parity or scale qualification.
+The Rust benchmark example's `--compare` mode reproduces that campaign; its
+legacy wire adapter remains confined to benchmark tooling.
+
+The subsequent configuration cleanup uses stable `N1-LINK` identity instead
+of a release-tagged discriminator. CLI/ping report the workspace Cargo version;
+LINK also inherits that workspace package version. Native/HTTP ping and config
+validation regressions pass in the 221-test workspace run
+(`config-version-tests96.log`); current production crates and all their targets
+pass strict Clippy (`config-version-clippy97.log`).
+The updated release engine also passes the physical recovery witness
+(`config-version-witness99.log`, 47.92 seconds); its SHA-256 is
+`f7c8283633f31175da2968c14364e665f666ea288ee2b0409b8d2713b2370701`.
+
+## Pipeline optimization — November 2
+
+The subsequent optimization passes **223 workspace tests, zero failures**
+(179 engine library tests) and strict Clippy for the production crates and all
+their targets: `optimization-tests116.log`, `optimization-clippy117.log`.
+The three default ignored cases retain their explicit opt-in/helper roles.
+The physical Rust witness also passes on the optimized release binary in
+`optimization-witness119.log` (41.03 seconds), including crash/resume, shutdown
+drain, read repair, permanent retirement, member reconstruction and encrypted
+service recovery. Engine SHA-256:
+`f017966129b74894ea80d5c27bde0b446e5e77533ebb9f4fdfd294768e6000ed`.
+
+Uploads reuse bounded buffers and coalesce up to four adjacent framed stripes
+per member while preparing the next group. Reads prefetch bounded windows,
+verify each frame once and retain independent source SHA-256 checks. Health and
+repair reuse already verified source hashes. Canonical zero padding of newly
+written partial tails can be physically sparse; old retry regions are rewritten
+in full. Neither the immutable geometry nor the inline encoding changes.
+Regressions cover conflicts beyond two upload groups, exact final bytes,
+independent corrupt frames in prefetched windows, ranges, durable sparse-tail
+restart, conflicting retry, padding corruption, reconstruction and retirement.
+
+The strict before/after LINK campaign uses the same geometry, durability and
+permanent-delete guarantees on both binaries. `optimization-link-abba120.log`
+records four alternating trials and **808 SHA-256/length-verified downloads**.
+Warm large-read aggregate throughput improves from **185.93 to 588.78 MiB/s**;
+1 GiB durable upload throughput moves from **82.03 to 85.85 MiB/s**. The mean
+100-object upload phase drops from **52.27 to 40.14 seconds**. Per-process
+small-upload write bytes drop from **53,248,000 to 2,457,600** per 100 objects.
+Delete median increases while its aggregate wall time decreases; its protocol
+is unchanged, so this does not establish a deletion optimization. Process RSS
+sampling and kernel VmHWM are reported separately, including regressions.
+
+Detailed trials, latency tails, memory, CPU/I/O counters, original-NCX comparison,
+full batch/health workload, exact binary hashes and limitations are retained in
+`reports/OPTIMIZATION-RESULTS-20261102.md` under the HDD report root.
+Reproduce the strict LINK comparison with the Rust example:
+
+```sh
+rc2_bench --compare-link /absolute/before/litiaina-n1 /absolute/after/litiaina-n1 \
+  /mnt/PROJECT-DISK-1TB /media/altear/TEST-1TB/mx-tests
+```
+
+The before binary is hash-pinned to the configuration-cleanup checkpoint above;
+the harness refuses a substituted baseline. `--compare` retains the separately
+pinned original-NCX comparison. Both modes create isolated directories and
+terminate only owned engines. Current benchmark source is
+`native_client/examples/rc2_bench.rs` and `rc2_bench/{comparison,supervisor}.rs`.
+These bounded serial results do not qualify million-object scale, full-machine
+RAM usage, saturated concurrency or physical power cuts. RC.2 remains unreleased.
+
+The selected native-delivery checkpoint passes **226 Rust workspace tests**
+(182 engine library), zero failures, with the same three explicit opt-in/helper
+cases ignored by default (`native-selected-tests170.log`). Current production crates
+and all their targets pass strict Clippy (`native-selected-clippy171.log`); the
+historical release-proof executable retains its separate recorded limitations.
+Regressions exercise cancellation-safe socket/shard ownership, transport progress
+deadlines and the retained large-block corruption/range recovery case. Original
+startup banner and local timestamps are
+restored and exercised by `banner-smoke127.log`.
+
+Native GET now streams directly from the prepared verified range to the socket;
+the original adaptive admission, io_uring and cancellation/drain protections
+remain active. HTTP retains its bounded body adapter. Frame and source SHA-256
+verification remain intact, as explicitly requested. Rust checksum profiling
+separates that byte-processing cost from fixed-topology LINK placement.
+The final selected release rebuild (`native-selected-release167.log`) reproduces engine SHA-256
+`252b92024f59f2d339fa4e5af14412fef25272594404ab3ec1e39dc60e4ffff2`,
+which passed the physical recovery witness in `native-direct-witness135.log`
+(44.94 seconds). The result is
+`/mnt/PROJECT-DISK-1TB/n1-restoration-witness-01M6DHHZZDBYH5GW02K2DDRXQT/result.json`.
+
+Detailed CPU/throughput tradeoffs, original-NCX comparisons and unsuccessful
+buffer-channel/hash-backend experiments are retained in the HDD report
+`reports/NATIVE-READ-PATH-20261102.md`. The Rust benchmark adds
+`--compare-reads-link`, `--compare-reads-direct`, `--compare-reads-ncx` and
+`--profile-checksums`; existing
+full-workload modes retain their workloads. Read comparisons use eight warm
+verified GETs per trial; repeated reads of one object are correlated samples,
+not independent object populations or scale qualification.
+
+The attempted large-window worker-pool dispatch passes its own functional checks
+but reduces warm throughput by 63.41% and raises CPU/GiB by 156.57% in the paired
+comparison. That dispatch is removed from the selected implementation. Its
+source/binary/results remain on the HDD; its broader corruption regression is
+retained and passes in the selected 226-test suite. No checksum policy is weakened.
+
+The final original-NCX read comparison (`native-selected-ncx-reads172.log`)
+passes all 36 GETs with zero process storage-read bytes in both warm phases.
+Selected LINK delivers 606.772 versus NCX's 679.871 MiB/s, uses 1.857 versus
+1.443 CPU seconds/GiB and has 32.25% lower peak sampled process RSS. The full
+selected workload (`native-final-full152.log`) passes 402 downloads and 201
+permanent deletions with clean shutdown. The unchanged selected binary is
+identified above; unfavorable results and checksum-policy differences are
+explicit in the detailed report. No million-object or release claim follows.
+
+## Historical qualification record
+
 # N1 testing and results
 
 N1 1.0.0-RC.1 is the first formal release candidate, not stable or LTS. The

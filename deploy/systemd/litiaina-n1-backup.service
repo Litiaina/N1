@@ -13,9 +13,9 @@ User=root
 UMask=0077
 StateDirectory=litiaina/n1-backup
 StateDirectoryMode=0700
-ExecStart=/opt/litiaina/n1/litiaina-n1-shell backup run-job --config /etc/litiaina/n1/backup-job.json
+ExecStart=/opt/litiaina/n1/litiaina-n1 backup run-job --config /etc/litiaina/n1/backup-job.json
 # systemd runs this only after killing the remaining job cgroup.
-ExecStopPost=/opt/litiaina/n1/litiaina-n1-shell backup recover-job --state-dir /var/lib/litiaina/n1-backup
+ExecStopPost=/opt/litiaina/n1/litiaina-n1 backup recover-job --state-dir /var/lib/litiaina/n1-backup
 KillMode=control-group
 TimeoutStartSec=infinity
 TimeoutStopSec=360

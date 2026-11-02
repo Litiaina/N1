@@ -1,20 +1,18 @@
+//! N1 maintenance admission, with the original guard and safety-fence policies.
+//! Each Store owns its gate so independent engines never share maintenance state.
 use crate::enums::app_error_enum::AppError;
-use axum::body::Body;
-use axum::http::Method;
-use axum::http::Request;
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, RwLock};
+use axum::{
+    body::Body,
+    http::{Method, Request},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use std::sync::{
+    Arc, LazyLock, RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
-static READ_ONLY_FAST_MODE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
-static QUIESCED_MAINTENANCE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
-static TOPOLOGY_READ_ONLY_REASON: LazyLock<RwLock<Option<String>>> =
-    LazyLock::new(|| RwLock::new(None));
-static AUTO_HEALING_FAULT_REASON: LazyLock<RwLock<Option<String>>> =
-    LazyLock::new(|| RwLock::new(None));
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum MaintenanceAccessMode {
     #[default]
     Availability,
@@ -22,158 +20,172 @@ pub enum MaintenanceAccessMode {
     Quiesced,
 }
 
-pub struct ReadOnlyFastModeGuard {
-    mode: MaintenanceAccessMode,
-    active: bool,
+#[derive(Default)]
+pub struct OperationGate {
+    read_only: AtomicUsize,
+    quiesced: AtomicUsize,
+    topology_reason: RwLock<Option<String>>,
+    healing_reason: RwLock<Option<String>>,
 }
-
+pub struct ReadOnlyFastModeGuard {
+    gate: Arc<OperationGate>,
+    mode: MaintenanceAccessMode,
+}
 impl Drop for ReadOnlyFastModeGuard {
     fn drop(&mut self) {
-        if self.active {
-            match self.mode {
-                MaintenanceAccessMode::Availability => {}
-                MaintenanceAccessMode::ReadOnly => {
-                    READ_ONLY_FAST_MODE_REFCOUNT.fetch_sub(1, Ordering::AcqRel);
-                }
-                MaintenanceAccessMode::Quiesced => {
-                    QUIESCED_MAINTENANCE_REFCOUNT.fetch_sub(1, Ordering::AcqRel);
-                }
+        match self.mode {
+            MaintenanceAccessMode::Availability => {}
+            MaintenanceAccessMode::ReadOnly => {
+                self.gate.read_only.fetch_sub(1, Ordering::AcqRel);
+            }
+            MaintenanceAccessMode::Quiesced => {
+                self.gate.quiesced.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
 }
-
-pub fn acquire_maintenance_mode(mode: MaintenanceAccessMode) -> ReadOnlyFastModeGuard {
-    match mode {
-        MaintenanceAccessMode::Availability => ReadOnlyFastModeGuard {
+impl OperationGate {
+    pub fn acquire(self: &Arc<Self>, mode: MaintenanceAccessMode) -> ReadOnlyFastModeGuard {
+        match mode {
+            MaintenanceAccessMode::Availability => {}
+            MaintenanceAccessMode::ReadOnly => {
+                self.read_only.fetch_add(1, Ordering::AcqRel);
+            }
+            MaintenanceAccessMode::Quiesced => {
+                self.quiesced.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        ReadOnlyFastModeGuard {
+            gate: self.clone(),
             mode,
-            active: false,
-        },
-        MaintenanceAccessMode::ReadOnly => {
-            READ_ONLY_FAST_MODE_REFCOUNT.fetch_add(1, Ordering::AcqRel);
-            ReadOnlyFastModeGuard { mode, active: true }
-        }
-        MaintenanceAccessMode::Quiesced => {
-            QUIESCED_MAINTENANCE_REFCOUNT.fetch_add(1, Ordering::AcqRel);
-            ReadOnlyFastModeGuard { mode, active: true }
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn acquire_read_only_fast_mode(enable: bool) -> ReadOnlyFastModeGuard {
-    if enable {
-        acquire_maintenance_mode(MaintenanceAccessMode::ReadOnly)
-    } else {
-        acquire_maintenance_mode(MaintenanceAccessMode::Availability)
+    pub fn mode(&self) -> MaintenanceAccessMode {
+        if self.quiesced.load(Ordering::Acquire) > 0 {
+            MaintenanceAccessMode::Quiesced
+        } else if self.read_only.load(Ordering::Acquire) > 0 || self.safety_reason().is_some() {
+            MaintenanceAccessMode::ReadOnly
+        } else {
+            MaintenanceAccessMode::Availability
+        }
+    }
+    pub fn safety_reason(&self) -> Option<String> {
+        self.healing_reason
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .or_else(|| {
+                self.topology_reason
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+    }
+    pub fn set_safety_read_only(&self, reason: Option<String>) {
+        *self
+            .topology_reason
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = reason;
+    }
+    pub fn set_auto_healing_fault(&self, reason: Option<String>) {
+        *self
+            .healing_reason
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = reason;
+    }
+    pub fn ensure_mutations_allowed(&self) -> Result<(), AppError> {
+        if self.mode() >= MaintenanceAccessMode::ReadOnly {
+            return Err(AppError::ServiceUnavailable(
+                self.safety_reason().unwrap_or_else(|| {
+                    "N1 is read-only while strict maintenance is active.".into()
+                }),
+            ));
+        }
+        Ok(())
+    }
+    pub fn ensure_reads_allowed(&self) -> Result<(), AppError> {
+        if self.mode() == MaintenanceAccessMode::Quiesced {
+            return Err(AppError::ServiceUnavailable(
+                "N1 reads are quiesced for maintenance".into(),
+            ));
+        }
+        Ok(())
     }
 }
-
-pub fn current_maintenance_access_mode() -> MaintenanceAccessMode {
-    if QUIESCED_MAINTENANCE_REFCOUNT.load(Ordering::Acquire) > 0 {
-        MaintenanceAccessMode::Quiesced
-    } else if READ_ONLY_FAST_MODE_REFCOUNT.load(Ordering::Acquire) > 0
-        || safety_read_only_reason().is_some()
-    {
+static DEFAULT_GATE: LazyLock<Arc<OperationGate>> =
+    LazyLock::new(|| Arc::new(OperationGate::default()));
+pub fn acquire_maintenance_mode(mode: MaintenanceAccessMode) -> ReadOnlyFastModeGuard {
+    DEFAULT_GATE.acquire(mode)
+}
+pub fn acquire_read_only_fast_mode(enabled: bool) -> ReadOnlyFastModeGuard {
+    acquire_maintenance_mode(if enabled {
         MaintenanceAccessMode::ReadOnly
     } else {
         MaintenanceAccessMode::Availability
-    }
-}
-
-pub fn set_safety_read_only(reason: Option<String>) {
-    let mut current = TOPOLOGY_READ_ONLY_REASON
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *current = reason;
-}
-
-pub fn set_auto_healing_fault(reason: Option<String>) {
-    let mut current = AUTO_HEALING_FAULT_REASON
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *current = reason;
-}
-
-pub fn auto_healing_fault_reason() -> Option<String> {
-    AUTO_HEALING_FAULT_REASON
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-}
-
-pub fn safety_read_only_reason() -> Option<String> {
-    auto_healing_fault_reason().or_else(|| {
-        TOPOLOGY_READ_ONLY_REASON
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
     })
 }
-
-pub fn topology_read_only_reason() -> Option<String> {
-    TOPOLOGY_READ_ONLY_REASON
+pub fn current_maintenance_access_mode() -> MaintenanceAccessMode {
+    DEFAULT_GATE.mode()
+}
+pub fn set_safety_read_only(reason: Option<String>) {
+    DEFAULT_GATE.set_safety_read_only(reason);
+}
+pub fn set_auto_healing_fault(reason: Option<String>) {
+    DEFAULT_GATE.set_auto_healing_fault(reason);
+}
+pub fn auto_healing_fault_reason() -> Option<String> {
+    DEFAULT_GATE
+        .healing_reason
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|e| e.into_inner())
         .clone()
 }
-
-pub fn ensure_user_mutations_allowed() -> Result<(), AppError> {
-    if current_maintenance_access_mode() >= MaintenanceAccessMode::ReadOnly {
-        return Err(AppError::ServiceUnavailable(
-            safety_read_only_reason().unwrap_or_else(|| {
-                "N1 is read-only while strict maintenance is active.".to_string()
-            }),
-        ));
-    }
-    Ok(())
+pub fn topology_read_only_reason() -> Option<String> {
+    DEFAULT_GATE
+        .topology_reason
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
-
-#[allow(dead_code)]
+pub fn safety_read_only_reason() -> Option<String> {
+    DEFAULT_GATE.safety_reason()
+}
+pub fn ensure_user_mutations_allowed() -> Result<(), AppError> {
+    DEFAULT_GATE.ensure_mutations_allowed()
+}
 pub fn is_read_only_fast_mode_active() -> bool {
     current_maintenance_access_mode() >= MaintenanceAccessMode::ReadOnly
 }
 
 pub async fn enforce_read_only_fast_mode_on_mutations(req: Request<Body>, next: Next) -> Response {
-    if matches!(req.method(), &Method::OPTIONS) {
+    if req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
-
     let mode = current_maintenance_access_mode();
     if matches!(req.method(), &Method::GET | &Method::HEAD) {
-        if mode == MaintenanceAccessMode::Quiesced {
-            return (
+        return if mode == MaintenanceAccessMode::Quiesced {
+            (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "Read operations are temporarily disabled: scrub mode is active.",
             )
-                .into_response();
-        }
-        return next.run(req).await;
+                .into_response()
+        } else {
+            next.run(req).await
+        };
     }
-
     match mode {
         MaintenanceAccessMode::Availability => next.run(req).await,
         MaintenanceAccessMode::ReadOnly => match safety_read_only_reason() {
             Some(reason) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
-            None => (
-                axum::http::StatusCode::FORBIDDEN,
-                "Write/modify/delete operations are temporarily disabled: strict maintenance mode is active.",
-            )
-                .into_response(),
+            None => (axum::http::StatusCode::FORBIDDEN, "Write/modify/delete operations are temporarily disabled: strict maintenance mode is active.").into_response(),
         },
-        MaintenanceAccessMode::Quiesced => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Write/modify/delete operations are temporarily disabled: scrub mode is active.",
-        )
-            .into_response(),
+        MaintenanceAccessMode::Quiesced => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Write/modify/delete operations are temporarily disabled: scrub mode is active.").into_response(),
     }
 }
-
 pub async fn enforce_quiesced_mode_on_reads(req: Request<Body>, next: Next) -> Response {
-    if matches!(req.method(), &Method::OPTIONS) {
+    if req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
-
     if current_maintenance_access_mode() == MaintenanceAccessMode::Quiesced {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -181,10 +193,8 @@ pub async fn enforce_quiesced_mode_on_reads(req: Request<Body>, next: Next) -> R
         )
             .into_response();
     }
-
     next.run(req).await
 }
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -282,7 +292,7 @@ mod tests {
         set_safety_read_only(Some("storage root is missing".into()));
         set_safety_read_only(None);
         assert!(auto_healing_fault_reason().is_some());
-        let status = crate::core::auto_healing::get_auto_healing_status().await;
+        let status = crate::core::auto_healing::status(&super::DEFAULT_GATE);
         assert!(!status.write_safe);
         assert_eq!(status.read_only_reason, auto_healing_fault_reason());
         let blocked = app

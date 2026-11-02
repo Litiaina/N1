@@ -12,6 +12,17 @@ pub const RESTORE_PENDING: &str = ".n1-restore-pending";
 const FORMAT: &[u8] = b"n1-instance-lease-v1\n";
 
 pub struct InstanceLease(Vec<File>);
+impl Drop for InstanceLease {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            // Release ownership explicitly; a descriptor inherited briefly by
+            // another fork must not prolong an ended maintenance lease.
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
 
 impl InstanceLease {
     pub fn acquire(roots: &[PathBuf], require_initialized: bool) -> io::Result<Self> {

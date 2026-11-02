@@ -1,252 +1,273 @@
-//! Payload preparation for a bounded, filesystem-synchronized small-object group.
-//!
-//! This module does not publish NDX or NCX, and does not acknowledge durability.
-//! The group owner must hold the upload/activity and namespace operation guards,
-//! open its filesystem holders before writing, and complete its persistence and
-//! metadata publication boundaries before reporting any strict success.
+//! Normal and batch uploads share inline framing and completion. Batch owns
+//! its writes and two filesystem barriers; there is no detached commit queue.
+use crate::core::io_scheduler::{DiskIoClass, IoProgress, acquire_disk_io};
+use crate::core::{
+    Error, Result,
+    storage_pool::Pool,
+    store::{FinalizedObject, ShardFile, Store, blocking, collect, joined, now},
+    upload::{persist_files, required, write_frames},
+};
+use n1_link::UploadPlan;
+use std::{collections::BTreeSet, sync::Arc};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::data_plane;
-use super::*;
-
-pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
-
-pub(crate) struct Plan {
-    manifest: UploadSessionManifest,
-    bytes: Bytes,
+struct Prepared {
+    plan: UploadPlan,
+    files: Vec<ShardFile>,
+    already_finalized: bool,
 }
+impl Store {
+    pub async fn put<R: AsyncRead + Unpin + Send + 'static>(
+        self: &Arc<Self>,
+        scope: [u8; 16],
+        ticket: String,
+        mut reader: R,
+    ) -> Result<FinalizedObject> {
+        let store = self.clone();
+        joined(self.activity.clone(), async move {
+            store.operation_gate.ensure_mutations_allowed()?;
+            let plan = store.inspect_upload(scope, &ticket)?;
+            single_part(plan)?;
+            let pool = store.pool(plan.identity)?;
+            let io = acquire_disk_io(
+                DiskIoClass::ForegroundWrite,
+                Some(&hex::encode(scope)),
+                "normal upload",
+            )
+            .await?;
+            let _admission = store.admit(&pool).await?;
+            let check = pool.clone();
+            blocking(move || check.writable()).await?;
+            let fp = plan.identity.fingerprint();
+            let lease = store.foreground(fp)?;
+            let _guard = lease.state().lifecycle.clone().write_owned().await;
+            let result = async {
+                let prepared = store
+                    .prepare_complete(scope, pool, plan, &mut reader, &io.progress_handle())
+                    .await?;
+                persist_files(&prepared.files).await?;
+                let _snapshot = store.snapshot_gate.clone().read_owned().await;
+                publish(&prepared, true).await?;
+                Ok(store.completed(scope, &prepared))
+            }
+            .await;
+            store.forget(fp);
+            if result.is_ok() {
+                io.complete();
+            }
+            result
+        })
+        .await
+    }
 
-impl Plan {
-    pub(crate) fn new(
-        fragment: &str,
-        physical_object_id: &str,
-        content_type: &str,
-        bytes: Bytes,
-    ) -> Result<Self, AppError> {
-        if bytes.len() > MAX_OBJECT_BYTES {
-            return Err(AppError::PayloadTooLarge(
-                "Small-object groups accept objects up to 1 MiB".into(),
+    /// Tickets and raw bodies use the same request order. Locks use fingerprint
+    /// order, preventing deadlocks between overlapping batches and single puts.
+    /// A batch is not an all-or-nothing multi-object transaction: on a lost or
+    /// failed reply clients resolve each immutable identity by retrying it.
+    pub async fn put_batch<R: AsyncRead + Unpin + Send + 'static>(
+        self: &Arc<Self>,
+        scope: [u8; 16],
+        tickets: Vec<String>,
+        mut reader: R,
+    ) -> Result<Vec<FinalizedObject>> {
+        let store = self.clone();
+        joined(self.activity.clone(), async move {
+            store.operation_gate.ensure_mutations_allowed()?;
+            let plans = store.batch_plans(scope, &tickets)?;
+            let largest = plans
+                .iter()
+                .map(|p| store.pool(p.identity))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max_by_key(|p| p.layout.width() * p.layout.block_bytes as usize)
+                .expect("nonempty batch");
+            let io = acquire_disk_io(
+                DiskIoClass::ForegroundWrite,
+                Some(&hex::encode(scope)),
+                "batch upload",
+            )
+            .await?;
+            let _admission = store.admit(&largest).await?;
+            let mut fingerprints = plans
+                .iter()
+                .map(|p| p.identity.fingerprint())
+                .collect::<Vec<_>>();
+            fingerprints.sort_unstable_by_key(|fp| fp.0);
+            let leases = fingerprints
+                .iter()
+                .map(|fp| store.foreground(*fp))
+                .collect::<Result<Vec<_>>>()?;
+            let mut guards = Vec::new();
+            for lease in &leases {
+                guards.push(lease.state().lifecycle.clone().write_owned().await);
+            }
+            let mut roots = BTreeSet::new();
+            let mut pools = Vec::new();
+            for plan in &plans {
+                let pool = store.pool(plan.identity)?;
+                for member in pool.members.iter().flatten() {
+                    roots.insert(member.path.clone());
+                }
+                pools.push(pool);
+            }
+            let check = pools.clone();
+            let roots = roots.into_iter().collect::<Vec<_>>();
+            // Open/pin barrier descriptors before any attached batch writes.
+            let group = Arc::new(
+                blocking(move || {
+                    for p in check {
+                        p.writable()?;
+                    }
+                    crate::core::linux_io::group::FilesystemGroup::open(&roots).map_err(Error::from)
+                })
+                .await?,
+            );
+            let result = async {
+                let mut prepared = Vec::with_capacity(plans.len());
+                for (plan, pool) in plans.iter().zip(pools) {
+                    let mut body = (&mut reader).take(plan.total_bytes);
+                    prepared.push(
+                        store
+                            .prepare_complete(scope, pool, *plan, &mut body, &io.progress_handle())
+                            .await?,
+                    );
+                }
+                let barrier = group.clone();
+                blocking(move || barrier.sync_all().map_err(Error::from)).await?;
+                // Publication workers are joined even if one member fails. A
+                // later group barrier is never skipped after publication starts.
+                let _snapshot = store.snapshot_gate.clone().read_owned().await;
+                let mut publication = None;
+                for object in &prepared {
+                    if let Err(e) = publish(object, false).await
+                        && publication.is_none()
+                    {
+                        publication = Some(e);
+                    }
+                }
+                let barrier = group.clone();
+                let persisted = blocking(move || barrier.sync_all().map_err(Error::from)).await;
+                if let Some(e) = publication {
+                    return Err(e);
+                }
+                persisted?;
+                Ok(prepared
+                    .iter()
+                    .map(|object| store.completed(scope, object))
+                    .collect())
+            }
+            .await;
+            for fp in fingerprints {
+                store.forget(fp);
+            }
+            drop(guards);
+            if result.is_ok() {
+                io.complete();
+            }
+            result
+        })
+        .await
+    }
+
+    pub fn batch_length(&self, scope: [u8; 16], tickets: &[String]) -> Result<u64> {
+        Ok(self
+            .batch_plans(scope, tickets)?
+            .iter()
+            .map(|p| p.total_bytes)
+            .sum())
+    }
+    fn batch_plans(&self, scope: [u8; 16], tickets: &[String]) -> Result<Vec<UploadPlan>> {
+        if tickets.is_empty() || tickets.len() > 256 {
+            return Err(Error::Invalid("batch requires 1..=256 tickets".into()));
+        }
+        let mut seen = BTreeSet::new();
+        let mut total = 0u64;
+        let mut descriptors = 0;
+        let plans = tickets
+            .iter()
+            .map(|ticket| {
+                let plan = self.inspect_upload(scope, ticket)?;
+                single_part(plan)?;
+                if !seen.insert(plan.identity.fingerprint().0) {
+                    return Err(Error::Invalid("duplicate identity in batch".into()));
+                }
+                total = total
+                    .checked_add(plan.total_bytes)
+                    .ok_or_else(|| Error::Invalid("batch length overflow".into()))?;
+                descriptors += self.pool(plan.identity)?.layout.width();
+                Ok(plan)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if total > n1_link::noa::MAX_BODY_BYTES || descriptors > 1024 {
+            return Err(Error::Invalid(
+                "batch exceeds byte or open-shard bound".into(),
             ));
         }
-        let object_key = crate::core::index_store::normalize_object_id(physical_object_id)?;
-        let version_id = Ulid::new().to_string();
-        let (data_shards, parity_shards, placement_roots) =
-            data_plane::upload_layout(fragment, &object_key, &version_id)?;
-        Ok(Self {
-            manifest: UploadSessionManifest {
-                fragment: fragment.to_owned(),
-                object_key,
-                version_id,
-                session_id: Ulid::new().to_string(),
-                total_size_bytes: bytes.len() as u64,
-                expected_parts: 1,
-                part_size_bytes: bytes.len() as u64,
-                content_type: content_type.to_owned(),
-                created_at: Utc::now().timestamp(),
-                stripe_size_bytes: data_plane::choose_upload_stripe_size_for_len(bytes.len() as u64),
-                data_shards: data_shards as u16,
-                parity_shards: parity_shards as u16,
-                placement_roots,
-                payload_staged: true,
-            },
-            bytes,
-        })
+        Ok(plans)
     }
-
-    pub(crate) fn roots(&self) -> Result<Vec<PathBuf>, AppError> {
-        let roots = self
-            .manifest
-            .placement_roots
-            .iter()
-            .map(|root| crate::core::storage_pool::resolve_address(root))
-            .collect::<Result<Vec<_>, _>>()?;
-        data_plane::ensure_registered_placement_roots(&roots)?;
-        Ok(roots)
-    }
-
-    /// Complete all payload writes and userspace buffer drains, but do not sync
-    /// individual files. The enclosing group supplies strict filesystem barriers.
-    pub(crate) async fn write(
+    async fn prepare_complete<R: AsyncRead + Unpin>(
         &self,
-        progress: Option<IoProgress>,
-    ) -> Result<ObjectMetadata, AppError> {
-        let manifest = &self.manifest;
-        let path_manager = ObjectPathManager::new();
-        let stream = futures_util::stream::iter([Ok::<_, AppError>(self.bytes.clone())]);
-        let result = data_plane::write_part_blob_to_disk_from_stream(
-            &path_manager,
-            &manifest.fragment,
-            &manifest.object_key,
-            &manifest.version_id,
-            0,
-            manifest.total_size_bytes,
-            usize::from(manifest.data_shards),
-            usize::from(manifest.parity_shards),
-            manifest.stripe_size_bytes,
-            Some(&manifest.placement_roots),
-            manifest.payload_staged,
-            stream,
-            None,
-            false,
-            progress.as_ref(),
-        )
-        .await;
-        let part = match result {
-            Ok(part) => part,
-            Err(error) => {
-                data_plane::cleanup_blob_version_dirs_for_version(
-                    &path_manager,
-                    &manifest.fragment,
-                    &manifest.object_key,
-                    &manifest.version_id,
-                )
-                .await;
-                return Err(error);
-            }
-        };
-        Ok(ObjectMetadata {
-            object_key: manifest.object_key.clone(),
-            fragment: manifest.fragment.clone(),
-            version_id: manifest.version_id.clone(),
-            upload_session_id: manifest.session_id.clone(),
-            owner_uid: manifest.fragment.clone(),
-            content_type: manifest.content_type.clone(),
-            total_size_bytes: manifest.total_size_bytes,
-            created_at: manifest.created_at,
-            data_shards: manifest.data_shards,
-            parity_shards: manifest.parity_shards,
-            placement_generation: 0,
-            parts: vec![part],
-            is_delete_marker: false,
-            stripe_size_bytes: manifest.stripe_size_bytes,
+        _scope: [u8; 16],
+        pool: Arc<Pool>,
+        plan: UploadPlan,
+        reader: &mut R,
+        progress: &IoProgress,
+    ) -> Result<Prepared> {
+        let fp = plan.identity.fingerprint();
+        let files = required(self.files(pool.clone(), plan, true).await?)?;
+        if !files.iter().all(|f| f.finalized) && now() >= plan.expires_at {
+            return Err(Error::Conflict("upload ticket has expired".into()));
+        }
+        if plan.total_bytes > 0 {
+            self.forget_part(fp, 0);
+            let root = write_frames(&pool, &files, plan, 0, reader, progress).await?;
+            self.remember_part(fp, plan, 0, root);
+        }
+        let already_finalized = self.seal_upload(&pool, plan, &files).await?;
+        Ok(Prepared {
+            plan,
+            files,
+            already_finalized,
         })
+    }
+    fn completed(&self, scope: [u8; 16], prepared: &Prepared) -> FinalizedObject {
+        FinalizedObject {
+            object_key: self
+                .signer
+                .object_key(&scope, prepared.plan.identity)
+                .as_str()
+                .into(),
+            already_finalized: prepared.already_finalized,
+            total_bytes: prepared.plan.total_bytes,
+        }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn oversized_groups_reject_before_looking_up_placement() {
-        assert!(matches!(
-            Plan::new(
-                "unused-fragment",
-                &crate::core::index_store::new_object_id(),
-                "application/octet-stream",
-                Bytes::from(vec![0; MAX_OBJECT_BYTES + 1]),
-            ),
-            Err(AppError::PayloadTooLarge(_))
-        ));
+fn single_part(plan: UploadPlan) -> Result<()> {
+    if plan.parts() > 1 {
+        Err(Error::Invalid(
+            "normal/batch upload requires a single-part ticket".into(),
+        ))
+    } else {
+        Ok(())
     }
-
-    #[tokio::test]
-    async fn grouped_payloads_keep_ec_layout_checksums_and_publish_no_metadata() {
-        let _test = crate::test_support::global_test_lock().lock().await;
-        use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT};
-
-        let base = std::env::temp_dir().join(format!("n1-small-batch-{}", Ulid::new()));
-        let roots = BLOB_STORE_DISKS
-            .get_or_init(|| {
-                (0..2)
-                    .map(|index| base.join(format!("member-{index}")).display().to_string())
-                    .collect()
-            })
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        for root in &roots {
-            std::fs::create_dir_all(root).unwrap();
-        }
-        let control = FS_STORAGE_ROOT.get_or_init(|| base.join("control").display().to_string());
-        crate::core::root_identity::reconcile_roots_for_test(
-            &Path::new(control).join(".n1/topology-roots.json"),
-            &roots,
-        )
-        .unwrap();
-
-        let fragment = Ulid::new().to_string();
-        for length in [0, 1, 4097, 64 * 1024, MAX_OBJECT_BYTES] {
-            let bytes = Bytes::from(
-                (0..length)
-                    .map(|offset| ((offset * 31 + 17) % 251) as u8)
-                    .collect::<Vec<_>>(),
-            );
-            let plan = Plan::new(
-                &fragment,
-                &crate::core::index_store::new_object_id(),
-                "application/octet-stream",
-                bytes.clone(),
-            )
-            .unwrap();
-            let planned_roots = plan.roots().unwrap();
-            let metadata = plan.write(None).await.unwrap();
-            assert_eq!(metadata.total_size_bytes, length as u64);
-            assert_eq!(metadata.parts.len(), 1);
-            assert_eq!(metadata.parts[0].part_index, 0);
-            assert_eq!(metadata.parts[0].size_bytes, length as u64);
-            assert!(metadata.parts[0].checksum.is_none());
-            assert_eq!(metadata.parts[0].shards.len(), planned_roots.len());
-            assert!(Ulid::from_string(&metadata.version_id).is_ok());
-            assert!(Ulid::from_string(&metadata.upload_session_id).is_ok());
-            let expected_len = data_plane::final_shard_len_for_part(
-                length as u64,
-                usize::from(metadata.data_shards),
-                metadata.stripe_size_bytes,
-            );
-            let mut pieces = Vec::new();
-            for (slot, shard) in metadata.parts[0].shards.iter().enumerate() {
-                let path =
-                    crate::core::storage_pool::resolve_address(&shard.absolute_path).unwrap();
-                assert!(path.starts_with(&planned_roots[slot]));
-                assert!(
-                    !path.exists(),
-                    "private payload must not be committed before group publication"
-                );
-                let staged = staging::payload_dir(
-                    &planned_roots[slot],
-                    &metadata.fragment,
-                    &metadata.object_key,
-                    &metadata.version_id,
-                )
-                .join(&shard.file_name);
-                assert_eq!(shard.shard_index, slot);
-                assert_eq!(shard.is_parity, slot >= usize::from(metadata.data_shards));
-                assert_eq!(shard.size_bytes, expected_len);
-                assert_eq!(
-                    shard.file_name,
-                    data_plane::stable_shard_name(0, slot, usize::from(metadata.data_shards))
-                );
-                let piece = std::fs::read(&staged).unwrap();
-                assert_eq!(piece.len() as u64, expected_len);
-                assert_eq!(shard.checksum, format!("{:08x}", crc32fast::hash(&piece)));
-                assert_eq!(
-                    std::fs::read_dir(staged.parent().unwrap()).unwrap().count(),
-                    1
-                );
-                let object_dir = path.parent().unwrap().parent().unwrap();
-                assert!(
-                    !object_dir.exists(),
-                    "payload preparation must not publish an object directory"
-                );
-                pieces.push(piece);
-            }
-            let stripe = metadata.stripe_size_bytes;
-            let mut restored = Vec::new();
-            for offset in (0..expected_len as usize).step_by(stripe) {
-                for piece in pieces.iter().take(usize::from(metadata.data_shards)) {
-                    restored.extend_from_slice(&piece[offset..offset + stripe]);
+}
+async fn publish(object: &Prepared, strict: bool) -> Result<()> {
+    let fp = object.plan.identity.fingerprint();
+    collect(
+        futures_util::future::join_all(object.files.iter().map(|file| {
+            let member = file.member.clone();
+            let shard = file.header.shard;
+            let finalized = file.finalized;
+            blocking(move || {
+                if !finalized {
+                    member.promote(fp, shard, strict)?;
+                } else if strict {
+                    member.persist_final_parent(fp)?;
                 }
-            }
-            restored.truncate(length);
-            assert_eq!(restored, bytes);
-        }
-        for root in &roots {
-            let fragment_root =
-                crate::core::fragment_identity::physical_fragment_root_on(root, &fragment);
-            assert!(!fragment_root.join(".namespace").exists());
-            if fragment_root.exists() {
-                std::fs::remove_dir_all(fragment_root).unwrap();
-            }
-        }
-    }
+                member.retire_empty_stage(fp, strict)
+            })
+        }))
+        .await,
+    )?;
+    Ok(())
 }

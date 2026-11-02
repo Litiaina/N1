@@ -1,650 +1,784 @@
-use super::format::{Kind, Root};
-use super::repository::Repository;
+//! RAM functional recovery tests; physical restore/replication/power-loss
+//! qualification remains separate. The enrollment bypass exists only in tests.
 use super::*;
-use crate::core::instance_lease::{InstanceLease, RESTORE_PENDING};
-use std::fs;
-use std::io::{BufReader, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use crate::core::{Error as StoreError, Store, storage_pool::Pool, tests::Fixture};
+use n1_link::Durability;
+use std::{path::PathBuf, sync::Arc};
+const SCOPE: [u8; 16] = [11; 16];
 
-#[test]
-fn mislabeled_v4_snapshot_recovers_authenticated_logical_membership_only() {
-    let f = Fixture::new();
-    let repo = f.repo("legacy-v4");
-    let pool = crate::core::storage_pool::StoragePool {
-        id: "A".into(),
-        generation: 1,
-        data_shards: 1,
-        parity_shards: 0,
-        roots: vec![f.root()],
-        members: Vec::new(),
-        legacy_roots: Vec::new(),
-        sealed: false,
-    };
-    fs::write(
-        f.root().join(".n1-pool.json"),
-        serde_json::to_vec(&pool).unwrap(),
-    )
-    .unwrap();
-    let mut snapshot = f.capture(&repo);
-    snapshot.engine_format = 3;
-    let encrypted = repo
-        .key
-        .seal(
-            &format!("{}:snapshot:{}", format::FORMAT, snapshot.id),
-            &serde_json::to_vec(&snapshot).unwrap(),
-        )
-        .unwrap();
-    fs::write(
-        repo.path
-            .join("snapshots")
-            .join(&snapshot.id)
-            .join("manifest"),
-        encrypted,
-    )
-    .unwrap();
-    let normalized = repo.snapshot(&snapshot.id).unwrap();
-    assert_eq!(normalized.engine_format, 4);
-    assert_eq!(normalized.roots[0].member.as_ref().unwrap().slot, 0);
-    assert_eq!(normalized.roots[0].member.as_ref().unwrap().pool_id, "A");
-    // No authenticated flat-pool evidence means no guessed legacy migration.
-    let old = f.repo("legacy-unsupported");
-    fs::remove_file(f.root().join(".n1-pool.json")).unwrap();
-    let mut snapshot = f.capture(&old);
-    snapshot.engine_format = 3;
-    let encrypted = old
-        .key
-        .seal(
-            &format!("{}:snapshot:{}", format::FORMAT, snapshot.id),
-            &serde_json::to_vec(&snapshot).unwrap(),
-        )
-        .unwrap();
-    fs::write(
-        old.path
-            .join("snapshots")
-            .join(&snapshot.id)
-            .join("manifest"),
-        encrypted,
-    )
-    .unwrap();
-    assert!(old.snapshot(&snapshot.id).is_err());
-}
-
-#[test]
-fn automatic_retention_authenticates_before_deleting_and_preserves_protected_point() {
-    let f = Fixture::new();
-    let repo = f.repo("retention");
-    fs::write(f.root().join("data"), b"first").unwrap();
-    let first = f.capture(&repo);
-    fs::write(f.root().join("data"), b"second").unwrap();
-    let second = f.capture(&repo);
-    let block = repo.block_path(&crypto::digest(b"second")).unwrap();
-    let original = fs::read(&block).unwrap();
-    fs::write(&block, b"corrupted").unwrap();
-    assert!(retention::prune(&repo, 1, &first.id).is_err());
-    assert_eq!(repo.list().unwrap().len(), 2);
-    fs::write(&block, original).unwrap();
-    assert!(retention::prune(&repo, 0, &first.id).is_err());
-    retention::prune(&repo, 1, &first.id).unwrap();
-    assert_eq!(repo.list().unwrap().len(), 1);
-    restore::verify(&repo, &repo.snapshot(&first.id).unwrap()).unwrap();
-    assert!(repo.snapshot(&second.id).is_err());
-}
-
-struct Fixture {
-    base: PathBuf,
-    key: PathBuf,
-    roots: Vec<Root>,
-}
-
-#[test]
-fn corrupt_source_replication_does_not_replace_last_verified_recovery_point() {
-    let f = Fixture::new();
-    let source = f.repo("source-repository");
-    let target = f.repo("target-repository");
-    fs::write(f.root().join("data"), b"first-good").unwrap();
-    let first = f.capture(&source);
-    transfer::local(&source, &first, &target).unwrap();
-    fs::write(f.root().join("data"), b"new-data").unwrap();
-    let second = f.capture(&source);
-    let block = source.block_path(&crypto::digest(b"new-data")).unwrap();
-    let healthy = fs::read(&block).unwrap();
-    fs::write(&block, &healthy[..healthy.len() / 2]).unwrap();
-    assert!(transfer::local(&source, &second, &target).is_err());
-    assert!(target.snapshot(&second.id).is_err());
-    assert_eq!(target.list().unwrap().len(), 1);
-    restore::verify(&target, &target.snapshot(&first.id).unwrap()).unwrap();
-    assert_eq!(fs::read(f.root().join("data")).unwrap(), b"new-data");
-    fs::write(&block, healthy).unwrap();
-    transfer::local(&source, &second, &target).unwrap();
-    transfer::local(&source, &second, &target).unwrap();
-    assert_eq!(target.list().unwrap().len(), 2);
-    restore::verify(&target, &target.snapshot(&second.id).unwrap()).unwrap();
-}
-
-#[test]
-fn wrong_key_and_corrupt_replica_never_become_verified_snapshots() {
-    let f = Fixture::new();
-    let source = f.repo("source-repository");
-    let target = f.repo("target-repository");
-    fs::write(f.root().join("data"), b"replicated").unwrap();
-    let snapshot = f.capture(&source);
-    let wrong_key = f.base.join("wrong-key");
-    crypto::create_key(&wrong_key).unwrap();
-    let error = Repository::open(&source.path, &wrong_key, false)
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains("key") && !error.contains("busy"));
-    let hash = crypto::digest(b"replicated");
-    let conflicting = target.block_path(&hash).unwrap();
-    fs::create_dir_all(conflicting.parent().unwrap()).unwrap();
-    fs::write(&conflicting, b"corrupt-replica").unwrap();
-    assert!(transfer::local(&source, &snapshot, &target).is_err());
-    assert!(target.snapshot(&snapshot.id).is_err());
-    assert_eq!(fs::read(&conflicting).unwrap(), b"corrupt-replica");
-    restore::verify(&source, &snapshot).unwrap();
-}
-impl Fixture {
-    fn capture(&self, repo: &Repository) -> super::format::Snapshot {
-        self.capture_with_workers(repo, 1)
-    }
-    fn capture_with_workers(&self, repo: &Repository, workers: usize) -> super::format::Snapshot {
-        // A parallel test's fork can briefly inherit this fixture's CLOEXEC
-        // lease before exec. Only positive fresh-fixture acquisition waits;
-        // active-engine/overlap rejection tests still call capture directly.
-        for attempt in 0..100 {
-            match capture::create(repo, self.roots.clone(), workers) {
-                Ok(snapshot) => return snapshot,
-                Err(error)
-                    if attempt < 99
-                        && error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("fresh fixture capture: {error}"),
-            }
-        }
-        unreachable!()
-    }
-    fn new() -> Self {
-        let base = std::env::temp_dir().join(format!("n1-backup-tests-{}", ulid::Ulid::new()));
-        fs::create_dir(&base).unwrap();
-        let key = base.join("key");
-        crypto::create_key(&key).unwrap();
-        let root = base.join("source");
-        fs::create_dir(&root).unwrap();
-        drop(InstanceLease::engine(std::slice::from_ref(&root)).unwrap());
-        Self {
-            key,
-            base,
-            roots: vec![Root {
-                path: root.to_str().unwrap().to_owned(),
-                index: true,
-                blob: true,
-                member: None,
-                legacy_path: None,
-            }],
-        }
-    }
-    fn root(&self) -> PathBuf {
-        PathBuf::from(&self.roots[0].path)
-    }
-    fn repo(&self, name: &str) -> Repository {
-        let path = self.base.join(name);
-        Repository::initialize(&path, &self.key).unwrap();
-        Repository::open(&path, &self.key, true).unwrap()
-    }
-    fn target(&self, name: &str) -> Vec<Root> {
-        let root = self.base.join(name);
-        fs::create_dir(&root).unwrap();
-        vec![Root {
-            path: root.to_str().unwrap().to_owned(),
-            index: true,
-            blob: true,
-            member: None,
-            legacy_path: None,
-        }]
-    }
-    fn data(&self) -> Vec<u8> {
-        let bytes = (0..format::BLOCK_BYTES + 137)
-            .map(|i| (i.wrapping_mul(17) % 251) as u8)
-            .collect::<Vec<_>>();
-        fs::create_dir_all(self.root().join("@f_test/docs/empty")).unwrap();
-        fs::create_dir_all(self.root().join(".fragment")).unwrap();
-        fs::write(self.root().join("payload"), &bytes).unwrap();
-        fs::write(self.root().join("empty-file"), []).unwrap();
-        symlink("@o_test", self.root().join("@f_test/docs/图片.mp4")).unwrap();
-        symlink("../@f_test", self.root().join(".fragment/alias")).unwrap();
-        bytes
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.base);
-    }
-}
-
-#[test]
-fn encrypted_capture_restore_preserves_bytes_links_and_empty_directories() {
-    let f = Fixture::new();
-    let bytes = f.data();
-    let repo = f.repo("repo");
-    let snapshot = f.capture_with_workers(&repo, 4);
-    restore::verify(&repo, &snapshot).unwrap();
-    let target = f.target("target");
-    restore::restore(&repo, &snapshot, target.clone(), false).unwrap();
-    let root = PathBuf::from(&target[0].path);
-    assert_eq!(fs::read(root.join("payload")).unwrap(), bytes);
-    assert!(root.join("@f_test/docs/empty").is_dir());
-    assert_eq!(
-        fs::read_link(root.join("@f_test/docs/图片.mp4")).unwrap(),
-        PathBuf::from("@o_test")
-    );
-    assert_eq!(
-        fs::read_link(root.join(".fragment/alias")).unwrap(),
-        PathBuf::from("../@f_test")
-    );
-    assert_eq!(fs::metadata(root.join("empty-file")).unwrap().len(), 0);
-    drop(InstanceLease::engine(&[root]).unwrap());
-    assert!(restore::restore(&repo, &snapshot, target.clone(), false).is_err());
-    assert!(restore::restore(&repo, &snapshot, target, true).is_err());
-    let hash = crypto::digest(&bytes[..format::BLOCK_BYTES]);
-    assert_ne!(
-        fs::read(repo.block_path(&hash).unwrap()).unwrap(),
-        bytes[..format::BLOCK_BYTES]
-    );
-}
-
-#[test]
-fn capture_refuses_active_uninitialized_or_incomplete_engine() {
-    let f = Fixture::new();
-    let repo = f.repo("repo");
-    let lease = InstanceLease::engine(&[f.root()]).unwrap();
-    assert!(capture::create(&repo, f.roots.clone(), 2).is_err());
-    drop(lease);
-    fs::write(f.root().join(RESTORE_PENDING), b"incomplete").unwrap();
-    assert!(InstanceLease::engine(&[f.root()]).is_err());
-    assert!(capture::create(&repo, f.roots.clone(), 2).is_err());
-    fs::remove_file(f.root().join(RESTORE_PENDING)).unwrap();
-    fs::remove_file(f.root().join(crate::core::instance_lease::LEASE_FILE)).unwrap();
-    assert!(capture::create(&repo, f.roots.clone(), 2).is_err());
-}
-
-#[test]
-fn wrong_key_tampering_and_truncation_fail_before_restore() {
-    let f = Fixture::new();
-    let bytes = f.data();
-    let repo = f.repo("repo");
-    let snapshot = f.capture_with_workers(&repo, 2);
-    let wrong = f.base.join("wrong-key");
-    crypto::create_key(&wrong).unwrap();
-    assert!(Repository::open(&repo.path, &wrong, false).is_err());
-    let hash = crypto::digest(&bytes[..format::BLOCK_BYTES]);
-    let path = repo.block_path(&hash).unwrap();
-    let original = fs::read(&path).unwrap();
-    let mut damaged = original.clone();
-    damaged[40] ^= 1;
-    fs::write(&path, &damaged).unwrap();
-    let target = f.target("target");
-    assert!(restore::restore(&repo, &snapshot, target.clone(), false).is_err());
-    assert_eq!(fs::read_dir(&target[0].path).unwrap().count(), 0);
-    fs::write(&path, &original[..7]).unwrap();
-    assert!(restore::verify(&repo, &snapshot).is_err());
-    fs::write(&path, &original).unwrap();
-    restore::verify(&repo, &snapshot).unwrap();
-}
-
-#[test]
-fn replica_is_verified_idempotent_incremental_and_retained() {
-    let f = Fixture::new();
-    f.data();
-    let repo = f.repo("repo");
-    let replica = f.repo("replica");
-    let first = f.capture_with_workers(&repo, 2);
-    transfer::local(&repo, &first, &replica).unwrap();
-    let before = walkdir::WalkDir::new(replica.path.join("blocks"))
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .count();
-    transfer::local(&repo, &first, &replica).unwrap();
-    let after = walkdir::WalkDir::new(replica.path.join("blocks"))
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .count();
-    assert_eq!(before, after);
-    fs::write(f.root().join("new"), b"second recovery point").unwrap();
-    let second = f.capture_with_workers(&repo, 4);
-    transfer::local(&repo, &second, &replica).unwrap();
-    assert_eq!(replica.list().unwrap().len(), 2);
-    retention::forget(&repo, &first.id).unwrap();
-    retention::gc(&repo, true).unwrap();
-    restore::verify(&repo, &second).unwrap();
-    restore::verify(&replica, &first).unwrap();
-    assert!(retention::forget(&repo, &second.id).is_err());
-    let target = f.target("target");
-    restore::restore(&replica, &first, target.clone(), false).unwrap();
-    assert!(!PathBuf::from(&target[0].path).join("new").exists());
-}
-
-#[test]
-fn interrupted_transfer_is_never_published_and_retry_reuses_blocks() {
-    let f = Fixture::new();
-    f.data();
-    let repo = f.repo("repo");
-    let replica = f.repo("replica");
-    let snapshot = f.capture_with_workers(&repo, 2);
-    let begin = serde_json::json!({"message":"Begin","snapshot":snapshot,"key_id":repo.key.id});
-    let mut bytes = serde_json::to_vec(&begin).unwrap();
-    bytes.push(b'\n');
-    assert!(
-        transfer::receive(
-            &replica,
-            &mut BufReader::new(bytes.as_slice()),
-            &mut Vec::new()
-        )
-        .is_err()
-    );
-    assert!(replica.list().unwrap().is_empty());
-    transfer::local(&repo, &snapshot, &replica).unwrap();
-    retention::gc(&replica, true).unwrap();
-    restore::verify(&replica, &snapshot).unwrap();
-}
-
-#[test]
-fn worker_error_does_not_deadlock_a_full_capture_queue() {
-    let f = Fixture::new();
-    let repo = f.repo("repo");
-    for i in 0..200 {
-        symlink("/etc/passwd", f.root().join(format!("bad-{i}"))).unwrap();
-    }
-    let start = std::time::Instant::now();
-    assert!(capture::create(&repo, f.roots.clone(), 1).is_err());
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
-    assert!(repo.list().unwrap().is_empty());
-}
-
-#[test]
-fn paths_permissions_repository_overlap_and_pending_intents_are_rejected() {
-    for path in ["../etc", "/etc", "a/../b", "a/./b", "a//b", "", "a\0b"] {
-        assert!(super::fs::safe_relative(path).is_err());
-    }
-    let f = Fixture::new();
-    let repo = f.repo("repo");
-    fs::set_permissions(&f.key, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(Repository::open(&repo.path, &f.key, false).is_err());
-    fs::set_permissions(&f.key, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::create_dir_all(f.root().join("@f_test/.intents")).unwrap();
-    fs::write(f.root().join("@f_test/.intents/pending.ndx"), b"intent").unwrap();
-    assert!(capture::create(&repo, f.roots.clone(), 2).is_err());
-    let inside = f.root().join("backup");
-    Repository::initialize(&inside, &f.key).unwrap();
-    let inside = Repository::open(&inside, &f.key, true).unwrap();
-    assert!(capture::create(&inside, f.roots.clone(), 2).is_err());
-}
-
-#[test]
-fn interrupted_restore_is_fenced_resumable_and_refuses_foreign_files() {
-    let f = Fixture::new();
-    let bytes = f.data();
-    let repo = f.repo("repo");
-    let snapshot = f.capture_with_workers(&repo, 2);
-    let target = f.target("target");
-    let paths = vec![PathBuf::from(&target[0].path)];
-    let marker =
-        serde_json::to_vec(&(snapshot.id.as_str(), repo.key.id.as_str(), &target)).unwrap();
-    drop(InstanceLease::acquire(&paths, false).unwrap());
-    restore_guard::prepare(&paths, &marker, false).unwrap();
-    fs::write(paths[0].join("payload"), &bytes).unwrap();
-    fs::write(
-        paths[0]
-            .join(restore_guard::WORK)
-            .join(format!("temporary-{}", ulid::Ulid::new())),
-        b"partial",
-    )
-    .unwrap();
-    fs::write(paths[0].join("foreign"), b"do not delete").unwrap();
-    assert!(restore::restore(&repo, &snapshot, target.clone(), true).is_err());
-    assert_eq!(
-        fs::read(paths[0].join("foreign")).unwrap(),
-        b"do not delete"
-    );
-    assert!(InstanceLease::engine(&paths).is_err());
-    fs::remove_file(paths[0].join("foreign")).unwrap();
-    restore::restore(&repo, &snapshot, target, true).unwrap();
-    assert_eq!(fs::read(paths[0].join("payload")).unwrap(), bytes);
-    drop(InstanceLease::engine(&paths).unwrap());
-}
-
-#[test]
-fn metadata_restore_remaps_paths_and_rejects_shard_colocation() {
-    use crate::core::disk_manager::{PartMetadata, ShardInfo};
-    let f = Fixture::new();
-    let target = f.target("target");
-    let shard = ShardInfo {
-        shard_index: 0,
-        file_name: "data".to_owned(),
-        absolute_path: f.root().join("data").to_str().unwrap().to_owned(),
-        size_bytes: 1,
-        checksum: "123".to_owned(),
-        is_parity: false,
-    };
-    let part = PartMetadata {
-        part_index: 0,
-        size_bytes: 1,
-        created_at: 1,
-        shards: vec![shard.clone()],
-        checksum: None,
-    };
-    let bytes = metadata::remap(
-        "@f_f/.uploads/session/part_0.ndx",
-        rmp_serde::to_vec(&part).unwrap(),
-        &f.roots,
-        &target,
-    )
-    .unwrap();
-    let mapped: PartMetadata = rmp_serde::from_slice(&bytes).unwrap();
-    assert_eq!(
-        mapped.shards[0].absolute_path,
-        format!("{}/data", target[0].path)
-    );
-    let mut bad = part;
-    bad.shards.push(shard);
-    assert!(
-        metadata::remap(
-            ".uploads/session/part_0.ndx",
-            rmp_serde::to_vec(&bad).unwrap(),
-            &f.roots,
-            &target
-        )
-        .is_err()
-    );
-    assert!(metadata::remap_path("/outside/data", &f.roots, &target).is_err());
-}
-
-#[test]
-fn missing_or_foreign_pins_never_reclaim_a_completed_snapshot() {
-    let f = Fixture::new();
-    let bytes = f.data();
-    let repo = f.repo("repo");
-    let snapshot = f.capture_with_workers(&repo, 2);
-    let hash = crypto::digest(&bytes[..format::BLOCK_BYTES]);
-    let pin = repo
-        .path
-        .join("snapshots")
-        .join(&snapshot.id)
-        .join("blocks")
-        .join(&hash[..2])
-        .join(&hash);
-    fs::remove_file(&pin).unwrap();
-    retention::gc(&repo, true).unwrap();
-    restore::verify(&repo, &snapshot).unwrap();
-    fs::remove_file(&pin).unwrap();
-    fs::File::create(&pin)
-        .unwrap()
-        .write_all(b"foreign")
-        .unwrap();
-    assert!(retention::gc(&repo, true).is_err());
-    restore::verify(&repo, &snapshot).unwrap();
-}
-
-#[test]
-fn portable_backup_keeps_logical_addresses_and_converts_original_prefixes() {
-    use crate::core::backup::format::Member;
-    use crate::core::disk_manager::{PartMetadata, ShardInfo};
-    let f = Fixture::new();
-    let mut source = f.roots.clone();
-    let mut target = f.target("portable-target");
-    let member = Member {
-        pool_id: "A".into(),
-        generation: 1,
-        data_shards: 1,
-        parity_shards: 0,
-        slot: 0,
-    };
-    source[0].member = Some(member.clone());
-    target[0].member = Some(member);
-    source[0].legacy_path = Some("/original/member".into());
-    let logical = "n1://A/1/0/@f_f/.objects/a/b/@o_o/v/piece";
-    assert_eq!(
-        metadata::remap_path(logical, &source, &target).unwrap(),
-        logical
-    );
-    assert_eq!(
-        metadata::remap_path(
-            "/original/member/@f_f/.objects/a/b/@o_o/v/piece",
-            &source,
-            &target
-        )
-        .unwrap(),
-        logical
-    );
-    let part = PartMetadata {
-        part_index: 0,
-        size_bytes: 1,
-        created_at: 0,
-        checksum: None,
-        shards: vec![ShardInfo {
-            shard_index: 0,
-            file_name: "piece".into(),
-            absolute_path: logical.into(),
-            size_bytes: 1,
-            checksum: "00000000".into(),
-            is_parity: false,
+#[tokio::test]
+async fn encrypted_service_identity_survives_replication_gc_and_portable_restore() {
+    use crate::settings::config::{Config, ConfiguredPool, Fragment};
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use n1_link::{PoolId, noa::Permissions};
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let config = Config {
+        format: crate::settings::config::CONFIG_FORMAT.into(),
+        native_address: "127.0.0.1:19001".parse().unwrap(),
+        http_address: None,
+        signing_key_file: fixture.base.join("source-signing-key"),
+        state_dir: None,
+        max_connections: 16,
+        max_operations: 16,
+        operation_memory_bytes: 256 * 1024 * 1024,
+        read_repair: true,
+        concurrency: Default::default(),
+        rate_limits: Default::default(),
+        repositories: Default::default(),
+        maintenance: Default::default(),
+        tls: None,
+        pools: vec![ConfiguredPool {
+            layout: fixture.layout.clone(),
+            members: store.pools[0].members[0]
+                .as_ref()
+                .unwrap()
+                .marker
+                .members
+                .clone(),
+            roots: fixture.paths.clone(),
+            sealed: false,
+        }],
+        fragments: vec![Fragment {
+            id: PoolId(SCOPE),
+            alias: "test".into(),
+            secret_hash: Argon2::default()
+                .hash_password(b"test-secret", &SaltString::encode_b64(&[3; 16]).unwrap())
+                .unwrap()
+                .to_string(),
+            permissions: Permissions::all(),
+            operator: true,
         }],
     };
-    let bytes = rmp_serde::to_vec(&part).unwrap();
-    assert_eq!(
-        metadata::remap(".uploads/u/part_0.ndx", bytes.clone(), &source, &target).unwrap(),
-        bytes
+    assert!(
+        store
+            .configure_recovery_control(config.clone(), [18; 32])
+            .is_err()
     );
-    for bad in [
-        "n1://A/1/1/piece",
-        "n1://A/2/0/piece",
-        "n1://B/1/0/piece",
-        "n1://A/1/0/../../escape",
-    ] {
-        assert!(metadata::remap_path(bad, &source, &target).is_err());
-    }
-}
-
-#[test]
-fn malformed_manifest_counts_and_duplicate_paths_fail_closed() {
-    let f = Fixture::new();
-    f.data();
-    let repo = f.repo("repo");
-    let mut snapshot = f.capture_with_workers(&repo, 2);
-    snapshot.records += 1;
-    assert!(restore::verify(&repo, &snapshot).is_err());
-    snapshot.records -= 1;
-    snapshot.source_bytes += 1;
-    assert!(restore::verify(&repo, &snapshot).is_err());
-    let pending = repo.pending(&ulid::Ulid::new().to_string()).unwrap();
-    let mut writer = repository::ManifestWriter::new(&repo, pending);
-    let record = format::Record {
-        root: 0,
-        path: "duplicate".to_owned(),
-        modified_seconds: 1,
-        modified_nanos: 0,
-        kind: Kind::Directory,
-    };
-    writer.record(&record).unwrap();
-    writer.record(&record).unwrap();
-    writer.finish().unwrap();
-    snapshot.manifest = writer.blocks;
-    snapshot.records = 2;
-    snapshot.source_bytes = 0;
-    let target = f.target("target");
-    assert!(restore::restore(&repo, &snapshot, target.clone(), false).is_err());
-    assert!(InstanceLease::engine(&[PathBuf::from(&target[0].path)]).is_err());
-}
-
-#[test]
-fn partial_multi_root_restore_fences_can_resume_before_and_after_completion() {
-    let mut f = Fixture::new();
-    f.data();
-    let second = f.base.join("source2");
-    fs::create_dir(&second).unwrap();
-    fs::write(second.join("other"), b"second root bytes").unwrap();
-    drop(InstanceLease::engine(std::slice::from_ref(&second)).unwrap());
-    f.roots.push(Root {
-        path: second.to_str().unwrap().to_owned(),
-        index: true,
-        blob: true,
-        member: None,
-        legacy_path: None,
-    });
-    let repo = f.repo("repo");
-    let snapshot = f.capture_with_workers(&repo, 2);
-    let mut target = f.target("target");
-    target.extend(f.target("target2"));
-    let paths = target
-        .iter()
-        .map(|r| PathBuf::from(&r.path))
-        .collect::<Vec<_>>();
-    drop(InstanceLease::acquire(&paths, false).unwrap());
-    let marker =
-        serde_json::to_vec(&(snapshot.id.as_str(), repo.key.id.as_str(), &target)).unwrap();
-    super::fs::atomic_new(&paths[0].join(RESTORE_PENDING), &marker).unwrap();
-    assert!(InstanceLease::engine(&paths).is_err());
-    restore::restore(&repo, &snapshot, target.clone(), true).unwrap();
+    store.configure_recovery_control(config, [17; 32]).unwrap();
+    let live = put(&store, vec![97; 12345]).await;
+    let retired = put(&store, vec![98; 23456]).await;
+    store
+        .delete(SCOPE, retired.object_key.clone())
+        .await
+        .unwrap();
+    let source = repository(&fixture, "control-source");
+    let point = capture::offline(&source, &store).unwrap();
+    assert!(point.service_control.is_some());
+    let descriptor = serde_json::to_string(&point).unwrap();
+    assert!(!descriptor.contains("secret_hash"));
+    assert!(!descriptor.contains("signing_key"));
+    source.verify(&point).unwrap();
+    let target = repository(&fixture, "control-replica");
+    assert_ne!(source.key.id, target.key.id);
+    transfer::replicate(&source, &target, &point.id).unwrap();
+    retention::gc(&target, true).unwrap();
+    let replica = target.snapshot(&point.id).unwrap();
+    target.verify(&replica).unwrap();
+    let roots = targets(&fixture, "control-restored");
+    restore::restore_fixture(&target, &replica, &roots).unwrap();
+    let directory = fixture.base.join("recovered-service");
+    std::fs::create_dir(&directory).unwrap();
+    let output = directory.join("n1_config.json");
+    control::restore(&target, &replica, &output, &roots).unwrap();
+    control::restore(&target, &replica, &output, &roots).unwrap();
+    let config = Config::load(&output).unwrap();
+    assert_eq!(config.signing_secret().unwrap(), [17; 32]);
     assert_eq!(
-        fs::read(paths[1].join("other")).unwrap(),
-        b"second root bytes"
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o600
     );
-    // Crash while clearing fences: one root completed, another still fenced.
-    super::fs::atomic_new(&paths[1].join(RESTORE_PENDING), &marker).unwrap();
-    assert!(InstanceLease::engine(&paths).is_err());
-    restore::restore(&repo, &snapshot, target, true).unwrap();
-    drop(InstanceLease::engine(&paths).unwrap());
-}
-
-#[test]
-fn oversized_internal_metadata_is_rejected_before_snapshot_publication() {
-    let f = Fixture::new();
-    let repo = f.repo("repo");
-    let directory = f.root().join("@f_test/.objects/aa/bb/@o_test");
-    fs::create_dir_all(&directory).unwrap();
-    let file = fs::File::create(directory.join("version.ndx")).unwrap();
-    file.set_len(format::MAX_METADATA_BYTES as u64 + 1).unwrap();
-    assert!(capture::create(&repo, f.roots.clone(), 2).is_err());
-    assert!(repo.list().unwrap().is_empty());
-}
-
-#[test]
-fn unsupported_timestamps_never_become_completed_snapshots() {
-    let f = Fixture::new();
-    let repo = f.repo("repo");
-    let file = fs::File::create(f.root().join("bad-time")).unwrap();
-    file.set_times(
-        fs::FileTimes::new()
-            .set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+    assert_eq!(config.fragments[0].id, PoolId(SCOPE));
+    let recovered = Store::new(
+        vec![Pool::reopen_fixture(config.pools[0].layout.clone(), &config.pools[0].roots).unwrap()],
+        config.signing_secret().unwrap(),
+        16,
     )
     .unwrap();
-    assert!(capture::create(&repo, f.roots.clone(), 2).is_err());
+    let blocked = directory.join("already-serving.json");
+    assert!(control::restore(&target, &replica, &blocked, &roots).is_err());
+    assert!(!blocked.exists());
+    assert!(!blocked.with_extension("signing-key").exists());
+    assert_eq!(
+        recovered
+            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![97; 12345]
+    );
+    assert!(matches!(
+        recovered.stat(SCOPE, retired.object_key).await,
+        Err(StoreError::Retired)
+    ));
+    assert!(matches!(
+        recovered
+            .write_part(
+                SCOPE,
+                retired.upload_key,
+                0,
+                std::io::Cursor::new(vec![98; 12288])
+            )
+            .await,
+        Err(StoreError::Retired)
+    ));
+    std::fs::write(&output, b"operator edits must survive").unwrap();
+    assert!(control::restore(&target, &replica, &output, &roots).is_err());
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        b"operator edits must survive"
+    );
+}
+fn repository(fixture: &Fixture, name: &str) -> repository::Repository {
+    let key = fixture.base.join(format!("{name}.key"));
+    create_key(&key).unwrap();
+    let path = fixture.base.join(name);
+    repository::Repository::initialize(&path, &key).unwrap();
+    repository::Repository::open(&path, &key, true).unwrap()
+}
+fn targets(fixture: &Fixture, prefix: &str) -> Vec<PathBuf> {
+    (0..4)
+        .map(|i| {
+            let path = fixture.base.join(format!("{prefix}-{i}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect()
+}
+async fn put(store: &Arc<Store>, data: Vec<u8>) -> crate::core::InitializedUpload {
+    let part = (data.len() as u64).max(1).div_ceil(12288) * 12288;
+    let init = store
+        .init(SCOPE, 0, data.len() as u64, part, Durability::Durable, 3600)
+        .unwrap();
+    store
+        .put(SCOPE, init.upload_key.clone(), std::io::Cursor::new(data))
+        .await
+        .unwrap();
+    init
+}
+#[tokio::test]
+async fn encrypted_incremental_portable_restore_preserves_live_and_permanently_retired_keys() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "repository");
+    let data = (0..(13usize * 1024 * 1024 + 13))
+        .map(|n| (n * 197 % 251) as u8)
+        .collect::<Vec<_>>();
+    let live = put(&store, data.clone()).await;
+    let deleted = put(&store, vec![31; 9000]).await;
+    store
+        .delete(SCOPE, deleted.object_key.clone())
+        .await
+        .unwrap();
+    let first = capture::offline(&repo, &store).unwrap();
+    repo.verify(&first).unwrap();
+    let count = walkdir::WalkDir::new(repo.path.join("blocks"))
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count();
+    let second = capture::offline(&repo, &store).unwrap();
+    repo.verify(&second).unwrap();
+    assert_ne!(first.id, second.id);
+    let count2 = walkdir::WalkDir::new(repo.path.join("blocks"))
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count();
+    assert_eq!(
+        count, count2,
+        "identical payload and manifest blocks are reused"
+    );
+    let paths = targets(&fixture, "restore");
+    restore::restore_fixture(&repo, &second, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    restored.configure_read_repair(false);
+    assert_eq!(
+        restored
+            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        data
+    );
+    assert!(matches!(
+        restored.stat(SCOPE, deleted.object_key).await,
+        Err(StoreError::Retired)
+    ));
+    assert!(matches!(
+        restored.finalize(SCOPE, deleted.upload_key).await,
+        Err(StoreError::Retired)
+    ));
+    retention::prune(&repo, 1, &second.id).unwrap();
+    assert_eq!(repo.list().unwrap().len(), 1);
+    repo.verify(&second).unwrap();
+}
+#[tokio::test]
+async fn offline_recovery_preserves_durable_multipart_holes_and_status_without_receipts() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "repository");
+    let data = (0..30000)
+        .map(|n| (n * 197 % 251) as u8)
+        .collect::<Vec<_>>();
+    let init = store
+        .init(
+            SCOPE,
+            0,
+            data.len() as u64,
+            12288,
+            Durability::Durable,
+            3600,
+        )
+        .unwrap();
+    for index in [0, 2] {
+        let start = index * 12288;
+        let end = (start + 12288).min(data.len());
+        store
+            .write_part(
+                SCOPE,
+                init.upload_key.clone(),
+                index as u64,
+                std::io::Cursor::new(data[start..end].to_vec()),
+            )
+            .await
+            .unwrap();
+    }
+    let point = capture::offline(&repo, &store).unwrap();
+    repo.verify(&point).unwrap();
+    let paths = targets(&fixture, "resume");
+    restore::restore_fixture(&repo, &point, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+            .await
+            .unwrap()
+            .missing_parts,
+        vec![1]
+    );
+    restored
+        .write_part(
+            SCOPE,
+            init.upload_key.clone(),
+            1,
+            std::io::Cursor::new(data[12288..24576].to_vec()),
+        )
+        .await
+        .unwrap();
+    restored.finalize(SCOPE, init.upload_key).await.unwrap();
+    assert_eq!(
+        restored
+            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        data
+    );
+}
+#[tokio::test]
+async fn replication_reencrypts_reuses_blocks_and_detects_corruption_before_clearing_restore_fences()
+ {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let source = repository(&fixture, "source");
+    let destination = repository(&fixture, "destination");
+    let live = put(&store, vec![99; 50000]).await;
+    let point = capture::offline(&source, &store).unwrap();
+    transfer::replicate(&source, &destination, &point.id).unwrap();
+    transfer::replicate(&source, &destination, &point.id).unwrap();
+    destination
+        .verify(&destination.snapshot(&point.id).unwrap())
+        .unwrap();
+    let path = destination
+        .path
+        .join("blocks")
+        .join(&point.manifest[0][..2])
+        .join(&point.manifest[0]);
+    let mut damaged = std::fs::read(&path).unwrap();
+    damaged[0] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    assert!(destination.verify(&point).is_err());
+    let paths = targets(&fixture, "fenced");
+    assert!(restore::restore_fixture(&destination, &point, &paths).is_err());
+    for path in &paths {
+        assert!(path.join(restore::RESTORE_FENCE).is_file());
+    }
+    assert!(Pool::reopen_fixture(fixture.layout.clone(), &paths).is_err());
+    assert!(source.verify(&point).is_ok());
+    assert_eq!(
+        store
+            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![99; 50000]
+    );
+}
+#[tokio::test]
+async fn corrupted_live_shards_and_missing_markers_do_not_become_valid_recovery_points() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "repository");
+    let init = put(&store, vec![9; 9000]).await;
+    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let fp = plan.identity.fingerprint();
+    let pool = &store.pools[0];
+    let path = pool.holder(fp, 0).unwrap().path.join(fp.shard_path(0));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[128 + 96 + 3] ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    assert!(capture::offline(&repo, &store).is_err());
     assert!(repo.list().unwrap().is_empty());
+    let empty = capture::descriptors(&store.pools, "offline_all").unwrap();
+    assert!(repo.verify(&empty).is_err());
+}
+
+#[tokio::test]
+async fn online_capture_pins_live_and_terminal_files_excludes_private_uploads_and_releases_publication_gate()
+ {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "online");
+    let path = repo.path.clone();
+    drop(repo);
+    let live = put(&store, vec![7; 50000]).await;
+    let deleted = put(&store, vec![8; 9000]).await;
+    store
+        .delete(SCOPE, deleted.object_key.clone())
+        .await
+        .unwrap();
+    let unfinished = store
+        .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
+        .unwrap();
+    store
+        .write_part(
+            SCOPE,
+            unfinished.upload_key.clone(),
+            0,
+            std::io::Cursor::new(vec![9; 12288]),
+        )
+        .await
+        .unwrap();
+    let point = store
+        .snapshot_online(path.clone(), fixture.base.join("online.key"), 30)
+        .await
+        .unwrap();
+    assert_eq!(point.capture_mode, "online_committed");
+    let repo =
+        repository::Repository::open(&path, &fixture.base.join("online.key"), false).unwrap();
+    repo.verify(&point).unwrap();
+    let paths = targets(&fixture, "online-restore");
+    restore::restore_fixture(&repo, &point, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![7; 50000]
+    );
+    assert!(matches!(
+        restored.stat(SCOPE, deleted.object_key).await,
+        Err(StoreError::Retired)
+    ));
+    assert!(matches!(
+        restored
+            .upload_status(SCOPE, unfinished.upload_key.clone(), 0, 100)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    store.finalize(SCOPE, unfinished.upload_key).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_online_capture_never_publishes_a_partial_point_or_retains_a_member_lease() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "cancelled");
+    let path = repo.path.clone();
+    drop(repo);
+    put(&store, vec![42; 50000]).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let error = store
+        .snapshot_online_controlled(path.clone(), fixture.base.join("cancelled.key"), 30, cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    let repo =
+        repository::Repository::open(&path, &fixture.base.join("cancelled.key"), true).unwrap();
+    assert!(repo.list().unwrap().is_empty());
+    drop(repo);
+    store
+        .snapshot_online(path, fixture.base.join("cancelled.key"), 30)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failed_restore_resumes_only_with_the_same_owned_point_and_preserves_terminal_state() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "repository");
+    let live = put(&store, vec![61; 50000]).await;
+    let dead = put(&store, vec![62; 2000]).await;
+    store.delete(SCOPE, dead.object_key.clone()).await.unwrap();
+    let point = capture::offline(&repo, &store).unwrap();
+    let hash = &point.manifest[0];
+    let path = repo.path.join("blocks").join(&hash[..2]).join(hash);
+    let original = std::fs::read(&path).unwrap();
+    let mut bad = original.clone();
+    bad[1] ^= 1;
+    std::fs::write(&path, bad).unwrap();
+    let paths = targets(&fixture, "resume-restore");
+    assert!(restore::restore_fixture(&repo, &point, &paths).is_err());
+    std::fs::write(path, original).unwrap();
+    assert!(restore::restore_fixture(&repo, &point, &paths).is_err());
+    restore::resume_fixture(&repo, &point, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![61; 50000]
+    );
+    assert!(matches!(
+        restored.stat(SCOPE, dead.object_key).await,
+        Err(StoreError::Retired)
+    ));
+}
+
+#[tokio::test]
+async fn older_payload_restore_cannot_revive_a_key_retired_in_a_known_recovery_point() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "repository");
+    let object = put(&store, vec![17; 30000]).await;
+    let older = capture::offline(&repo, &store).unwrap();
+    store
+        .delete(SCOPE, object.object_key.clone())
+        .await
+        .unwrap();
+    let newer = capture::offline(&repo, &store).unwrap();
+    repo.verify(&newer).unwrap();
+    let paths = targets(&fixture, "older-restore");
+    restore::restore_fixture(&repo, &older, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert!(matches!(
+        restored.stat(SCOPE, object.object_key).await,
+        Err(StoreError::Retired)
+    ));
+    assert!(matches!(
+        restored.finalize(SCOPE, object.upload_key).await,
+        Err(StoreError::Retired)
+    ));
+}
+
+#[tokio::test]
+async fn retention_refuses_to_forget_the_only_known_deletion_before_changing_any_point() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "retention");
+    let object = put(&store, vec![17; 30000]).await;
+    let older = capture::offline(&repo, &store).unwrap();
+    store
+        .delete(SCOPE, object.object_key.clone())
+        .await
+        .unwrap();
+    let retired = capture::offline(&repo, &store).unwrap();
+    assert!(
+        retention::forget(&repo, &retired.id)
+            .unwrap_err()
+            .to_string()
+            .contains("last saved retirement")
+    );
+    assert!(
+        retention::prune(&repo, 1, &older.id)
+            .unwrap_err()
+            .to_string()
+            .contains("last saved retirement")
+    );
+    assert_eq!(repo.list().unwrap().len(), 2);
+    for point in [&older, &retired] {
+        repo.verify(point).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_dir(repo.path.join("pending"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let successor = capture::offline(&repo, &store).unwrap();
+    retention::forget(&repo, &retired.id).unwrap();
+    retention::prune(&repo, 1, &successor.id).unwrap();
+    let paths = targets(&fixture, "retention-restore");
+    restore::restore_fixture(&repo, &successor, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert!(matches!(
+        restored.stat(SCOPE, object.object_key).await,
+        Err(StoreError::Retired)
+    ));
+    assert!(matches!(
+        restored.finalize(SCOPE, object.upload_key).await,
+        Err(StoreError::Retired)
+    ));
+}
+
+#[tokio::test]
+async fn retirement_overlay_reclaims_restored_private_payload_and_revokes_its_old_ticket() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let repo = repository(&fixture, "repository");
+    let object = store
+        .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
+        .unwrap();
+    store
+        .write_part(
+            SCOPE,
+            object.upload_key.clone(),
+            0,
+            std::io::Cursor::new(vec![66; 12288]),
+        )
+        .await
+        .unwrap();
+    let fp = store
+        .inspect_upload(SCOPE, &object.upload_key)
+        .unwrap()
+        .identity
+        .fingerprint();
+    let older = capture::offline(&repo, &store).unwrap();
+    store
+        .delete(SCOPE, object.object_key.clone())
+        .await
+        .unwrap();
+    capture::offline(&repo, &store).unwrap();
+    let paths = targets(&fixture, "private-retirement");
+    restore::restore_fixture(&repo, &older, &paths).unwrap();
+    for path in &paths {
+        assert!(!path.join(fp.staging_path()).exists());
+        assert_eq!(std::fs::read_dir(path.join(".uploads")).unwrap().count(), 0);
+    }
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert!(matches!(
+        restored.finalize(SCOPE, object.upload_key).await,
+        Err(StoreError::Retired)
+    ));
+}
+
+#[tokio::test]
+async fn bounded_bidirectional_replication_reuses_a_completed_point_and_preserves_retirements() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let source = Arc::new(repository(&fixture, "source"));
+    let dest = fixture.base.join("destination");
+    repository::Repository::initialize(&dest, &fixture.base.join("source.key")).unwrap();
+    let destination = Arc::new(
+        repository::Repository::open(&dest, &fixture.base.join("source.key"), true).unwrap(),
+    );
+    let live = put(&store, vec![27; 200000]).await;
+    let dead = put(&store, vec![28; 9000]).await;
+    store.delete(SCOPE, dead.object_key.clone()).await.unwrap();
+    let point = capture::offline(&source, &store).unwrap();
+    for _ in 0..2 {
+        let (mut sender, mut receiver) = tokio::io::duplex(64 * 1024);
+        let (sent, received) = tokio::join!(
+            network::send(&mut sender, source.clone(), point.id.clone()),
+            network::receive(&mut receiver, destination.clone())
+        );
+        assert_eq!(sent.unwrap().id, point.id);
+        assert_eq!(received.unwrap().id, point.id);
+    }
+    destination
+        .verify(&destination.snapshot(&point.id).unwrap())
+        .unwrap();
+    let paths = targets(&fixture, "network-restore");
+    restore::restore_fixture(&destination, &point, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![27; 200000]
+    );
+    assert!(matches!(
+        restored.stat(SCOPE, dead.object_key).await,
+        Err(StoreError::Retired)
+    ));
+}
+
+#[tokio::test]
+async fn hierarchical_manifest_restores_and_replicates_with_bounded_multi_level_indices() {
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let source = repository(&fixture, "source");
+    let destination = repository(&fixture, "destination");
+    let mut keys = Vec::new();
+    for _ in 0..20 {
+        keys.push(put(&store, Vec::new()).await.object_key);
+    }
+    let point = capture::offline(&source, &store).unwrap();
+    assert!(point.manifest_depth >= 2);
+    assert!(point.manifest.len() <= 4);
+    source.verify(&point).unwrap();
+    transfer::replicate(&source, &destination, &point.id).unwrap();
+    let paths = targets(&fixture, "tree-restore");
+    restore::restore_fixture(&destination, &point, &paths).unwrap();
+    let restored = Store::new(
+        vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
+        [17; 32],
+        16,
+    )
+    .unwrap();
+    for key in keys {
+        assert_eq!(restored.stat(SCOPE, key).await.unwrap().total_bytes, 0);
+    }
+    retention::gc(&destination, false).unwrap();
+    destination.verify(&point).unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_replication_keeps_only_unpublished_pins_and_resumes_the_same_point() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    struct Cut {
+        inner: tokio::io::DuplexStream,
+        left: usize,
+    }
+    impl AsyncRead for Cut {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, out)
+        }
+    }
+    impl AsyncWrite for Cut {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.left == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected transfer disconnect",
+                )));
+            }
+            let n = bytes.len().min(self.left);
+            match Pin::new(&mut self.inner).poll_write(cx, &bytes[..n]) {
+                Poll::Ready(Ok(n)) => {
+                    self.left -= n;
+                    Poll::Ready(Ok(n))
+                }
+                other => other,
+            }
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let source = Arc::new(repository(&fixture, "source"));
+    put(&store, vec![41; 200000]).await;
+    let point = capture::offline(&source, &store).unwrap();
+    let destination_path = fixture.base.join("destination");
+    repository::Repository::initialize(&destination_path, &fixture.base.join("source.key"))
+        .unwrap();
+    let destination = Arc::new(
+        repository::Repository::open(&destination_path, &fixture.base.join("source.key"), true)
+            .unwrap(),
+    );
+    let (sender, mut receiver) = tokio::io::duplex(64 * 1024);
+    let source1 = source.clone();
+    let id = point.id.clone();
+    let (sent, received) = tokio::join!(
+        async move {
+            let mut sender = Cut {
+                inner: sender,
+                left: 20000,
+            };
+            network::send(&mut sender, source1, id).await
+        },
+        network::receive(&mut receiver, destination.clone())
+    );
+    assert!(sent.is_err());
+    assert!(received.is_err());
+    assert!(destination.list().unwrap().is_empty());
+    assert!(
+        walkdir::WalkDir::new(destination.path.join("blocks"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_type().is_file())
+    );
+    let (mut sender, mut receiver) = tokio::io::duplex(64 * 1024);
+    let (sent, received) = tokio::join!(
+        network::send(&mut sender, source, point.id.clone()),
+        network::receive(&mut receiver, destination.clone())
+    );
+    sent.unwrap();
+    received.unwrap();
+    destination
+        .verify(&destination.snapshot(&point.id).unwrap())
+        .unwrap();
 }

@@ -6,6 +6,7 @@ use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct IoControlSnapshot {
+    pub scheduler: crate::core::io_scheduler::DiskIoSchedulerSnapshot,
     pub backend: BackendSnapshot,
     pub config: IoControlConfig,
     pub latency: IoLatencySnapshot,
@@ -14,6 +15,7 @@ pub struct IoControlSnapshot {
 
 pub fn io_control_snapshot() -> IoControlSnapshot {
     IoControlSnapshot {
+        scheduler: crate::core::io_scheduler::disk_io_scheduler_snapshot(),
         backend: backend_snapshot(),
         config: io_control_config(),
         latency: io_latency_snapshot(),

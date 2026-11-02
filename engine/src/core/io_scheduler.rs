@@ -133,8 +133,8 @@ struct ActiveIoOperation {
 /// Resize the existing FIFO semaphore without making waiters surrender their
 /// queue position. A lower target retires idle permits immediately, then takes
 /// any remainder from finishing operations; in-flight work is never cancelled.
-struct FairIoGate {
-    semaphore: Arc<Semaphore>,
+pub(crate) struct FairIoGate {
+    pub(crate) semaphore: Arc<Semaphore>,
     maximum: usize,
     state: Mutex<FairIoGateState>,
 }
@@ -145,7 +145,7 @@ struct FairIoGateState {
 }
 
 impl FairIoGate {
-    fn new(maximum: usize) -> Self {
+    pub(crate) fn new(maximum: usize) -> Self {
         let maximum = maximum.max(1);
         Self {
             semaphore: Arc::new(Semaphore::new(maximum)),
@@ -164,7 +164,7 @@ impl FairIoGate {
             .target
     }
 
-    fn set_target(&self, target: usize) {
+    pub(crate) fn set_target(&self, target: usize) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.target = target.clamp(1, self.maximum);
         let reserve = self.maximum - state.target;
@@ -179,7 +179,7 @@ impl FairIoGate {
         }
     }
 
-    fn release(&self, permit: OwnedSemaphorePermit) {
+    pub(crate) fn release(&self, permit: OwnedSemaphorePermit) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.reserved.len() < self.maximum - state.target {
             state.reserved.push(permit);

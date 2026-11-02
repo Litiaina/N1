@@ -1,159 +1,192 @@
-# Node Object API (NOA)
+# N1 Operation API — NOA 2
 
-NOA v1 is N1's canonical HTTPS/WebSocket interface under /noa/v1. It is the API
-baseline for N1 1.0.0-RC.1; its version is separate from the product and storage
-specification versions. The product numbering reset does not rename API routes.
-The native n1:// transport is N1-specific and is not NOA.
+NOA 2 is the LINK engine contract for N1 1.0.0-RC.2. It intentionally replaces
+NOA 1 namespace operations. The typed definitions in `link/src/noa.rs` are shared
+by the native server and SDK. Implementation/qualification remains in progress;
+[the ledger](docs/RC2-IMPLEMENTATION.md) identifies retained features still open.
 
-Use Authorization: Bearer <access-token> on protected calls. Fragment permissions
-remain independent: read, write, modify and delete. Signed URLs carry narrowly
-scoped download authority instead of a reusable fragment token.
+Native `n1://host:port` is primary. `n1s://host:port` verifies the server's TLS
+certificate. Wire version: `n1/1`. HTTP is an optional adapter using the same
+service handlers. Object keys and upload tickets are client-held capabilities
+bound to a stable fragment ID and independently checked permissions.
 
-In RC.1, keys are flat, prefixes virtual, empty mkdir rejected and
-prefix mutations non-atomic with per-child results. Old /n1 routes are not
-aliases. This inventory names routes; field-level requests, responses, examples
-and retry rules are in [DOCUMENTATION.md](DOCUMENTATION.md).
+## Native framing
 
-## Connectivity And Authentication
+Each control frame is a four-byte unsigned big-endian length followed by a
+MessagePack map. Requests contain `id` (u64), `command` and `body_len` (u64,
+default zero). Command is `{op, args}`. Successful responses contain the same ID,
+`status:200`, nullable `result`, nullable `error`, and `body_len`. Errors use a
+non-200 status and no raw response body. A nullable result is also used when no
+maintenance job exists.
 
-```text
-GET  /noa/v1/ping
-POST /noa/v1/auth/fragment
-POST /noa/v1/auth/refresh
-POST /noa/v1/auth/logout
-GET  /noa/v1/ws?token=<access-token>
-```
+Exactly `body_len` raw bytes follow a control frame. Payload is never base64 or
+nested JSON text inside MessagePack. Control maps are bounded (64 KiB before
+authentication, 8 MiB after), with aggregate native control-memory admission.
+Parts and batches are limited to 1 GiB per request; normal upload streams may
+exceed that within the format's calculated file-offset limits. Control and body
+inactivity deadlines do not impose a fixed maximum object-transfer duration.
 
-## Fragments And Capacity
+Connections are ordered request/response streams. Authentication establishes the
+connection session. After a partial exchange, reconnect before retrying. Upload
+retries reuse the ticket, not a newly initialized identity. The client must retain
+issued keys; N1 does not provide a list from which to recover them.
 
-```text
-POST   /noa/v1/fragments
-GET    /noa/v1/fragments
-GET    /noa/v1/fragments/check
-GET    /noa/v1/fragments/hash
-PATCH  /noa/v1/fragments/{fragment}
-DELETE /noa/v1/fragments/{fragment}
-GET    /noa/v1/capacity/usage
-GET    /noa/v1/capacity/fragment
-```
+## Authentication
 
-## POSIX-Like Namespace
+| Operation | Arguments | Result |
+| --- | --- | --- |
+| `ping` | none | Product, LINK, NOA and wire versions; public |
+| `auth.fragment` | `fragment`, `secret`, optional `permissions`, `ttl_seconds` | Signed token, session, rotating refresh token and refresh lifetime |
+| `auth.bearer` | `token` | Verified connection session |
+| `session.refresh` | `refresh_token` | Rotates refresh token and returns new access token/session |
+| `auth.logout` | none | Durably revokes refresh session and clears native connection session |
+| `session.info` | none | Current session |
 
-```text
-GET  /noa/v1/posix/list
-GET  /noa/v1/posix/stat
-POST /noa/v1/posix/mkdir
-POST /noa/v1/posix/rename
-POST /noa/v1/posix/move
-POST /noa/v1/posix/trash
-POST /noa/v1/posix/recover
-```
+Permissions are `read`, `write`, `delete` and `repair`. Requested permissions are
+intersected with configured fragment permissions. Login tokens last at most
+86,400 seconds and are checked for expiry. Explicitly scoped login requests do
+not receive operator authority. Maintenance mutation/job operations require an
+operator session. Alias or credential changes do not change fragment identity or
+LINK placement. The service signing secret is not a fragment password.
 
-## Objects And Trash
+HTTP uses a Bearer token on each protected request. Logout does not revoke an
+already issued stateless token; stop using it or let it expire.
+Refresh tokens are single-use. Reusing a rotated token durably revokes its session
+family, including across engine restart. Refresh intersects current fragment
+permissions and rejects credential rotation; it cannot elevate a scoped session.
+Service recovery starts fresh login sessions.
 
-```text
-GET    /noa/v1/objects
-GET    /noa/v1/namespace/snapshot
-GET    /noa/v1/namespace/search
-GET    /noa/v1/trash
-GET    /noa/v1/objects/meta/{object_key}
-GET    /noa/v1/objects/versions/{object_key}
-GET    /noa/v1/objects/get/{object_key}
-GET    /noa/v1/objects/stream/{object_key}
-GET    /noa/v1/objects/download
-GET    /noa/v1/objects/download/chunk
-POST   /noa/v1/objects/signed-url
-GET    /noa/v1/objects/signed-read
-DELETE /noa/v1/objects/{object_key}
-POST   /noa/v1/objects/recover/{object_key}
-POST   /noa/v1/objects/rename
-POST   /noa/v1/objects/bulk-delete
-POST   /noa/v1/objects/bulk-recover
-POST   /noa/v1/trash/recover-all
-POST   /noa/v1/objects/archive
-POST   /noa/v1/objects/archive/manifest
-POST   /noa/v1/exports
-GET    /noa/v1/exports/{export_id}
-GET    /noa/v1/exports/{export_id}/download
-POST   /noa/v1/exports/{export_id}/signed-url
-GET    /noa/v1/signed-exports/download
-DELETE /noa/v1/exports/{export_id}
-```
+Both transports share the retained configurable IP/authentication and fragment
+quotas. Rejected quotas return 429. HTTP uses the actual socket peer address;
+untrusted forwarded-address headers cannot change the quota identity.
 
-Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
-not add empty-trash, hard-delete, or per-version-delete semantics.
+## Object operations
 
-Snapshot is a read-authorized NDJSON projection feed with a completion marker.
-Search proxies to optional Accel. Optional `N1_ACCEL_READ_URL` also accelerates
-version-pinned object bytes after N1 authorization/resolution, including existing
-Console media URLs. Pre-header failure falls back to N1; mid-stream failure
-terminates the response. Accel never becomes namespace or durability authority.
-Exports pin immutable versions, build durable ZIP/TAR artifacts and support
-stable length/ETag, range resume and scoped signed downloads. Cancellation and
-artifact retention do not delete source objects.
+| Operation | Arguments | Permission / body |
+| --- | --- | --- |
+| `upload.init` | optional `pool`, `total_bytes`, `part_bytes`, `durable`, `ttl_seconds` | write; no body |
+| `upload.part` | `upload_key`, zero-based `part` | write; exact part bytes |
+| `upload.put` | `upload_key` for a single-part/empty object | write; exact total bytes |
+| `upload.batch` | `upload_keys` in body order | write; concatenated single-part bodies |
+| `upload.status` | `upload_key`, `start`, `limit` (1..4096) | read or write; validates a page of actual parts |
+| `upload.finalize` | `upload_key` | write; no body |
+| `upload.cancel` | `upload_key` | write; removes unfinished staging only |
+| `object.stat` | `object_key` | read; size, EC representation and integrity root |
+| `object.get` | `object_key`, `offset`, optional `length` | read; exact raw response bytes |
+| `object.signed_read` | `object_key`, `offset`, optional `length`, `ttl_seconds` | read; client-held range/expiry-bound grant |
+| `object.get_signed` | `grant` | verified grant; raw signed range, no connection login required |
+| `object.health` | `object_key`, `deep` | read; object-specific integrity/availability |
+| `object.repair` | `object_key` | repair; replaces damaged/missing shards |
+| `object.delete` | `object_key` | delete; permanent retirement |
+| `object.bulk_delete` | explicit `object_keys` (1..256) | delete; per-key results |
 
-## Uploads
+Init returns both `upload_key` (`N1U1.`) and final `object_key` (`N1A1.`), counts,
+expiry and durability. It creates no session manifest on disk. A single-part
+normal/batch ticket requires `part_bytes >= total_bytes` and EC alignment. Empty
+objects have zero parts and no body. Batches have at most 256 tickets, 1 GiB of
+body and 1,024 calculated open shard descriptors; duplicate identities are invalid.
 
-```text
-POST   /noa/v1/upload/one-shot/{object_key}
-POST   /noa/v1/upload/batch
-POST   /noa/v1/upload/multipart/init/{object_key}
-GET    /noa/v1/upload/multipart
-GET    /noa/v1/upload/multipart/{version_id}
-PUT    /noa/v1/upload/multipart/{version_id}/{part_index}
-POST   /noa/v1/upload/multipart/{version_id}/{session_id}/finalize
-DELETE /noa/v1/upload/multipart/{version_id}
+Standard part replies do not promise persistence. Durable part replies require
+persistence on every member. Finalization, normal upload and batch success always
+require durable object publication. Identical retries are idempotent; conflicting
+valid bytes return 409. Lost replies may leave partially or fully published
+objects; resolve each identity with status/retry. Batch is not a multi-object
+transaction. Expiry does not garbage-collect a readable final object.
 
-POST   /noa/v1/upload/multipart/durable/init/{object_key}
-GET    /noa/v1/upload/multipart/durable
-GET    /noa/v1/upload/multipart/durable/{version_id}
-PUT    /noa/v1/upload/multipart/durable/{version_id}/{part_index}
-POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
-DELETE /noa/v1/upload/multipart/durable/{version_id}
-```
+Stat reports `LINK-SHA256-tree-v2` for new hybrid pools (CRC32C frames and
+identity/position/length-bound source SHA-256), and `LINK-SHA256-tree-v1` for
+existing SHA-256 pools. These roots must not be labelled as SHA-256 of the raw
+complete file. GET verifies frames and reconstructed
+source before emitting requested bytes. Range bounds are exact and rejected
+when outside the object; successful range output has exactly the declared length.
+Signed grants last at most six hours and never outlive the issuing session token.
+They bind fragment, key, offset, length and expiry; changing those fields invalidates
+the signature. Signed access grants no other operation or connection authority.
+Current fragment read permission and permanent retirement still apply.
 
-Standard multipart is nonpersistent until finalize; durable multipart retains
-restart-resumable progress. Both publish immutable objects after finalization.
-Batch accepts independent small objects, returning 201 for all-success or 207
-for mixed results. There is no durable batch route.
+Delete writes durable terminal state at calculated shard paths. `retired_shards`
+is the count newly retired by that call; repeated deletion can return zero.
+Completed retirement returns 410 to reads and rejects old upload tickets. Partial
+retirement or unavailable members can require retry (503). No rename, namespace
+listing, object history or undelete operation exists.
 
-## Maintenance And Object Health
+## Maintenance
 
-```text
-GET  /noa/v1/maintenance/health
-GET  /noa/v1/maintenance/pools/health
-GET  /noa/v1/maintenance/fragments/{fragment}/health
-GET  /noa/v1/objects/status/{object_key}
-POST /noa/v1/objects/repair/{object_key}
+| Operation | Arguments | Access |
+| --- | --- | --- |
+| `maintenance.health` | none | read; backend, scheduler, system/capacity and maintenance state |
+| `maintenance.pools` | none | read or write; immutable geometry and available slots |
+| `maintenance.gc` | none | operator; starts conservative staging GC |
+| `maintenance.scrub` | `options:{repair,bytes_per_second,window_seconds}` | operator; starts a paced job |
+| `maintenance.job` | none | operator; current/last bounded job state |
+| `maintenance.stop` | `job_id` | operator; requests cooperative stop |
 
-POST /noa/v1/maintenance/fragment/init
-POST /noa/v1/maintenance/fragment/cleanup
+A job progresses through running/stopping to completed, stopped or incomplete.
+An incomplete or stopped job does not mark N1 failed. IO already admitted is
+joined before ownership is released. Foreground work can preempt background work
+on its object. Optional interval schedules and startup delays live in private
+service configuration; both GC and scrub schedules default to disabled. Scrub can
+alternatively use one UTC calendar schedule with a persisted attempted-slot journal.
 
-POST /noa/v1/maintenance/repair/start
-POST /noa/v1/maintenance/repair/stop
-GET  /noa/v1/maintenance/repair/status
-POST /noa/v1/maintenance/fragments/{fragment}/repair/start
+## HTTP adapter
 
-POST /noa/v1/maintenance/gc/start
-POST /noa/v1/maintenance/gc/stop
-GET  /noa/v1/maintenance/gc/status
-POST /noa/v1/maintenance/fragments/{fragment}/gc/start
+| Endpoint | Encoding |
+| --- | --- |
+| `GET /health` | Public version response |
+| `POST /noa` | JSON request/response, no raw body |
+| `PUT /noa/upload/{upload_key}/parts/{part}` | Exact Content-Length, raw part body |
+| `POST /noa/stream` | Exact Content-Length; native length-prefixed MessagePack request followed by raw upload bytes; JSON response |
+| `GET /noa/object/{object_key}?offset=0&length=...` | Raw verified response, exact Content-Length |
+| `HEAD /noa/object/{object_key}` | Authenticated object headers without downloading payload |
+| `GET /noa/signed` | Signed grant query fields; raw verified signed range |
+| `GET /noa/backup/receive/{repository}` | Operator-authenticated WebSocket, binary recovery protocol |
 
-POST /noa/v1/maintenance/redistribution/start
-POST /noa/v1/maintenance/redistribution/stop
-GET  /noa/v1/maintenance/redistribution/status
-POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start
-POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
-```
+Streaming HTTP control is bounded to 64 KiB. Authentication uses the HTTP Bearer
+header. Both upload entry points call the same object handlers as native NOA.
+There is no native-to-HTTP bridge.
+Ordinary object GET supports a single HTTP `Range`, `ETag`, `If-Range`,
+`If-None-Match` and `If-Match`, returning 206/304/412/416 as appropriate. Byte
+range ends and suffix lengths extending past the object are clamped to its
+available bytes. An exact strong ETag satisfies `If-Range`; a mismatch, weak
+tag or date validator causes a full response. Empty objects use an empty 200
+response. HEAD evaluates the same ETag preconditions without reading payload.
+An explicit signed/query range cannot be combined with a second `Range` header,
+including when `If-Range` mismatches. Downloads use `Cache-Control: private,
+no-store`. The integrity ETag is the immutable LINK tree root.
 
-## Conformance
+## Recovery
 
-Maintenance starts require write/modify/delete. Fragment tokens are scoped to
-their own fragment; explicit all-fragment work, restrictive modes and global
-stops require master-key operator authentication. Pool content diagnostics stay
-read-authorized and fragment-scoped. See the maintenance reference for details.
+All recovery operations require an operator token. Requested/scoped permission
+tokens do not inherit operator privileges. `repository` and `destination` name
+preconfigured aliases; callers cannot submit filesystem paths or encryption keys.
 
-Conformance requires matching request meaning, authentication, responses,
-errors and retry behavior, not just route names. N1's workspace tests and the
-release runner's --noa-api-proof check the canonical surface. Test evidence and
-limits are in [TESTING.md](TESTING.md).
+| Operation | Arguments | Result |
+| --- | --- | --- |
+| `backup.list` | `repository,after,limit` | Bounded page of point summaries; limit 1..256, after empty or canonical ULID |
+| `backup.capture` | `repository,boundary_seconds` | Starts committed online capture; boundary 1..300 seconds |
+| `backup.verify` | `repository,snapshot` | Starts authenticated point verification |
+| `backup.replicate` | `repository,destination,snapshot` | Starts resumable local point replication |
+| `backup.prune` | `repository,keep_last,protect` | Starts retention; keep 1..10000, retain protected point and retirement witnesses |
+| `backup.gc` | `repository,discard_incomplete` | Starts block reclamation; incomplete transfers protected unless explicitly discarded |
+| `backup.job` | none | Current/last bounded recovery job status |
+| `backup.stop` | `job_id` | Requests cooperative stop |
+| `backup.receive` | `repository` | Upgrades an authenticated native connection to `LINK-replication-v1` |
+
+Job starts return a job record, not a claim that the work has completed. Poll
+`backup.job` for completed/stopped/incomplete status and its result or error.
+One recovery job runs at a time; running/stopping overlap returns 409. Stop does
+not release repository leases while accepted filesystem work is still running.
+Restore remains an offline operator helper operation with explicit targets.
+
+## Status meanings
+
+400 invalid encoding, parameters or range; 401 missing/invalid authentication;
+403 denied permission; 404 absent object/upload/job; 409 conflicting immutable
+bytes, expiry or active-job conflict; 410 permanently retired identity; 413 body
+limit; 422 verified format/integrity failure; 503 unavailable quorum, incomplete
+retirement, exhausted admission or incomplete operation; 507 ENOSPC/EDQUOT.
+A storage error is not converted into success because a final filename exists.
+
+Recovery automation, additional pool administration and signed download operations
+remain redesign work. No RC.2 release is authorized until retained features and
+qualification are complete.

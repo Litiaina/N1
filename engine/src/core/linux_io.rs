@@ -1,3 +1,51 @@
+/// Positioned owned bytes used by LINK's inline shard records. The driver
+/// retains the file and buffer through CQE even when the requester disappears.
+pub async fn write_at_async(file: Arc<File>, buffer: Vec<u8>, offset: u64) -> io::Result<()> {
+    write_owned_at_async(file, buffer, offset).await.map(|_| ())
+}
+
+/// Return storage only after CQE, allowing a stream to reuse bounded buffers.
+pub async fn write_owned_at_async(
+    file: Arc<File>,
+    buffer: Vec<u8>,
+    offset: u64,
+) -> io::Result<Vec<u8>> {
+    if let Some(native) = &selected_backend()?.native {
+        return match native
+            .write_all(file, uring::Buffer::Bytes(buffer), offset)
+            .await?
+        {
+            uring::Buffer::Bytes(bytes) => Ok(bytes),
+            uring::Buffer::Aligned(_) => unreachable!("write changed buffer type"),
+        };
+    }
+    tokio::task::spawn_blocking(move || {
+        pwrite_all_at(&*file, &buffer, offset)?;
+        Ok(buffer)
+    })
+    .await
+    .map_err(|error| io::Error::other(error.to_string()))?
+}
+/// Shared descriptor variant for immutable LINK frame reads. Ownership stays
+/// with the driver until completion without duplicating a descriptor per frame.
+pub async fn read_exact_at_async(file: Arc<File>, len: usize, offset: u64) -> io::Result<Vec<u8>> {
+    if let Some(native) = &selected_backend()?.native {
+        return match native
+            .read_exact(file, uring::Buffer::Bytes(vec![0; len]), offset)
+            .await?
+        {
+            uring::Buffer::Bytes(bytes) => Ok(bytes),
+            uring::Buffer::Aligned(_) => unreachable!("read changed buffer type"),
+        };
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut bytes = vec![0; len];
+        pread_exact_at(&*file, &mut bytes, offset)?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|e| io::Error::other(e.to_string()))?
+}
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -446,7 +494,7 @@ pub async fn pread_exact_at_async(
         Ok::<_, io::Error>((file, buf))
     })
     .await
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    .map_err(io::Error::other)?
 }
 
 pub fn fdatasync_blocking<Fd: AsFd>(fd: Fd) -> io::Result<()> {
@@ -614,7 +662,7 @@ pub async fn atomic_write_with_durability(
     let path = path.to_path_buf();
     let task_path = path.clone();
     tokio::task::spawn_blocking(move || {
-        atomic_write_blocking_with_durability(&task_path, &data, strict_durability)
+        atomic_write_shared_blocking_with_durability(&task_path, Arc::new(data), strict_durability)
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("atomic write task failed: {}", e)))?

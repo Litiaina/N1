@@ -1,20 +1,14 @@
-use crate::middleware::auth_middleware::JWT_KEYS;
-use crate::settings::constants::CONFIG_FILE;
-use crate::structs::auth_structs::Claims;
+use crate::middleware::auth_middleware::Claims;
 use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
 use governor::middleware::NoOpMiddleware;
-use ini::Ini;
-use jsonwebtoken::{Validation, decode};
-use std::sync::OnceLock;
 use std::time::Duration;
 use tower_governor::GovernorLayer;
 use tower_governor::errors::GovernorError;
 use tower_governor::governor::{GovernorConfig, GovernorConfigBuilder};
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
-use tracing::error;
 
 #[derive(Clone)]
 pub struct UserKeyExtractor;
@@ -27,40 +21,28 @@ impl KeyExtractor for UserKeyExtractor {
             return Ok("global_options_allow".to_string());
         }
 
-        let auth_header = req
-            .headers()
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-
-        if let Some(token) = auth_header {
-            let validation = Validation::default();
-
-            if let Ok(token_data) = decode::<Claims>(token, &JWT_KEYS.decoding, &validation) {
-                return Ok(token_data.claims.fragment.to_string());
-            }
-        }
-
-        Err(GovernorError::UnableToExtractKey)
+        req.extensions()
+            .get::<Claims>()
+            .map(|claims| hex::encode(claims.sub.0))
+            .ok_or(GovernorError::UnableToExtractKey)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RateLimitSettings {
-    enabled: bool,
-    auth_per_sec: u64,
-    auth_burst: u32,
-    view_per_sec: u64,
-    view_burst: u32,
-    upload_per_sec: u64,
-    upload_burst: u32,
-    transcode_per_sec: u64,
-    transcode_burst: u32,
-    global_per_sec: u64,
-    global_burst: u32,
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitSettings {
+    pub enabled: bool,
+    pub auth_per_sec: u64,
+    pub auth_burst: u32,
+    pub view_per_sec: u64,
+    pub view_burst: u32,
+    pub upload_per_sec: u64,
+    pub upload_burst: u32,
+    pub transcode_per_sec: u64,
+    pub transcode_burst: u32,
+    pub global_per_sec: u64,
+    pub global_burst: u32,
 }
-
-static RATE_LIMIT_CONFIG: OnceLock<RateLimitSettings> = OnceLock::new();
 
 impl Default for RateLimitSettings {
     fn default() -> Self {
@@ -78,62 +60,6 @@ impl Default for RateLimitSettings {
             global_burst: 300,
         }
     }
-}
-
-fn get_rate_limit_config() -> RateLimitSettings {
-    *RATE_LIMIT_CONFIG.get_or_init(|| {
-        let defaults = RateLimitSettings::default();
-
-        let config_result = Ini::load_from_file(CONFIG_FILE);
-
-        match config_result {
-            Ok(config) => {
-                let section = config.section(Some("rate_limiter_config"));
-                match section {
-                    Some(props) => {
-                         macro_rules! get_val {
-                            ($key:expr, $default:expr) => {
-                                props.get($key)
-                                    .and_then(|v| v.parse().ok())
-                                    .unwrap_or($default)
-                            };
-                        }
-
-                        let enabled = props.get("enable_rate_limiting")
-                            .map(|v| v.to_lowercase())
-                            .map(|v| match v.as_str() {
-                                "true" | "1" | "on" => true,
-                                "false" | "0" | "off" => false,
-                                _ => defaults.enabled,
-                            })
-                            .unwrap_or(defaults.enabled);
-
-                        RateLimitSettings {
-                            enabled,
-                            auth_per_sec: get_val!("auth_limit_per_second", defaults.auth_per_sec),
-                            auth_burst: get_val!("auth_limit_burst_size", defaults.auth_burst),
-                            view_per_sec: get_val!("view_limit_per_second", defaults.view_per_sec),
-                            view_burst: get_val!("view_limit_burst_size", defaults.view_burst),
-                            upload_per_sec: get_val!("upload_limit_per_second", defaults.upload_per_sec),
-                            upload_burst: get_val!("upload_limit_burst_size", defaults.upload_burst),
-                            transcode_per_sec: get_val!("transcode_limit_per_second", defaults.transcode_per_sec),
-                            transcode_burst: get_val!("transcode_limit_burst_size", defaults.transcode_burst),
-                            global_per_sec: get_val!("global_limit_per_second", defaults.global_per_sec),
-                            global_burst: get_val!("global_limit_burst_size", defaults.global_burst),
-                        }
-                    },
-                    None => {
-                        error!("Warning: [rate_limiter_config] section missing in config.ini. Using defaults.");
-                        defaults
-                    }
-                }
-            },
-            Err(_) => {
-                error!("Warning: config.ini not found. Using default rate limits.");
-                defaults
-            }
-        }
-    })
 }
 
 fn governor_config<K: KeyExtractor>(
@@ -157,6 +83,112 @@ fn governor_config<K: KeyExtractor>(
         .expect("validated rate and burst must produce a nonzero quota")
 }
 
+impl RateLimitSettings {
+    pub fn validate(&self) -> crate::core::Result<()> {
+        if self.enabled
+            && [
+                (self.auth_per_sec, self.auth_burst),
+                (self.view_per_sec, self.view_burst),
+                (self.upload_per_sec, self.upload_burst),
+                (self.global_per_sec, self.global_burst),
+            ]
+            .iter()
+            .any(|(rate, burst)| !(1..=1_000_000_000).contains(rate) || *burst == 0)
+        {
+            return Err(crate::core::Error::Invalid(
+                "invalid request rate/burst".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Native and HTTP share these quotas. Conversion uses the original tested
+/// middleware builder rather than a second interpretation of rates.
+pub struct RateLimits {
+    enabled: bool,
+    auth: GovernorConfig<SmartIpKeyExtractor, NoOpMiddleware>,
+    global: GovernorConfig<SmartIpKeyExtractor, NoOpMiddleware>,
+    view: GovernorConfig<UserKeyExtractor, NoOpMiddleware>,
+    upload: GovernorConfig<UserKeyExtractor, NoOpMiddleware>,
+    last_prune: std::sync::Mutex<std::time::Instant>,
+}
+impl RateLimits {
+    pub fn new(settings: RateLimitSettings) -> Self {
+        let enabled = settings.enabled;
+        let limits = if enabled {
+            settings
+        } else {
+            RateLimitSettings::default()
+        };
+        Self {
+            enabled,
+            auth: governor_config(limits.auth_per_sec, limits.auth_burst, SmartIpKeyExtractor),
+            global: governor_config(
+                limits.global_per_sec,
+                limits.global_burst,
+                SmartIpKeyExtractor,
+            ),
+            view: governor_config(limits.view_per_sec, limits.view_burst, UserKeyExtractor),
+            upload: governor_config(limits.upload_per_sec, limits.upload_burst, UserKeyExtractor),
+            last_prune: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
+    pub fn peer(&self, peer: std::net::IpAddr, authentication: bool) -> crate::core::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if let Ok(mut last) = self.last_prune.try_lock()
+            && last.elapsed() >= Duration::from_secs(60)
+        {
+            self.auth.limiter().retain_recent();
+            self.global.limiter().retain_recent();
+            self.view.limiter().retain_recent();
+            self.upload.limiter().retain_recent();
+            *last = std::time::Instant::now();
+        }
+        let limiter = if authentication {
+            &self.auth
+        } else {
+            &self.global
+        };
+        limiter
+            .limiter()
+            .check_key(&peer)
+            .map_err(|_| crate::core::Error::RateLimited)
+    }
+    pub fn operation(
+        &self,
+        claims: &Claims,
+        command: &n1_link::noa::Command,
+    ) -> crate::core::Result<()> {
+        use n1_link::noa::Command;
+        if !self.enabled {
+            return Ok(());
+        }
+        let write = matches!(
+            command,
+            Command::UploadInit { .. }
+                | Command::UploadPut { .. }
+                | Command::UploadBatch { .. }
+                | Command::UploadPart { .. }
+                | Command::UploadFinalize { .. }
+                | Command::UploadCancel { .. }
+        );
+        let limiter = if write { &self.upload } else { &self.view };
+        limiter
+            .limiter()
+            .check_key(&hex::encode(claims.sub.0))
+            .map_err(|_| crate::core::Error::RateLimited)
+    }
+}
+
+impl Default for RateLimitLayers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct RateLimitLayers {
     pub auth: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
     pub view: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
@@ -166,7 +198,7 @@ pub struct RateLimitLayers {
 
 impl RateLimitLayers {
     pub fn new() -> Self {
-        Self::from_settings(get_rate_limit_config())
+        Self::from_settings(RateLimitSettings::default())
     }
 
     fn from_settings(limits: RateLimitSettings) -> Self {

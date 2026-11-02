@@ -1,32 +1,33 @@
-//! Explicit offline pool maintenance. No namespace journal, object cache or
-//! online admission exception: ordinary engine operations never enter here.
-//! Healthy clones copy unchanged bytes; replacement reconstructs only its slot.
-use crate::core::backup::{Result, invalid};
-use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
-use crate::core::instance_lease::{InstanceLease, LEASE_FILE, RESTORE_PENDING};
-use crate::core::{
-    root_identity,
-    storage_pool::{self, StoragePool},
+//! Explicit offline member maintenance. Keep byte-exact copy, resumable fences,
+//! inventory verification and process exclusion independent of object addressing.
+//! LINK-specific verification reads the inline shard format rather than NDX/NCX.
+use super::{
+    backup::{
+        Result, invalid,
+        restore::{Target, validate_member_file},
+    },
+    instance_lease::{InstanceLease, LEASE_FILE, RESTORE_PENDING},
+    storage_pool::{Member, Pool},
 };
-use crate::namespace::flat;
+use crate::settings::config::Config;
 use clap::{Args, Parser, Subcommand};
+use n1_link::PoolId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, symlink};
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Component, Path, PathBuf},
+};
 use walkdir::{DirEntry, WalkDir};
+mod replacement;
 
 const WORK: &str = ".n1-pool-work";
-const MAX_METADATA: u64 = 64 * 1024 * 1024;
+const MAX_METADATA: u64 = 65536;
 
 #[derive(Parser)]
-#[command(
-    about = "Offline N1 pool verification, byte-exact cloning and enrolled-member replacement"
-)]
+#[command(about = "Offline LINK member verification and byte-exact cloning")]
 struct Cli {
     #[command(subcommand)]
     command: Operation,
@@ -36,39 +37,34 @@ struct Selection {
     #[arg(long)]
     config: PathBuf,
     #[arg(long)]
-    pool: String,
-    /// Zero-based logical member slot, identified by the member descriptor.
+    pool: PoolId,
     #[arg(long)]
     member: usize,
 }
 #[derive(Subcommand)]
 enum Operation {
-    /// Verify enrolled identities, namespace/metadata replicas and every recorded piece.
+    /// Validate registered member identities and every inline shard/terminal file.
     Verify {
         #[arg(long)]
         config: PathBuf,
-        /// Verify only this pool (other pools are not leased or scanned).
         #[arg(long)]
-        pool: Option<String>,
-        /// Stable fragment ID; omit to verify every fragment in the selected pools.
-        #[arg(long)]
-        fragment: Option<String>,
+        pool: Option<PoolId>,
     },
-    /// Fence an empty clone target before copying manually. Then run verify-copy.
+    /// Fence an empty target before a manual byte-exact copy.
     PrepareCopy {
         #[command(flatten)]
         selection: Selection,
         #[arg(long)]
         copy_root: PathBuf,
     },
-    /// Verify a complete manual copy; synchronize it and remove only its matching fence.
+    /// Verify a fenced manual copy before permitting activation.
     VerifyCopy {
         #[command(flatten)]
         selection: Selection,
         #[arg(long)]
         copy_root: PathBuf,
     },
-    /// Copy unchanged member contents to another device for verified cutover.
+    /// Copy one immutable member identity, verify every byte, then remove its fence.
     Clone {
         #[command(flatten)]
         selection: Selection,
@@ -77,133 +73,329 @@ enum Operation {
         #[arg(long)]
         resume: bool,
     },
-    /// Rebuild a blank replacement at its configured location; activate only after verification.
+    /// Reconstruct one blank configured member; retain its immutable identity.
     Replace {
         #[command(flatten)]
         selection: Selection,
         #[arg(long)]
         resume: bool,
-        /// Explicit authorization; never initializes replacement storage automatically.
         #[arg(long, required = true)]
         authorize: bool,
     },
 }
-
 #[derive(Default, Serialize)]
-pub(crate) struct Report {
-    pub files: u64,
-    pub bytes: u64,
-    pub versions: u64,
-    pub pointers: u64,
+struct Report {
+    files: u64,
+    bytes: u64,
     reconstructed_shards: u64,
+    preserved_retirements: u64,
+    unrecoverable_private_stripes: u64,
     elapsed_ms: f64,
-    peak_rss_kib: i64,
-    final_open_fds: usize,
-}
-struct Context {
-    control: PathBuf,
-    pools: Vec<StoragePool>,
-    _lease: InstanceLease,
 }
 
-impl Context {
-    fn open(
-        config: &Path,
-        replacement: Option<(&str, usize)>,
-        extra: Option<&Path>,
-    ) -> Result<Self> {
-        Self::open_scoped(config, replacement, extra, None)
+fn reserved(entry: &DirEntry) -> bool {
+    entry.depth() == 1
+        && matches!(
+            entry.file_name().to_str(),
+            Some(
+                LEASE_FILE
+                    | RESTORE_PENDING
+                    | WORK
+                    | ".n1-restore-work"
+                    | ".n1-restore-complete"
+                    | ".n1-backup-views"
+            )
+        )
+}
+fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
+    WalkDir::new(root)
+        .min_depth(1)
+        .max_open(16)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !reserved(e))
+}
+
+fn verify_member(member: &Member, report: &mut Report) -> Result<()> {
+    member.check_binding()?;
+    for entry in walk(&member.path) {
+        let entry = entry?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            return Err(invalid(
+                "LINK members cannot contain aliases or special files",
+            ));
+        }
+        let relative = entry.path().strip_prefix(&member.path)?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF8 member path"))?;
+        let mut file = member.open_read(Path::new(relative))?.try_clone()?;
+        let length = file.metadata()?.len();
+        verify_file(relative, &member.marker, &mut file, length)?;
+        report.files += 1;
+        report.bytes += length;
     }
+    member.check_binding()?;
+    Ok(())
+}
 
-    fn open_scoped(
-        config: &Path,
-        replacement: Option<(&str, usize)>,
-        extra: Option<&Path>,
-        selected_pool: Option<&str>,
-    ) -> Result<Self> {
-        let config = ini::Ini::load_from_file(config)?;
-        let control = fs::canonicalize(
-            config
-                .section(Some("disk_config"))
-                .and_then(|s| s.get("fs_storage_path"))
-                .ok_or_else(|| invalid("missing fs_storage_path"))?,
+/// Interrupted private frames may be missing or torn. Validate their identity
+/// and read every allocated extent for I/O errors, without reading a potentially
+/// enormous sparse hole as if it were an uploaded payload. Committed data still
+/// passes the complete frame/root verifier.
+fn verify_file(
+    path: &str,
+    marker: &super::storage_pool::MemberMarker,
+    file: &mut File,
+    length: u64,
+) -> Result<()> {
+    use super::backup::restore::{FileKind, allowed_path};
+    use std::os::fd::AsRawFd;
+    if let Some(FileKind::Staged(fp, index)) = allowed_path(path, marker, true)? {
+        let mut bytes = [0; 128];
+        super::linux_io::pread_exact_at(&*file, &mut bytes, 0)?;
+        let header = n1_link::shard::ShardHeader::decode(&bytes, &marker.layout, fp, index)?;
+        if length < 128 || length > header.file_bytes()? {
+            return Err(invalid("invalid staged maintenance length"));
+        }
+        let mut offset = 128;
+        let mut buffer = vec![0; 128 * 1024];
+        while offset < length {
+            let data = unsafe { libc::lseek(file.as_raw_fd(), offset as i64, libc::SEEK_DATA) };
+            if data < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ENXIO) => break,
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => {}
+                    _ => return Err(error.into()),
+                }
+            } else {
+                offset = data as u64;
+            }
+            let hole = unsafe { libc::lseek(file.as_raw_fd(), offset as i64, libc::SEEK_HOLE) };
+            let end = if hole < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => length,
+                    _ => return Err(error.into()),
+                }
+            } else {
+                (hole as u64).min(length)
+            };
+            if end <= offset {
+                return Err(invalid("invalid staged extent boundary"));
+            }
+            while offset < end {
+                let n = (end - offset).min(buffer.len() as u64) as usize;
+                super::linux_io::pread_exact_at(&*file, &mut buffer[..n], offset)?;
+                offset += n as u64;
+            }
+        }
+        return Ok(());
+    }
+    validate_member_file(path, marker, file, length, true)
+}
+
+struct CopyOptions {
+    prepare_only: bool,
+    manual: bool,
+    resume: bool,
+    independent: bool,
+}
+fn clone_member(
+    pool: &Pool,
+    slot: usize,
+    target: &Path,
+    options: CopyOptions,
+    report: &mut Report,
+) -> Result<()> {
+    let CopyOptions {
+        prepare_only,
+        manual,
+        resume,
+        independent,
+    } = options;
+    let source = pool
+        .members
+        .get(slot)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| invalid("selected member is unavailable or outside pool"))?;
+    pool.writable()?;
+    let target = fs::canonicalize(target)?;
+    for member in pool.members.iter().flatten() {
+        let root = fs::canonicalize(&member.path)?;
+        if root.starts_with(&target) || target.starts_with(&root) {
+            return Err(invalid("copy target overlaps a configured member"));
+        }
+    }
+    let lease = Target::open(&target)?;
+    if independent && fs::metadata(&source.path)?.dev() == fs::metadata(&target)?.dev() {
+        return Err(invalid(
+            "clone destination must be on another mounted filesystem",
+        ));
+    }
+    let fence = serde_json::to_vec(&serde_json::json!({
+        "format":"n1-offline-link-pool-v1", "operation":"clone",
+        "member":source.marker, "source":fs::canonicalize(&source.path)?, "target":target,
+    }))?;
+    if prepare_only {
+        prepare(&target, &fence, false, false)?;
+        return Ok(());
+    }
+    // Manual copies must have been fenced by prepare-copy; an arbitrary
+    // populated directory cannot acquire maintenance ownership retroactively.
+    prepare(&target, &fence, resume || manual, manual)?;
+    verify_member(source, &mut Report::default())?;
+    if !manual {
+        for entry in walk(&source.path) {
+            let entry = entry?;
+            lease.check()?;
+            source.check_binding()?;
+            copy_entry(
+                entry.path(),
+                &target,
+                entry.path().strip_prefix(&source.path)?,
+            )?;
+        }
+    }
+    verify_copy(&source.path, &target, report)?;
+    let copied = read_regular(&target.join(".n1-arc-pool.json"), MAX_METADATA)?;
+    if serde_json::from_slice::<super::storage_pool::MemberMarker>(&copied)? != source.marker {
+        return Err(invalid(
+            "copied member identity differs from the configured map",
+        ));
+    }
+    source.check_binding()?;
+    lease.check()?;
+    complete(&target)
+}
+
+pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
+    let started = std::time::Instant::now();
+    let cli = Cli::parse_from(args);
+    let (config_path, selected) = match &cli.command {
+        Operation::Verify { config, pool } => (config, *pool),
+        Operation::PrepareCopy { selection, .. }
+        | Operation::VerifyCopy { selection, .. }
+        | Operation::Clone { selection, .. }
+        | Operation::Replace { selection, .. } => (&selection.config, Some(selection.pool)),
+    };
+    let config = Config::load(config_path)?;
+    let state = config.ensure_state_root()?;
+    let _control_lease = InstanceLease::acquire(&[state], false)?;
+    if let Operation::Replace {
+        selection,
+        resume,
+        authorize,
+    } = &cli.command
+    {
+        if !authorize {
+            return Err(invalid("replacement requires --authorize"));
+        }
+        let configured = config
+            .pools
+            .iter()
+            .find(|p| p.layout.id == selection.pool)
+            .ok_or_else(|| invalid("unknown storage pool"))?;
+        let pool = Pool::open_survivors(
+            configured.layout.clone(),
+            &configured.roots,
+            selection.member,
         )?;
-        let pools =
-            storage_pool::bind_locations(storage_pool::parse(&config).map_err(invalid)?, &control)
-                .map_err(invalid)?;
-        let enrolled: Vec<StoragePool> = serde_json::from_slice(&read_regular(
-            &control.join(".n1/storage-pools.json"),
-            MAX_METADATA,
-        )?)?;
-        storage_pool::validate_catalog(&enrolled, &pools).map_err(invalid)?;
-        if selected_pool.is_some_and(|id| !pools.iter().any(|pool| pool.id == id)) {
-            return Err(invalid("unknown storage pool"));
-        }
-        let mut paths = vec![control.clone()];
-        for pool in pools
-            .iter()
-            .filter(|pool| selected_pool.is_none_or(|id| pool.id == id))
-        {
-            let mut devices = BTreeSet::new();
-            for (slot, root) in pool.roots.iter().enumerate() {
-                let replacing = replacement == Some((pool.id.as_str(), slot));
-                let metadata = fs::symlink_metadata(root)?;
-                if !metadata.is_dir() || !devices.insert(metadata.dev()) {
-                    return Err(invalid(
-                        "pool members must be directories on distinct mounted filesystems",
-                    ));
+        super::root_identity::verify_pool(&pool, &configured.members)?;
+        let mut report = Report::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        runtime.block_on(replacement::replace(
+            &config,
+            configured,
+            &pool,
+            selection.member,
+            *resume,
+            true,
+            &mut report,
+        ))?;
+        report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
+    let configured = config
+        .pools
+        .iter()
+        .filter(|p| selected.is_none_or(|id| p.layout.id == id));
+    let mut pools = Vec::new();
+    for configured in configured {
+        let pool = Pool::open(configured.layout.clone(), &configured.roots)?;
+        super::root_identity::verify_pool(&pool, &configured.members)?;
+        pool.writable()?;
+        pools.push(pool);
+    }
+    if pools.is_empty() {
+        return Err(invalid("unknown storage pool"));
+    }
+    let mut report = Report::default();
+    match cli.command {
+        Operation::Verify { .. } => {
+            for pool in &pools {
+                for member in pool.members.iter().flatten() {
+                    verify_member(member, &mut report)?;
                 }
-                if !replacing {
-                    root_identity::verify_registered_identity(&control, root).map_err(invalid)?;
-                    if root.join(RESTORE_PENDING).try_exists()? {
-                        return Err(invalid("source member has unfinished offline maintenance"));
-                    }
-                    check_pool_marker(pool, root)?;
-                    // A source never receives a newly fabricated lease/identity.
-                    if !root.join(LEASE_FILE).is_file() {
-                        return Err(invalid("source lease is not initialized"));
-                    }
-                }
-                paths.push(root.clone());
             }
         }
-        if let Some(extra) = extra {
-            let extra = fs::canonicalize(extra)?;
-            if paths
-                .iter()
-                .any(|p| p.starts_with(&extra) || extra.starts_with(p))
-            {
-                return Err(invalid("copy target overlaps configured storage/control"));
+        operation => {
+            let (selection, target, prepare, manual, resume) = match operation {
+                Operation::PrepareCopy {
+                    selection,
+                    copy_root,
+                } => (selection, copy_root, true, false, false),
+                Operation::VerifyCopy {
+                    selection,
+                    copy_root,
+                } => (selection, copy_root, false, true, false),
+                Operation::Clone {
+                    selection,
+                    copy_root,
+                    resume,
+                } => (selection, copy_root, false, false, resume),
+                _ => unreachable!(),
+            };
+            let canonical = fs::canonicalize(&target)?;
+            let control = fs::canonicalize(config.state_root())?;
+            if canonical.starts_with(&control) || control.starts_with(&canonical) {
+                return Err(invalid("copy target overlaps engine control state"));
             }
-            paths.push(extra);
+            for root in config.pools.iter().flat_map(|p| &p.roots) {
+                let root = fs::canonicalize(root)?;
+                if canonical.starts_with(&root) || root.starts_with(&canonical) {
+                    return Err(invalid("copy target overlaps configured storage"));
+                }
+            }
+            clone_member(
+                &pools[0],
+                selection.member,
+                &canonical,
+                CopyOptions {
+                    prepare_only: prepare,
+                    manual,
+                    resume,
+                    independent: true,
+                },
+                &mut report,
+            )?;
         }
-        let lease = InstanceLease::acquire(&paths, false)?;
-        // Recheck after obtaining exclusion, including the enrolled catalog.
-        let current: Vec<StoragePool> = serde_json::from_slice(&read_regular(
-            &control.join(".n1/storage-pools.json"),
-            MAX_METADATA,
-        )?)?;
-        storage_pool::validate_catalog(&current, &pools).map_err(invalid)?;
-        storage_pool::STORAGE_POOLS
-            .set(pools.clone())
-            .map_err(|_| invalid("offline pool locations already initialized"))?;
-        Ok(Self {
-            control,
-            pools: pools
-                .into_iter()
-                .filter(|pool| selected_pool.is_none_or(|id| pool.id == id))
-                .collect(),
-            _lease: lease,
-        })
     }
-    fn selected(&self, selection: &Selection) -> Result<&StoragePool> {
-        self.pools
-            .iter()
-            .find(|p| p.id == selection.pool && selection.member < p.width())
-            .ok_or_else(|| invalid("unknown pool/member slot"))
-    }
+    report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
+// Copy, fence and inventory primitives below are retained from the original
+// storage_admin implementation. Format-specific verification is above.
 fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut file = open_regular(path)?;
     if file.metadata()?.len() > limit {
@@ -219,7 +411,7 @@ fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
 fn open_regular(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(invalid("expected regular storage file"));
@@ -252,74 +444,6 @@ fn safe_join(root: &Path, path: &Path) -> Result<PathBuf> {
     }
     Ok(current)
 }
-fn reserved(entry: &DirEntry) -> bool {
-    entry.depth() == 1
-        && matches!(
-            entry.file_name().to_str(),
-            Some(
-                LEASE_FILE
-                    | RESTORE_PENDING
-                    | WORK
-                    | ".n1-restore-work"
-                    | ".n1-restore-complete"
-                    | crate::core::backup::online::VIEW_DIR
-            )
-        )
-}
-fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
-    WalkDir::new(root)
-        .min_depth(1)
-        .max_open(16)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| !reserved(e))
-}
-fn check_pool_marker(pool: &StoragePool, root: &Path) -> Result<()> {
-    if let Some(member) = storage_pool::read_member(root).map_err(invalid)? {
-        if !member.pool.same_geometry(pool)
-            || member.pool.members != pool.members
-            || member.pool.address_roots() != pool.address_roots()
-            || pool
-                .roots
-                .iter()
-                .position(|r| r == root)
-                .is_some_and(|slot| slot != member.member_slot)
-        {
-            return Err(invalid("member pool identity/geometry/slot mismatch"));
-        }
-        return Ok(());
-    }
-    let actual: StoragePool =
-        serde_json::from_slice(&read_regular(&root.join(".n1-pool.json"), MAX_METADATA)?)?;
-    let mut expected = pool.clone();
-    expected.sealed = false;
-    if actual != expected {
-        return Err(invalid("member pool identity/geometry/order mismatch"));
-    }
-    Ok(())
-}
-fn checksum(path: &Path, expected: &ShardInfo) -> Result<()> {
-    if expected.checksum.len() != 8 || !expected.checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(invalid("recorded piece has no valid integrity checksum"));
-    }
-    let mut file = open_regular(path)?;
-    if file.metadata()?.len() != expected.size_bytes {
-        return Err(invalid("piece length mismatch"));
-    }
-    let mut digest = crc32fast::Hasher::new();
-    let mut buffer = vec![0u8; 256 * 1024];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buffer[..n]);
-    }
-    if digest.finalize() != u32::from_str_radix(&expected.checksum, 16)? {
-        return Err(invalid("piece checksum mismatch"));
-    }
-    Ok(())
-}
 fn digest(path: &Path) -> Result<[u8; 32]> {
     let mut file = open_regular(path)?;
     let mut hash = Sha256::new();
@@ -333,412 +457,6 @@ fn digest(path: &Path) -> Result<[u8; 32]> {
     }
     Ok(hash.finalize().into())
 }
-fn piece_path(pool: &StoragePool, shard: &ShardInfo) -> Result<PathBuf> {
-    let root = pool
-        .roots
-        .get(shard.shard_index)
-        .ok_or_else(|| invalid("piece slot outside pool"))?;
-    let path = storage_pool::resolve_address_in(std::slice::from_ref(pool), &shard.absolute_path)
-        .map_err(invalid)?;
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|_| invalid("piece address outside its enrolled slot"))?;
-    if rel.file_name().and_then(|n| n.to_str()) != Some(shard.file_name.as_str()) {
-        return Err(invalid("piece filename/address mismatch"));
-    }
-    safe_join(root, rel)
-}
-fn verify_part(pool: &StoragePool, part: &PartMetadata, missing: Option<usize>) -> Result<()> {
-    if part.shards.len() != pool.width() {
-        return Err(invalid("part geometry differs from pool"));
-    }
-    let mut slots = BTreeSet::new();
-    for shard in &part.shards {
-        if !slots.insert(shard.shard_index)
-            || shard.is_parity != (shard.shard_index >= usize::from(pool.data_shards))
-        {
-            return Err(invalid("duplicate/invalid EC member slot"));
-        }
-        let path = piece_path(pool, shard)?;
-        if missing != Some(shard.shard_index) {
-            checksum(&path, shard)?;
-        }
-    }
-    Ok(())
-}
-fn version(pool: &StoragePool, rel: &Path, bytes: &[u8]) -> Result<ObjectMetadata> {
-    let meta: ObjectMetadata = rmp_serde::from_slice(bytes)?;
-    if meta.data_shards != pool.data_shards
-        || meta.parity_shards != pool.parity_shards
-        || meta.version_id.parse::<ulid::Ulid>().is_err()
-        || meta.parts.is_empty()
-    {
-        return Err(invalid("invalid committed version or pool geometry"));
-    }
-    let parts: Vec<_> = rel.iter().filter_map(|s| s.to_str()).collect();
-    if parts.len() != 6
-        || parts[1] != ".objects"
-        || parts[4] != format!("@o_{}", meta.object_key)
-        || !parts[5].starts_with(&format!("{}.", meta.version_id))
-    {
-        return Err(invalid("version metadata identity/location mismatch"));
-    }
-    let fanout = ObjectPathManager::object_fanout_segments(&meta.object_key);
-    if parts[2] != fanout[0] || parts[3] != fanout[1] {
-        return Err(invalid("object fanout mismatch"));
-    }
-    let directory = rel.parent().unwrap().join(&meta.version_id);
-    for part in &meta.parts {
-        for shard in &part.shards {
-            let path = piece_path(pool, shard)?;
-            let relative = path.strip_prefix(&pool.roots[shard.shard_index])?;
-            if relative.parent() != Some(directory.as_path()) {
-                return Err(invalid("piece belongs to another object/version"));
-            }
-        }
-    }
-    Ok(meta)
-}
-fn is_version(rel: &Path) -> bool {
-    rel.extension().is_some_and(|v| v == "ndx")
-        && rel.components().any(|c| c.as_os_str() == ".objects")
-}
-fn is_upload_part(rel: &Path) -> bool {
-    rel.components().any(|c| c.as_os_str() == ".uploads")
-        && rel
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("part_") && n.ends_with(".ndx"))
-}
-fn pointer_placement(
-    pool: &StoragePool,
-    rel: &Path,
-    bytes: &[u8],
-    path: &Path,
-    known_pools: &[StoragePool],
-) -> Result<Vec<PathBuf>> {
-    let pointer = flat::read(path)
-        .map_err(|e| invalid(e.to_string()))?
-        .ok_or_else(|| invalid("missing NCX"))?;
-    if pointer.pool_id != pool.id {
-        return Err(invalid("NCX belongs to a different pool"));
-    }
-    let components: Vec<_> = rel.iter().filter_map(|s| s.to_str()).collect();
-    let fragment = components
-        .first()
-        .and_then(|s| s.strip_prefix("@f_"))
-        .ok_or_else(|| invalid("invalid NCX fragment"))?;
-    let offset = match components.get(1).copied() {
-        Some(".namespace") => 2,
-        Some(".trash") => 3,
-        _ => return Err(invalid("NCX outside live/trash namespace")),
-    };
-    let encoded: PathBuf = components.iter().skip(offset).collect();
-    let key = flat::decoded_key(&encoded).ok_or_else(|| invalid("invalid encoded NCX key"))?;
-    let holders = pool.namespace_roots(fragment, &key);
-    let fanout = ObjectPathManager::object_fanout_segments(&pointer.object_id);
-    let object = pool.roots[0]
-        .join(components[0])
-        .join(".objects")
-        .join(&fanout[0])
-        .join(&fanout[1])
-        .join(format!("@o_{}", pointer.object_id));
-    // At least one committed version is required; dangling pointers cannot be
-    // certified by merely copying the small NCX successfully.
-    // NCX's pool owns its replica placement, not every future version of its
-    // stable object. After expansion new versions may live in another pool.
-    // A local-only lookup falsely labels that valid namespace binding dangling
-    // after older local versions are reclaimed. Use the same stable fanout on
-    // known pools; the selected pool's content scan still verifies only its own
-    // NDX/pieces, while full offline verification checks every selected pool.
-    let exists = pool
-        .roots
-        .iter()
-        .chain(
-            known_pools
-                .iter()
-                .filter(|other| other.id != pool.id)
-                .flat_map(|other| &other.roots),
-        )
-        .any(|root| {
-            let candidate = root.join(object.strip_prefix(&pool.roots[0]).unwrap());
-            fs::read_dir(candidate).is_ok_and(|entries| {
-                entries.filter_map(|e| e.ok()).any(|e| {
-                    e.path().extension().is_some_and(|x| x == "ndx")
-                        && e.file_type().is_ok_and(|t| t.is_file())
-                })
-            })
-        });
-    if !exists || bytes.is_empty() {
-        return Err(invalid("NCX has no committed object metadata"));
-    }
-    Ok(holders)
-}
-
-fn verify_replicas(
-    pool: &StoragePool,
-    missing: Option<usize>,
-    rel: &Path,
-    bytes: &[u8],
-) -> Result<()> {
-    for (slot, root) in pool.roots.iter().enumerate() {
-        if Some(slot) != missing && read_regular(&safe_join(root, rel)?, MAX_METADATA)? != bytes {
-            return Err(invalid(
-                "missing or divergent offline metadata/receipt replica",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn verify_pool(pool: &StoragePool, missing: Option<usize>, report: &mut Report) -> Result<()> {
-    verify_pool_scoped(pool, missing, None, report)
-}
-
-/// Read-only content inspection shared by online diagnostics and offline
-/// verification. Online callers must label this a live scan, not a snapshot.
-pub(crate) fn verify_pool_scoped(
-    pool: &StoragePool,
-    missing: Option<usize>,
-    fragment: Option<&str>,
-    report: &mut Report,
-) -> Result<()> {
-    verify_pool_scoped_on(pool, missing, fragment, storage_pool::configured(), report)
-}
-
-fn verify_pool_scoped_on(
-    pool: &StoragePool,
-    missing: Option<usize>,
-    fragment: Option<&str>,
-    known_pools: &[StoragePool],
-    report: &mut Report,
-) -> Result<()> {
-    if fragment.is_some_and(|id| id.parse::<ulid::Ulid>().is_err()) {
-        return Err(invalid("expected a stable fragment ULID"));
-    }
-    let primary = (0..pool.width())
-        .find(|s| Some(*s) != missing)
-        .ok_or_else(|| invalid("no surviving member"))?;
-    for (slot, root) in pool
-        .roots
-        .iter()
-        .enumerate()
-        .filter(|(s, _)| Some(*s) != missing)
-    {
-        let scan_root = fragment
-            .map(|id| root.join(format!("@f_{id}")))
-            .unwrap_or_else(|| root.clone());
-        // Unlike a full-pool walk, min_depth(1) on this directory still includes
-        // its .fragment.ndx. Missing fragment roots must not become an empty pass.
-        if fragment.is_some() && !fs::symlink_metadata(&scan_root).is_ok_and(|meta| meta.is_dir()) {
-            return Err(invalid("fragment is absent from a selected pool member"));
-        }
-        for entry in walk(&scan_root) {
-            let entry = entry?;
-            let rel = relative(entry.path().strip_prefix(root)?)?;
-            // Never follow a symlink standing in for the scan root itself.
-            if entry.file_type().is_symlink() {
-                let target = fs::read_link(entry.path())?;
-                if !rel.starts_with(".fragment")
-                    || target.components().count() != 2
-                    || !target.to_string_lossy().starts_with("../@f_")
-                {
-                    return Err(invalid("unsupported storage symlink"));
-                }
-                let fragment = root.join(".fragment").join(&target).join(".fragment.ndx");
-                if !fragment.is_file() {
-                    return Err(invalid("dangling fragment alias"));
-                }
-            } else if entry.file_type().is_file() {
-                report.files += 1;
-                report.bytes += entry.metadata()?.len();
-                if is_version(rel) {
-                    let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                    let meta = version(pool, rel, &bytes)?;
-                    for (other_slot, other) in pool.roots.iter().enumerate() {
-                        if Some(other_slot) != missing
-                            && read_regular(&safe_join(other, rel)?, MAX_METADATA)? != bytes
-                        {
-                            return Err(invalid("committed metadata replicas differ"));
-                        }
-                    }
-                    if slot == primary {
-                        for part in &meta.parts {
-                            verify_part(pool, part, missing)?;
-                        }
-                        report.versions += 1;
-                    }
-                } else if is_upload_part(rel) {
-                    let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                    let part: PartMetadata = rmp_serde::from_slice(&bytes)?;
-                    for (other_slot, other) in pool.roots.iter().enumerate() {
-                        if Some(other_slot) != missing
-                            && read_regular(&safe_join(other, rel)?, MAX_METADATA)? != bytes
-                        {
-                            return Err(invalid("durable part metadata replicas differ"));
-                        }
-                    }
-                    if slot == primary {
-                        verify_part(pool, &part, missing)?;
-                    }
-                } else if entry.file_name() == "manifest.ndx"
-                    && rel.components().any(|c| c.as_os_str() == ".uploads")
-                {
-                    let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                    verify_replicas(pool, missing, rel, &bytes)?;
-                    let manifest = crate::core::index_store::offline_session_manifest(&bytes)
-                        .map_err(|e| invalid(e.to_string()))?;
-                    if rel
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .and_then(|s| s.to_str())
-                        != Some(manifest.version_id.as_str())
-                    {
-                        return Err(invalid("durable manifest version/location mismatch"));
-                    }
-                    if manifest.data_shards != pool.data_shards
-                        || manifest.parity_shards != pool.parity_shards
-                        || manifest
-                            .placement_roots
-                            .iter()
-                            .map(|root| {
-                                storage_pool::resolve_address_in(std::slice::from_ref(pool), root)
-                                    .map_err(invalid)
-                            })
-                            .collect::<Result<Vec<_>>>()?
-                            != pool.roots
-                    {
-                        return Err(invalid(
-                            "durable upload geometry/placement differs from pool",
-                        ));
-                    }
-                    if slot == primary {
-                        let fragment = rel
-                            .iter()
-                            .next()
-                            .and_then(|s| s.to_str())
-                            .and_then(|s| s.strip_prefix("@f_"))
-                            .ok_or_else(|| invalid("invalid upload fragment"))?;
-                        for part in crate::core::index_store::offline_session_parts(
-                            entry.path().parent().unwrap(),
-                            manifest,
-                            fragment,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?
-                        {
-                            verify_part(pool, &part.map_err(|e| invalid(e.to_string()))?, missing)?;
-                        }
-                    }
-                } else if rel.extension().is_some_and(|s| s == "receipt")
-                    && rel.components().any(|c| c.as_os_str() == ".uploads")
-                {
-                    let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                    if !bytes.is_empty() {
-                        return Err(invalid("durable receipt is not an empty integrity marker"));
-                    }
-                    verify_replicas(pool, missing, rel, &bytes)?;
-                } else if rel.extension().is_some_and(|s| s == "ncx") {
-                    let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                    let holders = pointer_placement(pool, rel, &bytes, entry.path(), known_pools)?;
-                    if !holders.contains(root) {
-                        return Err(invalid("NCX on an unexpected member slot"));
-                    }
-                    for holder in holders {
-                        if missing.is_none_or(|s| holder != pool.roots[s])
-                            && read_regular(&safe_join(&holder, rel)?, MAX_METADATA)? != bytes
-                        {
-                            return Err(invalid("missing/divergent NCX replica"));
-                        }
-                    }
-                    report.pointers += 1;
-                } else if entry.file_name() == ".fragment.ndx" {
-                    let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                    verify_replicas(pool, missing, rel, &bytes)?;
-                    let meta: crate::core::index_store::FragmentMeta =
-                        rmp_serde::from_slice(&bytes)?;
-                    if meta.engine_format_version != 4
-                        || rel.iter().next().unwrap()
-                            != format!("@f_{}", meta.stable_fragment_id).as_str()
-                    {
-                        return Err(invalid("fragment metadata identity/format mismatch"));
-                    }
-                }
-            } else if !entry.file_type().is_dir() {
-                return Err(invalid("unsupported storage file type"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Shared full-integrity gate for offline capture/restore. Caller holds all
-/// member leases. Anonymous low-level backup fixtures have no N1 topology.
-pub(crate) fn verify_backup_roots(roots: &[crate::core::backup::format::Root]) -> Result<()> {
-    if roots.iter().all(|r| r.member.is_none()) {
-        return Ok(());
-    }
-    let mut ids = BTreeSet::new();
-    let mut pools = Vec::new();
-    for root in roots {
-        let member = root
-            .member
-            .as_ref()
-            .ok_or_else(|| invalid("missing backup member identity"))?;
-        if !ids.insert(member.pool_id.clone()) {
-            continue;
-        }
-        let width = usize::from(member.data_shards) + usize::from(member.parity_shards);
-        let mut members: Vec<_> = roots
-            .iter()
-            .filter(|r| {
-                r.member
-                    .as_ref()
-                    .is_some_and(|m| m.pool_id == member.pool_id)
-            })
-            .collect();
-        members.sort_by_key(|r| r.member.as_ref().unwrap().slot);
-        if members.len() != width
-            || members.iter().enumerate().any(|(slot, r)| {
-                let m = r.member.as_ref().unwrap();
-                m.slot != slot
-                    || m.generation != member.generation
-                    || m.data_shards != member.data_shards
-                    || m.parity_shards != member.parity_shards
-            })
-        {
-            return Err(invalid("incomplete or conflicting backup pool membership"));
-        }
-        let mut pool = StoragePool {
-            id: member.pool_id.clone(),
-            generation: member.generation,
-            data_shards: member.data_shards,
-            parity_shards: member.parity_shards,
-            roots: members.iter().map(|r| PathBuf::from(&r.path)).collect(),
-            members: Vec::new(),
-            legacy_roots: Vec::new(),
-            sealed: false,
-        };
-        if let Some(member) = storage_pool::read_member(&pool.roots[0]).map_err(invalid)? {
-            pool.members = member.pool.members.clone();
-            pool.legacy_roots = member.pool.address_roots().to_vec();
-        }
-        for root in &pool.roots {
-            check_pool_marker(&pool, root)?;
-        }
-        pools.push(pool);
-    }
-    for pool in &pools {
-        verify_pool_scoped_on(pool, None, None, &pools, &mut Report::default())?;
-    }
-    Ok(())
-}
-
-fn marker(pool: &StoragePool, slot: usize, operation: &str, target: &Path) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(
-        &serde_json::json!({"format":"n1-offline-pool-v1",
-        "operation":operation,"pool":pool,"slot":slot,"target":target}),
-    )?)
-}
 fn prepare(target: &Path, marker: &[u8], resume: bool, populated_copy: bool) -> Result<()> {
     let fence = target.join(RESTORE_PENDING);
     if fence.try_exists()? {
@@ -749,10 +467,12 @@ fn prepare(target: &Path, marker: &[u8], resume: bool, populated_copy: bool) -> 
         if resume {
             return Err(invalid("no matching interrupted maintenance to resume"));
         }
-        if !populated_copy
-            && fs::read_dir(target)?.any(|e| e.is_ok_and(|e| e.file_name() != LEASE_FILE))
-        {
-            return Err(invalid("maintenance requires an empty target"));
+        if !populated_copy {
+            for entry in fs::read_dir(target)? {
+                if entry?.file_name() != LEASE_FILE {
+                    return Err(invalid("maintenance requires an empty target"));
+                }
+            }
         }
         atomic_bytes(&fence, marker)?;
     }
@@ -785,19 +505,7 @@ fn ensure_parents(target: &Path, rel: &Path) -> Result<PathBuf> {
 fn copy_entry(source: &Path, target: &Path, rel: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
-        let path = target.join(relative(rel)?);
-        let link = fs::read_link(source)?;
-        safe_join(
-            target,
-            rel.parent().ok_or_else(|| invalid("invalid alias path"))?,
-        )?;
-        fs::create_dir_all(path.parent().unwrap())?;
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() && fs::read_link(&path)? == link => {}
-            Ok(_) => return Err(invalid("conflicting copied alias")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => symlink(link, path)?,
-            Err(e) => return Err(e.into()),
-        }
+        return Err(invalid("LINK member copy refuses aliases"));
     } else {
         let path = ensure_parents(target, rel)?;
         if metadata.is_dir() {
@@ -860,7 +568,7 @@ fn verify_copy(source: &Path, target: &Path, report: &mut Report) -> Result<()> 
 }
 fn complete(target: &Path) -> Result<()> {
     // Full file/directory synchronization is ONLY for offline cutover. It does
-    // not add fsyncs to ordinary NCX namespace mutation.
+    // not add fsyncs to ordinary LINK object operations.
     for entry in WalkDir::new(target)
         .min_depth(1)
         .max_open(16)
@@ -914,12 +622,20 @@ fn expect(target: &Path, rel: &Path, kind: &str) -> Result<()> {
     Ok(())
 }
 fn audit_replacement(target: &Path) -> Result<()> {
-    for entry in walk(target) {
+    // A fresh replacement has only its own fence/work area. Do not let the
+    // clone scanner's exclusions hide unrelated backup/restore state here.
+    for entry in WalkDir::new(target)
+        .min_depth(1)
+        .max_open(16)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !(entry.depth() == 1
+                && matches!(entry.file_name().to_str(), Some(WORK | RESTORE_PENDING)))
+        })
+    {
         let entry = entry?;
         let rel = entry.path().strip_prefix(target)?;
-        if rel == Path::new(".n1-root-id") {
-            continue;
-        }
         let kind = if entry.file_type().is_dir() {
             "directory"
         } else if entry.file_type().is_file() {
@@ -970,298 +686,26 @@ fn audit_replacement(target: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn rebuild_part(
-    pool: &StoragePool,
-    slot: usize,
-    part: PartMetadata,
-    stripe: usize,
-    report: &mut Report,
-) -> Result<()> {
-    verify_part(pool, &part, Some(slot))?;
-    let shard = part
-        .shards
-        .iter()
-        .find(|s| s.shard_index == slot)
-        .ok_or_else(|| invalid("missing replacement slot"))?;
-    let path = piece_path(pool, shard)?;
-    expect(
-        &pool.roots[slot],
-        path.strip_prefix(&pool.roots[slot])?,
-        "file",
-    )?;
-    if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
-        let prefix = format!("{}.tmp.repair.", shard.file_name);
-        for entry in fs::read_dir(parent)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.strip_prefix(&prefix))
-                .is_some_and(|suffix| suffix.parse::<ulid::Ulid>().is_ok())
-            {
-                if !entry.file_type()?.is_file() {
-                    return Err(invalid("invalid interrupted repair temporary"));
-                }
-                fs::remove_file(entry.path())?;
-            }
-        }
-    }
-    if checksum(&path, shard).is_err() {
-        if stripe == 0 || stripe % 4096 != 0 {
-            return Err(invalid("invalid recorded stripe geometry"));
-        }
-        crate::core::recovery::repair_entire_shard(Arc::new(part.clone()), slot, stripe)
-            .await
-            .map_err(|e| invalid(e.to_string()))?;
-        checksum(&path, shard)?;
-        report.reconstructed_shards += 1;
-    }
-    Ok(())
-}
-
-async fn replace(
-    context: &Context,
-    pool: &StoragePool,
-    slot: usize,
-    resume: bool,
-    report: &mut Report,
-) -> Result<()> {
-    if pool.parity_shards == 0 {
-        return Err(invalid(
-            "lost 1+0 member requires a verified backup; use clone for a healthy source",
-        ));
-    }
-    let target = &pool.roots[slot];
-    // Context bound and validated the accepted logical member already. A blank
-    // replacement at a new location deliberately has no path-keyed identity.
-    if pool.members.get(slot).is_none_or(|id| id.is_empty()) {
-        return Err(invalid("replacement slot has no accepted member identity"));
-    }
-    let marker = marker(pool, slot, "replace", target)?;
-    prepare(target, &marker, resume, false)?;
-    storage_pool::write_member(pool, slot).map_err(invalid)?;
-    fs::create_dir_all(safe_join(target, Path::new(WORK))?)?;
-    let inventory = safe_join(target, &Path::new(WORK).join("inventory"))?;
-    if inventory.try_exists()? {
-        fs::remove_dir_all(inventory)?;
-    }
-    expect(target, Path::new(".n1-pool.json"), "file")?;
-    // Require all surviving peers to be complete and checksum-valid. Do not
-    // certify a partial inventory or guess through conflicting metadata.
-    verify_pool(pool, Some(slot), &mut Report::default())?;
-    for (peer_slot, peer) in pool.roots.iter().enumerate().filter(|(s, _)| *s != slot) {
-        for entry in walk(peer) {
-            let entry = entry?;
-            let rel = relative(entry.path().strip_prefix(peer)?)?;
-            if rel == Path::new(".n1-root-id") || entry.file_type().is_dir() {
-                continue;
-            }
-            if entry.file_type().is_symlink() || entry.file_name() == ".fragment.ndx" {
-                expect(
-                    target,
-                    rel,
-                    if entry.file_type().is_symlink() {
-                        "link"
-                    } else {
-                        "file"
-                    },
-                )?;
-                copy_entry(entry.path(), target, rel)?;
-            } else if rel.extension().is_some_and(|s| s == "ncx") {
-                let bytes = read_regular(entry.path(), MAX_METADATA)?;
-                if pointer_placement(pool, rel, &bytes, entry.path(), storage_pool::configured())?
-                    .contains(target)
-                {
-                    expect(target, rel, "file")?;
-                    copy_entry(entry.path(), target, rel)?;
-                }
-            } else if is_version(rel) || rel.components().any(|c| c.as_os_str() == ".uploads") {
-                expect(target, rel, "file")?;
-                copy_entry(entry.path(), target, rel)?;
-                // A single surviving metadata copy drives each reconstruction;
-                // subsequent replicas are compared, not re-encoded repeatedly.
-                if peer_slot == (0..pool.width()).find(|s| *s != slot).unwrap() {
-                    if is_version(rel) {
-                        let meta = version(pool, rel, &read_regular(entry.path(), MAX_METADATA)?)?;
-                        for part in meta.parts {
-                            rebuild_part(pool, slot, part, meta.stripe_size_bytes, report).await?;
-                        }
-                    } else if is_upload_part(rel) {
-                        let part = rmp_serde::from_slice::<PartMetadata>(&read_regular(
-                            entry.path(),
-                            MAX_METADATA,
-                        )?)?;
-                        let manifest =
-                            crate::core::index_store::offline_session_manifest(&read_regular(
-                                &safe_join(peer, &rel.parent().unwrap().join("manifest.ndx"))?,
-                                MAX_METADATA,
-                            )?)
-                            .map_err(|e| invalid(e.to_string()))?;
-                        rebuild_part(pool, slot, part, manifest.stripe_size_bytes, report).await?;
-                    } else if entry.file_name() == "manifest.ndx" {
-                        let manifest = crate::core::index_store::offline_session_manifest(
-                            &read_regular(entry.path(), MAX_METADATA)?,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?;
-                        let stripe = manifest.stripe_size_bytes;
-                        let fragment = rel
-                            .iter()
-                            .next()
-                            .and_then(|s| s.to_str())
-                            .and_then(|s| s.strip_prefix("@f_"))
-                            .ok_or_else(|| invalid("invalid upload fragment"))?;
-                        for part in crate::core::index_store::offline_session_parts(
-                            entry.path().parent().unwrap(),
-                            manifest,
-                            fragment,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?
-                        {
-                            rebuild_part(
-                                pool,
-                                slot,
-                                part.map_err(|e| invalid(e.to_string()))?,
-                                stripe,
-                                report,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    verify_pool(pool, None, report)?;
-    audit_replacement(target)?;
-    // Root identity becomes trusted ONLY after the complete pool is verified.
-    root_identity::restore_verified_marker(&context.control, target).map_err(invalid)?;
-    complete(target)?;
-    Ok(())
-}
-
-pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
-    let started = std::time::Instant::now();
-    let cli = Cli::parse_from(args);
-    let mut report = Report::default();
-    match cli.command {
-        Operation::Verify {
-            config,
-            pool,
-            fragment,
-        } => {
-            let context = Context::open_scoped(&config, None, None, pool.as_deref())?;
-            for pool in &context.pools {
-                verify_pool_scoped(pool, None, fragment.as_deref(), &mut report)?;
-            }
-        }
-        operation @ (Operation::PrepareCopy { .. }
-        | Operation::VerifyCopy { .. }
-        | Operation::Clone { .. }) => {
-            let (selection, copy_root, prepare_only, manual, resume) = match operation {
-                Operation::PrepareCopy {
-                    selection,
-                    copy_root,
-                } => (selection, copy_root, true, false, false),
-                Operation::VerifyCopy {
-                    selection,
-                    copy_root,
-                } => (selection, copy_root, false, true, false),
-                Operation::Clone {
-                    selection,
-                    copy_root,
-                    resume,
-                } => (selection, copy_root, false, false, resume),
-                _ => unreachable!(),
-            };
-            let copy_root = fs::canonicalize(copy_root)?;
-            let context = Context::open(&selection.config, None, Some(&copy_root))?;
-            let pool = context.selected(&selection)?;
-            let source = &pool.roots[selection.member];
-            if fs::metadata(source)?.dev() == fs::metadata(&copy_root)?.dev() {
-                return Err(invalid(
-                    "clone destination must be on another mounted filesystem",
-                ));
-            }
-            let fence = marker(pool, selection.member, "clone", &copy_root)?;
-            if prepare_only {
-                prepare(&copy_root, &fence, false, false)?;
-            } else {
-                if manual {
-                    let pending = copy_root.join(RESTORE_PENDING).try_exists()?;
-                    prepare(&copy_root, &fence, pending, true)?;
-                } else {
-                    prepare(&copy_root, &fence, resume, false)?;
-                }
-                verify_pool(pool, None, &mut Report::default())?;
-                if !manual {
-                    fs::create_dir_all(copy_root.join(WORK))?;
-                    for entry in walk(source) {
-                        let entry = entry?;
-                        copy_entry(entry.path(), &copy_root, entry.path().strip_prefix(source)?)?;
-                    }
-                }
-                verify_copy(source, &copy_root, &mut report)?;
-                check_pool_marker(pool, &copy_root)?;
-                complete(&copy_root)?;
-            }
-        }
-        Operation::Replace {
-            selection,
-            resume,
-            authorize,
-        } => {
-            if !authorize {
-                return Err(invalid("replacement requires --authorize"));
-            }
-            let context = Context::open(
-                &selection.config,
-                Some((&selection.pool, selection.member)),
-                None,
-            )?;
-            let pool = context.selected(&selection)?;
-            // Reuse N1's existing repair reader with only the explicitly leased
-            // offline topology. No server, root admission bypass or cache is
-            // started; Context already verified all surviving identities.
-            let roots: Vec<_> = context
-                .pools
-                .iter()
-                .flat_map(|p| p.roots.iter())
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            crate::core::disk_manager::INDEX_STORE_DISKS
-                .set(roots.clone())
-                .map_err(|_| invalid("offline metadata topology was already initialized"))?;
-            crate::core::disk_manager::BLOB_STORE_DISKS
-                .set(roots)
-                .map_err(|_| invalid("offline repair topology was already initialized"))?;
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()?;
-            runtime.block_on(replace(
-                &context,
-                pool,
-                selection.member,
-                resume,
-                &mut report,
-            ))?;
-        }
-    }
-    report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
-        report.peak_rss_kib = unsafe { usage.assume_init() }.ru_maxrss;
-    }
-    report.final_open_fds = fs::read_dir("/proc/self/fd")
-        .map(|entries| entries.count())
-        .unwrap_or(0);
-    println!("{}", serde_json::to_string(&report)?);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+    #[test]
+    fn replacement_inventory_detects_missing_and_unexpected_files() {
+        let f = Fixture::new();
+        let target = f.dir("target");
+        fs::write(target.join("data"), b"data").unwrap();
+        expect(&target, Path::new("data"), "file").unwrap();
+        audit_replacement(&target).unwrap();
+        fs::write(target.join("extra"), b"extra").unwrap();
+        assert!(audit_replacement(&target).is_err());
+        fs::remove_file(target.join("extra")).unwrap();
+        fs::create_dir(target.join(".n1-backup-views")).unwrap();
+        assert!(audit_replacement(&target).is_err());
+        fs::remove_dir(target.join(".n1-backup-views")).unwrap();
+        fs::remove_file(target.join("data")).unwrap();
+        assert!(audit_replacement(&target).is_err());
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -1324,196 +768,175 @@ mod tests {
         assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
         assert!(safe_join(&target, Path::new("../escape")).is_err());
     }
-    #[test]
-    fn replacement_inventory_detects_missing_and_unexpected_files() {
-        let f = Fixture::new();
-        let target = f.dir("target");
-        expect(&target, Path::new("a/data"), "file").unwrap();
-        fs::create_dir(target.join("a")).unwrap();
-        fs::write(target.join("a/data"), b"data").unwrap();
-        audit_replacement(&target).unwrap();
-        fs::remove_file(target.join("a/data")).unwrap();
-        assert!(audit_replacement(&target).is_err());
-        fs::write(target.join("a/data"), b"data").unwrap();
-        fs::write(target.join("extra"), b"extra").unwrap();
-        assert!(audit_replacement(&target).is_err());
-    }
-    #[test]
-    fn piece_integrity_requires_checksum_size_and_bytes() {
-        let f = Fixture::new();
-        let path = f.0.join("piece");
-        fs::write(&path, b"piece").unwrap();
-        let mut shard = ShardInfo {
-            shard_index: 0,
-            is_parity: false,
-            file_name: "piece".into(),
-            absolute_path: path.to_string_lossy().into_owned(),
-            size_bytes: 5,
-            checksum: format!("{:08x}", crc32fast::hash(b"piece")),
-        };
-        checksum(&path, &shard).unwrap();
-        shard.checksum.clear();
-        assert!(checksum(&path, &shard).is_err());
-        shard.checksum = format!("{:08x}", crc32fast::hash(b"piece"));
-        fs::write(&path, b"other").unwrap();
-        assert!(checksum(&path, &shard).is_err());
-        fs::write(&path, b"piec").unwrap();
-        assert!(checksum(&path, &shard).is_err());
-    }
-    #[test]
-    fn offline_activation_rejects_missing_or_divergent_receipt_and_manifest_replicas() {
-        let f = Fixture::new();
-        let pool = StoragePool {
-            id: "A".into(),
-            generation: 1,
-            data_shards: 1,
-            parity_shards: 1,
-            roots: vec![f.dir("a"), f.dir("b")],
-            members: Vec::new(),
-            legacy_roots: Vec::new(),
-            sealed: false,
-        };
-        for (name, bytes) in [
-            ("manifest.ndx", &b"manifest"[..]),
-            ("piece.receipt", &b""[..]),
-        ] {
-            let rel = Path::new(name);
-            fs::write(pool.roots[0].join(rel), bytes).unwrap();
-            assert!(verify_replicas(&pool, None, rel, bytes).is_err());
-            verify_replicas(&pool, Some(1), rel, bytes).unwrap();
-            fs::write(pool.roots[1].join(rel), bytes).unwrap();
-            verify_replicas(&pool, None, rel, bytes).unwrap();
-            fs::write(pool.roots[1].join(rel), b"different").unwrap();
-            assert!(verify_replicas(&pool, None, rel, bytes).is_err());
+
+    fn options(prepare_only: bool, manual: bool, resume: bool) -> CopyOptions {
+        CopyOptions {
+            prepare_only,
+            manual,
+            resume,
+            independent: false,
         }
     }
 
-    #[test]
-    fn backup_verifies_cross_pool_version_references_without_global_engine_state() {
-        use crate::core::backup::format::{Member, Root};
-        let f = Fixture::new();
-        let fragment = ulid::Ulid::new().to_string();
-        let object = ulid::Ulid::new().to_string();
-        let version_id = ulid::Ulid::new().to_string();
-        let pools = ["A", "B"]
-            .into_iter()
-            .enumerate()
-            .map(|(i, id)| StoragePool {
-                id: id.into(),
-                generation: i as u64 + 1,
-                data_shards: 1,
-                parity_shards: 0,
-                roots: vec![f.dir(id)],
-                members: vec![ulid::Ulid::new().to_string()],
-                legacy_roots: vec![],
-                sealed: false,
-            })
-            .collect::<Vec<_>>();
-        let meta = crate::core::index_store::FragmentMeta {
-            engine_format_version: 4,
-            stable_fragment_id: fragment.clone(),
-            state: "active".into(),
-            committed_bytes: 0,
-            reserved_bytes: 0,
-            trash_bytes: 0,
-            created_at_unix: 1,
-            updated_at_unix: 1,
-            key_phc: None,
-            nt_hash_hex: None,
-            index_partition_count: 64,
-        };
-        for pool in &pools {
-            storage_pool::write_member(pool, 0).unwrap();
-            let physical = pool.roots[0].join(format!("@f_{fragment}"));
-            fs::create_dir_all(&physical).unwrap();
-            fs::write(
-                physical.join(".fragment.ndx"),
-                rmp_serde::to_vec_named(&meta).unwrap(),
+    #[tokio::test]
+    async fn verified_member_cutover_preserves_keys_retirements_and_durable_multipart_progress() {
+        use crate::core::{Store, tests::Fixture as EngineFixture};
+        use n1_link::Durability;
+        let f = EngineFixture::new();
+        let store = f.enroll();
+        let scope = [11; 16];
+        let payload = vec![63; 37000];
+        let live = store
+            .init(
+                scope,
+                0,
+                payload.len() as u64,
+                49152,
+                Durability::Durable,
+                3600,
             )
             .unwrap();
-        }
-        let fanout = ObjectPathManager::object_fanout_segments(&object);
-        let object_rel = PathBuf::from(format!("@f_{fragment}"))
-            .join(".objects")
-            .join(&fanout[0])
-            .join(&fanout[1])
-            .join(format!("@o_{object}"));
-        let directory = pools[1].roots[0].join(&object_rel);
-        fs::create_dir_all(directory.join(&version_id)).unwrap();
-        let piece = directory.join(&version_id).join("0.shard");
-        fs::write(&piece, b"data").unwrap();
-        let metadata = ObjectMetadata {
-            object_key: object.clone(),
-            fragment: fragment.clone(),
-            version_id: version_id.clone(),
-            upload_session_id: version_id.clone(),
-            owner_uid: fragment.clone(),
-            content_type: "application/octet-stream".into(),
-            total_size_bytes: 4,
-            created_at: 1,
-            data_shards: 1,
-            parity_shards: 0,
-            placement_generation: 1,
-            is_delete_marker: false,
-            stripe_size_bytes: 4,
-            parts: vec![PartMetadata {
-                part_index: 0,
-                size_bytes: 4,
-                created_at: 1,
-                checksum: None,
-                shards: vec![ShardInfo {
-                    shard_index: 0,
-                    file_name: "0.shard".into(),
-                    absolute_path: format!(
-                        "n1://B/2/0/{}/{version_id}/0.shard",
-                        object_rel.display()
-                    ),
-                    size_bytes: 4,
-                    checksum: format!("{:08x}", crc32fast::hash(b"data")),
-                    is_parity: false,
-                }],
-            }],
-        };
-        let ndx = directory.join(format!("{version_id}.ndx"));
-        fs::write(&ndx, rmp_serde::to_vec_named(&metadata).unwrap()).unwrap();
-        let pointer_path = pools[0].roots[0].join(format!("@f_{fragment}/.namespace/existing.ncx"));
-        flat::write(
-            &pools[0].roots[0],
-            &pointer_path,
-            &flat::Pointer {
-                format: 4,
-                pool_id: "A".into(),
-                object_id: object,
-            },
-            true,
+        store
+            .put(
+                scope,
+                live.upload_key.clone(),
+                std::io::Cursor::new(payload.clone()),
+            )
+            .await
+            .unwrap();
+        let dead = store
+            .init(scope, 0, 1, 12288, Durability::Durable, 3600)
+            .unwrap();
+        store
+            .put(
+                scope,
+                dead.upload_key.clone(),
+                std::io::Cursor::new(vec![7]),
+            )
+            .await
+            .unwrap();
+        store.delete(scope, dead.object_key.clone()).await.unwrap();
+        let upload = store
+            .init(scope, 0, 36864, 12288, Durability::Durable, 3600)
+            .unwrap();
+        store
+            .write_part(
+                scope,
+                upload.upload_key.clone(),
+                1,
+                std::io::Cursor::new(vec![41; 12288]),
+            )
+            .await
+            .unwrap();
+        let target = f.base.join("copy");
+        fs::create_dir(&target).unwrap();
+        let mut report = Report::default();
+        clone_member(
+            &store.pools[0],
+            0,
+            &target,
+            options(false, false, false),
+            &mut report,
         )
         .unwrap();
-        let roots = pools
-            .iter()
-            .map(|pool| Root {
-                path: pool.roots[0].display().to_string(),
-                legacy_path: None,
-                index: true,
-                blob: true,
-                member: Some(Member {
-                    pool_id: pool.id.clone(),
-                    generation: pool.generation,
-                    data_shards: 1,
-                    parity_shards: 0,
-                    slot: 0,
-                }),
-            })
-            .collect::<Vec<_>>();
-        let before_ndx = fs::read(&ndx).unwrap();
-        let before_ncx = fs::read(&pointer_path).unwrap();
-        verify_backup_roots(&roots).unwrap();
-        assert_eq!(fs::read(&ndx).unwrap(), before_ndx);
-        assert_eq!(fs::read(&pointer_path).unwrap(), before_ncx);
-        fs::write(&piece, b"evil").unwrap();
-        assert!(verify_backup_roots(&roots).is_err());
-        assert_eq!(fs::read(&piece).unwrap(), b"evil");
-        fs::write(&piece, b"data").unwrap();
-        fs::remove_file(ndx).unwrap();
-        assert!(verify_backup_roots(&roots).is_err());
+        assert!(report.files >= 4);
+        assert!(!target.join(RESTORE_PENDING).exists());
+        let identities = store.pools[0].members[0]
+            .as_ref()
+            .unwrap()
+            .marker
+            .members
+            .clone();
+        drop(store);
+        let mut paths = f.paths.clone();
+        paths[0] = target;
+        let pool = Pool::reopen_fixture(f.layout.clone(), &paths).unwrap();
+        crate::core::root_identity::verify_pool(&pool, &identities).unwrap();
+        let recovered = Store::new(vec![pool], [17; 32], 16).unwrap();
+        recovered.configure_read_repair(false);
+        assert_eq!(
+            recovered
+                .download(scope, live.object_key, 0, None, Vec::new())
+                .await
+                .unwrap()
+                .0,
+            payload
+        );
+        assert!(matches!(
+            recovered.stat(scope, dead.object_key).await,
+            Err(super::super::Error::Retired)
+        ));
+        assert!(matches!(
+            recovered
+                .put(scope, dead.upload_key, std::io::Cursor::new(vec![7]))
+                .await,
+            Err(super::super::Error::Retired)
+        ));
+        let status = recovered
+            .upload_status(scope, upload.upload_key.clone(), 0, 16)
+            .await
+            .unwrap();
+        assert_eq!(status.missing_parts, vec![0, 2]);
+        for part in [0, 2] {
+            recovered
+                .write_part(
+                    scope,
+                    upload.upload_key.clone(),
+                    part,
+                    std::io::Cursor::new(vec![41; 12288]),
+                )
+                .await
+                .unwrap();
+        }
+        recovered.finalize(scope, upload.upload_key).await.unwrap();
+        assert_eq!(
+            recovered
+                .download(scope, upload.object_key, 0, None, Vec::new())
+                .await
+                .unwrap()
+                .0,
+            vec![41; 36864]
+        );
+    }
+
+    #[test]
+    fn clone_resume_requires_owned_fence_and_refuses_corrupted_source_or_extra_copy_entries() {
+        let f = crate::core::tests::Fixture::new();
+        let store = f.enroll();
+        let target = f.base.join("copy");
+        fs::create_dir(&target).unwrap();
+        let pool = &store.pools[0];
+        let mut report = Report::default();
+        assert!(clone_member(pool, 0, &target, options(false, true, false), &mut report).is_err());
+        clone_member(pool, 0, &target, options(true, false, false), &mut report).unwrap();
+        assert!(
+            Pool::reopen_fixture(
+                f.layout.clone(),
+                &[
+                    target.clone(),
+                    f.paths[1].clone(),
+                    f.paths[2].clone(),
+                    f.paths[3].clone()
+                ]
+            )
+            .is_err()
+        );
+        fs::write(target.join("extra"), b"never remove unknown data").unwrap();
+        assert!(clone_member(pool, 0, &target, options(false, false, true), &mut report).is_err());
+        assert!(target.join(RESTORE_PENDING).exists());
+        assert_eq!(
+            fs::read(target.join("extra")).unwrap(),
+            b"never remove unknown data"
+        );
+        fs::remove_file(target.join("extra")).unwrap();
+        clone_member(pool, 0, &target, options(false, false, true), &mut report).unwrap();
+        assert!(!target.join(RESTORE_PENDING).exists());
+
+        let bad = f.base.join("bad-copy");
+        fs::create_dir(&bad).unwrap();
+        fs::write(f.paths[0].join("unexpected"), b"unknown").unwrap();
+        assert!(clone_member(pool, 0, &bad, options(false, false, false), &mut report).is_err());
+        assert!(bad.join(RESTORE_PENDING).exists());
+        assert!(!bad.join("unexpected").exists());
     }
 }

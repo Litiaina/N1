@@ -41,7 +41,7 @@ impl Key {
         }
         Ok(Self {
             id: digest(&bytes),
-            key: hkdf::Salt::new(hkdf::HKDF_SHA256, b"n1-backup-v1").extract(&bytes),
+            key: hkdf::Salt::new(hkdf::HKDF_SHA256, b"Litiaina/LINK/backup/v1").extract(&bytes),
         })
     }
     fn record_key(&self, label: &str) -> Result<LessSafeKey> {

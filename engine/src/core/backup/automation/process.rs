@@ -109,7 +109,6 @@ impl Processes {
                     snapshot: snapshot.into(),
                     keep_last: replica.keep_last,
                     confirm: true,
-                    ..Default::default()
                 },
                 seconds,
             ))?;
@@ -148,11 +147,9 @@ impl Driver for Processes {
                     "job state/repository must be outside every storage root",
                 ));
             }
-            // Check initialized lease files without acquiring them from the running engine.
-            super::super::fs::read_regular(
-                &root.join(crate::core::instance_lease::LEASE_FILE),
-                128,
-            )?;
+            // LINK leases the member directory itself. Check enrollment without
+            // attempting to take that lease from a running engine.
+            super::super::fs::read_regular(&root.join(".n1-arc-pool.json"), 65536)?;
         }
         if state.starts_with(&repo.path) || repo.path.starts_with(&state) {
             return Err(invalid("job state and repository must not overlap"));
@@ -165,9 +162,6 @@ impl Driver for Processes {
                 &replica.key_file,
                 true,
             )?;
-            if target.key.id != repo.key.id {
-                return Err(invalid("replica encryption key differs"));
-            }
             if target.path.starts_with(&repo.path)
                 || repo.path.starts_with(&target.path)
                 || state.starts_with(&target.path)
@@ -224,20 +218,19 @@ impl Driver for Processes {
                     },
                     config.capture_timeout_seconds,
                 ))?;
-            super::super::online::validate_result(&result)?;
-            return Ok(result["snapshot"]
+            if result["capture_mode"] != "online_committed" {
+                return Err(invalid("source did not complete committed-state capture"));
+            }
+            return Ok(result["id"]
                 .as_str()
                 .ok_or_else(|| invalid("online capture did not return a completed snapshot"))?
                 .into());
         }
         let mut cmd = self.helper("create", config, None);
-        cmd.arg("--config")
-            .arg(&config.engine_config)
-            .arg("--workers")
-            .arg(config.workers.to_string());
+        cmd.arg("--config").arg(&config.engine_config);
         let result: serde_json::Value =
             serde_json::from_slice(&self.run(cmd, config.capture_timeout_seconds)?)?;
-        Ok(result["snapshot"]
+        Ok(result["id"]
             .as_str()
             .ok_or_else(|| invalid("capture did not return a snapshot identity"))?
             .into())
@@ -254,23 +247,25 @@ impl Driver for Processes {
             .replica
             .as_ref()
             .ok_or_else(|| invalid("missing replica settings"))?;
-        let mut cmd = self.helper("replicate", config, Some(snapshot));
-        cmd.arg("--target-repository").arg(&replica.repository);
+        let operation = if replica.url.is_some() {
+            "replicate-remote"
+        } else {
+            "replicate"
+        };
+        let mut cmd = self.helper(operation, config, Some(snapshot));
+        cmd.arg("--destination").arg(&replica.repository);
         if let Some(url) = &replica.url {
-            cmd.arg("--target-url").arg(url).arg("--token-file").arg(
+            cmd.arg("--endpoint").arg(url).arg("--credentials").arg(
                 replica
                     .token_file
                     .as_ref()
                     .ok_or_else(|| invalid("missing replica token file"))?,
             );
             if let Some(ca) = &replica.ca_file {
-                cmd.arg("--ca-file").arg(ca);
-            }
-            if replica.allow_plaintext {
-                cmd.arg("--allow-plaintext");
+                cmd.arg("--ca").arg(ca);
             }
         } else {
-            cmd.arg("--target-key-file").arg(&replica.key_file);
+            cmd.arg("--destination-key").arg(&replica.key_file);
         }
         // The receive protocol verifies and fsyncs before its completion ACK.
         self.run(cmd, config.operation_timeout_seconds)?;

@@ -1,491 +1,276 @@
-//! Fragment metadata, namespace replica, and object-layout repair mechanics.
+use crate::core::{
+    Error, Result, corrupt,
+    download::{VerifiedStripe, check_health, decode_stripe},
+    ec::StripeCodec,
+    storage_pool::Pool,
+    store::{Store, blocking, collect, joined},
+};
+use n1_link::{Fingerprint, shard};
+use serde::Serialize;
+use sha2::Digest;
+use std::{
+    path::Path,
+    sync::{Arc, atomic::Ordering},
+};
 
-use super::*;
-
-pub(super) async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
-    let roots = index_roots.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut out = HashSet::new();
-        for root in roots {
-            if !root.exists() {
-                continue;
-            }
-            for name in list_fragment_aliases(&root) {
-                if fragment_root_on(&root, &name)
-                    .join(FRAGMENT_METADATA_FILE)
-                    .is_file()
-                {
-                    out.insert(stable_fragment_id_for_root(&root, &name).unwrap_or(name));
-                }
-            }
-        }
-        let mut v: Vec<String> = out.into_iter().collect();
-        v.sort();
-        v
-    })
-    .await
-    .unwrap_or_default()
+#[derive(Debug, Serialize)]
+pub struct RepairResult {
+    pub repaired_shards: Vec<u16>,
+    pub total_bytes: u64,
 }
 
-pub(super) async fn reachable_dir_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for root in roots {
-        if let Ok(meta) = fs::metadata(&root).await {
-            if meta.is_dir() {
-                out.push(root);
-            }
-        }
-    }
-    out
-}
-
-fn sha256_bytes(b: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b);
-    let out = h.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&out[..]);
-    arr
-}
-
-#[derive(Clone)]
-struct RawReplica {
-    bytes: Option<Vec<u8>>,
-    mtime: SystemTime,
-    len: u64,
-    sha256: Option<[u8; 32]>,
-    valid: bool,
-}
-
-async fn read_raw_replica<F>(full: &Path, valid_fn: &F) -> RawReplica
-where
-    F: Fn(&[u8]) -> bool + Send + Sync,
-{
-    match fs::read(full).await {
-        Ok(bytes) => {
-            let meta = fs::metadata(full).await.ok();
-            let mtime = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let len = meta.as_ref().map(|m| m.len()).unwrap_or(bytes.len() as u64);
-            let sha = Some(sha256_bytes(&bytes));
-            let valid = valid_fn(&bytes);
-
-            RawReplica {
-                bytes: Some(bytes),
-                mtime,
-                len,
-                sha256: sha,
-                valid,
-            }
-        }
-        Err(_) => RawReplica {
-            bytes: None,
-            mtime: SystemTime::UNIX_EPOCH,
-            len: 0,
-            sha256: None,
-            valid: false,
-        },
-    }
-}
-
-fn choose_best_raw_replica(replicas: &[RawReplica]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (i, r) in replicas.iter().enumerate() {
-        if !r.valid {
-            continue;
-        }
-        let take = match best {
-            None => true,
-            Some(cur) => {
-                let c = &replicas[cur];
-                (r.mtime > c.mtime)
-                    || (r.mtime == c.mtime && r.len > c.len)
-                    || (r.mtime == c.mtime
-                        && r.len == c.len
-                        && r.sha256.unwrap_or([0u8; 32]) > c.sha256.unwrap_or([0u8; 32]))
-            }
-        };
-        if take {
-            best = Some(i);
-        }
-    }
-    best
-}
-
-async fn replicate_bytes_strict(
-    paths: &[PathBuf],
-    canonical: &[u8],
-    dry_run: bool,
-) -> Result<(u64, u64), AppError> {
-    let canon_sha = sha256_bytes(canonical);
-    let mut missing = 0u64;
-    let mut divergent = 0u64;
-
-    for p in paths {
-        match fs::read(p).await {
-            Ok(b) => {
-                if sha256_bytes(&b) != canon_sha {
-                    divergent += 1;
-                    if !dry_run {
-                        linux_io::atomic_write(p, canonical.to_vec()).await?;
-                    }
-                }
-            }
-            Err(_) => {
-                missing += 1;
-                if !dry_run {
-                    linux_io::atomic_write(p, canonical.to_vec()).await?;
-                }
-            }
-        }
-    }
-
-    Ok((missing, divergent))
-}
-
-pub(super) async fn fragment_is_present(
-    roots: &[PathBuf],
-    fragment: &str,
-) -> Result<bool, AppError> {
-    for root in roots {
-        let path = fragment_root_on(root, fragment);
-        match fs::metadata(&path).await {
-            Ok(metadata) if metadata.is_dir() => return Ok(true),
-            Ok(_) => {
-                return Err(AppError::Conflict(format!(
-                    "fragment root is not a directory: {}",
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(AppError::Io(
-                    error,
-                    format!("inspect fragment lifecycle {}", path.display()),
-                ));
-            }
-        }
-    }
-    Ok(false)
-}
-
-pub(super) async fn repair_fragment_metadata_replicas(
-    index_roots: &[PathBuf],
-    fragment: &str,
-    dry_run: bool,
-) -> Result<(u64, u64, u64), AppError> {
-    let roots = index_roots.to_vec();
-    let fragment = fragment.to_owned();
-    tokio::spawn(async move {
-        let _boundary = crate::core::backup::barrier::mutation_async().await;
-        repair_fragment_metadata_replicas_inner(&roots, &fragment, dry_run).await
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(e.to_string()))?
-}
-
-async fn repair_fragment_metadata_replicas_inner(
-    index_roots: &[PathBuf],
-    fragment: &str,
-    dry_run: bool,
-) -> Result<(u64, u64, u64), AppError> {
-    let paths: Vec<PathBuf> = index_roots
-        .iter()
-        .map(|r| fragment_root_on(r, fragment).join(FRAGMENT_METADATA_FILE))
-        .collect();
-
-    let valid = |b: &[u8]| -> bool { rmp_serde::from_slice::<serde_json::Value>(b).is_ok() };
-
-    let mut reps = Vec::with_capacity(paths.len());
-    for p in &paths {
-        reps.push(read_raw_replica(p, &valid).await);
-    }
-
-    let Some(best) = choose_best_raw_replica(&reps) else {
-        let any_exists = reps.iter().any(|r| r.bytes.is_some());
-        let corrupt = if any_exists { 1 } else { 0 };
-        return Ok((0, 0, corrupt));
-    };
-
-    let canon = reps[best].bytes.clone().unwrap();
-    let (m, d) = replicate_bytes_strict(&paths, &canon, dry_run).await?;
-    Ok((m, d, 0))
-}
-
-pub(super) async fn process_object_repair(
-    meta: ObjectMetadata,
-    writable_blob_roots: &[PathBuf],
-    cfg: RepairRunConfig,
-    shard_repair_sem: Arc<Semaphore>,
-    catalog: MetadataCatalog,
-) -> Result<(usize, usize, usize, usize, Option<String>, Option<String>), AppError> {
-    if meta.parts.is_empty() || writable_blob_roots.is_empty() {
-        return Ok((0, 0, 0, 0, None, None));
-    }
-
-    let path_manager = ObjectPathManager::new();
-    let _object_guard =
-        index::acquire_object_operation_lock(&meta.fragment, &meta.object_key).await?;
-    let mut metadata = match catalog {
-        MetadataCatalog::Live => {
-            match index::read_object_version(&meta.fragment, &meta.object_key, &meta.version_id)
-                .await
-            {
-                Ok(current) => current,
-                Err(AppError::NotFound) => return Ok((0, 0, 0, 0, None, None)),
-                Err(error) => return Err(error),
-            }
-        }
-        MetadataCatalog::Trash => {
-            match index::read_trashed_object_version(
-                &meta.fragment,
-                &meta.object_key,
-                &meta.version_id,
-            )
-            .await
-            {
-                Ok(current) => current,
-                Err(AppError::NotFound) => return Ok((0, 0, 0, 0, None, None)),
-                Err(error) => return Err(error),
-            }
-        }
-    };
-    let configured_blob_roots = path_manager.get_blob_roots();
-
-    let mut repaired_total = 0usize;
-    let mut corrupt_found = 0usize;
-    let mut last_repaired: Option<String> = None;
-    let mut failed_repairs = 0usize;
-    let mut last_failure: Option<String> = None;
-    let mut placement_changed = false;
-
-    for part_index in 0..metadata.parts.len() {
-        if should_stop() {
-            break;
-        }
-
-        let mut part_fixed =
-            normalize_part_paths_for_repair(metadata.parts[part_index].clone()).await;
-        let mut missing_shards: Vec<usize> = Vec::new();
-
-        for shard in &part_fixed.shards {
-            let shard_path = crate::core::storage_pool::resolve_address(strip_tmp_attempt_suffix(
-                &shard.absolute_path,
-            ))?;
-            let mut healthy = false;
-
-            if !configured_blob_roots
-                .iter()
-                .any(|root| shard_path.starts_with(root))
-            {
-                missing_shards.push(shard.shard_index);
-                continue;
-            }
-
-            match fs::metadata(&shard_path).await {
-                Ok(m) => {
-                    if !cfg.check_mode.verifies_full_integrity() {
-                        healthy = m.len() == shard.size_bytes;
-                        if !healthy {
-                            corrupt_found += 1;
-                            warn!("Size mismatch shard (availability): {:?}", shard_path);
-                        }
-                    } else {
-                        if let Ok(f) = linux_io::open_read(&shard_path).await {
-                            healthy = verify_shard_integrity(&f, &shard.checksum).await;
-                            if !healthy {
-                                corrupt_found += 1;
-                                warn!("Corrupt shard found: {:?}", shard_path);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    healthy = false;
-                }
-            }
-
-            if !healthy {
-                missing_shards.push(shard.shard_index);
-            }
-        }
-
-        if missing_shards.is_empty() || cfg.dry_run {
-            continue;
-        }
-
-        for missing_idx in missing_shards {
-            let Some(shard_position) = part_fixed
-                .shards
-                .iter()
-                .position(|shard| shard.shard_index == missing_idx)
-            else {
-                continue;
-            };
-            let original_address = part_fixed.shards[shard_position].absolute_path.clone();
-            let original_path = crate::core::storage_pool::resolve_address(&original_address)?;
-            let original_root = configured_blob_roots
-                .iter()
-                .filter(|root| original_path.starts_with(root))
-                .max_by_key(|root| root.components().count());
-            let original_root_is_writable = original_root
-                .is_some_and(|root| writable_blob_roots.iter().any(|active| active == root));
-
-            if !original_root_is_writable {
-                let occupied_roots = part_fixed
-                    .shards
-                    .iter()
-                    .filter(|shard| shard.shard_index != missing_idx)
-                    .filter_map(|shard| {
-                        let path = crate::core::storage_pool::resolve_address(&shard.absolute_path)
-                            .ok()?;
-                        configured_blob_roots
-                            .iter()
-                            .filter(|root| path.starts_with(root))
-                            .max_by_key(|root| root.components().count())
-                            .cloned()
-                    })
-                    .collect::<HashSet<_>>();
-                #[cfg(unix)]
-                let occupied_devices = {
-                    use std::os::unix::fs::MetadataExt;
-                    occupied_roots
-                        .iter()
-                        .filter_map(|root| std::fs::metadata(root).ok().map(|meta| meta.dev()))
-                        .collect::<HashSet<_>>()
-                };
-                let ranked_roots = if crate::core::storage_pool::configured().is_empty() {
-                    path_manager.rank_blob_roots_for_object(
-                        &metadata.fragment,
-                        &metadata.object_key,
-                        &metadata.version_id,
-                    )
-                } else {
-                    crate::core::storage_pool::pool_for_metadata(&metadata)
-                        .ok_or_else(|| {
-                            AppError::Conflict(
-                                "recorded placement does not belong to one immutable storage pool"
-                                    .into(),
-                            )
-                        })?
-                        .roots
-                        .clone()
-                };
-                let replacement = ranked_roots.into_iter().find(|candidate| {
-                    let eligible = writable_blob_roots.iter().any(|active| active == candidate)
-                        && !occupied_roots.contains(candidate);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        eligible
-                            && std::fs::metadata(candidate)
-                                .ok()
-                                .is_some_and(|meta| !occupied_devices.contains(&meta.dev()))
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        eligible
-                    }
-                });
-                let Some(replacement) = replacement else {
-                    let message = format!(
-                        "Deferred repair for {}/{} shard {}: no distinct writable replacement root",
-                        metadata.fragment, metadata.object_key, missing_idx
-                    );
-                    warn!("{message}");
-                    failed_repairs += 1;
-                    last_failure = Some(message);
-                    continue;
-                };
-                let replacement_path = path_manager
-                    .get_shard_dir_on_disk(
-                        &replacement,
-                        &metadata.fragment,
-                        &metadata.object_key,
-                        &metadata.version_id,
-                    )
-                    .join(&part_fixed.shards[shard_position].file_name);
-                part_fixed.shards[shard_position].absolute_path =
-                    crate::core::storage_pool::record_address(&replacement_path);
-            }
-
-            let _permit = shard_repair_sem
-                .acquire()
-                .await
-                .map_err(|_| AppError::InternalServerError("Repair semaphore closed".into()))?;
-            match repair_entire_shard(
-                Arc::new(part_fixed.clone()),
-                missing_idx,
-                metadata.stripe_size_bytes,
-            )
-            .await
-            {
-                Ok(_) => {
-                    repaired_total += 1;
-                    placement_changed |= crate::core::storage_pool::resolve_address(
-                        &part_fixed.shards[shard_position].absolute_path,
-                    )? != original_path;
-                    metadata.parts[part_index] = part_fixed.clone();
-                    last_repaired = Some(format!("{}/{}", metadata.fragment, metadata.object_key));
-                }
-                Err(e) => {
-                    part_fixed.shards[shard_position].absolute_path = original_address.clone();
-                    let message = format!(
-                        "Shard repair failed for {}/{} shard {}: {}",
-                        metadata.fragment, metadata.object_key, missing_idx, e
-                    );
-                    warn!("{message}");
-                    failed_repairs += 1;
-                    last_failure = Some(message);
-                }
-            }
-        }
-    }
-
-    let metadata_needs_repair = if placement_changed {
-        true
-    } else {
-        let metadata_for_check = metadata.clone();
-        !tokio::task::spawn_blocking(move || {
-            index_store::object_metadata_placements_healthy(&metadata_for_check)
+impl Store {
+    pub async fn repair(self: &Arc<Self>, scope: [u8; 16], key: String) -> Result<RepairResult> {
+        let store = self.clone();
+        joined(self.activity.clone(), async move {
+            let identity = store.signer.verify_object(&scope, &key)?;
+            let pool = store.pool(identity)?;
+            store.repair_owned(pool, identity.fingerprint(), None).await
         })
         .await
-        .map_err(|error| {
-            AppError::InternalServerError(format!("object metadata health worker failed: {error}"))
-        })??
-    };
-
-    if placement_changed {
-        metadata.placement_generation =
-            metadata
-                .placement_generation
-                .checked_add(1)
-                .ok_or_else(|| {
-                    AppError::InternalServerError(
-                        "object placement generation exhausted during repair".into(),
-                    )
-                })?;
     }
-    let metadata_repaired = if metadata_needs_repair {
-        match catalog {
-            MetadataCatalog::Live => index::upsert_object_version(&metadata).await?,
-            MetadataCatalog::Trash => {
-                index::publish_trashed_object_version_for_maintenance(&metadata).await?
+
+    pub(crate) async fn queue_read_repair(self: &Arc<Self>, pool: Arc<Pool>, fp: Fingerprint) {
+        if !self.read_repair.load(Ordering::Acquire) {
+            return;
+        }
+        let mut job = match self.repair_manager.read(fp) {
+            Ok(Some(job)) => job,
+            Ok(None) => return, // An existing owner coalesced this repair request.
+            Err(error) => {
+                tracing::debug!(%error,"read repair not admitted");
+                return;
+            }
+        };
+        let control = Arc::new(crate::core::maintenance::WorkControl::new(
+            self.repair_manager.stop.child_token(),
+            128 * 1024 * 1024,
+            3600,
+        ));
+        // Keep the bounded backpressure of the original recovery reader. The
+        // foreground data/memory guards have already been released by GET.
+        let permit =
+            match super::super::recovery::admit(&self.repair_manager.stop, Some(&control)).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    tracing::debug!(%error,"read repair admission stopped");
+                    return;
+                }
+            };
+        let store = self.clone();
+        super::super::recovery::spawn(async move {
+            loop {
+                if let Err(error) = store
+                    .clone()
+                    .repair_admitted(pool.clone(), fp, Some(control.clone()), &permit)
+                    .await
+                {
+                    tracing::debug!("read repair incomplete: {error}");
+                }
+                if control.stopped() {
+                    break;
+                }
+                match job.finish_or_again() {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        tracing::debug!(%error,"read repair completion failed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn repair_owned(
+        self: Arc<Self>,
+        pool: Arc<Pool>,
+        fp: Fingerprint,
+        control: Option<Arc<crate::core::maintenance::WorkControl>>,
+    ) -> Result<RepairResult> {
+        let _job = self.repair_manager.register()?;
+        let permit =
+            super::super::recovery::admit(&self.repair_manager.stop, control.as_deref()).await?;
+        self.repair_admitted(pool, fp, control, &permit).await
+    }
+
+    async fn repair_admitted(
+        self: Arc<Self>,
+        pool: Arc<Pool>,
+        fp: Fingerprint,
+        control: Option<Arc<crate::core::maintenance::WorkControl>>,
+        _permit: &tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<RepairResult> {
+        use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
+        let class = if control.is_some() {
+            DiskIoClass::BackgroundRepair
+        } else {
+            DiskIoClass::ForegroundWrite
+        };
+        let io = if let Some(control) = &control {
+            tokio::select! {
+                _ = control.until_stopped() => return Err(Error::Conflict("repair stopped".into())),
+                _ = self.repair_manager.stop.cancelled() => return Err(Error::Conflict("repair stopped".into())),
+                io = acquire_disk_io(class, None, "LINK shard repair") => io?,
+            }
+        } else {
+            tokio::select! {
+                _ = self.repair_manager.stop.cancelled() => return Err(Error::Conflict("repair stopped".into())),
+                io = acquire_disk_io(class,None,"LINK shard repair") => io?,
+            }
+        };
+        let _admission = if control.is_some() {
+            self.admit_background(&pool).await?
+        } else {
+            self.admit(&pool).await?
+        };
+        let lease = if control.is_some() {
+            self.lease(fp)?
+        } else {
+            self.foreground(fp)?
+        };
+        let background = control.as_ref().map(|_| lease.state().background());
+        let control = control.map(|c| {
+            Arc::new(
+                c.for_object(
+                    background
+                        .as_ref()
+                        .expect("background registration")
+                        .cancel
+                        .clone(),
+                ),
+            )
+        });
+        let manual_control =
+            crate::core::maintenance::WorkControl::unpaced(self.repair_manager.stop.child_token());
+        let work = control.as_deref().unwrap_or(&manual_control);
+        let _guard = lease.state().lifecycle.clone().write_owned().await;
+        work.charge(0).await?;
+        let object = self.open_fingerprint(pool.clone(), fp).await?;
+        let health = check_health(
+            &object,
+            &pool.layout,
+            fp,
+            true,
+            Some(work),
+            Some(&io.progress_handle()),
+        )
+        .await?;
+        let mut targets = health.missing_shards;
+        targets.extend(health.corrupt_shards);
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            io.complete();
+            return Ok(RepairResult {
+                repaired_shards: Vec::new(),
+                total_bytes: object.header.total_bytes,
+            });
+        }
+        let check = pool.clone();
+        blocking(move || check.writable()).await?;
+        let mut files = Vec::new();
+        for &shard in &targets {
+            let member = pool.holder(fp, shard)?;
+            let m = member.clone();
+            let file = blocking(move || m.create_repair(fp, shard)).await?;
+            let mut header = object.header.clone();
+            header.shard = shard;
+            crate::core::linux_io::write_at_async(file.clone(), header.encode(fp).to_vec(), 0)
+                .await?;
+            files.push((member, file, header));
+        }
+        let result = async {
+            let mut codec = StripeCodec::new(&pool.layout)?;
+            let mut root = shard::object_hasher(
+                object.header.format,
+                object.header.total_bytes,
+                object.header.part_bytes,
+            );
+            for part in 0..object.header.parts() {
+                let mut part_root = shard::part_hasher(object.header.format, part);
+                for stripe in object.header.part_stripes(part)? {
+                    work.charge(
+                        object.header.record_bytes() * (pool.layout.width() + targets.len()) as u64,
+                    )
+                    .await?;
+                    let VerifiedStripe {
+                        source,
+                        source_hash: hash,
+                        ..
+                    } = decode_stripe(&object, fp, stripe, &mut codec, false).await?;
+                    io.record_progress(source.len() as u64);
+                    part_root.update(hash);
+                    let pieces = codec.encode(&source)?;
+                    let writes = files.iter().map(|(_, file, header)| {
+                        let record = shard::encode_frame(
+                            header,
+                            fp,
+                            stripe,
+                            hash,
+                            &pieces[usize::from(header.shard)],
+                        );
+                        async move {
+                            crate::core::linux_io::write_at_async(
+                                file.clone(),
+                                record?,
+                                header.frame_offset(stripe)?,
+                            )
+                            .await
+                            .map_err(Error::from)
+                        }
+                    });
+                    collect(futures_util::future::join_all(writes).await)?;
+                }
+                root.update(part_root.finalize());
+            }
+            if <[u8; 32]>::from(root.finalize()) != object.root {
+                return Err(corrupt(
+                    "repair reconstruction failed object root verification",
+                ));
+            }
+            collect(
+                futures_util::future::join_all(files.iter().map(|(_, file, header)| async move {
+                    crate::core::linux_io::write_at_async(
+                        file.clone(),
+                        shard::encode_seal(header, fp, object.root).to_vec(),
+                        header.seal_offset(),
+                    )
+                    .await?;
+                    crate::core::linux_io::fdatasync_async(file.clone())
+                        .await
+                        .map_err(Error::from)
+                }))
+                .await,
+            )?;
+            let _snapshot = self.snapshot_gate.clone().read_owned().await;
+            work.charge(0).await?;
+            collect(
+                futures_util::future::join_all(files.iter().map(|(member, _, header)| {
+                    let m = member.clone();
+                    let shard = header.shard;
+                    blocking(move || m.publish_repair(fp, shard))
+                }))
+                .await,
+            )?;
+            Ok(RepairResult {
+                repaired_shards: targets.clone(),
+                total_bytes: object.header.total_bytes,
+            })
+        }
+        .await;
+        if result.is_err() {
+            // Cleanup only private repair temporaries. Never roll back a final
+            // replacement which may already have reached a durability boundary.
+            for (member, _, header) in &files {
+                let m = member.clone();
+                let path = format!(".uploads/{fp}/repair.s{}.tmp", header.shard);
+                let _ = blocking(move || m.unlink(Path::new(&path), true)).await;
             }
         }
-        1
-    } else {
-        0
-    };
-
-    Ok((
-        repaired_total,
-        corrupt_found,
-        metadata_repaired,
-        failed_repairs,
-        last_repaired,
-        last_failure,
-    ))
+        if result.is_ok() {
+            io.complete();
+        }
+        result
+    }
 }

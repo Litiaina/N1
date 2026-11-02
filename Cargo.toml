@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "link",
     "cli_core",
     "engine",
     "shell",
@@ -9,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0-RC.1"
+version = "1.0.0-RC.2"
 
 [profile.release]
 opt-level = 3
@@ -35,6 +36,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
 core_affinity = "0.8.3"
 crc32fast = "1.5.0"
+crc32c = "0.6.8"
 dashmap = "6.1.0"
 dotenv = "0.15.0"
 futures-util = "0.3.31"

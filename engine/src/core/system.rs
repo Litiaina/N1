@@ -122,10 +122,10 @@ pub async fn get_system_metrics() -> SystemMetrics {
 
 async fn calculate_cpu_usage() -> f64 {
     let mut sampler = CPU_USAGE_SAMPLER.lock().await;
-    if let Ok(content) = fs::read_to_string("/proc/stat").await {
-        if let Some(current) = content.lines().next().and_then(CpuTimes::parse) {
-            return sampler.observe(current);
-        }
+    if let Ok(content) = fs::read_to_string("/proc/stat").await
+        && let Some(current) = content.lines().next().and_then(CpuTimes::parse)
+    {
+        return sampler.observe(current);
     }
     // A failed read must not reset the last valid baseline or fake idle CPU.
     sampler.usage
@@ -165,14 +165,14 @@ async fn get_load_avg() -> f64 {
 }
 
 async fn get_uptime_seconds() -> u64 {
-    if let Ok(content) = fs::read_to_string("/proc/uptime").await {
-        if let Some(first) = content.split_whitespace().next() {
-            return first
-                .split('.')
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0);
-        }
+    if let Ok(content) = fs::read_to_string("/proc/uptime").await
+        && let Some(first) = content.split_whitespace().next()
+    {
+        return first
+            .split('.')
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
     }
     0
 }

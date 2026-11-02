@@ -35,7 +35,7 @@ fn engine_reports_release_and_storage_contract_without_initializing_storage() {
     assert_eq!(
         version(env!("CARGO_BIN_EXE_litiaina-n1"), &directory.0),
         format!(
-            "litiaina-n1 {}\nstorage_format 1.0.0-RC.1\nstorage_encoding 4\nnoa v1\nnative_protocol n1/0.5\n",
+            "litiaina-n1 {}\nstorage_format LINK-v1\nnoa v2\nnative_protocol n1/1\n",
             env!("CARGO_PKG_VERSION"),
         )
     );

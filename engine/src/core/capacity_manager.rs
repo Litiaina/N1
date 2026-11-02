@@ -1,33 +1,13 @@
-use crate::core::constants::N1_OBJECTS_DIR;
-use crate::core::disk_manager::ObjectPathManager;
-use crate::core::fragment_identity::physical_fragment_root_on;
 use crate::enums::app_error_enum::AppError;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct StorageUsage {
     pub capacity_allocated: u64,
     pub capacity_used: u64,
     pub capacity_available: u64,
     pub filesystem_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FragmentBlobUsage {
-    pub live_bytes: u64,
-    pub trash_bytes: u64,
-}
-
-fn blob_fragment_root(root: &Path, fragment: &str) -> PathBuf {
-    let stable_fragment_id = ObjectPathManager::new().resolve_stable_fragment_id(fragment);
-    physical_fragment_root_on(root, &stable_fragment_id)
-}
-
-impl FragmentBlobUsage {
-    pub fn used_bytes(self) -> u64 {
-        self.live_bytes.saturating_add(self.trash_bytes)
-    }
 }
 
 #[cfg(unix)]
@@ -61,81 +41,6 @@ fn statvfs_totals_sync(_path: &Path) -> Result<(u64, u64, u64), AppError> {
     Ok((0, 0, 0))
 }
 
-fn unique_capacity_probe_paths() -> Vec<PathBuf> {
-    let pm = ObjectPathManager::new();
-    let mut out = Vec::<PathBuf>::new();
-    let mut seen = HashSet::<PathBuf>::new();
-
-    for path in pm
-        .get_blob_roots()
-        .into_iter()
-        .chain(pm.get_all_index_roots().into_iter())
-    {
-        if seen.insert(path.clone()) {
-            out.push(path);
-        }
-    }
-
-    out
-}
-
-#[cfg(unix)]
-fn file_storage_bytes(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-
-    metadata.blocks().saturating_mul(512)
-}
-
-#[cfg(not(unix))]
-fn file_storage_bytes(metadata: &std::fs::Metadata) -> u64 {
-    metadata.len()
-}
-
-fn sum_file_tree_bytes(path: &Path) -> Result<u64, AppError> {
-    let mut total = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let entries = match std::fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(AppError::Io(err, format!("read_dir {}", current.display()))),
-        };
-        for entry in entries {
-            let entry = entry
-                .map_err(|err| AppError::Io(err, format!("read_dir {}", current.display())))?;
-            let metadata = entry
-                .metadata()
-                .map_err(|err| AppError::Io(err, format!("metadata {}", entry.path().display())))?;
-            if metadata.is_dir() {
-                stack.push(entry.path());
-            } else if metadata.is_file() {
-                total = total.saturating_add(file_storage_bytes(&metadata));
-            }
-        }
-    }
-    Ok(total)
-}
-
-async fn compute_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage, AppError> {
-    let fragment = fragment.to_string();
-    let roots = ObjectPathManager::new().get_blob_roots();
-    tokio::task::spawn_blocking(move || {
-        let mut usage = FragmentBlobUsage::default();
-        let mut seen_roots = HashSet::<PathBuf>::new();
-        for root in roots {
-            if !seen_roots.insert(root.clone()) {
-                continue;
-            }
-            usage.live_bytes = usage.live_bytes.saturating_add(sum_file_tree_bytes(
-                &blob_fragment_root(&root, &fragment).join(N1_OBJECTS_DIR),
-            )?);
-        }
-        Ok::<FragmentBlobUsage, AppError>(usage)
-    })
-    .await
-    .map_err(|err| AppError::InternalServerError(format!("fragment blob usage task: {err}")))?
-}
-
 fn final_shard_len_for_part(part_size_bytes: u64, data_shards: usize, block_size: usize) -> u64 {
     let stripe_data_width = block_size as u64 * data_shards.max(1) as u64;
     let stripe_count = if stripe_data_width == 0 {
@@ -144,6 +49,22 @@ fn final_shard_len_for_part(part_size_bytes: u64, data_shards: usize, block_size
         part_size_bytes.div_ceil(stripe_data_width)
     };
     stripe_count * block_size as u64
+}
+
+/// Probe the pinned member descriptor before first allocation, including LINK
+/// frame headers and seal bytes. Kernel ENOSPC/EDQUOT still decide races.
+pub fn ensure_member_capacity(file: &std::fs::File, required: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: file owns a live directory descriptor; vfs is valid writable storage.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut vfs) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let available = vfs.f_frsize.saturating_mul(vfs.f_bavail);
+    if required > available {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+    }
+    Ok(())
 }
 
 fn placement_required_bytes_by_root(
@@ -186,8 +107,7 @@ fn human_bytes_for_error(bytes: u64) -> String {
     }
 }
 
-async fn compute_box_usage() -> Result<StorageUsage, AppError> {
-    let paths = unique_capacity_probe_paths();
+async fn compute_box_usage(paths: Vec<PathBuf>) -> Result<StorageUsage, AppError> {
     tokio::task::spawn_blocking(move || {
         let mut seen_devices = HashSet::<u64>::new();
         let mut total_bytes = 0u64;
@@ -216,16 +136,26 @@ async fn compute_box_usage() -> Result<StorageUsage, AppError> {
     .map_err(|e| AppError::InternalServerError(format!("capacity stat task: {}", e)))?
 }
 
-pub async fn get_storage_usage() -> Result<StorageUsage, AppError> {
-    compute_box_usage().await
+pub async fn get_storage_usage(
+    pools: &[std::sync::Arc<super::storage_pool::Pool>],
+) -> Result<StorageUsage, AppError> {
+    let mut paths = Vec::new();
+    for pool in pools {
+        for member in pool.members.iter().flatten() {
+            member
+                .check_binding()
+                .map_err(|e| AppError::ServiceUnavailable(e.to_string()))?;
+            paths.push(member.path.clone());
+        }
+    }
+    compute_box_usage(paths).await
 }
 
-pub async fn get_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage, AppError> {
-    compute_fragment_blob_usage(fragment).await
-}
-
-pub async fn ensure_capacity_available(required_bytes: u64) -> Result<(), AppError> {
-    let usage = compute_box_usage().await?;
+pub async fn ensure_capacity_available(
+    paths: Vec<PathBuf>,
+    required_bytes: u64,
+) -> Result<(), AppError> {
+    let usage = compute_box_usage(paths).await?;
     if required_bytes > usage.capacity_available {
         return Err(AppError::InsufficientStorage);
     }

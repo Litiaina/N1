@@ -1,341 +1,383 @@
-# N1 architecture
+# Litiaina N1 — LINK engine, 1.0.0-RC.2
 
-N1 1.0.0-RC.1 is a single-node object store, not a filesystem or a distributed
-cluster. Its storage-format specification is also 1.0.0-RC.1. This formal naming
-reset retains the tested encoding identifier 4 and existing NCX/NDX/payload,
-pool and backup representations; it is not a data migration. Unsupported older
-development formats are not migrated automatically. API details and versioning
-rules are in [DOCUMENTATION.md](DOCUMENTATION.md).
+LINK replaces N1's object identity, placement and shard representation. N1 keeps
+its established responsibilities and module structure: adaptive concurrency,
+disk scheduling, streaming, io_uring, middleware, server, repair and backup.
+Both native NOA and the optional HTTP adapter use the same object service.
 
-## Storage pools
+Implementation and qualification are in progress. This document describes the
+new runtime and identifies unfinished retained responsibilities explicitly.
+[Implementation ledger](docs/RC2-IMPLEMENTATION.md) tracks completion;
+[LINK format](docs/LINK-FORMAT.md) is the exact byte-level specification.
+Changing the package version does not authorize or qualify a release.
 
-Each named pool owns its members and immutable K+P erasure-code layout:
+## Responsibility
+
+N1 accepts client-held immutable keys, calculates shard locations, and performs
+object I/O. A separate metadata service owns names, directories, user-visible
+versions, references and listings. That service is outside this development
+cycle. N1 has no public rename, move, namespace list, search, latest-version,
+trash, undelete, ZIP or TAR export operation.
+
+Fragments are stable authorization scopes. Their display aliases and credentials
+belong to service configuration; object addressing uses a stable 16-byte fragment
+ID for authentication. They are called fragments, never buckets.
+
+The complete retained scope is normal and batch upload, standard and durable
+multipart upload, resumable status and finalization, stat, streamed and ranged
+GET, object-specific health and repair, permanent single/bulk deletion,
+conservative staging GC, optional paced scrub/repair, immutable pool maintenance,
+transport security, native SDK/CLI, encrypted incremental backup/restore and
+recovery-point replication. Native CLI operations, backup automation and verified
+member cloning and explicit failed-member reconstruction are implemented.
+Installer/UI adaptation and broader qualification remain open; see the
+implementation ledger.
+
+## Code responsibilities
+
+| Location | Responsibility |
+| --- | --- |
+| `link/src` | Canonical immutable identity, placement, ticket and inline format |
+| `engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
+| `engine/src/core/upload/activity.rs` | Owned operation lifetime, shutdown admission and control-lease retention |
+| `engine/src/core/download.rs` | Verified streamed/ranged reads and read-repair admission |
+| `engine/src/core/adaptive_concurrency.rs` | Original controller with cancellable service lifecycle |
+| `engine/src/core/io_scheduler.rs` | FIFO resizing, foreground/background and per-fragment admission |
+| `engine/src/core/object_parser.rs` | Adaptive stream admission, chunks and bounded read-ahead buffer |
+| `engine/src/core/linux_io` | Retained io_uring driver and completion ownership |
+| `engine/src/core/ec.rs` | Retained N1 streaming EC wrapper; LINK adapter in `ec/stripe.rs` |
+| `engine/src/core/repair_manager` | Verified shard reconstruction and publication |
+| `engine/src/core/recovery.rs` | Retained four-job admission and separate CPU-affine recovery runtime |
+| `engine/src/core/maintenance` | Conservative staging GC and paced asynchronous jobs |
+| `engine/src/core/backup` | Encrypted repository, recovery, replication and retained automation supervisor |
+| `engine/src/core/storage_admin.rs` | Offline verification, copy fences and byte-exact member cutover |
+| `engine/src/core/storage_admin/replacement.rs` | LINK shard reconstruction under the retained offline inventory/fence workflow |
+| `engine/src/middleware` | Authentication, refresh rotation/reuse detection and request quotas |
+| `engine/src/protocol/server` | Native listener, TLS, explicit enrollment and startup/shutdown |
+| `engine/src/routes/storage_routes.rs` | Secondary HTTP adapter to shared NOA operations |
+| `engine/src/settings/config.rs` | Private configuration and explicit immutable member binding |
+| `shell/src/args.rs`, `shell/src/offline.rs` | CLI arguments and shared engine-side offline operations |
+
+The removal boundary is name/version metadata, NCX/NDX lookup and explicitly
+discarded namespace/export operations. Tested infrastructure is retained and
+adapted where the shard representation changes; fewer source files is not an
+acceptance criterion. The implementation ledger records remaining adaptations.
+
+## Addressing and immutable pools
+
+A pool freezes its identity, generation, member slots, K data shards, P parity
+shards, block size, codec profile, shard integrity format and placement version. It has exactly K+P
+logical members. Capacity expansion adds a complete pool; it does not change old
+placement. A missing member remains missing in its original slot.
+
+LINK's canonical binary identity contains a format byte, pool ID, generation and
+32 random bytes. A domain-separated SHA-256 produces a fingerprint. Another
+versioned calculation rotates shard indices across the fixed member slots.
+Each shard's relative path follows directly from the fingerprint and index.
+No scan, per-object lookup table or mutable location record is needed for GET.
+
+An authenticated object key has prefix `N1A1.`. An authenticated upload ticket
+has prefix `N1U1.` and carries the exact same identity, plus immutable upload
+parameters and expiry. The ticket does not contain a different temporary object
+identity. Neither authentication tags nor upload progress alter placement.
+
+The client retains these keys. N1 does not persist the original object key or
+upload ticket. A shared service signing secret authenticates keys to fragment
+IDs. Keep an independent protected copy. Service-created recovery points also
+include configuration, that secret and any configured TLS identity as a bounded
+encrypted block. Losing all copies prevents validating previously issued keys.
+
+## Member representation
 
 ```text
-Pool A: 3 data + 1 parity → four mounted members
-Pool B: 4 data + 2 parity → six different mounted members
+<member-root>/
+├── .n1-arc-pool.json
+├── .uploads/
+│   └── <fingerprint>/
+│       ├── shard.tmp
+│       ├── repair.s<i>.tmp    # only while repairing this member
+│       └── retire.tmp         # only while replacing terminal state
+└── <fingerprint-byte-0-hex>/
+    └── <fingerprint-byte-1-hex>/
+        └── <fingerprint>.s<i>.shard
 ```
 
-Expand by appending a complete pool. Existing objects keep their pool, geometry,
-stripe size and placements; expansion creates no mandatory redistribution debt.
-New allocation selects the newest complete, unsealed pool, not a free-space
-balancer. Sealing stops new allocation without retiring stored objects.
+A final shard contains an immutable inline header, fixed-position EC stripe
+records with integrity checks, and a final inline seal. An empty object still
+has a header and seal. There is no NDX, NCX, `.commits`, `.claims`, upload manifest
+or separate part receipt. The final seal is bytes inside the shard file.
 
-Pool ID, generation, geometry and logical shard slots remain fixed after
-enrollment. Each .n1-pool.json identifies its member and accepted pool. Startup
-reads these small descriptors and binds configured candidate locations by slot,
-not path or discovery order. Mount paths may change; member identity does not.
-Members must remain independent mounted devices. Unknown/conflicting identities,
-duplicate slots and unfinished maintenance are rejected. Missing slots are never
-renumbered or initialized automatically.
+A permanently deleted identity has a small terminal record at that same final
+shard path in place of payload. This durable deletion state was explicitly
+chosen by the user so old upload tickets cannot recreate deleted identities.
+GC never expires terminal records.
+If a terminal record is corrupt, N1 blocks reads, repair and upload-ticket reuse
+even when other payload shards could still reconstruct the old object. An
+authenticated delete retry can complete retirement; parity repair cannot erase
+this deletion fence.
 
-Root identity is a software enrollment guard, not a disk serial number. Offline
-cloning preserves a healthy member's bytes and logical identity for verified
-cutover at the same or a new location. Explicit replacement reconstructs only
-the missing member's pieces at its configured location;
-full inventory/CRC verification precedes identity restoration and activation.
-An interrupted operation remains fenced and requires matching explicit resume.
-These administrative fences do not add journals, tombstones or synchronization
-to ordinary NCX mutations. Without parity, a lost member requires a backup.
+Pool markers identify logical members and geometry without embedding absolute
+paths. Explicit enrollment requires empty roots on independent filesystems.
+Startup validates existing markers and holds exclusive directory leases; it
+never enrolls a missing disk. Descendants are opened relative to pinned directory
+descriptors with symlink following disabled. Root replacement is rejected.
 
-fs_storage_path holds local topology/control state, including
-.n1/topology-roots.json and the accepted logical pool membership. It is not a
-namespace database, object index or global object writer. NCX, NDX and payload
-live together on storage-pool members.
+## Upload and completion
 
-New shard/session addresses name pool, generation, slot and a member-relative
-path. One resolver uses the startup-bound roots for reads, writes and maintenance.
-Pre-portability absolute addresses resolve through each slot's original prefix;
-relocation does not rewrite committed NDX or payload or grow an alias history.
-Locations remain fixed during a running engine; cutover is offline.
-Existing path-bound v4 members first acquire descriptors at their old locations.
-Identity/topology readiness is not a full content-integrity claim: health gates,
-verified recover-on-read and explicit content scans have separate roles.
-A valid marker alone does not prove a complete or fresh copy.
+Init creates a cryptographically random identity and returns its final key and
+self-contained upload ticket. It creates no per-upload disk record.
 
-## Stored representation
+Part numbers start at zero. Part size is a positive multiple of K times block
+size; the final part may be short. Parts can arrive out of order. Positioned
+inline records make holes, short bodies, torn frames and conflicting retries
+detectable without a manifest. Status pages validate the actual staged bytes;
+file length and the ticket alone cannot prove completion.
 
-Fragments are authentication scopes. Their public aliases may change; physical
-fragment identity and object identity remain stable.
+A standard part reply acknowledges the completed write without promising disk
+persistence. A durable part reply also requires every member's file and staging
+directory state to pass persistence barriers. Final object success always
+requires full durable publication. A successful retry must not hide an earlier
+writeback error. Private data can be rewritten after verification; committed
+payload is never changed by an upload retry.
 
-A fragment has no preallocated, pool-local size. On pool expansion, startup
-enrolls its small identity/credential record on the new members. New object
-versions use the current write pool; existing objects/versions remain in their
-original pools. Listing resolves the same fragment across all pools. Adding
-capacity therefore extends where that fragment can store new data, without
-moving old data. Allocation is not automatic free-space balancing: switch to a
-new complete pool before the selected pool fills, and retain metadata headroom
-for NCX operations in old pools.
+The upload pipeline reuses two sets of owned record buffers, preparing the next
+group while the current writes complete. Each member gets one contiguous write
+for up to four adjacent stripes, within the charged memory budget; individual
+frame positions and checksums stay unchanged. Original data and codec parity feed
+framing directly. Codec workspaces are initialized only when that operation
+needs them. For a new partial tail, known zero padding can remain sparse; its
+logical bytes, positions and checksums are identical to a fully written record.
+A positioned final zero extends the frame before durable part acknowledgement,
+without truncating concurrently uploaded parts. Existing retry regions are
+written in full. Sparse representation never replaces frame validation.
 
-On-demand pool diagnostics are independent of the global health summary.
-Readiness checks logical member descriptors, fences, independent filesystems,
-fragment metadata replicas and current capacity. Explicit live integrity scans
-reuse the offline NCX/NDX/receipt/piece verifier, scoped to the caller's fragment.
-They do not repair or cache data and are not atomic snapshots of concurrent
-mutations. A single bounded diagnostic worker does not coordinate object writes;
-quiesced offline verification remains the complete maintenance gate.
+Finalization validates completeness, writes seals, persists payload, moves staged
+files to calculated final paths with no replacement, and persists directory
+changes. Publication across separate filesystems is not a transaction. A lost
+reply or crash between member moves can leave partial publication; retrying the
+same ticket completes that identity. Repeated finalization rechecks persistence.
+Enough matching finalized shards may already be readable after a lost reply.
 
-```text
-<pool-member>/
-  .n1-pool.json
-  .fragment/<alias> -> ../@f_<stable-fragment-id>
-  @f_<stable-fragment-id>/
-    .fragment.ndx
-    .namespace/<encoded-key>.ncx
-    .trash/<time>.d<depth>.<nonce>/<encoded-key>.ncx
-    .uploads/<version-ULID>/
-      <durable-session-manifest-binding-and-receipts-if-used>
-      @o_<object-id>/
-        <private-group-NDX-and-NCX-files-if-used>
-        payload/<unfinished-data-and-parity-pieces>
-    .objects/<fanout>/@o_<object-id>/
-      <version-summary>.ndx
-      <version-id>/<data-and-parity-pieces>
-```
+Normal `upload.put` streams a single-part ticket through completion without an
+intermediate part acknowledgement or part durability flush. Batch accepts explicit
+single-part tickets and concatenated bodies. It prepares the payloads, performs
+a shared filesystem barrier, publishes paths, then performs another barrier
+before success. Batches are bounded by count, bytes and open shard descriptors.
+They are not all-or-nothing transactions across objects; clients resolve lost
+replies by retrying the same identities. There is no background commit queue.
 
-- NCX is a small checksummed reference containing format, pool ID and object ID.
-  Each key has P+1 deterministic holders in its owning pool.
-- NDX describes an immutable version and its recorded EC placement. It is
-  colocated with the K+P payload placements, not held in a separate index pool.
-- Committed NDX and payload are immutable during normal namespace operations.
-  Repair and explicit maintenance have separate write/reclamation authority.
-- Versions are identified by ULID; latest means the maximum valid committed
-  ULID. No mutable version-head pointer exists.
+A bounded volatile cache accelerates recently completed part roots. Actual shard
+bytes remain recovery authority. Cache eviction or restart triggers validation;
+it does not lose upload identity or make incomplete parts complete.
 
-ECS Core performs bounded-memory encoding, decoding, checksums and recovery.
-N1 owns paths, placement, synchronization, publication and metadata. Its codec
-dependency remains pinned; the namespace revision does not change EC math.
+## Reads, health and repair
 
-New uploads write payload under their `.uploads` owner. Finalization moves each
-member's payload directory into `.objects/<fanout>/@o_<object-id>/<version-ULID>`
-without copying pieces, then publishes NDX and the logical NCX reference. NDX
-records final addresses from its first publication; it never records temporary
-addresses or mutable logical names. Partial member moves can be retried and
-cannot replace an existing version. Strict small-object groups retain the
-existing three shared filesystem barriers. Strict standalone/multipart writes
-persist their staging organizers and promotion before publishing NDX.
+GET validates matching headers and seals and verifies every requested stripe's
+frames and reconstructed source before emitting its bytes. It reads data shards
+first and uses parity when needed. A range decodes only intersecting stripes.
+The integrity root is `LINK-SHA256-tree-v2` for new hybrid pools and
+`LINK-SHA256-tree-v1` for existing SHA-256 pools. Neither is SHA-256 of
+concatenated user bytes.
 
-GC considers upload-owned candidates before collecting committed namespace
-references. Existing activity fences, durable and standard session protection,
-TTL, fragment lifecycle, member identity, backup and export protection apply.
-An expired abandoned owner can be removed without an NCX population walk;
-committed orphan versions and trash still require their existing separate
-reachability work. Legacy sessions without the staging flag retain their old
-`.objects` payload placement until completed or reclaimed. This does not migrate
-committed encoding-4 objects or add a namespace catalogue.
+Adjacent frames use bounded coalesced reads, with the following window submitted
+while the current window is emitted. Each frame is validated once and carries
+that validation with its owned shared buffer. Healthy single-data-shard reads
+reuse a slice of that buffer; parity recovery still verifies reconstructed
+source bytes. Individual-record fallback preserves recovery when a coalesced
+read fails. Both current and prefetched work drain before ownership is released.
 
-## Flat keys and listing
+For a fixed immutable pool topology, LINK placement does not grow with the
+number of stored objects: the key identifies the pool and calculates its shard
+holders and paths. Reading and verifying the requested bytes is a separate
+operation whose work grows with the requested length.
 
-a and a/child may coexist. Prefixes are virtual groupings, not stored empty
-folders. A trailing slash selects prefix-only behavior when a key and prefix
-share a name. Encoded key components prevent suffix and physical-path collisions.
+New pools use CRC32C for each encoded frame and independently verify SHA-256
+of the decoded source, bound to fingerprint, stripe index and logical length.
+Headers, seals and integrity roots retain SHA-256. Existing pools without a
+shard-format field keep their original SHA-256 frame/source encoding unchanged;
+pool markers reject changing an enrolled pool's integrity format. The former
+NCX engine used CRC32 for shard payload integrity. Payload-verification policy
+is separate from LINK's fixed-size placement calculation.
 
-Live LIST reads entry names/types without decoding NCX, NDX or payload. Page
-memory is bounded by page size and traversal depth. Sorted continuation pages
-can rescan matching directories: listing is not an O(1) seek or a snapshot.
-Export enumeration is a separate linear walk. Its cursor visits a sorted copy
-of the roots to match lexical replica suppression; this does not reorder pool
-members, omit replica traversal or add a whole-namespace deduplication cache.
-Maintenance reachability snapshots
-are not claimed constant-memory at arbitrary object counts.
+Native GET prepares the verified range and its admission/lifecycle guards,
+then streams directly into the native socket or TLS transport. One activity-owned
+worker retains both the transport and those guards through completion or error;
+cancelling the connection's caller cannot abandon admitted I/O. There is no
+native payload duplex/relay stage. The HTTP body adapter retains its bounded
+stream interface and uses the same prepared read implementation. Socket stalls
+have a progress deadline, independent of total object-transfer duration.
 
-Repair, monitoring and redistribution resume an internal directory cursor across
-bounded metadata batches rather than restarting sorted LIST for every batch.
-Replica selection uses the existing holders; no object catalog or cache is added.
-Filesystem work runs outside async workers, and a paused cursor occupies no
-blocking worker. Public LIST ordering and continuation semantics are unchanged.
-Payload/NDX presence probes stream the existing two-level object fanout and stop
-at their first match; they do not allocate an inventory of every object directory.
+Shallow health establishes finalized representation; deep health verifies the
+whole object and its integrity root. Unavailable holders remain distinct from
+missing or corrupt holders. No diagnostic timeout declares the whole engine
+failed. Insufficient verified fragments prevent returning unverified data.
 
-## Namespace mutation
+Read repair is bounded and optional. Manual or scheduled repair reconstructs into
+private files, verifies the original integrity root, then atomically replaces
+only damaged or missing shards. Healthy shard inodes are preserved. Background
+scrub and repair can be preempted by foreground work on the same object.
+The original global four-recovery-job budget and separate CPU-affine Tokio
+runtime are retained. A full budget backpressures read-repair admission after
+foreground data/memory guards are released; it does not silently skip repair.
+GET completion can wait at that admission boundary. Pending requests for the
+same fingerprint coalesce under an owner that shutdown drains.
 
-Rename, move, trash and recovery use the same per-key sequence:
+## Permanent deletion
 
-1. Copy unchanged NCX to every required destination holder.
-2. Complete destination publication and its durability barriers.
-3. Delete source NCX replicas and complete source-directory barriers.
+Deletion uses two durable phases. All K+P paths must first hold terminal
+`Retiring` records. Only after that barrier and staging cleanup can any member
+publish a completed `Retired` certificate. A valid completed certificate proves
+that the first barrier was reached everywhere before it was issued.
 
-Local copies can link an already committed NCX inode. Cross-filesystem copies
-stage and synchronize only those small NCX bytes. Neither path opens or rewrites
-object-version metadata or payload. There is no namespace tombstone, deletion
-generation, mutation journal or background durability queue.
+A completed certificate returns Gone (410) on reads. An incomplete retirement
+returns 503 and requires deletion retry. No upload, finalization or repair may
+recreate payload through these records. Completing deletion requires all member
+bindings; a missing member produces an incomplete operation. Deletion is
+idempotent. Cancellation removes only unfinished staging and does not retire an
+identity; use object deletion when permanent revocation is required.
 
-A failure before destination completion preserves the source. A process crash
-during deletion may leave both names; data remains reachable, repair preserves
-the destination and retry removes remaining sources. This is not an atomic
-multi-key transaction. Prefix work reports conflicts/failures per child and
-preserves unrelated destinations. Trash IDs distinguish repeated deletions;
-they are not version-head or deletion-authority records.
+## Maintenance and resource bounds
 
-Same-key publication/mutation is coordinated, including blocking workers after
-caller cancellation. Different keys can progress independently; there is no
-global namespace writer. All holder workers are joined before source deletion
-or ownership release. Holder fanout is bounded at four, independent mutation/
-recovery work at sixteen. Coordination and bounded admission are not a cache.
+GC scans `.uploads` through bounded physical traversal. It removes only known,
+expired, unpublished staged payload after excluding active ownership, final paths
+and retirement intent. Uncertain or corrupt candidates are retained and reported.
+It does not infer that a final object is garbage because its client key was lost.
 
-## Publication, repair and reclamation
+Scheduled GC and scrub are independently opt-in and disabled by default. A scrub
+schedule supplies an interval, startup delay, IO rate, run window and explicit
+repair choice. Stopping or exhausting a window leaves an incomplete/stopped job;
+foreground object service remains available. Only one maintenance job runs at a
+time, and job records are bounded control state rather than an object catalogue.
+Scrub can instead use a UTC calendar such as `Sun 02:00` or `daily 03:15`.
+Its private journal records attempted slots before admission, preventing duplicate
+execution after restart or clock rollback. Restart marks an interrupted scrub
+incomplete; it does not silently retry it or mark the object engine failed.
 
-Successful upload publication follows completion of the recorded EC set and
-NDX, then NCX. Standard multipart progress is process-local until finalize;
-durable multipart persists progress for restart/resume. Kernel ENOSPC/EDQUOT
-failures return 507 rather than publishing a successful partial object.
+Operation count and estimated EC working memory are admitted separately. Pools
+whose stripe workspace exceeds the configured budget are rejected. Native
+connections and aggregate control buffers are bounded. Bodies stream through
+bounded buffers; object size does not determine the per-operation allocation.
+All admitted member workers are joined before ownership is released, including
+when callers disconnect. Shutdown stops admission and drains active work.
+The activity owner retains the control-state lease across caller cancellation,
+including durable login/refresh writes. Download completion can be awaited or
+dropped without exposing an abort handle for an admitted worker. Transport drain
+has a deadline; admitted filesystem work and repair ownership are still awaited
+before control/member leases are released.
+The original adaptive controller adjusts FIFO I/O and stream targets using CPU,
+memory and disk pressure. Stream chunk and buffer sizes remain bounded. Fixed
+operation/memory limits are hard ceilings alongside this controller. Repair and
+GC use background scheduler lanes; optional maintenance cannot monopolize the
+foreground lane. `maintenance.health` exposes system, capacity, scheduler,
+backend and maintenance state.
 
-Strict upload publication propagates shard-directory synchronization failures.
-Standard multipart tracks each part's acknowledged durability in its existing
-temporary session; all parts must be strict for strict NDX/NCX finalization.
-The relaxed default does not promise power-loss-durable acknowledgement.
-This changes upload error handling, not ordinary copy/delete mutation barriers.
+Private service state lives outside object members. The engine holds the retained
+instance lease there and exclusive directory leases on members. Configuration
+binds every member ID, so mutually agreeing replacement markers cannot silently
+rebind an existing pool. Explicit read-only/quiesced operation gates are separate
+from optional maintenance time limits.
 
-Topology/identity checks block unsafe mutations. Reads may reconstruct within
-the recorded parity tolerance, but missing members do not authorize silently
-rebinding or rewriting an enrolled pool. Repair uses the object's original
-geometry; a newer pool is not an automatic repair/rebalance destination.
+The service configuration uses the stable format identifier `N1-LINK`, defined
+once by `CONFIG_FORMAT`. It contains no binary release label. The workspace
+`Cargo.toml` supplies the package version for CLI output and native/HTTP ping.
+LINK key, shard and wire encoding identifiers describe their respective formats
+independently of the package release.
 
-Reads validate the existing whole-shard checksum before exposing bytes; the
-streaming path does not bypass verification on a successful filesystem read.
-Validated descriptors and rejected candidates are retained only for the current
-request/part. Read-triggered repair uses the existing bounded repair capacity;
-reconstruction is checksum-checked before replacement and directory-sync errors
-propagate. Range recovery decodes a recorded EC stripe before slicing the
-requested bytes; it never treats an arbitrary byte slice as a separately encoded
-shard. A peer's failed validation does not suppress repair when that peer becomes
-a read target. Read repair reuses whole-fragment lifecycle admission and checks
-the fragment still exists before writing. It defers to pending deletion rather
-than waiting behind it or recreating a deleted fragment. Healthy committed NDX
-is not rewritten by this repair path.
-Full availability/checksum walks require explicit repair requests or an opt-in
-calendar checksum schedule. Deep health inspection remains explicit.
-Periodic known-member safety probes do not enumerate namespace or payload.
+Server startup retains the original `L I T I A I N A  N 1` boxed banner in
+`engine/src/main.rs`: Cargo version, STARTING status, local start time, PID,
+hostname, working directory and runtime thread settings. The original local
+`YYYY-MM-DD HH:MM:SS` log timer and nonblocking stderr logger are retained.
+The logger guard flushes during shutdown; machine-readable maintenance output
+and CLI version/help do not receive the server banner.
 
-`auto_healing.scrub_schedule_utc` is empty by default. An entry such as
-`Sun 02:00` or `daily 02:00` starts an asynchronous online checksum repair job
-through the existing background repair worker and its shared singleton guard.
-The scheduled job uses availability access rather than the manual API's
-read-only/quiesced modes. It paces between objects and backs off for foreground
-operations, including streamed downloads. In-flight shard I/O is not preempted;
-background scans still consume bandwidth and can increase foreground latency.
-Topology probes run independently while a long scan executes.
+## Native NOA and HTTP
 
-The small local `.n1/scheduled-scrub.json` journal records admission and completion
-so a restart cannot duplicate a calendar slot. Missed/busy slots are deferred to
-the next calendar occurrence; there is no catch-up storm. No whole-scan deadline
-declares the engine failed. Stopped/errored/interrupted scans report incomplete
-coverage, retain the last successful completion, and do not set a safety gate.
-Real topology and identity gates remain independent. Progress is visible through
-the existing repair status and the nested `auto_healing.scheduled_scrub` status.
-Persistent mid-scan pause/resume is not implemented; a later run starts a fresh
-scan. This journal is maintenance state, not object or namespace authority.
+Native NOA 2 over `n1://` is primary; `n1s://` adds certificate-verified TLS. The
+wire version is `n1/1`. MessagePack control is length-prefixed and raw object
+bytes follow separately. Native requests call storage directly without HTTP.
+The SDK poisons a connection after an interrupted exchange so it cannot reuse
+an unknown frame boundary.
 
-Whole-fragment deletion takes exclusive per-fragment admission. Uploads and
-repair share admission, so different uploads still run concurrently. Each
-rechecks on-disk existence after admission; stale tokens or repair snapshots
-cannot recreate a deleted fragment. Started HTTP upload workers retain admission
-through publication/cleanup even after disconnect. Deletion errors propagate
-and aliases remain available for retry until all members are removed.
-Ordinary object/NCX mutations do not acquire this guard.
+HTTP is optional. JSON control, raw part/range endpoints and the streaming NOA
+adapter use the same authorization and object handlers. Configured TLS also
+secures the HTTP listener. [NOA.md](NOA.md) defines this new operation contract.
 
-Independent NDX and NCX holders publish in bounded parallel phases with all
-workers joined before proceeding. Ordinary strict uploads retain their direct-I/O
-path and every data/publication barrier; small relaxed writes may use buffered I/O.
-Strict small-file batches use request-local groups bounded to 64 objects / 8 MiB,
-not a global writer. Payloads and private metadata are written in the existing
-version directories. Pinned participating filesystem handles are opened before
-writing; a group synchronization makes contents durable before NDX publication,
-another precedes NCX publication, and a final one precedes strict ACK. Healthy
-existing NCX is reused for a new immutable version. Sorted object guards precede
-the existing namespace/backup mutation boundary, avoiding lock inversion. GC's
-existing version pass removes expired private staging only when no upload owns
-the object. Lock waits and payload I/O remain asynchronous; only synchronous
-publication occupies a blocking worker, so admitted groups cannot exhaust the
-workers needed to open their own files. No packing, new receipts, version heads
-or disk format are introduced.
-The Linux I/O backend uses a bounded in-process io_uring completion queue when
-available. Submitted buffers and descriptors remain owned until completion,
-including after caller cancellation. Writes must complete before data sync;
-data sync precedes publication and the existing directory-sync barriers. Queue
-submission alone is not durability. Backend selection happens at startup;
-automatic compatibility fallback is reported, not a retry of failed storage I/O.
-This adds no service, cache, storage representation or relaxed acknowledgement.
-One driver thread owns the ring, with at most 128 queued and 128 active
-requests; it does not busy-poll. Asynchronous direct and buffered shard writes,
-exact/chunked checksum reads and file/directory syncs use this backend.
-Synchronous publication workers perform their writes and durability syncs
-directly through POSIX, avoiding a second queue-and-wait handoff. Opens and
-renames also retain their blocking helpers. This is a fixed operation policy,
-reported separately as `publication_backend: posix`, not fallback after a failed
-native request. Publication ordering and every required sync are unchanged.
-Replicated NDX writes share one immutable encoded allocation, and checksum walks
-reuse a bounded chunk buffer rather than allocating per chunk.
-Batch buffering takes the existing shared I/O permit before allocating each
-object body; request concurrency is not extra payload capacity. That permit,
-lifecycle and activity protection remain held through NCX publication, including
-after disconnect. This bounds the complete commit, not only payload/NDX work.
-Admission failure preserves already-admitted results and reports explicit
-per-object rejections. Batch result memory is bounded by a 4,096-object request
-limit; these per-request bounds are not a universal process-memory guarantee.
+## Recovery and qualification
 
-Adaptive I/O capacity uses the existing FIFO semaphore. Reducing capacity retires
-permits as admitted work finishes; increasing capacity returns those permits.
-Waiters retain their queue position instead of cancelling and polling. Waiting
-for foreground capacity does not occupy the shared background lane. The hard
-configured concurrency bound and foreground admission deadline remain in force.
+Recovery preserves pool identity, generation, member slots, exact shard bytes,
+terminal state and encrypted service identity. `restore --output-config` writes
+owner-only signing/TLS files, rewrites member roots and publishes configuration
+last. It refuses conflicting existing files and serving member roots. Recovered
+services start with fresh login sessions. Backups never create a key catalogue
+inside the object engine.
 
-Scheduled and manual GC use the same collector. It expires trash NCX by TTL,
-expires abandoned durable sessions and reclaims aged, inactive upload versions.
-Trash TTL is checked before reading version NDX. Ordinary uploads have no new
-cleanup receipt: restart discovery walks object/version directory names and
-checks namespace references, upload activity and existing NDX authority. An
-abandoned new version under a live object is eligible; committed history is not.
+Online capture briefly excludes publication, deletion and repair publication
+while hard-linking a committed physical view. Upload bodies and reads continue.
+The gate is released before hashing, encryption and payload copying; a configured
+pin deadline fails the job if that boundary cannot complete. Offline capture
+requires exclusive pool leases and additionally preserves resumable private
+uploads. An online point excludes unfinished uploads.
 
-GC uses BackgroundGc admission, rejoining between groups of 128 objects/sessions
-and fragments. The fanout cursor retains at most three open directories rather
-than collecting every object directory. Trash expiration and the namespace
-reference snapshot remain separate traversal phases; the reference set grows
-with the namespace. This is not constant-memory or constant-time collection.
-All configured members, not only the foreground-eligible subset, must establish
-safe deletion authority. Unavailable identities, unreadable authority or unsafe
-layout cause preservation/reporting. Existing upload/mutation fences protect
-overlap; export admission is rechecked between destructive batches. Backup pins
-remain protected. No payload relocation or new cleanup-record encoding is added.
+Recovery repositories live outside active members. Authenticated encryption
+protects content-addressed chunks of at most 4 MiB. Bounded hierarchical manifests
+describe file chunks rather than allocating an object-sized block list. Completed
+points are immutable; pending transfer pins protect incomplete work from GC.
+Local replication can reencrypt under a destination key. Native replication uses
+the authenticated `backup.receive` protocol; HTTP uses the same recovery protocol
+over an optional WebSocket adapter. Network peers require the same repository key.
+This is recovery-point replication, without live standby or failover semantics.
 
-Offline backup captures every pool member under exclusive leases, including
-unfinished durable-upload progress. Online backup instead pins committed NCX,
-version NDX and pieces inside the running engine. Shared mutation admission stays
-concurrent; a bounded exclusive capture boundary freezes namespace/version
-selection while hard links are made. Hashing/copying runs after that boundary.
-No object-count memory cache, mutable head or namespace mutation journal is added.
-GC and fragment deletion cannot remove pinned inodes; abandoned scratch views
-are cleaned only after startup owns the member leases. Online recovery excludes
-all unfinished uploads. Restore
-maps by pool ID/generation/geometry/member slot, never mount-path sorting;
-it preserves logical identities and uses startup fences until complete. Config,
-secrets and application databases require separate backup. Accel can be rebuilt
-from N1 and is never storage truth. See
-[backup instructions](DOCUMENTATION.md#backup-and-restore) and
-[measured validation](TESTING.md).
+Restore requires explicit empty, independent targets and holds directory leases.
+Durable restore fences prevent startup until verification and retirement overlay
+finish. Explicit resume accepts only fences belonging to the same point and key.
+Restoring an older point unions retirement state from the targets and every
+available point in the repository. A deletion that never reached any surviving
+backup cannot be reconstructed after all original members are lost.
 
-## Operational boundaries
+Retention verifies its inputs before removal and refuses to discard the final
+saved witness of a retirement. This maintenance check uses temporary sorted runs
+and a bounded merge, without a persistent deletion catalogue or memory proportional
+to object count. Repository GC authenticates and pins retained blocks before
+reclaiming unreferenced blocks.
 
-Optional private Accel read delivery runs only after N1 authorization and
-authoritative namespace/version resolution. Byte cache keys pin immutable object
-identity/version; rename does not invalidate the underlying content. Cache-origin
-requests bypass only the proxy, never authentication. Pre-header failure returns
-to the normal N1 read path; mid-stream failure terminates that response. No cache
-entries, mutable heads or new durable coordination are added to N1. Accepted HTTP
-sockets use TCP_NODELAY, as the native transport already does.
+Configured repository aliases are the only repository selectors accepted over
+NOA. Operator recovery commands start a bounded asynchronous job. Status and stop
+requests do not depend on the request connection staying open; cooperative stop
+retains ownership until admitted work finishes. Capture, verification, local
+replication, retention and repository GC share these controls on native and HTTP.
+The retained optional backup supervisor persists restart intent before service
+stop, restarts before long verification/replication work, retries the same pending
+point and retains failed points. It supports online jobs through native or HTTP
+NOA as well as full offline captures. Shipped systemd units invoke `litiaina-n1
+backup run-job/recover-job`; the standalone backup helper uses the same code.
+These workflows are opt-in and never enabled implicitly.
 
-Master-key authentication grants a signed operator capability for server-wide
-maintenance. Fragment secrets cannot request another fragment or put the whole
-server into restrictive maintenance. This is API authorization, not namespace
-state, a new writer lock or distributed coordination. Key rotation invalidates
-credential-bound refresh sessions; access tokens retain their normal expiry.
+Offline `pool clone`, `prepare-copy` and `verify-copy` preserve one logical member
+identity without changing placement. Source/target leases, operation-bound
+fences, complete inventory/content checks and synchronization precede activation.
+An administrator changes the configured physical path after verified cutover;
+ordinary startup never adopts an empty replacement. The Rust physical witness
+tests this path with original keys and permanent retirements.
 
-Native connections/control frames and multipart temporary metadata have bounded
-admission. Pool warnings reuse capacity probes and report byte/inode headroom;
-they add no upload free-space scan, placement reservation or object cache.
-Replication copies authenticated, completed recovery points to optional
-independent storage. It does not add a live second writer or distributed failover.
-The receiver and operator API belong to N1's own Engine/Shell binaries. HTTP(S)
-and native N1(S) carry the same bounded snapshot transfer; no SSH daemon/client
-or external backup service is required. Offline operator work is separate from
-the running storage engine and reuses repository leases, pins and restore fences.
+Explicit offline `pool replace --authorize` rebuilds one configured blank slot
+from all surviving peers while retaining the immutable member map. It uses the
+same control/root leases, operation-bound fence, expected inventory and final
+synchronization as the retained maintenance workflow. Stripe memory is bounded
+by the configured budget. Healthy peers are never rewritten. Completed payload
+requires verified reconstruction of the original integrity root. Private multipart
+progress is reconstructed only from verified frames; holes remain missing and
+partial publication is not silently promoted. Terminal records take precedence
+over payload, and incomplete retirement never becomes a completed certificate.
+Temporary inventory and deduplication files use bounded directory fanout and
+leave at cutover; they are not part of ordinary uploads or an object catalogue.
+Filesystems supporting data/hole queries avoid scanning unwritten sparse gaps;
+others use a conservative sequential scan. Reconstruction failures keep the
+target inactive. Multi-member replacement and full pool expansion qualification
+remain tracked separately.
+
+Builds and unit fixtures use RAM. Persistent reports and physical test data use
+the HDDs, not the source NVMe. Evidence includes parser/corruption vectors,
+EC loss patterns, restart/resume, retry conflicts, cancellation, repair,
+interrupted retirement, native/HTTP authorization, TLS and physical two-HDD
+witnesses. Small debug witnesses do not establish production throughput,
+power-loss durability, million-object scale or a win over the former engine.

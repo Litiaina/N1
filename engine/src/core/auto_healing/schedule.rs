@@ -7,10 +7,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::AUTO_HEALING_STATUS;
-use crate::core::{disk_manager::FS_STORAGE_ROOT, linux_io, operation_gate, repair_manager};
-use crate::routes::storage_routes::AppState;
-use crate::settings::config::AutoHealingConfig;
+use crate::core::maintenance::jobs::Jobs;
+use crate::core::{Store, linux_io};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarScrub {
+    pub schedule_utc: String,
+    pub initial_delay_seconds: u64,
+    pub options: n1_link::noa::ScrubOptions,
+}
+impl CalendarScrub {
+    pub fn validate(&self) -> crate::core::Result<()> {
+        Schedule::parse(&self.schedule_utc).map_err(crate::core::Error::Invalid)?;
+        self.options.validate()?;
+        if self.initial_delay_seconds > 30 * 86400 {
+            return Err(crate::core::Error::Invalid(
+                "calendar startup delay exceeds 30 days".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Schedule {
@@ -93,10 +112,6 @@ impl ScheduledScrubStatus {
     }
 }
 
-async fn publish(status: &ScheduledScrubStatus) {
-    AUTO_HEALING_STATUS.write().await.scheduled_scrub = status.clone();
-}
-
 async fn save(path: &Path, status: &ScheduledScrubStatus) -> Result<(), String> {
     let bytes = serde_json::to_vec(status).map_err(|e| e.to_string())?;
     linux_io::atomic_write(path, bytes)
@@ -105,129 +120,83 @@ async fn save(path: &Path, status: &ScheduledScrubStatus) -> Result<(), String> 
 }
 
 async fn load(path: &Path) -> Result<ScheduledScrubStatus, String> {
-    match tokio::fs::read(path).await {
+    let path = path.to_owned();
+    let read =
+        tokio::task::spawn_blocking(move || crate::core::backup::fs::read_regular(&path, 65536))
+            .await
+            .map_err(|e| e.to_string())?;
+    match read {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|e| format!("invalid scrub journal: {e}"))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
             Ok(ScheduledScrubStatus::default())
         }
         Err(error) => Err(format!("cannot read scrub journal: {error}")),
     }
 }
 
-pub(super) async fn run(state: Arc<AppState>, cfg: AutoHealingConfig) {
-    let mut status = ScheduledScrubStatus {
-        phase: "disabled".into(),
-        ..Default::default()
-    };
-    if !cfg.enabled || cfg.scrub_schedule_utc.is_empty() {
-        publish(&status).await;
-        return;
+pub async fn run(
+    jobs: Arc<Jobs>,
+    store: Arc<Store>,
+    cfg: CalendarScrub,
+    path: PathBuf,
+    stop: CancellationToken,
+) -> Result<(), String> {
+    cfg.validate().map_err(|e| e.to_string())?;
+    let schedule = Schedule::parse(&cfg.schedule_utc)?;
+    let mut status = load(&path).await?;
+    if status.phase == "running" {
+        status.phase = "incomplete".into();
+        status.last_error = Some("previous scrub interrupted by engine restart".into());
     }
-    status.schedule_utc = Some(cfg.scrub_schedule_utc.clone());
-    let schedule = match Schedule::parse(&cfg.scrub_schedule_utc) {
-        Ok(schedule) => schedule,
-        Err(error) => {
-            status.phase = "invalid_schedule".into();
-            status.last_error = Some(error);
-            publish(&status).await;
-            return;
-        }
-    };
-    let Some(root) = FS_STORAGE_ROOT.get() else {
-        return;
-    };
-    let path = PathBuf::from(root).join(".n1/scheduled-scrub.json");
-    match load(&path).await {
-        Ok(previous) => {
-            status.last_attempt_slot = previous.last_attempt_slot;
-            status.last_started_at = previous.last_started_at;
-            status.last_completed_at = previous.last_completed_at;
-            AUTO_HEALING_STATUS.write().await.last_checksum_scrub_at = status.last_completed_at;
-            if previous.phase == "running" {
-                status.last_error = Some(
-                    "previous scrub interrupted by engine restart; scan coverage is incomplete"
-                        .into(),
-                );
-            } else {
-                status.last_error = previous.last_error;
-            }
-        }
-        Err(error) => {
-            status.phase = "journal_unavailable".into();
-            status.last_error = Some(error);
-            publish(&status).await;
-            return;
-        }
-    }
-    status.phase = "startup_delay".into();
+    status.schedule_utc = Some(cfg.schedule_utc);
     status.next_scheduled_at = Some(schedule.next_after(Utc::now()));
-    publish(&status).await;
-    tokio::time::sleep(Duration::from_secs(cfg.initial_scan_delay_seconds)).await;
-    let mut running: Option<
-        tokio::task::JoinHandle<Result<bool, crate::enums::app_error_enum::AppError>>,
-    > = None;
+    save(&path, &status).await?;
+    tokio::select! { _ = stop.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(cfg.initial_delay_seconds)) => {} }
+    let mut owned: Option<String> = None;
+    let mut timer = tokio::time::interval(Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        tokio::select! { _ = stop.cancelled() => return Ok(()), _ = timer.tick() => {} }
         let now = Utc::now();
-        if running.as_ref().is_some_and(|job| job.is_finished()) {
-            let result = running.take().unwrap().await;
-            match result {
-                Ok(Ok(true)) => {
-                    status.phase = "completed".into();
-                    status.last_completed_at = Some(now.timestamp());
-                    status.last_error = None;
-                    AUTO_HEALING_STATUS.write().await.last_checksum_scrub_at =
-                        status.last_completed_at;
+        if let Some(id) = &owned {
+            match jobs.status().map_err(|e| e.to_string())? {
+                Some(job) if job.id == *id && matches!(job.phase, "running" | "stopping") => {}
+                Some(job) if job.id == *id => {
+                    status.phase = job.phase.into();
+                    status.last_error = job.error;
+                    if job.phase == "completed" {
+                        status.last_completed_at = Some(now.timestamp());
+                    }
+                    owned = None;
+                    save(&path, &status).await?;
                 }
-                Ok(Ok(false)) => {
+                _ => {
                     status.phase = "incomplete".into();
-                    status.last_error = Some("scrub stopped before full coverage".into());
+                    status.last_error =
+                        Some("scheduled job result replaced before observation".into());
+                    owned = None;
+                    save(&path, &status).await?;
                 }
-                Ok(Err(error)) => {
-                    status.phase = "incomplete".into();
-                    status.last_error = Some(error.to_string());
-                }
-                Err(error) => {
-                    status.phase = "incomplete".into();
-                    status.last_error = Some(format!("scrub worker: {error}"));
-                }
-            }
-            if let Err(error) = save(&path, &status).await {
-                status.last_error = Some(error);
             }
         }
         if let Some(slot) = status.due(&schedule, now) {
             status.last_attempt_slot = Some(slot);
-            // Never overlap another scheduled/manual job, or start mutations
-            // through an existing topology/maintenance safety gate.
-            if running.is_some() {
-                // Preserve the running job's result/state; this slot is skipped.
-            } else if operation_gate::current_maintenance_access_mode()
-                != operation_gate::MaintenanceAccessMode::Availability
-            {
-                status.phase = "deferred".into();
-                status.last_error = Some(
-                    "scheduled slot skipped: storage maintenance/safety gate is active".into(),
-                );
-            } else {
-                match repair_manager::reserve_scheduled_scrub(
-                    &cfg,
-                    Arc::new(state.ws_manager.clone()),
-                ) {
+            // Persist the slot before admitting any filesystem work. Restarts
+            // and clock rollback cannot duplicate a previously attempted slot.
+            save(&path, &status).await?;
+            if owned.is_none() {
+                match jobs.scrub(store.clone(), cfg.options.clone()) {
                     Ok(job) => {
                         status.phase = "running".into();
                         status.last_started_at = Some(now.timestamp());
                         status.last_error = None;
-                        // Persist admission BEFORE spawning; a restart cannot
-                        // immediately duplicate this slot. No global scan deadline.
-                        if let Err(error) = save(&path, &status).await {
-                            status.phase = "journal_unavailable".into();
-                            status.last_error = Some(error);
-                            publish(&status).await;
-                            return;
-                        }
-                        running = Some(tokio::spawn(job));
+                        owned = Some(job.id);
                     }
                     Err(error) => {
                         status.phase = "deferred".into();
@@ -235,18 +204,9 @@ pub(super) async fn run(state: Arc<AppState>, cfg: AutoHealingConfig) {
                     }
                 }
             }
-            if let Err(error) = save(&path, &status).await {
-                status.last_error = Some(error);
-            }
-        } else if status.phase == "startup_delay" {
-            status.phase = "waiting".into();
+            status.next_scheduled_at = Some(schedule.next_after(now));
+            save(&path, &status).await?;
         }
-        status.next_scheduled_at = Some(schedule.next_after(now));
-        publish(&status).await;
-        tokio::time::sleep(Duration::from_secs(
-            cfg.topology_check_interval_seconds.clamp(1, 30),
-        ))
-        .await;
     }
 }
 
@@ -301,5 +261,71 @@ mod tests {
         ] {
             assert!(Schedule::parse(value).is_err(), "{value}");
         }
+    }
+
+    #[tokio::test]
+    async fn journal_rejects_symlinks_special_files_oversize_and_corrupt_content() {
+        use std::os::unix::fs::symlink;
+        let fixture = crate::core::tests::Fixture::new();
+        let path = fixture.base.join("journal.json");
+        assert_eq!(load(&path).await.unwrap().last_attempt_slot, None);
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(load(&path).await.is_err());
+        std::fs::write(&path, vec![b' '; 65537]).unwrap();
+        assert!(load(&path).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        let outside = fixture.base.join("outside");
+        std::fs::write(&outside, b"{}").unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(load(&path).await.is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"{}");
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), load(&path))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_marks_interrupted_scrub_without_restarting_io_or_losing_the_attempted_slot() {
+        let fixture = crate::core::tests::Fixture::new();
+        let store = fixture.enroll();
+        let jobs = Jobs::new();
+        let path = fixture.base.join("journal.json");
+        let status = ScheduledScrubStatus {
+            phase: "running".into(),
+            last_attempt_slot: Some(1793498400),
+            last_started_at: Some(1793498400),
+            ..Default::default()
+        };
+        save(&path, &status).await.unwrap();
+        let cfg = CalendarScrub {
+            schedule_utc: "Sun 02:00".into(),
+            initial_delay_seconds: 3600,
+            options: n1_link::noa::ScrubOptions {
+                repair: true,
+                bytes_per_second: 1024,
+                window_seconds: 60,
+            },
+        };
+        let stop = CancellationToken::new();
+        stop.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run(jobs.clone(), store, cfg, path.clone(), stop),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let restored = load(&path).await.unwrap();
+        assert_eq!(restored.phase, "incomplete");
+        assert_eq!(restored.last_attempt_slot, status.last_attempt_slot);
+        assert_eq!(restored.last_started_at, status.last_started_at);
+        assert!(restored.last_error.unwrap().contains("restart"));
+        assert!(jobs.status().unwrap().is_none());
     }
 }

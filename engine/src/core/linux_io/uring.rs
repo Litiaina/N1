@@ -18,7 +18,7 @@ pub(super) const CAPACITY: usize = 128;
 const WAKE_ID: u64 = u64::MAX;
 
 pub(super) enum Buffer {
-    Aligned(crate::core::ec::AlignedBuffer),
+    Aligned(ecs_core::AlignedBuffer),
     Bytes(Vec<u8>),
 }
 
@@ -77,7 +77,7 @@ struct Request {
 impl Request {
     fn chunk_length(&self) -> usize {
         let limit = if matches!(self.buffer, Some(Buffer::Aligned(_))) {
-            (u32::MAX as usize / crate::core::ec::ALIGNMENT) * crate::core::ec::ALIGNMENT
+            (u32::MAX as usize / ecs_core::ALIGNMENT) * ecs_core::ALIGNMENT
         } else {
             u32::MAX as usize
         };
@@ -91,7 +91,8 @@ impl Request {
         let fd = types::Fd(self.file.as_raw_fd());
         let offset = self.offset + self.done as u64;
         let length = self.chunk_length() as u32;
-        let entry = match self.kind {
+
+        match self.kind {
             Kind::Read | Kind::ReadSome => {
                 let tail = &mut self
                     .buffer
@@ -116,8 +117,7 @@ impl Request {
                     types::FsyncFlags::empty()
                 })
                 .build(),
-        };
-        entry
+        }
     }
 
     fn advance(&mut self, result: i32) -> io::Result<bool> {
@@ -494,10 +494,10 @@ fn drive(mut ring: IoUring, queue: Arc<Queue>, wake: Arc<File>, counters: Arc<Co
         // left queued work and free slots, no I/O completion may exist to wake
         // us: submit the armed poll without waiting and drain the next batch.
         let queued_work = !free.is_empty() && !queue.state.lock().unwrap().requests.is_empty();
-        if let Err(error) = ring.submit_and_wait(usize::from(!queued_work)) {
-            if error.kind() != io::ErrorKind::Interrupted {
-                fatal(&format!("submit/wait failed: {error}"));
-            }
+        if let Err(error) = ring.submit_and_wait(usize::from(!queued_work))
+            && error.kind() != io::ErrorKind::Interrupted
+        {
+            fatal(&format!("submit/wait failed: {error}"));
         }
     }
 }
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn direct_short_write_keeps_buffer_owned_and_does_not_fallback_on_alignment_error() {
-        let mut buffer = crate::core::ec::AlignedBuffer::new(8192);
+        let mut buffer = ecs_core::AlignedBuffer::new(8192);
         buffer.fill_zeros();
         let file = Arc::new(File::open("/dev/null").unwrap());
         let mut operation = Backend::request(
@@ -597,7 +597,7 @@ mod tests {
             oneshot::channel().0,
         );
         assert!(matches!(offset_error, Err(error) if error.kind() == io::ErrorKind::InvalidInput));
-        let mut buffer = crate::core::ec::AlignedBuffer::new(4096);
+        let mut buffer = ecs_core::AlignedBuffer::new(4096);
         buffer.fill_zeros();
         let read_error = Backend::request(
             file,
@@ -656,7 +656,7 @@ mod tests {
             request(Kind::Read, 4096).advance(0).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
-        let mut aligned = crate::core::ec::AlignedBuffer::new(4096);
+        let mut aligned = ecs_core::AlignedBuffer::new(4096);
         aligned.fill_zeros();
         let invalid = Backend::request(
             Arc::new(File::open("/dev/null").unwrap()),

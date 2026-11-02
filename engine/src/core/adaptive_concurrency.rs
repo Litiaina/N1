@@ -54,7 +54,7 @@ fn clamp_next_aligned(
     up_pct: usize,
 ) -> usize {
     let next = clamp_next(cur, min_v, max_v, down_pct, up_pct);
-    ((next.max(4096) + 4095) / 4096) * 4096
+    next.max(4096).div_ceil(4096) * 4096
 }
 
 // Queued demand alone must not pin a reduced target forever. Recover within
@@ -91,10 +91,14 @@ fn adjustment(
 }
 
 pub async fn run_adaptive_concurrency_loop() {
+    run_adaptive_concurrency_until(tokio_util::sync::CancellationToken::new()).await;
+}
+
+pub async fn run_adaptive_concurrency_until(stop: tokio_util::sync::CancellationToken) {
     let io_max = *MAX_IO_SEMAPHORE.get().unwrap_or(&128usize);
     let stream_max = *STREAM_MAX_CONCURRENCY.get().unwrap_or(&128usize);
-    let io_min = (io_max / 8).max(4);
-    let stream_min = (stream_max / 8).max(8);
+    let io_min = (io_max / 8).max(4).min(io_max);
+    let stream_min = (stream_max / 8).max(8).min(stream_max);
     let stream_chunk_max = STREAM_CHUNK_SIZE_ATOMIC
         .get()
         .map(|v| v.load(Ordering::Relaxed))
@@ -118,7 +122,7 @@ pub async fn run_adaptive_concurrency_loop() {
 
     loop {
         if !enabled() {
-            tokio::time::sleep(Duration::from_millis(interval_ms())).await;
+            tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(interval_ms())) => {} }
             continue;
         }
 
@@ -148,6 +152,7 @@ pub async fn run_adaptive_concurrency_loop() {
             let cur = stream_target.load(Ordering::Relaxed);
             let next = clamp_next(cur, stream_min, stream_max, down_pct, up_pct);
             stream_target.store(next, Ordering::Relaxed);
+            crate::core::object_parser::set_stream_target(next);
         }
 
         if let Some(chunk_atomic) = STREAM_CHUNK_SIZE_ATOMIC.get() {
@@ -173,7 +178,7 @@ pub async fn run_adaptive_concurrency_loop() {
             readahead_atomic.store(next, Ordering::Relaxed);
         }
 
-        tokio::time::sleep(Duration::from_millis(interval_ms())).await;
+        tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(interval_ms())) => {} }
     }
 }
 

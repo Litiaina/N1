@@ -4,7 +4,7 @@ use crate::args::OfflineArgs;
 use std::io;
 use std::process::Command;
 
-pub fn run(operation: &str, args: &OfflineArgs) -> Result<(), cli_core::client::DynError> {
+pub fn run(operation: &str, args: &OfflineArgs) -> cli_core::Result<()> {
     let engine = match &args.engine_binary {
         Some(path) => path.clone(),
         None => std::env::current_exe()?
@@ -24,7 +24,7 @@ pub fn run(operation: &str, args: &OfflineArgs) -> Result<(), cli_core::client::
 
 #[cfg(test)]
 mod tests {
-    use crate::args::{Cli, Commands};
+    use crate::args::{Action, BackupAction, Cli};
     use clap::Parser;
     #[test]
     fn offline_commands_preserve_flags_without_network_authentication() {
@@ -33,7 +33,7 @@ mod tests {
             "pool",
             "replace",
             "--config",
-            "/etc/n1.ini",
+            "/etc/n1.json",
             "--pool",
             "A",
             "--member",
@@ -42,20 +42,26 @@ mod tests {
             "--resume",
         ])
         .unwrap();
-        let Commands::Pool(args) = cli.command else {
+        let Action::Pool(args) = cli.command else {
             panic!("wrong command");
         };
         assert_eq!(args.arguments.last().unwrap(), "--resume");
         let cli = Cli::try_parse_from([
             "shell",
             "backup",
+            "offline",
             "restore",
             "--snapshot",
             "id",
             "--target-config",
-            "/etc/n1.ini",
+            "/etc/n1.json",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Commands::Backup(_)));
+        assert!(matches!(
+            cli.command,
+            Action::Backup {
+                command: BackupAction::Offline(_)
+            }
+        ));
     }
 }
