@@ -1,143 +1,48 @@
 # Changelog
 
-This is a condensed release and development history, not an LTS declaration.
-Results and known failures are recorded separately in [TESTING.md](TESTING.md).
+This file records product changes. Architecture is defined in
+[ARCHITECTURE.md](ARCHITECTURE.md); commands are in
+[DOCUMENTATION.md](DOCUMENTATION.md); test results are in [TESTING.md](TESTING.md).
 
-## Unreleased — bounded maintenance and upload performance
+## Unreleased — 1.0.0-RC.2
 
-- Fix pending durable-upload enumeration racing finalization/cancellation. Read
-  bindings and manifests directly; treat only disappearance as a retired
-  session, preserve corruption/conflict handling and surviving-replica policy,
-  and make overlapping session removals idempotent. Late receipts no longer
-  recreate retired session directories.
-- Never delete immutable payload merely because an upload session disappeared:
-  it may already have finalized. Retain existing GC reclamation for abandoned
-  data. Cancellation preserves unreadable committed metadata, resolves retired
-  logical-name hints safely and requires a live session before payload cleanup.
-  Add deterministic filesystem/part-finalization races and isolated concurrent
-  durable-reuse, integrity and restart proofs. Storage encoding, architecture,
-  acknowledgement barriers and RC version remain unchanged.
-- Consume accepted durable-part HTTP replays before returning write-once
-  success. Discard chunks without buffering the entire part or rewriting shards;
-  reject truncated, excess or failed bodies instead of losing the response to
-  an early HTTP/1 connection close. Preserve existing part identity and receipts.
-- Reduce full namespace-inventory I/O: reuse the validated NCX identity, avoid
-  repeated authoritative lookups for duplicate replicas, and select the newest
-  immutable NDX in one directory pass per member. Retain replica-conflict,
-  corruption and maximum-ULID checks; change no storage encoding.
-- Add opt-in, actual-traversal progress to namespace snapshots. Require explicit
-  successful scan exhaustion before emitting completion; a failed producer is
-  not an empty success. Preserve the default entry/completion stream.
-- Continue failed post-upload qualifications in place with pinned source/build
-  evidence, bounded probe discovery and independent results. Preserve original
-  failures; do not clone member storage or repeat the million-object upload.
-- Share only pending, sealed filesystem flush rounds between concurrent small
-  batches. Late writers require a new flush; writeback errors fail every live
-  attached group without retry. Keep all three ordered durability barriers,
-  pre/post root validation and ordinary immutable storage files. Add bounded
-  per-device flush timing; this does not eliminate filesystem-wide coupling.
-- Pace GC at entry-count or elapsed-time boundaries. Give active and queued
-  foreground work finite service windows, without disabling collection or
-  weakening reference, upload, export or TTL protection.
-- Separate CPU execution from I/O wait and sample counters coherently. Do not
-  interpret I/O-blocked load average alone as CPU saturation; retain configured
-  concurrency ceilings and actual CPU, memory and stall safeguards.
-- Retain read-only GC/flush diagnostics on a refused scale-test batch, and
-  support exact enrolled EC topology when independently cloning failed test
-  populations for verification and matched comparisons.
-- Isolate the namespace key-lock cleanup regression from unrelated parallel
-  tests; preserve the failed qualification and require a fresh complete rerun.
-  This changes no runtime behavior, storage format or RC version.
-- Add a request-owned strict small-file batch path: at most 64 objects / 8 MiB
-  per commit group, bounded payload parallelism and shared filesystem durability
-  barriers before NDX, before NCX and before ACK. Keep ordinary independent
-  NCX/immutable NDX/shards, existing per-key coordination and format. Do not
-  rewrite healthy NCX for a new version. GC reclaims only expired private batch
-  staging files in its existing version pass, fenced against active uploads.
-  Correctness and measured performance qualification are separate gates.
-- Add a bounded, in-process Linux io_uring backend with owned completion
-  lifetimes and explicit `auto`, required `uring` and `blocking` selection.
-  Expose the selected backend, initialization fallback and operation counters
-  in startup logs/system health. Preserve publication order and durability
-  barriers across direct/relaxed writes, checksum/recovery reads and metadata
-  publication. Keep asynchronous data/read/sync work native; synchronous
-  publication uses POSIX directly rather than a worker-to-ring reply bridge,
-  reported as `publication_backend: posix`. Share encoded NDX between holders
-  and reuse checksum buffers;
-  storage formats are unchanged. Native XFS/ext4 correctness gates pass;
-  performance qualification is separate.
-- Visit metadata-snapshot holders in the same lexical order used for replica
-  suppression, avoiding a complete non-emitting member walk before the first
-  entry. Keep all-member traversal and EC member order unchanged. Report startup
-  phase timings without weakening lease or publication syncs.
-- Verify existing shard checksums on streaming GET/download/range reads as well
-  as verified chunk reads. Reject unavailable checksum authority; validate
-  reconstructed bytes before repair publication. Keep storage encoding intact.
-- Make full healing/checksum walks and deep health scans explicit. Retain
-  known-member safety checks and bounded, targeted read-triggered repair.
-- Check trash TTL before loading version metadata. Route scheduled and manual
-  GC through the same collector so scheduled runs also reclaim aged abandoned
-  uploads, including unpublished versions beneath live objects. Preserve
-  committed history, active uploads, overlapping namespace mutations and backups.
-- Stream object fanout with bounded directory handles and rejoin BackgroundGc
-  admission between object/session batches. Check every configured member before
-  deletion; reject redirected layouts and uncertain export authority. Recheck
-  export admission between destructive batches. No new upload receipts or format.
-- Prune only known empty trash ancestors after GC expiry, preserving siblings
-  and `.trash` itself. Keep ordinary recovery free of added pruning syncs.
-- Reconstruct short/unaligned reads from recorded EC stripes, and repair every
-  encountered corrupt data target rather than confusing peer rejection with
-  an already-admitted repair. Keep reconstruction memory stripe-bounded.
-- Honor existing whole-fragment deletion admission in read-triggered repair;
-  defer repair during deletion and refuse publication without live identity.
-- Treat unavailable process metrics as telemetry, not storage I/O failure, and
-  stop the sampler before stopping a test engine. Preserve and reconcile timed-out
-  writes without retrying them or relabeling an incomplete run as a scale PASS.
+RC.2 introduces N1's LINK architecture and optional metadata engine. It has not
+been released. This section describes implemented changes, not a declaration of
+complete API conformance or qualification.
 
-- Preserve and independently recheck failed HDD scale fixtures, including every
-  acknowledged historical version and complete namespace/maximum-ULID inventory.
-- Record bounded, in-memory admission-owner diagnostics on foreground timeout
-  and separate batch payload/NDX and NCX latency classes. Durability, admission
-  deadlines and storage encoding are unchanged.
-- Preserve FIFO admission when adaptive concurrency shrinks: retire existing
-  semaphore permits as operations finish instead of cancelling queue position
-  and retrying every 2 ms. Keep waiting foreground work out of the shared
-  background lane. Hard concurrency and memory limits remain unchanged.
-- Allow adaptive concurrency to recover after host pressure clears even with
-  queued demand. Retain configured ceilings and saturation/stall/resource guards;
-  validate against unchanged strict-durability workloads before claiming gains.
-- Resume one physical NCX walk across internal maintenance batches instead of
-  restarting sorted LIST for every page. Keep live/trash scan state bounded;
-  reuse the cursor for repair, monitoring and redistribution.
-- Remove duplicate NCX repair passes and move namespace inspection off async
-  workers. Namespace/payload/NDX presence probes stop at their first match;
-  object fanout counting streams without a whole-fragment directory inventory.
-- Keep bounded independent-object concurrency and report admitted successes
-  alongside explicit per-object backpressure rejections.
-- Publish independent NDX holders in bounded parallel phases, joining every
-  writer before proceeding. Avoid redundant existing-parent traversal while
-  retaining the existing strict direct-I/O and data/directory barriers.
-- Keep one-shot and batch-upload admission through NCX publication, including detached
-  commits after caller cancellation. Resolve stable fragment IDs without
-  rediscovering roots and create only missing directory suffixes.
-- Reuse the typed streaming commit result for HTTP one-shot uploads instead of
-  serializing/parsing an internal response and rereading the just-written NDX.
-  Share stream/reader shard setup, open independent members in bounded parallel,
-  and omit redundant small-shard pre-sizing. Keep strict direct I/O and all
-  synchronization barriers. NDX publication no longer initializes unused
-  `.uploads` and `.trash` directories.
-- Collect GC references from each physical NCX in cooperative batches. Preserve
-  conflicting references and defer reclamation on unreadable authority; reuse
-  one object-directory inventory and lazy cross-member NDX authority per object.
-  Give queued foreground work a bounded service window between GC batches.
-- Separate shard setup, direct-write drain, data sync and directory-sync timing.
-  These changes require fresh HDD integrity and matched-population performance
-  verification; the failed 300k run is not relabeled as a pass.
-- Retain server-stage/scheduler telemetry at scale checkpoints and separate
-  client source preparation, HTTP and acknowledgement-ledger timing. Keep the
-  real source files, FULL acknowledgement database and strict workload unchanged.
-- No disk-format, NCX copy/delete, immutable version, backup or cache changes.
-  Performance and integrity qualification are recorded separately below.
+- Introduce **LINK — Litiaina Immutable Native Key** for deterministic object
+  addressing and shard placement within immutable storage pools. Remove NCX/NDX
+  lookup from object storage; keep names and user-visible versions outside it.
+- Separate the workspace into an independently usable `object_engine` and an
+  optional `metadata_engine` built on the retained ProcyonDB storage core.
+- Add metadata-owned fragments, named uploads, immutable version references,
+  maximum-ULID selection, namespace operations, trash/recovery and exports.
+  Named HTTP/WebSocket and native adapters serve the original Console contract.
+- Provide direct LINK NOA v2 operations over native `n1/1`, with a secondary
+  HTTP adapter. Retain NOA v1 as the metadata interface; v2 does not replace it.
+- Keep N1's adaptive concurrency, I/O scheduler, io_uring, middleware, server,
+  streaming download, repair, backup automation and module responsibilities.
+- Retain operator INI/environment controls for listeners, TLS, pool enrollment,
+  concurrency, I/O, staging cleanup and optional scheduled healing. Expand
+  capacity by enrolling complete immutable pools.
+- Add CRC32C frame verification with context-bound source SHA-256 for the hybrid
+  shard profile; preserve immutable integrity profiles within enrolled pools.
+- Add permanent LINK key retirement, conservative upload staging GC, object
+  recovery points, replication and explicit member verification/reconstruction.
+- Add Rust physical qualification and failure auditing for direct objects,
+  metadata transactions and original-console-to-metadata-to-object operations.
+  Retire cached metadata transports before the object's native idle deadline.
+
+Remaining metadata lifecycle, full NOA conformance and release qualification are
+tracked in [the completion checklist](docs/RC2-IMPLEMENTATION.md). Benchmark and
+population outcomes are not release notes; see [TESTING.md](TESTING.md).
+
+## Earlier architecture
+
+The entries below describe the former NCX/NDX engine and its historical releases
+or private development labels. They do not describe LINK storage or imply
+compatibility with RC.2. The pre-LINK unreleased notes are preserved in Git at
+`9939ec8:CHANGELOG.md`, rather than being presented as current RC.2 changes.
 
 ## 1.0.0-RC.1 — October 18, 2026
 

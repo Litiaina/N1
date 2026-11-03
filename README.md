@@ -10,7 +10,7 @@
   <h1>Litiaina N1</h1>
 
   <p>
-    <b>N1 is a high-performance single-node object storage system built for durable, redundant, key-addressed, and efficient storage.</b>
+    <b>N1 is a high-performance single-node object storage system built on LINK (Litiaina Immutable Native Key), with an independent object engine and an optional metadata engine for named-object management.</b>
   </p>
 
 </div>
@@ -21,65 +21,69 @@
 
 ## Overview
 
-N1 is being redesigned as a pure immutable object engine using **LINK — Litiaina
-Immutable Native Key**. The development target is **1.0.0-RC.2**, with native
-**NOA 2 / `n1/1`**. RC.2 is not released or fully qualified.
+**LINK — Litiaina Immutable Native Key** is N1's native object-addressing and
+shard-placement architecture. The object engine calculates shard locations from
+a client-held key and an immutable storage-pool layout. It does not use NCX/NDX
+or a namespace database to locate object bytes.
 
-A client-held key identifies an immutable pool and object. N1 calculates shard
-locations, streams verified object bytes and permanently retires deleted keys.
-The workspace has two main components: **`object_engine/`**, the standalone LINK
-object engine, and **`metadata_engine/`**, the optional ProcyonDB-based metadata
-component. Metadata provides fragments, names, versions, listings and named
-upload transactions through the original HTTP and native NOA interfaces.
-Users can also provide their own metadata service. There is no NCX/NDX catalogue
-or namespace API in the object engine.
+N1 has two main components:
 
-The new implementation includes normal/batch/multipart upload, durable parts,
-restart resume, GET/ranges, object health, manual/read repair, conservative upload
-GC, optional paced scrub schedules, encrypted recovery points, restore and
-recovery-point replication. Native `n1://` and verified TLS `n1s://` are primary;
-HTTP is an optional adapter to the same service. N1 retains adaptive concurrency,
-the disk scheduler, io_uring, middleware and backup automation. Verified member
-cloning and explicit single-member reconstruction are implemented; installer/UI adaptation
-and full scale/fault/performance qualification remain tracked work.
+- **`object_engine/`** stores and verifies immutable objects. It handles normal,
+  batch and multipart uploads, durable finalization, GET/ranges, object health,
+  repair, permanent key retirement, staging GC and object recovery.
+- **`metadata_engine/`** provides logical fragments, names, versions, listings,
+  named upload transactions, rename, trash/recovery and exports. Its database
+  foundation is ProcyonDB. It coordinates storage through the public native LINK
+  interface, without importing object-engine internals.
 
-## Build and start
+The original Console connects to metadata's NOA v1 interface. Metadata forwards
+object operations over native NOA v2. Applications that manage their own names
+and LINK keys can use the object engine independently.
 
-Build with Rust on Linux. Keep `CARGO_TARGET_DIR`, temporary fixtures and large
-reports on storage with adequate space; do not put test data in the source tree.
+`Console / named client → metadata_engine → LINK object_engine → shards`
+
+`Client with its own metadata → LINK object_engine → shards`
+
+N1 retains adaptive concurrency, the disk scheduler, io_uring, streaming,
+middleware, repair and backup infrastructure. Capacity expansion adds a complete
+immutable pool; existing objects keep their original placement. Operators retain
+INI/environment control of addresses, ports, TLS, concurrency and maintenance.
+
+## Build and operate
+
+Build with Rust on Linux. Keep build output and large datasets on storage with
+adequate space, outside the source tree.
 
 ```sh
-cargo build --locked --release -p n1 -p n1_shell
+cargo build --locked --release -p n1 -p n1_metadata_engine -p n1_shell
 litiaina-n1 --help
+litiaina-n1-metadata --help
 litiaina-n1-shell --help
-litiaina-n1-backup --help
 ```
 
-The object engine's package and executable names are preserved after the
-directory rename. Build the optional metadata component independently with
-`cargo build --locked -p n1_metadata_engine`. Its `litiaina-n1-metadata` binary
-provides the public named-object server and offline `init` and `check` commands.
-Both components accept operator INI configuration; see the operator guide for
-listen addresses, TLS, immutable pool enrollment and concurrency controls.
-
-Use `litiaina-n1 init` only with explicitly selected empty, independent member
-roots. Never point enrollment or restore at existing production storage. The
-operator guide explains configuration and credentials; startup does not format
-or adopt missing members automatically.
+Package `n1` builds the object engine; its directory and executable names are
+independent. Both servers use their own `n1_config.ini` and private `n1.env`.
+Follow the operator guide to enroll empty member roots, configure the two
+services and connect Console to metadata.
 
 ## Documentation
 
-- [Architecture](ARCHITECTURE.md): engine boundaries and invariants.
-- [Metadata engine](docs/METADATA-ENGINE.md): Procyon foundation, standard and integration scope.
-- [LINK format](docs/LINK-FORMAT.md): canonical identities, tickets and disk bytes.
-- [NOA](NOA.md): implemented native operations and secondary HTTP adapter.
-- [Operator guide](DOCUMENTATION.md): setup, native CLI and recovery tools.
-- [Implementation ledger](docs/RC2-IMPLEMENTATION.md): completed work and open gates.
-- [Testing](TESTING.md): current qualification context and historical evidence.
-- [Changelog](CHANGELOG.md): release history.
+| Read | Purpose |
+| --- | --- |
+| [Operator guide](DOCUMENTATION.md) | Configure, enroll disks, start services, tune and recover N1 |
+| [Architecture](ARCHITECTURE.md) | LINK placement and the object/metadata responsibility boundary |
+| [NOA standard](NOA.md) | Both the named metadata v1 contract and direct LINK v2 contract |
+| [Testing](TESTING.md) | Reproduce tests and distinguish qualified results from running campaigns |
+| [Changelog](CHANGELOG.md) | Product changes; older engine history is explicitly separated |
 
-The previous engine and its historical tooling are preserved in Git at `061a40a`;
-old-format data and endpoints are not supported by the new engine.
+Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
+[metadata internals](docs/METADATA-ENGINE.md) and
+[remaining completion gates](docs/RC2-IMPLEMENTATION.md).
+
+**Development status:** RC.2 is unreleased. Implemented features, test evidence
+and remaining API/product work are different things; the completion checklist
+and testing guide identify them explicitly. Earlier development storage formats
+are not a compatibility or migration requirement.
 
 ## License and reports
 

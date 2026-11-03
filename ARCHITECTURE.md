@@ -1,65 +1,70 @@
-# Litiaina N1 — object and metadata engines
+# N1 architecture
 
-LINK replaces N1's object identity, placement and shard representation. N1 keeps
-its established responsibilities and module structure: adaptive concurrency,
-disk scheduling, streaming, io_uring, middleware, server, repair and backup.
-Both native NOA and the optional HTTP adapter use the same object service.
-The workspace now contains `object_engine/` and `metadata_engine/` as separate
-main components. Product versions come from workspace Cargo metadata.
+N1 is a single-node object storage system built on **LINK — Litiaina Immutable
+Native Key**. LINK is N1's native object-addressing and shard-placement
+architecture. An optional metadata engine supplies the named-object product
+used by Console. These are two components of N1, with separate responsibilities
+and a public native API between them.
 
-Implementation and qualification are in progress. This document describes the
-new runtime and identifies unfinished retained responsibilities explicitly.
-[Implementation ledger](docs/RC2-IMPLEMENTATION.md) tracks completion;
-[LINK format](docs/LINK-FORMAT.md) is the exact byte-level specification.
-Changing the package version does not authorize or qualify a release.
+`Console / named client → metadata_engine → native LINK object_engine → shards`
 
-## Responsibility
+`Client with its own metadata → native LINK object_engine → shards`
 
-N1 accepts client-held immutable keys, calculates shard locations, and performs
-object I/O. Its source directory is `object_engine/`; its Cargo package remains
-`n1` and its executables keep their existing names. This is a directory move,
-with the tested implementation and module structure retained.
+| Component | Owns | Does not own |
+| --- | --- | --- |
+| `object_engine/` | LINK keys, immutable pools/EC, upload bytes, verified reads, repair, permanent key retirement, staging GC and object recovery | Human names, logical versions, namespace lists or a metadata database |
+| `metadata_engine/` | Logical fragments, names, maximum-ULID version selection, upload transactions, listings, rename, trash/recovery, permissions and exports | Shard placement, member-root access or an alternate object format |
+| Console (separate repository) | Existing user interface and workflows through metadata's NOA v1 API | Storage authority or replacement metadata semantics |
 
-The optional `metadata_engine/` component owns the metadata development cycle:
-names, virtual prefixes, user-visible history, permissions, LINK references and
-listings. Its storage foundation is imported from ProcyonDB, with optimistic
-transactions, consistent snapshots and durable journal commits. The current
-component supplies transactional storage, a named-upload coordinator, logical
-namespace transactions, named HTTP/WebSocket APIs and the original named native
-protocol. The coordinator consumes the existing native object API; it has no
-dependency on object-engine internals. Full product qualification and the
-remaining service responsibilities are tracked separately; see
-[the metadata contract and implementation boundary](docs/METADATA-ENGINE.md).
+The object engine builds and operates independently. Metadata uses
+`n1_native_client`, not object-engine internals. An external metadata service
+can use the same LINK interface. Metadata availability is not a prerequisite for
+a client holding a valid object key and object-service credentials.
 
-The object engine is the independently usable LINK storage engine. Metadata is
-optional for direct key-based access. N1's complete named-object product consists
-of the console communicating with metadata, and metadata coordinating references
-and transactions with the object engine. Logical features belong in metadata;
-their absence there must never be worked around by removing console features or
-putting a namespace back into LINK. Object-engine startup, placement and ordinary
-I/O never open a metadata database or depend on metadata availability. A custom
-metadata implementation can use the same public object API.
+## LINK addressing
 
-The object engine has no public rename, move, namespace list, search,
-latest-version, trash, undelete, ZIP or TAR export operation. It builds and runs
-without ProcyonDB or a metadata service. Users can retain LINK keys themselves,
-use their own metadata service, or use N1's optional named metadata service.
-Metadata outages do not enter the direct,
-authorized LINK operation path.
+A LINK object identity identifies an immutable pool, generation and random token.
+Canonical, versioned encoding produces its fingerprint; the pool's fixed member
+map and placement rule determine the shard locations. The key-to-path calculation
+does not consult NCX, NDX, a namespace index or a per-object database record.
+Looking up a shard is separate from the I/O, integrity checking and EC work
+required to read its bytes. LINK does not make those costs disappear.
 
-Fragments are stable authorization scopes. Their display aliases and credentials
-belong to service configuration; object addressing uses a stable 16-byte fragment
-ID for authentication. They are called fragments, never buckets.
+The immutable pool fixes member slots, EC geometry and integrity/placement
+profiles. Expansion adds another complete pool; it does not redistribute objects
+or reinterpret old keys. The exact algorithm, key bytes and disk encoding are
+in [LINK-FORMAT.md](docs/LINK-FORMAT.md).
 
-The complete retained scope is normal and batch upload, standard and durable
-multipart upload, resumable status and finalization, stat, streamed and ranged
-GET, object-specific health and repair, permanent single/bulk deletion,
-conservative staging GC, optional paced scrub/repair, immutable pool maintenance,
-transport security, native SDK/CLI, encrypted incremental backup/restore and
-recovery-point replication. Native CLI operations, backup automation and verified
-member cloning and explicit failed-member reconstruction are implemented.
-Installer/UI adaptation and broader qualification remain open; see the
-implementation ledger.
+The product retains N1's adaptive concurrency, scheduler, streaming I/O,
+io_uring, middleware, native server, repair and backup infrastructure. The
+object Cargo package is still `n1`; existing executable names and the original
+startup banner are preserved. Versions come from Cargo, not release labels in
+keys or upload directories.
+
+Logical user fragments are managed by metadata. The object service separately
+authenticates its clients/service fragments; metadata's backend credential is
+not a user's logical fragment password. The term is **fragment**, never bucket.
+
+## Named upload transaction
+
+1. Metadata authorizes the logical fragment, name and permissions.
+2. LINK init returns the immutable object identity and upload ticket.
+3. Metadata durably records the pending named operation before accepting bytes.
+4. Bytes reach the independent object engine through native NOA v2.
+5. The object engine confirms durable finalization.
+6. A short metadata transaction publishes the name and immutable version reference.
+7. Metadata returns named success to the client.
+
+Object I/O does not run inside a database transaction. If the object finishes
+before metadata publication, the pending operation retains its identity for
+reconciliation. It is not discarded as an orphan by guessing from filenames.
+An overwrite keeps the old named version visible until publication. A rename
+changes metadata; it never renames or rewrites the immutable shard payload.
+
+The following sections describe the storage design. Current incomplete product
+work is listed only in [the completion checklist](docs/RC2-IMPLEMENTATION.md);
+verification evidence belongs in [TESTING.md](TESTING.md). This is not a release
+announcement or a migration guide.
 
 ## Code responsibilities
 
@@ -285,8 +290,9 @@ expired, unpublished staged payload after excluding active ownership, final path
 and retirement intent. Uncertain or corrupt candidates are retained and reported.
 It does not infer that a final object is garbage because its client key was lost.
 
-Scheduled GC and scrub are independently opt-in and disabled by default. A scrub
-schedule supplies an interval, startup delay, IO rate, run window and explicit
+Staging GC uses the operator INI cleanup interval (3,600 seconds in the
+generated configuration). Scheduled healing requires an enabled flag and an
+explicit UTC calendar. Manual scrub requests can supply a rate, run window and
 repair choice. Stopping or exhausting a window leaves an incomplete/stopped job;
 foreground object service remains available. Only one maintenance job runs at a
 time, and job records are bounded control state rather than an object catalogue.
@@ -334,15 +340,19 @@ and CLI version/help do not receive the server banner.
 
 ## Native NOA and HTTP
 
-Native NOA 2 over `n1://` is primary; `n1s://` adds certificate-verified TLS. The
-wire version is `n1/1`. MessagePack control is length-prefixed and raw object
+The object engine uses native NOA v2 over `n1://` as its primary interface;
+`n1s://` adds certificate-verified TLS. The wire version is `n1/1`.
+MessagePack control is length-prefixed and raw object
 bytes follow separately. Native requests call storage directly without HTTP.
 The SDK poisons a connection after an interrupted exchange so it cannot reuse
 an unknown frame boundary.
 
 HTTP is optional. JSON control, raw part/range endpoints and the streaming NOA
 adapter use the same authorization and object handlers. Configured TLS also
-secures the HTTP listener. [NOA.md](NOA.md) defines this new operation contract.
+secures the HTTP listener. [NOA.md](NOA.md) defines both contracts. Metadata
+serves the retained named NOA v1 HTTP/WebSocket and native `n1/0.5` interfaces;
+it forwards object bytes
+over `n1/1`. The Console communicates with metadata.
 
 ## Recovery and qualification
 
@@ -417,9 +427,6 @@ others use a conservative sequential scan. Reconstruction failures keep the
 target inactive. Multi-member replacement and full pool expansion qualification
 remain tracked separately.
 
-Builds and unit fixtures use RAM. Persistent reports and physical test data use
-the HDDs, not the source NVMe. Evidence includes parser/corruption vectors,
-EC loss patterns, restart/resume, retry conflicts, cancellation, repair,
-interrupted retirement, native/HTTP authorization, TLS and physical two-HDD
-witnesses. Small debug witnesses do not establish production throughput,
-power-loss durability, million-object scale or a win over the former engine.
+Builds, fixtures and qualification results are kept outside the source tree.
+[TESTING.md](TESTING.md) records exact hardware, binaries, commands and scope;
+object-only, metadata-KV and complete named-service results are distinct.

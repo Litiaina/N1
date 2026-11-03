@@ -1,16 +1,198 @@
-# N1 Operation API — NOA 2
+# Node Object API (NOA)
 
-NOA 2 is the LINK engine contract for N1 1.0.0-RC.2. It intentionally replaces
-NOA 1 namespace operations. The typed definitions in `link/src/noa.rs` are shared
-by the native server and SDK. Implementation/qualification remains in progress;
-[the ledger](docs/RC2-IMPLEMENTATION.md) identifies retained features still open.
+NOA defines both parts of N1's public operation contract. **NOA v1 is the named
+metadata interface; NOA v2 is the direct LINK object interface.** Neither
+replaces the other. API and wire versions are independent of the binary version
+in Cargo metadata. N1 RC.2 is still in development; full product conformance has
+not yet been established.
 
-Native `n1://host:port` is primary. `n1s://host:port` verifies the server's TLS
-certificate. Wire version: `n1/1`. HTTP is an optional adapter using the same
-service handlers. Object keys and upload tickets are client-held capabilities
-bound to a stable fragment ID and independently checked permissions.
+| Client or component | Connects to | Contract |
+| --- | --- | --- |
+| Console and applications using fragments, names and versions | Metadata engine | NOA v1, HTTP(S)/WebSocket; named native wire `n1/0.5` |
+| Metadata engine forwarding object bytes | Object engine | NOA v2 over native `n1/1` |
+| Applications managing their own metadata and LINK keys | Object engine directly | NOA v2 over native `n1/1`; optional HTTP adapter |
 
-## Native framing
+Native URLs are `n1://host:port` or certificate-verified `n1s://host:port`.
+The selected engine determines the wire schema; `n1/0.5` and `n1/1` are distinct
+protocols. The LINK SDK/shell targets the object engine. The original Console
+targets metadata and retains its named-object operations.
+
+## NOA v1 — metadata engine
+
+This is the retained named-object standard under `/noa/v1`. It is a requirement
+of N1's metadata engine, not an old-storage compatibility mode. The inventories
+below retain the original contract; missing implementation must not be hidden
+by deleting operations from this document.
+
+Use `Authorization: Bearer <access-token>` on protected HTTP calls. Fragment
+permissions are independently `read`, `write`, `modify` and `delete`. Signed
+URLs grant narrowly scoped download authority rather than a reusable fragment
+token. Names are flat, prefixes are virtual, empty mkdir is rejected, and prefix
+mutations return per-child results rather than promising one atomic tree move.
+Here `object_key` means the logical name; it is not a LINK `N1A1.` key.
+
+The named native interface uses a four-byte big-endian MessagePack control-frame
+length. Requests carry a string `id`, `op`, optional JSON-string `payload`,
+and either an embedded byte `body` or a `body_len` followed by raw bytes.
+Responses carry the matching ID, `ok`, optional status/payload/error and body
+metadata. These are the existing named frames in
+[types.rs](metadata_engine/src/server/native/types.rs). They must not be decoded
+using the LINK frame schema below.
+
+### Connectivity And Authentication
+
+```text
+GET  /noa/v1/ping
+POST /noa/v1/auth/fragment
+POST /noa/v1/auth/refresh
+POST /noa/v1/auth/logout
+GET  /noa/v1/ws?token=<access-token>
+```
+
+### Fragments And Capacity
+
+```text
+POST   /noa/v1/fragments
+GET    /noa/v1/fragments
+GET    /noa/v1/fragments/check
+GET    /noa/v1/fragments/hash
+PATCH  /noa/v1/fragments/{fragment}
+DELETE /noa/v1/fragments/{fragment}
+GET    /noa/v1/capacity/usage
+GET    /noa/v1/capacity/fragment
+```
+
+### POSIX-Like Namespace
+
+```text
+GET  /noa/v1/posix/list
+GET  /noa/v1/posix/stat
+POST /noa/v1/posix/mkdir
+POST /noa/v1/posix/rename
+POST /noa/v1/posix/move
+POST /noa/v1/posix/trash
+POST /noa/v1/posix/recover
+```
+
+### Objects And Trash
+
+```text
+GET    /noa/v1/objects
+GET    /noa/v1/namespace/snapshot
+GET    /noa/v1/namespace/search
+GET    /noa/v1/trash
+GET    /noa/v1/objects/meta/{object_key}
+GET    /noa/v1/objects/versions/{object_key}
+GET    /noa/v1/objects/get/{object_key}
+GET    /noa/v1/objects/stream/{object_key}
+GET    /noa/v1/objects/download
+GET    /noa/v1/objects/download/chunk
+POST   /noa/v1/objects/signed-url
+GET    /noa/v1/objects/signed-read
+DELETE /noa/v1/objects/{object_key}
+POST   /noa/v1/objects/recover/{object_key}
+POST   /noa/v1/objects/rename
+POST   /noa/v1/objects/bulk-delete
+POST   /noa/v1/objects/bulk-recover
+POST   /noa/v1/trash/recover-all
+POST   /noa/v1/objects/archive
+POST   /noa/v1/objects/archive/manifest
+POST   /noa/v1/exports
+GET    /noa/v1/exports/{export_id}
+GET    /noa/v1/exports/{export_id}/download
+POST   /noa/v1/exports/{export_id}/signed-url
+GET    /noa/v1/signed-exports/download
+DELETE /noa/v1/exports/{export_id}
+```
+
+Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
+not add empty-trash, hard-delete, or per-version-delete semantics.
+
+Snapshot is a read-authorized NDJSON projection feed with a completion marker.
+Search proxies to optional Accel. Optional `N1_ACCEL_READ_URL` also accelerates
+version-pinned object bytes after N1 authorization/resolution, including existing
+Console media URLs. Pre-header failure falls back to N1; mid-stream failure
+terminates the response. Accel never becomes namespace or durability authority.
+Exports pin immutable versions, build durable ZIP/TAR artifacts and support
+stable length/ETag, range resume and scoped signed downloads. Cancellation and
+artifact retention do not delete source objects.
+
+### Uploads
+
+```text
+POST   /noa/v1/upload/one-shot/{object_key}
+POST   /noa/v1/upload/batch
+POST   /noa/v1/upload/multipart/init/{object_key}
+GET    /noa/v1/upload/multipart
+GET    /noa/v1/upload/multipart/{version_id}
+PUT    /noa/v1/upload/multipart/{version_id}/{part_index}
+POST   /noa/v1/upload/multipart/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/{version_id}
+
+POST   /noa/v1/upload/multipart/durable/init/{object_key}
+GET    /noa/v1/upload/multipart/durable
+GET    /noa/v1/upload/multipart/durable/{version_id}
+PUT    /noa/v1/upload/multipart/durable/{version_id}/{part_index}
+POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
+DELETE /noa/v1/upload/multipart/durable/{version_id}
+```
+
+Standard multipart is nonpersistent until finalize; durable multipart retains
+restart-resumable progress. Both publish immutable objects after finalization.
+Batch accepts independent small objects, returning 201 for all-success or 207
+for mixed results. There is no durable batch route.
+
+### Maintenance And Object Health
+
+```text
+GET  /noa/v1/maintenance/health
+GET  /noa/v1/maintenance/pools/health
+GET  /noa/v1/maintenance/fragments/{fragment}/health
+GET  /noa/v1/objects/status/{object_key}
+POST /noa/v1/objects/repair/{object_key}
+
+POST /noa/v1/maintenance/fragment/init
+POST /noa/v1/maintenance/fragment/cleanup
+
+POST /noa/v1/maintenance/repair/start
+POST /noa/v1/maintenance/repair/stop
+GET  /noa/v1/maintenance/repair/status
+POST /noa/v1/maintenance/fragments/{fragment}/repair/start
+
+POST /noa/v1/maintenance/gc/start
+POST /noa/v1/maintenance/gc/stop
+GET  /noa/v1/maintenance/gc/status
+POST /noa/v1/maintenance/fragments/{fragment}/gc/start
+
+POST /noa/v1/maintenance/redistribution/start
+POST /noa/v1/maintenance/redistribution/stop
+GET  /noa/v1/maintenance/redistribution/status
+POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start
+POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
+```
+
+### Conformance
+
+Maintenance starts require write/modify/delete. Fragment tokens are scoped to
+their own fragment; explicit all-fragment work, restrictive modes and global
+stops require master-key operator authentication. Pool content diagnostics stay
+read-authorized and fragment-scoped. The metadata implementation must preserve these authorization scopes.
+
+Conformance requires matching request meaning, authentication, responses,
+errors and retry behavior, not just route names. A registered route or a passing object-engine test does not establish metadata
+conformance. Current evidence and remaining gates are in [TESTING.md](TESTING.md)
+and [the completion checklist](docs/RC2-IMPLEMENTATION.md).
+
+## NOA v2 — object engine and LINK
+
+This contract performs direct object storage. Its typed operations are shared
+by the object engine and native SDK in [link/src/noa.rs](link/src/noa.rs).
+Native `n1/1` is primary; HTTP is a secondary adapter to the same handlers.
+Object keys and upload tickets are client-held capabilities, bound to a stable
+object-service fragment ID and checked permissions. This service does not open
+the metadata database.
+
+### Native framing
 
 Each control frame is a four-byte unsigned big-endian length followed by a
 MessagePack map. Requests contain `id` (u64), `command` and `body_len` (u64,
@@ -31,7 +213,7 @@ connection session. After a partial exchange, reconnect before retrying. Upload
 retries reuse the ticket, not a newly initialized identity. The client must retain
 issued keys; N1 does not provide a list from which to recover them.
 
-## Authentication
+### Authentication
 
 | Operation | Arguments | Result |
 | --- | --- | --- |
@@ -43,8 +225,8 @@ issued keys; N1 does not provide a list from which to recover them.
 | `session.info` | none | Current session |
 
 Permissions are `read`, `write`, `delete` and `repair`. Requested permissions are
-intersected with configured fragment permissions. Login tokens last at most
-86,400 seconds and are checked for expiry. Explicitly scoped login requests do
+intersected with configured fragment permissions. Login lifetimes are bounded by the configured maximum
+(up to 86,400 seconds) and checked for expiry. Explicitly scoped login requests do
 not receive operator authority. Maintenance mutation/job operations require an
 operator session. Alias or credential changes do not change fragment identity or
 LINK placement. The service signing secret is not a fragment password.
@@ -60,7 +242,7 @@ Both transports share the retained configurable IP/authentication and fragment
 quotas. Rejected quotas return 429. HTTP uses the actual socket peer address;
 untrusted forwarded-address headers cannot change the quota identity.
 
-## Object operations
+### Object operations
 
 | Operation | Arguments | Permission / body |
 | --- | --- | --- |
@@ -107,10 +289,10 @@ Current fragment read permission and permanent retirement still apply.
 Delete writes durable terminal state at calculated shard paths. `retired_shards`
 is the count newly retired by that call; repeated deletion can return zero.
 Completed retirement returns 410 to reads and rejects old upload tickets. Partial
-retirement or unavailable members can require retry (503). No rename, namespace
-listing, object history or undelete operation exists.
+retirement or unavailable members can require retry (503). The object engine has no rename, namespace
+listing, object history or undelete operation; those belong to metadata.
 
-## Maintenance
+### Maintenance
 
 | Operation | Arguments | Access |
 | --- | --- | --- |
@@ -125,10 +307,11 @@ A job progresses through running/stopping to completed, stopped or incomplete.
 An incomplete or stopped job does not mark N1 failed. IO already admitted is
 joined before ownership is released. Foreground work can preempt background work
 on its object. Optional interval schedules and startup delays live in private
-service configuration; both GC and scrub schedules default to disabled. Scrub can
-alternatively use one UTC calendar schedule with a persisted attempted-slot journal.
+operator INI configuration. Staging GC uses [garbage_collector] intervals.
+Scheduled healing requires [auto_healing] enabled with an explicit UTC schedule;
+its persisted attempted-slot journal prevents duplicate admission.
 
-## HTTP adapter
+### HTTP adapter
 
 | Endpoint | Encoding |
 | --- | --- |
@@ -154,7 +337,7 @@ An explicit signed/query range cannot be combined with a second `Range` header,
 including when `If-Range` mismatches. Downloads use `Cache-Control: private,
 no-store`. The integrity ETag is the immutable LINK tree root.
 
-## Recovery
+### Recovery
 
 All recovery operations require an operator token. Requested/scoped permission
 tokens do not inherit operator privileges. `repository` and `destination` name
@@ -178,7 +361,7 @@ One recovery job runs at a time; running/stopping overlap returns 409. Stop does
 not release repository leases while accepted filesystem work is still running.
 Restore remains an offline operator helper operation with explicit targets.
 
-## Status meanings
+### Status meanings
 
 400 invalid encoding, parameters or range; 401 missing/invalid authentication;
 403 denied permission; 404 absent object/upload/job; 409 conflicting immutable
@@ -187,6 +370,26 @@ limit; 422 verified format/integrity failure; 503 unavailable quorum, incomplete
 retirement, exhausted admission or incomplete operation; 507 ENOSPC/EDQUOT.
 A storage error is not converted into success because a final filename exists.
 
-Recovery automation, additional pool administration and signed download operations
-remain redesign work. No RC.2 release is authorized until retained features and
-qualification are complete.
+Full product conformance also requires the named metadata contract above.
+See [the completion checklist](docs/RC2-IMPLEMENTATION.md) for outstanding work.
+
+## Current compliance boundary
+
+The contract above describes required behavior. The current metadata service
+implements the main fragment, namespace, upload, versioned-read and export
+paths, with integration and original-console tests. It is **not yet a full
+NOA v1 conformance pass**. Specific remaining differences include:
+
+- Direct archive/manifest routes and fragment-scoped maintenance routes from
+  the v1 inventory are not all registered by the metadata router.
+- The optional Accel search/read integration is not connected; search currently
+  returns an unavailable response.
+- Metadata retention/reclamation and coordinated metadata/object backup need
+  completion. Object staging GC and object-only backups do not replace them.
+- Maintenance authorization/results and all retained request/response/retry
+  semantics still require complete contract qualification. Redistribution must
+  respect immutable pools; its current rejection is not a conformance pass.
+
+A v2 storage pass, a metadata KV test or a successful Console upload does not
+close these gaps. [The completion checklist](docs/RC2-IMPLEMENTATION.md) owns the
+remaining work; [TESTING.md](TESTING.md) owns qualification evidence.

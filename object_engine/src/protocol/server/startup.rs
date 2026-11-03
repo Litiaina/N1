@@ -43,9 +43,6 @@ enum Action {
     Init {
         #[arg(long)]
         config: PathBuf,
-        /// Import trusted existing LINK identities into an operator INI setup.
-        #[arg(long)]
-        from_config: Option<PathBuf>,
         #[arg(long)]
         member: Vec<PathBuf>,
         #[arg(long)]
@@ -81,7 +78,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Action::Init {
             config,
-            from_config,
             member,
             data_shards,
             parity_shards,
@@ -102,14 +98,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                         "INI enrollment uses storage_pool and server settings from the file".into(),
                     ));
                 }
-                if let Some(source) = from_config {
-                    let destination = config.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::settings::ini::import(&destination, &source)
-                    })
-                    .await
-                    .map_err(|error| Error::Unavailable(error.to_string()))??;
-                }
                 let service = load(config, true).await?;
                 println!(
                     "{}",
@@ -117,11 +105,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                         .map_err(|error| Error::Invalid(error.to_string()))?
                 );
                 return Ok(());
-            }
-            if from_config.is_some() {
-                return Err(Error::Invalid(
-                    "--from-config is only used with an INI destination".into(),
-                ));
             }
             let data_shards = data_shards.ok_or_else(|| {
                 Error::Invalid("JSON enrollment requires --data-shards and --member".into())

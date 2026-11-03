@@ -30,28 +30,6 @@ pub fn load(path: &Path) -> Result<Config> {
     mapping::config(&settings, &environment, &registry)
 }
 
-/// Adopt an existing trusted LINK service configuration without enrolling,
-/// moving or rewriting any member. Both old/new control and pool leases apply.
-pub fn import(path: &Path, source: &Path) -> Result<()> {
-    if is_ini(source) {
-        return Err(Error::Invalid(
-            "--from-config requires an existing private LINK JSON configuration".into(),
-        ));
-    }
-    bootstrap::ensure(path)?;
-    let settings = settings(path)?;
-    let environment = settings
-        .read_env()
-        .map_err(|error| Error::Invalid(error.to_string()))?;
-    let original = Config::load(source)?;
-    mapping::validate(&settings)?;
-    registry::control_directory(&settings.control_dir, true)?;
-    let old_control = original.ensure_state_root()?;
-    let _lease = InstanceLease::engine(&[old_control, settings.control_dir.clone()])?;
-    let _pools = original.open_pools()?;
-    registry::import(&settings, &environment, &original)
-}
-
 pub fn open(path: &Path, enroll: bool) -> Result<Arc<Service>> {
     if enroll {
         bootstrap::ensure(path)?;

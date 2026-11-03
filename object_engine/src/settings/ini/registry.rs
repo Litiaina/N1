@@ -296,60 +296,6 @@ pub(super) fn prepare(settings: &N1Settings, env: &BTreeMap<String, String>) -> 
     Ok(registry)
 }
 
-pub(super) fn import(
-    settings: &N1Settings,
-    env: &BTreeMap<String, String>,
-    original: &Config,
-) -> Result<()> {
-    let control = &settings.control_dir;
-    if control.join(REGISTRY).symlink_metadata().is_ok() {
-        return Err(Error::Conflict(
-            "INI control directory is already enrolled; refusing replacement of its identity"
-                .into(),
-        ));
-    }
-    if settings.pools.len() != original.pools.len() {
-        return Err(Error::Invalid(
-            "INI import must name every existing pool exactly once".into(),
-        ));
-    }
-    let principal = original
-        .fragments
-        .first()
-        .ok_or_else(|| Error::Invalid("source service has no object credentials".into()))?;
-    let key = original.signing_secret()?;
-    let pools=settings.pools.iter().map(|wanted|{
-        let pool=original.pools.iter().find(|pool|pool.roots==wanted.roots).ok_or_else(||Error::Invalid(format!("pool {} must use the exact ordered member paths from the trusted source configuration",wanted.name)))?;
-        Ok((wanted.name.clone(),Enrollment{config:pool.clone(),ready:true}))
-    }).collect::<Result<BTreeMap<_,_>>>()?;
-    let mut registry = Registry {
-        schema: 2,
-        principal: principal.id,
-        principal_alias: principal.alias.clone(),
-        permissions: principal.permissions,
-        operator: principal.operator,
-        additional_fragments: original.fragments.iter().skip(1).cloned().collect(),
-        env_managed: false,
-        secret_hash: principal.secret_hash.clone(),
-        signing_hash: Sha256::digest(key).into(),
-        bootstrap_key: Some(key),
-        pools,
-    };
-    registry.validate(settings)?;
-    super::mapping::config(settings, env, &registry)?;
-    let destination = control.join("link.signing-key");
-    if destination.symlink_metadata().is_ok() {
-        registry.verify_signing(control)?;
-    }
-    registry.save(control)?;
-    if !destination.exists() {
-        write_new(&destination, &key)?;
-    }
-    registry.verify_signing(control)?;
-    registry.bootstrap_key = None;
-    registry.save(control)
-}
-
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)

@@ -486,142 +486,18 @@ async fn interrupted_planned_enrollment_resumes_exact_ids_and_rejects_foreign_by
 }
 
 #[tokio::test]
-async fn import_preserves_existing_link_keys_all_credentials_and_member_bytes() {
+async fn removed_json_import_flag_cannot_enroll_or_rebind_members() {
     let f = Fixture::new().await;
-    let source = f.root.join("existing.json");
-    let enrollment = Process::new(env!("CARGO_BIN_EXE_litiaina-n1"))
-        .args(["init", "--config"])
-        .arg(&source)
-        .arg("--member")
-        .arg(f.root.join("a0"))
-        .args([
-            "--data-shards",
-            "1",
-            "--parity-shards",
-            "0",
-            "--block-bytes",
-            "4096",
-            "--fragment",
-            "existing-scope",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        enrollment.status.success(),
-        "{}",
-        String::from_utf8_lossy(&enrollment.stderr)
-    );
-    let mut config = n1::settings::config::Config::load(&source).unwrap();
-    let mut other = config.fragments[0].clone();
-    other.id = n1_link::PoolId([0x71; 16]);
-    other.alias = "read-only".into();
-    other.operator = false;
-    other.permissions = n1_link::noa::Permissions {
-        read: true,
-        ..Default::default()
-    };
-    config.fragments.push(other);
-    fs::write(&source, serde_json::to_vec(&config).unwrap()).unwrap();
-    let scope = config.fragments[0].id;
-    let service = n1::protocol::ops::Service::open(config.clone()).unwrap();
-    let pending = service
-        .store
-        .init(scope.0, 0, 8193, 12288, n1_link::Durability::Durable, 3600)
-        .unwrap();
-    let bytes = vec![29u8; 8193];
-    let other_upload = service
-        .store
-        .init([0x71; 16], 0, 3, 4096, n1_link::Durability::Durable, 3600)
-        .unwrap();
-    service
-        .store
-        .put(
-            [0x71; 16],
-            other_upload.upload_key,
-            std::io::Cursor::new(vec![3u8; 3]),
-        )
-        .await
-        .unwrap();
-    service
-        .store
-        .put(
-            scope.0,
-            pending.upload_key,
-            std::io::Cursor::new(bytes.clone()),
-        )
-        .await
-        .unwrap();
-    drop(service);
-    let marker = fs::read(f.root.join("a0/.n1-arc-pool.json")).unwrap();
-    let signing = config.signing_secret().unwrap();
-    let imported = Process::new(env!("CARGO_BIN_EXE_litiaina-n1"))
+    let run = Process::new(env!("CARGO_BIN_EXE_litiaina-n1"))
         .args(["init", "--config"])
         .arg(&f.ini)
-        .arg("--from-config")
-        .arg(&source)
+        .args(["--from-config", "/nonexistent/development.json"])
         .output()
         .unwrap();
-    assert!(
-        imported.status.success(),
-        "{}",
-        String::from_utf8_lossy(&imported.stderr)
-    );
-    assert_eq!(
-        marker,
-        fs::read(f.root.join("a0/.n1-arc-pool.json")).unwrap()
-    );
-    assert_eq!(
-        signing.as_slice(),
-        fs::read(f.root.join("control/link.signing-key")).unwrap()
-    );
-    let creds: Value =
-        serde_json::from_slice(&fs::read(source.with_extension("credentials.json")).unwrap())
-            .unwrap();
-    let server = f.start("127.0.0.1", f.native).await;
-    let mut client = N1NativeClient::connect(&format!("n1://127.0.0.1:{}", f.native))
-        .await
-        .unwrap();
-    client
-        .auth_fragment(
-            creds["fragment"].as_str().unwrap(),
-            creds["secret"].as_str().unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut read = Vec::new();
-    client
-        .download(pending.object_key, 0, None, &mut read)
-        .await
-        .unwrap();
-    assert_eq!(read, bytes);
-    let mut reader = N1NativeClient::connect(&format!("n1://127.0.0.1:{}", f.native))
-        .await
-        .unwrap();
-    reader
-        .auth_fragment("read-only", creds["secret"].as_str().unwrap())
-        .await
-        .unwrap();
-    assert!(
-        reader
-            .control(Command::UploadInit {
-                pool: None,
-                total_bytes: 1,
-                part_bytes: 4096,
-                durable: true,
-                ttl_seconds: 60
-            })
-            .await
-            .is_err()
-    );
-    let mut other_bytes = Vec::new();
-    reader
-        .download(other_upload.object_key, 0, None, &mut other_bytes)
-        .await
-        .unwrap();
-    assert_eq!(other_bytes, vec![3u8; 3]);
-    drop(reader);
-    drop(client);
-    drop(server);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--from-config"));
+    assert!(!f.root.join("a0/.n1-arc-pool.json").exists());
+    assert!(!f.root.join("control/pool-enrollment.json").exists());
 }
 
 #[tokio::test]

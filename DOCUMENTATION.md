@@ -1,12 +1,49 @@
 # N1 operator guide
 
-This guide covers the unreleased N1 1.0.0-RC.2 engine. Read
-[ARCHITECTURE.md](ARCHITECTURE.md), [NOA.md](NOA.md) and the
-[implementation ledger](docs/RC2-IMPLEMENTATION.md) for the contract and remaining
-qualification work. The previous RC.1 guide is available in Git at `061a40a`.
-No old storage-format migration is provided.
+This is the operator guide for N1 with LINK and the optional metadata engine.
+RC.2 is in development. Server settings use `n1_config.ini`; secrets use the
+adjacent private `n1.env`. No migration from earlier development configurations
+or storage formats is required or promised.
 
-## Original INI operation
+For a named N1 deployment, the connection path is:
+
+`Console / named client → metadata_engine → native LINK object_engine → shards`
+
+A client that owns its metadata can use `object_engine` directly. The table below
+uses object ports 19001/19002 and public metadata ports 50001/50002; these are
+examples, all editable under each service's `[server]` section.
+
+| Setting | Object engine | Metadata engine |
+| --- | --- | --- |
+| HTTP(S) listener | Internal 19001 | Public 50001; Console connects here |
+| Native listener | Internal 19002, `n1/1` | Public 50002, named `n1/0.5` |
+| Pool roots | Owns `[storage_pool.NAME]` | No member roots |
+| Private state | Pool identities, signing key, control state | Database, named uploads and exports |
+
+## Prepare and start the services
+
+Build `n1` and `n1_metadata_engine` from the workspace. Give each service its
+own configuration directory, control directory and `n1.env`. Starting the
+object binary without a prepared configuration creates templates and stops;
+complete them before retrying. Both environment files require `JWT_SECRET`,
+`AUTH_KEY`, `MASTER_KEY` and `ADMIN_KEY` with real private values. Metadata's
+object-service credential must match the selected object's `AUTH_KEY`; its
+logical user-fragment credentials are managed separately.
+
+The object INI example below uses internal ports 19001/19002. Standalone
+LINK deployments can choose their own ports. Start it with:
+
+`litiaina-n1 serve --config /etc/litiaina/object/n1_config.ini`
+
+Configure metadata as shown in the next section and run:
+
+`litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini`
+
+Point the original Console at metadata's HTTPS address, not at LINK's internal
+object listener. Use certificates valid for the actual client/server names.
+`n1s://` verifies TLS for native connections as well.
+
+## Object configuration and pool enrollment
 
 The normal server configuration is `n1_config.ini`, with private credentials in
 `n1.env` alongside it. Running `litiaina-n1` in its service directory, or passing
@@ -17,8 +54,8 @@ and complete storage roots. It never enrolls a nonempty unknown root.
 ```ini
 [server]
 host=127.0.0.1
-https_port=50001
-native_port=50002
+https_port=19001
+native_port=19002
 native_max_connections=32
 cert_path=cert.pem
 key_path=key.pem
@@ -62,19 +99,6 @@ control lease fences enrollment against an active server. Interrupted enrollment
 resumes its recorded identities; missing signing keys for established storage
 are rejected rather than regenerated.
 
-Existing LINK JSON deployments can explicitly import their identities into INI:
-
-```sh
-litiaina-n1 init --config /etc/litiaina/object/n1_config.ini \
-  --from-config /srv/n1/service.json
-litiaina-n1 check --config /etc/litiaina/object/n1_config.ini
-litiaina-n1 serve --config /etc/litiaina/object/n1_config.ini
-```
-
-The INI pool roots must match the source deployment. This import retains the
-signing key, pool/member identities and existing service principals. It does not
-rewrite members or convert an older NCX/NDX storage format.
-
 ## Optional named metadata service
 
 The object service works independently over native NOA v2. Named N1 clients,
@@ -89,12 +113,12 @@ public client address and TLS exactly as above. `[disk_config]` selects metadata
 control storage. Metadata does not enroll disks or require pool-root sections;
 it obtains immutable pool profiles from the object service.
 
-For an existing named N1 deployment, keep the familiar public ports on metadata:
+For a named N1 deployment, put the public ports on metadata:
 `https_port=50001` and `native_port=50002`. Assign the independent object process
 different local ports in its own `[server]` section, for example HTTP 19001 and
-native 19002. Existing Console connections then keep their public address;
+native 19002. Console connections use that public address;
 metadata's `object_native_url` points to the internal object listener. A direct
-LINK-only deployment can keep the object listener on its existing ports instead.
+LINK-only deployment can choose its own object listener ports.
 
 ```ini
 [server]
@@ -131,52 +155,31 @@ litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini
 An external metadata implementation can use the object interface directly.
 The object engine requires neither this metadata process nor its database.
 
-## Explicit JSON setup and recovery tooling
+## Direct LINK client operations
 
-The member roots must already exist, be empty and belong to independent
-filesystems. This example uses an illustrative 1D+1P pool; substitute actual
-operator-selected paths. Enrollment persists immutable pool markers and private
-service files. It must not run against an existing data root.
+The LINK native CLI loads a private client credential file containing a native
+URL and object-service fragment credentials or a bearer token. For example:
 
-```sh
-litiaina-n1 init --config /srv/n1/service.json \
-  --member /data/disk-a/n1 --member /data/disk-b/n1 \
-  --data-shards 1 --parity-shards 1 --native-address 127.0.0.1:19001
-litiaina-n1 check --config /srv/n1/service.json
-litiaina-n1 serve --config /srv/n1/service.json
+```json
+{"native_url":"n1s://storage.example:19002","fragment":"root","secret":"OBJECT_AUTH_KEY"}
 ```
 
-Init writes a private signing key and client credential file beside the service
-configuration. Preserve the signing key, stable fragment IDs, immutable pool
-descriptors and repository keys separately. They are not recoverable from a
-client key or a shard. Service-created encrypted recovery points also preserve
-configuration, signing identity and configured TLS material. Keep configuration,
-keys and credentials owner-only.
-An interrupted init can leave enrolled markers; do not erase them or silently
-retry with a different pool identity.
-
-Native TLS requires `--tls-certificate` and `--tls-key` together at init.
-A configured HTTP address is optional. Remote clients should use verified TLS;
-private certificate authorities can be supplied with client `--ca`. Native
-clients do not route through the HTTP adapter.
-
-## Client operations
-
-The native CLI loads a private credential file containing a native URL and
-fragment credentials or a bearer token. `--endpoint` can explicitly override its
-native URL. Keys below are values returned by N1, retained by the client.
+Save this as an owner-only client file (for example `chmod 600 object-client.json`).
+This client file is not a server configuration or a migration format. Use the
+shell's `--ca` option for a private CA. `--endpoint` can override the native URL.
+Keys below are values returned by LINK, retained by the client.
 
 ```sh
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json put ./payload.bin
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json batch ./one.bin ./two.bin
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json put ./large.bin \
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json put ./payload.bin
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json batch ./one.bin ./two.bin
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json put ./large.bin \
   --part-bytes 16777216 --durable-parts
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json status --upload-key N1U1.EXAMPLE
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json finalize --upload-key N1U1.EXAMPLE
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json get --key N1A1.EXAMPLE --output ./recovered.bin
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json health --key N1A1.EXAMPLE --deep
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json repair --key N1A1.EXAMPLE
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json delete --key N1A1.EXAMPLE
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json status --upload-key N1U1.EXAMPLE
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json finalize --upload-key N1U1.EXAMPLE
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json get --key N1A1.EXAMPLE --output ./recovered.bin
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json health --key N1A1.EXAMPLE --deep
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json repair --key N1A1.EXAMPLE
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json delete --key N1A1.EXAMPLE
 ```
 
 `N1U1.EXAMPLE` and `N1A1.EXAMPLE` are placeholders, not valid keys. Part size must
@@ -192,50 +195,67 @@ N1 cannot enumerate or reconstruct that record for you.
 
 Delete permanently retires the key, including still-valid upload tickets. Partial
 retirement requires retry and blocks reads or recreation. There is no rename,
-object version history, trash or undelete API.
+object version history, trash or undelete API in the object engine. Metadata
+provides the named version/trash operations used by Console.
 
 ## Optional maintenance
 
-Configuration `maintenance.gc` and `maintenance.scrub` are absent/disabled by
-default. Each configured interval has `every_seconds` and `start_delay_seconds`;
-scrub also has `options` with `repair`, `bytes_per_second` and `window_seconds`.
-GC touches only confidently expired private uploads. It never expires final
-payload or retirement state.
+Change the existing INI controls and restart the relevant service:
 
-Operator CLI commands `gc`, `scrub`, `job` and `stop --job-id ...` start and inspect
-maintenance. A stopped or incomplete scrub reports job status and leaves N1
-available. Rate and time limits apply between bounded work units; an already
-blocked device request cannot be interrupted safely. Foreground access can
-preempt background work on the same object.
+| Control | INI section and keys |
+| --- | --- |
+| Bind IP, ports and TLS | `[server]`: `host`, `https_port`, `native_port`, `cert_path`, `key_path` |
+| Native connection limit | `[server] native_max_connections` |
+| Upload I/O and memory | `[upload_config]`: `max_concurrent_io`, `upload_memory_budget_bytes`, `writer_buffer_size` |
+| Adaptive concurrency | `[upload_config]`: `adaptive_concurrency_enabled`, `adaptive_concurrency_interval_ms`, `stream_max_concurrency` |
+| Stream buffers | `[upload_config]`: `stream_chunk_size`, `stream_readahead_bytes` |
+| Upload policy | `[upload_config]`: `max_part_size`, `stripe_block_size`, `upload_part_strict_durability_default`, `upload_io_gate_enabled` |
+| Foreground wait/stall diagnostics | `[io_control]`: `foreground_wait_timeout_ms`, `stall_threshold_ms`, `slow_io_threshold_ms` |
+| Object staging cleanup | `[garbage_collector]`: `cleanup_interval_seconds`, `file_ttl_seconds` |
+| Named trash retention | `[garbage_collector] trash_retention_seconds`; metadata reclamation remains a completion gate |
+| Scheduled healing | `[auto_healing]`: `enabled`, `scrub_schedule_utc`, `initial_scan_delay_seconds`, `scheduled_scrub_pause_millis` |
+| Repair worker bounds | `[auto_healing]`: `object_scan_concurrency`, `shard_repair_concurrency`, `metadata_batch_size` |
+| Rate quotas | `[rate_limiter_config]`: `enable_rate_limiting` and the existing rate/burst keys |
+| File size ceiling | `[set_limits] max_file_size` |
+| Export bounds | `[export]`: retention, job, download and buffer controls on metadata |
 
-For an optional UTC maintenance window, configure `maintenance.calendar_scrub`
-instead of the interval scrub. For example:
+Values accepting `auto` retain their host-derived defaults. Pool geometry and
+`stripe_block_size` must match enrolled immutable layouts; they are not tuning
+knobs for changing already stored objects. Operational tuning does not alter
+existing LINK identities.
 
-```json
-"calendar_scrub": {
-  "schedule_utc": "Sun 02:00",
-  "initial_delay_seconds": 300,
-  "options": {"repair": true, "bytes_per_second": 16777216, "window_seconds": 3600}
-}
+Staging GC runs at the configured cleanup interval; the generated INI uses
+3,600 seconds. It conservatively reclaims expired unpublished uploads, never
+committed objects or retirement records. Scheduled healing requires both an
+enabled flag and an explicit UTC calendar, for example:
+
+```ini
+[auto_healing]
+enabled=true
+scrub_schedule_utc=Sun 02:00
+initial_scan_delay_seconds=300
+scheduled_scrub_pause_millis=25
+object_scan_concurrency=1
+shard_repair_concurrency=1
+metadata_batch_size=128
 ```
 
-Only the configured minute starts a job; missed windows do not cause a boot-time
-catch-up scrub. The private journal prevents repeat admission in the same slot.
-An interrupted scrub is reported incomplete after restart. Read repair operates
-independently of this schedule.
+Use `enabled=false` when no scheduled scrub is wanted. The calendar starts work
+at the configured UTC minute; it does not impose a whole-scan deadline or run a
+missed-slot catch-up scan at boot. A persisted slot journal prevents duplicate
+starts. Manual job stop is cooperative, and stopped/incomplete healing does not
+by itself mean foreground object storage has failed. Repair on read remains
+independent of scheduled healing.
 
-`concurrency` preserves N1's adaptive controller. Its defaults enable adjustment
-every 1,000 ms, up to 128 streams, 256 KiB chunks and a 512 KiB stream buffer.
-`max_operations` and `operation_memory_bytes` remain hard admission ceilings.
-Runtime environment overrides remain `N1_RUNTIME_WORKER_THREADS`,
+The LINK shell's `gc`, `scrub`, `job` and `stop --job-id ...` commands control
+manual object maintenance. Foreground work can preempt background work at
+bounded work boundaries. An already blocked kernel/device request cannot be
+safely interrupted. Object health reports the effective runtime controls.
+
+Runtime environment overrides are `N1_RUNTIME_WORKER_THREADS`,
 `N1_RUNTIME_MAX_BLOCKING_THREADS` and `N1_RUNTIME_THREAD_STACK_BYTES`.
-Use `N1_IO_BACKEND=uring` when fallback is unacceptable; `auto` reports any
-startup fallback and `blocking` explicitly selects the blocking backend.
-
-The private configuration contains immutable pool member IDs. Never regenerate
-them when a disk is missing. `state_dir` optionally selects an owner-only control
-directory outside member roots; its default is beside the signing key. It holds
-the instance lease, refresh sessions and the calendar journal.
+`N1_IO_BACKEND=auto` selects the backend with reported fallback;
+`uring` requires io_uring, and `blocking` explicitly selects blocking I/O.
 
 ## Recovery repositories
 
@@ -246,22 +266,22 @@ litiaina-n1-backup keygen --output /recovery/n1.key
 litiaina-n1-backup init --repository /recovery/points --key /recovery/n1.key
 ```
 
-Before service startup, configure an alias in `service.json`:
+Before object-service startup, configure the alias in its INI:
 
-```json
-"repositories": {
-  "archive": {"path": "/recovery/points", "key_file": "/recovery/n1.key"}
-}
+```ini
+[backup_repository.archive]
+path=/recovery/points
+key_file=/recovery/n1.key
 ```
 
 Repository paths must be outside every active member root. Operator requests
 accept only these configured aliases. Start online capture and poll its job:
 
 ```sh
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json backup capture --repository archive
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json backup job
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json backup list --repository archive --limit 64
-litiaina-n1-shell --credentials /srv/n1/service.credentials.json backup verify --repository archive --snapshot POINT_ULID
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json backup capture --repository archive
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json backup job
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json backup list --repository archive --limit 64
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json backup verify --repository archive --snapshot POINT_ULID
 ```
 
 A job start acknowledges admission. Check completed/stopped/incomplete status
@@ -276,7 +296,7 @@ service to be stopped so the helper can acquire all member leases:
 
 ```sh
 litiaina-n1-backup capture --repository /recovery/points --key /recovery/n1.key \
-  --config /srv/n1/service.json
+  --config /etc/litiaina/object/n1_config.ini
 litiaina-n1-backup verify --repository /recovery/points --key /recovery/n1.key --snapshot POINT_ULID
 ```
 
@@ -294,8 +314,10 @@ litiaina-n1-backup restore --repository /recovery/points --key /recovery/n1.key 
   --output-config /srv/recovered/service.json
 ```
 
-The output parent must already exist. Recovery writes private signing/TLS files
-and configuration without overwriting operator edits. It rewrites physical roots
+The helper generates `service.json` as a private effective recovery snapshot
+containing the restored identities and member paths. The output parent must
+already exist. Recovery writes private signing/TLS files and this generated
+configuration without overwriting operator edits. It rewrites physical roots
 while preserving member identities and client-held keys. Fresh login sessions
 are created when the recovered service starts.
 
@@ -341,5 +363,6 @@ fallback. There is no automatic failed-disk enrollment or replacement.
 
 The shell forwards `pool ...` and `backup offline ...` to the matching adjacent
 engine, with optional `--engine-binary`. These commands require no network login.
-Use `--help` on the engine or backup helper for exact flags. Installer/UI
-adaptation and remaining administration/qualification work are in the ledger.
+Use `--help` on the engine or backup helper for exact flags. These object recovery tools do not yet provide a coordinated metadata/database
+recovery point. Complete named-service recovery and Console administration
+qualification remain in [the completion checklist](docs/RC2-IMPLEMENTATION.md).
