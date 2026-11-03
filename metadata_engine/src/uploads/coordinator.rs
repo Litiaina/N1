@@ -116,10 +116,8 @@ pub(crate) async fn init(
     } else {
         request.total_size_bytes.div_ceil(request.part_size_bytes)
     };
-    if request.total_size_bytes > app.config.max_file_size
-        || request.part_size_bytes > app.config.max_part_size
-        || request.expected_parts > 131072
-    {
+    app.config.check_object_size(request.total_size_bytes)?;
+    if request.part_size_bytes > app.config.max_part_size || request.expected_parts > 131072 {
         return Err(ApiError(
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
             "Multipart upload exceeds configured size or part-count limits".into(),

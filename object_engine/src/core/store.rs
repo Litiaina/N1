@@ -291,7 +291,11 @@ impl Store {
         ttl_seconds: u64,
     ) -> Result<InitializedUpload> {
         self.operation_gate.ensure_mutations_allowed()?;
-        if total_bytes > self.runtime().max_file_size {
+        if self
+            .runtime()
+            .max_file_size
+            .is_some_and(|limit| total_bytes > limit)
+        {
             return Err(Error::Invalid(
                 "object exceeds configured max_file_size".into(),
             ));

@@ -58,7 +58,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("metadata_batch_size", "128");
 
     conf.with_section(Some("set_limits"))
-        .set("max_file_size", "5368709120");
+        .set("max_file_size", "unlimited");
 
     conf.with_section(Some("jwt_token_config"))
         .set("login_token_expiration", "900");

@@ -13,7 +13,7 @@ pub struct RuntimeConfig {
     pub upload_io_gate_enabled: bool,
     pub upload_part_strict_durability_default: bool,
     pub max_part_size: u64,
-    pub max_file_size: u64,
+    pub max_file_size: Option<u64>,
     pub stream_locality_bias_enabled: bool,
     pub staging_min_age_seconds: u64,
     pub scheduled_scrub_pause_millis: u64,
@@ -29,6 +29,7 @@ pub struct RuntimeConfig {
     pub access_token_max_ttl_seconds: u64,
     pub refresh_token_ttl_seconds: u64,
 }
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -37,7 +38,7 @@ impl Default for RuntimeConfig {
             upload_io_gate_enabled: true,
             upload_part_strict_durability_default: false,
             max_part_size: n1_link::noa::MAX_BODY_BYTES,
-            max_file_size: i64::MAX as u64,
+            max_file_size: None,
             stream_locality_bias_enabled: true,
             staging_min_age_seconds: 0,
             scheduled_scrub_pause_millis: 0,
@@ -64,8 +65,9 @@ impl RuntimeConfig {
             || normalized.latency_samples_per_class != self.io_control.latency_samples_per_class
             || self.writer_buffer_size > 64 * 1024 * 1024
             || self.max_part_size == 0
-            || self.max_file_size == 0
-            || self.max_file_size > i64::MAX as u64
+            || self
+                .max_file_size
+                .is_some_and(|bytes| bytes == 0 || bytes > i64::MAX as u64)
             || self.scheduled_scrub_pause_millis > 60000
             || !(1..=4096).contains(&self.object_scan_concurrency)
             || !(1..=4096).contains(&self.shard_repair_concurrency)
@@ -92,5 +94,39 @@ impl RuntimeConfig {
             ))
             .map_err(|_| Error::Conflict("stream locality policy already configured".into()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_cap_round_trips_and_rejects_invalid_finite_limits() {
+        for json in ["{}", r#"{"max_file_size":null}"#] {
+            let config: RuntimeConfig = serde_json::from_str(json).unwrap();
+            config.validate().unwrap();
+            assert!(serde_json::to_value(config).unwrap()["max_file_size"].is_null());
+        }
+        for limit in [1, 1_099_511_627_776, i64::MAX as u64] {
+            let config = RuntimeConfig {
+                max_file_size: Some(limit),
+                ..Default::default()
+            };
+            config.validate().unwrap();
+            let decoded: RuntimeConfig =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(decoded.max_file_size, Some(limit));
+        }
+        for limit in [0, i64::MAX as u64 + 1] {
+            assert!(
+                RuntimeConfig {
+                    max_file_size: Some(limit),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 }

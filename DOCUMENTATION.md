@@ -1,8 +1,8 @@
 # N1 operator guide
 
 This is the operator guide for N1 with LINK and the optional metadata engine.
-RC.2 is in development. Server settings use `n1_config.ini`; secrets use the
-adjacent private `n1.env`. No migration from earlier development configurations
+RC.2 is in development. Server settings use INI; secrets come from a private
+file or the service environment. No migration from earlier development configurations
 or storage formats is required or promised.
 
 For a named N1 deployment, the connection path is:
@@ -23,9 +23,9 @@ examples, all editable under each service's `[server]` section.
 ## Prepare and start the services
 
 Build `n1` and `n1_metadata_engine` from the workspace. Give each service its
-own configuration directory, control directory and `n1.env`. Starting the
+own configuration and control directories, with separate secrets. Starting the
 object binary without a prepared configuration creates templates and stops;
-complete them before retrying. Both environment files require `JWT_SECRET`,
+complete them before retrying. Both services require `JWT_SECRET`,
 `AUTH_KEY`, `MASTER_KEY` and `ADMIN_KEY` with real private values. Metadata's
 object-service credential must match the selected object's `AUTH_KEY`; its
 logical user-fragment credentials are managed separately.
@@ -45,8 +45,10 @@ object listener. Use certificates valid for the actual client/server names.
 
 ## Object configuration and pool enrollment
 
-The normal server configuration is `n1_config.ini`, with private credentials in
-`n1.env` alongside it. Running `litiaina-n1` in its service directory, or passing
+The default server configuration is `n1_config.ini`, with private credentials in
+an optional adjacent `n1.env`. `[server] env_file` selects a different secrets
+file; the service environment can supply credentials without one. Running
+`litiaina-n1` in its service directory, or passing
 `--config /etc/litiaina/object/n1_config.ini`, uses that configuration. A first
 run creates missing templates and stops until the operator supplies credentials
 and complete storage roots. It never enrolls a nonempty unknown root.
@@ -216,13 +218,51 @@ Change the existing INI controls and restart the relevant service:
 | Scheduled healing | `[auto_healing]`: `enabled`, `scrub_schedule_utc`, `initial_scan_delay_seconds`, `scheduled_scrub_pause_millis` |
 | Repair worker bounds | `[auto_healing]`: `object_scan_concurrency`, `shard_repair_concurrency`, `metadata_batch_size` |
 | Rate quotas | `[rate_limiter_config]`: `enable_rate_limiting` and the existing rate/burst keys |
-| File size ceiling | `[set_limits] max_file_size` |
+| Optional file size ceiling | `[set_limits] max_file_size`: `unlimited` (default), or a positive byte count |
 | Export bounds | `[export]`: retention, job, download and buffer controls on metadata |
 
 Values accepting `auto` retain their host-derived defaults. Pool geometry and
 `stripe_block_size` must match enrolled immutable layouts; they are not tuning
 knobs for changing already stored objects. Operational tuning does not alter
 existing LINK identities.
+
+There is no configured total-object size cap by default. In **both** engines'
+`n1_config.ini`, omit `max_file_size` or set:
+
+```ini
+[set_limits]
+max_file_size=unlimited
+```
+
+A positive byte count enables an operator cap; `0` is invalid. Restart the
+component after changing its INI. The metadata and object engines enforce their
+caps independently, so either finite cap can reject a named upload.
+`[upload_config] max_part_size` limits each multipart part, not the whole file.
+Large objects use multiple parts with bounded buffers; removing the total-size
+policy cap does not remove part-count, LINK representation, memory or I/O
+admission checks. For example, a 1 TiB object using 32 MiB parts has 32,768 parts.
+
+Each engine accepts an arbitrary INI filename through `--config`. For a shared
+configuration directory, use distinct files such as `object.ini` and
+`metadata.ini`, with `[server] env_file=object.env` and `env_file=metadata.env`
+respectively. Relative secrets paths resolve beside the selected INI. An
+explicit secrets file must exist, be regular, and have owner-only permissions;
+symlinks are rejected. Do not put these files in source control.
+
+When `env_file` is omitted, an owner-only `n1.env` beside the INI is read if
+present. It is optional when the service supplies all required secrets through
+the process environment. Exported values override matching file values. A bad
+or insecure file still fails startup; it is not silently ignored.
+
+For systemd-managed secrets, `LoadCredential=` or `LoadCredentialEncrypted=`
+can supply a private dotenv-format credential file. Point `env_file` at that
+service's absolute credential path (normally `/run/credentials/<unit>/<id>`);
+N1 reads it directly without exporting the secrets to child processes. Keep
+object and metadata credentials separate. Raw `Environment=` entries are not
+a secret store; see [systemd's credential guidance](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+The object systemd installer accepts an arbitrary `--config-file`. Use
+`--no-env-file` when N1 reads `[server] env_file` directly or the service obtains
+credentials another way; the installer then omits its `EnvironmentFile=` line.
 
 Staging GC runs at the configured cleanup interval; the generated INI uses
 3,600 seconds. It conservatively reclaims expired unpublished uploads, never

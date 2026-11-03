@@ -125,6 +125,61 @@ async fn cancelled_exchange_is_not_returned_to_the_connection_pool() {
 }
 
 #[tokio::test]
+async fn complete_control_errors_reuse_one_authenticated_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        login(&mut stream).await;
+        for status in [404, 410, 413, 429] {
+            let request = read(&mut stream).await;
+            assert!(matches!(request.command, Command::ObjectStat { .. }));
+            write(
+                &mut stream,
+                Response::error(request.id, status, "complete control error"),
+            )
+            .await;
+        }
+        let request = read(&mut stream).await;
+        write(&mut stream, stat(request.id)).await;
+        let request = read(&mut stream).await;
+        write(
+            &mut stream,
+            Response::error(request.id, 401, "session revoked"),
+        )
+        .await;
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        let (mut replacement, _) = listener.accept().await.unwrap();
+        login(&mut replacement).await;
+        let request = read(&mut replacement).await;
+        write(&mut replacement, stat(request.id)).await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for status in [404, 410, 413, 429] {
+            assert_eq!(
+                store.stat("N1A1.missing").await.unwrap_err().status(),
+                status
+            );
+        }
+        assert_eq!(store.stat("N1A1.present").await.unwrap().total_bytes, 17);
+        assert_eq!(store.stat("N1A1.revoked").await.unwrap_err().status(), 401);
+        assert_eq!(
+            store
+                .stat("N1A1.reauthenticated")
+                .await
+                .unwrap()
+                .total_bytes,
+            17
+        );
+        server.await.unwrap();
+    })
+    .await
+    .expect("a complete error discarded the authenticated connection");
+    store.shutdown().await;
+}
+
+#[tokio::test]
 async fn operation_status_and_shutdown_ownership_are_preserved() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = client(&listener, 1);

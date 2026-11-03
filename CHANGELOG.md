@@ -25,6 +25,13 @@ complete API conformance or qualification.
 - Retain operator INI/environment controls for listeners, TLS, pool enrollment,
   concurrency, I/O, staging cleanup and optional scheduled healing. Expand
   capacity by enrolling complete immutable pools.
+- Make the total-object size cap optional in both engines. Omitted
+  `[set_limits] max_file_size` or `unlimited` disables the policy cap; positive
+  byte counts retain explicit limits independently of multipart part size.
+- Allow a separate `[server] env_file` for each component and environment-only
+  secret provisioning without a mandatory `n1.env`; retain strict file checks.
+- Reuse authenticated object connections after complete native control errors,
+  avoiding a fresh login per missing-status page on large multipart uploads.
 - Add CRC32C frame verification with context-bound source SHA-256 for the hybrid
   shard profile; preserve immutable integrity profiles within enrolled pools.
 - Add permanent LINK key retirement, conservative upload staging GC, object

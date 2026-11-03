@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/upload_size_limits.rs"]
+mod upload_size_limits;
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -34,6 +36,15 @@ fn port() -> u16 {
         .port()
 }
 fn spawn(binary: &Path, args: &[&str], root: &Path, log: &str) -> Process {
+    spawn_with_env(binary, args, root, log, &[])
+}
+fn spawn_with_env(
+    binary: &Path,
+    args: &[&str],
+    root: &Path,
+    log: &str,
+    environment: &[(&str, &str)],
+) -> Process {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -42,6 +53,7 @@ fn spawn(binary: &Path, args: &[&str], root: &Path, log: &str) -> Process {
     Process(
         Command::new(binary)
             .args(args)
+            .envs(environment.iter().copied())
             .current_dir(root)
             .stdout(Stdio::from(file.try_clone().unwrap()))
             .stderr(Stdio::from(file))
@@ -60,7 +72,9 @@ impl Stack {
             .create(&root)
             .unwrap();
         eprintln!("public NOA evidence: {}", root.display());
-        let first = root.join("member0");
+        let first = std::env::var_os("N1_OBJECT_TEST_FIRST_ROOT")
+            .map(|parent| PathBuf::from(parent).join(root.file_name().unwrap()))
+            .unwrap_or_else(|| root.join("member0"));
         std::fs::create_dir(&first).unwrap();
         let second = std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT")
             .map(|p| PathBuf::from(p).join(root.file_name().unwrap()));
@@ -179,11 +193,15 @@ impl Stack {
         );
     }
     async fn start_metadata(&mut self) {
-        self.metadata = Some(spawn(
+        self.start_metadata_with_env(&[]).await;
+    }
+    async fn start_metadata_with_env(&mut self, environment: &[(&str, &str)]) {
+        self.metadata = Some(spawn_with_env(
             Path::new(env!("CARGO_BIN_EXE_litiaina-n1-metadata")),
             &["serve", "--config", "n1_config.ini"],
             &self.root,
             "metadata.log",
+            environment,
         ));
         let client = Client::builder()
             .timeout(Duration::from_secs(2))

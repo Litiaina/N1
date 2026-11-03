@@ -145,3 +145,134 @@ fn invalid_limits_and_overlapping_roots_are_rejected() {
         );
     }
 }
+
+#[test]
+fn object_size_cap_is_optional_for_both_components() {
+    let (path, _guard) = fixture();
+    let mut ini = ini::Ini::load_from_file(&path).unwrap();
+    for (value, expected) in [
+        (Some("unlimited"), None),
+        (Some("UnLiMiTeD"), None),
+        (None, None),
+        (Some("1099511627776"), Some(1_099_511_627_776)),
+        (Some("1"), Some(1)),
+        (Some("9223372036854775807"), Some(i64::MAX as u64)),
+    ] {
+        ini.with_section(Some("set_limits"))
+            .delete(&"max_file_size");
+        if let Some(value) = value {
+            ini.with_section(Some("set_limits"))
+                .set("max_file_size", value);
+        }
+        ini.write_to_file(&path).unwrap();
+        let object = N1Settings::load(&path).unwrap();
+        let metadata = N1Settings::load_metadata(&path).unwrap();
+        assert_eq!(object.max_file_size, expected);
+        assert_eq!(metadata.max_file_size, expected);
+        assert_eq!(object.upload.max_part_size, metadata.upload.max_part_size);
+        assert_eq!(object.upload.max_part_size, 52_428_800);
+    }
+    for invalid in [
+        "0",
+        "",
+        "-1",
+        "auto",
+        "9223372036854775808",
+        "18446744073709551616",
+    ] {
+        ini.with_section(Some("set_limits"))
+            .set("max_file_size", invalid);
+        ini.write_to_file(&path).unwrap();
+        assert!(N1Settings::load(&path).is_err(), "accepted {invalid:?}");
+        assert!(
+            N1Settings::load_metadata(&path).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "subprocess helper invoked by secret_sources_support_isolation_and_fail_closed"]
+fn isolated_secret_provisioning_child() {
+    let path =
+        std::env::var_os("N1_SETTINGS_ENV_TEST_CONFIG").expect("isolated child config required");
+    for config in [
+        N1Settings::load(Path::new(&path)),
+        N1Settings::load_metadata(Path::new(&path)),
+    ] {
+        let result = config.unwrap().read_env();
+        if std::env::var_os("N1_SETTINGS_ENV_TEST_REJECT").is_some() {
+            assert!(result.is_err());
+        } else {
+            let values = result.unwrap();
+            assert_eq!(values["JWT_SECRET"], "service-jwt");
+            assert_eq!(values["AUTH_KEY"], "service-auth");
+            assert_eq!(values["MASTER_KEY"], "service-master");
+            assert_eq!(values["ADMIN_KEY"], "service-admin");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_sources_support_isolation_and_fail_closed() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (path, _guard) = fixture();
+    let child = |reject: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "settings::tests::isolated_secret_provisioning_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("N1_SETTINGS_ENV_TEST_CONFIG", &path)
+            .env("JWT_SECRET", "service-jwt")
+            .env("AUTH_KEY", "service-auth")
+            .env("MASTER_KEY", "service-master")
+            .env("ADMIN_KEY", "service-admin");
+        command.env_remove("N1_SETTINGS_ENV_TEST_REJECT");
+        if reject {
+            command.env("N1_SETTINGS_ENV_TEST_REJECT", "1");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    // No file is required when the service supplies all required values.
+    child(false);
+    let mut ini = ini::Ini::load_from_file(&path).unwrap();
+    ini.with_section(Some("server"))
+        .set("env_file", "object.env");
+    ini.write_to_file(&path).unwrap();
+    child(true); // Explicit paths cannot silently fall back to the environment.
+    let secrets = path.with_file_name("object.env");
+    fs::write(
+        &secrets,
+        "JWT_SECRET=file-jwt\nAUTH_KEY=file-auth\nMASTER_KEY=file-master\nADMIN_KEY=file-admin\n",
+    )
+    .unwrap();
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600)).unwrap();
+    child(false); // Process values override the private file.
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o644)).unwrap();
+    child(true);
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600)).unwrap();
+    let link = path.with_file_name("linked.env");
+    symlink(&secrets, &link).unwrap();
+    ini.with_section(Some("server"))
+        .set("env_file", "linked.env");
+    ini.write_to_file(&path).unwrap();
+    child(true);
+    ini.with_section(Some("server"))
+        .set("env_file", "object.env");
+    ini.write_to_file(&path).unwrap();
+    fs::write(&secrets, "JWT_SECRET=first\nJWT_SECRET=duplicate\n").unwrap();
+    child(true);
+    fs::write(&secrets, "JWT_SECRET='unterminated\n").unwrap();
+    child(true);
+}

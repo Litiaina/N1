@@ -8,6 +8,7 @@ SERVICE_NAME="litiaina-n1"
 INSTALL_DIR=""
 BINARY_PATH=""
 ENV_FILE=""
+USE_ENV_FILE=1
 CONFIG_FILE=""
 RUN_USER=""
 RUN_GROUP=""
@@ -25,11 +26,12 @@ Usage:
   sudo scripts/install-n1-systemd.sh --install-dir /path/to/n1-server [options]
 
 Required:
-  --install-dir PATH        Directory containing litiaina-n1, n1.env, and n1_config.ini.
+  --install-dir PATH        Working directory for the N1 service.
 
 Common options:
   --binary PATH             N1 binary path. Default: <install-dir>/litiaina-n1
   --env-file PATH           Environment file. Default: <install-dir>/n1.env
+  --no-env-file             Do not export a file; use N1's selected secrets file or service credentials.
   --config-file PATH        Config file. Default: <install-dir>/n1_config.ini
   --service-name NAME       systemd unit name without .service. Default: litiaina-n1
   --rust-log VALUE          RUST_LOG value. Default: info
@@ -89,7 +91,12 @@ parse_args() {
         ;;
       --env-file)
         ENV_FILE="${2:-}"
+        USE_ENV_FILE=1
         shift 2
+        ;;
+      --no-env-file)
+        USE_ENV_FILE=0
+        shift
         ;;
       --config-file)
         CONFIG_FILE="${2:-}"
@@ -143,6 +150,7 @@ validate_paths() {
   [[ "$DRY_RUN" -eq 1 || "$(id -u)" -eq 0 ]] || die "run this installer with sudo/root"
   [[ -n "$INSTALL_DIR" ]] || die "--install-dir is required"
   [[ -d "$INSTALL_DIR" ]] || die "install dir does not exist: $INSTALL_DIR"
+  INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
 
   BINARY_PATH="${BINARY_PATH:-${INSTALL_DIR}/litiaina-n1}"
   ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/n1.env}"
@@ -155,23 +163,25 @@ validate_paths() {
   fi
 
   [[ -x "$BINARY_PATH" ]] || die "binary not found or not executable: $BINARY_PATH"
-  [[ -f "$ENV_FILE" ]] || die "env file not found: $ENV_FILE"
+  if [[ "$USE_ENV_FILE" -eq 1 ]]; then
+    [[ -f "$ENV_FILE" ]] || die "env file not found: $ENV_FILE"
+    [[ ! -L "$ENV_FILE" ]] || die "env file must not be a symlink: $ENV_FILE"
+    local env_mode
+    env_mode="$(stat -c '%a' -- "$ENV_FILE")"
+    (( (8#$env_mode & 077) == 0 )) || die "env file must be owner-only (chmod 600): $ENV_FILE"
+  fi
   [[ -f "$CONFIG_FILE" ]] || die "config file not found: $CONFIG_FILE"
   [[ -f "$TEMPLATE_FILE" ]] || die "service template not found: $TEMPLATE_FILE"
+  BINARY_PATH="$(cd "$(dirname "$BINARY_PATH")" && pwd -P)/$(basename "$BINARY_PATH")"
+  CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)/$(basename "$CONFIG_FILE")"
+  if [[ "$USE_ENV_FILE" -eq 1 ]]; then
+    ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd -P)/$(basename "$ENV_FILE")"
+  fi
   [[ -n "$SERVICE_NAME" ]] || die "--service-name cannot be empty"
   [[ -n "$RUN_USER" ]] || die "--user cannot be empty"
   [[ -n "$RUN_GROUP" ]] || die "--group cannot be empty"
   [[ -n "$RUST_LOG_VALUE" ]] || die "--rust-log cannot be empty"
 
-  local expected_env expected_config
-  expected_env="$(cd "$INSTALL_DIR" && pwd -P)/n1.env"
-  expected_config="$(cd "$INSTALL_DIR" && pwd -P)/n1_config.ini"
-  [[ "$(cd "$(dirname "$ENV_FILE")" && pwd -P)/$(basename "$ENV_FILE")" == "$expected_env" ]] || {
-    die "N1 reads n1.env from its working directory; place it at ${INSTALL_DIR}/n1.env"
-  }
-  [[ "$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)/$(basename "$CONFIG_FILE")" == "$expected_config" ]] || {
-    die "N1 reads n1_config.ini from its working directory; place it at ${INSTALL_DIR}/n1_config.ini"
-  }
 }
 
 render_unit() {
@@ -179,11 +189,12 @@ render_unit() {
   unit_tmp="$(mktemp)"
   unit_dest="/etc/systemd/system/${SERVICE_NAME}.service"
 
-  local working_directory binary env_file config_file line requires_mounts
+  local working_directory binary env_file config_file config_directory line requires_mounts
   working_directory="$(systemd_escape_path "$INSTALL_DIR")"
   binary="$(systemd_escape_path "$BINARY_PATH")"
   env_file="$(systemd_escape_path "$ENV_FILE")"
   config_file="$(systemd_escape_path "$CONFIG_FILE")"
+  config_directory="$(dirname "$CONFIG_FILE")"
   requires_mounts="$({
     awk '
       /^\[/ { in_disk = ($0 ~ /^\[disk_config\]/); in_pool = ($0 ~ /^\[storage_pool\./); next }
@@ -197,6 +208,9 @@ render_unit() {
     mount_path="${mount_path#"${mount_path%%[![:space:]]*}"}"
     mount_path="${mount_path%"${mount_path##*[![:space:]]}"}"
     if [[ -n "$mount_path" ]]; then
+      if [[ "$mount_path" != /* ]]; then
+        mount_path="$config_directory/$mount_path"
+      fi
       systemd_escape_path "$mount_path"
       printf '\n'
     fi
@@ -204,6 +218,9 @@ render_unit() {
   [[ -n "$requires_mounts" ]] || die "no N1 storage mounts found in $CONFIG_FILE"
 
   while IFS= read -r line; do
+    if [[ "$USE_ENV_FILE" -eq 0 && "$line" == EnvironmentFile=* ]]; then
+      continue
+    fi
     line="${line//__SERVICE_NAME__/$SERVICE_NAME}"
     line="${line//__RUN_USER__/$RUN_USER}"
     line="${line//__RUN_GROUP__/$RUN_GROUP}"

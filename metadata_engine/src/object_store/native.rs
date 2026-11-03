@@ -3,7 +3,7 @@ use super::{
     ObjectUploadStatus,
 };
 use n1_link::{PoolId, noa::Command};
-use n1_native_client::{N1NativeClient, Response};
+use n1_native_client::{N1NativeClient, NativeClientError, Response};
 use serde::de::DeserializeOwned;
 use std::{
     sync::{Arc, Mutex},
@@ -45,8 +45,8 @@ struct CachedClient {
 const MAX_IDLE_AGE: Duration = Duration::from_secs(90);
 
 /// Bounded independent native connections; never one mutex around all object
-/// I/O. A cancelled or failed exchange discards its connection, so the next
-/// operation cannot reuse an uncertain frame boundary.
+/// I/O. A cancelled or incomplete exchange discards its connection. A complete
+/// control error retains its known frame boundary and authenticated transport.
 #[derive(Clone)]
 pub struct NativeObjectStore(Arc<Inner>);
 
@@ -169,9 +169,23 @@ impl NativeObjectStore {
 
     async fn command<T: DeserializeOwned>(&self, command: Command) -> ObjectStoreResult<T> {
         let mut connection = self.connection().await?;
-        let value = decode(connection.client.control(command).await?)?;
-        connection.release();
-        Ok(value)
+        match connection.client.control(command).await {
+            Ok(response) => {
+                let value = decode(response)?;
+                connection.release();
+                Ok(value)
+            }
+            Err(error) => {
+                // control() returns Native only after consuming and validating
+                // the whole response with no body. In particular, an untouched
+                // upload's 404 must not cause a new password login per page.
+                // An unauthorized session still requires reauthentication.
+                if matches!(&error, NativeClientError::Native { code, .. } if code != "401") {
+                    connection.release();
+                }
+                Err(error.into())
+            }
+        }
     }
 
     pub async fn init(

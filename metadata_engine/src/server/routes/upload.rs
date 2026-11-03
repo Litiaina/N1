@@ -90,17 +90,11 @@ pub(super) async fn one_shot(
         options.mode(0o600);
         let mut file = options.open(&temp).await?;
         let result = async {
-            let copied = tokio::io::copy(
-                &mut (&mut source).take(app.config.max_file_size.saturating_add(1)),
-                &mut file,
-            )
-            .await?;
-            if copied > app.config.max_file_size {
-                return Err(ApiError(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "object exceeds max_file_size".into(),
-                ));
-            }
+            // Stream unknown-length bodies to disk; an absent policy cap does
+            // not change memory admission or LINK's supported source length.
+            let maximum = app.config.max_file_size.unwrap_or(i64::MAX as u64);
+            let copied = tokio::io::copy(&mut (&mut source).take(maximum + 1), &mut file).await?;
+            app.config.check_object_size(copied)?;
             file.flush().await?;
             use tokio::io::AsyncSeekExt;
             file.rewind().await?;
@@ -131,12 +125,7 @@ pub(crate) async fn put_stream<R: AsyncRead + Unpin>(
     durable: bool,
     source: &mut R,
 ) -> ApiResult<crate::namespace::PublishedVersion> {
-    if length > app.config.max_file_size {
-        return Err(ApiError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "object exceeds max_file_size".into(),
-        ));
-    }
+    app.config.check_object_size(length)?;
     let pool = app
         .pools
         .iter()
@@ -314,6 +303,10 @@ async fn batch_group(
     let mut results = Vec::new();
     let mut objects = Vec::new();
     for (path, content_type, bytes) in group {
+        if let Err(error) = app.config.check_object_size(bytes.len() as u64) {
+            results.push(json!({"object_key":path,"status":error.0.as_u16(),"error":error.1}));
+            continue;
+        }
         match crate::namespace::store::validate_upload(&path, &content_type) {
             Ok(_) => objects.push(crate::service::batch::SmallObject {
                 path,

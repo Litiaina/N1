@@ -58,11 +58,48 @@ validation and existing `tests/live-local.spec.ts` against a real metadata
 service. Do not replace production Console features or change its expectations
 to obtain a pass.
 
+The `noa_service` integration target also covers optional object-size policy.
+`finite_and_unlimited_policy_on_real_metadata_and_object_engines` checks finite
+rejection on known-length, chunked, batch and multipart uploads, then byte-exact
+transfers with omitted/explicit unlimited caps and 15 GiB/1 TiB multipart
+init/retry/status/cancel. Large initialization is admission testing, not a
+claim that those payload sizes were transferred. Supply `N1_OBJECT_TEST_ROOT`
+for control/database evidence and `N1_OBJECT_TEST_BINARY` for the actual object
+binary; optional `N1_OBJECT_TEST_FIRST_ROOT` and `N1_OBJECT_TEST_SECOND_ROOT`
+put shard members on separate physical disks. Run the ignored witness explicitly.
+
+`running_deployment_unlimited_upload_smoke` targets an already running private
+test deployment only when explicitly invoked with `--ignored`. It requires
+`N1_SIZE_TEST_ACCESS_FILE` (JSON with `metadata_url`, `fragment`, `fragment_key`)
+and `N1_SIZE_TEST_CA`. It uploads and verifies two small payloads, cancels its
+large sessions, and moves its completed fixtures to named trash. Optional
+`N1_SIZE_TEST_REPORT` records the result without credentials.
+
+The separately ignored `running_deployment_large_multipart_round_trip` requires
+the same access/CA inputs plus an explicit `N1_SIZE_TEST_BYTES` above 5 GiB.
+It streams deterministic, part-indexed payloads through strict durable 32 MiB
+parts, repeats finalize, and compares every downloaded byte using bounded
+buffers. It retains its named fixture and records its path in the optional
+report. This is the actual large-payload witness; the admission test above does
+not replace it.
+
 ## Recorded evidence as of November 3, 2026
 
-The service checkpoint is `9939ec8` on `link`. Source/executable hashes and
+The earlier full-stack campaigns below use checkpoint `9939ec8` on `link`. Source/executable hashes and
 exact environments in each report identify the tested snapshot. Counts from
 different runs are not added together as new distinct tests.
+
+The later local size-policy and credential-provisioning checks on
+`192.168.254.107` passed: 421 workspace cases, 81 storage documentation cases,
+both explicit metadata-to-object HDD witnesses, and all three original Console
+live cases. A separate real **15 GiB** strict durable upload used 480 parts and
+passed repeated finalize and complete byte-for-byte download verification.
+The **1 TiB** checks covered initialization, retry, status and cancellation.
+Custom secrets files, environment-only startup and rejection of insecure files
+also passed. Raw evidence, binaries and the current operator paths are under
+`/mnt/DATA_SSD/n1-local-test-20261103-01/reports/UNLIMITED-UPLOADS-20261103.md`
+on that host. This does not change the completion status of the earlier
+population campaigns.
 
 | Campaign | Recorded result | Scope and evidence |
 | --- | --- | --- |

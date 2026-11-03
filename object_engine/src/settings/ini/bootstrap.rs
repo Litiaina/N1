@@ -45,6 +45,12 @@ pub(super) fn ensure(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::Invalid("configuration has no parent".into()))?;
     fs::create_dir_all(parent)?;
+    let new_config = !path.try_exists()?;
     publish(&path, None)?;
-    publish(&path.with_file_name("n1.env"),Some(b"# N1 service secrets. Configure before starting the server.\nJWT_SECRET=\nAUTH_KEY=\nMASTER_KEY=\nADMIN_KEY=\nACCESS_TOKEN_DEFAULT_TTL_SECS=900\nACCESS_TOKEN_MAX_TTL_SECS=3600\nREFRESH_TOKEN_TTL_SECS=604800\n"))
+    // Existing operator configurations may use service credentials or an
+    // explicit secrets file. Starting those must not write a sibling env file.
+    if new_config {
+        publish(&path.with_file_name("n1.env"),Some(b"# N1 service secrets. Configure before starting the server.\nJWT_SECRET=\nAUTH_KEY=\nMASTER_KEY=\nADMIN_KEY=\nACCESS_TOKEN_DEFAULT_TTL_SECS=900\nACCESS_TOKEN_MAX_TTL_SECS=3600\nREFRESH_TOKEN_TTL_SECS=604800\n"))?;
+    }
+    Ok(())
 }

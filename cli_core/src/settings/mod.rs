@@ -28,7 +28,8 @@ pub struct N1Settings {
     pub auto_healing: AutoHealing,
     pub rate_limits: RateLimits,
     pub export: Export,
-    pub max_file_size: u64,
+    /// Optional operator cap on an object's total bytes, independent of part size.
+    pub max_file_size: Option<u64>,
     pub login_token_expiration: u64,
     pub index_partition_count: u16,
 }
@@ -46,6 +47,7 @@ pub struct Server {
     pub native_max_connections: usize,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    pub env_file: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct StoragePool {
@@ -138,14 +140,29 @@ impl N1Settings {
         parse::load_metadata(path)
     }
     pub fn read_env(&self) -> crate::Result<BTreeMap<String, String>> {
-        let path = self.source.with_file_name("n1.env");
-        let bytes = parse::read_regular(&path, true)?;
+        let path = self
+            .server
+            .env_file
+            .clone()
+            .unwrap_or_else(|| self.source.with_file_name("n1.env"));
+        let bytes = match parse::read_regular(&path, true) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if self.server.env_file.is_none()
+                    && error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         let mut values = BTreeMap::new();
         for item in dotenvy::from_read_iter(bytes.as_slice()) {
             // Parser diagnostics may include the secret source line.
-            let (key, value) = item.map_err(|_| "invalid n1.env assignment or quoting")?;
+            let (key, value) = item.map_err(|_| "invalid secrets-file assignment or quoting")?;
             if values.insert(key.clone(), value).is_some() {
-                return Err(format!("duplicate n1.env key {key}").into());
+                return Err(format!("duplicate secrets-file key {key}").into());
             }
         }
         // Service environment overrides the same named file setting, as before.
@@ -169,7 +186,7 @@ impl N1Settings {
                 .ok()
                 .or_else(|| values.get(name).cloned())
                 .ok_or_else(|| {
-                    format!("{name} is required in n1.env or the service environment")
+                    format!("{name} is required in the secrets file or service environment")
                 })?;
             if value.is_empty() {
                 return Err(format!("{name} must not be empty").into());

@@ -94,6 +94,14 @@ impl Fixture {
         self.root.join("control/pool-enrollment.json")
     }
     async fn start(&self, host: &str, native: u16) -> Server {
+        self.start_with_env(host, native, &[]).await
+    }
+    async fn start_with_env(
+        &self,
+        host: &str,
+        native: u16,
+        environment: &[(&str, &str)],
+    ) -> Server {
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -103,6 +111,7 @@ impl Fixture {
             Process::new(env!("CARGO_BIN_EXE_litiaina-n1"))
                 .args(["--config"])
                 .arg(&self.ini)
+                .envs(environment.iter().copied())
                 .stdout(Stdio::from(log.try_clone().unwrap()))
                 .stderr(Stdio::from(log))
                 .spawn()
@@ -172,6 +181,209 @@ async fn put(client: &mut N1NativeClient, mut bytes: &[u8]) -> Value {
         .await
         .unwrap();
     result
+}
+
+#[tokio::test]
+async fn optional_size_cap_changes_policy_without_changing_identity_or_part_limits() {
+    let f = Fixture::new().await;
+    let server = f.start("127.0.0.1", f.native).await;
+    let mut client = f.client("127.0.0.1", f.native, false).await;
+    let bytes = (0..2 * 1024 * 1024 + 7)
+        .map(|n| (n % 251) as u8)
+        .collect::<Vec<_>>();
+    let init = || Command::UploadInit {
+        pool: None,
+        total_bytes: bytes.len() as u64,
+        part_bytes: 16384,
+        durable: true,
+        ttl_seconds: 3600,
+    };
+    assert!(client.control(init()).await.is_err());
+    let marker = fs::read(f.root.join("a0/.n1-arc-pool.json")).unwrap();
+    let signing = fs::read(f.root.join("control/link.signing-key")).unwrap();
+    drop(client);
+    drop(server);
+    f.edit(|ini| {
+        ini.with_section(Some("set_limits"))
+            .set("max_file_size", "unlimited");
+    });
+    let server = f.start("127.0.0.1", f.native).await;
+    let mut client = f.client("127.0.0.1", f.native, false).await;
+    let upload = client.control(init()).await.unwrap().result.unwrap();
+    let ticket = upload["upload_key"].as_str().unwrap();
+    for (index, mut part) in bytes.chunks(16384).enumerate() {
+        client
+            .upload_part(ticket.into(), index as u64, part.len() as u64, &mut part)
+            .await
+            .unwrap();
+    }
+    client
+        .control(Command::UploadFinalize {
+            upload_key: ticket.into(),
+        })
+        .await
+        .unwrap();
+    let mut read = Vec::new();
+    client
+        .download(
+            upload["object_key"].as_str().unwrap().into(),
+            0,
+            None,
+            &mut read,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, bytes);
+    let oversized = client
+        .control(Command::UploadInit {
+            pool: None,
+            total_bytes: 16385,
+            part_bytes: 32768,
+            durable: true,
+            ttl_seconds: 3600,
+        })
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    assert!(
+        client
+            .upload_part(
+                oversized["upload_key"].as_str().unwrap().into(),
+                0,
+                16385,
+                &mut &vec![0; 16385][..]
+            )
+            .await
+            .is_err()
+    );
+    // A rejected streaming request may close the connection; reauthenticate.
+    let mut client = f.client("127.0.0.1", f.native, false).await;
+    let health = client
+        .control(Command::Health)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    assert!(health["configuration"]["runtime"]["max_file_size"].is_null());
+    assert_eq!(health["configuration"]["runtime"]["max_part_size"], 16384);
+    assert_eq!(health["configuration"]["operation_memory_bytes"], 67108864);
+    assert_eq!(
+        marker,
+        fs::read(f.root.join("a0/.n1-arc-pool.json")).unwrap()
+    );
+    assert_eq!(
+        signing,
+        fs::read(f.root.join("control/link.signing-key")).unwrap()
+    );
+    drop(client);
+    drop(server);
+}
+
+#[tokio::test]
+async fn object_starts_with_explicit_secrets_or_environment_without_creating_sibling_env() {
+    let mut f = Fixture::new().await;
+    let renamed = f.root.join("object.ini");
+    fs::rename(&f.ini, &renamed).unwrap();
+    f.ini = renamed;
+    fs::rename(f.root.join("n1.env"), f.root.join("object.env")).unwrap();
+    f.edit(|ini| {
+        ini.with_section(Some("server"))
+            .set("env_file", "object.env");
+        ini.with_section(Some("disk_config"))
+            .set("fs_storage_path", "control");
+        ini.with_section(Some("storage_pool.A")).set("roots", "a0");
+    });
+    let installer =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/install-n1-systemd.sh");
+    let rendered = Process::new("bash")
+        .arg(installer)
+        .arg("--install-dir")
+        .arg(&f.root)
+        .arg("--binary")
+        .arg(env!("CARGO_BIN_EXE_litiaina-n1"))
+        .arg("--config-file")
+        .arg(&f.ini)
+        .args(["--no-env-file", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let unit = String::from_utf8(rendered.stdout).unwrap();
+    assert!(unit.contains("object.ini"));
+    assert!(!unit.contains("EnvironmentFile="));
+    let mounts = unit
+        .lines()
+        .find(|line| line.starts_with("RequiresMountsFor="))
+        .unwrap();
+    assert!(mounts.contains(f.root.join("a0").to_str().unwrap()));
+    assert!(mounts.contains(f.root.join("control").to_str().unwrap()));
+    let export_unit = || {
+        Process::new("bash")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/install-n1-systemd.sh"),
+            )
+            .arg("--install-dir")
+            .arg(&f.root)
+            .arg("--binary")
+            .arg(env!("CARGO_BIN_EXE_litiaina-n1"))
+            .arg("--config-file")
+            .arg(&f.ini)
+            .arg("--env-file")
+            .arg(f.root.join("object.env"))
+            .arg("--dry-run")
+            .output()
+            .unwrap()
+    };
+    assert!(export_unit().status.success());
+    fs::set_permissions(f.root.join("object.env"), fs::Permissions::from_mode(0o644)).unwrap();
+    let insecure = export_unit();
+    assert!(!insecure.status.success());
+    assert!(String::from_utf8_lossy(&insecure.stderr).contains("owner-only"));
+    fs::set_permissions(f.root.join("object.env"), fs::Permissions::from_mode(0o600)).unwrap();
+    let server = f.start("127.0.0.1", f.native).await;
+    let client = f.client("127.0.0.1", f.native, false).await;
+    assert!(!f.root.join("n1.env").exists());
+    drop(client);
+    drop(server);
+    f.edit(|ini| {
+        ini.with_section(Some("server")).delete(&"env_file");
+    });
+    let server = f
+        .start_with_env(
+            "127.0.0.1",
+            f.native,
+            &[
+                ("JWT_SECRET", "test-service-jwt"),
+                ("AUTH_KEY", SECRET),
+                ("MASTER_KEY", "test-master"),
+                ("ADMIN_KEY", "test-admin"),
+                ("ACCESS_TOKEN_DEFAULT_TTL_SECS", "120"),
+                ("ACCESS_TOKEN_MAX_TTL_SECS", "300"),
+                ("REFRESH_TOKEN_TTL_SECS", "600"),
+            ],
+        )
+        .await;
+    let mut client = f.client("127.0.0.1", f.native, false).await;
+    let upload = put(&mut client, b"environment-only service credentials").await;
+    let mut read = Vec::new();
+    client
+        .download(
+            upload["object_key"].as_str().unwrap().into(),
+            0,
+            None,
+            &mut read,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, b"environment-only service credentials");
+    assert!(!f.root.join("n1.env").exists());
+    drop(client);
+    drop(server);
 }
 
 #[tokio::test]
@@ -525,7 +737,28 @@ async fn ini_healing_is_opt_in_background_work_and_monitor_controls_are_live() {
     for n in 0..4 {
         put(&mut client, &vec![n; 8193]).await;
     }
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Stability requires a second topology observation after the configured
+    // interval. A fixed 1.2-second sleep races timer and blocking-I/O dispatch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let health = client
+            .control(Command::Health)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(health["job"].is_null());
+        if health["monitor"]["topology_stable"] == true
+            && health["monitor"]["last_capacity_check"].is_u64()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "monitor did not stabilize: {health}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let health = client
         .control(Command::Health)
         .await

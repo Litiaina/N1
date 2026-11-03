@@ -62,7 +62,8 @@ litiaina-n1-shell --help
 ```
 
 Package `n1` builds the object engine; its directory and executable names are
-independent. Both servers use their own `n1_config.ini` and private `n1.env`.
+independent. Each server has its own INI configuration and private credentials,
+supplied through a selected secrets file or its service environment.
 Follow the operator guide to enroll empty member roots, configure the two
 services and connect Console to metadata.
 

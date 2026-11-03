@@ -28,7 +28,7 @@ pub struct ServerConfig {
     pub metadata_workers: usize,
     pub upload_concurrency: usize,
     pub upload_memory_budget: usize,
-    pub max_file_size: u64,
+    pub max_file_size: Option<u64>,
     pub max_part_size: u64,
     pub strict_parts: bool,
     pub trash_retention_seconds: u64,
@@ -36,12 +36,30 @@ pub struct ServerConfig {
     pub export: cli_core::settings::Export,
 }
 impl ServerConfig {
+    /// No configured cap still preserves LINK's source-length representation.
+    pub(crate) fn check_object_size(&self, bytes: u64) -> ApiResult<()> {
+        let message = if self.max_file_size.is_some_and(|limit| bytes > limit) {
+            Some("object exceeds configured max_file_size")
+        } else if bytes > i64::MAX as u64 {
+            Some("object exceeds LINK source-length limit")
+        } else {
+            None
+        };
+        match message {
+            Some(message) => Err(ApiError(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                message.into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
     pub fn load(path: &Path) -> ApiResult<Self> {
         let settings = cli_core::settings::N1Settings::load_metadata(path)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
         let env = settings
             .read_env()
-            .map_err(|_| ApiError::invalid("invalid or incomplete private n1.env"))?;
+            .map_err(|_| ApiError::invalid("invalid or incomplete service credentials"))?;
         let ini = ini::Ini::load_from_file(path)
             .map_err(|_| ApiError::invalid("cannot read metadata INI"))?;
         let section = ini.section(Some("metadata_engine"));

@@ -20,7 +20,7 @@ pub(super) fn read_regular(path: &Path, private: bool) -> Result<Vec<u8>> {
     {
         use std::os::unix::fs::PermissionsExt;
         if private && metadata.permissions().mode() & 0o077 != 0 {
-            return Err("n1.env must be owner-only (chmod 600)".into());
+            return Err("secrets file must be owner-only (chmod 600)".into());
         }
     }
     #[cfg(not(unix))]
@@ -67,6 +67,24 @@ impl Section<'_> {
             "0" | "false" | "no" | "off" => Ok(false),
             _ => Err(format!("[{}] {key} must be a boolean", self.name).into()),
         }
+    }
+    fn optional_size(&self, key: &str) -> Result<Option<u64>> {
+        let value = self.text(key, "unlimited");
+        if value.eq_ignore_ascii_case("unlimited") {
+            return Ok(None);
+        }
+        let bytes = value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=i64::MAX as u64).contains(n));
+        bytes.map(Some).ok_or_else(|| {
+            format!(
+                "[{}] {key} must be unlimited or 1..={} bytes",
+                self.name,
+                i64::MAX
+            )
+            .into()
+        })
     }
     fn auto(&self, key: &str, default: usize, maximum: usize) -> Result<usize> {
         let value = self.text(key, "auto");
@@ -139,6 +157,7 @@ fn load_for_component(path: &Path, owns_members: bool) -> Result<N1Settings> {
     let server = section("server");
     let cert = server.text("cert_path", "");
     let key = server.text("key_path", "");
+    let env_file = server.text("env_file", "");
     if cert.is_empty() != key.is_empty() {
         return Err("[server] cert_path and key_path must be configured together".into());
     }
@@ -152,6 +171,9 @@ fn load_for_component(path: &Path, owns_members: bool) -> Result<N1Settings> {
             .transpose()?,
         key_path: (!key.is_empty())
             .then(|| absolute(base, &key))
+            .transpose()?,
+        env_file: (!env_file.is_empty())
+            .then(|| absolute(base, &env_file))
             .transpose()?,
     };
     if server.https_port == server.native_port {
@@ -464,12 +486,7 @@ fn load_for_component(path: &Path, owns_members: bool) -> Result<N1Settings> {
         auto_healing,
         rate_limits,
         export,
-        max_file_size: section("set_limits").number(
-            "max_file_size",
-            5368709120,
-            1,
-            i64::MAX as u64,
-        )?,
+        max_file_size: section("set_limits").optional_size("max_file_size")?,
         login_token_expiration: section("jwt_token_config").number(
             "login_token_expiration",
             900,
