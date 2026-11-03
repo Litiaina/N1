@@ -50,10 +50,17 @@ The source contains the following Rust physical harnesses:
   captured successful rows from a retained failed attempt.
 - `metadata_engine/examples/qualification_summary.rs`: read-only summary of
   existing latency/resource evidence; it cannot manufacture a campaign pass.
-- `metadata_engine/examples/upload_comparison.rs`: matched native LINK and
-  HTTPS metadata uploads with the same payload, strict durability, part size
-  and concurrency. Samples CPU/RSS, process I/O and physical disk counters.
-  Its three range checks are explicitly separate from full-download witnesses.
+- `metadata_engine/examples/upload_comparison.rs`: matched native LINK,
+  original NCX/NDX and current named metadata uploads with the same payload,
+  strict durability, part size and concurrency. Samples CPU/RSS, process I/O
+  and physical disk counters. `--mode ncx` uses the original named HTTPS API
+  with its unmodified engine binary. `--access-file` selects that private
+  endpoint/fragment configuration; `--session-mode standard|durable` selects
+  the existing upload scheme. `--full-download` checks the complete named GET
+  length and source SHA-256, outside upload timing. Without that flag, three
+  64 KiB range checks are explicitly sampled verification. All expected source
+  hashing occurs before timers. Set the measured server PID(s); omit
+  `--metadata-pid` for the original combined engine.
 - `metadata_engine/examples/upload_audit.rs`: inspect a stopped metadata copy
   without printing object capabilities. `recover_upload.rs` is an explicit
   offline operator recovery for a cancelled session whose verified native parts

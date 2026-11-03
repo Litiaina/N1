@@ -1,10 +1,12 @@
 //! Matched live metadata/native upload measurement; never changes server policy.
 use clap::Parser;
 use cli_core::{Credentials, Result, result};
+use futures_util::StreamExt;
 use futures_util::future::try_join_all;
 use n1_native_client::{Command, N1NativeClient};
 use reqwest::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
     sync::{
@@ -34,7 +36,15 @@ struct Args {
     #[arg(long)]
     object_pid: u32,
     #[arg(long)]
-    metadata_pid: u32,
+    metadata_pid: Option<u32>,
+    /// Named API credentials/URL; defaults to the local deployment access file.
+    #[arg(long)]
+    access_file: Option<PathBuf>,
+    #[arg(long, default_value = "durable")]
+    session_mode: String,
+    /// Verify every downloaded byte via length and the expected source SHA-256.
+    #[arg(long)]
+    full_download: bool,
 }
 fn payload(offset: u64, length: usize) -> Vec<u8> {
     let mut bytes = (0..65536)
@@ -69,9 +79,27 @@ async fn http(response: reqwest::Response, status: u16) -> Result<Value> {
     let actual = response.status().as_u16();
     let bytes = response.bytes().await?;
     if actual != status {
-        return Err(format!("HTTP status {actual}, expected {status}").into());
+        return Err(format!(
+            "HTTP status {actual}, expected {status}: {}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(2048)])
+        )
+        .into());
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+async fn part_ack(response: reqwest::Response) -> Result<()> {
+    let actual = response.status().as_u16();
+    let bytes = response.bytes().await?;
+    if actual != 200 {
+        return Err(format!(
+            "part status {actual}: {}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(2048)])
+        )
+        .into());
+    }
+    // Original NOA sends a plain-text ACK; current NOA sends JSON. Both must
+    // be completely drained before measuring completion/reusing the transport.
+    Ok(())
 }
 fn latency(mut values: Vec<f64>) -> Value {
     values.sort_by(f64::total_cmp);
@@ -81,22 +109,37 @@ fn latency(mut values: Vec<f64>) -> Value {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if !matches!(args.mode.as_str(), "native" | "metadata")
+    if !matches!(args.mode.as_str(), "native" | "metadata" | "ncx")
         || args.bytes < 65536
         || ![8 << 20, 32 << 20].contains(&args.part_bytes)
         || !(1..=16).contains(&args.concurrency)
+        || !matches!(args.session_mode.as_str(), "standard" | "durable")
+        || (args.mode == "ncx" && args.metadata_pid.is_some())
+        || (args.mode == "metadata" && args.metadata_pid.is_none())
+        || (args.mode == "native" && args.full_download)
     {
-        return Err("mode=native|metadata, parts=8|32 MiB, concurrency=1..16 required".into());
+        return Err(
+            "invalid comparison mode, process set, session mode or payload geometry".into(),
+        );
     }
     std::fs::create_dir(&args.output)?;
     let ca = args.root.join("certs/test-ca.crt");
     let credentials = Credentials::load(&args.root.join("config/object/client.json"))?;
-    let mut native = credentials.connect(None, Some(&ca)).await?;
+    let mut native = if args.mode == "native" {
+        Some(credentials.connect(None, Some(&ca)).await?)
+    } else {
+        None
+    };
     let client = Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(&ca)?)?)
         .timeout(Duration::from_secs(1800))
         .build()?;
-    let access: Value = serde_json::from_slice(&std::fs::read(args.root.join("access.json"))?)?;
+    let access: Value = serde_json::from_slice(&std::fs::read(
+        args.access_file
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| args.root.join("access.json")),
+    )?)?;
     let base = format!(
         "{}/noa/v1",
         access["metadata_url"]
@@ -105,7 +148,7 @@ async fn main() -> Result<()> {
             .trim_end_matches('/')
     );
     let logged = http(client.post(format!("{base}/auth/fragment"))
-        .json(&json!({"fragment":access["fragment"],"secret":access["fragment_key"],"read":true,"write":true,"delete":true,"expires_in":3600}))
+        .json(&json!({"fragment":access["fragment"],"secret":access["fragment_key"],"read":true,"write":true,"modify":true,"delete":true,"expires_in":21600}))
         .send().await?, 200).await?;
     let token = logged["access_token"]
         .as_str()
@@ -117,6 +160,32 @@ async fn main() -> Result<()> {
         args.mode
     );
     let shape = json!({"content_type":"application/octet-stream","total_size_bytes":args.bytes,"part_size_bytes":args.part_bytes,"expected_parts":args.bytes.div_ceil(args.part_bytes)});
+    let multipart = format!(
+        "{base}/upload/multipart{}",
+        if args.session_mode == "durable" {
+            "/durable"
+        } else {
+            ""
+        }
+    );
+    let expected_hash = if args.full_download {
+        let bytes = args.bytes;
+        Some(
+            tokio::task::spawn_blocking(move || {
+                let mut hash = Sha256::new();
+                let mut offset = 0;
+                while offset < bytes {
+                    let length = (bytes - offset).min(8 << 20) as usize;
+                    hash.update(payload(offset, length));
+                    offset += length as u64;
+                }
+                format!("{:x}", hash.finalize())
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
     let mut connections = Vec::new();
     if args.mode == "native" {
         for _ in 0..args.concurrency {
@@ -129,6 +198,8 @@ async fn main() -> Result<()> {
     let upload = if args.mode == "native" {
         result(
             native
+                .as_mut()
+                .ok_or("missing native connection")?
                 .control(Command::UploadInit {
                     pool: None,
                     total_bytes: args.bytes,
@@ -141,14 +212,12 @@ async fn main() -> Result<()> {
     } else {
         http(
             client
-                .post(format!(
-                    "{base}/upload/multipart/durable/init/{named}?durability=strict"
-                ))
+                .post(format!("{multipart}/init/{named}?durability=strict"))
                 .bearer_auth(&token)
                 .json(&shape)
                 .send()
                 .await?,
-            200,
+            if args.mode == "ncx" { 201 } else { 200 },
         )
         .await?
     };
@@ -168,7 +237,7 @@ async fn main() -> Result<()> {
             None
         };
         let client = client.clone();
-        let base = base.clone();
+        let multipart = multipart.clone();
         let token = token.clone();
         let upload = upload.clone();
         let acknowledged = acknowledged.clone();
@@ -182,8 +251,8 @@ async fn main() -> Result<()> {
                 if let Some(native) = &mut connection {
                     native.upload_part(upload["upload_key"].as_str().ok_or("missing ticket")?.into(), index, length, &mut &data[..]).await?;
                 } else {
-                    http(client.put(format!("{base}/upload/multipart/durable/{}/{index}", upload["version_id"].as_str().ok_or("missing version")?))
-                        .bearer_auth(&token).body(data).send().await?, 200).await?;
+                    part_ack(client.put(format!("{multipart}/{}/{index}?durability=strict", upload["version_id"].as_str().ok_or("missing version")?))
+                        .bearer_auth(&token).header("content-type","application/octet-stream").body(data).send().await?).await?;
                 }
                 rows.push(json!({"part":index,"bytes":length,"milliseconds":start.elapsed().as_secs_f64()*1000.0}));
                 let done = acknowledged.fetch_add(length, Ordering::Relaxed) + length;
@@ -200,7 +269,7 @@ async fn main() -> Result<()> {
             // Keep the connection that carried parts active for finalization.
             // The initial control connection may have hit its idle timeout
             // while the separate workers spent minutes uploading to HDDs.
-            native = connection;
+            native = Some(connection);
         }
     }
     let parts_seconds = parts_start.elapsed().as_secs_f64();
@@ -208,6 +277,8 @@ async fn main() -> Result<()> {
     if args.mode == "native" {
         result(
             native
+                .as_mut()
+                .ok_or("missing native connection")?
                 .control(Command::UploadFinalize {
                     upload_key: upload["upload_key"]
                         .as_str()
@@ -220,11 +291,12 @@ async fn main() -> Result<()> {
         http(
             client
                 .post(format!(
-                    "{base}/upload/multipart/durable/{}/{}/finalize",
+                    "{multipart}/{}/{}/finalize",
                     upload["version_id"].as_str().ok_or("missing version")?,
                     upload["session_id"].as_str().ok_or("missing session")?
                 ))
                 .bearer_auth(&token)
+                .query(&[("object_key", &named)])
                 .json(&shape)
                 .send()
                 .await?,
@@ -237,11 +309,49 @@ async fn main() -> Result<()> {
     let resource = watch.finish().await?;
     rows.sort_by_key(|v| v["part"].as_u64());
     std::fs::write(args.output.join("parts.json"), serde_json::to_vec(&rows)?)?;
-    // Matched sample verification is outside the measured upload interval.
-    for offset in [0, (args.bytes / 2) / 65536 * 65536, args.bytes - 65536] {
+    let mut download_report = Value::Null;
+    if let Some(expected_hash) = &expected_hash {
+        let directory = args.output.join("download");
+        std::fs::create_dir(&directory)?;
+        let download_watch =
+            resources::Watch::start(args.object_pid, args.metadata_pid, &directory)?;
+        let start = Instant::now();
+        let response = client
+            .get(format!("{base}/objects/download"))
+            .query(&[("object_key", &named)])
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let headers_seconds = start.elapsed().as_secs_f64();
+        if response.status() != 200 {
+            return Err(format!("full download returned {}", response.status()).into());
+        }
+        let mut stream = response.bytes_stream();
+        let mut hash = Sha256::new();
+        let mut length = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            length += chunk.len() as u64;
+            hash.update(&chunk);
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let actual_hash = format!("{:x}", hash.finalize());
+        if length != args.bytes || &actual_hash != expected_hash {
+            return Err("full download length/SHA-256 mismatch".into());
+        }
+        download_report = json!({"bytes":length,"seconds":seconds,"mib_per_second":length as f64/1048576.0/seconds,"headers_seconds":headers_seconds,"sha256":actual_hash,"resources":download_watch.finish().await?});
+    }
+    // Verification is outside the measured upload interval.
+    for offset in if args.full_download {
+        vec![]
+    } else {
+        vec![0, (args.bytes / 2) / 65536 * 65536, args.bytes - 65536]
+    } {
         let mut body = Vec::new();
         if args.mode == "native" {
             native
+                .as_mut()
+                .ok_or("missing native connection")?
                 .download(
                     upload["object_key"]
                         .as_str()
@@ -272,7 +382,8 @@ async fn main() -> Result<()> {
         "durability":"strict","init_seconds":init_seconds,"parts_seconds":parts_seconds,"finalize_seconds":finalize_seconds,
         "upload_seconds":seconds,"upload_mib_per_second":args.bytes as f64 / 1048576.0 / seconds,
         "part_latency":latency(rows.iter().map(|v|v["milliseconds"].as_f64().unwrap()).collect()),"resources":resource,
-        "verified_ranges":3,"verified_bytes":196608,"full_download_verified":false,"retained_named_path":if args.mode=="metadata" {Some(named)} else {None}});
+        "verified_ranges":if args.full_download {0} else {3},"verified_bytes":if args.full_download {args.bytes} else {196608},"full_download_verified":args.full_download,"download":download_report,
+        "session_mode":args.session_mode,"expected_source_sha256":expected_hash,"retained_named_path":if args.mode!="native" {Some(named)} else {None}});
     std::fs::write(
         args.output.join("PASSED.json"),
         serde_json::to_vec_pretty(&report)?,

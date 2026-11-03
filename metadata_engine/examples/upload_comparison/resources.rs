@@ -54,23 +54,32 @@ fn disks() -> Result<Value> {
 }
 pub struct Watch {
     before: Value,
-    pids: [u32; 3],
+    pids: Vec<u32>,
+    roles: Vec<&'static str>,
     stop: Arc<AtomicBool>,
-    sample: tokio::task::JoinHandle<Result<[u64; 3]>>,
+    sample: tokio::task::JoinHandle<Result<Vec<u64>>>,
     start: Instant,
 }
 impl Watch {
-    pub fn start(object: u32, metadata: u32, path: &Path) -> Result<Self> {
-        let pids = [object, metadata, std::process::id()];
+    pub fn start(object: u32, metadata: Option<u32>, path: &Path) -> Result<Self> {
+        let mut pids = vec![object];
+        let mut roles = vec!["object"];
+        if let Some(metadata) = metadata {
+            pids.push(metadata);
+            roles.push("metadata");
+        }
+        pids.push(std::process::id());
+        roles.push("client");
         let before = json!({"processes":pids.iter().map(|&p|process(p)).collect::<Result<Vec<_>>>()?,"disks":disks()?});
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let mut file = std::io::BufWriter::new(fs::File::create(path.join("resources.jsonl"))?);
         let start = Instant::now();
+        let sampled_pids = pids.clone();
         let sample = tokio::spawn(async move {
-            let mut peak = [0; 3];
+            let mut peak = vec![0; sampled_pids.len()];
             while !stopping.load(Ordering::Relaxed) {
-                let values = pids
+                let values = sampled_pids
                     .iter()
                     .map(|&p| process(p))
                     .collect::<Result<Vec<_>>>()?;
@@ -90,6 +99,7 @@ impl Watch {
         Ok(Self {
             before,
             pids,
+            roles,
             stop,
             sample,
             start,
@@ -100,9 +110,8 @@ impl Watch {
         let after = json!({"processes":self.pids.iter().map(|&p|process(p)).collect::<Result<Vec<_>>>()?,"disks":disks()?});
         self.stop.store(true, Ordering::Relaxed);
         let peak = self.sample.await??;
-        let roles = ["object", "metadata", "client"];
         let mut processes = Vec::new();
-        for (i, role) in roles.iter().enumerate() {
+        for (i, role) in self.roles.iter().enumerate() {
             let b = &self.before["processes"][i];
             let a = &after["processes"][i];
             let delta =
