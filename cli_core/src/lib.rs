@@ -1,4 +1,5 @@
 //! Native LINK client configuration and allocation discovery shared by CLI tools.
+pub mod settings;
 use n1_link::PoolId;
 use n1_native_client::{Command, N1NativeClient, Response};
 use serde::Deserialize;

@@ -1,0 +1,601 @@
+//! Named upload coordination. External multipart geometry is independent of
+//! immutable LINK stripe geometry; only incompatible shapes use HDD staging.
+use super::private_directory;
+use crate::{
+    RecordKey, Table, fragments,
+    namespace::UploadHandle,
+    server::{
+        App,
+        error::{ApiError, ApiResult},
+    },
+    service::UploadRequest,
+};
+use n1_link::PoolId;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{path::PathBuf, sync::Arc};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Plan {
+    pub handle: UploadHandle,
+    pub bridge: bool,
+    pub cancelled: bool,
+    pub durable: bool,
+    pub strict: bool,
+    pub content_type: String,
+}
+#[derive(Deserialize)]
+pub(crate) struct InitRequest {
+    pub content_type: Option<String>,
+    pub total_size_bytes: u64,
+    pub expected_parts: u64,
+    pub part_size_bytes: Option<u64>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Part {
+    bytes: u64,
+    sha256: String,
+    strict: bool,
+}
+fn plan_key(fragment: PoolId, version: &str) -> crate::Result<RecordKey> {
+    RecordKey::new(fragment, format!("upload-plan/{version}"))
+}
+fn directory(app: &App, fragment: PoolId, version: &str) -> PathBuf {
+    app.config
+        .staging_dir
+        .join(fragment.to_string())
+        .join(version)
+}
+pub(crate) async fn plan(
+    app: &App,
+    fragment: PoolId,
+    version: &str,
+    durable: bool,
+) -> ApiResult<Plan> {
+    if ulid::Ulid::from_string(version).map_or(true, |v| v.to_string() != version) {
+        return Err(ApiError::invalid("invalid upload version"));
+    }
+    let key = plan_key(fragment, version)?;
+    let plan: Plan = app
+        .db
+        .execute(move |db| {
+            fragments::decode(
+                db.snapshot()
+                    .get(Table::Reclamation, &key)?
+                    .ok_or(crate::Error::NotFound)?,
+            )
+        })
+        .await?;
+    if plan.cancelled {
+        return Err(ApiError(
+            axum::http::StatusCode::GONE,
+            "Upload was cancelled".into(),
+        ));
+    }
+    if plan.durable != durable {
+        return Err(crate::Error::NotFound.into());
+    }
+    Ok(plan)
+}
+pub(crate) async fn init(
+    app: &App,
+    fragment: PoolId,
+    path: String,
+    request: InitRequest,
+    durable: bool,
+    fresh: bool,
+    strict: bool,
+) -> ApiResult<UploadHandle> {
+    struct Shape {
+        content_type: String,
+        total_size_bytes: u64,
+        expected_parts: u64,
+        part_size_bytes: u64,
+    }
+    let part_size_bytes = request
+        .part_size_bytes
+        .unwrap_or(if request.expected_parts <= 1 {
+            request.total_size_bytes
+        } else {
+            0
+        });
+    let request = Shape {
+        content_type: request
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".into()),
+        total_size_bytes: request.total_size_bytes,
+        expected_parts: request.expected_parts,
+        part_size_bytes,
+    };
+    crate::namespace::store::validate_upload(&path, &request.content_type)?;
+    let computed = if request.total_size_bytes == 0 {
+        1
+    } else if request.part_size_bytes == 0 {
+        0
+    } else {
+        request.total_size_bytes.div_ceil(request.part_size_bytes)
+    };
+    if request.total_size_bytes > app.config.max_file_size
+        || request.part_size_bytes > app.config.max_part_size
+        || request.expected_parts > 131072
+    {
+        return Err(ApiError(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Multipart upload exceeds configured size or part-count limits".into(),
+        ));
+    }
+    if (request.part_size_bytes == 0 && request.total_size_bytes != 0)
+        || request.expected_parts != computed
+    {
+        return Err(ApiError::invalid("invalid multipart upload shape"));
+    }
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&serde_json::json!([
+            path,
+            request.content_type,
+            request.total_size_bytes,
+            request.part_size_bytes,
+            durable,
+            strict
+        ]))
+        .expect("JSON upload shape"),
+    ));
+    let lock = app.upload_lock(fragment, &format!("reuse-{digest}"));
+    let _guard = lock.write().await;
+    let reuse_key = RecordKey::new(fragment, format!("upload-reuse/{digest}"))?;
+    if !fresh {
+        let lookup = reuse_key.clone();
+        let existing: Option<String> = app
+            .db
+            .execute(move |db| {
+                db.snapshot()
+                    .get(Table::Reclamation, &lookup)?
+                    .map(fragments::decode)
+                    .transpose()
+            })
+            .await?;
+        if let Some(version) = existing
+            && let Ok(saved) = plan(app, fragment, &version, durable).await
+        {
+            let pending = app.service.pending(fragment, &version, None).await?;
+            if !pending.completed && pending.upload.expires_at > crate::middleware::auth::now() {
+                return Ok(saved.handle);
+            }
+        }
+    }
+    let profile = app
+        .pools
+        .iter()
+        .rev()
+        .find(|p| !p.sealed)
+        .ok_or_else(|| ApiError::invalid("all object pools are sealed"))?;
+    let stripe = u64::from(profile.data_shards) * u64::from(profile.block_bytes);
+    let bridge = request.total_size_bytes == 0 || !request.part_size_bytes.is_multiple_of(stripe);
+    let backend_part = if bridge {
+        (app.config.max_part_size / stripe).max(1) * stripe
+    } else {
+        request.part_size_bytes
+    };
+    let mut handle = app
+        .service
+        .begin_upload(UploadRequest {
+            fragment,
+            path,
+            content_type: request.content_type.clone(),
+            pool: Some(profile.id),
+            total_bytes: request.total_size_bytes,
+            part_bytes: backend_part,
+            durable: durable || strict,
+            ttl_seconds: 30 * 86400,
+        })
+        .await?;
+    handle.part_size_bytes = request.part_size_bytes;
+    handle.expected_parts = request.expected_parts;
+    handle.durable = durable;
+    let saved = Plan {
+        handle: handle.clone(),
+        bridge,
+        cancelled: false,
+        durable,
+        strict,
+        content_type: request.content_type,
+    };
+    let key = plan_key(fragment, &handle.version_id)?;
+    let version = handle.version_id.clone();
+    app.db
+        .execute(move |db| {
+            db.transact(64, |tx| {
+                tx.put(Table::Reclamation, &key, &fragments::encode(&saved)?)?;
+                tx.put(
+                    Table::Reclamation,
+                    &reuse_key,
+                    &fragments::encode(&version)?,
+                )
+            })
+        })
+        .await?;
+    Ok(handle)
+}
+pub(crate) struct PartRequest<'a> {
+    pub fragment: PoolId,
+    pub version: &'a str,
+    pub index: u64,
+    pub length: u64,
+    pub durable: bool,
+    pub strict: bool,
+}
+pub(crate) async fn part<R: AsyncRead + Unpin>(
+    app: &App,
+    request: PartRequest<'_>,
+    source: &mut R,
+) -> ApiResult<()> {
+    let PartRequest {
+        fragment,
+        version,
+        index,
+        length,
+        durable,
+        strict,
+    } = request;
+    let lock = app.upload_lock(fragment, version);
+    let _guard = lock.read().await;
+    let plan = plan(app, fragment, version, durable).await?;
+    if index >= plan.handle.expected_parts
+        || length
+            != plan
+                .handle
+                .total_size_bytes
+                .saturating_sub(index * plan.handle.part_size_bytes)
+                .min(plan.handle.part_size_bytes)
+    {
+        return Err(ApiError::invalid(
+            "part length or index differs from upload shape",
+        ));
+    }
+    let strict = strict || plan.strict || durable;
+    if strict && !plan.strict && !durable {
+        return Err(crate::Error::NameConflict(
+            "strict durability cannot upgrade an existing relaxed upload".into(),
+        )
+        .into());
+    }
+    let part_lock = app.upload_lock(fragment, &format!("{version}/part/{index}"));
+    let _part_guard = part_lock.try_write().map_err(|_| {
+        ApiError(
+            axum::http::StatusCode::CONFLICT,
+            "Part is already being written".into(),
+        )
+    })?;
+    if !plan.bridge {
+        app.service
+            .upload_part(fragment, version, index, length, source)
+            .await?;
+        return Ok(());
+    }
+    let pending = app.service.pending(fragment, version, None).await?;
+    if pending.completed {
+        return Err(crate::Error::NameConflict("upload is already finalized".into()).into());
+    }
+    let dir = directory(app, fragment, version);
+    private_directory(&dir).await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let temp = dir.join(format!("{index}.{}.tmp", ulid::Ulid::new()));
+    let result = async {
+        let mut file = options.open(&temp).await?;
+        let mut remaining = length;
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        while remaining > 0 {
+            let wanted = remaining.min(buffer.len() as u64) as usize;
+            let read = source.read(&mut buffer[..wanted]).await?;
+            if read == 0 {
+                return Err(ApiError::invalid("part body ended early"));
+            }
+            file.write_all(&buffer[..read]).await?;
+            hash.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        if strict {
+            file.sync_all().await?;
+        } else {
+            file.flush().await?;
+        }
+        drop(file);
+        let record = Part {
+            bytes: length,
+            sha256: hex::encode(hash.finalize()),
+            strict,
+        };
+        let part_key = RecordKey::new(fragment, format!("upload-part/{version}/{index:06}"))?;
+        let lookup = part_key.clone();
+        let previous: Option<Part> = app
+            .db
+            .execute(move |db| {
+                db.snapshot()
+                    .get(Table::Reclamation, &lookup)?
+                    .map(fragments::decode)
+                    .transpose()
+            })
+            .await?;
+        if let Some(previous) = previous
+            && (previous.bytes != record.bytes
+                || previous.sha256 != record.sha256
+                || (strict && !previous.strict))
+        {
+            return Err(crate::Error::NameConflict(
+                "part retry differs from its prior bytes or durability".into(),
+            )
+            .into());
+        }
+        tokio::fs::rename(&temp, dir.join(format!("{index}.part"))).await?;
+        let sync_dir = dir.clone();
+        tokio::task::spawn_blocking(move || std::fs::File::open(sync_dir)?.sync_all())
+            .await
+            .map_err(|_| ApiError::invalid("staging sync worker failed"))??;
+        app.db
+            .execute(move |db| {
+                db.transact(64, |tx| {
+                    tx.put(Table::Reclamation, &part_key, &fragments::encode(&record)?)
+                })
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temp).await;
+    result
+}
+pub(crate) async fn status(
+    app: &App,
+    fragment: PoolId,
+    version: &str,
+    durable: bool,
+) -> ApiResult<serde_json::Value> {
+    let plan = plan(app, fragment, version, durable).await?;
+    let pending = app.service.pending(fragment, version, None).await?;
+    let mut uploaded = Vec::new();
+    if pending.completed {
+        uploaded.extend(0..plan.handle.expected_parts);
+    } else if plan.bridge {
+        let prefix = format!("upload-part/{version}/");
+        let rows = app
+            .db
+            .execute(move |db| {
+                let mut parts = Vec::new();
+                let mut after = None;
+                loop {
+                    let rows = db.snapshot().scan(
+                        Table::Reclamation,
+                        fragment,
+                        &prefix,
+                        after.as_ref(),
+                        1000,
+                    )?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    after = rows.last().map(|(key, _)| key.clone());
+                    for (key, bytes) in rows {
+                        let part: Part = fragments::decode(bytes)?;
+                        parts.push((
+                            key.identifier()
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("")
+                                .parse::<u64>()
+                                .map_err(|_| {
+                                    crate::Error::Incompatible("invalid staged part index".into())
+                                })?,
+                            part,
+                        ));
+                    }
+                }
+                Ok(parts)
+            })
+            .await?;
+        let dir = directory(app, fragment, version);
+        for (index, record) in rows {
+            if tokio::fs::metadata(dir.join(format!("{index}.part")))
+                .await
+                .is_ok_and(|m| m.is_file() && m.len() == record.bytes)
+            {
+                uploaded.push(index);
+            }
+        }
+    } else {
+        let mut start = 0;
+        while start < plan.handle.expected_parts {
+            let report = app
+                .service
+                .upload_status(fragment, version, start, 4096)
+                .await?;
+            if !report.unavailable_members.is_empty() {
+                return Err(ApiError(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Some upload members are unavailable".into(),
+                ));
+            }
+            uploaded.extend(
+                (report.checked_start..report.checked_end)
+                    .filter(|part| !report.missing_parts.contains(part)),
+            );
+            start = report.checked_end;
+        }
+    }
+    let bytes: u64 = uploaded
+        .iter()
+        .map(|i| {
+            plan.handle
+                .total_size_bytes
+                .saturating_sub(i * plan.handle.part_size_bytes)
+                .min(plan.handle.part_size_bytes)
+        })
+        .sum();
+    Ok(
+        serde_json::json!({"version_id":version, "session_id":plan.handle.session_id, "object_key":plan.handle.object_key, "total_size_bytes":plan.handle.total_size_bytes,"part_size_bytes":plan.handle.part_size_bytes,"expected_parts":plan.handle.expected_parts,"uploaded_parts":uploaded,"committed_parts":uploaded.len(),"uploaded_bytes":bytes,"committed_bytes":bytes,"completed":pending.completed,"durable":durable}),
+    )
+}
+pub(crate) async fn finalize(
+    app: Arc<App>,
+    fragment: PoolId,
+    version: String,
+    session: String,
+    durable: bool,
+    body: serde_json::Value,
+) -> ApiResult<crate::namespace::PublishedVersion> {
+    let lock = app.upload_lock(fragment, &version);
+    let _guard = lock.write().await;
+    let plan = plan(&app, fragment, &version, durable).await?;
+    if plan.handle.session_id != session {
+        return Err(crate::Error::NotFound.into());
+    }
+    for (name, expected) in [
+        ("total_size_bytes", plan.handle.total_size_bytes),
+        ("expected_parts", plan.handle.expected_parts),
+    ] {
+        if body.get(name).is_some_and(|v| v.as_u64() != Some(expected)) {
+            return Err(crate::Error::NameConflict(
+                "finalize body differs from upload shape".into(),
+            )
+            .into());
+        }
+    }
+    if body
+        .get("content_type")
+        .is_some_and(|v| v.as_str() != Some(plan.content_type.as_str()))
+    {
+        return Err(crate::Error::NameConflict(
+            "finalize content type differs from upload shape".into(),
+        )
+        .into());
+    }
+    let pending = app
+        .service
+        .pending(fragment, &version, Some(&session))
+        .await?;
+    let physically_complete = if plan.bridge && !pending.completed {
+        match app.service.objects().stat(&pending.upload.object_key).await {
+            Ok(_) => true,
+            Err(error) if error.status() == 404 => false,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        pending.completed
+    };
+    if plan.bridge && !physically_complete {
+        let state = status(&app, fragment, &version, durable).await?;
+        if state["uploaded_parts"].as_array().map_or(0, Vec::len) as u64
+            != plan.handle.expected_parts
+        {
+            return Err(crate::Error::NameConflict("upload is missing parts".into()).into());
+        }
+        let dir = directory(&app, fragment, &version);
+        // Each staged part is verified before it is allowed to contribute to
+        // physical publication. Memory stays bounded to one streaming buffer.
+        for index in 0..plan.handle.expected_parts {
+            let key = RecordKey::new(fragment, format!("upload-part/{version}/{index:06}"))?;
+            let expected: Part = app
+                .db
+                .execute(move |db| {
+                    fragments::decode(
+                        db.snapshot()
+                            .get(Table::Reclamation, &key)?
+                            .ok_or(crate::Error::NotFound)?,
+                    )
+                })
+                .await?;
+            let mut file = tokio::fs::File::open(dir.join(format!("{index}.part"))).await?;
+            let mut hash = Sha256::new();
+            let mut buffer = vec![0; 64 * 1024];
+            let mut bytes = 0;
+            loop {
+                let n = file.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buffer[..n]);
+                bytes += n as u64;
+            }
+            if bytes != expected.bytes || hex::encode(hash.finalize()) != expected.sha256 {
+                return Err(ApiError(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "Staged part failed its checksum".into(),
+                ));
+            }
+        }
+        use futures_util::{StreamExt, TryStreamExt};
+        if pending.upload.parts == 0 {
+            app.service
+                .objects()
+                .put(&pending.upload, &mut tokio::io::empty())
+                .await?;
+        }
+        let mut source = tokio_util::io::StreamReader::new(
+            futures_util::stream::iter(0..plan.handle.expected_parts)
+                .then(move |i| {
+                    let path = dir.join(format!("{i}.part"));
+                    async move {
+                        tokio::fs::File::open(path)
+                            .await
+                            .map(tokio_util::io::ReaderStream::new)
+                    }
+                })
+                .try_flatten()
+                .boxed(),
+        );
+        for index in 0..pending.upload.parts {
+            let bytes = pending
+                .upload
+                .total_bytes
+                .saturating_sub(index * pending.upload.part_bytes)
+                .min(pending.upload.part_bytes);
+            app.service
+                .objects()
+                .part(
+                    &pending.upload,
+                    index,
+                    bytes,
+                    &mut (&mut source).take(bytes),
+                )
+                .await?;
+        }
+    }
+    let result = app.service.finalize(fragment, &version, &session).await?;
+    app.emit(fragment);
+    if plan.bridge {
+        let _ = tokio::fs::remove_dir_all(directory(&app, fragment, &version)).await;
+    }
+    Ok(result)
+}
+pub(crate) async fn cancel(
+    app: &App,
+    fragment: PoolId,
+    version: &str,
+    durable: bool,
+) -> ApiResult<()> {
+    let lock = app.upload_lock(fragment, version);
+    let _guard = lock.write().await;
+    let mut saved = plan(app, fragment, version, durable).await?;
+    let pending = app.service.pending(fragment, version, None).await?;
+    if pending.completed {
+        return Err(crate::Error::NameConflict("upload is already finalized".into()).into());
+    }
+    saved.cancelled = true;
+    let key = plan_key(fragment, version)?;
+    let pending_key = RecordKey::new(fragment, format!("pending/{version}"))?;
+    app.db
+        .execute(move |db| {
+            db.transact(64, |tx| {
+                tx.put(Table::Reclamation, &key, &fragments::encode(&saved)?)?;
+                tx.remove(Table::Reclamation, &pending_key)
+            })
+        })
+        .await?;
+    app.service.objects().cancel(&pending.upload).await?;
+    let _ = tokio::fs::remove_dir_all(directory(app, fragment, version)).await;
+    Ok(())
+}

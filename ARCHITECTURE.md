@@ -1,9 +1,11 @@
-# Litiaina N1 — LINK engine, 1.0.0-RC.2
+# Litiaina N1 — object and metadata engines
 
 LINK replaces N1's object identity, placement and shard representation. N1 keeps
 its established responsibilities and module structure: adaptive concurrency,
 disk scheduling, streaming, io_uring, middleware, server, repair and backup.
 Both native NOA and the optional HTTP adapter use the same object service.
+The workspace now contains `object_engine/` and `metadata_engine/` as separate
+main components. Product versions come from workspace Cargo metadata.
 
 Implementation and qualification are in progress. This document describes the
 new runtime and identifies unfinished retained responsibilities explicitly.
@@ -14,10 +16,36 @@ Changing the package version does not authorize or qualify a release.
 ## Responsibility
 
 N1 accepts client-held immutable keys, calculates shard locations, and performs
-object I/O. A separate metadata service owns names, directories, user-visible
-versions, references and listings. That service is outside this development
-cycle. N1 has no public rename, move, namespace list, search, latest-version,
-trash, undelete, ZIP or TAR export operation.
+object I/O. Its source directory is `object_engine/`; its Cargo package remains
+`n1` and its executables keep their existing names. This is a directory move,
+with the tested implementation and module structure retained.
+
+The optional `metadata_engine/` component owns the metadata development cycle:
+names, virtual prefixes, user-visible history, permissions, LINK references and
+listings. Its storage foundation is imported from ProcyonDB, with optimistic
+transactions, consistent snapshots and durable journal commits. The current
+component supplies transactional storage, a named-upload coordinator, logical
+namespace transactions, named HTTP/WebSocket APIs and the original named native
+protocol. The coordinator consumes the existing native object API; it has no
+dependency on object-engine internals. Full product qualification and the
+remaining service responsibilities are tracked separately; see
+[the metadata contract and implementation boundary](docs/METADATA-ENGINE.md).
+
+The object engine is the independently usable LINK storage engine. Metadata is
+optional for direct key-based access. N1's complete named-object product consists
+of the console communicating with metadata, and metadata coordinating references
+and transactions with the object engine. Logical features belong in metadata;
+their absence there must never be worked around by removing console features or
+putting a namespace back into LINK. Object-engine startup, placement and ordinary
+I/O never open a metadata database or depend on metadata availability. A custom
+metadata implementation can use the same public object API.
+
+The object engine has no public rename, move, namespace list, search,
+latest-version, trash, undelete, ZIP or TAR export operation. It builds and runs
+without ProcyonDB or a metadata service. Users can retain LINK keys themselves,
+use their own metadata service, or use N1's optional named metadata service.
+Metadata outages do not enter the direct,
+authorized LINK operation path.
 
 Fragments are stable authorization scopes. Their display aliases and credentials
 belong to service configuration; object addressing uses a stable 16-byte fragment
@@ -38,28 +66,40 @@ implementation ledger.
 | Location | Responsibility |
 | --- | --- |
 | `link/src` | Canonical immutable identity, placement, ticket and inline format |
-| `engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
-| `engine/src/core/upload/activity.rs` | Owned operation lifetime, shutdown admission and control-lease retention |
-| `engine/src/core/download.rs` | Verified streamed/ranged reads and read-repair admission |
-| `engine/src/core/adaptive_concurrency.rs` | Original controller with cancellable service lifecycle |
-| `engine/src/core/io_scheduler.rs` | FIFO resizing, foreground/background and per-fragment admission |
-| `engine/src/core/object_parser.rs` | Adaptive stream admission, chunks and bounded read-ahead buffer |
-| `engine/src/core/linux_io` | Retained io_uring driver and completion ownership |
-| `engine/src/core/ec.rs` | Retained N1 streaming EC wrapper; LINK adapter in `ec/stripe.rs` |
-| `engine/src/core/repair_manager` | Verified shard reconstruction and publication |
-| `engine/src/core/recovery.rs` | Retained four-job admission and separate CPU-affine recovery runtime |
-| `engine/src/core/maintenance` | Conservative staging GC and paced asynchronous jobs |
-| `engine/src/core/backup` | Encrypted repository, recovery, replication and retained automation supervisor |
-| `engine/src/core/storage_admin.rs` | Offline verification, copy fences and byte-exact member cutover |
-| `engine/src/core/storage_admin/replacement.rs` | LINK shard reconstruction under the retained offline inventory/fence workflow |
-| `engine/src/middleware` | Authentication, refresh rotation/reuse detection and request quotas |
-| `engine/src/protocol/server` | Native listener, TLS, explicit enrollment and startup/shutdown |
-| `engine/src/routes/storage_routes.rs` | Secondary HTTP adapter to shared NOA operations |
-| `engine/src/settings/config.rs` | Private configuration and explicit immutable member binding |
+| `metadata_engine/src/store.rs` | Procyon-backed durable cross-table transactions and snapshots |
+| `metadata_engine/src/key.rs` | Exact UTF-8 metadata identifiers scoped by stable fragment ID |
+| `metadata_engine/src/executor.rs` | Bounded blocking database workers, cancellation ownership and draining |
+| `metadata_engine/src/namespace` | Logical name bindings, maximum-ULID heads, immutable version references, rename, trash and recovery |
+| `metadata_engine/src/service.rs` | Persist upload identity before bytes, finalize through LINK, then publish metadata atomically |
+| `metadata_engine/src/object_store` | Bounded concurrent native NOA client connections; no member-root or shard-format access |
+| `metadata_engine/src/server` | Named HTTP/WebSocket and native adapters, INI startup and recovery of unfinished publications |
+| `metadata_engine/src/fragments`, `metadata_engine/src/middleware` | Logical fragment identities, aliases, permissions, authentication and refresh rotation |
+| `metadata_engine/src/uploads` | Original multipart sessions and bounded HDD re-chunking for non-aligned client part geometry |
+| `metadata_engine/src/exports` | Retained bounded ZIP64/TAR builder reading immutable versions through native object requests |
+| `metadata_engine/storage` | Retained Procyon storage core, upstream fixes, recovery fixtures and tests |
+| `object_engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
+| `object_engine/src/core/upload/activity.rs` | Owned operation lifetime, shutdown admission and control-lease retention |
+| `object_engine/src/core/download.rs` | Verified streamed/ranged reads and read-repair admission |
+| `object_engine/src/core/adaptive_concurrency.rs` | Original controller with cancellable service lifecycle |
+| `object_engine/src/core/io_scheduler.rs` | FIFO resizing, foreground/background and per-fragment admission |
+| `object_engine/src/core/object_parser.rs` | Adaptive stream admission, chunks and bounded read-ahead buffer |
+| `object_engine/src/core/linux_io` | Retained io_uring driver and completion ownership |
+| `object_engine/src/core/ec.rs` | Retained N1 streaming EC wrapper; LINK adapter in `ec/stripe.rs` |
+| `object_engine/src/core/repair_manager` | Verified shard reconstruction and publication |
+| `object_engine/src/core/recovery.rs` | Retained four-job admission and separate CPU-affine recovery runtime |
+| `object_engine/src/core/maintenance` | Conservative staging GC and paced asynchronous jobs |
+| `object_engine/src/core/backup` | Encrypted repository, recovery, replication and retained automation supervisor |
+| `object_engine/src/core/storage_admin.rs` | Offline verification, copy fences and byte-exact member cutover |
+| `object_engine/src/core/storage_admin/replacement.rs` | LINK shard reconstruction under the retained offline inventory/fence workflow |
+| `object_engine/src/middleware` | Authentication, refresh rotation/reuse detection and request quotas |
+| `object_engine/src/protocol/server` | Native listener, TLS, explicit enrollment and startup/shutdown |
+| `object_engine/src/routes/storage_routes.rs` | Secondary HTTP adapter to shared NOA operations |
+| `object_engine/src/settings/config.rs` | Private configuration and explicit immutable member binding |
 | `shell/src/args.rs`, `shell/src/offline.rs` | CLI arguments and shared engine-side offline operations |
 
-The removal boundary is name/version metadata, NCX/NDX lookup and explicitly
-discarded namespace/export operations. Tested infrastructure is retained and
+Within the object engine, the removal boundary is name/version metadata,
+NCX/NDX lookup and explicitly discarded namespace/export operations. Logical
+metadata belongs to the optional metadata component. Tested infrastructure is retained and
 adapted where the shard representation changes; fewer source files is not an
 acceptance criterion. The implementation ledger records remaining adaptations.
 
@@ -81,8 +121,10 @@ has prefix `N1U1.` and carries the exact same identity, plus immutable upload
 parameters and expiry. The ticket does not contain a different temporary object
 identity. Neither authentication tags nor upload progress alter placement.
 
-The client retains these keys. N1 does not persist the original object key or
-upload ticket. A shared service signing secret authenticates keys to fragment
+The direct client retains these keys. The object engine does not persist the
+original object key or upload ticket. An optional metadata service retains the
+keys it needs for its logical references and unfinished transactions in its own
+database, outside object members. A shared service signing secret authenticates keys to fragment
 IDs. Keep an independent protected copy. Service-created recovery points also
 include configuration, that secret and any configured TLS identity as a bounded
 encrypted block. Losing all copies prevents validating previously issued keys.
@@ -284,7 +326,7 @@ LINK key, shard and wire encoding identifiers describe their respective formats
 independently of the package release.
 
 Server startup retains the original `L I T I A I N A  N 1` boxed banner in
-`engine/src/main.rs`: Cargo version, STARTING status, local start time, PID,
+`object_engine/src/main.rs`: Cargo version, STARTING status, local start time, PID,
 hostname, working directory and runtime thread settings. The original local
 `YYYY-MM-DD HH:MM:SS` log timer and nonblocking stderr logger are retained.
 The logger guard flushes during shutdown; machine-readable maintenance output

@@ -1,0 +1,57 @@
+use crate::{Error, MetadataEngine, Result};
+use std::sync::Arc;
+use tokio::sync::{RwLock, Semaphore};
+
+/// Bounded bridge from async request handling to synchronous database work.
+/// The worker retains admission and the database when its caller is cancelled.
+#[derive(Clone)]
+pub struct MetadataExecutor {
+    engine: MetadataEngine,
+    permits: Arc<Semaphore>,
+    lifecycle: Arc<RwLock<()>>,
+}
+
+impl MetadataExecutor {
+    pub fn new(engine: MetadataEngine, capacity: usize) -> Result<Self> {
+        if capacity == 0 || capacity > 1024 {
+            return Err(Error::Invalid(
+                "metadata worker capacity must be 1–1024".into(),
+            ));
+        }
+        Ok(Self {
+            engine,
+            permits: Arc::new(Semaphore::new(capacity)),
+            lifecycle: Arc::new(RwLock::new(())),
+        })
+    }
+
+    pub async fn execute<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(MetadataEngine) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let lifecycle = self.lifecycle.clone().read_owned().await;
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => Error::Closed,
+                tokio::sync::TryAcquireError::NoPermits => Error::Busy,
+            })?;
+        let engine = self.engine.clone();
+        tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle;
+            let _permit = permit;
+            work(engine)
+        })
+        .await
+        .map_err(|error| Error::Worker(format!("metadata worker failed: {error}")))?
+    }
+
+    /// Stops admission across every clone, then waits for owned workers. All
+    /// accepted mutation transactions retain their normal durability semantics.
+    pub async fn shutdown(&self) {
+        self.permits.close();
+        let _drained = self.lifecycle.write().await;
+    }
+}

@@ -1,5 +1,134 @@
 # LINK RC.2 implementation ledger
 
+## INI operations and named public service — November 3
+
+Original operator INI and private environment controls are wired into object
+startup, TLS/listen addresses, immutable pool enrollment/append, concurrency,
+I/O admission, staging GC and opt-in scheduled healing. Metadata has its own
+INI startup and consumes the public native object client; it does not require
+member roots or import object-engine internals. The object binary remains an
+independently usable key store. These operational changes supersede the earlier
+directory-only preservation checkpoint below.
+
+The metadata application now serves the named HTTP/WebSocket adapters and
+original named native protocol. Public integration tests cover fragments,
+permissions and refresh sessions, one-shot/grouped batch uploads, original
+standard/durable multipart shapes, pending publication/restart, namespace and
+history operations, signed/ranged reads, and the retained ZIP64/TAR builder.
+All three original console live tests pass without changing its production
+runtime or proxy. Shallow listings seek past descendant prefixes.
+
+A complete all-target workspace regression passes **414 tests**, with nine
+explicit helper/opt-in exclusions (`final-workspace73.log`). A subsequent native
+pool expiry regression and its metadata/native boundary suite pass **17 cases**;
+updated strict metadata Clippy and the public two-HDD API witness also pass.
+These are separate runs, not 431 distinct tests.
+
+The first new full-stack population attempt failed: a captured 256-object HTTP
+batch contained 128 successes and 128 backend errors. Metadata had retained
+native pooled connections beyond the independent object's 120-second idle
+deadline during slow HDD persistence. The metadata pool now retires idle
+connections at 90 seconds; its transport regression requires a fresh connection
+and login. The object engine's protocol, placement and integrity policy are
+unchanged. Fresh API and browser 500,000-object campaigns are in progress;
+neither has passed yet. No release follows from preflight or smoke results.
+
+Current evidence, exact frozen binary/source hashes, failed attempts and scope:
+[FULL-STACK-QUALIFICATION-20261103.md](/mnt/PROJECT-DISK-1TB/n1-ini-restoration-20261103-01/reports/FULL-STACK-QUALIFICATION-20261103.md).
+Remaining metadata lifecycle/reclamation, coordinated backup, request quotas,
+optional integration and complete public contract qualification remain distinct
+product work. The user has authorized a checkpoint commit and push to `link`
+while the detached campaigns continue. This checkpoint does not pass unfinished
+campaigns, tag a release or promote RC.2 to production.
+
+## Object independence and metadata transactions — November 3
+
+The LINK object component stays independent and byte-identical across all 99
+tracked files. The optional metadata application consumes the existing native
+client, without an object-engine implementation dependency. A build-graph test
+enforces both directions of this boundary. The existing console baseline is
+preserved; its features are the metadata API contract.
+
+The metadata application now has durable pending upload records, native byte
+forwarding, atomic post-finalization publication, maximum-ULID version heads,
+immutable version references, exact-key rename, trash and recovery. Renaming
+retains a pending upload's logical identity; trash followed by an unrelated
+replacement cannot be undone by a late finalize. Database roots protect stored
+LINK credentials with owner-only permissions on Unix.
+
+A two-HDD 1+1 process witness passes against the unchanged qualified LINK binary:
+direct key access before metadata exists, named writes and reads, out-of-order
+durable multipart, rename while pending, physical completion before metadata
+publication, object process restart, saved-session retry, history, empty objects
+and direct LINK access after metadata shutdown. The full workspace run passes
+398 tests; the final private-root change separately passes all 29 metadata
+targets/tests and the physical witness. Scoped strict Clippy passes.
+
+These internal APIs are not the public metadata server. NOA adapters, fragment
+authorization, all retained upload schemes, prefix/list/trash projections,
+exports, lifecycle/backup coordination and startup/enrollment wiring remain
+required product work. Restoring the shared INI parser is not a claim that those
+settings are already wired into the unchanged object startup.
+
+Full evidence and exact validation sequence:
+[COMPONENT-BOUNDARY-20261103.md](/mnt/PROJECT-DISK-1TB/n1-operational-restoration-20261103-01/reports/COMPONENT-BOUNDARY-20261103.md).
+No commit, push or release accompanies this work.
+
+## MCH metadata storage qualification — November 3
+
+The optional metadata foundation passes the 143 metadata/Procyon regression
+cases on MCH DISK0, the 15 metadata integration cases independently on all four
+SATA HDDs, and 81 storage documentation examples with Rust 1.92.0. The new
+Rust-only qualification supervisor additionally completes a one-million-entry
+database, eight concurrent writers/four snapshot readers, SIGKILL/restart,
+100,000 update/delete fixtures, a second SIGKILL/restart, full exact-value/history
+verification and an exact final 2,080,000-record application-table census.
+Every previously acknowledged entry is verified before resuming writes.
+
+The full million-entry campaign takes 438.99 seconds including faults and
+verification, with 106.66 MiB maximum RSS. Independent 8,192-entry concurrent
+fault/churn witnesses pass on DISK1–3. Both headless drivers exit zero; existing
+N1 processes are preserved and test processes end. No engine implementation
+changes are required. The new harness raises the complete local workspace pass
+to 382 tests, zero failures; the imported-core lint findings remain separately
+documented. No NOA metadata or object-upload qualification is implied.
+
+Evidence and exact scope:
+[MCH-METADATA-QUALIFICATION-20261103.md](/mnt/PROJECT-DISK-1TB/n1-mch-metadata-20261103-01/reports/MCH-METADATA-QUALIFICATION-20261103.md).
+No commit, push or release accompanies the testing instruction.
+
+## Optional metadata component — November 3
+
+The user authorized using ProcyonDB as N1's metadata foundation and renaming the
+existing component to `object_engine/`. The directory move preserves all 99
+tracked component files exactly; package `n1`, executable names, adaptive
+concurrency, middleware, server, io_uring, streaming and backup remain intact.
+The object dependency graph contains neither Procyon nor `n1_metadata_engine`.
+
+`metadata_engine/` and its retained `storage/` fork are workspace members. The
+foundation uses Procyon's optimistic transaction engine, durable `SyncAll`
+commits, cross-table snapshots, exact fragment-scoped identifiers, bounded
+pagination and mutation sizes, and a bounded async execution bridge that owns
+accepted work through caller cancellation and shutdown. Offline init/check
+commands are implemented. The original Procyon source repository is untouched.
+Selected upstream correctness fixes and retained tests are recorded in
+[`metadata_engine/storage/UPSTREAM.md`](../metadata_engine/storage/UPSTREAM.md).
+
+Final validation: **381 workspace tests and 81 storage documentation tests pass**;
+both HDD filesystems separately pass the 32-transaction process-kill/recovery
+witness. N1 production Clippy passes with the imported core and historical proof
+tool excluded from linting; an inclusive attempt's 89 diagnostics remain in the
+evidence. All core tests are included. Formatting and whitespace checks pass.
+See [the full report](/mnt/PROJECT-DISK-1TB/n1-metadata-foundation-20261103-01/reports/METADATA-FOUNDATION-20261103.md).
+
+Namespace/history/ACL models, named-upload coordination, public NOA v1/v2
+metadata adapters and coordinated metadata/object recovery are service-layer
+work, not capabilities supplied by this database foundation. The agreed API and
+lifecycle boundaries are in [METADATA-ENGINE.md](METADATA-ENGINE.md). No release,
+commit or push is authorized by this integration instruction.
+
+## Preserved object checkpoint and qualification
+
 Started November 1, 2026. Baseline: `061a40a`. On November 3 the user authorized
 a checkpoint commit and push to the `link` branch; `main` remains the original
 baseline. Deployment, tags and release remain unauthorized. The baseline archive

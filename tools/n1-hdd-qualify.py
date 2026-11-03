@@ -59,12 +59,12 @@ def main():
     report = dict(status='RUNNING', phase='unit-regressions', completed=[],
                   qualification_population=args.objects, target_churn_mutations=args.churn_mutations,
                   million_object_qualification=False)
-    source_paths = (list((repo / 'engine/src').rglob('*.rs'))
+    source_paths = (list((repo / 'object_engine/src').rglob('*.rs'))
                     + list((repo / 'tools/n1-release-proof/src').rglob('*.rs'))
                     + list((repo / 'tools').glob('n1*hdd*.py'))
                     + list((repo / 'tools').glob('n1-rc*.py'))
                     + list((repo / 'tools').glob('test_n1*.py'))
-                    + [repo / name for name in ('Cargo.toml', 'Cargo.lock', 'engine/Cargo.toml',
+                    + [repo / name for name in ('Cargo.toml', 'Cargo.lock', 'object_engine/Cargo.toml',
                                                'tools/n1-release-proof/Cargo.toml', 'shell/web/n1_config.default.ini')])
     def source_manifest():
         return {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -111,7 +111,7 @@ def main():
             executable = re.search(r'Running unittests src/lib.rs \(([^)]+)\)', unit_text)
             assert executable, 'Completed engine-unit executable must be identified'
             unit_binary = (repo / executable[1]).resolve(strict=True)
-            sources = list((repo / 'engine/src').rglob('*.rs')) + [repo / 'Cargo.lock', repo / 'engine/Cargo.toml', repo / 'Cargo.toml']
+            sources = list((repo / 'object_engine/src').rglob('*.rs')) + [repo / 'Cargo.lock', repo / 'object_engine/Cargo.toml', repo / 'Cargo.toml']
             assert all(path.stat().st_mtime_ns <= unit_binary.stat().st_mtime_ns for path in sources), 'Engine changed after the tested binary was built'
             shutil.copy2(args.unit_log, root / 'unit-regressions.log')
             elapsed = None

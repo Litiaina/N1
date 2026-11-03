@@ -10,6 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 rustls.workspace = true
+rust-ini.workspace = true
+dotenvy = "0.15.7"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

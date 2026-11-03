@@ -2,7 +2,9 @@
 members = [
     "link",
     "cli_core",
-    "engine",
+    "object_engine",
+    "metadata_engine",
+    "metadata_engine/storage",
     "shell",
     "native_client",
     "tools/n1-release-proof",

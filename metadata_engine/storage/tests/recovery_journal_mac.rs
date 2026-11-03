@@ -1,0 +1,36 @@
+use procyon_engine::Database;
+use test_log::test;
+
+#[test]
+fn db_journal_recovery_mac_ds_store() -> procyon_engine::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    {
+        let _db = Database::builder(&folder).open()?;
+    }
+
+    std::fs::File::create(folder.path().join(".DS_Store"))?;
+
+    {
+        let _db = Database::builder(&folder).open()?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn db_journal_recovery_mac_underscore_file() -> procyon_engine::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    {
+        let _db = Database::builder(&folder).open()?;
+    }
+
+    std::fs::File::create(folder.path().join("._0"))?;
+
+    {
+        let _db = Database::builder(&folder).open()?;
+    }
+
+    Ok(())
+}

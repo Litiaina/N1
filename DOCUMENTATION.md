@@ -1,4 +1,4 @@
-# LINK operator guide
+# N1 operator guide
 
 This guide covers the unreleased N1 1.0.0-RC.2 engine. Read
 [ARCHITECTURE.md](ARCHITECTURE.md), [NOA.md](NOA.md) and the
@@ -6,7 +6,132 @@ This guide covers the unreleased N1 1.0.0-RC.2 engine. Read
 qualification work. The previous RC.1 guide is available in Git at `061a40a`.
 No old storage-format migration is provided.
 
-## Explicit setup
+## Original INI operation
+
+The normal server configuration is `n1_config.ini`, with private credentials in
+`n1.env` alongside it. Running `litiaina-n1` in its service directory, or passing
+`--config /etc/litiaina/object/n1_config.ini`, uses that configuration. A first
+run creates missing templates and stops until the operator supplies credentials
+and complete storage roots. It never enrolls a nonempty unknown root.
+
+```ini
+[server]
+host=127.0.0.1
+https_port=50001
+native_port=50002
+native_max_connections=32
+cert_path=cert.pem
+key_path=key.pem
+
+[disk_config]
+fs_storage_path=/var/lib/litiaina/object-control
+
+[storage_pool.A]
+generation=1
+roots=/mnt/storage-00/n1,/mnt/storage-01/n1
+data_shards=1
+parity_shards=1
+sealed=false
+```
+
+Edit `[server]` to change the bind IP, ports, certificate or key; restart the
+service to apply it. Certificate and key paths must be supplied together. Empty
+paths explicitly select plaintext for local testing. Existing pool identities,
+signing keys and member markers are retained across these edits.
+
+The original `[upload_config]`, `[io_control]`, `[rate_limiter_config]`,
+`[garbage_collector]`, `[auto_healing]`, `[export]` and token lifetime settings
+retain their INI names. They control concurrency, adaptive admission, memory,
+streaming, durability, I/O admission, rate quotas, cleanup and optional healing.
+Automatic full scrubs require an explicitly enabled UTC calendar; ordinary
+repair on read remains independent. A scheduled scrub has no whole-scan timeout.
+The object health response reports effective operational controls.
+
+To expand, create empty N1 directories on the new independent filesystems and
+append a **complete** `[storage_pool.B]` section with its own roots and EC width.
+Restart the object service. New uploads use the new eligible pool; existing
+LINK keys retain their original pool, generation and EC topology. Do not edit an
+enrolled pool's generation, width or identities. Seal a pool to stop allocation;
+do not remove its section while its objects must remain accessible. Replacing a
+member is an explicit offline recovery operation, not enrollment of an empty
+directory at a previously used path.
+
+Enrollment persists an operator journal under `fs_storage_path`. It contains
+pool/member identities and service credentials, not an object catalogue. The
+control lease fences enrollment against an active server. Interrupted enrollment
+resumes its recorded identities; missing signing keys for established storage
+are rejected rather than regenerated.
+
+Existing LINK JSON deployments can explicitly import their identities into INI:
+
+```sh
+litiaina-n1 init --config /etc/litiaina/object/n1_config.ini \
+  --from-config /srv/n1/service.json
+litiaina-n1 check --config /etc/litiaina/object/n1_config.ini
+litiaina-n1 serve --config /etc/litiaina/object/n1_config.ini
+```
+
+The INI pool roots must match the source deployment. This import retains the
+signing key, pool/member identities and existing service principals. It does not
+rewrite members or convert an older NCX/NDX storage format.
+
+## Optional named metadata service
+
+The object service works independently over native NOA v2. Named N1 clients,
+including the existing Console, connect to `litiaina-n1-metadata`. Its original
+NOA v1 HTTP endpoints and named native operations resolve names and versions,
+then stream bytes through the object's native interface. The Console's product
+layout and workflows are retained.
+
+Each independently running service has its own INI, environment file, control
+directory and listening ports. In the metadata INI, `[server]` controls the
+public client address and TLS exactly as above. `[disk_config]` selects metadata
+control storage. Metadata does not enroll disks or require pool-root sections;
+it obtains immutable pool profiles from the object service.
+
+For an existing named N1 deployment, keep the familiar public ports on metadata:
+`https_port=50001` and `native_port=50002`. Assign the independent object process
+different local ports in its own `[server]` section, for example HTTP 19001 and
+native 19002. Existing Console connections then keep their public address;
+metadata's `object_native_url` points to the internal object listener. A direct
+LINK-only deployment can keep the object listener on its existing ports instead.
+
+```ini
+[server]
+host=127.0.0.1
+https_port=50001
+native_port=50002
+native_max_connections=32
+cert_path=/etc/litiaina/metadata/cert.pem
+key_path=/etc/litiaina/metadata/key.pem
+
+[disk_config]
+fs_storage_path=/var/lib/litiaina/metadata/control
+
+[metadata_engine]
+object_native_url=n1s://127.0.0.1:19002
+object_fragment=root
+object_secret_env=AUTH_KEY
+object_ca_path=/etc/litiaina/object-ca.pem
+data_dir=/var/lib/litiaina/metadata/database
+staging_dir=/var/lib/litiaina/metadata/uploads
+object_connections=32
+workers=64
+```
+
+The referenced environment secret authenticates the metadata service to LINK.
+Logical fragment secrets, permissions, refresh sessions, names, versions, upload
+coordination and trash live in metadata. Its database and staging directories
+must be real owner-only directories. LINK tickets remain private to this service.
+
+```sh
+litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini
+```
+
+An external metadata implementation can use the object interface directly.
+The object engine requires neither this metadata process nor its database.
+
+## Explicit JSON setup and recovery tooling
 
 The member roots must already exist, be empty and belong to independent
 filesystems. This example uses an illustrative 1D+1P pool; substitute actual

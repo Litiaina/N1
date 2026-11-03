@@ -1,4 +1,116 @@
-# Current LINK RC.2 qualification campaign — November 2–3, 2026
+# Named service and original console qualification — November 3, 2026
+
+The latest complete workspace regression passes **414 tests, zero failures**,
+with nine explicit helper/physical opt-in exclusions. Public metadata tests run
+through a real native LINK process on both HDDs. All three original console live
+tests pass using its existing runtime and proxy: flat-key prefix rename and
+browser TAR download, interrupted multipart resume, and standard batch upload.
+The existing Node suite passes 38 tests and static console validation reports
+zero errors/warnings. These checks do not replace population qualification.
+
+The first full-stack population attempt returned a mixed batch response and
+failed. The metadata native-client pool retained sockets past the object
+server's idle deadline; the pool now discards old idle transports before reuse.
+The added deterministic transport regression and metadata/native suite pass
+17 cases, and the full two-HDD public API witness passes again. No shard
+corruption has been observed; neither new 500,000-object campaign has passed yet.
+
+The Rust `metadata_engine/examples/noa_qualification` harness drives the actual
+API or original console in Chromium, durably journals each acknowledged version,
+kills/reopens both engines, performs an offline metadata/shard census, then
+checks every object's bytes and version via metadata. The browser driver uses
+real production XHR/FormData; it does not mock routes or responses. Bulk data,
+binaries and reports stay on HDDs. No Python is used in these campaigns.
+
+Current results and exact source/binary provenance:
+[FULL-STACK-QUALIFICATION-20261103.md](/mnt/PROJECT-DISK-1TB/n1-ini-restoration-20261103-01/reports/FULL-STACK-QUALIFICATION-20261103.md).
+The following sections preserve earlier, separately scoped qualification.
+
+# MCH physical metadata qualification — November 3, 2026
+
+The metadata storage foundation now passes on MCH's four rotational SATA HDDs
+(XFS). The complete metadata/Procyon regression suite passes **143 tests** on
+DISK0; the **15 metadata integration cases** also pass independently on DISK1,
+DISK2 and DISK3. **81 storage documentation examples** pass on MCH with Rust
+1.92.0, locked/offline vendored dependencies and warnings denied.
+
+The new Rust `hdd_qualification` supervisor completes **1,000,000 metadata entries**
+on DISK0 with eight writers and four snapshot readers, a mid-population SIGKILL,
+resume without rewriting prior acknowledgements, full verification, and then
+**100,000 mutations** (80,000 updates / 20,000 deletions) with another SIGKILL,
+resume and exact final verification. The final table census is 980,000 entries,
+1,080,000 history fixtures and 20,000 reclamation fixtures. All one million
+identifiers and every expected value/history/absence pass; completed resume
+workers record 356,692 concurrent snapshot checks without mismatches.
+
+Each of the other HDDs separately passes an 8,192-entry / 2,048-mutation run with
+two kill/resume cycles. The full million-entry campaign takes **438.99 seconds**
+including faults, churn and both full verification passes, with **106.66 MiB**
+peak RSS. Transactions contain up to 256 entries; phase timings and transaction
+latencies are detailed in the report and are not single-object/API benchmarks.
+
+No engine implementation changes accompany these tests. A fresh local full
+workspace run, including the new harness regression, passes **382 tests**, zero
+failures, six explicit opt-in/helper exclusions. New harness strict metadata
+Clippy and formatting pass. All **262 shipped Rust files** match the workstation
+SHA-256 manifest. Existing MCH N1 processes remain running, and the headless test
+drivers exit zero with no qualification processes left behind.
+
+This qualifies metadata KV storage, not object payload uploads, a public
+namespace service, metadata NOA conformance, power loss or metadata replication.
+The imported-core lint findings in the earlier report remain separate.
+Raw logs, source/binary hashes, exact commands and all scope details:
+[MCH-METADATA-QUALIFICATION-20261103.md](/mnt/PROJECT-DISK-1TB/n1-mch-metadata-20261103-01/reports/MCH-METADATA-QUALIFICATION-20261103.md).
+
+# Object/metadata workspace integration — November 3, 2026
+
+The `engine/` directory is now `object_engine/`. All **99 tracked component
+files are byte-identical** to checkpoint `19462b4`, including Cargo metadata,
+the banner, infrastructure and tests. The package remains `n1`; direct object
+operations have no dependency on `metadata_engine`, Procyon or `lsm-tree`.
+
+The optional `n1_metadata_engine` component imports Procyon's storage core and
+regression fixtures, applies the specific fixes recorded in
+[`metadata_engine/storage/UPSTREAM.md`](metadata_engine/storage/UPSTREAM.md), and
+adds durable optimistic transactions, cross-table snapshots, bounded scans,
+cancellation-safe blocking ownership and offline init/check commands.
+This is a storage foundation, not an implemented named-object NOA service.
+
+Validation of the final source:
+
+| Check | Result |
+| --- | --- |
+| Full workspace/all targets, offline/locked, warnings denied | **381 passed, 0 failed**, 6 opt-in/helper cases ignored by the default command |
+| Included original N1 checks | All previous **238 passed**, including 185 object-engine library tests |
+| Included Procyon core checks | **128 passed**, including recovery, transactions, partial flush replay and write/sync failure regressions |
+| Included metadata integration checks | **15 passed**, including actual concurrent writers/readers, CAS conflicts, range predicates, resource limits, schema refusal, cancellation ownership, CLI and subprocess crash recovery |
+| Procyon storage documentation examples | **81 passed, 0 failed**, warnings denied |
+| Separate PROJECT XFS HDD process-kill witness | All 32 acknowledged cross-table transactions recovered exactly; uncommitted transaction absent |
+| Separate TEST ext4 HDD process-kill witness | All 32 acknowledged cross-table transactions recovered exactly; uncommitted transaction absent |
+| N1 production Clippy, all targets, warnings denied | Passed; excludes the historical release-proof tool and imported Procyon core from linting, not from tests |
+| Formatting and whitespace | Passed |
+
+The six default exclusions comprise the four existing N1 physical/helper cases,
+one retained Procyon ingestion/compaction case, and the metadata subprocess
+fixture. The metadata crash test explicitly invokes that fixture; it also ran
+separately on both HDDs. No ignored object-engine physical case was rerun as
+part of this directory-only change, and no million-object metadata or physical
+power-cut claim follows from these checks.
+
+An inclusive Clippy attempt reports **89 imported/core/workspace diagnostics**,
+including package-metadata lints, duplicate dependency versions, `expect` usage,
+documentation and style. This is retained as a failed check, not reported as a
+whole-workspace lint pass. The successful N1 lint command does not add lint
+suppression attributes to the imported core. Earlier dependency-resolution,
+fault-fixture and old-format assertion attempts are retained separately.
+
+All logs, source archives, exact commands and scope are in
+[METADATA-FOUNDATION-20261103.md](/mnt/PROJECT-DISK-1TB/n1-metadata-foundation-20261103-01/reports/METADATA-FOUNDATION-20261103.md).
+Builds and ordinary fixtures used `/tmp` tmpfs; physical test data and reports
+used the HDDs. No Python tests, persistent services, commit, push or release.
+The original Procyon repository remains clean at `7ee9a06`.
+
+# Previous LINK RC.2 qualification campaign — November 2–3, 2026
 
 The November 3 `link` branch checkpoint passes a fresh warnings-denied
 `cargo test --workspace --all-targets --offline --locked`: **238 passed,
