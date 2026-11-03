@@ -50,6 +50,16 @@ The source contains the following Rust physical harnesses:
   captured successful rows from a retained failed attempt.
 - `metadata_engine/examples/qualification_summary.rs`: read-only summary of
   existing latency/resource evidence; it cannot manufacture a campaign pass.
+- `metadata_engine/examples/upload_comparison.rs`: matched native LINK and
+  HTTPS metadata uploads with the same payload, strict durability, part size
+  and concurrency. Samples CPU/RSS, process I/O and physical disk counters.
+  Its three range checks are explicitly separate from full-download witnesses.
+- `metadata_engine/examples/upload_audit.rs`: inspect a stopped metadata copy
+  without printing object capabilities. `recover_upload.rs` is an explicit
+  offline operator recovery for a cancelled session whose verified native parts
+  survived failed cleanup. It requires the original unexpired ticket and
+  matching reservation; dry-run precedes `--apply`. It cannot recreate shards
+  or revive a permanently retired object key.
 - Existing object-engine physical/recovery tests and the native client's Rust
   benchmark/resume examples retain their separate purposes.
 
@@ -82,6 +92,15 @@ parts, repeats finalize, and compares every downloaded byte using bounded
 buffers. It retains its named fixture and records its path in the optional
 report. This is the actual large-payload witness; the admission test above does
 not replace it.
+
+`interrupted_upload_listing_and_resume_survive_metadata_restart` is another
+explicit physical witness in `noa_service`. It checks normal and durable
+session discovery behind completed/cancelled records, truthful pagination,
+status after restart, completion from missing parts and exact downloaded bytes.
+The original Console's `tests/live-reload-resume.spec.ts` starts a real upload,
+reloads after two acknowledged parts, finds Resume in the Uploads modal and
+checks that only missing parts are sent, with no cancellation request. The
+production Console runtime is unchanged by this regression test.
 
 ## Recorded evidence as of November 3, 2026
 

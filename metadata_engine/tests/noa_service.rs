@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/resume_listing.rs"]
+mod resume_listing;
 #[path = "noa_service/upload_size_limits.rs"]
 mod upload_size_limits;
 struct Process(Child);

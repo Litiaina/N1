@@ -354,22 +354,6 @@ impl Namespace {
             })
             .collect()
     }
-    pub(crate) fn uploads(
-        &self,
-        fragment: PoolId,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<PendingUpload>> {
-        let after = after
-            .map(|value| RecordKey::new(fragment, value))
-            .transpose()?;
-        self.engine
-            .snapshot()
-            .scan(Table::Uploads, fragment, "", after.as_ref(), limit)?
-            .into_iter()
-            .map(|(_, value)| decode(value))
-            .collect()
-    }
     pub fn new(engine: MetadataEngine) -> Self {
         Self { engine }
     }

@@ -567,24 +567,11 @@ async fn do_list(app: Arc<App>, headers: HeaderMap, q: Q, durable: bool) -> ApiR
         &scope,
         q.get("continuation_token").map(String::as_str),
     )?;
-    let rows = app
+    let (sessions, next) = app
         .db
-        .execute(move |db| {
-            crate::namespace::Namespace::new(db).uploads(id, after.as_deref(), limit)
-        })
+        .execute(move |db| uploads::list(db, id, durable, after.as_deref(), limit, auth::now()))
         .await?;
-    let next = rows
-        .last()
-        .map(|p| super::cursor::encode(&app, &scope, &p.handle.version_id));
-    let mut sessions = Vec::new();
-    for p in rows {
-        if p.completed {
-            continue;
-        }
-        if let Ok(saved) = uploads::plan(&app, id, &p.handle.version_id, durable).await {
-            sessions.push(serde_json::to_value(saved.handle).expect("handle JSON"));
-        }
-    }
+    let next = next.map(|version| super::cursor::encode(&app, &scope, &version));
     Ok(Json(json!({"sessions":sessions,"continuation_token":next})))
 }
 pub(super) async fn list(
