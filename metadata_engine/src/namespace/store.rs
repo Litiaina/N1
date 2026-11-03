@@ -818,6 +818,7 @@ fn publish_record(
             Table::Reclamation,
             &RecordKey::new(fragment, format!("pending/{version_id}"))?,
         )?;
+        crate::uploads::progress::remove(tx, fragment, version_id)?;
         return Ok(metadata);
     }
     if pending.completed {
@@ -859,5 +860,6 @@ fn publish_record(
         Table::Reclamation,
         &RecordKey::new(fragment, format!("pending/{version_id}"))?,
     )?;
+    crate::uploads::progress::remove(tx, fragment, version_id)?;
     Ok(metadata)
 }

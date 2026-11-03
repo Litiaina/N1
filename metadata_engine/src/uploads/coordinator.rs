@@ -26,6 +26,10 @@ pub(crate) struct Plan {
     pub durable: bool,
     pub strict: bool,
     pub content_type: String,
+    /// Only durable native ACKs may replace reconstruction of actual parts.
+    /// An interrupted development session without this index is reconciled once.
+    #[serde(default)]
+    pub acknowledgements_indexed: bool,
 }
 #[derive(Deserialize)]
 pub(crate) struct InitRequest {
@@ -200,6 +204,7 @@ pub(crate) async fn init(
         durable,
         strict,
         content_type: request.content_type,
+        acknowledgements_indexed: !bridge && (strict || durable),
     };
     let key = plan_key(fragment, &handle.version_id)?;
     let version = handle.version_id.clone();
@@ -271,6 +276,31 @@ pub(crate) async fn part<R: AsyncRead + Unpin>(
         app.service
             .upload_part(fragment, version, index, length, source)
             .await?;
+        if plan.strict || durable {
+            let version = version.to_owned();
+            app.db
+                .execute(move |db| {
+                    db.transact(64, |tx| {
+                        let saved: Plan = fragments::decode(
+                            tx.get(Table::Reclamation, &plan_key(fragment, &version)?)?
+                                .ok_or(crate::Error::NotFound)?,
+                        )?;
+                        let pending: crate::namespace::PendingUpload = fragments::decode(
+                            tx.get(Table::Uploads, &RecordKey::new(fragment, &version)?)?
+                                .ok_or(crate::Error::NotFound)?,
+                        )?;
+                        // A cancelled HTTP future does not cancel an already-owned DB
+                        // worker. Recheck lifecycle inside its retrying transaction.
+                        if saved.cancelled || pending.completed {
+                            return Err(crate::Error::NameConflict(
+                                "upload is no longer accepting parts".into(),
+                            ));
+                        }
+                        super::progress::acknowledge(tx, fragment, &version, index)
+                    })
+                })
+                .await?;
+        }
         return Ok(());
     }
     let pending = app.service.pending(fragment, version, None).await?;
@@ -355,6 +385,16 @@ pub(crate) async fn status(
     version: &str,
     durable: bool,
 ) -> ApiResult<serde_json::Value> {
+    let lock = app.upload_lock(fragment, version);
+    let _guard = lock.write().await;
+    status_locked(app, fragment, version, durable).await
+}
+async fn status_locked(
+    app: &App,
+    fragment: PoolId,
+    version: &str,
+    durable: bool,
+) -> ApiResult<serde_json::Value> {
     let plan = plan(app, fragment, version, durable).await?;
     let pending = app.service.pending(fragment, version, None).await?;
     let mut uploaded = Vec::new();
@@ -406,6 +446,15 @@ pub(crate) async fn status(
                 uploaded.push(index);
             }
         }
+    } else if plan.acknowledgements_indexed {
+        let version = version.to_owned();
+        let expected = plan.handle.expected_parts;
+        uploaded = app
+            .db
+            .execute(move |db| {
+                super::progress::uploaded(&db.snapshot(), fragment, &version, expected)
+            })
+            .await?;
     } else {
         let mut start = 0;
         while start < plan.handle.expected_parts {
@@ -424,6 +473,45 @@ pub(crate) async fn status(
                     .filter(|part| !report.missing_parts.contains(part)),
             );
             start = report.checked_end;
+        }
+        if plan.strict || durable {
+            let version = version.to_owned();
+            let verified = uploaded.clone();
+            let expected = plan.handle.expected_parts;
+            uploaded = app
+                .db
+                .execute(move |db| {
+                    // Valid frames alone do not prove that a failed/abandoned
+                    // native operation completed its durability barrier. Keep
+                    // only durable ACKs that still pass actual reconstruction;
+                    // uncertain parts are safely retransmitted with the same
+                    // immutable ticket rather than promoted into new ACKs.
+                    let acknowledged =
+                        super::progress::uploaded(&db.snapshot(), fragment, &version, expected)?;
+                    let retained = acknowledged
+                        .into_iter()
+                        .filter(|part| verified.binary_search(part).is_ok())
+                        .collect::<Vec<_>>();
+                    db.transact(64, |tx| {
+                        let key = plan_key(fragment, &version)?;
+                        let mut saved: Plan = fragments::decode(
+                            tx.get(Table::Reclamation, &key)?
+                                .ok_or(crate::Error::NotFound)?,
+                        )?;
+                        let pending: crate::namespace::PendingUpload = fragments::decode(
+                            tx.get(Table::Uploads, &RecordKey::new(fragment, &version)?)?
+                                .ok_or(crate::Error::NotFound)?,
+                        )?;
+                        if saved.cancelled || pending.completed {
+                            return Ok(Vec::new());
+                        }
+                        super::progress::replace(tx, fragment, &version, &retained)?;
+                        saved.acknowledgements_indexed = true;
+                        tx.put(Table::Reclamation, &key, &fragments::encode(&saved)?)?;
+                        Ok(retained.clone())
+                    })
+                })
+                .await?;
         }
     }
     let bytes: u64 = uploaded
@@ -487,7 +575,7 @@ pub(crate) async fn finalize(
         pending.completed
     };
     if plan.bridge && !physically_complete {
-        let state = status(&app, fragment, &version, durable).await?;
+        let state = status_locked(&app, fragment, &version, durable).await?;
         if state["uploaded_parts"].as_array().map_or(0, Vec::len) as u64
             != plan.handle.expected_parts
         {
@@ -564,7 +652,30 @@ pub(crate) async fn finalize(
                 .await?;
         }
     }
-    let result = app.service.finalize(fragment, &version, &session).await?;
+    let result = match app.service.finalize(fragment, &version, &session).await {
+        Ok(result) => result,
+        Err(error) => {
+            // An ACK records successful persistence, not perpetual media
+            // health. If native validation now fails, the next resume must
+            // reconcile actual shards rather than repeatedly skipping them.
+            if !plan.bridge && matches!(&error, crate::service::ServiceError::Object(_)) {
+                let key = plan_key(fragment, &version)?;
+                app.db
+                    .execute(move |db| {
+                        db.transact(64, |tx| {
+                            let mut saved: Plan = fragments::decode(
+                                tx.get(Table::Reclamation, &key)?
+                                    .ok_or(crate::Error::NotFound)?,
+                            )?;
+                            saved.acknowledgements_indexed = false;
+                            tx.put(Table::Reclamation, &key, &fragments::encode(&saved)?)
+                        })
+                    })
+                    .await?;
+            }
+            return Err(error.into());
+        }
+    };
     app.emit(fragment);
     if plan.bridge {
         let _ = tokio::fs::remove_dir_all(directory(&app, fragment, &version)).await;
@@ -587,11 +698,13 @@ pub(crate) async fn cancel(
     saved.cancelled = true;
     let key = plan_key(fragment, version)?;
     let pending_key = RecordKey::new(fragment, format!("pending/{version}"))?;
+    let cleanup_version = version.to_owned();
     app.db
         .execute(move |db| {
             db.transact(64, |tx| {
                 tx.put(Table::Reclamation, &key, &fragments::encode(&saved)?)?;
-                tx.remove(Table::Reclamation, &pending_key)
+                tx.remove(Table::Reclamation, &pending_key)?;
+                super::progress::remove(tx, fragment, &cleanup_version)
             })
         })
         .await?;

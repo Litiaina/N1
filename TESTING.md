@@ -76,6 +76,15 @@ service. Do not replace production Console features or change its expectations
 to obtain a pass.
 
 The `noa_service` integration target also covers optional object-size policy.
+Its resume witnesses cover strict standard and durable uploads, truncated bodies,
+conflicting retries, bitmap-page boundaries, SIGKILL of both engines, repeated
+finalize, exact readback, staged shard loss and cancellation cleanup. The scale
+witness reserves a 15 GiB identity and transfers **1 GiB** (128 x 8 MiB parts)
+to the two HDDs. It measures reconstruction, indexed status and status after
+restarting both processes, asserting zero native I/O submissions for indexed
+queries. This is a resume-control test, not a complete 15 GiB transfer. The
+131,072-part metadata limit is separately exercised without allocating payloads.
+
 `finite_and_unlimited_policy_on_real_metadata_and_object_engines` checks finite
 rejection on known-length, chunked, batch and multipart uploads, then byte-exact
 transfers with omitted/explicit unlimited caps and 15 GiB/1 TiB multipart

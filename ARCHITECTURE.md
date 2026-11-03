@@ -79,7 +79,7 @@ announcement or a migration guide.
 | `metadata_engine/src/object_store` | Bounded concurrent native NOA client connections; no member-root or shard-format access |
 | `metadata_engine/src/server` | Named HTTP/WebSocket and native adapters, INI startup and recovery of unfinished publications |
 | `metadata_engine/src/fragments`, `metadata_engine/src/middleware` | Logical fragment identities, aliases, permissions, authentication and refresh rotation |
-| `metadata_engine/src/uploads` | Original multipart sessions and bounded HDD re-chunking for non-aligned client part geometry |
+| `metadata_engine/src/uploads` | Multipart sessions, durable acknowledged-part metadata and bounded HDD re-chunking for non-aligned client part geometry |
 | `metadata_engine/src/exports` | Retained bounded ZIP64/TAR builder reading immutable versions through native object requests |
 | `metadata_engine/storage` | Retained Procyon storage core, upstream fixes, recovery fixtures and tests |
 | `object_engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
@@ -170,6 +170,20 @@ never enrolls a missing disk. Descendants are opened relative to pinned director
 descriptors with symlink following disabled. Root replacement is rejected.
 
 ## Upload and completion
+
+Named uploads retain their coordination state in the metadata database. For
+strict native-aligned parts, a successful native object ACK is followed by a
+durable metadata bit before the named request succeeds. A 32-byte page covers
+256 parts; updates merge transactionally across writers. Named resume status
+reads these pages without rereading payloads. Publication/cancellation removes
+them in the corresponding metadata transaction. Relaxed or unindexed uploads
+require actual-part reconciliation; only still-valid durable ACKs are indexed.
+Valid frames without an ACK may be retransmitted using the same immutable ticket.
+If native finalization detects lost/incomplete staging, the next status rebuilds
+the index from actual shards. These records describe acknowledged completion,
+not media health, and do not alter LINK keys, object placement or shard files.
+
+The following lifecycle describes the independent object engine:
 
 Init creates a cryptographically random identity and returns its final key and
 self-contained upload ticket. It creates no per-upload disk record.

@@ -137,8 +137,24 @@ POST   /noa/v1/upload/multipart/durable/{version_id}/{session_id}/finalize
 DELETE /noa/v1/upload/multipart/durable/{version_id}
 ```
 
-Standard multipart is nonpersistent until finalize; durable multipart retains
-restart-resumable progress. Both publish immutable objects after finalization.
+Both multipart routes support interruption and resume. Durable multipart always
+persists accepted parts; standard multipart does so when strict durability is
+selected. Relaxed standard acknowledgements do not guarantee crash persistence.
+Both publish immutable objects after finalization.
+
+For native-aligned named uploads with strict acknowledgements, the metadata
+engine commits completed-part bits after the object engine confirms persistence,
+before returning the part ACK. Status reads those bounded metadata pages, rather
+than reading the payload. Restarting either engine retains this completion state.
+An unindexed session reconciles its durable ACK records with actual shard
+records. Valid bytes without a recorded durable ACK are retransmitted safely;
+they do not establish that an interrupted sync succeeded. Relaxed sessions
+continue to inspect actual progress.
+Unaligned uploads retain their existing staged-part checks. Status describes
+acknowledged completion, while native finalization and object reads enforce
+payload integrity. A native finalize failure invalidates the completion index so
+the next resume reconciles actual parts. Publication and cancellation remove
+completion pages atomically with their metadata lifecycle transition.
 Batch accepts independent small objects, returning 201 for all-success or 207
 for mixed results. There is no durable batch route.
 

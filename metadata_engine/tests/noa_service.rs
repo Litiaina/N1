@@ -10,8 +10,14 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/resume_damage.rs"]
+mod resume_damage;
 #[path = "noa_service/resume_listing.rs"]
 mod resume_listing;
+#[path = "noa_service/resume_progress.rs"]
+mod resume_progress;
+#[path = "noa_service/resume_scale.rs"]
+mod resume_scale;
 #[path = "noa_service/upload_size_limits.rs"]
 mod upload_size_limits;
 struct Process(Child);
@@ -65,6 +71,9 @@ fn spawn_with_env(
 }
 impl Stack {
     async fn new() -> Self {
+        Self::with_block_bytes(4096).await
+    }
+    async fn with_block_bytes(block_bytes: u32) -> Self {
         let parent = PathBuf::from(
             std::env::var_os("N1_OBJECT_TEST_ROOT").expect("explicit HDD parent required"),
         );
@@ -103,7 +112,7 @@ impl Stack {
                 "--parity-shards",
                 if second.is_some() { "1" } else { "0" },
                 "--block-bytes",
-                "4096",
+                &block_bytes.to_string(),
                 "--native-address",
                 &format!("127.0.0.1:{object_port}"),
             ])
