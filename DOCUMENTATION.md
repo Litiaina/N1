@@ -202,6 +202,22 @@ recovery point, pause writers and deletion/GC affecting the captured objects,
 capture metadata and object state, verify both, then resume. Independent live
 captures alone do not guarantee a shared point in time.
 
+If the metadata database is lost, stop the metadata service and retain the
+remaining database/staging directories as evidence. Restore a verified metadata
+snapshot into an absent destination using the command above, then select that
+directory in metadata's INI and restart. Keep its original service credentials
+and the object pool/member identities. Verify fragments, named versions, trash,
+permissions and upload status before reopening writes. Bridged unfinished
+uploads can require their separately retained staging bytes; a database archive
+does not supply those bytes.
+
+Object shards alone do not reconstruct logical names or permissions. Without a
+metadata backup, an authorized client that independently retained LINK keys can
+still read surviving objects directly, but cannot rebuild the named catalog
+from those shards. If object state was also lost, restore its matching verified
+recovery point before reopening the named service. A copy of a live database
+directory is not a substitute for the snapshot workflow.
+
 Object recovery retains the existing `backup create`, `verify`, `replicate`,
 `replicate-remote` and `restore` workflows. Local repository replication can
 reencrypt under a new backup key. Native remote replication requires matching

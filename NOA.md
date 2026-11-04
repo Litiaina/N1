@@ -160,6 +160,13 @@ Exports pin immutable versions, build durable ZIP/TAR artifacts and support
 stable length/ETag, range resume and scoped signed downloads. Cancellation and
 artifact retention do not delete source objects.
 
+A successful complete named download requires a successful object-engine read,
+including for an empty object. Metadata verifies a zero-length backend read
+before returning empty success headers. For a nonempty streamed response, a
+backend failure after headers terminates the body with an error; receiving a
+200 header alone does not establish a complete download. These rules apply to
+named HTTP and native byte reads.
+
 ### Uploads
 
 ```text

@@ -61,6 +61,14 @@ reconciliation. It is not discarded as an orphan by guessing from filenames.
 An overwrite keeps the old named version visible until publication. A rename
 changes metadata; it never renames or rewrites the immutable shard payload.
 
+Named reads resolve an immutable LINK reference and use the public native
+download interface. Empty reads verify backend availability before success;
+nonempty streaming failures remain body errors. Metadata may reconnect a
+disconnected download once before any destination bytes or destination error,
+while keeping its admission and shutdown guards. It never replays partial
+downloads or writes. This adds no RPC to healthy reads and does not change
+LINK placement or the object engine's storage path.
+
 The following sections describe the storage design. Current incomplete product
 work is listed only in [the completion checklist](docs/RC2-IMPLEMENTATION.md);
 verification evidence belongs in [TESTING.md](TESTING.md). This is not a release
@@ -460,8 +468,10 @@ Temporary inventory and deduplication files use bounded directory fanout and
 leave at cutover; they are not part of ordinary uploads or an object catalogue.
 Filesystems supporting data/hole queries avoid scanning unwritten sparse gaps;
 others use a conservative sequential scan. Reconstruction failures keep the
-target inactive. Multi-member replacement and full pool expansion qualification
-remain tracked separately.
+target inactive. Physical two-member loss/recovery, replacement and INI pool
+expansion are qualified in the [November 4 reliability record](docs/RELIABILITY-20261104.md).
+Larger physical topologies, multiple-member replacement and hardware power-loss
+qualification remain separate gates.
 
 Builds, fixtures and qualification results are kept outside the source tree.
 [TESTING.md](TESTING.md) records exact hardware, binaries, commands and scope;

@@ -6,7 +6,10 @@ use n1_link::{PoolId, noa::Command};
 use n1_native_client::{N1NativeClient, NativeClientError, Response};
 use serde::de::DeserializeOwned;
 use std::{
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -65,6 +68,48 @@ struct Connection {
     _lifecycle: OwnedRwLockReadGuard<()>,
 }
 
+// A disconnected source can be retried only before the destination observed
+// bytes. Destination failures and partially delivered streams are never replayed.
+struct DownloadWriter<'a, W> {
+    inner: &'a mut W,
+    started: bool,
+    failed: bool,
+}
+impl<W: AsyncWrite + Unpin> AsyncWrite for DownloadWriter<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut *this.inner).poll_write(cx, bytes);
+        match &result {
+            Poll::Ready(Ok(n)) => this.started |= *n > 0,
+            Poll::Ready(Err(_)) => this.failed = true,
+            Poll::Pending => (),
+        }
+        result
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut *this.inner).poll_flush(cx);
+        this.failed |= matches!(&result, Poll::Ready(Err(_)));
+        result
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut *this.inner).poll_shutdown(cx);
+        this.failed |= matches!(&result, Poll::Ready(Err(_)));
+        result
+    }
+}
+fn disconnected(error: &NativeClientError) -> bool {
+    matches!(error, NativeClientError::Io(error) if matches!(error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset |
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::UnexpectedEof |
+        io::ErrorKind::NotConnected))
+}
+
 impl Connection {
     fn release(self) {
         let mut idle = self.owner.idle.lock().unwrap_or_else(|e| e.into_inner());
@@ -113,7 +158,22 @@ impl NativeObjectStore {
             .acquire_owned()
             .await
             .map_err(|_| ObjectStoreError::Closed)?;
-        let cached = self.0.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let (client, expires_at) = self.transport(true).await?;
+        Ok(Connection {
+            owner: self.0.clone(),
+            client,
+            expires_at,
+            _permit: permit,
+            _lifecycle: lifecycle,
+        })
+    }
+
+    async fn transport(&self, reuse_idle: bool) -> ObjectStoreResult<(N1NativeClient, u64)> {
+        let cached = if reuse_idle {
+            self.0.idle.lock().unwrap_or_else(|e| e.into_inner()).pop()
+        } else {
+            None
+        };
         let now = unix_now()?;
         let cached = cached.filter(|cached| {
             cached.expires_at > now.saturating_add(30)
@@ -185,13 +245,7 @@ impl NativeObjectStore {
             }
             (client, expires_at)
         };
-        Ok(Connection {
-            owner: self.0.clone(),
-            client,
-            expires_at,
-            _permit: permit,
-            _lifecycle: lifecycle,
-        })
+        Ok((client, expires_at))
     }
 
     /// Stop new calls and close idle transports. Accepted calls retain their
@@ -451,11 +505,31 @@ impl NativeObjectStore {
         destination: &mut W,
     ) -> ObjectStoreResult<u64> {
         let mut connection = self.connection().await?;
-        let (_, length) = connection
+        let mut output = DownloadWriter {
+            inner: destination,
+            started: false,
+            failed: false,
+        };
+        let first = connection
             .client
-            .download(object_key.into(), offset, length, destination)
-            .await
-            .map_err(|error| self.failed(error))?;
+            .download(object_key.into(), offset, length, &mut output)
+            .await;
+        let result = match first {
+            Err(error) if !output.started && !output.failed && disconnected(&error) => {
+                // Keep this operation's original admission/lifecycle guards.
+                // A single fresh transport bypasses other stale idle sockets,
+                // without another RPC on healthy reads or any write replay.
+                let (client, expires_at) = self.transport(false).await?;
+                connection.client = client;
+                connection.expires_at = expires_at;
+                connection
+                    .client
+                    .download(object_key.into(), offset, length, &mut output)
+                    .await
+            }
+            result => result,
+        };
+        let (_, length) = result.map_err(|error| self.failed(error))?;
         connection.release();
         Ok(length)
     }

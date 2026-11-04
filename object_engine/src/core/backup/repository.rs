@@ -123,9 +123,9 @@ impl Repository {
         } else {
             let encrypted = self.key.seal(&format!("{FORMAT}:block:{hash}"), bytes)?;
             if let Err(error) = atomic_new(&path, &encrypted) {
-                if !error
+                if error
                     .downcast_ref::<io::Error>()
-                    .is_some_and(|e| e.kind() == io::ErrorKind::AlreadyExists)
+                    .is_none_or(|e| e.kind() != io::ErrorKind::AlreadyExists)
                 {
                     return Err(error);
                 }

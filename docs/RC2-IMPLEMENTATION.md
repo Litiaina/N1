@@ -23,7 +23,11 @@ optional metadata engine; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 Implemented is not synonymous with fully qualified. [TESTING.md](../TESTING.md)
 records completed checks and separates object-only, metadata-KV and full-stack
 results. Each report identifies its source checkpoint and executable hashes;
-the current monitoring work remains on `link` with `main` held.
+the current work remains on `link` with `main` held. The completed local
+[November 4 reliability qualification](RELIABILITY-20261104.md) covers member
+loss/corruption, full metadata loss and restore, crash/resume, encrypted-replica
+recovery and actual OS unmount/remount. It is separate from population and
+hardware power-loss qualification.
 
 ## Work required before completion
 
@@ -33,12 +37,12 @@ the current monitoring work remains on `link` with `main` held.
 | Immutable-pool maintenance mapping | Resolve every retained maintenance operation without mutating existing pool geometry. The current redistribution rejection and generic job adapter are not full contract parity. |
 | Metadata lifecycle / GC | Complete expired sessions, trash/history retention and explicit-key object reclamation with durable ownership/retry. A pending or live reference must never be discarded by guessing; LINK's staging GC cannot replace metadata reclamation. |
 | Export lifecycle | Complete and qualify retention/cleanup, restart behavior and resource limits for the complete named service. |
-| Named-service recovery | Matching metadata/object restore is physically exercised with exact named reads. Preserve the documented operator pause; independent live captures must never be presented as an atomic cross-service snapshot. Broader crash/churn qualification remains separate. |
+| Named-service recovery | Full metadata/staging loss, verified snapshot restore, named history/permissions/resume and metadata/object/both process crashes pass on two local HDDs. Preserve the documented operator pause; independent live captures are not an atomic cross-service snapshot. Qualify host power loss and additional crash points separately. |
 | Metadata request quotas | Complete and verify the configured named-service admission/rate policy; do not infer coverage from object-engine middleware. |
 | Optional Accel | Restore and qualify retained search/read integration when configured; preserve authoritative metadata resolution and direct-read fallback rules. |
 | Console and administration | Exercise the original product workflows and deployment/administration helpers against both engines. Passing three original live tests is scoped evidence, not complete feature parity. |
 | End-to-end population | Finish each requested 500K API and Console campaign with physical census, real process restart and every acknowledged version/payload verified. Keep failed attempts and distinct machine results separate. |
-| Broader storage qualification | Complete remaining multi-member loss/topology, expansion, crash/churn and fault scenarios. Distinguish process crashes from power loss and object-only from named-service evidence. |
+| Broader storage qualification | Two-HDD member loss/corruption, beyond-parity refusal, replica recovery after loss of both originals, replacement, INI expansion and database crash/churn pass. The EC subset matrix uses logical fixtures; qualify larger physical topologies, multiple-member replacement and hardware power loss separately. |
 | Matched performance | Measure CPU, RSS, latency and throughput on equivalent completed operations; retain cache/durability/integrity conditions and all failed trials. |
 
 ## Fixed boundaries

@@ -59,6 +59,262 @@ fn client(listener: &TcpListener, connections: usize) -> NativeObjectStore {
     .unwrap()
 }
 
+#[tokio::test]
+async fn download_reconnects_a_closed_idle_transport_before_forwarding_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let (closed, disconnected) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut old, _) = listener.accept().await.unwrap();
+        assert!(login(&mut old).await);
+        let request = read(&mut old).await;
+        assert!(matches!(request.command, Command::ObjectStat { .. }));
+        write(&mut old, stat(request.id)).await;
+        drop(old);
+        closed.send(()).unwrap();
+        let (mut fresh, _) = listener.accept().await.unwrap();
+        assert!(
+            !login(&mut fresh).await,
+            "reconnect must reuse the valid service session"
+        );
+        let request = read(&mut fresh).await;
+        assert!(matches!(request.command, Command::ObjectGet { .. }));
+        let mut response = Response::ok(request.id, json!({}));
+        response.body_len = 5;
+        write(&mut fresh, response).await;
+        fresh.write_all(b"fresh").await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        assert_eq!(store.stat("N1A1.seed").await.unwrap().total_bytes, 17);
+        disconnected.await.unwrap();
+        let mut bytes = Vec::new();
+        assert_eq!(
+            store
+                .download("N1A1.read", 0, Some(5), &mut bytes)
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(bytes, b"fresh");
+        server.await.unwrap();
+    })
+    .await
+    .expect("closed idle download transport did not recover");
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_never_replays_after_forwarding_partial_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        login(&mut stream).await;
+        let request = read(&mut stream).await;
+        let mut response = Response::ok(request.id, json!({}));
+        response.body_len = 6;
+        write(&mut stream, response).await;
+        stream.write_all(b"abc").await.unwrap();
+        drop(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "partial download was replayed"
+        );
+    });
+    let mut bytes = Vec::new();
+    assert!(
+        store
+            .download("N1A1.partial", 0, Some(6), &mut bytes)
+            .await
+            .is_err()
+    );
+    assert_eq!(bytes, b"abc");
+    server.await.unwrap();
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_transport_reconnect_is_bounded_to_one_fresh_attempt() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(login(&mut stream).await, attempt == 0);
+            let request = read(&mut stream).await;
+            assert!(matches!(request.command, Command::ObjectGet { .. }));
+            drop(stream);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "download reconnect loop exceeded one retry"
+        );
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        assert!(
+            store
+                .download("N1A1.unavailable", 0, None, &mut bytes)
+                .await
+                .is_err()
+        );
+        assert!(bytes.is_empty());
+        server.await.unwrap();
+    })
+    .await
+    .expect("download reconnect did not stop");
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_does_not_retry_complete_application_errors() {
+    for status in [404, 410, 401] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let store = client(&listener, 1);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            login(&mut stream).await;
+            let request = read(&mut stream).await;
+            write(
+                &mut stream,
+                Response::error(request.id, status, "explicit object error"),
+            )
+            .await;
+            drop(stream);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "application error was retried"
+            );
+        });
+        let mut bytes = Vec::new();
+        assert_eq!(
+            store
+                .download("N1A1.error", 0, None, &mut bytes)
+                .await
+                .unwrap_err()
+                .status(),
+            status
+        );
+        assert!(bytes.is_empty());
+        server.await.unwrap();
+        store.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn download_does_not_retry_a_destination_failure_before_the_first_byte() {
+    struct FailedDestination;
+    impl tokio::io::AsyncWrite for FailedDestination {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "destination closed",
+            )))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        login(&mut stream).await;
+        let request = read(&mut stream).await;
+        let mut response = Response::ok(request.id, json!({}));
+        response.body_len = 6;
+        write(&mut stream, response).await;
+        stream.write_all(b"direct").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "destination error caused backend replay"
+        );
+    });
+    assert!(
+        store
+            .download("N1A1.destination", 0, Some(6), &mut FailedDestination)
+            .await
+            .is_err()
+    );
+    server.await.unwrap();
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnecting_download_retains_admission_and_shutdown_waits_for_its_completion() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let (closed, disconnected) = oneshot::channel();
+    let (arrived, reconnected) = oneshot::channel();
+    let (reply, permitted) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut old, _) = listener.accept().await.unwrap();
+        login(&mut old).await;
+        let request = read(&mut old).await;
+        write(&mut old, stat(request.id)).await;
+        drop(old);
+        closed.send(()).unwrap();
+        let (mut fresh, _) = listener.accept().await.unwrap();
+        assert!(!login(&mut fresh).await);
+        let request = read(&mut fresh).await;
+        arrived.send(()).unwrap();
+        permitted.await.unwrap();
+        let mut response = Response::ok(request.id, json!({}));
+        response.body_len = 5;
+        write(&mut fresh, response).await;
+        fresh.write_all(b"owned").await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        store.stat("N1A1.seed").await.unwrap();
+        disconnected.await.unwrap();
+        let active = store.clone();
+        let download = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            active
+                .download("N1A1.owned", 0, Some(5), &mut bytes)
+                .await
+                .unwrap();
+            bytes
+        });
+        reconnected.await.unwrap();
+        let stopping = store.clone();
+        let shutdown = tokio::spawn(async move { stopping.shutdown().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown abandoned a reconnecting accepted read"
+        );
+        reply.send(()).unwrap();
+        assert_eq!(download.await.unwrap(), b"owned");
+        shutdown.await.unwrap();
+        server.await.unwrap();
+    })
+    .await
+    .expect("reconnecting download lost its admission/shutdown ownership");
+    assert_eq!(store.stat("N1A1.closed").await.unwrap_err().status(), 503);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_native_calls_run_concurrently_within_the_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

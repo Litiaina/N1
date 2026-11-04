@@ -10,12 +10,18 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/crash_matrix.rs"]
+mod crash_matrix;
+#[path = "noa_service/device_cycle.rs"]
+mod device_cycle;
 #[path = "noa_service/monitoring.rs"]
 mod monitoring;
 #[path = "noa_service/monitoring_performance.rs"]
 mod monitoring_performance;
 #[path = "noa_service/object_recovery.rs"]
 mod object_recovery;
+#[path = "noa_service/reliability.rs"]
+mod reliability;
 #[path = "noa_service/resume_damage.rs"]
 mod resume_damage;
 #[path = "noa_service/resume_listing.rs"]

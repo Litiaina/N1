@@ -164,33 +164,44 @@ pub(crate) async fn stream(
     } else {
         (0, total)
     };
-    let (mut writer, reader) = tokio::io::duplex(256 * 1024);
     let objects = app.service.objects();
     let key = stored.object_key;
-    let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
-    tokio::spawn(async move {
-        if objects
-            .download(&key, offset, Some(length), &mut writer)
-            .await
-            .is_err()
-        {
-            let _ = error_tx
-                .send(std::io::Error::other(
-                    "object download failed integrity or availability checks",
-                ))
-                .await;
-        }
-    });
-    // Surface a truncated/corrupt backend stream as a body error. A successful
-    // HTTP header alone is never used as evidence of a complete download.
-    use futures_util::{StreamExt, stream};
-    let source = tokio_util::io::ReaderStream::new(reader).chain(stream::once(async move {
-        match error_rx.recv().await {
-            Some(error) => Err(error),
-            None => Ok(bytes::Bytes::new()),
-        }
-    }));
-    let mut response = Body::from_stream(source).into_response();
+    let body = if length == 0 {
+        // Content-Length: 0 completes the client exchange at the headers.
+        // Validate the native read before publishing those headers: a later
+        // body error cannot retract an empty HTTP or named-native success.
+        objects
+            .download(&key, offset, Some(0), &mut tokio::io::sink())
+            .await?;
+        Body::empty()
+    } else {
+        let (mut writer, reader) = tokio::io::duplex(256 * 1024);
+        let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
+        tokio::spawn(async move {
+            if objects
+                .download(&key, offset, Some(length), &mut writer)
+                .await
+                .is_err()
+            {
+                let _ = error_tx
+                    .send(std::io::Error::other(
+                        "object download failed integrity or availability checks",
+                    ))
+                    .await;
+            }
+        });
+        // Surface a truncated/corrupt backend stream as a body error. A successful
+        // HTTP header alone is never used as evidence of a complete download.
+        use futures_util::{StreamExt, stream};
+        let source = tokio_util::io::ReaderStream::new(reader).chain(stream::once(async move {
+            match error_rx.recv().await {
+                Some(error) => Err(error),
+                None => Ok(bytes::Bytes::new()),
+            }
+        }));
+        Body::from_stream(source)
+    };
+    let mut response = body.into_response();
     *response.status_mut() = if partial {
         StatusCode::PARTIAL_CONTENT
     } else {

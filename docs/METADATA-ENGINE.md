@@ -84,6 +84,17 @@ object I/O. Cancelled/failed exchanges discard uncertain transports. Idle
 transports expire before the object's idle socket deadline; token expiry is a
 separate condition.
 
+A download that encounters a disconnected native transport may reconnect once
+before the destination has received any bytes, provided the destination itself
+has not failed. The fresh connection bypasses other idle sockets and retains
+the operation's existing admission permit and shutdown guard. Application
+errors, partial delivery and destination errors are returned without replay;
+writes are not retried by this mechanism. Healthy reads require no extra RPC.
+
+Empty named reads await native verification before publishing success headers.
+Nonempty reads stream with bounded buffers and propagate a backend failure as
+a response-body error. A zero-byte response must not conceal unavailable shards.
+
 ## Public service and completion
 
 The original Console connects to metadata's named NOA v1 HTTP/WebSocket API.

@@ -52,40 +52,37 @@ impl MetadataEngine {
             .unwrap_or(Path::new("."));
         let stage = parent.join(format!(".n1-metadata-restore-{}", ulid::Ulid::new()));
         std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(archive)?;
-            if !file.metadata()?.is_file() {
-                return Err(Error::Invalid("snapshot must be a regular file".into()));
-            }
-            let db = MetadataEngine::open(&stage, Options::default())?;
-            let count = restore(&db, &mut file)?;
-            drop(db);
-            // Linux atomic no-replace publication closes the destination race.
-            use std::{ffi::CString, os::unix::ffi::OsStrExt};
-            let from = CString::new(stage.as_os_str().as_bytes())
-                .map_err(|_| Error::Invalid("invalid restore path".into()))?;
-            let to = CString::new(destination.as_os_str().as_bytes())
-                .map_err(|_| Error::Invalid("invalid restore path".into()))?;
-            if unsafe {
-                libc::renameat2(
-                    libc::AT_FDCWD,
-                    from.as_ptr(),
-                    libc::AT_FDCWD,
-                    to.as_ptr(),
-                    libc::RENAME_NOREPLACE,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            File::open(parent)?.sync_all()?;
-            Ok(count)
-        })();
         // Keep failed restore evidence; it is never published as the target.
-        result
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(archive)?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::Invalid("snapshot must be a regular file".into()));
+        }
+        let db = MetadataEngine::open(&stage, Options::default())?;
+        let count = restore(&db, &mut file)?;
+        drop(db);
+        // Linux atomic no-replace publication closes the destination race.
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from = CString::new(stage.as_os_str().as_bytes())
+            .map_err(|_| Error::Invalid("invalid restore path".into()))?;
+        let to = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| Error::Invalid("invalid restore path".into()))?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        File::open(parent)?.sync_all()?;
+        Ok(count)
     }
 }
 use std::os::unix::fs::DirBuilderExt;

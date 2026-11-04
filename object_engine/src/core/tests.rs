@@ -1,6 +1,7 @@
 //! Functional tests use isolated directories on RAM. These do not qualify
 //! physical member independence, power loss or sustained hardware performance.
 mod integrity;
+mod redundancy;
 use super::*;
 
 #[tokio::test]

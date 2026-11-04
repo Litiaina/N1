@@ -31,8 +31,8 @@ fn statvfs_totals_sync(path: &Path) -> Result<(u64, u64, u64), AppError> {
         ));
     }
 
-    let total = (vfs.f_frsize as u64).saturating_mul(vfs.f_blocks as u64);
-    let avail = (vfs.f_frsize as u64).saturating_mul(vfs.f_bavail as u64);
+    let total = vfs.f_frsize.saturating_mul(vfs.f_blocks);
+    let avail = vfs.f_frsize.saturating_mul(vfs.f_bavail);
     Ok((device_id, total, avail))
 }
 

@@ -39,6 +39,14 @@ complete API conformance or qualification.
 - Add Rust physical qualification and failure auditing for direct objects,
   metadata transactions and original-console-to-metadata-to-object operations.
   Retire cached metadata transports before the object's native idle deadline.
+- Verify empty named downloads against the object engine before returning
+  success, so missing backing shards cannot become a successful empty response.
+- Recover a disconnected metadata-to-object download with one fresh native
+  connection only before any destination bytes or destination error. Keep the
+  original admission/shutdown guards; never replay writes or partial downloads.
+- Add exhaustive shard-loss/corruption checks, full metadata-loss restoration,
+  in-flight process-crash/resume and explicit physical HDD unmount/remount tests.
+  Extend encrypted-replica recovery to cover loss of both original members.
 
 Remaining metadata lifecycle, full NOA conformance and release qualification are
 tracked in [the completion checklist](docs/RC2-IMPLEMENTATION.md). Benchmark and

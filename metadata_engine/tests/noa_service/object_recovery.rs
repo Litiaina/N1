@@ -225,6 +225,15 @@ async fn object_pool_backup_replication_restore_and_blank_replacement_preserve_k
             snapshot,
         ],
     );
+    // Total source-pool loss: make both original members unavailable before
+    // restore. Only the verified replicated backup may supply recovered bytes.
+    for root in roots {
+        let root = PathBuf::from(root.as_str().unwrap());
+        let lost = root.with_extension("lost-original-pool-evidence");
+        assert!(!lost.exists());
+        std::fs::rename(&root, &lost).unwrap();
+        assert!(!root.exists());
+    }
     let restored0 = parent0.join(format!("restored-{label}"));
     let restored1 = parent1.join(format!("restored-{label}"));
     for path in [&restored0, &restored1] {

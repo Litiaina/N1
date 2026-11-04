@@ -20,6 +20,38 @@ Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
 selected HDD/RAM locations; never put population fixtures on the source NVMe.
 
+## Latest completed reliability qualification — November 4, 2026
+
+The local two-HDD campaign **full03 passed at 21:19:44 Asia/Manila**, after
+fixing two metadata read-path defects and repeating the complete campaign.
+The [reliability record](docs/RELIABILITY-20261104.md) gives coverage,
+reproduction commands, failure evidence and explicit limits.
+
+- **447 default workspace cases and 81 documentation cases passed.**
+- **18 distinct opt-in Rust tests passed in 21 executions**, including repeated
+  loss/crash cases. These are separate from the default count.
+- One default test checks **410 EC loss/corruption combinations**. They are not
+  410 additional Rust test functions or 410 physical disk failures.
+- Physical named-service tests cover both member-loss directions, corruption,
+  full metadata/staging loss and snapshot restore, in-flight process crashes,
+  native independence, replica recovery after both original members are lost,
+  replacement, INI expansion, GC and actual OS unmount/remount of the TEST HDD.
+- Each HDD independently passed a 16,384-entry metadata campaign with 4,096
+  mutations and two actual SIGKILL/resume cycles. These are KV fixtures, not
+  object payload counts or a replicated metadata database.
+
+Source/build/data evidence is under
+`/mnt/PROJECT-DISK-1TB/n1-reliability-20261104-01`; its
+`reports/RELIABILITY-20261104.md` and `reports/full03/PASSED` identify the final
+result. Metadata/control and one object member shared the PROJECT HDD; the
+other member used the independent TEST HDD. Unit fixtures and the separate
+Console operator control fixture used RAM. The object executable was unchanged
+between full02 and full03; both runtime fixes are in metadata.
+
+This campaign does not rerun a 500K population, claim hardware power-loss
+coverage, or close every RC.2 completion gate. Earlier scale results and failed
+attempts below retain their own scope and source checkpoints.
+
 ## Reproduce workspace checks
 
 Set `CARGO_TARGET_DIR` and `TMPDIR` to explicit task directories on storage with
@@ -130,7 +162,7 @@ reloads after two acknowledged parts, finds Resume in the Uploads modal and
 checks that only missing parts are sent, with no cancellation request. The
 production Console runtime is unchanged by this regression test.
 
-## Monitoring and recovery qualification — November 4, 2026
+## Earlier monitoring and recovery checkpoint — November 4, 2026
 
 The later monitoring work remains on `link`; `main` is held. Authoritative
 evidence is on `altear@192.168.254.107` under
@@ -186,16 +218,17 @@ A subsequent bounded per-file candidate also failed its 4,096-object smoke
 on admission and was rejected and reverted. A read-only restart audit checked
 all 128 captured successful rows / 1,787,920 bytes; there were no complete
 journaled batches in that attempt. Neither experiment is deployed.
-The next gated profile uses the original batch persistence with database,
+The subsequent gated profile used the original batch persistence with database,
 control and ACK journals on DATA_SSD and one member on each HDD. It explicitly
 sets metadata admission to four while retaining eight upload clients, the
 object engine's independent admission policy and all strict barriers/deadlines.
 This is a different placement/admission profile, not a retroactive pass for
 the failed HDD-database campaigns. Its 4,096-object smoke passed: 8,192 shards,
 no unexpected staging/pending/unreferenced files and every original version and
-all 57,213,440 bytes verified after both engines restarted. The API 500K run is
-active; Console 500K remains gated on its complete pass. Both larger terminal
-results are pending. `qualification-ssd21.sh` owns the sequential headless runs;
+all 57,213,440 bytes verified after both engines restarted. At that checkpoint,
+API 500K was active and Console 500K was gated on its complete pass. This
+checkpoint does not establish their later terminal outcomes.
+`qualification-ssd21.sh` owns the sequential headless runs;
 `qualification-evidence21.sh` retains resource summaries and separately audits
 ACKs if the API run fails. Both temporary user units use `Restart=no`.
 No server deadline or durability policy was weakened. The full current report
@@ -228,7 +261,7 @@ population campaigns.
 | MCH component regression and physical API | 246 passed, zero failed; eight explicit helper/physical exclusions; physical API witness and 1,024-object API smoke passed | [MCH full-stack report](/mnt/PROJECT-DISK-1TB/n1-mch-full-stack-20261103-01/reports/MCH-FULL-STACK-QUALIFICATION-20261103.md) |
 | Direct LINK 500,000-object campaign | Passed 500,000 durable ACKs, all exact full GETs after restart and a 1,000,000-shard census | [Object-only 500K report](/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/HEADLESS-500K-20261102-20261103.md); a separate earlier object-only snapshot |
 | Procyon metadata foundation on MCH HDDs | One million KV entries, 100K mutations, concurrent snapshots and two SIGKILL/resume cycles passed; other drives passed independent smaller campaigns | [Metadata KV report](/mnt/PROJECT-DISK-1TB/n1-mch-metadata-20261103-01/reports/MCH-METADATA-QUALIFICATION-20261103.md); not object uploads |
-| Current API and Console 500,000-object campaigns | In progress at the source checkpoint; no full-stack 500K pass recorded here | [Headless handover](/mnt/PROJECT-DISK-1TB/n1-mch-full-stack-20261103-01/reports/HEADLESS-HANDOVER-20261103.md) and the terminal files it identifies |
+| API and Console 500,000-object campaigns at that checkpoint | In progress at the source checkpoint; no full-stack 500K pass recorded in that snapshot | [Headless handover](/mnt/PROJECT-DISK-1TB/n1-mch-full-stack-20261103-01/reports/HEADLESS-HANDOVER-20261103.md) and the terminal files it identifies |
 
 Headless terminal JSON files and raw logs are authoritative for completion after
 this status snapshot. A populated dataset or upload progress line is not a
