@@ -333,6 +333,28 @@ GC use background scheduler lanes; optional maintenance cannot monopolize the
 foreground lane. `maintenance.health` exposes system, capacity, scheduler,
 backend and maintenance state.
 
+System Monitoring observes metadata and object nodes independently through the
+metadata API. Node CPU/RAM and process counters are collected where that process
+runs; object capacity is obtained across native NOA, never by opening object
+roots on the metadata host. Demand-driven observations use one collector and a
+shared cache per component. Sample age, pending/stale state and incomplete
+capacity remain visible. A Console refresh cannot bypass the configured
+sampling interval or start an object census. Explicit integrity checks have
+separate, single-admission asynchronous work. Logical live-byte capacity reads
+transactional counter shards rather than walking the namespace.
+Native pool allocation discovery reads immutable configuration and never waits
+for the monitoring collector. Live readiness and capacity use the health API.
+
+Metadata backups stream one cross-keyspace MVCC snapshot into a private,
+checksummed archive and publish it only after durable completion. They require
+an explicit operator request and configured metadata-host destination. Restore
+verifies the archive and publishes a new database directory without replacing
+an existing one. These archives contain metadata and LINK capabilities, not
+object payloads; whole-product recovery requires the matching object state and
+service credentials. Object recovery preserves logical pool/member identities
+across new filesystems and hosts. Runtime descriptor binding fences do not bind
+membership to a disk hardware serial number.
+
 Private service state lives outside object members. The engine holds the retained
 instance lease there and exclusive directory leases on members. Configuration
 binds every member ID, so mutually agreeing replacement markers cannot silently

@@ -113,6 +113,81 @@ pub struct Namespace {
 }
 
 impl Namespace {
+    /// Read bounded, sharded counters instead of scanning all logical names.
+    pub fn usage(&self, fragment: PoolId) -> Result<Option<Usage>> {
+        let snapshot = self.engine.snapshot();
+        if snapshot
+            .get(
+                Table::Reclamation,
+                &RecordKey::new(fragment, "usage/initialized")?,
+            )?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let mut result = Usage::default();
+        for (key, value) in
+            snapshot.scan(Table::Reclamation, fragment, "usage/bucket/", None, 256)?
+        {
+            if key.identifier().len() != 15 {
+                return Err(Error::Incompatible("invalid namespace usage bucket".into()));
+            }
+            let usage: Usage = decode(value)?;
+            result.used_bytes = result
+                .used_bytes
+                .checked_add(usage.used_bytes)
+                .ok_or_else(|| Error::Incompatible("namespace usage overflow".into()))?;
+            result.object_count = result
+                .object_count
+                .checked_add(usage.object_count)
+                .ok_or_else(|| Error::Incompatible("namespace count overflow".into()))?;
+        }
+        Ok(Some(result))
+    }
+    /// Explicit offline administration only; may read the full namespace.
+    pub fn recount_usage(&self, fragment: PoolId) -> Result<Usage> {
+        let snapshot = self.engine.snapshot();
+        let mut after = None;
+        let mut buckets = std::collections::BTreeMap::<String, Usage>::new();
+        loop {
+            let page = snapshot.scan(Table::Entries, fragment, "", after.as_ref(), 1000)?;
+            if page.is_empty() {
+                break;
+            }
+            for (key, value) in page {
+                after = Some(key);
+                let entry: Entry = decode(value)?;
+                if let Some(head) = entry.head {
+                    let bucket = buckets.entry(usage_bucket(&entry.object_id)?).or_default();
+                    bucket.used_bytes = bucket
+                        .used_bytes
+                        .checked_add(head.total_size_bytes)
+                        .ok_or_else(|| Error::Invalid("namespace byte count overflow".into()))?;
+                    bucket.object_count += 1;
+                }
+            }
+        }
+        self.engine.transact(ATTEMPTS, |tx| {
+            for (key, _) in tx.scan(Table::Reclamation, fragment, "usage/bucket/", None, 256)? {
+                tx.remove(Table::Reclamation, &key)?;
+            }
+            for (bucket, value) in &buckets {
+                put(
+                    tx,
+                    Table::Reclamation,
+                    &RecordKey::new(fragment, bucket)?,
+                    value,
+                )?;
+            }
+            tx.put(
+                Table::Reclamation,
+                &RecordKey::new(fragment, "usage/initialized")?,
+                b"1",
+            )?;
+            Ok(())
+        })?;
+        Ok(self.usage(fragment)?.expect("recount initialized usage"))
+    }
     /// Seek past a reported virtual prefix instead of visiting every child.
     /// Inclusive successor bounds preserve a real key at the exact boundary.
     pub(crate) fn shallow(
@@ -497,12 +572,16 @@ impl Namespace {
             if source == destination {
                 return Ok(());
             }
-            if let Some(other) = read::<Entry>(tx, Table::Entries, &destination)?
+            let previous_destination = read::<Entry>(tx, Table::Entries, &destination)?;
+            if let Some(other) = previous_destination.as_ref()
                 && other.object_id != entry.object_id
             {
                 return Err(Error::NameConflict(
                     "destination belongs to another logical object".into(),
                 ));
+            }
+            if let Some(other) = previous_destination {
+                update_usage(tx, fragment, &other.object_id, other.head.as_ref(), None)?;
             }
             put(tx, Table::Entries, &destination, &entry)?;
             tx.remove(Table::Entries, &source)?;
@@ -527,6 +606,7 @@ impl Namespace {
             let entry: Entry = read(tx, Table::Entries, &key)?
                 .filter(|entry: &Entry| entry.head.is_some())
                 .ok_or(Error::NotFound)?;
+            update_usage(tx, fragment, &entry.object_id, entry.head.as_ref(), None)?;
             put(
                 tx,
                 Table::Versions,
@@ -559,6 +639,7 @@ impl Namespace {
             let mut trash: Trash =
                 read(tx, Table::Reclamation, &trash_key)?.ok_or(Error::NotFound)?;
             let key = RecordKey::new(fragment, &trash.path)?;
+            let previous = read::<Entry>(tx, Table::Entries, &key)?;
             if let Some(other) = read::<Entry>(tx, Table::Entries, &key)? {
                 if other.object_id != trash.entry.object_id {
                     return Err(Error::NameConflict(
@@ -574,6 +655,13 @@ impl Namespace {
                 ));
             }
             put(tx, Table::Entries, &key, &trash.entry)?;
+            update_usage(
+                tx,
+                fragment,
+                &trash.entry.object_id,
+                previous.as_ref().and_then(|entry| entry.head.as_ref()),
+                trash.entry.head.as_ref(),
+            )?;
             put(
                 tx,
                 Table::Versions,
@@ -851,6 +939,13 @@ fn publish_record(
         .as_ref()
         .is_none_or(|head| head.version_id.as_str() < version_id)
     {
+        update_usage(
+            tx,
+            fragment,
+            &entry.object_id,
+            entry.head.as_ref(),
+            Some(&metadata),
+        )?;
         entry.head = Some(metadata.clone());
         put(tx, Table::Entries, &key, &entry)?;
     }
@@ -862,4 +957,45 @@ fn publish_record(
     )?;
     crate::uploads::progress::remove(tx, fragment, version_id)?;
     Ok(metadata)
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub used_bytes: u64,
+    pub object_count: u64,
+}
+fn usage_bucket(object: &str) -> Result<String> {
+    let id = Ulid::from_string(object)
+        .map_err(|_| Error::Incompatible("invalid object ID for namespace usage".into()))?;
+    Ok(format!("usage/bucket/{:02x}", id.to_bytes()[15]))
+}
+fn update_usage(
+    tx: &mut MetadataTransaction,
+    fragment: PoolId,
+    object: &str,
+    old: Option<&PublishedVersion>,
+    new: Option<&PublishedVersion>,
+) -> Result<()> {
+    if tx
+        .get(
+            Table::Reclamation,
+            &RecordKey::new(fragment, "usage/initialized")?,
+        )?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let key = RecordKey::new(fragment, usage_bucket(object)?)?;
+    let mut usage: Usage = read(tx, Table::Reclamation, &key)?.unwrap_or_default();
+    usage.used_bytes = usage
+        .used_bytes
+        .checked_sub(old.map_or(0, |v| v.total_size_bytes))
+        .and_then(|n| n.checked_add(new.map_or(0, |v| v.total_size_bytes)))
+        .ok_or_else(|| Error::Incompatible("namespace usage counter differs".into()))?;
+    usage.object_count = usage
+        .object_count
+        .checked_sub(u64::from(old.is_some()))
+        .and_then(|n| n.checked_add(u64::from(new.is_some())))
+        .ok_or_else(|| Error::Incompatible("namespace object counter differs".into()))?;
+    put(tx, Table::Reclamation, &key, &usage)
 }

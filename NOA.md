@@ -17,6 +17,15 @@ The selected engine determines the wire schema; `n1/0.5` and `n1/1` are distinct
 protocols. The LINK SDK/shell targets the object engine. The original Console
 targets metadata and retains its named-object operations.
 
+Console's dedicated object-backup operator connection is a separate
+administration boundary on the repository host. N1 Shell provides
+`POST /noa/v1/maintenance/backups/operation` with its own operator token,
+exact-origin allowlist and configured aliases. It delegates object capture and
+replication to NOA v2 and offline recovery to the existing backup tools.
+Fragment tokens do not authorize this endpoint. Metadata snapshots remain
+metadata-service NOA v1 operations. See [the operator guide](DOCUMENTATION.md)
+for configuration and coordinated recovery.
+
 ## NOA v1 — metadata engine
 
 This is the retained named-object standard under `/noa/v1`. It is a requirement
@@ -61,6 +70,40 @@ DELETE /noa/v1/fragments/{fragment}
 GET    /noa/v1/capacity/usage
 GET    /noa/v1/capacity/fragment
 ```
+
+Named capacity responses distinguish bounded transactional live-byte counts
+from cached physical object-filesystem capacity. `measurement=not_initialized`
+means unknown logical usage, never zero measured usage.
+
+### Monitoring and metadata snapshots
+
+`GET /noa/v1/maintenance/health` and
+`GET /noa/v1/maintenance/fragments/{fragment}/health` return
+`components.metadata` and `components.object`, each with its own node, process,
+metrics and observation age. Fragment scoping is authorized before observing.
+`GET /noa/v1/maintenance/pools/health` reports native object-pool members and
+capacity. Normal calls never scan payloads. `deep_scan=true` explicitly starts
+one asynchronous integrity check; subsequent `deep_scan=false` requests read
+its progress. `refresh=true` cannot bypass sampling admission. The explicit
+`live_counters=true` global health query reads current in-memory object I/O
+counters for diagnostics, retaining cached filesystem observations.
+
+Metadata snapshots require master-key operator authorization:
+
+```text
+GET  /noa/v1/maintenance/metadata/backups
+POST /noa/v1/maintenance/metadata/backups
+GET  /noa/v1/maintenance/metadata/backups/{id}/download
+POST /noa/v1/maintenance/metadata/backups/{id}/signed-url
+GET  /noa/v1/maintenance/metadata/signed-backup?token=SCOPED_GRANT
+```
+
+Named native operations are `maintenance.health`, `maintenance.pools.health`,
+`metadata.backups.list`, `metadata.backups.create` and
+`metadata.backups.download` (`snapshot` supplies the ID). Creation returns an
+accepted job, listing exposes its state, and download streams a completed
+snapshot. These are metadata database snapshots; object payload backup remains
+the independent object engine's recovery protocol.
 
 ### POSIX-Like Namespace
 
@@ -400,8 +443,10 @@ NOA v1 conformance pass**. Specific remaining differences include:
   the v1 inventory are not all registered by the metadata router.
 - The optional Accel search/read integration is not connected; search currently
   returns an unavailable response.
-- Metadata retention/reclamation and coordinated metadata/object backup need
-  completion. Object staging GC and object-only backups do not replace them.
+- Metadata retention/reclamation needs completion. Object staging GC does not
+  reclaim namespace history. Metadata snapshots and object recovery are separate
+  operations; a matching whole-product point requires the documented operator
+  pause. Independent live snapshots do not provide an atomic cross-service point.
 - Maintenance authorization/results and all retained request/response/retry
   semantics still require complete contract qualification. Redistribution must
   respect immutable pools; its current rejection is not a conformance pass.

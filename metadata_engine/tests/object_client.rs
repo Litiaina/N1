@@ -22,14 +22,25 @@ async fn write(stream: &mut TcpStream, value: Response) {
     stream.write_u32(bytes.len() as u32).await.unwrap();
     stream.write_all(&bytes).await.unwrap();
 }
-async fn login(stream: &mut TcpStream) {
+async fn login(stream: &mut TcpStream) -> bool {
     let request = read(stream).await;
-    assert!(matches!(request.command, Command::Login { .. }));
+    let password = match request.command {
+        Command::Login { .. } => true,
+        Command::Bearer { token } => {
+            assert_eq!(token, "service-test-token");
+            false
+        }
+        command => panic!("unexpected authentication command: {command:?}"),
+    };
     write(
         stream,
-        Response::ok(request.id, json!({"session":{"exp":9_999_999_999u64}})),
+        Response::ok(
+            request.id,
+            json!({"token":"service-test-token","session":{"exp":9_999_999_999u64}}),
+        ),
     )
     .await;
+    password
 }
 fn stat(id: u64) -> Response {
     Response::ok(
@@ -59,16 +70,22 @@ async fn independent_native_calls_run_concurrently_within_the_limit() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
-                login(&mut stream).await;
+                let password = login(&mut stream).await;
                 let request = read(&mut stream).await;
                 assert!(matches!(request.command, Command::ObjectStat { .. }));
                 barrier.wait().await;
                 write(&mut stream, stat(request.id)).await;
+                password
             }));
         }
+        let mut passwords = 0;
         for task in tasks {
-            task.await.unwrap();
+            passwords += usize::from(task.await.unwrap());
         }
+        assert_eq!(
+            passwords, 1,
+            "one password session must authenticate all four independent transports"
+        );
     });
     let mut calls = Vec::new();
     for _ in 0..4 {
@@ -151,7 +168,10 @@ async fn complete_control_errors_reuse_one_authenticated_connection() {
         let mut byte = [0];
         assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
         let (mut replacement, _) = listener.accept().await.unwrap();
-        login(&mut replacement).await;
+        assert!(
+            login(&mut replacement).await,
+            "a revoked session must not be reused"
+        );
         let request = read(&mut replacement).await;
         write(&mut replacement, stat(request.id)).await;
     });

@@ -16,10 +16,14 @@ optional metadata engine; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 | Named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
 | Public adapters | Main named NOA v1 HTTP/WebSocket and native operations; independent direct LINK NOA v2; original Console runtime/proxy retained |
 | Exports | Version-pinned ZIP64/TAR construction, job state, range and signed downloads through the metadata service |
+| Monitoring | Independently sampled metadata/object node health, cached filesystem/member capacity, bounded logical usage counters, explicit integrity checks and original Console service/pool panels |
+| Metadata recovery | Operator-requested checksummed MVCC snapshots, scoped downloads, fresh-directory restore and matching paused-writer object/metadata recovery procedure |
+| Console object recovery | Retained dedicated Shell operator contract; configured repository/replica/target aliases, explicit capture/verify/replicate/restore jobs using existing LINK recovery tools |
 
 Implemented is not synonymous with fully qualified. [TESTING.md](../TESTING.md)
 records completed checks and separates object-only, metadata-KV and full-stack
-results. The latest service source checkpoint is `9939ec8` on `link`.
+results. Each report identifies its source checkpoint and executable hashes;
+the current monitoring work remains on `link` with `main` held.
 
 ## Work required before completion
 
@@ -29,7 +33,7 @@ results. The latest service source checkpoint is `9939ec8` on `link`.
 | Immutable-pool maintenance mapping | Resolve every retained maintenance operation without mutating existing pool geometry. The current redistribution rejection and generic job adapter are not full contract parity. |
 | Metadata lifecycle / GC | Complete expired sessions, trash/history retention and explicit-key object reclamation with durable ownership/retry. A pending or live reference must never be discarded by guessing; LINK's staging GC cannot replace metadata reclamation. |
 | Export lifecycle | Complete and qualify retention/cleanup, restart behavior and resource limits for the complete named service. |
-| Named-service recovery | Coordinate a metadata database snapshot and matching LINK recovery points; test restore, reference integrity and replication. Object-only recovery points do not back up the namespace database. |
+| Named-service recovery | Matching metadata/object restore is physically exercised with exact named reads. Preserve the documented operator pause; independent live captures must never be presented as an atomic cross-service snapshot. Broader crash/churn qualification remains separate. |
 | Metadata request quotas | Complete and verify the configured named-service admission/rate policy; do not infer coverage from object-engine middleware. |
 | Optional Accel | Restore and qualify retained search/read integration when configured; preserve authoritative metadata resolution and direct-read fallback rules. |
 | Console and administration | Exercise the original product workflows and deployment/administration helpers against both engines. Passing three original live tests is scoped evidence, not complete feature parity. |

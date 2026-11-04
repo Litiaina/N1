@@ -14,11 +14,26 @@ n1_link = { path = "../link" }
 n1_native_client = { path = "../native_client" }
 serde_json.workspace = true
 tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+rand.workspace = true
+hex.workspace = true
+ulid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+n1 = { path = "../object_engine" }
 
 [dev-dependencies]
 rmp-serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
+tempfile = "3.20.0"
+rust-ini.workspace = true

@@ -67,6 +67,114 @@ fn fixture() -> (tempfile::TempDir, Namespace) {
 }
 
 #[test]
+fn usage_counters_follow_maximum_version_rename_trash_recovery_and_retries() {
+    let (_root, namespace) = fixture();
+    assert!(namespace.usage(FRAGMENT).unwrap().is_none());
+    namespace.recount_usage(FRAGMENT).unwrap();
+    let first = reserve(&namespace, "a", 10);
+    publish(&namespace, &first, 10);
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().object_count, 1);
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().used_bytes, 123);
+    publish(&namespace, &first, 10);
+    let older = reserve(&namespace, "a", 11);
+    let newer = reserve(&namespace, "a", 12);
+    publish(&namespace, &newer, 12);
+    publish(&namespace, &older, 11);
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().used_bytes, 123);
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().object_count, 1);
+    namespace.rename(FRAGMENT, "a", "b").unwrap();
+    let trash = namespace.trash(FRAGMENT, "b", 1700000001).unwrap();
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().object_count, 0);
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().used_bytes, 0);
+    namespace.recover(FRAGMENT, &trash).unwrap();
+    namespace.recover(FRAGMENT, &trash).unwrap();
+    assert_eq!(namespace.usage(FRAGMENT).unwrap().unwrap().object_count, 1);
+    assert_eq!(namespace.recount_usage(FRAGMENT).unwrap().used_bytes, 123);
+}
+
+#[test]
+fn concurrent_usage_counters_match_live_heads_in_every_cross_table_snapshot() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let (_root, namespace) = fixture();
+    namespace.recount_usage(FRAGMENT).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let reader_namespace = namespace.clone();
+    let read_running = running.clone();
+    let reader = std::thread::spawn(move || {
+        let mut checked = 0;
+        while read_running.load(Ordering::Acquire) {
+            let snapshot = reader_namespace.engine.snapshot();
+            let mut actual = Usage::default();
+            let mut after = None;
+            loop {
+                let rows = snapshot
+                    .scan(Table::Entries, FRAGMENT, "", after.as_ref(), 1000)
+                    .unwrap();
+                if rows.is_empty() {
+                    break;
+                }
+                for (key, value) in rows {
+                    after = Some(key);
+                    let entry: Entry = decode(value).unwrap();
+                    if let Some(head) = entry.head {
+                        actual.used_bytes += head.total_size_bytes;
+                        actual.object_count += 1;
+                    }
+                }
+            }
+            let mut counted = Usage::default();
+            for (_, value) in snapshot
+                .scan(Table::Reclamation, FRAGMENT, "usage/bucket/", None, 256)
+                .unwrap()
+            {
+                let usage: Usage = decode(value).unwrap();
+                counted.used_bytes += usage.used_bytes;
+                counted.object_count += usage.object_count;
+            }
+            assert_eq!(actual.used_bytes, counted.used_bytes);
+            assert_eq!(actual.object_count, counted.object_count);
+            checked += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        checked
+    });
+    let mut writers = Vec::new();
+    for writer in 0..8u128 {
+        let namespace = namespace.clone();
+        writers.push(std::thread::spawn(move || {
+            for index in 0..64u128 {
+                let n = writer * 64 + index + 1;
+                let path = format!("objects/{n}");
+                let handle = reserve(&namespace, &path, n);
+                publish(&namespace, &handle, n);
+                // Publication retries, rename and soft deletion must update
+                // counts in the same transaction as the visible namespace.
+                publish(&namespace, &handle, n);
+                let moved = format!("moved/{n}");
+                namespace.rename(FRAGMENT, &path, &moved).unwrap();
+                if index % 2 == 0 {
+                    let trash = namespace.trash(FRAGMENT, &moved, 1700000000).unwrap();
+                    if index % 4 == 0 {
+                        namespace.recover(FRAGMENT, &trash).unwrap();
+                    }
+                }
+            }
+        }));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    running.store(false, Ordering::Release);
+    assert!(reader.join().unwrap() > 0);
+    let usage = namespace.usage(FRAGMENT).unwrap().unwrap();
+    assert_eq!(usage.object_count, 384);
+    assert_eq!(usage.used_bytes, 384 * 123);
+}
+
+#[test]
 fn maximum_ulid_wins_even_when_an_older_upload_finishes_last() {
     let (_root, namespace) = fixture();
     let older = reserve(&namespace, "file", 1);

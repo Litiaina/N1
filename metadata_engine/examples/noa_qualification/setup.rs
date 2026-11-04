@@ -10,6 +10,7 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub root: PathBuf,
+    pub first: PathBuf,
     pub second: PathBuf,
     pub url: String,
     pub metadata_native: u16,
@@ -73,11 +74,25 @@ fn hash(path: &Path) -> Result<String> {
 }
 impl Stack {
     pub async fn open(args: &Args) -> Result<Self> {
-        if !args.root.is_absolute() || !args.second_root.is_absolute() {
+        if !args.root.is_absolute()
+            || !args.second_root.is_absolute()
+            || args
+                .first_root
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+        {
             return Err("qualification roots must be absolute".into());
         }
         directory(&args.root)?;
+        if let Some(first) = &args.first_root {
+            directory(first)?;
+        }
         directory(&args.second_root)?;
+        if let Some(first) = &args.first_root
+            && std::fs::metadata(first)?.dev() == std::fs::metadata(&args.second_root)?.dev()
+        {
+            return Err("object members require two independent filesystems".into());
+        }
         if std::fs::metadata(&args.root)?.dev() == std::fs::metadata(&args.second_root)?.dev() {
             return Err("two independent filesystems are required".into());
         }
@@ -101,6 +116,15 @@ impl Stack {
             {
                 return Err("resume roots do not match this campaign".into());
             }
+            let expected = match &args.first_root {
+                Some(parent) => parent
+                    .join(format!("n1-noa-{}", c.identity))
+                    .join("member0"),
+                None => args.root.join("member0"),
+            };
+            if c.first.canonicalize()? != expected.canonicalize()? {
+                return Err("resume first member does not match this campaign".into());
+            }
             c.object_binary = args.object_binary.canonicalize()?;
             c.metadata_binary = args.metadata_binary.canonicalize()?;
             c
@@ -110,7 +134,11 @@ impl Stack {
             directory(&second)?;
             directory(&args.root.join("object"))?;
             directory(&args.root.join("metadata"))?;
-            let member0 = args.root.join("member0");
+            let member0 = args
+                .first_root
+                .as_ref()
+                .map(|parent| parent.join(format!("n1-noa-{identity}")).join("member0"))
+                .unwrap_or_else(|| args.root.join("member0"));
             let member1 = second.join("member1");
             directory(&member0)?;
             directory(&member1)?;
@@ -164,6 +192,10 @@ impl Stack {
                 ini.with_section(Some("rate_limiter_config"))
                     .set("enable_rate_limiting", "false");
                 if component == "metadata" {
+                    if let Some(limit) = args.metadata_max_concurrent_io {
+                        ini.with_section(Some("upload_config"))
+                            .set("max_concurrent_io", limit.to_string());
+                    }
                     ini.with_section(Some("metadata_engine"))
                         .set(
                             "object_native_url",
@@ -184,6 +216,7 @@ impl Stack {
             }
             let c = Config {
                 root: args.root.clone(),
+                first: member0,
                 second,
                 url: format!("http://127.0.0.1:{metadata_http}"),
                 metadata_native,

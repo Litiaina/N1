@@ -21,6 +21,7 @@ pub struct Service {
     pub jobs: Arc<crate::core::maintenance::jobs::Jobs>,
     pub recovery_jobs: Arc<crate::core::backup::jobs::Jobs>,
     pub transfers: Arc<tokio::sync::Semaphore>,
+    pub(crate) observations: Arc<cli_core::monitoring::ObservationCache>,
 }
 impl Service {
     /// Called on the startup blocking executor; pool opens never block an async
@@ -69,6 +70,7 @@ impl Service {
             jobs: crate::core::maintenance::jobs::Jobs::new(),
             recovery_jobs: crate::core::backup::jobs::Jobs::new(),
             transfers: Arc::new(tokio::sync::Semaphore::new(2)),
+            observations: Arc::default(),
         }))
     }
     pub fn ping(&self) -> Value {
@@ -433,18 +435,24 @@ impl Service {
                 })?)
             }
             Command::Health => {
-                let system = crate::core::system::get_system_metrics().await;
-                let capacity =
-                    crate::core::capacity_manager::get_storage_usage(&self.store.pools).await?;
+                let observed = super::monitoring::observe(self.clone()).await;
+                let snapshot = observed.value.clone().unwrap_or(Value::Null);
+                let stale = observed
+                    .age_seconds
+                    .is_none_or(|age| age > observed.interval_seconds.saturating_mul(2));
                 Ok(
-                    json!({"engine":self.ping(),"io":crate::io_control::io_control_snapshot(),"system":system,"capacity":capacity,
+                    json!({"engine":self.ping(),"node":snapshot["node"],"status":if stale {json!("pending")}else{snapshot["status"].clone()},"observation":observed,
+                    "io":crate::io_control::io_control_snapshot(),"system":snapshot["system"],"capacity":snapshot["capacity"],"pools":snapshot["pools"],
                     "operations":self.store.activity.status()?,"monitor":self.store.monitor.lock().unwrap_or_else(|error|error.into_inner()).clone(),
                     "maintenance":crate::core::auto_healing::status(&self.store.operation_gate),"job":self.jobs.status()?,
                     "configuration":{"native_address":self.config.native_address,"http_address":self.config.http_address,"max_connections":self.config.max_connections,
                     "max_operations":self.config.max_operations,"operation_memory_bytes":self.config.operation_memory_bytes,"concurrency":self.config.concurrency,
-                    "runtime":self.config.runtime,"scheduled_maintenance":self.config.maintenance}}),
+                    "runtime":self.config.runtime,"read_repair":self.config.read_repair,"scheduled_maintenance":self.config.maintenance}}),
                 )
             }
+            // Allocation discovery is immutable configuration, not monitoring.
+            // Keep it independent of a slow/cold filesystem observation. Live
+            // member readiness and capacity belong to the cached Health call.
             Command::Pools => Ok(
                 json!({"pools":self.config.pools.iter().enumerate().map(|(i,p)|json!({
                 "id":p.layout.id,"generation":p.layout.generation,"data_shards":p.layout.data_shards,"parity_shards":p.layout.parity_shards,

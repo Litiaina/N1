@@ -16,7 +16,7 @@ pub(super) async fn status(client: &Client, route: &str, token: &str, version: &
 pub(super) async fn health_submitted(client: &Client, base: &str, token: &str) -> u64 {
     json_response(
         client
-            .get(format!("{base}/maintenance/health"))
+            .get(format!("{base}/maintenance/health?live_counters=true"))
             .bearer_auth(token)
             .send()
             .await

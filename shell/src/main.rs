@@ -2,6 +2,8 @@
 use clap::Parser;
 mod args;
 mod offline;
+#[cfg(target_os = "linux")]
+mod operator;
 use args::{Action, BackupAction, Cli};
 use cli_core::{Credentials, Result, aligned_part, result, stripe_bytes};
 use n1_link::noa::{Command, ScrubOptions};
@@ -11,6 +13,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 impl BackupAction {
     fn command(self) -> Result<Command> {
         Ok(match self {
+            Self::Serve { .. } | Self::OperatorKeygen { .. } => {
+                return Err("operator commands run on the repository host".into());
+            }
             Self::Offline(_) => {
                 return Err("offline backup must run through the offline dispatcher".into());
             }
@@ -75,6 +80,31 @@ async fn main() {
     }
 }
 async fn run(cli: Cli) -> Result<()> {
+    match &cli.command {
+        Action::Backup {
+            command: BackupAction::Serve { config },
+        } => {
+            #[cfg(target_os = "linux")]
+            return operator::serve(config).await;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = config;
+                return Err("the repository operator host requires Linux".into());
+            }
+        }
+        Action::Backup {
+            command: BackupAction::OperatorKeygen { token_file },
+        } => {
+            #[cfg(target_os = "linux")]
+            return operator::config::generate_token(token_file);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = token_file;
+                return Err("the repository operator host requires Linux".into());
+            }
+        }
+        _ => (),
+    }
     let offline = match &cli.command {
         Action::Pool(args) => Some(("pool", args.clone())),
         Action::Backup {

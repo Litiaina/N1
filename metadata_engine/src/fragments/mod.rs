@@ -81,6 +81,11 @@ pub fn create(db: &MetadataEngine, name: &str, key_hash: &str) -> Result<Fragmen
             &key(format!("fragment/{}", record.id))?,
             &encode(&record)?,
         )?;
+        tx.put(
+            Table::Reclamation,
+            &RecordKey::new(record.id, "usage/initialized")?,
+            b"1",
+        )?;
         Ok(())
     })?;
     Ok(record)

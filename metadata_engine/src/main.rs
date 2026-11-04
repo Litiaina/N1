@@ -26,6 +26,20 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Restore a verified metadata snapshot into a NEW database directory.
+    Restore {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Explicit offline rebuild of a fragment's logical usage counters.
+    Recount {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        fragment: String,
+    },
 }
 
 fn main() {
@@ -58,7 +72,28 @@ fn main() {
 }
 
 fn run(cli: Cli) -> n1_metadata_engine::Result<()> {
+    if let Command::Recount { data_dir, fragment } = cli.command {
+        let db = MetadataEngine::open(data_dir, Options::default())?;
+        let fragment = n1_metadata_engine::fragments::resolve(&db, &fragment)?;
+        let usage = n1_metadata_engine::namespace::Namespace::new(db).recount_usage(fragment.id)?;
+        println!(
+            "{}",
+            serde_json::to_string(&usage)
+                .map_err(|e| n1_metadata_engine::Error::Invalid(e.to_string()))?
+        );
+        return Ok(());
+    }
+    if let Command::Restore { snapshot, data_dir } = cli.command {
+        let records = MetadataEngine::restore_backup(&snapshot, &data_dir)?;
+        println!(
+            "{}",
+            serde_json::json!({"restored_records":records,"data_dir":data_dir})
+        );
+        return Ok(());
+    }
     let path = match cli.command {
+        Command::Restore { .. } => unreachable!("restore handled separately"),
+        Command::Recount { .. } => unreachable!("recount handled separately"),
         Command::Serve { .. } => unreachable!("serve runs inside its async runtime"),
         Command::Init { data_dir } => {
             if data_dir.exists() && std::fs::read_dir(&data_dir)?.next().is_some() {

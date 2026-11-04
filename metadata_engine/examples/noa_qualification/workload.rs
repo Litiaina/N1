@@ -40,6 +40,11 @@ impl Api {
     pub async fn open(config: &Config, mode: &str) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
+            // Reqwest 0.12 defaults TCP_USER_TIMEOUT to 30 seconds on Linux.
+            // Multipart parsing legitimately applies backpressure while a
+            // durable group commits. Keep the transport within the existing
+            // 300-second request budget, without changing N1's I/O deadline.
+            .tcp_user_timeout(std::time::Duration::from_secs(300))
             .pool_max_idle_per_host(64)
             .build()?;
         let label = format!("N1 qualification {} {mode}", config.identity);
@@ -180,7 +185,7 @@ pub async fn populate(api: Api, root: &Path, count: u64, writers: usize) -> Resu
   loop{let start=next.fetch_add(256,Ordering::Relaxed);if start>=count{break;}let indices=(start..(start+256).min(count)).filter(|i|old[*i as usize].is_none()).collect::<Vec<_>>();if indices.is_empty(){continue;}
    let mut recovered=Vec::new();let mut missing=Vec::new();
    if resuming{for index in indices{let response=api.get("api",index).await?;if response.status()==200{let tag=response.headers().get("etag").and_then(|v|v.to_str().ok()).ok_or("recovered object has no version ETag")?.trim_matches('"').to_owned();let bytes=response.bytes().await?;if bytes.as_ref()!=payload(index){return Err("uncertain prior upload has different bytes; refusing overwrite".into());}recovered.push(Ack{index,version:tag});}else if response.status()==404{missing.push(index);}else{return Err(format!("uncertain upload lookup returned {}",response.status()).into());}}}else{missing=indices;}
-   let mut rows=recovered;if !missing.is_empty(){let mut form=reqwest::multipart::Form::new();for index in &missing{form=form.part("object",reqwest::multipart::Part::bytes(payload(*index)).file_name(name("api",*index)).mime_str("application/octet-stream")?);}let begin=Instant::now();let response=api.client.post(format!("{}/noa/v1/upload/batch?durability=strict",api.url)).bearer_auth(api.token().await?).multipart(form).send().await?;let status=response.status();let response:Value=response.json().await?;if status!=201{return Err(format!("batch failed: {status} {response}").into());}let entries=response["results"].as_array().ok_or("batch returned no result entries")?;if entries.len()!=missing.len(){return Err("batch result count mismatch".into());}
+   let mut rows=recovered;if !missing.is_empty(){let mut form=reqwest::multipart::Form::new();for index in &missing{form=form.part("object",reqwest::multipart::Part::bytes(payload(*index)).file_name(name("api",*index)).mime_str("application/octet-stream")?);}let begin=Instant::now();let response=api.client.post(format!("{}/noa/v1/upload/batch?durability=strict",api.url)).bearer_auth(api.token().await?).multipart(form).send().await?;let response=batch_response(response).await?;let entries=response["results"].as_array().ok_or("batch returned no result entries")?;if entries.len()!=missing.len(){return Err("batch result count mismatch".into());}
     let mut seen=std::collections::BTreeSet::new();for result in entries{if result["status"]!=201{return Err("batch returned unconfirmed result".into());}let path=result["object_key"].as_str().ok_or("batch object key missing")?;let index=path.strip_prefix("qual/api/").and_then(|s|s.strip_suffix(".bin")).ok_or("batch returned foreign path")?.parse::<u64>()?;if !missing.contains(&index)||!seen.insert(index){return Err("batch returned duplicate or foreign index".into());}let version=result["version_id"].as_str().ok_or("batch returned no version")?.to_owned();let parsed=ulid::Ulid::from_string(&version)?;if parsed.to_string()!=version||result["total_size_bytes"].as_u64()!=Some(SIZES[index as usize%8]as u64){return Err("batch result has wrong version or byte count".into());}rows.push(Ack{index,version});}
     writeln!(samples,"{}",json!({"count":missing.len(),"milliseconds":begin.elapsed().as_secs_f64()*1000.0}))?;samples.flush()?;
    }
@@ -205,6 +210,24 @@ fn acknowledged_read(root: &Path, count: u64) -> Result<u64> {
         .iter()
         .filter(|v| v.is_some())
         .count() as u64)
+}
+async fn batch_response(response: reqwest::Response) -> Result<Value> {
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("batch response body failed, status={status}: {error:?}"))?;
+    let body: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "batch response is not JSON, status={status}, length={}, prefix={:?}: {error}",
+            bytes.len(),
+            String::from_utf8_lossy(&bytes[..bytes.len().min(200)])
+        )
+    })?;
+    if status != 201 {
+        return Err(format!("batch failed: {status} {body}").into());
+    }
+    Ok(body)
 }
 pub async fn verify(
     api: Api,

@@ -124,6 +124,16 @@ pub(crate) enum Action {
 }
 #[derive(Subcommand)]
 pub(crate) enum BackupAction {
+    /// Serve the Console's dedicated operator API on the repository host.
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Generate an owner-only operator API token without printing it.
+    OperatorKeygen {
+        #[arg(long)]
+        token_file: PathBuf,
+    },
     /// Run offline backup/recovery without opening a native connection.
     Offline(OfflineArgs),
     Capture {

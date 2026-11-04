@@ -50,6 +50,14 @@ pub struct Pool {
     pub members: Vec<Option<Arc<Member>>>,
 }
 
+impl Member {
+    /// Monitoring uses the same pinned device and binding fence as object I/O.
+    pub fn filesystem_metrics(&self) -> Result<cli_core::system::FilesystemMetrics> {
+        self.check_binding()?;
+        Ok(cli_core::system::filesystem_metrics(&self.root)?)
+    }
+}
+
 impl Pool {
     /// Resume only a durably planned, unpublished enrollment. The caller holds
     /// the node's control lease and supplies identities from its trusted journal.

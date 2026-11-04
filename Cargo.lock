@@ -2007,14 +2007,27 @@ dependencies = [
 name = "n1_shell"
 version = "1.0.0-RC.2"
 dependencies = [
+ "axum",
+ "axum-server",
  "clap",
  "cli_core",
+ "hex",
  "libc",
+ "n1",
  "n1_link",
  "n1_native_client",
+ "rand 0.8.5",
+ "reqwest",
  "rmp-serde",
+ "rust-ini",
+ "rustls",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
+ "tower-http",
+ "ulid",
 ]
 
 [[package]]

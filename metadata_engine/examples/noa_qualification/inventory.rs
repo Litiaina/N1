@@ -92,7 +92,7 @@ pub(super) fn census(config: &Config, alias: &str, mode: &str, count: u64) -> Re
     {
         return Err("completed campaign retains unfinished publication intents".into());
     }
-    let roots = [config.root.join("member0"), config.second.join("member1")];
+    let roots = [config.first.clone(), config.second.join("member1")];
     let mut physical = 0u64;
     let mut staged = 0;
     fn walk(

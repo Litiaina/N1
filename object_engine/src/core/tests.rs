@@ -1395,6 +1395,87 @@ async fn batch_short_body_never_publishes_earlier_items_and_can_resume() {
 }
 
 #[tokio::test]
+async fn cancelled_batch_owner_finishes_durable_publication_before_shutdown_drains() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+    struct Reader {
+        input: tokio::io::DuplexStream,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl AsyncRead for Reader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            Pin::new(&mut self.input).poll_read(cx, buf)
+        }
+    }
+    let fixture = Fixture::new();
+    let store = fixture.enroll();
+    let data = source(12288);
+    let items = (0..3)
+        .map(|_| {
+            store
+                .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let tickets = items.iter().map(|item| item.upload_key.clone()).collect();
+    let (input, mut output) = tokio::io::duplex(1024);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let worker = store.clone();
+    let caller = tokio::spawn(async move {
+        worker
+            .put_batch(
+                SCOPE,
+                tickets,
+                Reader {
+                    input,
+                    started: Some(started),
+                },
+            )
+            .await
+    });
+    ready.await.unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    store.activity.close().unwrap();
+    let activity = store.activity.clone();
+    let mut drained = tokio::spawn(async move { activity.wait_idle().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut drained)
+            .await
+            .is_err()
+    );
+    output.write_all(&data.repeat(3)).await.unwrap();
+    output.shutdown().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), drained)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(store);
+    let store = fixture.reopen();
+    for item in items {
+        assert_eq!(
+            store
+                .download(SCOPE, item.object_key, 0, None, Vec::new())
+                .await
+                .unwrap()
+                .0,
+            data
+        );
+    }
+}
+
+#[tokio::test]
 async fn batches_reject_duplicate_identities_and_cannot_recreate_retired_keys() {
     let fixture = Fixture::new();
     let store = fixture.enroll();

@@ -26,10 +26,11 @@ Set `CARGO_TARGET_DIR` and `TMPDIR` to explicit task directories on storage with
 adequate space before invoking these commands:
 
 ```sh
+export N1_LINK_TEST_ROOT="$TMPDIR/n1-link-tests"
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo test -p n1_metadata_engine -p procyon-engine --doc --locked
-cargo clippy -p n1 -p n1_metadata_engine -p cli_core --all-targets --no-deps --locked -- -D warnings
+cargo clippy -p n1 -p n1_metadata_engine -p cli_core -p n1_shell --all-targets --no-deps --locked -- -D warnings
 ```
 
 Use `--offline` only when the locked dependencies are already available.
@@ -47,7 +48,18 @@ The source contains the following Rust physical harnesses:
   uploads through both services, frozen executable/source provenance, ACK
   journals, process crashes, physical census and exact version/payload readback.
 - `metadata_engine/examples/failed_batch_audit.rs`: read-only recovery audit of
-  captured successful rows from a retained failed attempt.
+  every journaled ACK and captured successful mixed-batch row from a retained
+  failed attempt, using the original executables. It never retries failed rows.
+- `metadata_engine/examples/qualification_observer.rs`: read-only Linux process,
+  wait-channel, I/O-pressure and device samples alongside a supervised campaign.
+  It neither calls N1 nor changes service or host tuning.
+- `shell/tests/operator_live.rs`: opt-in real original Console backup controls,
+  dedicated HTTP operator host, native object capture/replication, exact restored
+  payload and permanent retirement. Rust owns the isolated services and oracle;
+  the Console's `n1-link-backups.live.mjs` only drives the browser. Requires
+  `N1_OPERATOR_TEST_ROOT` (owner-only RAM/HDD parent), `N1_OBJECT_TEST_BINARY`,
+  `N1_CONSOLE_REPO`, `N1_BROWSER_NODE`, built Console assets and Chromium.
+  Invoke `cargo test -p n1_shell --test operator_live -- --ignored --nocapture`.
 - `metadata_engine/examples/qualification_summary.rs`: read-only summary of
   existing latency/resource evidence; it cannot manufacture a campaign pass.
 - `metadata_engine/examples/upload_comparison.rs`: matched native LINK,
@@ -117,6 +129,77 @@ The original Console's `tests/live-reload-resume.spec.ts` starts a real upload,
 reloads after two acknowledged parts, finds Resume in the Uploads modal and
 checks that only missing parts are sent, with no cancellation request. The
 production Console runtime is unchanged by this regression test.
+
+## Monitoring and recovery qualification — November 4, 2026
+
+The later monitoring work remains on `link`; `main` is held. Authoritative
+evidence is on `altear@192.168.254.107` under
+`/mnt/DATA_SSD/n1-local-test-20261103-01/health-monitoring-01`. Task-owned HDD
+roots are under `/media/altear/PROJECT-1TB/n1-monitoring-20261104` and
+`/media/altear/TEST-1TB/mx-tests/n1-monitoring-20261104`; whole drives were not
+reformatted. Workstation browser output uses RAM; builds/reports use DATA_SSD.
+
+The complete workspace passed **440 cases** (`workspace-final13.log`), and
+scoped strict Clippy passed. The ordinary run leaves opt-in physical/helper
+cases ignored; these are not counted as passes. Separate completed witnesses
+include two-HDD service monitoring/outage/metadata restore, matched transfers,
+matching named metadata/object recovery, process-crash/retirement/member
+recovery, actual INI pool expansion, and explicit io_uring with no fallback.
+Their raw files are `physical-final.log`, `combined-recovery-final.log`,
+`object-chaos-final.log`, `ini-physical-final.log` and `uring-final.log`.
+
+Two physical machines also passed live Console service monitoring and object
+outage tests; matching hostnames were distinguished using kernel boot IDs.
+Native encrypted backup transfer crossed those nodes and the destination
+verified the point. A replacement on a different device preserved the logical
+member identity; an opt-in scrub repaired deliberate corruption with read
+repair disabled, followed by exact 8,388,627-byte GET verification. Terminal
+JSON files name each scope explicitly.
+
+The full desktop Console suite passed **150 cases**, with six opt-in cases
+skipped. Monitoring/backups passed **30 checks across all five viewport
+profiles**; these overlap the desktop suite rather than adding 30 new cases.
+All **38 Node cases** and static validation passed. The separate Rust
+`operator_live` witness drives the actual Console through its dedicated Shell
+host: capture, verify, native replication, restore, exact payload and retirement,
+plus truthful failures for a running offline source and the last recovery point.
+Its RAM control fixture is distinct from the physical backup/replacement tests.
+
+The eight-writer full-stack attempts **failed** on 30-second object write
+admission while strict filesystem flushes held all six per-fragment slots.
+Read-only audits verified every **52,480** and **56,832** respective journaled
+ACKs plus each retained mixed response's **192** successful rows, with exact
+versions/bytes after restart. Neither failed population is a 500K pass.
+The separate default four-writer 500K API campaign also **failed**, on its
+300-second HTTP request budget. A read-only restart audit verified all
+**101,120 journaled ACKs / 1,412,456,800 bytes**, with zero payload/version
+mismatches. No complete response was captured for the timed-out batch, so its
+unacknowledged outcomes are not guessed. The gated Console phase never started.
+Eight readers perform post-restart readback, not simultaneous fresh population.
+
+The Rust client's original 30-second TCP user timeout was also diagnosed and
+aligned with its existing 300-second request budget. A fresh 4,096-object
+strict/restart/full-read smoke passed, but the later eight-writer server
+admission failure remains recorded. An experimental per-file persistence path
+was rejected after its HDD stall and the original persistence code restored.
+A subsequent bounded per-file candidate also failed its 4,096-object smoke
+on admission and was rejected and reverted. A read-only restart audit checked
+all 128 captured successful rows / 1,787,920 bytes; there were no complete
+journaled batches in that attempt. Neither experiment is deployed.
+The next gated profile uses the original batch persistence with database,
+control and ACK journals on DATA_SSD and one member on each HDD. It explicitly
+sets metadata admission to four while retaining eight upload clients, the
+object engine's independent admission policy and all strict barriers/deadlines.
+This is a different placement/admission profile, not a retroactive pass for
+the failed HDD-database campaigns. Its 4,096-object smoke passed: 8,192 shards,
+no unexpected staging/pending/unreferenced files and every original version and
+all 57,213,440 bytes verified after both engines restarted. The API 500K run is
+active; Console 500K remains gated on its complete pass. Both larger terminal
+results are pending. `qualification-ssd21.sh` owns the sequential headless runs;
+`qualification-evidence21.sh` retains resource summaries and separately audits
+ACKs if the API run fails. Both temporary user units use `Restart=no`.
+No server deadline or durability policy was weakened. The full current report
+is `WHOLE-N1-MONITORING-RECOVERY-20261104.md` in the remote evidence directory.
 
 ## Recorded evidence as of November 3, 2026
 

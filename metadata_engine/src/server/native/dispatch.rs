@@ -108,6 +108,16 @@ pub(super) async fn dispatch(
         "auth.refresh" => ("POST", "/noa/v1/auth/refresh".into()),
         "auth.logout" => ("POST", "/noa/v1/auth/logout".into()),
         "maintenance.health" => ("GET", "/noa/v1/maintenance/health".into()),
+        "maintenance.pools.health" => ("GET", "/noa/v1/maintenance/pools/health".into()),
+        "metadata.backups.list" => ("GET", "/noa/v1/maintenance/metadata/backups".into()),
+        "metadata.backups.create" => ("POST", "/noa/v1/maintenance/metadata/backups".into()),
+        "metadata.backups.download" => (
+            "GET",
+            format!(
+                "/noa/v1/maintenance/metadata/backups/{}/download",
+                field("snapshot")?
+            ),
+        ),
         "capacity.usage" => ("GET", "/noa/v1/capacity/usage".into()),
         "capacity.fragment" => ("GET", "/noa/v1/capacity/fragment".into()),
         "object.status" => (

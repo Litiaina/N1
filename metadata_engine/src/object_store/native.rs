@@ -29,8 +29,15 @@ struct Inner {
     config: ObjectStoreConfig,
     permits: Arc<Semaphore>,
     idle: Mutex<Vec<CachedClient>>,
+    session: Mutex<Option<ServiceSession>>,
     lifecycle: Arc<RwLock<()>>,
     logins: Semaphore,
+}
+
+#[derive(Clone)]
+struct ServiceSession {
+    token: String,
+    expires_at: u64,
 }
 
 struct CachedClient {
@@ -90,6 +97,7 @@ impl NativeObjectStore {
         Ok(Self(Arc::new(Inner {
             permits: Arc::new(Semaphore::new(config.max_connections)),
             idle: Mutex::new(Vec::new()),
+            session: Mutex::new(None),
             lifecycle: Arc::new(RwLock::new(())),
             logins: Semaphore::new(1),
             config,
@@ -106,10 +114,7 @@ impl NativeObjectStore {
             .await
             .map_err(|_| ObjectStoreError::Closed)?;
         let cached = self.0.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| ObjectStoreError::Invalid("system time precedes the Unix epoch"))?
-            .as_secs();
+        let now = unix_now()?;
         let cached = cached.filter(|cached| {
             cached.expires_at > now.saturating_add(30)
                 && cached.released_at.elapsed() < MAX_IDLE_AGE
@@ -117,33 +122,67 @@ impl NativeObjectStore {
         let (client, expires_at) = if let Some(cached) = cached {
             (cached.client, cached.expires_at)
         } else {
-            let mut client = N1NativeClient::connect_with_tls(
-                &self.0.config.native_url,
-                self.0.config.tls.clone(),
-            )
-            .await?;
-            // Opening transports must not fan out expensive password hashes
-            // beyond the object's authentication admission. Existing pooled
-            // transports perform ordinary object operations concurrently.
+            // Authenticate new transports with the pool's existing service
+            // session. Password verification and durable session creation are
+            // needed once per renewal, not once per concurrent connection.
+            // Neither authentication nor object quotas are bypassed.
             let _login = self
                 .0
                 .logins
                 .acquire()
                 .await
                 .map_err(|_| ObjectStoreError::Closed)?;
-            let response = client
-                .auth_fragment(&self.0.config.fragment, &self.0.config.secret)
-                .await?;
+            let mut client = N1NativeClient::connect_with_tls(
+                &self.0.config.native_url,
+                self.0.config.tls.clone(),
+            )
+            .await?;
+            let now = unix_now()?;
+            let session = self
+                .0
+                .session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .filter(|session| session.expires_at > now.saturating_add(30));
+            let response = match &session {
+                Some(session) => client.auth_bearer(session.token.clone()).await,
+                None => {
+                    client
+                        .auth_fragment(&self.0.config.fragment, &self.0.config.secret)
+                        .await
+                }
+            }
+            .map_err(|error| {
+                if matches!(&error, NativeClientError::Native {code,..} if code=="401") {
+                    self.invalidate_authorization();
+                }
+                ObjectStoreError::from(error)
+            })?;
             let expires_at = response
                 .result
                 .as_ref()
                 .and_then(|result| result.get("session"))
                 .and_then(|session| session.get("exp"))
                 .and_then(serde_json::Value::as_u64)
-                .filter(|expiry| *expiry > now.saturating_add(30))
+                .filter(|expiry| unix_now().is_ok_and(|now| *expiry > now.saturating_add(30)))
                 .ok_or(ObjectStoreError::Contract(
                     "object login returned an invalid session lifetime",
                 ))?;
+            if session.is_none() {
+                let token = response
+                    .result
+                    .as_ref()
+                    .and_then(|r| r["token"].as_str())
+                    .filter(|token| !token.is_empty() && token.len() <= 16384)
+                    .ok_or(ObjectStoreError::Contract(
+                        "object login returned no service token",
+                    ))?;
+                *self.0.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(ServiceSession {
+                    token: token.into(),
+                    expires_at,
+                });
+            }
             (client, expires_at)
         };
         Ok(Connection {
@@ -165,6 +204,31 @@ impl NativeObjectStore {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         let _drained = self.0.lifecycle.write().await;
+        self.0
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    fn invalidate_authorization(&self) {
+        self.0
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.0
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn failed(&self, error: NativeClientError) -> ObjectStoreError {
+        if matches!(&error, NativeClientError::Native {code,..} if code=="401") {
+            self.invalidate_authorization();
+        }
+        error.into()
     }
 
     async fn command<T: DeserializeOwned>(&self, command: Command) -> ObjectStoreResult<T> {
@@ -183,7 +247,7 @@ impl NativeObjectStore {
                 if matches!(&error, NativeClientError::Native { code, .. } if code != "401") {
                     connection.release();
                 }
-                Err(error.into())
+                Err(self.failed(error))
             }
         }
     }
@@ -247,7 +311,8 @@ impl NativeObjectStore {
         connection
             .client
             .upload_part(upload.upload_key.clone(), part, length, source)
-            .await?;
+            .await
+            .map_err(|error| self.failed(error))?;
         connection.release();
         Ok(())
     }
@@ -262,7 +327,8 @@ impl NativeObjectStore {
             connection
                 .client
                 .put(upload.upload_key.clone(), upload.total_bytes, source)
-                .await?,
+                .await
+                .map_err(|error| self.failed(error))?,
         )?;
         check_finalization(upload, &result)?;
         connection.release();
@@ -302,7 +368,8 @@ impl NativeObjectStore {
                     length,
                     source,
                 )
-                .await?,
+                .await
+                .map_err(|error| self.failed(error))?,
         )?
         .objects;
         if result.len() != uploads.len() {
@@ -387,7 +454,8 @@ impl NativeObjectStore {
         let (_, length) = connection
             .client
             .download(object_key.into(), offset, length, destination)
-            .await?;
+            .await
+            .map_err(|error| self.failed(error))?;
         connection.release();
         Ok(length)
     }
@@ -419,6 +487,13 @@ impl NativeObjectStore {
         })
         .await
     }
+}
+
+fn unix_now() -> ObjectStoreResult<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .map_err(|_| ObjectStoreError::Invalid("system time precedes the Unix epoch"))
 }
 
 fn decode<T: DeserializeOwned>(response: Response) -> ObjectStoreResult<T> {
@@ -461,12 +536,21 @@ mod tests {
         stream.write_u32(bytes.len() as u32).await.unwrap();
         stream.write_all(&bytes).await.unwrap();
     }
-    async fn authenticated_stat(stream: &mut TcpStream) {
+    async fn authenticated_stat(stream: &mut TcpStream, password: bool) {
         let login = request(stream).await;
-        assert!(matches!(login.command, Command::Login { .. }));
+        if password {
+            assert!(matches!(login.command, Command::Login { .. }));
+        } else {
+            assert!(
+                matches!(login.command, Command::Bearer {token} if token=="service-test-token")
+            );
+        }
         respond(
             stream,
-            Response::ok(login.id, json!({"session":{"exp":9_999_999_999u64}})),
+            Response::ok(
+                login.id,
+                json!({"token":"service-test-token","session":{"exp":9_999_999_999u64}}),
+            ),
         )
         .await;
         let stat = request(stream).await;
@@ -487,13 +571,16 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
-            authenticated_stat(&mut first).await;
+            authenticated_stat(&mut first, true).await;
             // The pool must close its aged transport, without sending another
             // operation on it, and authenticate a fresh independent transport.
             let mut byte = [0];
             assert_eq!(first.read(&mut byte).await.unwrap(), 0);
             let (mut second, _) = listener.accept().await.unwrap();
-            authenticated_stat(&mut second).await;
+            authenticated_stat(&mut second, false).await;
+            assert_eq!(second.read(&mut byte).await.unwrap(), 0);
+            let (mut third, _) = listener.accept().await.unwrap();
+            authenticated_stat(&mut third, true).await;
         });
         assert_eq!(store.stat("N1A1.test").await.unwrap().total_bytes, 17);
         {
@@ -503,10 +590,61 @@ mod tests {
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             assert_eq!(store.stat("N1A1.test").await.unwrap().total_bytes, 17);
+            store.0.session.lock().unwrap().as_mut().unwrap().expires_at = 0;
+            store.0.idle.lock().unwrap()[0].released_at = Instant::now() - Duration::from_secs(121);
+            assert_eq!(store.stat("N1A1.renewed").await.unwrap().total_bytes, 17);
             server.await.unwrap();
         })
         .await
         .expect("aged native connection was reused or failed to reconnect");
+        store.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn revoked_bearer_is_reported_without_replaying_an_object_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let store = NativeObjectStore::new(ObjectStoreConfig {
+            native_url: format!("n1://{}", listener.local_addr().unwrap()),
+            fragment: "private".into(),
+            secret: "private-test-secret".into(),
+            max_connections: 1,
+            tls: None,
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            authenticated_stat(&mut first, true).await;
+            let mut byte = [0];
+            assert_eq!(first.read(&mut byte).await.unwrap(), 0);
+            let (mut rejected, _) = listener.accept().await.unwrap();
+            let auth = request(&mut rejected).await;
+            assert!(matches!(auth.command, Command::Bearer { .. }));
+            respond(
+                &mut rejected,
+                Response::error(auth.id, 401, "session revoked"),
+            )
+            .await;
+            assert_eq!(
+                rejected.read(&mut byte).await.unwrap(),
+                0,
+                "object command was sent after rejected authentication"
+            );
+            let (mut next, _) = listener.accept().await.unwrap();
+            authenticated_stat(&mut next, true).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            store.stat("N1A1.first").await.unwrap();
+            store.0.idle.lock().unwrap()[0].released_at = Instant::now() - Duration::from_secs(121);
+            assert_eq!(store.stat("N1A1.rejected").await.unwrap_err().status(), 401);
+            // Only a new caller request starts a new password session.
+            assert_eq!(
+                store.stat("N1A1.next-request").await.unwrap().total_bytes,
+                17
+            );
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
         store.shutdown().await;
     }
 }

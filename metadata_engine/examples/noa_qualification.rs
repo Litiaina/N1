@@ -20,6 +20,10 @@ enum Mode {
 struct Args {
     #[arg(long)]
     root: PathBuf,
+    /// Optional first-member HDD parent, keeping control/database/journals on
+    /// --root (for example DATA_SSD) independently of both object HDDs.
+    #[arg(long)]
+    first_root: Option<PathBuf>,
     #[arg(long)]
     second_root: PathBuf,
     #[arg(long)]
@@ -34,6 +38,10 @@ struct Args {
     writers: usize,
     #[arg(long, default_value_t = 8)]
     readers: usize,
+    /// Independent metadata admission from its existing INI control. The
+    /// object engine keeps its own limit and durability/deadline settings.
+    #[arg(long)]
+    metadata_max_concurrent_io: Option<usize>,
     /// Startup/enrollment budget for each real HDD-backed service, not an I/O
     /// operation timeout or a change to acknowledgement durability.
     #[arg(long, default_value_t = 180)]
@@ -58,6 +66,14 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 async fn main() {
     if let Err(e) = run(Args::parse()).await {
         eprintln!("qualification failed: {e}");
+        let mut source = e.source();
+        for _ in 0..8 {
+            let Some(error) = source else {
+                break;
+            };
+            eprintln!("caused by: {error}");
+            source = error.source();
+        }
         std::process::exit(1);
     }
 }
@@ -66,6 +82,9 @@ async fn run(args: Args) -> Result<()> {
         || args.count > 10000000
         || !(1..=64).contains(&args.writers)
         || !(1..=128).contains(&args.readers)
+        || args
+            .metadata_max_concurrent_io
+            .is_some_and(|value| !(1..=4096).contains(&value))
         || !(30..=600).contains(&args.startup_timeout_seconds)
         || (args.external_browser && !matches!(args.mode, Mode::Console))
     {
@@ -77,7 +96,7 @@ async fn run(args: Args) -> Result<()> {
         Mode::Console => "console",
         Mode::Serve => "live",
     };
-    let campaign = serde_json::json!({"format":1,"mode":prefix,"external_browser":args.external_browser,"count":args.count,"writers":args.writers,"readers":args.readers,"payload":"u32-xor-v1-eight-sizes"});
+    let campaign = serde_json::json!({"format":1,"mode":prefix,"external_browser":args.external_browser,"count":args.count,"writers":args.writers,"readers":args.readers,"metadata_max_concurrent_io":args.metadata_max_concurrent_io,"payload":"u32-xor-v1-eight-sizes"});
     let campaign_path = args.root.join("qualification-campaign.json");
     if campaign_path.exists() {
         if serde_json::from_slice::<serde_json::Value>(&std::fs::read(&campaign_path)?)? != campaign

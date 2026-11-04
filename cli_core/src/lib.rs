@@ -1,5 +1,8 @@
 //! Native LINK client configuration and allocation discovery shared by CLI tools.
+pub mod monitoring;
 pub mod settings;
+#[cfg(target_os = "linux")]
+pub mod system;
 use n1_link::PoolId;
 use n1_native_client::{Command, N1NativeClient, Response};
 use serde::Deserialize;

@@ -14,6 +14,7 @@ pub struct ServerConfig {
     pub key_path: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub staging_dir: PathBuf,
+    pub backup_dir: Option<PathBuf>,
     pub object_native_url: String,
     pub object_fragment: String,
     pub object_secret: String,
@@ -26,6 +27,7 @@ pub struct ServerConfig {
     pub access_max_ttl: u64,
     pub refresh_ttl: u64,
     pub metadata_workers: usize,
+    pub monitor_interval_seconds: u64,
     pub upload_concurrency: usize,
     pub upload_memory_budget: usize,
     pub max_file_size: Option<u64>,
@@ -103,6 +105,7 @@ impl ServerConfig {
             staging_dir: get("staging_dir")
                 .map(resolve)
                 .unwrap_or_else(|| settings.control_dir.join("metadata-uploads")),
+            backup_dir: get("backup_dir").filter(|s| !s.is_empty()).map(resolve),
             object_native_url: get("object_native_url").ok_or_else(|| {
                 ApiError::invalid("[metadata_engine] object_native_url is required")
             })?,
@@ -123,6 +126,7 @@ impl ServerConfig {
             access_max_ttl: ttl("ACCESS_TOKEN_MAX_TTL_SECS", 3600)?,
             refresh_ttl: ttl("REFRESH_TOKEN_TTL_SECS", 604800)?,
             metadata_workers: integer("workers", 64)? as usize,
+            monitor_interval_seconds: settings.upload.monitor_interval_seconds,
             upload_concurrency: settings.upload.max_concurrent_io,
             upload_memory_budget: settings.upload.upload_memory_budget_bytes,
             max_file_size: settings.max_file_size,

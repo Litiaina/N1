@@ -10,6 +10,12 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/monitoring.rs"]
+mod monitoring;
+#[path = "noa_service/monitoring_performance.rs"]
+mod monitoring_performance;
+#[path = "noa_service/object_recovery.rs"]
+mod object_recovery;
 #[path = "noa_service/resume_damage.rs"]
 mod resume_damage;
 #[path = "noa_service/resume_listing.rs"]
@@ -127,6 +133,14 @@ impl Stack {
             &std::fs::read(object_config.with_extension("credentials.json")).unwrap(),
         )
         .unwrap();
+        let mut object_settings: Value =
+            serde_json::from_slice(&std::fs::read(&object_config).unwrap()).unwrap();
+        object_settings["runtime"]["monitor_interval_seconds"] = json!(1);
+        std::fs::write(
+            &object_config,
+            serde_json::to_vec_pretty(&object_settings).unwrap(),
+        )
+        .unwrap();
         let http = port();
         let native = port();
         let ini_path = root.join("n1_config.ini");
@@ -152,6 +166,8 @@ impl Stack {
             .set("max_concurrent_io", "32")
             .set("max_part_size", "52428800")
             .set("upload_memory_budget_bytes", "67108864");
+        ini.with_section(Some("upload_config"))
+            .set("monitor_interval_seconds", "1");
         ini.with_section(Some("metadata_engine"))
             .set(
                 "object_native_url",
@@ -159,6 +175,10 @@ impl Stack {
             )
             .set("object_fragment", credentials["fragment"].as_str().unwrap())
             .set("object_connections", "16");
+        ini.with_section(Some("metadata_engine")).set(
+            "backup_dir",
+            root.join("metadata-backups").display().to_string(),
+        );
         ini.write_to_file(&ini_path).unwrap();
         let env = root.join("n1.env");
         std::fs::write(&env,format!("JWT_SECRET=test-only-private-metadata-jwt-{}\nAUTH_KEY={}\nMASTER_KEY=test-only-master\nADMIN_KEY=test-only-admin\n",ulid::Ulid::new(),credentials["secret"].as_str().unwrap())).unwrap();

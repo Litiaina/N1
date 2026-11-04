@@ -12,6 +12,11 @@ pub struct MetadataExecutor {
 }
 
 impl MetadataExecutor {
+    /// Read-only sampling uses its own single admitted worker, rather than
+    /// competing for the transaction executor's foreground permits.
+    pub(crate) fn observation_handle(&self) -> MetadataEngine {
+        self.engine.clone()
+    }
     pub fn new(engine: MetadataEngine, capacity: usize) -> Result<Self> {
         if capacity == 0 || capacity > 1024 {
             return Err(Error::Invalid(

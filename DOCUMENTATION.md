@@ -141,6 +141,7 @@ object_secret_env=AUTH_KEY
 object_ca_path=/etc/litiaina/object-ca.pem
 data_dir=/var/lib/litiaina/metadata/database
 staging_dir=/var/lib/litiaina/metadata/uploads
+backup_dir=/var/backups/litiaina/metadata
 object_connections=32
 workers=64
 ```
@@ -156,6 +157,97 @@ litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini
 
 An external metadata implementation can use the object interface directly.
 The object engine requires neither this metadata process nor its database.
+
+## Console monitoring and backups
+
+System Monitoring → Health reports **two independent service nodes**. Metadata
+CPU, RAM, process RSS, database space and staging-filesystem capacity come from
+the metadata host. Object CPU/RAM, member identities, pool EC topology and
+filesystem capacity come from the object host over native NOA. The services may
+run on different machines. Filesystem usage includes everything on that
+filesystem; it is not an exact accounting of N1 shard bytes.
+
+Ordinary refreshes share observations controlled by
+`[upload_config] monitor_interval_seconds` on each service. More Console clients
+do not start more collectors. Refresh cannot bypass that interval. Responses
+include sample age and pending/stale state. Collection performs read-only root
+binding and filesystem-counter probes; it never walks object directories or
+reads payloads. Console polls only while its monitoring screen is visible.
+The explicit integrity action starts one paced, asynchronous fragment-reference
+check. Its result is a live observation, not a consistent backup snapshot.
+
+Fragment live-byte counts are transactionally maintained in 256 counter shards;
+capacity queries read those bounded counters, never enumerate all names. An
+absent counter is reported as unknown. The explicit offline administration
+command `litiaina-n1-metadata recount --data-dir DATABASE --fragment FRAGMENT`
+rebuilds those counters when an operator requests a full recount.
+
+The **Metadata backups** panel requires master-key operator authentication and
+an explicit `[metadata_engine] backup_dir` on the metadata host. Capture pins
+one cross-keyspace MVCC snapshot and streams it to an owner-only file, with
+SHA-256 and record-count verification. It does not copy the live database
+directory. Capture is single-admission and runs only on request. Download URLs
+expire after two minutes. Snapshots contain private LINK credentials; protect
+them like the database. Restore only into a new directory:
+
+```sh
+litiaina-n1-metadata restore --snapshot SNAPSHOT.n1meta --data-dir /new/metadata-db
+```
+
+The metadata snapshot includes named transactions and upload controls; staged
+payload bytes and object shards are separate. Preserve metadata staging for
+bridged unfinished uploads and preserve an object recovery point, pool identities,
+service signing keys, INI, secrets and TLS material. For a coordinated whole-N1
+recovery point, pause writers and deletion/GC affecting the captured objects,
+capture metadata and object state, verify both, then resume. Independent live
+captures alone do not guarantee a shared point in time.
+
+Object recovery retains the existing `backup create`, `verify`, `replicate`,
+`replicate-remote` and `restore` workflows. Local repository replication can
+reencrypt under a new backup key. Native remote replication requires matching
+repository encryption keys, transferred through the operator's secure process.
+It preserves logical pool/member identities and permanent retirement state.
+Hardware serial numbers are not membership identities: a blank replacement
+uses the existing logical slot and reconstructs its shards through the explicit
+`pool replace --authorize` workflow. The live descriptor/device binding fence
+prevents accidental mount substitution during operation.
+
+Byte-copy recovery preserves the original immutable pool geometry and keys.
+Copying shards into an unrelated pool with another identity or EC geometry does
+not change LINK placement; such a destination needs an explicit object transfer
+with new returned keys. A metadata snapshot may itself be uploaded using the
+normal object API, but its recovery LINK key and service credentials must be
+kept outside the database being backed up.
+
+Console's **Backups & snapshot replication** controls connect to the dedicated Shell operator
+host on the object/repository machine. They do not send filesystem paths or
+object-administration credentials through the metadata service. Start it with:
+
+```sh
+litiaina-n1-shell backup operator-keygen --token-file /etc/litiaina/n1/operator.token
+litiaina-n1-shell backup serve --config /etc/litiaina/n1/backup-operator.json
+```
+
+Use [the operator configuration example](deploy/backup-operator.json.example),
+save it with mode `0600`, and configure the Console's exact HTTPS origin in
+`allowed_origins`. The listener requires TLS unless `allow_plaintext` is
+explicitly enabled for a private test. Enter its origin and dedicated token in
+Console; the token is cleared from the input and is not saved in browser storage.
+Repository, replica, restore-target and job aliases are operator-configured.
+The host admits one modifying job and four inventory readers, keeps the last
+32 operation outcomes, and drains accepted work on orderly shutdown. Browser
+disconnection does not cancel an accepted job. Its operation history is in
+memory; after a host crash, inspect the repository and recovery/job state.
+
+For online capture, configure `online_source` with `credentials_file` pointing
+to a private native object-client file and `repository` matching a repository
+alias registered on both the object service and this host. A replica uses the
+same fields, with an optional `ca_file` for its native TLS endpoint. Existing
+object NOA performs the transfer. Restore targets map aliases to target INI
+files; their configured roots must be empty/fenced and the target engine must
+be stopped. Preserve its control registry, signing key, authentication and TLS
+material separately, or use the offline recovery tools to restore control state.
+The operator adapter restores member contents, not a replacement deployment.
 
 ## Direct LINK client operations
 
@@ -403,6 +495,8 @@ fallback. There is no automatic failed-disk enrollment or replacement.
 
 The shell forwards `pool ...` and `backup offline ...` to the matching adjacent
 engine, with optional `--engine-binary`. These commands require no network login.
-Use `--help` on the engine or backup helper for exact flags. These object recovery tools do not yet provide a coordinated metadata/database
-recovery point. Complete named-service recovery and Console administration
-qualification remain in [the completion checklist](docs/RC2-IMPLEMENTATION.md).
+Use `--help` on the engine or backup helper for exact flags. The object tools
+capture object state. Use the paused-writer metadata/object capture procedure
+above for a matching named-service recovery point. Independent live captures
+are not an atomic whole-product snapshot. Outstanding qualification is tracked
+in [the completion checklist](docs/RC2-IMPLEMENTATION.md).

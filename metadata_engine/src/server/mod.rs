@@ -1,7 +1,10 @@
 //! NOA adapters for the optional named N1 service. Both transports call the
 //! same domain service; object bytes cross the public native LINK boundary.
+pub(crate) mod backups;
 pub mod config;
+mod diagnostics;
 pub mod error;
+mod monitoring;
 pub mod native;
 mod recovery;
 pub(crate) mod routes;
@@ -30,6 +33,11 @@ pub struct App {
     upload_locks: Mutex<HashMap<String, Weak<RwLock<()>>>>,
     pub(crate) pools: Vec<PoolProfile>,
     pub recovery_errors: Mutex<Vec<String>>,
+    pub(crate) metadata_observations: Arc<cli_core::monitoring::ObservationCache>,
+    pub(crate) object_observations: Arc<cli_core::monitoring::ObservationCache>,
+    pub(crate) monitor_objects: NativeObjectStore,
+    diagnostics: Arc<diagnostics::Diagnostics>,
+    pub(crate) backups: Arc<backups::Backups>,
 }
 #[derive(Clone, serde::Deserialize)]
 pub(crate) struct PoolProfile {
@@ -55,6 +63,20 @@ impl App {
                 .map_err(|_| error::ApiError::invalid("cannot load object engine CA"))?,
         })?;
         let profiles = objects.control(n1_link::noa::Command::Pools).await?;
+        // A single separate control connection cannot occupy an upload's
+        // native connection permit when a monitoring request is slow.
+        let monitor_objects = NativeObjectStore::new(ObjectStoreConfig {
+            native_url: config.object_native_url.clone(),
+            fragment: config.object_fragment.clone(),
+            secret: config.object_secret.clone(),
+            max_connections: 1,
+            tls: config
+                .object_ca
+                .as_deref()
+                .map(cli_core::client_tls)
+                .transpose()
+                .map_err(|_| error::ApiError::invalid("cannot load object engine CA"))?,
+        })?;
         let pools: Vec<PoolProfile> = serde_json::from_value(profiles["pools"].clone())
             .map_err(|_| error::ApiError::invalid("invalid object pool profiles"))?;
         if pools.is_empty()
@@ -78,6 +100,11 @@ impl App {
             upload_locks: Mutex::new(HashMap::new()),
             pools,
             recovery_errors: Mutex::new(Vec::new()),
+            metadata_observations: Arc::default(),
+            object_observations: Arc::default(),
+            monitor_objects,
+            diagnostics: Arc::default(),
+            backups: Arc::default(),
         });
         recovery::reconcile(&app).await?;
         Ok(app)
@@ -99,6 +126,8 @@ impl App {
         let _ = self.events.send(serde_json::json!({"event":"NAMESPACE_CHANGED", "fragment":ulid::Ulid::from_bytes(fragment.0).to_string()}));
     }
     pub async fn shutdown(&self) {
+        self.backups.drain().await;
+        self.monitor_objects.shutdown().await;
         self.service.shutdown().await;
     }
 }

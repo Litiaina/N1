@@ -17,26 +17,93 @@ use std::{collections::HashMap, sync::Arc};
 pub(super) async fn health(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
-    auth::authorize(&app, &headers, "read").await?;
-    let mut health = app.service.objects().control(Command::Health).await?;
-    health["metadata"] = json!({"engine":"procyon-engine","namespace":true});
+    let claims = auth::authorize(&app, &headers, "read").await?;
+    if q.get("deep_scan").is_some_and(|s| s == "true") {
+        app.diagnostics.start(app.clone(), claims.id(), None)?;
+    }
+    let mut value = super::super::monitoring::health(&app).await;
+    // Explicit diagnostics may request live in-memory counters. Routine Console
+    // polling never takes this path or bypasses filesystem observation caching.
+    if q.get("live_counters").is_some_and(|s| s == "true") {
+        let live = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.monitor_objects.control(Command::Health),
+        )
+        .await
+        .map_err(|_| ApiError::invalid("live object counters timed out"))??;
+        value["io"] = live["io"].clone();
+        value["operations"] = live["operations"].clone();
+    }
+    Ok(Json(value))
+}
+pub(super) async fn fragment_health(
+    State(app): State<Arc<App>>,
+    Path(fragment): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
+    let claims = auth::authorize(&app, &headers, "read").await?;
+    let target = app
+        .db
+        .execute(move |db| crate::fragments::resolve(&db, &fragment))
+        .await?;
+    if target.id != claims.id() && !claims.operator {
+        return Err(ApiError::forbidden());
+    }
+    if q.get("deep_scan").is_some_and(|s| s == "true") {
+        app.diagnostics.start(app.clone(), target.id, None)?;
+    }
+    let mut health = super::super::monitoring::health(&app).await;
+    health["fragment"] = json!(ulid::Ulid::from_bytes(target.id.0).to_string());
     Ok(Json(health))
 }
 pub(super) async fn pools(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
-    auth::authorize(&app, &headers, "read").await?;
-    Ok(Json(app.service.objects().control(Command::Pools).await?))
+    let claims = auth::authorize(&app, &headers, "read").await?;
+    let observed = super::super::monitoring::object(&app).await;
+    let object = observed.value.as_ref().cloned().unwrap_or(Value::Null);
+    let mut pools = object["pools"].as_array().cloned().unwrap_or_default();
+    if let Some(id) = q.get("pool").filter(|s| !s.is_empty()) {
+        pools.retain(|pool| pool["id"].as_str() == Some(id));
+        if pools.is_empty() && object["pools"].is_array() {
+            return Err(ApiError::invalid("unknown pool"));
+        }
+    }
+    if q.get("deep_scan").is_some_and(|s| s == "true") {
+        app.diagnostics
+            .start(app.clone(), claims.id(), q.get("pool").cloned())?;
+    }
+    for pool in &mut pools {
+        if let Some(integrity) = app
+            .diagnostics
+            .status(claims.id(), pool["id"].as_str().unwrap_or(""))
+        {
+            pool["integrity"] = integrity;
+        }
+    }
+    Ok(Json(
+        json!({"architecture":"LINK","fragment":claims.fragment,"pools":pools,"observation":observed,
+        "object_status":object["status"],"error":object["error"],
+        "allocation_policy":"newest complete unsealed pool","metadata_store":"procyon-engine"}),
+    ))
 }
 pub(super) async fn capacity(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     auth::authorize(&app, &headers, "read").await?;
-    let value = app.service.objects().control(Command::Health).await?;
-    Ok(Json(value["capacity"].clone()))
+    let observed = super::super::monitoring::object(&app).await;
+    Ok(Json(
+        observed
+            .value
+            .map(|v| v["capacity"].clone())
+            .unwrap_or(Value::Null),
+    ))
 }
 pub(super) async fn fragment_capacity(
     State(app): State<Arc<App>>,
@@ -44,26 +111,27 @@ pub(super) async fn fragment_capacity(
 ) -> ApiResult<Json<Value>> {
     let claims = auth::authorize(&app, &headers, "read").await?;
     let id = claims.id();
-    let (mut bytes, mut objects) = (0, 0);
-    let mut after = None;
-    loop {
-        let cursor = after.clone();
-        let page = app
-            .db
-            .execute(move |db| Namespace::new(db).list(id, "", cursor.as_deref(), 1000))
-            .await?;
-        if page.files.is_empty() {
-            break;
-        }
-        after = page.after;
-        for file in page.files {
-            bytes += file.version.total_size_bytes;
-            objects += 1;
-        }
-    }
-    Ok(Json(
-        json!({"fragment":claims.fragment,"used_bytes":bytes,"object_count":objects}),
-    ))
+    let usage = app
+        .db
+        .execute(move |db| Namespace::new(db).usage(id))
+        .await?;
+    let observed = super::super::monitoring::object(&app).await;
+    let mut value = observed
+        .value
+        .map(|v| v["capacity"].clone())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    value["architecture"] = json!("LINK");
+    value["fragment"] = json!(claims.fragment);
+    value["used_bytes"] = json!(usage.as_ref().map(|s| s.used_bytes));
+    value["object_count"] = json!(usage.as_ref().map(|s| s.object_count));
+    value["measurement"] = json!(if usage.is_some() {
+        "transaction_counters"
+    } else {
+        "not_initialized"
+    });
+    value["objects_scanned"] = json!(0);
+    Ok(Json(value))
 }
 pub(super) async fn object_status(
     State(app): State<Arc<App>>,
@@ -150,15 +218,24 @@ pub(super) async fn status(
     if !["gc", "repair", "redistribution"].contains(&kind.as_str()) {
         return Err(ApiError::invalid("unknown maintenance job"));
     }
-    let mut value = app
+    let value = app
         .service
         .objects()
         .control(Command::MaintenanceJob)
         .await?;
+    let matches = match kind.as_str() {
+        "repair" => value["kind"] == "scrub",
+        "gc" => value["kind"] == "gc",
+        _ => false,
+    };
+    if !matches {
+        return Ok(Json(json!({"kind":kind,"running":false,"phase":"idle"})));
+    }
     let running = value
-        .get("state")
+        .get("phase")
         .and_then(Value::as_str)
         .is_some_and(|s| s == "running" || s == "stopping");
+    let mut value = value;
     value["running"] = json!(running);
     Ok(Json(value))
 }
