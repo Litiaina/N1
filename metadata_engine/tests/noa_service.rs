@@ -14,6 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod crash_matrix;
 #[path = "noa_service/device_cycle.rs"]
 mod device_cycle;
+#[path = "noa_service/maintenance.rs"]
+mod maintenance;
 #[path = "noa_service/monitoring.rs"]
 mod monitoring;
 #[path = "noa_service/monitoring_performance.rs"]

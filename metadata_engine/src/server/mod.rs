@@ -38,6 +38,7 @@ pub struct App {
     pub(crate) monitor_objects: NativeObjectStore,
     diagnostics: Arc<diagnostics::Diagnostics>,
     pub(crate) backups: Arc<backups::Backups>,
+    pub(crate) maintenance: Arc<crate::maintenance::Manager>,
 }
 #[derive(Clone, serde::Deserialize)]
 pub(crate) struct PoolProfile {
@@ -49,6 +50,11 @@ pub(crate) struct PoolProfile {
 impl App {
     pub async fn open(config: ServerConfig) -> error::ApiResult<Arc<Self>> {
         let engine = MetadataEngine::open(&config.data_dir, Options::default())?;
+        let maintenance_db =
+            MetadataExecutor::new(engine.clone(), config.maintenance.object_concurrency + 1)?;
+        maintenance_db
+            .execute(|db| crate::namespace::Namespace::new(db).ensure_maintenance_indexes())
+            .await?;
         let db = MetadataExecutor::new(engine, config.metadata_workers)?;
         let objects = NativeObjectStore::new(ObjectStoreConfig {
             native_url: config.object_native_url.clone(),
@@ -86,6 +92,25 @@ impl App {
         {
             return Err(error::ApiError::invalid("object engine has no valid pools"));
         }
+        let background_objects = NativeObjectStore::new(ObjectStoreConfig {
+            native_url: config.object_native_url.clone(),
+            fragment: config.object_fragment.clone(),
+            secret: config.object_secret.clone(),
+            max_connections: config.maintenance.object_concurrency * 2,
+            tls: config
+                .object_ca
+                .as_deref()
+                .map(cli_core::client_tls)
+                .transpose()
+                .map_err(|_| error::ApiError::invalid("cannot load object engine CA"))?,
+        })?;
+        let maintenance = crate::maintenance::Manager::new(
+            maintenance_db,
+            background_objects,
+            config.maintenance.clone(),
+            pools.clone(),
+            config.staging_dir.clone(),
+        );
         crate::uploads::private_directory(&config.staging_dir).await?;
         let (events, _) = tokio::sync::broadcast::channel(256);
         let memory_units = config.upload_memory_budget.div_ceil(65536);
@@ -105,6 +130,7 @@ impl App {
             monitor_objects,
             diagnostics: Arc::default(),
             backups: Arc::default(),
+            maintenance,
         });
         recovery::reconcile(&app).await?;
         Ok(app)
@@ -126,8 +152,12 @@ impl App {
         let _ = self.events.send(serde_json::json!({"event":"NAMESPACE_CHANGED", "fragment":ulid::Ulid::from_bytes(fragment.0).to_string()}));
     }
     pub async fn shutdown(&self) {
+        self.maintenance.shutdown().await;
         self.backups.drain().await;
         self.monitor_objects.shutdown().await;
         self.service.shutdown().await;
+    }
+    pub async fn start_maintenance(&self) -> error::ApiResult<()> {
+        self.maintenance.resume_and_schedule().await
     }
 }

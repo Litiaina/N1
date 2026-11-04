@@ -70,10 +70,10 @@ struct Connection {
 
 // A disconnected source can be retried only before the destination observed
 // bytes. Destination failures and partially delivered streams are never replayed.
-struct DownloadWriter<'a, W> {
-    inner: &'a mut W,
-    started: bool,
-    failed: bool,
+pub(crate) struct DownloadWriter<'a, W> {
+    pub(crate) inner: &'a mut W,
+    pub(crate) started: bool,
+    pub(crate) failed: bool,
 }
 impl<W: AsyncWrite + Unpin> AsyncWrite for DownloadWriter<'_, W> {
     fn poll_write(

@@ -35,6 +35,7 @@ pub struct ServerConfig {
     pub strict_parts: bool,
     pub trash_retention_seconds: u64,
     pub file_ttl_seconds: u64,
+    pub maintenance: crate::maintenance::Config,
     pub export: cli_core::settings::Export,
 }
 impl ServerConfig {
@@ -88,6 +89,44 @@ impl ServerConfig {
                 .unwrap_or(Ok(fallback))
         };
         let secret_env = get("object_secret_env").unwrap_or_else(|| "AUTH_KEY".into());
+        let gc = ini.section(Some("garbage_collector"));
+        let gc_number = |name: &str, default: u64| -> ApiResult<u64> {
+            gc.and_then(|s| s.get(name))
+                .map(|v| {
+                    v.parse()
+                        .map_err(|_| ApiError::invalid(format!("invalid garbage_collector {name}")))
+                })
+                .unwrap_or(Ok(default))
+        };
+        let enabled = match gc.and_then(|s| s.get("enabled")).unwrap_or("true") {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(ApiError::invalid(
+                    "garbage_collector enabled must be true or false",
+                ));
+            }
+        };
+        let maintenance = crate::maintenance::Config {
+            enabled,
+            cleanup_interval_seconds: settings.garbage_collector.cleanup_interval_seconds,
+            trash_retention_seconds: settings.garbage_collector.trash_retention_seconds,
+            batch_size: gc_number("batch_size", 128)? as usize,
+            object_concurrency: gc_number("object_concurrency", 1)? as usize,
+            pause_millis: gc_number("pause_millis", 25)?,
+            bytes_per_second: gc_number("bytes_per_second", 16 * 1024 * 1024)?,
+            max_part_size: settings.upload.max_part_size,
+        };
+        if !(1..=1000).contains(&maintenance.batch_size)
+            || !(1..=16).contains(&maintenance.object_concurrency)
+            || maintenance.pause_millis > 60000
+            || maintenance.bytes_per_second == 0
+            || maintenance.cleanup_interval_seconds == 0
+        {
+            return Err(ApiError::invalid(
+                "invalid metadata maintenance resource limits",
+            ));
+        }
         let object_secret = env
             .get(&secret_env)
             .cloned()
@@ -134,6 +173,7 @@ impl ServerConfig {
             strict_parts: settings.upload.upload_part_strict_durability_default,
             trash_retention_seconds: settings.garbage_collector.trash_retention_seconds,
             file_ttl_seconds: settings.garbage_collector.file_ttl_seconds,
+            maintenance,
             export: settings.export,
         };
         if result.access_ttl == 0

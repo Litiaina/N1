@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use ulid::Ulid;
 
 const ATTEMPTS: usize = 64;
+pub(crate) mod lifecycle;
 type SnapshotFiles = (Vec<(RecordKey, PublishedVersion)>, Option<RecordKey>);
 pub(crate) struct ShallowEntry {
     pub path: String,
@@ -82,6 +83,8 @@ pub(crate) struct PendingUpload {
 struct ObjectBinding {
     path: String,
     trashed: bool,
+    #[serde(default)]
+    reclaiming: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -90,6 +93,8 @@ pub(crate) struct Trash {
     entry: Entry,
     pub deleted_at_unix: i64,
     pub restored: bool,
+    #[serde(default)]
+    reclaiming: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -468,6 +473,17 @@ impl Namespace {
         session_id: Option<&str>,
     ) -> Result<PendingUpload> {
         valid_ulid(version_id)?;
+        if self
+            .engine
+            .snapshot()
+            .get(
+                Table::Reclamation,
+                &RecordKey::new(fragment, format!("upload-gc/{version_id}"))?,
+            )?
+            .is_some()
+        {
+            return Err(Error::NameConflict("upload reclamation has started".into()));
+        }
         let pending: PendingUpload = decode(
             self.engine
                 .snapshot()
@@ -592,6 +608,7 @@ impl Namespace {
                 &ObjectBinding {
                     path: destination.identifier().into(),
                     trashed: false,
+                    reclaiming: false,
                 },
             )
         })
@@ -614,6 +631,7 @@ impl Namespace {
                 &ObjectBinding {
                     path: key.identifier().into(),
                     trashed: true,
+                    reclaiming: false,
                 },
             )?;
             put(
@@ -625,8 +643,10 @@ impl Namespace {
                     entry,
                     deleted_at_unix,
                     restored: false,
+                    reclaiming: false,
                 },
             )?;
+            lifecycle::index_trash(tx, fragment, &trash_id, deleted_at_unix)?;
             tx.remove(Table::Entries, &key)?;
             Ok(trash_id.clone())
         })
@@ -638,6 +658,11 @@ impl Namespace {
         self.engine.transact(ATTEMPTS, |tx| {
             let mut trash: Trash =
                 read(tx, Table::Reclamation, &trash_key)?.ok_or(Error::NotFound)?;
+            if trash.reclaiming {
+                return Err(Error::NameConflict(
+                    "trash reclamation has already started".into(),
+                ));
+            }
             let key = RecordKey::new(fragment, &trash.path)?;
             let previous = read::<Entry>(tx, Table::Entries, &key)?;
             if let Some(other) = read::<Entry>(tx, Table::Entries, &key)? {
@@ -669,10 +694,20 @@ impl Namespace {
                 &ObjectBinding {
                     path: trash.path.clone(),
                     trashed: false,
+                    reclaiming: false,
                 },
             )?;
             trash.restored = true;
             put(tx, Table::Reclamation, &trash_key, &trash)?;
+            lifecycle::unindex_trash(
+                tx,
+                &lifecycle::TrashWork {
+                    fragment,
+                    trash: trash_id.into(),
+                    object: trash.entry.object_id.clone(),
+                    deleted_at: trash.deleted_at_unix,
+                },
+            )?;
             Ok(trash.path)
         })
     }
@@ -817,6 +852,7 @@ fn reserve_record(
                 &ObjectBinding {
                     path: path.clone(),
                     trashed: false,
+                    reclaiming: false,
                 },
             )?;
             entry
@@ -837,13 +873,14 @@ fn reserve_record(
         &pending_key,
         &PendingUpload {
             handle: handle.clone(),
-            object_id: entry.object_id,
+            object_id: entry.object_id.clone(),
             upload: upload.clone(),
             content_type: content_type.into(),
             created_at_unix,
             completed: false,
         },
     )?;
+    lifecycle::index_upload(tx, fragment, &entry.object_id, version_id, upload)?;
     put(
         tx,
         Table::Reclamation,
@@ -866,6 +903,15 @@ fn publish_record(
 
     let mut pending: PendingUpload =
         read(tx, Table::Uploads, &pending_key)?.ok_or(Error::NotFound)?;
+    if tx
+        .get(
+            Table::Reclamation,
+            &RecordKey::new(fragment, format!("upload-gc/{version_id}"))?,
+        )?
+        .is_some()
+    {
+        return Err(Error::NameConflict("upload reclamation has started".into()));
+    }
     if pending.handle.session_id != session_id {
         return Err(Error::NotFound);
     }
@@ -920,7 +966,7 @@ fn publish_record(
         &binding_key(fragment, &pending.object_id)?,
     )?
     .ok_or(Error::NotFound)?;
-    if binding.trashed {
+    if binding.trashed || binding.reclaiming {
         return Err(Error::NameConflict(
             "upload's logical object has been trashed".into(),
         ));
@@ -933,6 +979,7 @@ fn publish_record(
         ));
     }
     put(tx, Table::Versions, &version_key, &stored)?;
+    lifecycle::index_version(tx, fragment, &stored)?;
     // Completion order never changes N1's maximum-ULID rule.
     if entry
         .head
@@ -950,6 +997,15 @@ fn publish_record(
         put(tx, Table::Entries, &key, &entry)?;
     }
     pending.completed = true;
+    lifecycle::unindex_upload(
+        tx,
+        &lifecycle::Target {
+            fragment,
+            object: pending.object_id.clone(),
+            version: version_id.into(),
+        },
+        pending.upload.expires_at,
+    )?;
     put(tx, Table::Uploads, &pending_key, &pending)?;
     tx.remove(
         Table::Reclamation,

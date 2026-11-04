@@ -258,10 +258,48 @@ impl MetadataService {
             .metadata
             .execute(move |db| Namespace::new(db).resolve(fragment, &path, version.as_deref()))
             .await?;
-        Ok(self
+        self.download_resolved(fragment, stored, offset, length, destination)
+            .await
+    }
+
+    /// A placement switch can retire the old key after name resolution but
+    /// before its native read starts. Re-resolve only that immutable version,
+    /// only on retirement and before destination bytes; healthy reads add no RPC.
+    pub(crate) async fn download_resolved<W: AsyncWrite + Unpin>(
+        &self,
+        fragment: PoolId,
+        stored: crate::namespace::store::StoredVersion,
+        offset: u64,
+        length: Option<u64>,
+        destination: &mut W,
+    ) -> ServiceResult<u64> {
+        let mut writer = crate::object_store::DownloadWriter {
+            inner: destination,
+            started: false,
+            failed: false,
+        };
+        match self
             .objects
-            .download(&stored.object_key, offset, length, destination)
-            .await?)
+            .download(&stored.object_key, offset, length, &mut writer)
+            .await
+        {
+            Err(error) if error.status() == 410 && !writer.started && !writer.failed => {
+                let object = stored.metadata.object_id.clone();
+                let version = stored.metadata.version_id.clone();
+                let current = self
+                    .metadata
+                    .execute(move |db| Namespace::new(db).by_identity(fragment, &object, &version))
+                    .await?;
+                if current.object_key == stored.object_key || current.metadata != stored.metadata {
+                    return Err(error.into());
+                }
+                Ok(self
+                    .objects
+                    .download(&current.object_key, offset, length, &mut writer)
+                    .await?)
+            }
+            result => Ok(result?),
+        }
     }
 
     pub async fn shutdown(&self) {

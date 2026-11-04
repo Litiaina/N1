@@ -48,7 +48,18 @@ complete API conformance or qualification.
   in-flight process-crash/resume and explicit physical HDD unmount/remount tests.
   Extend encrypted-replica recovery to cover loss of both original members.
 
-Remaining metadata lifecycle, full NOA conformance and release qualification are
+- Add metadata-owned indexed trash TTL and expired-upload reclamation, automatic
+  and explicit bounded GC, durable deletion retry and export/reference pinning.
+- Replace the object-only maintenance adapter with scoped metadata integrity/
+  healing jobs and verified pool migration across different EC geometries.
+  Keep names/version IDs stable while atomically switching private LINK keys;
+  retain source and restart/stop state until destination verification completes.
+- Update the existing Console maintenance cards with pool selection, effective
+  metadata GC policy and truthful job status. Keep the original product layout.
+- Drain queued Shell download-file writes before reporting a short native body,
+  preserving partial output rather than racing process exit.
+
+Remaining export lifecycle, full NOA conformance and release qualification are
 tracked in [the completion checklist](docs/RC2-IMPLEMENTATION.md). Benchmark and
 population outcomes are not release notes; see [TESTING.md](TESTING.md).
 

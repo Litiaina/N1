@@ -142,6 +142,12 @@ pub(super) async fn initialize(app: &Arc<App>) -> ApiResult<()> {
             let record: PersistedExport = fragments::decode(bytes)?;
             if !record.phase.is_terminal() {
                 enqueue(record).await?;
+            } else {
+                let job = record.id;
+                context()
+                    .db
+                    .execute(move |db| crate::namespace::Namespace::new(db).unpin_job(&job))
+                    .await?;
             }
         }
     }
@@ -229,6 +235,14 @@ pub(super) async fn enqueue(record: PersistedExport) -> ApiResult<()> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
+        let job = id.clone();
+        if let Err(error) = ctx
+            .db
+            .execute(move |db| crate::namespace::Namespace::new(db).unpin_job(&job))
+            .await
+        {
+            tracing::error!(%error,"export source pins retained after cleanup failure");
+        }
     });
     let mut tasks = ctx.tasks.lock().unwrap_or_else(|e| e.into_inner());
     tasks.retain(|task| !task.is_finished());

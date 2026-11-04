@@ -7,6 +7,7 @@ mod executor;
 pub mod exports;
 pub mod fragments;
 mod key;
+pub mod maintenance;
 pub mod middleware;
 pub mod namespace;
 pub mod object_store;

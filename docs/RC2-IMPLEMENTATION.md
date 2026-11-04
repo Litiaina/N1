@@ -19,6 +19,7 @@ optional metadata engine; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 | Monitoring | Independently sampled metadata/object node health, cached filesystem/member capacity, bounded logical usage counters, explicit integrity checks and original Console service/pool panels |
 | Metadata recovery | Operator-requested checksummed MVCC snapshots, scoped downloads, fresh-directory restore and matching paused-writer object/metadata recovery procedure |
 | Console object recovery | Retained dedicated Shell operator contract; configured repository/replica/target aliases, explicit capture/verify/replicate/restore jobs using existing LINK recovery tools |
+| Metadata maintenance | Indexed trash TTL and expired-upload reclamation; automatic/manual GC with bounded resources, durable retry and reference/pin protection; scoped integrity/healing; verified cross-EC pool migration with restart/stop recovery |
 
 Implemented is not synonymous with fully qualified. [TESTING.md](../TESTING.md)
 records completed checks and separates object-only, metadata-KV and full-stack
@@ -33,9 +34,7 @@ hardware power-loss qualification.
 
 | Area | Remaining work / acceptance condition |
 | --- | --- |
-| Full NOA v1 surface | Complete retained archive/manifest and fragment-scoped maintenance operations; verify field-level responses, permissions, errors and retry meaning against the original standard. Registered route names alone are insufficient. |
-| Immutable-pool maintenance mapping | Resolve every retained maintenance operation without mutating existing pool geometry. The current redistribution rejection and generic job adapter are not full contract parity. |
-| Metadata lifecycle / GC | Complete expired sessions, trash/history retention and explicit-key object reclamation with durable ownership/retry. A pending or live reference must never be discarded by guessing; LINK's staging GC cannot replace metadata reclamation. |
+| Full NOA v1 surface | Complete retained archive/manifest operations; verify remaining field-level responses, permissions, errors and retry meaning against the original standard. Scoped GC/healing/migration have explicit physical and browser coverage in the maintenance qualification. Registered route names alone are insufficient. |
 | Export lifecycle | Complete and qualify retention/cleanup, restart behavior and resource limits for the complete named service. |
 | Named-service recovery | Full metadata/staging loss, verified snapshot restore, named history/permissions/resume and metadata/object/both process crashes pass on two local HDDs. Preserve the documented operator pause; independent live captures are not an atomic cross-service snapshot. Qualify host power loss and additional crash points separately. |
 | Metadata request quotas | Complete and verify the configured named-service admission/rate policy; do not infer coverage from object-engine middleware. |

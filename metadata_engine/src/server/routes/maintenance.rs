@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
 };
-use n1_link::noa::{Command, ScrubOptions};
+use n1_link::noa::Command;
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
 pub(super) async fn health(
@@ -177,91 +177,153 @@ pub(super) async fn object_repair(
             .await?,
     ))
 }
+
+async fn scope(
+    app: &App,
+    claims: &auth::Claims,
+    q: &HashMap<String, String>,
+) -> ApiResult<Option<n1_link::PoolId>> {
+    if q.get("all_fragments").is_some_and(|v| v == "true") {
+        claims.require("operator")?;
+        return Ok(None);
+    }
+    let Some(identity) = q.get("fragment") else {
+        return Ok(Some(claims.id()));
+    };
+    let identity = identity.clone();
+    let target = app
+        .db
+        .execute(move |db| crate::fragments::resolve(&db, &identity))
+        .await?;
+    if target.id != claims.id() {
+        claims.require("operator")?;
+    }
+    Ok(Some(target.id))
+}
+fn number(q: &HashMap<String, String>, name: &str, default: u64) -> ApiResult<u64> {
+    q.get(name)
+        .map(|v| {
+            v.parse()
+                .map_err(|_| ApiError::invalid(format!("invalid {name}")))
+        })
+        .unwrap_or(Ok(default))
+}
+fn boolean(q: &HashMap<String, String>, name: &str, default: bool) -> ApiResult<bool> {
+    match q.get(name).map(String::as_str) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => Err(ApiError::invalid(format!("invalid {name}"))),
+    }
+}
 pub(super) async fn start(
     State(app): State<Arc<App>>,
     Path(kind): Path<String>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
+    use crate::maintenance::Kind;
     let claims = auth::authorize(&app, &headers, "maintenance").await?;
-    claims.require("operator")?;
-    let command = match kind.as_str() {
-        "gc" => Command::GarbageCollect,
-        "repair" => Command::Scrub {
-            options: ScrubOptions {
-                repair: true,
-                bytes_per_second: q
-                    .get("bytes_per_second")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(16 * 1024 * 1024),
-                window_seconds: q
-                    .get("window_seconds")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(3600),
-            },
-        },
-        "redistribution" => {
-            return Err(ApiError::invalid(
-                "immutable LINK pools are expanded by enrolling a complete new pool; existing objects retain their pool",
-            ));
-        }
-        _ => return Err(ApiError::invalid("unknown maintenance job")),
-    };
-    Ok(Json(app.service.objects().control(command).await?))
+    let kind = Kind::parse(&kind)?;
+    if boolean(&q, "fast_mode", false)? {
+        return Err(ApiError::invalid(
+            "fast_mode is not supported; use the configured bounded maintenance controls",
+        ));
+    }
+    if q.get("durability").is_some_and(|value| value != "strict") {
+        return Err(ApiError::invalid(
+            "pool migration always requires strict durability",
+        ));
+    }
+    let mut request = app
+        .maintenance
+        .default_request(scope(&app, &claims, &q).await?);
+    request.dry_run = boolean(&q, "dry_run", false)?;
+    request.repair = q.get("mode").is_none_or(|mode| mode != "check") && !request.dry_run;
+    request.batch_size = number(&q, "batch", request.batch_size as u64)? as usize;
+    request.object_concurrency =
+        number(&q, "object_concurrency", request.object_concurrency as u64)? as usize;
+    request.pause_millis = number(&q, "pause_millis", request.pause_millis)?;
+    request.bytes_per_second = number(&q, "bytes_per_second", request.bytes_per_second)?;
+    for (field, destination) in [
+        ("source_pool", &mut request.source_pool),
+        ("target_pool", &mut request.target_pool),
+    ] {
+        *destination = q
+            .get(field)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| ApiError::invalid(format!("invalid {field}")))
+            })
+            .transpose()?;
+    }
+    if let Some(path) = q.get("object_key") {
+        let fragment = request
+            .fragment
+            .ok_or_else(|| ApiError::invalid("object selection requires a fragment"))?;
+        let path = path.clone();
+        request.object = Some(
+            app.db
+                .execute(move |db| Ok(Namespace::new(db).stat(fragment, &path, None)?.object_id))
+                .await?,
+        );
+    }
+    let job = app.maintenance.start(kind, request).await?;
+    Ok(Json(serde_json::to_value(job).map_err(|_| {
+        ApiError::invalid("invalid maintenance response")
+    })?))
 }
 pub(super) async fn status(
     State(app): State<Arc<App>>,
     Path(kind): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    auth::authorize(&app, &headers, "maintenance").await?;
-    if !["gc", "repair", "redistribution"].contains(&kind.as_str()) {
-        return Err(ApiError::invalid("unknown maintenance job"));
-    }
+    let claims = auth::authorize(&app, &headers, "maintenance").await?;
     let value = app
-        .service
-        .objects()
-        .control(Command::MaintenanceJob)
+        .maintenance
+        .status(crate::maintenance::Kind::parse(&kind)?)
         .await?;
-    let matches = match kind.as_str() {
-        "repair" => value["kind"] == "scrub",
-        "gc" => value["kind"] == "gc",
-        _ => false,
-    };
-    if !matches {
-        return Ok(Json(json!({"kind":kind,"running":false,"phase":"idle"})));
+    if !claims.operator
+        && value.get("request").is_some()
+        && value["request"]["fragment"].as_str() != Some(&claims.id().to_string())
+    {
+        return Err(ApiError::forbidden());
     }
-    let running = value
-        .get("phase")
-        .and_then(Value::as_str)
-        .is_some_and(|s| s == "running" || s == "stopping");
-    let mut value = value;
-    value["running"] = json!(running);
     Ok(Json(value))
 }
 pub(super) async fn stop(
     State(app): State<Arc<App>>,
-    Path(_kind): Path<String>,
+    Path(kind): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let claims = auth::authorize(&app, &headers, "maintenance").await?;
     claims.require("operator")?;
-    let state = app
-        .service
-        .objects()
-        .control(Command::MaintenanceJob)
-        .await?;
-    let id = state
-        .get("id")
-        .or_else(|| state.get("job_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::invalid("no maintenance job is active"))?;
-    Ok(Json(
-        app.service
-            .objects()
-            .control(Command::MaintenanceStop { job_id: id.into() })
-            .await?,
-    ))
+    let kind = crate::maintenance::Kind::parse(&kind)?;
+    app.maintenance.stop_job(kind).await?;
+    Ok(Json(app.maintenance.status(kind).await?))
+}
+pub(super) async fn scoped_start(
+    State(app): State<Arc<App>>,
+    Path((fragment, kind)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(mut q): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
+    if q.get("all_fragments").is_some_and(|v| v == "true") {
+        return Err(ApiError::invalid(
+            "fragment route cannot request all fragments",
+        ));
+    }
+    q.insert("fragment".into(), fragment);
+    start(State(app), Path(kind), headers, Query(q)).await
+}
+pub(super) async fn migrate_object(
+    State(app): State<Arc<App>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    Query(mut q): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
+    q.insert("object_key".into(), path);
+    start(State(app), Path("redistribution".into()), headers, Query(q)).await
 }
 pub(super) async fn fragment_init(
     State(app): State<Arc<App>>,

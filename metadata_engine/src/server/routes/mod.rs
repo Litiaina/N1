@@ -76,6 +76,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/noa/v1/objects/status/{*key}", get(maintenance::object_status))
         .route("/noa/v1/objects/repair/{*key}", post(maintenance::object_repair))
         .route("/noa/v1/maintenance/{kind}/start", post(maintenance::start))
+        .route("/noa/v1/maintenance/fragments/{fragment}/{kind}/start", post(maintenance::scoped_start))
+        .route("/noa/v1/maintenance/objects/redistribution/start/{*key}", post(maintenance::migrate_object))
         .route("/noa/v1/maintenance/{kind}/status", get(maintenance::status))
         .route("/noa/v1/maintenance/{kind}/stop", post(maintenance::stop))
         .route("/noa/v1/maintenance/fragment/init", post(maintenance::fragment_init))

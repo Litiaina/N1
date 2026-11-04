@@ -77,6 +77,18 @@ pub(super) fn capture(
     let mut names = BTreeSet::new();
     let mut emit = |entry: ExportManifestEntry| -> Result<()> {
         validate_archive_path(&entry.archive_path)?;
+        let job = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::Invalid("manifest has no job identity".into()))?;
+        Namespace::new(db.clone()).pin(
+            &crate::namespace::store::lifecycle::Target {
+                fragment: id,
+                object: entry.object_id.clone(),
+                version: entry.version_id.clone(),
+            },
+            job,
+        )?;
         let line = serde_json::to_vec(&entry)
             .map_err(|_| Error::Invalid("cannot encode export manifest".into()))?;
         file.write_all(&line)?;

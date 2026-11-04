@@ -20,7 +20,57 @@ Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
 selected HDD/RAM locations; never put population fixtures on the source NVMe.
 
-## Latest completed reliability qualification — November 4, 2026
+## Metadata maintenance qualification — November 5, 2026
+
+The [maintenance qualification](docs/MAINTENANCE-20261105.md) covers indexed
+trash TTL GC, unfinished-upload expiration, explicit integrity/healing and
+verified migration between immutable pools with different EC geometry.
+
+- **456 default workspace tests**, **81 documentation tests**, and scoped
+  strict Clippy passed. The default run leaves **33 opt-in/helper cases ignored**;
+  ignored cases are not passes.
+- **18 explicit two-HDD service tests passed**, including all six new maintenance
+  cases. The original Console drove real migration and GC against both engines;
+  Rust checked the resulting payloads, versions and permanent retirements.
+- The Console desktop suite passed **151 tests, 6 skipped**. The focused four
+  service/maintenance cases passed across all five viewport profiles (**20
+  executions**, overlapping desktop coverage). All **38 Node tests** passed.
+- Metadata library tests cover claim/recovery races, shared references, pins,
+  transactional placement switches and reads resolved before source retirement.
+  Idle GC index checks used 10,000 future trash rows; they are a bounded-query
+  regression, not a matched throughput or memory comparison with old N1.
+
+Evidence, binaries, original failure logs and browser screenshots are under
+`/mnt/PROJECT-DISK-1TB/n1-maintenance-20261104-01`. Data/control and the first
+member used PROJECT; the second member used TEST. Builds stayed on PROJECT and
+temporary unit fixtures used RAM. No object-engine or LINK source changed.
+
+Reproduce the physical service run using distinct directories for control and
+the first member (never the same parent), an unchanged tested object binary,
+the original Console build and installed Chromium:
+
+```sh
+export N1_OBJECT_TEST_ROOT=/path/on/project/control-fixtures
+export N1_OBJECT_TEST_FIRST_ROOT=/path/on/project/first-members
+export N1_OBJECT_TEST_SECOND_ROOT=/path/on/test/second-members
+export N1_OBJECT_TEST_BINARY=/path/to/litiaina-n1
+export N1_CONSOLE_REPO=/path/to/console
+export N1_CONSOLE_TEST_DIST=/path/to/built-console
+export N1_BROWSER_NODE=/path/to/node
+export PLAYWRIGHT_BROWSERS_PATH=/path/to/installed-browsers
+cargo test --release -p n1_metadata_engine --test noa_service --locked -- \
+  --ignored --nocapture --test-threads=1 \
+  --skip running_deployment_ --skip monitoring_performance:: \
+  --skip real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
+```
+
+The OS-unmount case was deliberately excluded while the user's independent
+deployment used the same HDD. It passed in the preceding qualification below.
+This maintenance run does not rerun 500K population or certify hardware power
+loss. The complete physical invocation and its terminal result are in
+`reports/physical06.log`; failed attempts remain separate.
+
+## Earlier reliability qualification — November 4, 2026
 
 The local two-HDD campaign **full03 passed at 21:19:44 Asia/Manila**, after
 fixing two metadata read-path defects and repeating the complete campaign.

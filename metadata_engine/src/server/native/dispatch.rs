@@ -140,7 +140,7 @@ pub(super) async fn dispatch(
         }
         _ => return Err(ApiError::invalid("unsupported native operation")),
     };
-    if (method == "GET" || body_len.is_some())
+    if (method == "GET" || body_len.is_some() || request.op.starts_with("maintenance."))
         && let Some(fields) = payload.as_object()
     {
         let query: Vec<_> = fields

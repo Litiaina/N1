@@ -265,9 +265,13 @@ async fn run(cli: Cli) -> Result<()> {
             #[cfg(unix)]
             options.mode(0o600);
             let mut file = options.open(&output).await?;
-            let (response, _) = client.download(key, offset, length, &mut file).await?;
+            let downloaded = client.download(key, offset, length, &mut file).await;
+            // Tokio file writes may still be queued when the source returns
+            // an error. Drain them before process exit so the documented
+            // partial output survives a truncated native body.
             file.flush().await?;
             file.sync_all().await?;
+            let (response, _) = downloaded?;
             print_result(response)?;
             return Ok(());
         }

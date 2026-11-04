@@ -1,4 +1,6 @@
 use super::*;
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 const FRAGMENT: PoolId = PoolId([23; 16]);
 fn version(n: u128) -> String {
@@ -7,7 +9,21 @@ fn version(n: u128) -> String {
 fn upload(n: u128) -> ObjectUpload {
     ObjectUpload {
         upload_key: format!("N1U1.test-{n}"),
-        object_key: format!("N1A1.test-{n}"),
+        object_key: n1_link::KeySigner::new([7; 32])
+            .object_key(
+                &FRAGMENT.0,
+                n1_link::Identity {
+                    pool: PoolId([8; 16]),
+                    generation: 1,
+                    token: {
+                        let mut bytes = [0; 32];
+                        bytes[..16].copy_from_slice(&n.to_be_bytes());
+                        bytes
+                    },
+                },
+            )
+            .as_str()
+            .into(),
         total_bytes: 123,
         part_bytes: 4096,
         parts: 1,

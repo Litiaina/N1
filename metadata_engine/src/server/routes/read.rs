@@ -164,22 +164,29 @@ pub(crate) async fn stream(
     } else {
         (0, total)
     };
-    let objects = app.service.objects();
-    let key = stored.object_key;
+    let service = app.service.clone();
+    let content_type = stored
+        .metadata
+        .content_type
+        .parse::<axum::http::HeaderValue>()
+        .map_err(|_| ApiError::invalid("invalid stored content type"))?;
+    let etag = format!("\"{}\"", stored.metadata.version_id)
+        .parse::<axum::http::HeaderValue>()
+        .expect("version ETag");
     let body = if length == 0 {
         // Content-Length: 0 completes the client exchange at the headers.
         // Validate the native read before publishing those headers: a later
         // body error cannot retract an empty HTTP or named-native success.
-        objects
-            .download(&key, offset, Some(0), &mut tokio::io::sink())
+        service
+            .download_resolved(fragment, stored, offset, Some(0), &mut tokio::io::sink())
             .await?;
         Body::empty()
     } else {
         let (mut writer, reader) = tokio::io::duplex(256 * 1024);
         let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
         tokio::spawn(async move {
-            if objects
-                .download(&key, offset, Some(length), &mut writer)
+            if service
+                .download_resolved(fragment, stored, offset, Some(length), &mut writer)
                 .await
                 .is_err()
             {
@@ -208,14 +215,7 @@ pub(crate) async fn stream(
         StatusCode::OK
     };
     let h = response.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        stored
-            .metadata
-            .content_type
-            .parse()
-            .map_err(|_| ApiError::invalid("invalid stored content type"))?,
-    );
+    h.insert(header::CONTENT_TYPE, content_type);
     h.insert(
         header::CONTENT_LENGTH,
         length.to_string().parse().expect("length header"),
@@ -224,12 +224,7 @@ pub(crate) async fn stream(
         header::ACCEPT_RANGES,
         "bytes".parse().expect("static header"),
     );
-    h.insert(
-        header::ETAG,
-        format!("\"{}\"", stored.metadata.version_id)
-            .parse()
-            .expect("version ETag"),
-    );
+    h.insert(header::ETAG, etag);
     if partial {
         h.insert(
             header::CONTENT_RANGE,

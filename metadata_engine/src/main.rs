@@ -143,6 +143,7 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + S
     let listener = tokio::net::TcpListener::bind(address).await?;
     let app = App::open(config).await?;
     n1_metadata_engine::exports::initialize(&app).await?;
+    app.start_maintenance().await?;
     eprintln!(
         "╔════════════════════════════════════════════════╗\n║              L I T I A I N A  N 1              ║\n╚════════════════════════════════════════════════╝\n│ Version        : {}\n│ Component      : metadata_engine\n│ Start Time     : {}\n│ PID            : {}\n│ Native         : n1://{}\n│ HTTP           : {}://{}",
         env!("CARGO_PKG_VERSION"),

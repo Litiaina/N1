@@ -237,6 +237,38 @@ POST /noa/v1/maintenance/fragments/{fragment}/redistribution/start
 POST /noa/v1/maintenance/objects/redistribution/start/{object_key}
 ```
 
+Metadata maintenance starts return a persisted job record: admission is not
+completion. Poll the matching status route. Phases are running, stopping,
+interrupted, completed, stopped and incomplete, with scanned/processed/failure/
+deferred counters and a last error. Status includes effective metadata policy.
+Running/interrupted jobs resume after process restart. Stop is cooperative and
+operator-only.
+
+An unqualified start targets the authenticated fragment. The fragment path
+selects that fragment; another fragment or `all_fragments=true` requires operator
+authority. Starts require write/modify/delete. Native maintenance operations
+use the same domain behavior and scalar parameters as these HTTP routes.
+
+Both automatic and explicit metadata GC enforce configured trash TTL.
+`dry_run=true` observes eligible work without deleting objects. There is no TTL
+bypass or empty-trash action. Expired unfinished upload cleanup protects completed
+versions. Object staging GC remains an independent NOA v2 operation.
+
+Redistribution requires distinct enrolled `source_pool` and `target_pool` IDs;
+the target must be unsealed. Optional `object_key` selects one logical object's
+versions in the selected fragment. Migration verifies a new destination LINK
+identity before switching metadata, then retires the unreferenced source. EC
+topologies may differ; logical versions/ETags do not change. This is explicit
+same-object-service pool migration. `dry_run=true` selects without copying.
+Retry incomplete migration with its original parameters, or stop it to clean up
+unswitched destinations.
+
+`batch`, `object_concurrency`, `pause_millis` and `bytes_per_second` are bounded
+by service policy. Metadata healing uses a sequential object worker and retains
+the object's repair admission. `mode=check` or `dry_run=true` checks without
+repair; other retained repair modes invoke healing. Fast mode is rejected and
+migration always uses strict durability.
+
 ### Conformance
 
 Maintenance starts require write/modify/delete. Fragment tokens are scoped to

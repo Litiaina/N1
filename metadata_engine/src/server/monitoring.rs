@@ -158,6 +158,17 @@ pub(super) async fn health(app: &Arc<App>) -> Value {
     } else {
         "idle"
     });
+    for kind in [
+        crate::maintenance::Kind::Gc,
+        crate::maintenance::Kind::Repair,
+        crate::maintenance::Kind::Redistribution,
+    ] {
+        if let Ok(state) = app.maintenance.status(kind).await {
+            maintenance[format!("{}_running", kind.name())] = state["running"].clone();
+            maintenance[format!("{}_phase", kind.name())] = state["phase"].clone();
+            maintenance[format!("{}_job", kind.name())] = state;
+        }
+    }
     json!({"sampled_at":cli_core::monitoring::now(),"status":status,
         "summary":format!("Metadata: {}. Object engine: {}. Cached read-only node and pool counters; payload integrity is not scanned.",meta["status"].as_str().unwrap_or("unknown"),object["status"].as_str().unwrap_or("pending")),
         "components":{"metadata":meta,"object":object},"system":meta["system"],"disks":disks,

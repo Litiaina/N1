@@ -97,13 +97,34 @@ a response-body error. A zero-byte response must not conceal unavailable shards.
 
 ## Public service and completion
 
+Metadata maintenance is under `src/maintenance`: bounded workers with separate
+database admission and native connection capacity, persisted job state, explicit
+stop/status and configurable automatic GC. Namespace lifecycle indexes/claims
+live under `src/namespace/store/lifecycle`. Selection uses ordered database keys;
+no maintenance code opens object member roots. First startup constructs missing
+indexes before serving, using bounded database pages.
+
+Trash claims fence recovery and new publication before native retirement. Keys
+and ownership survive failed deletion and process restart. Purge removes version,
+upload and bridge controls in bounded transactions only after retirement ACK.
+Ticket-expired unfinished uploads have a separate indexed claim; completed live
+versions are excluded. Export source pins protect retained versions.
+
+Pool migration durably records its source and destination upload identity before
+copying. Strict parts, complete payload digest comparison and native finalization
+precede the atomic private-reference switch. Source retirement is a subsequent,
+retryable step. The source survives failed/unswitched transfers. Logical version
+metadata stays immutable while the private storage reference changes. A named
+read racing that switch can re-resolve the same immutable version once after an
+old-key 410, only before any destination bytes/error; healthy reads add no RPC.
+
 The original Console connects to metadata's named NOA v1 HTTP/WebSocket API.
 Named native frames use `n1/0.5`; the backend object connection uses `n1/1`.
 Adapters share domain behavior without adding an HTTP network hop between the
 engines. The Console's existing production features and proxy are retained.
 
 Full contract compliance is still a completion gate. Missing route groups,
-maintenance semantics, metadata reclamation, coordinated recovery, request
+remaining maintenance semantics, export lifecycle, coordinated recovery, request
 quotas and optional integrations are listed in
 [the completion checklist](RC2-IMPLEMENTATION.md). Tests and population reports
 are indexed in [TESTING.md](../TESTING.md), with their actual scope.

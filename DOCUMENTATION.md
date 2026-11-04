@@ -198,7 +198,7 @@ The metadata snapshot includes named transactions and upload controls; staged
 payload bytes and object shards are separate. Preserve metadata staging for
 bridged unfinished uploads and preserve an object recovery point, pool identities,
 service signing keys, INI, secrets and TLS material. For a coordinated whole-N1
-recovery point, pause writers and deletion/GC affecting the captured objects,
+recovery point, pause writers, pool migration and deletion/GC affecting the captured objects,
 capture metadata and object state, verify both, then resume. Independent live
 captures alone do not guarantee a shared point in time.
 
@@ -322,7 +322,8 @@ Change the existing INI controls and restart the relevant service:
 | Upload policy | `[upload_config]`: `max_part_size`, `stripe_block_size`, `upload_part_strict_durability_default`, `upload_io_gate_enabled` |
 | Foreground wait/stall diagnostics | `[io_control]`: `foreground_wait_timeout_ms`, `stall_threshold_ms`, `slow_io_threshold_ms` |
 | Object staging cleanup | `[garbage_collector]`: `cleanup_interval_seconds`, `file_ttl_seconds` |
-| Named trash retention | `[garbage_collector] trash_retention_seconds`; metadata reclamation remains a completion gate |
+| Named trash retention | Metadata `[garbage_collector] trash_retention_seconds`; measured from deletion, reset by recovery followed by deletion |
+| Metadata GC scheduling and bounds | Metadata `[garbage_collector]`: `enabled`, `cleanup_interval_seconds`, `batch_size`, `object_concurrency`, `pause_millis`, `bytes_per_second` |
 | Scheduled healing | `[auto_healing]`: `enabled`, `scrub_schedule_utc`, `initial_scan_delay_seconds`, `scheduled_scrub_pause_millis` |
 | Repair worker bounds | `[auto_healing]`: `object_scan_concurrency`, `shard_repair_concurrency`, `metadata_batch_size` |
 | Rate quotas | `[rate_limiter_config]`: `enable_rate_limiting` and the existing rate/burst keys |
@@ -404,6 +405,68 @@ Runtime environment overrides are `N1_RUNTIME_WORKER_THREADS`,
 `N1_RUNTIME_MAX_BLOCKING_THREADS` and `N1_RUNTIME_THREAD_STACK_BYTES`.
 `N1_IO_BACKEND=auto` selects the backend with reported fallback;
 `uring` requires io_uring, and `blocking` explicitly selects blocking I/O.
+
+## Metadata lifecycle and maintenance
+
+Metadata owns named trash and expiration policy. A named delete changes metadata
+only; recovery remains available until GC claims the expired entry. There is no
+empty-trash operation, forced early purge or per-version deletion. Configure
+the **metadata INI** independently of object staging GC:
+
+```ini
+[garbage_collector]
+enabled=true
+cleanup_interval_seconds=3600
+trash_retention_seconds=2592000
+batch_size=128
+object_concurrency=1
+pause_millis=25
+bytes_per_second=16777216
+```
+
+Restart metadata to apply changes. `enabled=false` disables automatic passes but
+retains Run now. Both modes respect `deleted_at + trash_retention_seconds <= now`;
+expiration makes trash eligible for the next pass. Recovery followed by another
+delete starts a new TTL. The first automatic pass follows one interval after
+startup, without replaying missed intervals. Bounds are batch 1–1000, concurrency
+1–16, pause 0–60000 ms and a positive byte rate. The byte rate paces migration;
+GC bounds deletion through concurrency and pause.
+
+Routine GC seeks ordered database indexes, not namespace or shard-directory
+walks. The first startup with unindexed existing metadata builds indexes from
+the database before request admission. Claims fence recovery/publication races;
+native LINK deletion precedes metadata purge. Failure retains keys and durable
+retry state. Shared references and export/migration pins protect retained data.
+Unfinished upload cleanup uses native ticket expiration and never expires a
+completed live version.
+
+Console Maintenance shows effective GC policy and Run now / Stop / Status.
+Mounted-fragment actions stay scoped to that fragment. An operator can explicitly
+request `all_fragments=true` through NOA. Global stop and cross-fragment access
+require master-key authentication. Stop is cooperative. Already claimed trash
+stays nonrecoverable until reclamation finishes; failures are reported as
+incomplete and retried on a later pass.
+
+**Integrity check / healing** selects indexed version references and calls the
+object health or repair API. Dry run checks without repair. The metadata object
+worker is sequential; object repair retains its own shard admission. Ordinary
+read repair and optional object scrub scheduling remain independent.
+
+**Pool migration** selects different enrolled source and unsealed destination
+pool IDs within the connected object service. Source bytes are reconstructed and
+streamed into the destination EC geometry using bounded buffers and strict
+durable parts. Full source/destination payload SHA-256 comparison precedes the
+atomic metadata-reference switch. Part size adapts within metadata's configured
+`max_part_size`. Names, version IDs and ETags stay unchanged; private LINK keys
+change. Retained history versions are included. This does not mutate existing
+keys or pool layouts; independent direct clients manage their own key changes.
+
+Only after the switch does migration retire the unreferenced source, retaining
+retry state until confirmation. Stopping an unswitched transfer retires only its
+destination. Durable running/interrupted work resumes after process restart.
+Retry incomplete migration with its original parameters, or explicitly stop it.
+Conflicting export pins are reported for retry rather than bypassed. Cross-node
+recovery-point replication remains a separate backup operation.
 
 ## Recovery repositories
 

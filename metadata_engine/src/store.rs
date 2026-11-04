@@ -255,6 +255,39 @@ pub struct MetadataSnapshot {
 }
 
 impl MetadataSnapshot {
+    /// Startup index construction only, before request admission. Routine
+    /// maintenance seeks its own indexed prefixes instead of using this scan.
+    pub(crate) fn scan_all(
+        &self,
+        table: Table,
+        after: Option<&RecordKey>,
+        limit: usize,
+    ) -> Result<Vec<(RecordKey, Vec<u8>)>> {
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(Error::Invalid("metadata page size must be 1–1000".into()));
+        }
+        let start = after.map_or(Bound::Unbounded, |key| {
+            Bound::Excluded(procyon_engine::Slice::from(key.encode()))
+        });
+        let mut result = Vec::new();
+        let mut bytes = 0;
+        for row in self
+            .snapshot
+            .range(
+                self.engine.table(table),
+                (start, Bound::<procyon_engine::Slice>::Unbounded),
+            )
+            .take(limit)
+        {
+            let (key, value) = row.into_inner()?;
+            bytes += key.len() + value.len();
+            if bytes > MAX_PAGE_BYTES {
+                break;
+            }
+            result.push((RecordKey::decode(&key)?, value.to_vec()));
+        }
+        Ok(result)
+    }
     pub(crate) fn scan_from(
         &self,
         table: Table,

@@ -61,6 +61,18 @@ reconciliation. It is not discarded as an orphan by guessing from filenames.
 An overwrite keeps the old named version visible until publication. A rename
 changes metadata; it never renames or rewrites the immutable shard payload.
 
+Metadata owns trash TTL, indexed reclamation, scoped integrity/healing jobs and
+explicit pool migration. Trash is claimed transactionally after expiry; object
+deletion uses the native API, and metadata ownership survives until its ACK.
+Ordered deletion-time/upload-expiry and pool-reference indexes bound selection
+without namespace or shard-root walks. Export and migration pins fence GC.
+
+Migration streams a new immutable destination identity, verifies its payload,
+then switches the private metadata reference without changing names, versions
+or ETags. Source retirement follows the switch. Persisted intents support
+resume/stop and cleanup after failures; immutable pool geometry is unchanged.
+Neither lifecycle policy nor named migration is implemented inside object storage.
+
 Named reads resolve an immutable LINK reference and use the public native
 download interface. Empty reads verify backend availability before success;
 nonempty streaming failures remain body errors. Metadata may reconnect a

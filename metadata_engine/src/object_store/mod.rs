@@ -9,6 +9,7 @@ use n1_native_client::NativeClientError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub(crate) use native::DownloadWriter;
 pub use native::{NativeObjectStore, ObjectStoreConfig};
 
 /// Private upload state owned by the metadata service. These credentials must

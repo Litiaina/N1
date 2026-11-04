@@ -64,6 +64,19 @@ pub(super) async fn reconcile(app: &Arc<App>) -> ApiResult<()> {
                             let session = record["session"].as_str().ok_or_else(|| {
                                 ApiError::invalid("invalid pending publication session")
                             })?;
+                            let gc_key = crate::RecordKey::new(id, format!("upload-gc/{version}"))?;
+                            if app
+                                .db
+                                .execute(move |db| {
+                                    Ok(db.snapshot().get(Table::Reclamation, &gc_key)?.is_some())
+                                })
+                                .await?
+                            {
+                                // A durable expiry claim owns this identity.
+                                // Let maintenance resume retirement; do not
+                                // attempt named publication or prevent startup.
+                                return Ok(());
+                            }
                             let pending = app.service.pending(id, version, Some(session)).await?;
                             match app.service.objects().stat(&pending.upload.object_key).await {
                                 Ok(_) => {
