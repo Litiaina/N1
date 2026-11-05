@@ -9,6 +9,49 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use tokio::io::AsyncReadExt;
 
 #[tokio::test]
+async fn checksum_invalid_quorum_reports_integrity_failure_instead_of_admission_pressure() {
+    let mut fixture = Fixture::new();
+    fixture.layout.data_shards = 1;
+    fixture.layout.parity_shards = 0;
+    fixture.paths.truncate(1);
+    let store = fixture.enroll();
+    let init = store
+        .init(SCOPE, 0, 4096, 4096, Durability::Durable, 3600)
+        .await
+        .unwrap();
+    store
+        .put(
+            SCOPE,
+            init.object_key.clone(),
+            std::io::Cursor::new(source(4096)),
+        )
+        .await
+        .unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
+    let fp = plan.identity.fingerprint();
+    let pool = store.pool(plan.identity).unwrap();
+    let path = pool.holder(fp, 0).unwrap().path.join(fp.shard_path(0));
+    let original = std::fs::read(&path).unwrap();
+    for offset in [shard::HEADER_BYTES + shard::FRAME_HEADER_BYTES + 17, 8] {
+        let mut bytes = original.clone();
+        bytes[offset] ^= 0x80;
+        std::fs::write(&path, bytes).unwrap();
+        let error = store
+            .object_health(SCOPE, init.object_key.clone(), true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Corrupt(_)),
+            "offset {offset}: {error}"
+        );
+        assert_eq!(error.status(), 422);
+    }
+}
+
+#[tokio::test]
 async fn crc_valid_wrong_source_or_foreign_identity_never_emits_or_repairs_unverified_data() {
     for foreign_digest in [false, true] {
         let mut fixture = Fixture::new();
@@ -19,16 +62,20 @@ async fn crc_valid_wrong_source_or_foreign_identity_never_emits_or_repairs_unver
         let source = source(4096);
         let init = store
             .init(SCOPE, 0, 4096, 4096, Durability::Durable, 3600)
+            .await
             .unwrap();
         store
             .put(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 std::io::Cursor::new(source.clone()),
             )
             .await
             .unwrap();
-        let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+        let plan = store
+            .inspect_upload(SCOPE, &init.object_key.clone())
+            .await
+            .unwrap();
         let fp = plan.identity.fingerprint();
         let header = ShardHeader::new(&fixture.layout, plan, 0).unwrap();
         let pool = store.pool(plan.identity).unwrap();
@@ -75,15 +122,15 @@ async fn crc_valid_wrong_source_or_foreign_identity_never_emits_or_repairs_unver
             encoded
         );
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), before.ino());
-        // Permanent retirement must still fence this key and its old ticket.
+        // Purge must remove the corrupt shards and prevent continuation with this key.
         store.delete(SCOPE, init.object_key.clone()).await.unwrap();
         assert!(matches!(
-            store.stat(SCOPE, init.object_key).await,
-            Err(Error::Retired)
+            store.stat(SCOPE, init.object_key.clone()).await,
+            Err(Error::NotFound)
         ));
         assert!(
             store
-                .put(SCOPE, init.upload_key, std::io::Cursor::new(source))
+                .put(SCOPE, init.object_key.clone(), std::io::Cursor::new(source))
                 .await
                 .is_err()
         );
@@ -91,7 +138,7 @@ async fn crc_valid_wrong_source_or_foreign_identity_never_emits_or_repairs_unver
 }
 
 #[tokio::test]
-async fn legacy_and_hybrid_upload_resume_reconstruction_and_retirement_keep_their_pool_format() {
+async fn sha256_and_hybrid_upload_resume_reconstruction_and_purge_keep_their_pool_format() {
     for format in [ShardFormat::Sha256V1, ShardFormat::Crc32cSha256V2] {
         let mut fixture = Fixture::new();
         fixture.layout.shard_format = format;
@@ -106,11 +153,12 @@ async fn legacy_and_hybrid_upload_resume_reconstruction_and_retirement_keep_thei
                 Durability::Durable,
                 3600,
             )
+            .await
             .unwrap();
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 0,
                 std::io::Cursor::new(data[..12288].to_vec()),
             )
@@ -119,7 +167,7 @@ async fn legacy_and_hybrid_upload_resume_reconstruction_and_retirement_keep_thei
         drop(store);
         let store = fixture.reopen();
         let status = store
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 4096)
+            .upload_status(SCOPE, init.object_key.clone(), 0, 4096)
             .await
             .unwrap();
         assert_eq!(status.missing_parts, vec![1, 2]);
@@ -129,7 +177,7 @@ async fn legacy_and_hybrid_upload_resume_reconstruction_and_retirement_keep_thei
             store
                 .write_part(
                     SCOPE,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     part as u64,
                     std::io::Cursor::new(data[start..end].to_vec()),
                 )
@@ -137,14 +185,17 @@ async fn legacy_and_hybrid_upload_resume_reconstruction_and_retirement_keep_thei
                 .unwrap();
         }
         store
-            .finalize(SCOPE, init.upload_key.clone())
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .unwrap();
         store
-            .finalize(SCOPE, init.upload_key.clone())
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .unwrap();
-        let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+        let plan = store
+            .inspect_upload(SCOPE, &init.object_key.clone())
+            .await
+            .unwrap();
         let fp = plan.identity.fingerprint();
         let pool = store.pool(plan.identity).unwrap();
         let path = pool.holder(fp, 0).unwrap().path.join(fp.shard_path(0));
@@ -168,10 +219,15 @@ async fn legacy_and_hybrid_upload_resume_reconstruction_and_retirement_keep_thei
         drop(store);
         let store = fixture.reopen();
         assert!(matches!(
-            store.stat(SCOPE, init.object_key).await,
-            Err(Error::Retired)
+            store.stat(SCOPE, init.object_key.clone()).await,
+            Err(Error::NotFound)
         ));
-        assert!(store.finalize(SCOPE, init.upload_key).await.is_err());
+        assert!(
+            store
+                .finalize(SCOPE, init.object_key.clone())
+                .await
+                .is_err()
+        );
     }
 }
 

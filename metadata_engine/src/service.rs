@@ -264,7 +264,7 @@ impl MetadataService {
 
     /// A placement switch can retire the old key after name resolution but
     /// before its native read starts. Re-resolve only that immutable version,
-    /// only on retirement and before destination bytes; healthy reads add no RPC.
+    /// only on an absent source and before destination bytes; healthy reads add no RPC.
     pub(crate) async fn download_resolved<W: AsyncWrite + Unpin>(
         &self,
         fragment: PoolId,
@@ -283,7 +283,7 @@ impl MetadataService {
             .download(&stored.object_key, offset, length, &mut writer)
             .await
         {
-            Err(error) if error.status() == 410 && !writer.started && !writer.failed => {
+            Err(error) if error.status() == 404 && !writer.started && !writer.failed => {
                 let object = stored.metadata.object_id.clone();
                 let version = stored.metadata.version_id.clone();
                 let current = self

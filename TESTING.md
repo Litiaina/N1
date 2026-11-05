@@ -9,7 +9,7 @@ completion gates are in [docs/RC2-IMPLEMENTATION.md](docs/RC2-IMPLEMENTATION.md)
 
 | Layer | Required checks | Does not prove |
 | --- | --- | --- |
-| LINK/object engine | Key encoding and placement, EC/integrity, upload/finalize idempotence, exact GET/ranges, repair, retirement, GC and recovery | Names, metadata transactions or Console behavior |
+| LINK/object engine | Key encoding and placement, EC/integrity, upload/finalize idempotence, exact GET/ranges, repair, purge, GC and recovery | Names, metadata transactions or Console behavior |
 | Procyon/metadata storage | Concurrent writers/readers, atomic cross-table updates, snapshots, crash/recovery, conflict handling | Object payload durability or the NOA service contract |
 | Metadata service → object engine | Pending identity before bytes, durable object completion before named publication, version/name semantics and exact reads after restart | Every Console workflow or full retained API parity |
 | Original Console → metadata → object engine | Real production UI/API requests, original upload schemes, resume, listings and downloads | An API simulated by mocked responses, or untested administrative features |
@@ -20,7 +20,27 @@ Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
 selected HDD/RAM locations; never put population fixtures on the source NVMe.
 
-## Metadata maintenance qualification — November 5, 2026
+## Key-only lifecycle qualification — November 5, 2026
+
+The current upload/purge contract uses one LINK key, existing-only continuation
+and zero per-identity residue after acknowledged purge. The
+[key lifecycle record](docs/KEY-PURGE-20261105.md) links its source, regression,
+crash/recovery and matched benchmark evidence. Earlier results below describe
+their original checkpoints, including the former permanent-retirement contract.
+
+The current optimization checkpoint passed **472 default workspace tests**, with
+**36 explicit opt-in/helper exclusions**, **81 documentation cases**, strict
+scoped Clippy and **13 selected two-HDD service/native cases**. Five persistence
+cases and eleven purge cases were also repeated on PROJECT. Matched standalone
+benchmarks include Begin in PUT timing and verify complete payload hashes and
+zero identity residue after purge. Their CPU/RSS, allocation and timing results,
+including regressions, are under
+`/mnt/PROJECT-DISK-1TB/n1-upload-optimization-20261105-01/reports`.
+The operator selected allocation-only Begin; an unused key may disappear on
+power loss before its first durable payload. This run does not repeat 500K or
+million-object population or simulate host power loss.
+
+## Earlier metadata maintenance qualification — November 5, 2026
 
 The [maintenance qualification](docs/MAINTENANCE-20261105.md) covers indexed
 trash TTL GC, unfinished-upload expiration, explicit integrity/healing and
@@ -158,9 +178,9 @@ The source contains the following Rust physical harnesses:
 - `metadata_engine/examples/upload_audit.rs`: inspect a stopped metadata copy
   without printing object capabilities. `recover_upload.rs` is an explicit
   offline operator recovery for a cancelled session whose verified native parts
-  survived failed cleanup. It requires the original unexpired ticket and
+  survived failed cleanup. It requires the original LINK key, unexpired upload and
   matching reservation; dry-run precedes `--apply`. It cannot recreate shards
-  or revive a permanently retired object key.
+  or revive a purged object key.
 - Existing object-engine physical/recovery tests and the native client's Rust
   benchmark/resume examples retain their separate purposes.
 
@@ -334,6 +354,12 @@ full-stack report; they are not relabelled as scale passes.
 
 ## Benchmark and release limits
 
+The [aligned direct-I/O qualification](docs/DIRECT-IO-20261105.md) records the
+current large-upload writer, physical page-cache proof, repeated fault/recovery
+checks and matched buffered-LINK/NCX comparisons. It includes per-phase CPU/RSS,
+latency, allocation and adverse measurements. The two current HDD mounts are
+`/mnt/HDD1TB001` and `/mnt/HDD1TB002`; source/build/data evidence lives on HDDs.
+
 Compare the same workload, integrity/durability policy, hardware, concurrency,
 cache state and completed operation semantics. Report upload/download latency,
 throughput, CPU and sampled RSS separately. A metadata KV batch latency is not a
@@ -342,7 +368,7 @@ is not a physical power cut. Permanent LINK retirement is not the same operation
 as moving a named object to trash.
 
 The direct old/new comparison is retained in
-[NCX-VS-CRC32C-LINK-20261103.md](/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/NCX-VS-CRC32C-LINK-20261103.md).
+[NCX-VS-CRC32C-LINK-20261103.md](/mnt/HDD1TB001/n1-xfs-rebenchmark-20261105-01/evidence-before-format/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/NCX-VS-CRC32C-LINK-20261103.md).
 It does not prove a win in every metric or the performance of the later metadata
 stack. Full product NOA conformance and the remaining fault/topology/recovery
 gates must pass before RC.2 is released.

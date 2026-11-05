@@ -12,7 +12,7 @@ and a public native API between them.
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| `object_engine/` | LINK keys, immutable pools/EC, upload bytes, verified reads, repair, permanent key retirement, staging GC and object recovery | Human names, logical versions, namespace lists or a metadata database |
+| `object_engine/` | LINK keys, immutable pools/EC, upload bytes, verified reads, repair, zero-residue purge, staging GC and object recovery | Human names, logical versions, namespace lists or a metadata database |
 | `metadata_engine/` | Logical fragments, names, maximum-ULID version selection, upload transactions, listings, rename, trash/recovery, permissions and exports | Shard placement, member-root access or an alternate object format |
 | Console (separate repository) | Existing user interface and workflows through metadata's NOA v1 API | Storage authority or replacement metadata semantics |
 
@@ -48,7 +48,7 @@ not a user's logical fragment password. The term is **fragment**, never bucket.
 ## Named upload transaction
 
 1. Metadata authorizes the logical fragment, name and permissions.
-2. LINK init returns the immutable object identity and upload ticket.
+2. LINK Begin creates incomplete shard headers and returns one immutable LINK key.
 3. Metadata durably records the pending named operation before accepting bytes.
 4. Bytes reach the independent object engine through native NOA v2.
 5. The object engine confirms durable finalization.
@@ -69,7 +69,7 @@ without namespace or shard-root walks. Export and migration pins fence GC.
 
 Migration streams a new immutable destination identity, verifies its payload,
 then switches the private metadata reference without changing names, versions
-or ETags. Source retirement follows the switch. Persisted intents support
+or ETags. Source purge follows the switch. Persisted intents support
 resume/stop and cleanup after failures; immutable pool geometry is unchanged.
 Neither lifecycle policy nor named migration is implemented inside object storage.
 
@@ -90,7 +90,7 @@ announcement or a migration guide.
 
 | Location | Responsibility |
 | --- | --- |
-| `link/src` | Canonical immutable identity, placement, ticket and inline format |
+| `link/src` | Canonical immutable identity, placement, key authentication and inline format |
 | `metadata_engine/src/store.rs` | Procyon-backed durable cross-table transactions and snapshots |
 | `metadata_engine/src/key.rs` | Exact UTF-8 metadata identifiers scoped by stable fragment ID |
 | `metadata_engine/src/executor.rs` | Bounded blocking database workers, cancellation ownership and draining |
@@ -141,13 +141,13 @@ versioned calculation rotates shard indices across the fixed member slots.
 Each shard's relative path follows directly from the fingerprint and index.
 No scan, per-object lookup table or mutable location record is needed for GET.
 
-An authenticated object key has prefix `N1A1.`. An authenticated upload ticket
-has prefix `N1U1.` and carries the exact same identity, plus immutable upload
-parameters and expiry. The ticket does not contain a different temporary object
-identity. Neither authentication tags nor upload progress alter placement.
+An authenticated object key has prefix `N1A1.`. Begin, continuation and finalized
+reads use exactly the same key. Upload parameters reside in immutable incomplete
+shard headers. Progress is owned by metadata or the standalone client; neither
+parameters nor progress change placement. There is no separate upload ticket.
 
 The direct client retains these keys. The object engine does not persist the
-original object key or upload ticket. An optional metadata service retains the
+original object key. An optional metadata service retains the
 keys it needs for its logical references and unfinished transactions in its own
 database, outside object members. A shared service signing secret authenticates keys to fragment
 IDs. Keep an independent protected copy. Service-created recovery points also
@@ -162,8 +162,7 @@ encrypted block. Losing all copies prevents validating previously issued keys.
 ├── .uploads/
 │   └── <fingerprint>/
 │       ├── shard.tmp
-│       ├── repair.s<i>.tmp    # only while repairing this member
-│       └── retire.tmp         # only while replacing terminal state
+│       └── repair.s<i>.tmp    # only while repairing this member
 └── <fingerprint-byte-0-hex>/
     └── <fingerprint-byte-1-hex>/
         └── <fingerprint>.s<i>.shard
@@ -174,14 +173,9 @@ records with integrity checks, and a final inline seal. An empty object still
 has a header and seal. There is no NDX, NCX, `.commits`, `.claims`, upload manifest
 or separate part receipt. The final seal is bytes inside the shard file.
 
-A permanently deleted identity has a small terminal record at that same final
-shard path in place of payload. This durable deletion state was explicitly
-chosen by the user so old upload tickets cannot recreate deleted identities.
-GC never expires terminal records.
-If a terminal record is corrupt, N1 blocks reads, repair and upload-ticket reuse
-even when other payload shards could still reconstruct the old object. An
-authenticated delete retry can complete retirement; parity repair cannot erase
-this deletion fence.
+A completed purge leaves no file or directory for that identity. Only shared
+pool markers and bounded fanout organizers remain. Continuation opens existing
+files only, so an old key cannot recreate a purged upload.
 
 Pool markers identify logical members and geometry without embedding absolute
 paths. Explicit enrollment requires empty roots on independent filesystems.
@@ -198,21 +192,26 @@ durable metadata bit before the named request succeeds. A 32-byte page covers
 reads these pages without rereading payloads. Publication/cancellation removes
 them in the corresponding metadata transaction. Relaxed or unindexed uploads
 require actual-part reconciliation; only still-valid durable ACKs are indexed.
-Valid frames without an ACK may be retransmitted using the same immutable ticket.
+Valid frames without an ACK may be retransmitted using the same immutable LINK key.
 If native finalization detects lost/incomplete staging, the next status rebuilds
 the index from actual shards. These records describe acknowledged completion,
 not media health, and do not alter LINK keys, object placement or shard files.
 
 The following lifecycle describes the independent object engine:
 
-Init creates a cryptographically random identity and returns its final key and
-self-contained upload ticket. It creates no per-upload disk record.
+Begin creates a fresh random identity and writes incomplete shard
+headers on all N members, then returns its LINK key. This is the sole creation
+boundary. This reply acknowledges allocation; an unused allocation may disappear
+on power loss before a durable payload acknowledgement. The first durable part
+persists the header, payload and staging ancestry together. Normal/batch PUT
+and finalization persist the header with durable publication. Continuation opens
+existing shards only, including after a lost unused allocation.
 
-Part numbers start at zero. Part size is a positive multiple of K times block
+The byte offset selects a part; it must align to part size. Part size is a positive multiple of K times block
 size; the final part may be short. Parts can arrive out of order. Positioned
 inline records make holes, short bodies, torn frames and conflicting retries
 detectable without a manifest. Status pages validate the actual staged bytes;
-file length and the ticket alone cannot prove completion.
+file length and the key alone cannot prove completion.
 
 A standard part reply acknowledges the completed write without promising disk
 persistence. A durable part reply also requires every member's file and staging
@@ -222,26 +221,43 @@ writeback error. Private data can be rewritten after verification; committed
 payload is never changed by an upload retry.
 
 The upload pipeline reuses two sets of owned record buffers, preparing the next
-group while the current writes complete. Each member gets one contiguous write
-for up to four adjacent stripes, within the charged memory budget; individual
+group while the current writes complete. Each member assembles up to four
+adjacent stripes, within the charged memory budget; individual
 frame positions and checksums stay unchanged. Original data and codec parity feed
 framing directly. Codec workspaces are initialized only when that operation
-needs them. For a new partial tail, known zero padding can remain sparse; its
+needs them.
+
+For objects of at least 1 MiB, complete pages stream through an existing-only
+`O_DIRECT` descriptor on the same staging inode. The writer reuses ECS's aligned
+buffer and the owned I/O backend, carrying a partial page between groups. Only
+the unaligned bytes at each part's two ends use the buffered descriptor. Direct
+ranges contain full cache pages wholly inside that part, so concurrent parts
+cannot overwrite each other's boundary bytes. This needs no format change,
+read-modify-write, sidecar or extra persistence barrier. Direct-open/write errors
+fail the request; there is no buffered replay after an I/O error. File-data and
+publication persistence still precede the same acknowledgements.
+
+Smaller objects retain buffered writes. For a new buffered partial tail, known zero padding can remain sparse; its
 logical bytes, positions and checksums are identical to a fully written record.
 A positioned final zero extends the frame before durable part acknowledgement,
 without truncating concurrently uploaded parts. Existing retry regions are
 written in full. Sparse representation never replaces frame validation.
+At the first payload write the calculated shard length is established sparsely,
+after capacity admission. This prevents speculative allocation beyond EOF;
+holes remain missing frames, even though the logical length is already complete.
 
 Finalization validates completeness, writes seals, persists payload, moves staged
 files to calculated final paths with no replacement, and persists directory
 changes. Publication across separate filesystems is not a transaction. A lost
 reply or crash between member moves can leave partial publication; retrying the
-same ticket completes that identity. Repeated finalization rechecks persistence.
+same key completes that identity. Repeated finalization rechecks persistence.
 Enough matching finalized shards may already be readable after a lost reply.
 
-Normal `upload.put` streams a single-part ticket through completion without an
-intermediate part acknowledgement or part durability flush. Batch accepts explicit
-single-part tickets and concatenated bodies. It prepares the payloads, performs
+Normal `upload.put` streams a single-part object through completion without an
+intermediate part acknowledgement. It synchronizes sealed file data, publishes
+paths and joins namespace persistence per filesystem before replying.
+Batch accepts explicit
+single-part keys and concatenated bodies. It prepares the payloads, performs
 a shared filesystem barrier, publishes paths, then performs another barrier
 before success. Batches are bounded by count, bytes and open shard descriptors.
 They are not all-or-nothing transactions across objects; clients resolve lost
@@ -303,25 +319,29 @@ foreground data/memory guards are released; it does not silently skip repair.
 GET completion can wait at that admission boundary. Pending requests for the
 same fingerprint coalesce under an owner that shutdown drains.
 
-## Permanent deletion
+## Purge and interrupted deletion
 
-Deletion uses two durable phases. All K+P paths must first hold terminal
-`Retiring` records. Only after that barrier and staging cleanup can any member
-publish a completed `Retired` certificate. A valid completed certificate proves
-that the first barrier was reached everywhere before it was issued.
+Purge takes the per-identity exclusive lifecycle guard, drains admitted owners,
+unlinks all incomplete/final shards and repair temporaries, and removes private
+staging directories. All member workers finish; persistence barriers precede a
+success reply. An unavailable member or a failed removal prevents acknowledgement.
+No terminal record or permanent deletion history remains. Repeating an already
+completed purge returns zero removals. Old continuation and finalize return 404.
+Cancellation removes only incomplete data and refuses partially finalized objects.
 
-A completed certificate returns Gone (410) on reads. An incomplete retirement
-returns 503 and requires deletion retry. No upload, finalization or repair may
-recreate payload through these records. Completing deletion requires all member
-bindings; a missing member produces an incomplete operation. Deletion is
-idempotent. Cancellation removes only unfinished staging and does not retire an
-identity; use object deletion when permanent revocation is required.
+A crash during removals is an unacknowledged purge. A survivor is indistinguishable
+from disk failure: with enough remaining shards it may still be readable and
+repairable. In the metadata deployment, the durable reclamation claim and LINK
+key remain until native purge succeeds; named restore/publication is fenced and
+GC retries after restart. Standalone clients retain their own pending deletion
+intent and retry. Object startup does not infer deletion intent from shard counts.
+The exact 3-of-4 crash boundary is exercised by a SIGKILL subprocess regression.
 
 ## Maintenance and resource bounds
 
 GC scans `.uploads` through bounded physical traversal. It removes only known,
 expired, unpublished staged payload after excluding active ownership, final paths
-and retirement intent. Uncertain or corrupt candidates are retained and reported.
+and final publication. Uncertain or corrupt candidates are retained and reported.
 It does not infer that a final object is garbage because its client key was lost.
 
 Staging GC uses the operator INI cleanup interval (3,600 seconds in the
@@ -436,16 +456,12 @@ over an optional WebSocket adapter. Network peers require the same repository ke
 This is recovery-point replication, without live standby or failover semantics.
 
 Restore requires explicit empty, independent targets and holds directory leases.
-Durable restore fences prevent startup until verification and retirement overlay
-finish. Explicit resume accepts only fences belonging to the same point and key.
-Restoring an older point unions retirement state from the targets and every
-available point in the repository. A deletion that never reached any surviving
-backup cannot be reconstructed after all original members are lost.
-
-Retention verifies its inputs before removal and refuses to discard the final
-saved witness of a retirement. This maintenance check uses temporary sorted runs
-and a bounded merge, without a persistent deletion catalogue or memory proportional
-to object count. Repository GC authenticates and pins retained blocks before
+Durable restore fences prevent startup until exact-point verification finishes.
+Explicit resume accepts only fences belonging to the same point and key.
+Restoring an older point intentionally rolls back later writes and purges.
+Metadata and object recovery points must be coordinated; there is no historical
+deletion overlay. Retention preserves protected points and refuses deletion of
+the final point. Repository GC authenticates and pins retained blocks before
 reclaiming unreferenced blocks.
 
 Configured repository aliases are the only repository selectors accepted over
@@ -465,7 +481,7 @@ identity without changing placement. Source/target leases, operation-bound
 fences, complete inventory/content checks and synchronization precede activation.
 An administrator changes the configured physical path after verified cutover;
 ordinary startup never adopts an empty replacement. The Rust physical witness
-tests this path with original keys and permanent retirements.
+tests this path with original keys and purged-key absence.
 
 Explicit offline `pool replace --authorize` rebuilds one configured blank slot
 from all surviving peers while retaining the immutable member map. It uses the
@@ -474,8 +490,8 @@ synchronization as the retained maintenance workflow. Stripe memory is bounded
 by the configured budget. Healthy peers are never rewritten. Completed payload
 requires verified reconstruction of the original integrity root. Private multipart
 progress is reconstructed only from verified frames; holes remain missing and
-partial publication is not silently promoted. Terminal records take precedence
-over payload, and incomplete retirement never becomes a completed certificate.
+partial publication is not silently promoted. Outstanding metadata reclamation
+claims must finish after physical member recovery.
 Temporary inventory and deduplication files use bounded directory fanout and
 leave at cutover; they are not part of ordinary uploads or an object catalogue.
 Filesystems supporting data/hole queries avoid scanning unwritten sparse gaps;

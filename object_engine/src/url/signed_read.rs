@@ -92,7 +92,7 @@ mod tests {
             reads
                 .verify(&reads.issue(
                     grant.fragment,
-                    grant.object_key,
+                    grant.object_key.clone(),
                     0,
                     None,
                     signing::now_unix().unwrap()

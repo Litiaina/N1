@@ -196,7 +196,7 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
         .unwrap();
         client
             .put(
-                init["upload_key"].as_str().unwrap().into(),
+                init["object_key"].as_str().unwrap().into(),
                 payload.len() as u64,
                 &mut std::io::Cursor::new(payload.to_vec()),
             )
@@ -390,7 +390,7 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
     assert!(
         client
             .put(
-                keys[1]["upload_key"].as_str().unwrap().into(),
+                keys[1]["object_key"].as_str().unwrap().into(),
                 4096,
                 &mut std::io::Cursor::new(vec![31u8; 4096])
             )

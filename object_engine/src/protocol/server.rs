@@ -292,7 +292,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     command @ (Command::UploadPart { .. }
                     | Command::UploadPut { .. }
                     | Command::UploadBatch { .. }) => {
-                        let expected = match service.body_length(claims, &command) {
+                        let expected = match service.body_length(claims, &command).await {
                             Ok(length) => length,
                             Err(e) => {
                                 write_frame(

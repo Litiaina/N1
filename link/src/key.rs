@@ -4,9 +4,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 const TAG_BYTES: usize = 16;
-const PLAN_BYTES: usize = IDENTITY_BYTES + 8 + 8 + 8 + 1;
 const OBJECT_PREFIX: &str = "N1A1.";
-const UPLOAD_PREFIX: &str = "N1U1.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Durability {
@@ -54,35 +52,6 @@ impl UploadPlan {
         }
         Ok((self.total_bytes - part * self.part_bytes).min(self.part_bytes))
     }
-
-    fn encode(self) -> [u8; PLAN_BYTES] {
-        let mut bytes = [0; PLAN_BYTES];
-        bytes[..57].copy_from_slice(&self.identity.encode());
-        bytes[57..65].copy_from_slice(&self.total_bytes.to_be_bytes());
-        bytes[65..73].copy_from_slice(&self.part_bytes.to_be_bytes());
-        bytes[73..81].copy_from_slice(&self.expires_at.to_be_bytes());
-        bytes[81] = u8::from(self.durability == Durability::Durable);
-        bytes
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != PLAN_BYTES || bytes[81] > 1 {
-            return Err(Error("malformed upload plan"));
-        }
-        let u64_at =
-            |start| u64::from_be_bytes(bytes[start..start + 8].try_into().expect("fixed field"));
-        Ok(Self {
-            identity: Identity::decode(&bytes[..57])?,
-            total_bytes: u64_at(57),
-            part_bytes: u64_at(65),
-            expires_at: u64_at(73),
-            durability: if bytes[81] == 0 {
-                Durability::Standard
-            } else {
-                Durability::Durable
-            },
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,18 +64,6 @@ impl ObjectKey {
     pub fn inspect(value: &str) -> Result<Identity> {
         let bytes = decode(value, OBJECT_PREFIX, IDENTITY_BYTES)?;
         Identity::decode(&bytes[..IDENTITY_BYTES])
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UploadTicket(String);
-impl UploadTicket {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-    pub fn inspect(value: &str) -> Result<UploadPlan> {
-        let bytes = decode(value, UPLOAD_PREFIX, PLAN_BYTES)?;
-        UploadPlan::decode(&bytes[..PLAN_BYTES])
     }
 }
 
@@ -144,15 +101,6 @@ impl KeySigner {
         ))
     }
 
-    pub fn upload_ticket(&self, scope: &[u8; 16], plan: UploadPlan) -> UploadTicket {
-        UploadTicket(self.encode(
-            UPLOAD_PREFIX,
-            b"Litiaina/LINK/upload-ticket/v1\0",
-            scope,
-            &plan.encode(),
-        ))
-    }
-
     pub fn verify_object(&self, scope: &[u8; 16], key: &str) -> Result<Identity> {
         let bytes = decode(key, OBJECT_PREFIX, IDENTITY_BYTES)?;
         self.verify(
@@ -162,17 +110,6 @@ impl KeySigner {
             IDENTITY_BYTES,
         )?;
         Identity::decode(&bytes[..IDENTITY_BYTES])
-    }
-
-    pub fn verify_upload(&self, scope: &[u8; 16], ticket: &str) -> Result<UploadPlan> {
-        let bytes = decode(ticket, UPLOAD_PREFIX, PLAN_BYTES)?;
-        self.verify(
-            b"Litiaina/LINK/upload-ticket/v1\0",
-            scope,
-            &bytes,
-            PLAN_BYTES,
-        )?;
-        UploadPlan::decode(&bytes[..PLAN_BYTES])
     }
 
     fn verify(&self, domain: &[u8], scope: &[u8; 16], bytes: &[u8], length: usize) -> Result<()> {

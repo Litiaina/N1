@@ -223,9 +223,9 @@ impl Manager {
             && (self.interrupted(cancel)
                 || pending.upload.expires_at <= crate::middleware::auth::now())
         {
-            // Stateless tickets may expire while offline. Explicitly retire
-            // their destination before replacing or forgetting the intent.
-            self.objects.retire(&pending.upload.object_key).await?;
+            // Incomplete uploads may expire while offline. Purge their
+            // destination before replacing or forgetting the intent.
+            self.objects.purge(&pending.upload.object_key).await?;
             let owned = pending.clone();
             let id = job.id.clone();
             self.db
@@ -304,7 +304,7 @@ impl Manager {
                     if self.stopping.load(Ordering::Acquire) {
                         return Ok(());
                     }
-                    self.objects.retire(&work.upload.object_key).await?;
+                    self.objects.purge(&work.upload.object_key).await?;
                     let owned = work.clone();
                     let id = job.id.clone();
                     self.db
@@ -383,10 +383,10 @@ impl Manager {
         let key = work.source.clone();
         let retire = self
             .db
-            .execute(move |db| Namespace::new(db).prepare_retirement(&owned, &key))
+            .execute(move |db| Namespace::new(db).prepare_purge(&owned, &key))
             .await?;
         if retire {
-            self.objects.retire(&work.source).await?;
+            self.objects.purge(&work.source).await?;
         }
         let bytes = work.upload.total_bytes;
         let owned = work;

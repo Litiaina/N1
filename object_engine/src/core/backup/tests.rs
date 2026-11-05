@@ -103,26 +103,26 @@ async fn encrypted_service_identity_survives_replication_gc_and_portable_restore
     assert!(!blocked.with_extension("signing-key").exists());
     assert_eq!(
         recovered
-            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
         vec![97; 12345]
     );
     assert!(matches!(
-        recovered.stat(SCOPE, retired.object_key).await,
-        Err(StoreError::Retired)
+        recovered.stat(SCOPE, retired.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
     assert!(matches!(
         recovered
             .write_part(
                 SCOPE,
-                retired.upload_key,
+                retired.object_key.clone(),
                 0,
                 std::io::Cursor::new(vec![98; 12288])
             )
             .await,
-        Err(StoreError::Retired)
+        Err(StoreError::NotFound)
     ));
     std::fs::write(&output, b"operator edits must survive").unwrap();
     assert!(control::restore(&target, &replica, &output, &roots).is_err());
@@ -151,9 +151,10 @@ async fn put(store: &Arc<Store>, data: Vec<u8>) -> crate::core::InitializedUploa
     let part = (data.len() as u64).max(1).div_ceil(12288) * 12288;
     let init = store
         .init(SCOPE, 0, data.len() as u64, part, Durability::Durable, 3600)
+        .await
         .unwrap();
     store
-        .put(SCOPE, init.upload_key.clone(), std::io::Cursor::new(data))
+        .put(SCOPE, init.object_key.clone(), std::io::Cursor::new(data))
         .await
         .unwrap();
     init
@@ -202,19 +203,19 @@ async fn encrypted_incremental_portable_restore_preserves_live_and_permanently_r
     restored.configure_read_repair(false);
     assert_eq!(
         restored
-            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
         data
     );
     assert!(matches!(
-        restored.stat(SCOPE, deleted.object_key).await,
-        Err(StoreError::Retired)
+        restored.stat(SCOPE, deleted.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
     assert!(matches!(
-        restored.finalize(SCOPE, deleted.upload_key).await,
-        Err(StoreError::Retired)
+        restored.finalize(SCOPE, deleted.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
     retention::prune(&repo, 1, &second.id).unwrap();
     assert_eq!(repo.list().unwrap().len(), 1);
@@ -237,6 +238,7 @@ async fn offline_recovery_preserves_durable_multipart_holes_and_status_without_r
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     for index in [0, 2] {
         let start = index * 12288;
@@ -244,7 +246,7 @@ async fn offline_recovery_preserves_durable_multipart_holes_and_status_without_r
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 index as u64,
                 std::io::Cursor::new(data[start..end].to_vec()),
             )
@@ -263,7 +265,7 @@ async fn offline_recovery_preserves_durable_multipart_holes_and_status_without_r
     .unwrap();
     assert_eq!(
         restored
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+            .upload_status(SCOPE, init.object_key.clone(), 0, 100)
             .await
             .unwrap()
             .missing_parts,
@@ -272,16 +274,19 @@ async fn offline_recovery_preserves_durable_multipart_holes_and_status_without_r
     restored
         .write_part(
             SCOPE,
-            init.upload_key.clone(),
+            init.object_key.clone(),
             1,
             std::io::Cursor::new(data[12288..24576].to_vec()),
         )
         .await
         .unwrap();
-    restored.finalize(SCOPE, init.upload_key).await.unwrap();
+    restored
+        .finalize(SCOPE, init.object_key.clone())
+        .await
+        .unwrap();
     assert_eq!(
         restored
-            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
@@ -320,7 +325,7 @@ async fn replication_reencrypts_reuses_blocks_and_detects_corruption_before_clea
     assert!(source.verify(&point).is_ok());
     assert_eq!(
         store
-            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
@@ -333,7 +338,10 @@ async fn corrupted_live_shards_and_missing_markers_do_not_become_valid_recovery_
     let store = fixture.enroll();
     let repo = repository(&fixture, "repository");
     let init = put(&store, vec![9; 9000]).await;
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let pool = &store.pools[0];
     let path = pool.holder(fp, 0).unwrap().path.join(fp.shard_path(0));
@@ -347,8 +355,7 @@ async fn corrupted_live_shards_and_missing_markers_do_not_become_valid_recovery_
 }
 
 #[tokio::test]
-async fn online_capture_pins_live_and_terminal_files_excludes_private_uploads_and_releases_publication_gate()
- {
+async fn online_capture_pins_live_files_excludes_private_uploads_and_releases_publication_gate() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let repo = repository(&fixture, "online");
@@ -362,11 +369,12 @@ async fn online_capture_pins_live_and_terminal_files_excludes_private_uploads_an
         .unwrap();
     let unfinished = store
         .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
+        .await
         .unwrap();
     store
         .write_part(
             SCOPE,
-            unfinished.upload_key.clone(),
+            unfinished.object_key.clone(),
             0,
             std::io::Cursor::new(vec![9; 12288]),
         )
@@ -390,23 +398,26 @@ async fn online_capture_pins_live_and_terminal_files_excludes_private_uploads_an
     .unwrap();
     assert_eq!(
         restored
-            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
         vec![7; 50000]
     );
     assert!(matches!(
-        restored.stat(SCOPE, deleted.object_key).await,
-        Err(StoreError::Retired)
+        restored.stat(SCOPE, deleted.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
     assert!(matches!(
         restored
-            .upload_status(SCOPE, unfinished.upload_key.clone(), 0, 100)
+            .upload_status(SCOPE, unfinished.object_key.clone(), 0, 100)
             .await,
         Err(StoreError::NotFound)
     ));
-    store.finalize(SCOPE, unfinished.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, unfinished.object_key.clone())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -438,7 +449,7 @@ async fn cancelled_online_capture_never_publishes_a_partial_point_or_retains_a_m
 }
 
 #[tokio::test]
-async fn failed_restore_resumes_only_with_the_same_owned_point_and_preserves_terminal_state() {
+async fn failed_restore_resumes_only_with_the_same_owned_point() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let repo = repository(&fixture, "repository");
@@ -465,20 +476,20 @@ async fn failed_restore_resumes_only_with_the_same_owned_point_and_preserves_ter
     .unwrap();
     assert_eq!(
         restored
-            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
         vec![61; 50000]
     );
     assert!(matches!(
-        restored.stat(SCOPE, dead.object_key).await,
-        Err(StoreError::Retired)
+        restored.stat(SCOPE, dead.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
 }
 
 #[tokio::test]
-async fn older_payload_restore_cannot_revive_a_key_retired_in_a_known_recovery_point() {
+async fn explicit_older_snapshot_restore_rolls_back_a_later_purge() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let repo = repository(&fixture, "repository");
@@ -498,18 +509,25 @@ async fn older_payload_restore_cannot_revive_a_key_retired_in_a_known_recovery_p
         16,
     )
     .unwrap();
-    assert!(matches!(
-        restored.stat(SCOPE, object.object_key).await,
-        Err(StoreError::Retired)
-    ));
-    assert!(matches!(
-        restored.finalize(SCOPE, object.upload_key).await,
-        Err(StoreError::Retired)
-    ));
+    assert_eq!(
+        restored
+            .download(SCOPE, object.object_key.clone(), 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![17; 30000]
+    );
+    assert!(
+        restored
+            .finalize(SCOPE, object.object_key.clone())
+            .await
+            .unwrap()
+            .already_finalized
+    );
 }
 
 #[tokio::test]
-async fn retention_refuses_to_forget_the_only_known_deletion_before_changing_any_point() {
+async fn retention_follows_explicit_snapshot_selection_without_permanent_deletion_history() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let repo = repository(&fixture, "retention");
@@ -520,22 +538,13 @@ async fn retention_refuses_to_forget_the_only_known_deletion_before_changing_any
         .await
         .unwrap();
     let retired = capture::offline(&repo, &store).unwrap();
+    retention::forget(&repo, &retired.id).unwrap();
+    assert_eq!(repo.list().unwrap().len(), 1);
+    repo.verify(&older).unwrap();
     assert!(
-        retention::forget(&repo, &retired.id)
-            .unwrap_err()
-            .to_string()
-            .contains("last saved retirement")
+        retention::forget(&repo, &older.id).is_err(),
+        "the last recovery point stays protected"
     );
-    assert!(
-        retention::prune(&repo, 1, &older.id)
-            .unwrap_err()
-            .to_string()
-            .contains("last saved retirement")
-    );
-    assert_eq!(repo.list().unwrap().len(), 2);
-    for point in [&older, &retired] {
-        repo.verify(point).unwrap();
-    }
     assert_eq!(
         std::fs::read_dir(repo.path.join("pending"))
             .unwrap()
@@ -543,7 +552,6 @@ async fn retention_refuses_to_forget_the_only_known_deletion_before_changing_any
         0
     );
     let successor = capture::offline(&repo, &store).unwrap();
-    retention::forget(&repo, &retired.id).unwrap();
     retention::prune(&repo, 1, &successor.id).unwrap();
     let paths = targets(&fixture, "retention-restore");
     restore::restore_fixture(&repo, &successor, &paths).unwrap();
@@ -554,34 +562,36 @@ async fn retention_refuses_to_forget_the_only_known_deletion_before_changing_any
     )
     .unwrap();
     assert!(matches!(
-        restored.stat(SCOPE, object.object_key).await,
-        Err(StoreError::Retired)
+        restored.stat(SCOPE, object.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
     assert!(matches!(
-        restored.finalize(SCOPE, object.upload_key).await,
-        Err(StoreError::Retired)
+        restored.finalize(SCOPE, object.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
 }
 
 #[tokio::test]
-async fn retirement_overlay_reclaims_restored_private_payload_and_revokes_its_old_ticket() {
+async fn explicit_offline_snapshot_restores_its_incomplete_shards_without_external_overlays() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let repo = repository(&fixture, "repository");
     let object = store
         .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
+        .await
         .unwrap();
     store
         .write_part(
             SCOPE,
-            object.upload_key.clone(),
+            object.object_key.clone(),
             0,
             std::io::Cursor::new(vec![66; 12288]),
         )
         .await
         .unwrap();
     let fp = store
-        .inspect_upload(SCOPE, &object.upload_key)
+        .inspect_upload(SCOPE, &object.object_key.clone())
+        .await
         .unwrap()
         .identity
         .fingerprint();
@@ -594,8 +604,8 @@ async fn retirement_overlay_reclaims_restored_private_payload_and_revokes_its_ol
     let paths = targets(&fixture, "private-retirement");
     restore::restore_fixture(&repo, &older, &paths).unwrap();
     for path in &paths {
-        assert!(!path.join(fp.staging_path()).exists());
-        assert_eq!(std::fs::read_dir(path.join(".uploads")).unwrap().count(), 0);
+        assert!(path.join(fp.staging_path()).is_file());
+        assert_eq!(std::fs::read_dir(path.join(".uploads")).unwrap().count(), 1);
     }
     let restored = Store::new(
         vec![Pool::reopen_fixture(fixture.layout.clone(), &paths).unwrap()],
@@ -603,14 +613,23 @@ async fn retirement_overlay_reclaims_restored_private_payload_and_revokes_its_ol
         16,
     )
     .unwrap();
-    assert!(matches!(
-        restored.finalize(SCOPE, object.upload_key).await,
-        Err(StoreError::Retired)
-    ));
+    restored
+        .finalize(SCOPE, object.object_key.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .download(SCOPE, object.object_key.clone(), 0, None, Vec::new())
+            .await
+            .unwrap()
+            .0,
+        vec![66; 12288]
+    );
 }
 
 #[tokio::test]
-async fn bounded_bidirectional_replication_reuses_a_completed_point_and_preserves_retirements() {
+async fn bounded_bidirectional_replication_reuses_a_completed_point_and_preserves_snapshot_absences()
+ {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let source = Arc::new(repository(&fixture, "source"));
@@ -645,15 +664,15 @@ async fn bounded_bidirectional_replication_reuses_a_completed_point_and_preserve
     .unwrap();
     assert_eq!(
         restored
-            .download(SCOPE, live.object_key, 0, None, Vec::new())
+            .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
         vec![27; 200000]
     );
     assert!(matches!(
-        restored.stat(SCOPE, dead.object_key).await,
-        Err(StoreError::Retired)
+        restored.stat(SCOPE, dead.object_key.clone()).await,
+        Err(StoreError::NotFound)
     ));
 }
 
@@ -665,7 +684,7 @@ async fn hierarchical_manifest_restores_and_replicates_with_bounded_multi_level_
     let destination = repository(&fixture, "destination");
     let mut keys = Vec::new();
     for _ in 0..20 {
-        keys.push(put(&store, Vec::new()).await.object_key);
+        keys.push(put(&store, Vec::new()).await.object_key.clone());
     }
     let point = capture::offline(&source, &store).unwrap();
     assert!(point.manifest_depth >= 2);

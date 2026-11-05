@@ -3,7 +3,6 @@ use crate::core::storage_pool::MemberMarker;
 pub use crate::core::storage_pool::RESTORE_FENCE;
 use n1_link::{
     Fingerprint,
-    retirement::Retirement,
     shard::{self, ShardHeader},
 };
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
@@ -20,7 +19,6 @@ pub(crate) enum FileKind {
     Marker,
     Final(Fingerprint, u16),
     Staged(Fingerprint, u16),
-    Retirement(Fingerprint, u16),
 }
 pub(crate) fn allowed_path(
     path: &str,
@@ -40,9 +38,6 @@ pub(crate) fn allowed_path(
             return Ok(None);
         };
         let shard = marker.layout.shard_at_slot(fp, marker.slot)?;
-        if parts[2] == "retire.tmp" {
-            return Ok(Some(FileKind::Retirement(fp, shard)));
-        }
         if parts[2] == "shard.tmp" || parts[2] == format!("repair.s{shard}.tmp") {
             return Ok(Some(FileKind::Staged(fp, shard)));
         }
@@ -86,22 +81,7 @@ pub(crate) fn validate_member_file(
         }
         FileKind::Final(fp, index) => (fp, index, true),
         FileKind::Staged(fp, index) => (fp, index, false),
-        FileKind::Retirement(fp, index) => {
-            if length != 96 {
-                return Err(invalid("invalid private retirement length"));
-            }
-            let mut bytes = [0; 96];
-            reader.read_exact(&mut bytes)?;
-            Retirement::decode(&bytes, fp, index)?;
-            return Ok(());
-        }
     };
-    if finalized && length == 96 {
-        let mut bytes = [0; 96];
-        reader.read_exact(&mut bytes)?;
-        Retirement::decode(&bytes, fp, index)?;
-        return Ok(());
-    }
     let mut bytes = [0; 128];
     reader.read_exact(&mut bytes)?;
     let header = ShardHeader::decode(&bytes, &marker.layout, fp, index)?;
@@ -313,20 +293,6 @@ fn restore_inner(
         let name = relative
             .file_name()
             .ok_or_else(|| invalid("restore file has no name"))?;
-        if let Some(FileKind::Final(fp, shard)) =
-            allowed_path(path, &snapshot.marker(ordinal)?, false)?
-            && let Some(record) = read_terminal(target, fp, shard)?
-        {
-            validate_member_file(
-                path,
-                &snapshot.marker(ordinal)?,
-                reader,
-                length,
-                snapshot.capture_mode == "offline_all",
-            )?;
-            let _ = record;
-            return Ok(());
-        }
         let mut file = if writable[ordinal] {
             let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
             let file = match rfs::openat(
@@ -391,7 +357,6 @@ fn restore_inner(
         parent.sync_all()?;
         Ok(())
     })?;
-    preserve_retirements(repo, snapshot, &targets)?;
     // An empty .uploads organizer is required even for online committed-only
     // captures; create it before clearing any startup fence.
     for target in &targets {
@@ -432,225 +397,6 @@ pub(crate) fn resume_fixture(
     paths: &[PathBuf],
 ) -> Result<()> {
     restore_inner(repo, snapshot, paths, false, true)
-}
-
-fn read_terminal(target: &Target, fp: Fingerprint, shard: u16) -> Result<Option<Retirement>> {
-    let path = fp.shard_path(shard);
-    let path = Path::new(&path);
-    let parent = match target.parent(path, false) {
-        Ok(parent) => parent,
-        Err(e)
-            if e.downcast_ref::<rustix::io::Errno>()
-                .is_some_and(|e| *e == rustix::io::Errno::NOENT) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    let file = match rfs::openat(
-        &*parent,
-        path.file_name().unwrap(),
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => File::from(fd),
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if !file.metadata()?.is_file() {
-        return Err(invalid("nonregular restore retirement path"));
-    }
-    if file.metadata()?.len() != 96 {
-        return Ok(None);
-    }
-    let mut bytes = [0; 96];
-    crate::core::linux_io::pread_exact_at(&file, &mut bytes, 0)?;
-    Ok(Some(Retirement::decode(&bytes, fp, shard)?))
-}
-fn write_terminal(target: &Target, fp: Fingerprint, record: Retirement) -> Result<()> {
-    let temporary = format!(".uploads/{fp}/retire.tmp");
-    let parent = target.parent(Path::new(&temporary), true)?;
-    match rfs::unlinkat(&*parent, "retire.tmp", AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-        Err(e) => return Err(e.into()),
-    }
-    let mut file = File::from(rfs::openat(
-        &*parent,
-        "retire.tmp",
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?);
-    file.write_all(&record.encode(fp))?;
-    file.sync_all()?;
-    let path = fp.shard_path(record.shard);
-    let path = Path::new(&path);
-    let destination = target.parent(path, true)?;
-    rfs::renameat(
-        &*parent,
-        "retire.tmp",
-        &*destination,
-        path.file_name().unwrap(),
-    )?;
-    destination.sync_all()?;
-    parent.sync_all()?;
-    target.root.sync_all()?;
-    Ok(())
-}
-fn retire_recovered(
-    snapshot: &Snapshot,
-    targets: &[Target],
-    pool: usize,
-    fp: Fingerprint,
-    source: Retirement,
-) -> Result<()> {
-    use n1_link::retirement::Phase;
-    let layout = &snapshot.pools[pool].layout;
-    let mut operation = sha2::Sha256::new();
-    operation.update(b"Litiaina/LINK/restore-retirement/v1\0");
-    operation.update(snapshot.id.as_bytes());
-    operation.update(fp.0);
-    let hash = operation.finalize();
-    let nonce: [u8; 16] = hash[..16].try_into().unwrap();
-    let root_for = |shard: u16| -> Result<usize> {
-        let slot = layout.member_slot(fp, shard)?;
-        snapshot
-            .roots
-            .iter()
-            .position(|r| r.pool == pool && r.slot == slot)
-            .ok_or_else(|| invalid("retirement restore target is unavailable"))
-    };
-    // This operation's completed certificate proves every target was made
-    // terminal first. It also deduplicates repeated authority/scan records
-    // without keeping a retirement catalogue in RAM or another on-disk index.
-    if read_terminal(&targets[root_for(0)?], fp, 0)?
-        .is_some_and(|r| r.phase == Phase::Retired && r.nonce == nonce)
-    {
-        let mut terminal = true;
-        for shard in 0..layout.width() {
-            terminal &=
-                read_terminal(&targets[root_for(shard as u16)?], fp, shard as u16)?.is_some();
-        }
-        if terminal {
-            for shard in 0..layout.width() {
-                cleanup_retired_stage(&targets[root_for(shard as u16)?], fp, shard as u16)?;
-            }
-            return Ok(());
-        }
-    }
-    for phase in [Phase::Retiring, Phase::Retired] {
-        for shard in 0..layout.width() {
-            let record = Retirement {
-                phase,
-                shard: shard as u16,
-                nonce,
-                timestamp: source.timestamp,
-            };
-            write_terminal(&targets[root_for(shard as u16)?], fp, record)?;
-        }
-    }
-    for shard in 0..layout.width() {
-        cleanup_retired_stage(&targets[root_for(shard as u16)?], fp, shard as u16)?;
-    }
-    Ok(())
-}
-fn preserve_retirements(repo: &Repository, snapshot: &Snapshot, targets: &[Target]) -> Result<()> {
-    // Preserve any terminal state left by an earlier interrupted restore before
-    // consulting repository points. This cannot turn a known retired key live.
-    for (ordinal, target) in targets.iter().enumerate() {
-        let marker = snapshot.marker(ordinal)?;
-        for entry in walkdir::WalkDir::new(&target.path)
-            .min_depth(3)
-            .max_depth(3)
-            .follow_links(false)
-            .max_open(16)
-        {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry
-                .path()
-                .strip_prefix(&target.path)?
-                .to_str()
-                .ok_or_else(|| invalid("non-UTF8 retirement scan path"))?;
-            if let Some(FileKind::Final(fp, shard)) = allowed_path(path, &marker, false)?
-                && let Some(record) = read_terminal(target, fp, shard)?
-            {
-                retire_recovered(snapshot, targets, snapshot.roots[ordinal].pool, fp, record)?;
-            }
-        }
-    }
-    // All available recovery points contribute known retirement state. Clock
-    // rollback cannot make a later deletion disappear from this union.
-    repo.walk_snapshots(|point| {
-        for known in &point.pools {
-            if let Some(expected) = snapshot.pools.iter().find(|p| {
-                p.layout.id == known.layout.id && p.layout.generation == known.layout.generation
-            }) && (expected.layout != known.layout || expected.members != known.members)
-            {
-                return Err(invalid(
-                    "recovery points disagree about immutable pool membership",
-                ));
-            }
-        }
-        repo.files(&point, |root, path, length, reader| {
-            let marker = point.marker(root)?;
-            if length == 96
-                && let Some(FileKind::Final(fp, shard)) = allowed_path(path, &marker, false)?
-            {
-                let mut bytes = [0; 96];
-                reader.read_exact(&mut bytes)?;
-                let record = Retirement::decode(&bytes, fp, shard)?;
-                if let Some(pool) = snapshot
-                    .pools
-                    .iter()
-                    .position(|p| p.layout == marker.layout)
-                {
-                    retire_recovered(snapshot, targets, pool, fp, record)?;
-                }
-                return Ok(());
-            }
-            validate_member_file(
-                path,
-                &marker,
-                reader,
-                length,
-                point.capture_mode == "offline_all",
-            )
-        })?;
-        Ok(())
-    })
-}
-
-fn cleanup_retired_stage(target: &Target, fp: Fingerprint, shard: u16) -> Result<()> {
-    let stage = match target.parent(Path::new(&format!(".uploads/{fp}/placeholder")), false) {
-        Ok(stage) => stage,
-        Err(e)
-            if e.downcast_ref::<rustix::io::Errno>()
-                .is_some_and(|e| *e == rustix::io::Errno::NOENT) =>
-        {
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-    for name in [
-        "shard.tmp".to_owned(),
-        "retire.tmp".to_owned(),
-        format!("repair.s{shard}.tmp"),
-    ] {
-        match rfs::unlinkat(&*stage, &name, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    stage.sync_all()?;
-    let uploads = target.parent(Path::new(".uploads/placeholder"), false)?;
-    match rfs::unlinkat(&*uploads, fp.to_string(), AtFlags::REMOVEDIR) {
-        Ok(()) | Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
-        Err(e) => return Err(e.into()),
-    }
-    uploads.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

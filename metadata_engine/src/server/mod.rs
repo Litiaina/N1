@@ -152,6 +152,7 @@ impl App {
         let _ = self.events.send(serde_json::json!({"event":"NAMESPACE_CHANGED", "fragment":ulid::Ulid::from_bytes(fragment.0).to_string()}));
     }
     pub async fn shutdown(&self) {
+        self.diagnostics.shutdown().await;
         self.maintenance.shutdown().await;
         self.backups.drain().await;
         self.monitor_objects.shutdown().await;

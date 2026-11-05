@@ -73,7 +73,7 @@ pub(super) async fn reconcile(app: &Arc<App>) -> ApiResult<()> {
                                 .await?
                             {
                                 // A durable expiry claim owns this identity.
-                                // Let maintenance resume retirement; do not
+                                // Let maintenance resume purge; do not
                                 // attempt named publication or prevent startup.
                                 return Ok(());
                             }

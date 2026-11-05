@@ -17,6 +17,41 @@ pub struct Repository {
     cancel: tokio_util::sync::CancellationToken,
 }
 
+impl Drop for Repository {
+    fn drop(&mut self) {
+        // A concurrent process spawn can briefly inherit this close-on-exec
+        // descriptor between fork and exec. Closing only the parent's fd would
+        // leave its flock alive in that unrelated child. Release the owner's
+        // lease explicitly before closing; no child may use a Repository.
+        unsafe { libc::flock(self._lease.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn dropping_repository_releases_lease_despite_a_fork_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repository");
+        let key = directory.path().join("key");
+        crate::core::backup::create_key(&key).unwrap();
+        Repository::initialize(&path, &key).unwrap();
+        let owner = Repository::open(&path, &key, true).unwrap();
+        // dup and fork preserve the same open-file description. Keeping this
+        // descriptor alive models the child-before-exec window deterministically.
+        let inherited = owner._lease.try_clone().unwrap();
+        assert!(Repository::open(&path, &key, true).is_err());
+        drop(owner);
+        let next = Repository::open(&path, &key, true).unwrap();
+        assert!(Repository::open(&path, &key, false).is_err());
+        drop(inherited);
+        assert!(Repository::open(&path, &key, false).is_err());
+        drop(next);
+        Repository::open(&path, &key, false).unwrap();
+    }
+}
+
 impl Repository {
     pub fn initialize(path: &Path, key: &Path) -> Result<()> {
         private_dir(path)?;

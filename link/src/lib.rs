@@ -1,18 +1,17 @@
-//! LINK v1: canonical identities and stateless, fragment-scoped upload tickets.
+//! LINK v1: canonical identities, authenticated object keys and immutable upload geometry.
 //!
 //! This crate has no filesystem, HTTP, engine configuration, clock, or object
 //! catalogue dependency. Native and HTTP use these exact same calculations.
 mod identity;
+mod key;
 pub mod noa;
 mod placement;
-pub mod retirement;
 pub mod shard;
-mod ticket;
 
 pub use identity::{Fingerprint, IDENTITY_BYTES, Identity, PoolId};
+pub use key::{Durability, KeySigner, ObjectKey, UploadPlan};
 pub use placement::PoolLayout;
 pub use shard::ShardFormat;
-pub use ticket::{Durability, KeySigner, ObjectKey, UploadPlan, UploadTicket};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

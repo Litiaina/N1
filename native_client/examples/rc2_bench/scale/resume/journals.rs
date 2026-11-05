@@ -50,14 +50,10 @@ pub(super) fn validate(entry: &Entry, expected_index: u64, total: u64) -> Result
     {
         return Err("journal length/SHA-256 differs from deterministic source".into());
     }
-    let plan = n1_link::UploadTicket::inspect(&entry.ticket)?;
-    if n1_link::ObjectKey::inspect(&entry.key)? != plan.identity
-        || plan.total_bytes != entry.bytes
-        || plan.part_bytes != 65536
-        || plan.durability != n1_link::Durability::Durable
-    {
-        return Err("journal object key and upload ticket name different identities".into());
+    if entry.key != entry.ticket {
+        return Err("journal continuation changed LINK identity".into());
     }
+    n1_link::ObjectKey::inspect(&entry.key)?;
     Ok(())
 }
 
@@ -229,7 +225,7 @@ pub(super) async fn upload(
                 let entry = Entry {
                     index: i,
                     key: field(&initialized, "object_key")?,
-                    ticket: field(&initialized, "upload_key")?,
+                    ticket: field(&initialized, "object_key")?,
                     bytes: source.len() as u64,
                     sha256: format!("{:x}", Sha256::digest(&source)),
                 };

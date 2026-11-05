@@ -303,6 +303,15 @@ impl FilesystemGroup {
         })
     }
 
+    /// Check pinned roots and shared error state without persisting writes.
+    pub(crate) fn check(&self) -> io::Result<()> {
+        self.validate()?;
+        for &index in &self.representatives {
+            self.members[index].filesystem.healthy()?;
+        }
+        Ok(())
+    }
+
     fn sync_all_with(&self, sync: impl Fn(&File) -> io::Result<()> + Sync) -> io::Result<()> {
         self.validate()?;
         let filesystems = self
@@ -438,6 +447,23 @@ mod tests {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn allocation_checks_refuse_rebound_roots_and_latched_shared_errors() {
+        let fixture = Fixture::new();
+        let original = fixture.0.join("member");
+        fs::create_dir(&original).unwrap();
+        let group = group(std::slice::from_ref(&original));
+        group.check().unwrap();
+        let failure = group.members[0]
+            .filesystem
+            .sync_with(&|_| Err(io::Error::from_raw_os_error(libc::EIO)));
+        assert_eq!(failure.unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert_eq!(group.check().unwrap_err().raw_os_error(), Some(libc::EIO));
+        fs::rename(&original, fixture.0.join("old-member")).unwrap();
+        fs::create_dir(&original).unwrap();
+        assert_eq!(group.check().unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

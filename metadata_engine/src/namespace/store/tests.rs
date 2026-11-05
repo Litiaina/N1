@@ -8,7 +8,6 @@ fn version(n: u128) -> String {
 }
 fn upload(n: u128) -> ObjectUpload {
     ObjectUpload {
-        upload_key: format!("N1U1.test-{n}"),
         object_key: n1_link::KeySigner::new([7; 32])
             .object_key(
                 &FRAGMENT.0,

@@ -94,7 +94,7 @@ async fn placement_read(migrate: bool) {
                 matches!(request.command, Command::ObjectGet { object_key, offset: 7, length: Some(3) } if object_key == key)
             );
             if attempt == 0 {
-                write(&mut stream, Response::error(request.id, 410, "retired")).await;
+                write(&mut stream, Response::error(request.id, 404, "purged")).await;
             } else {
                 let mut response = Response::ok(request.id, serde_json::json!({}));
                 response.body_len = 3;
@@ -119,7 +119,7 @@ async fn placement_read(migrate: bool) {
             assert_eq!(result.unwrap(), 3);
             assert_eq!(bytes, b"abc");
         } else {
-            assert!(matches!(result, Err(ServiceError::Object(error)) if error.status() == 410));
+            assert!(matches!(result, Err(ServiceError::Object(error)) if error.status() == 404));
             assert!(bytes.is_empty());
         }
         server.await.unwrap();
@@ -193,7 +193,7 @@ fn claiming_expired_trash_fences_recovery_and_all_versions_until_ack() {
     let ns = Namespace::new(MetadataEngine::open(root.path(), crate::Options::default()).unwrap());
     assert_eq!(ns.claimed_trash(None, None, 10).unwrap().len(), 1);
     for blob in ns.object_blobs(&work, 10).unwrap() {
-        assert!(ns.prepare_retirement(&blob.target, &blob.key).unwrap());
+        assert!(ns.prepare_purge(&blob.target, &blob.key).unwrap());
         assert_eq!(
             ns.object_blobs(&work, 10)
                 .unwrap()
@@ -260,7 +260,7 @@ fn expired_upload_claim_cannot_delete_a_completed_or_live_version() {
     );
     let blob = ns.claim_upload(&work, work.expires_at).unwrap().unwrap();
     assert!(ns.pending(FRAGMENT, &pending.version_id, None).is_err());
-    assert!(ns.prepare_retirement(&blob.target, &blob.key).unwrap());
+    assert!(ns.prepare_purge(&blob.target, &blob.key).unwrap());
     assert!(ns.purge_blob(&blob, 1).unwrap());
     assert!(ns.due_uploads(None, u64::MAX, None, 10).unwrap().is_empty());
     assert!(ns.stat(FRAGMENT, "a", None).is_ok());
@@ -311,7 +311,7 @@ fn migration_switch_is_durable_preserves_version_and_retires_only_old_key() {
     drop(ns);
     let ns = Namespace::new(MetadataEngine::open(root.path(), crate::Options::default()).unwrap());
     assert!(ns.move_work("job", &target).unwrap().unwrap().switched);
-    assert!(ns.prepare_retirement(&target, &source).unwrap());
+    assert!(ns.prepare_purge(&target, &source).unwrap());
     ns.finish_move("job", &work).unwrap();
     assert!(ns.move_work("job", &target).unwrap().is_none());
     assert!(ns.claim_trash(&trash, 100).unwrap());
@@ -332,13 +332,13 @@ fn shared_link_reference_and_concurrent_retirement_are_transactional() {
         object: ns.stat(FRAGMENT, "a", None).unwrap().object_id,
         version: one.version_id,
     };
-    assert!(!ns.prepare_retirement(&target, &key).unwrap());
+    assert!(!ns.prepare_purge(&target, &key).unwrap());
     let other = Target {
         fragment: FRAGMENT,
         object: version(999),
         version: version(888),
     };
-    assert!(ns.prepare_retirement(&other, &key).unwrap());
+    assert!(ns.prepare_purge(&other, &key).unwrap());
     assert!(
         ns.engine
             .transact(64, |tx| index_upload(

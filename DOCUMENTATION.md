@@ -149,7 +149,7 @@ workers=64
 The referenced environment secret authenticates the metadata service to LINK.
 Logical fragment secrets, permissions, refresh sessions, names, versions, upload
 coordination and trash live in metadata. Its database and staging directories
-must be real owner-only directories. LINK tickets remain private to this service.
+must be real owner-only directories. LINK keys remain private to this service.
 
 ```sh
 litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini
@@ -222,7 +222,7 @@ Object recovery retains the existing `backup create`, `verify`, `replicate`,
 `replicate-remote` and `restore` workflows. Local repository replication can
 reencrypt under a new backup key. Native remote replication requires matching
 repository encryption keys, transferred through the operator's secure process.
-It preserves logical pool/member identities and permanent retirement state.
+It preserves logical pool/member identities and the exact captured shard state.
 Hardware serial numbers are not membership identities: a blank replacement
 uses the existing logical slot and reconstructs its shards through the explicit
 `pool replace --authorize` workflow. The live descriptor/device binding fence
@@ -284,31 +284,42 @@ litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json put ./pa
 litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json batch ./one.bin ./two.bin
 litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json put ./large.bin \
   --part-bytes 16777216 --durable-parts
-litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json status --upload-key N1U1.EXAMPLE
-litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json finalize --upload-key N1U1.EXAMPLE
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json status --object-key N1A1.EXAMPLE
+litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json finalize --object-key N1A1.EXAMPLE
 litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json get --key N1A1.EXAMPLE --output ./recovered.bin
 litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json health --key N1A1.EXAMPLE --deep
 litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json repair --key N1A1.EXAMPLE
 litiaina-n1-shell --credentials /etc/litiaina/object/object-client.json delete --key N1A1.EXAMPLE
 ```
 
-`N1U1.EXAMPLE` and `N1A1.EXAMPLE` are placeholders, not valid keys. Part size must
+`N1A1.EXAMPLE` is a placeholder, not a valid key. Part size must
 respect the pool's EC stripe geometry; `put --part-bytes` rounds its requested
 size to that geometry. Standard parts may require retransmission after a crash;
 durable parts acknowledge only after their persistence barriers. Finalization
 is durable and idempotent for the same immutable identity.
+
+Begin acknowledges creation of incomplete shards. An unused allocation may
+disappear on power loss before its first durable payload reply. In that case
+the old key returns 404; start a fresh upload. The first durable part persists
+its header, payload and staging paths together. Completed normal/batch uploads
+and finalized objects remain durable.
 
 Download output uses exclusive creation and never overwrites a local file.
 A failed transfer can leave a partial output for inspection. Keep original
 client-held keys in the separate metadata system or another client-owned record;
 N1 cannot enumerate or reconstruct that record for you.
 
-Delete permanently retires the key, including still-valid upload tickets. Partial
-retirement requires retry and blocks reads or recreation. There is no rename,
-object version history, trash or undelete API in the object engine. Metadata
-provides the named version/trash operations used by Console.
+Delete removes all incomplete and final shard files and persists their removal.
+It leaves no terminal record. Retrying after success returns zero removals; old
+continuation/finalize requests return 404. A failed or interrupted delete must be
+retried using the same LINK key. With sufficient surviving shards, an interrupted
+purge can remain readable: missing files alone do not encode deletion intent.
+Metadata GC retains its durable claim until native success; standalone clients
+must retain their own pending deletion request. There is no rename, history,
+trash or undelete API in the object engine. Metadata provides those named
+operations for Console.
 
-## Optional maintenance
+## Optional maintenance## Optional maintenance
 
 Change the existing INI controls and restart the relevant service:
 
@@ -375,7 +386,7 @@ credentials another way; the installer then omits its `EnvironmentFile=` line.
 
 Staging GC runs at the configured cleanup interval; the generated INI uses
 3,600 seconds. It conservatively reclaims expired unpublished uploads, never
-committed objects or retirement records. Scheduled healing requires both an
+committed objects. Scheduled healing requires both an
 enabled flag and an explicit UTC calendar, for example:
 
 ```ini
@@ -437,7 +448,7 @@ walks. The first startup with unindexed existing metadata builds indexes from
 the database before request admission. Claims fence recovery/publication races;
 native LINK deletion precedes metadata purge. Failure retains keys and durable
 retry state. Shared references and export/migration pins protect retained data.
-Unfinished upload cleanup uses native ticket expiration and never expires a
+Unfinished upload cleanup uses immutable staging expiry and never expires a
 completed live version.
 
 Console Maintenance shows effective GC policy and Run now / Stop / Status.
@@ -461,8 +472,8 @@ atomic metadata-reference switch. Part size adapts within metadata's configured
 change. Retained history versions are included. This does not mutate existing
 keys or pool layouts; independent direct clients manage their own key changes.
 
-Only after the switch does migration retire the unreferenced source, retaining
-retry state until confirmation. Stopping an unswitched transfer retires only its
+Only after the switch does migration purge the unreferenced source, retaining
+retry state until confirmation. Stopping an unswitched transfer purges only its
 destination. Durable running/interrupted work resumes after process restart.
 Retry incomplete migration with its original parameters, or explicitly stop it.
 Conflicting export pins are reported for retry rather than bypassed. Cross-node
@@ -500,7 +511,7 @@ before using its result. `backup stop --job-id ...` requests cooperative stop;
 repository leases remain owned until accepted work finishes. Requested/scoped
 tokens cannot operate recovery jobs even when they originate from an operator.
 
-Online capture pins only committed shards and retirement records. Upload bodies
+Online capture pins only committed shards. Upload bodies
 and reads can continue; publication briefly waits for the pin boundary. Offline
 capture additionally preserves private multipart progress and requires the
 service to be stopped so the helper can acquire all member leases:
@@ -514,10 +525,10 @@ litiaina-n1-backup verify --repository /recovery/points --key /recovery/n1.key -
 Restore is offline into explicit empty, independent targets, one per saved root
 in descriptor order. `--target` repeats for each target. Failed recovery keeps
 startup fences; `--resume` accepts only the same point, root assignment and key.
-Older-point restore overlays retirement state known to any available repository
-point. A deletion absent from all surviving backups cannot be recovered after
-all original members are lost. Retention refuses to remove the last saved
-retirement witness, even if its point is outside the requested keep count.
+An older-point restore is an explicit rollback: it can restore data purged after
+that point. Coordinate metadata/object recovery points. No permanent deletion
+witness or cross-point overlay is maintained. Retention preserves protected
+points and refuses to remove the final point.
 
 ```sh
 litiaina-n1-backup restore --repository /recovery/points --key /recovery/n1.key \
@@ -566,8 +577,8 @@ the same fenced operation. This path requires parity and every other member.
 It verifies source files, reconstructs payload through the pinned codec, checks
 the integrity root and verifies the complete expected inventory before activation.
 Conflicts, corrupt sources or unexpected files prevent activation. Source shards
-are not rewritten. Valid permanent retirements are preserved; an incomplete
-retirement stays incomplete and requires deletion retry. Acknowledged durable
+are not rewritten. Retry pending metadata reclamation after physical recovery.
+Acknowledged durable
 parts survive reconstruction, while holes remain missing. Sparse private uploads
 use filesystem data extents when available, with conservative sequential
 fallback. There is no automatic failed-disk enrollment or replacement.

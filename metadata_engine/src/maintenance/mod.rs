@@ -128,6 +128,11 @@ fn job_key(kind: Kind) -> Result<RecordKey> {
     lifecycle::catalog(format!("maintenance-job/{}", kind.name()))
 }
 impl Manager {
+    /// Explicit integrity scans share bounded maintenance resources, never the
+    /// foreground transaction or upload connection permits.
+    pub(crate) fn diagnostic_handles(&self) -> (MetadataExecutor, NativeObjectStore) {
+        (self.db.clone(), self.objects.clone())
+    }
     pub(crate) fn new(
         db: MetadataExecutor,
         objects: NativeObjectStore,

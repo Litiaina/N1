@@ -192,6 +192,18 @@ impl NativeObjectStore {
                 .acquire()
                 .await
                 .map_err(|_| ObjectStoreError::Closed)?;
+            // Another operation may have returned an authenticated connection
+            // while this caller waited for login admission. Reuse it instead
+            // of creating a burst of needless bearer authentications.
+            if reuse_idle {
+                let cached = self.0.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                if let Some(cached) = cached.filter(|cached| {
+                    cached.expires_at > now.saturating_add(30)
+                        && cached.released_at.elapsed() < MAX_IDLE_AGE
+                }) {
+                    return Ok((cached.client, cached.expires_at));
+                }
+            }
             let mut client = N1NativeClient::connect_with_tls(
                 &self.0.config.native_url,
                 self.0.config.tls.clone(),
@@ -205,13 +217,26 @@ impl NativeObjectStore {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
                 .filter(|session| session.expires_at > now.saturating_add(30));
-            let response = match &session {
-                Some(session) => client.auth_bearer(session.token.clone()).await,
-                None => {
-                    client
-                        .auth_fragment(&self.0.config.fragment, &self.0.config.secret)
-                        .await
+            let mut attempt = 0;
+            let response = loop {
+                let result = match &session {
+                    Some(session) => client.auth_bearer(session.token.clone()).await,
+                    None => {
+                        client
+                            .auth_fragment(&self.0.config.fragment, &self.0.config.secret)
+                            .await
+                    }
+                };
+                if matches!(&result,Err(NativeClientError::Native{code,..}) if code=="429")
+                    && attempt < 10
+                {
+                    // Only a fully consumed rejection before authentication;
+                    // no object command or body has been submitted on this socket.
+                    tokio::time::sleep(Duration::from_millis((50u64 << attempt).min(1000))).await;
+                    attempt += 1;
+                    continue;
                 }
+                break result;
             }
             .map_err(|error| {
                 if matches!(&error, NativeClientError::Native {code,..} if code=="401") {
@@ -329,7 +354,6 @@ impl NativeObjectStore {
             || part_bytes == 0
             || upload.parts != total_bytes.div_ceil(part_bytes)
             || !upload.object_key.starts_with("N1A1.")
-            || !upload.upload_key.starts_with("N1U1.")
         {
             return Err(ObjectStoreError::Contract(
                 "object service returned a different upload plan",
@@ -364,7 +388,7 @@ impl NativeObjectStore {
         let mut connection = self.connection().await?;
         connection
             .client
-            .upload_part(upload.upload_key.clone(), part, length, source)
+            .write_at(upload.object_key.clone(), offset, length, source)
             .await
             .map_err(|error| self.failed(error))?;
         connection.release();
@@ -380,7 +404,7 @@ impl NativeObjectStore {
         let result: ObjectFinalization = decode(
             connection
                 .client
-                .put(upload.upload_key.clone(), upload.total_bytes, source)
+                .put(upload.object_key.clone(), upload.total_bytes, source)
                 .await
                 .map_err(|error| self.failed(error))?,
         )?;
@@ -418,7 +442,7 @@ impl NativeObjectStore {
             connection
                 .client
                 .put_batch(
-                    uploads.iter().map(|u| u.upload_key.clone()).collect(),
+                    uploads.iter().map(|u| u.object_key.clone()).collect(),
                     length,
                     source,
                 )
@@ -447,36 +471,20 @@ impl NativeObjectStore {
         if limit == 0 || limit > 4096 || start > upload.parts {
             return Err(ObjectStoreError::Invalid("invalid upload status page"));
         }
-        let result = self
-            .command(Command::UploadStatus {
-                upload_key: upload.upload_key.clone(),
-                start,
-                limit,
-            })
-            .await;
-        match result {
-            Err(error) if error.status() == 404 => {
-                // LINK init writes no file. An untouched valid ticket therefore
-                // has no shard to inspect yet; metadata still knows its plan.
-                let end = upload.parts.min(start.saturating_add(limit));
-                Ok(ObjectUploadStatus {
-                    finalized: false,
-                    finalized_shards: 0,
-                    parts: upload.parts,
-                    checked_start: start,
-                    checked_end: end,
-                    missing_parts: (start..end).collect(),
-                    unavailable_members: Vec::new(),
-                })
-            }
-            result => result,
-        }
+        // Begin has already persisted incomplete headers. Absence means the
+        // identity is gone, never an untouched session that may be recreated.
+        self.command(Command::UploadStatus {
+            object_key: upload.object_key.clone(),
+            start,
+            limit,
+        })
+        .await
     }
 
     pub async fn finalize(&self, upload: &ObjectUpload) -> ObjectStoreResult<ObjectFinalization> {
         let result: ObjectFinalization = self
             .command(Command::UploadFinalize {
-                upload_key: upload.upload_key.clone(),
+                object_key: upload.object_key.clone(),
             })
             .await?;
         check_finalization(upload, &result)?;
@@ -485,7 +493,7 @@ impl NativeObjectStore {
 
     pub async fn cancel(&self, upload: &ObjectUpload) -> ObjectStoreResult<serde_json::Value> {
         self.command(Command::UploadCancel {
-            upload_key: upload.upload_key.clone(),
+            object_key: upload.object_key.clone(),
         })
         .await
     }
@@ -553,9 +561,9 @@ impl NativeObjectStore {
         .await
     }
 
-    /// Physical, permanent retirement. Logical trash never calls this directly.
+    /// Physical purge to absence. Logical trash never calls this directly.
     /// The metadata reclamation worker must first establish no remaining refs.
-    pub async fn retire(&self, object_key: &str) -> ObjectStoreResult<serde_json::Value> {
+    pub async fn purge(&self, object_key: &str) -> ObjectStoreResult<serde_json::Value> {
         self.command(Command::ObjectDelete {
             object_key: object_key.into(),
         })
@@ -630,6 +638,38 @@ mod tests {
         let stat = request(stream).await;
         assert!(matches!(stat.command, Command::ObjectStat { .. }));
         respond(stream, Response::ok(stat.id, json!({"total_bytes":17,"data_shards":1,"parity_shards":1,"finalized_shards":2,"integrity_algorithm":"LINK-SHA256-tree-v2","integrity_root":"ab".repeat(32)}))).await;
+    }
+
+    #[tokio::test]
+    async fn throttled_authentication_retries_before_any_object_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let store = NativeObjectStore::new(ObjectStoreConfig {
+            native_url: format!("n1://{}", listener.local_addr().unwrap()),
+            fragment: "private".into(),
+            secret: "private-test-secret".into(),
+            max_connections: 1,
+            tls: None,
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let login = request(&mut stream).await;
+            assert!(matches!(login.command, Command::Login { .. }));
+            respond(
+                &mut stream,
+                Response::error(login.id, 429, "authentication quota"),
+            )
+            .await;
+            // The next frame must be login again, not an unauthenticated stat.
+            authenticated_stat(&mut stream, true).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(store.stat("N1A1.same").await.unwrap().total_bytes, 17);
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        store.shutdown().await;
     }
 
     #[tokio::test]

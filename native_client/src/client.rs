@@ -137,10 +137,10 @@ impl N1NativeClient {
         self.control(Command::BackupReceive { repository }).await?;
         Ok(self.stream)
     }
-    pub async fn upload_part<R: AsyncRead + Unpin>(
+    pub async fn write_at<R: AsyncRead + Unpin>(
         &mut self,
-        upload_key: String,
-        part: u64,
+        object_key: String,
+        offset: u64,
         length: u64,
         source: &mut R,
     ) -> NativeClientResult<Response> {
@@ -149,12 +149,12 @@ impl N1NativeClient {
                 "part exceeds native body limit",
             ));
         }
-        self.upload(Command::UploadPart { upload_key, part }, length, source)
+        self.upload(Command::UploadPart { object_key, offset }, length, source)
             .await
     }
     pub async fn put<R: AsyncRead + Unpin>(
         &mut self,
-        upload_key: String,
+        object_key: String,
         length: u64,
         source: &mut R,
     ) -> NativeClientResult<Response> {
@@ -163,12 +163,12 @@ impl N1NativeClient {
                 "object exceeds file offset limit",
             ));
         }
-        self.upload(Command::UploadPut { upload_key }, length, source)
+        self.upload(Command::UploadPut { object_key }, length, source)
             .await
     }
     pub async fn put_batch<R: AsyncRead + Unpin>(
         &mut self,
-        upload_keys: Vec<String>,
+        object_keys: Vec<String>,
         length: u64,
         source: &mut R,
     ) -> NativeClientResult<Response> {
@@ -177,7 +177,7 @@ impl N1NativeClient {
                 "batch exceeds native body limit",
             ));
         }
-        self.upload(Command::UploadBatch { upload_keys }, length, source)
+        self.upload(Command::UploadBatch { object_keys }, length, source)
             .await
     }
     async fn upload<R: AsyncRead + Unpin>(

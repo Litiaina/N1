@@ -1,4 +1,5 @@
 pub(crate) mod activity;
+mod direct;
 mod small_batch;
 mod stream;
 use once_cell::sync::OnceCell;
@@ -53,12 +54,12 @@ impl Store {
             .map_or_else(IoProgress::untracked, DiskIoGuard::progress_handle);
         Ok(UploadIo { guard, progress })
     }
-    pub async fn cancel_upload(self: &Arc<Self>, scope: [u8; 16], ticket: String) -> Result<usize> {
+    pub async fn cancel_upload(self: &Arc<Self>, scope: [u8; 16], key: String) -> Result<usize> {
         let store = self.clone();
         joined(self.activity.clone(), async move {
             store.operation_gate.ensure_mutations_allowed()?;
-            let plan = store.inspect_upload(scope, &ticket)?;
-            let pool = store.pool(plan.identity)?;
+            let identity = store.signer.verify_object(&scope, &key)?;
+            let pool = store.pool(identity)?;
             let io = acquire_disk_io(
                 DiskIoClass::ForegroundWrite,
                 Some(&hex::encode(scope)),
@@ -68,7 +69,7 @@ impl Store {
             let _admission = store.admit_metadata(&pool).await?;
             let check = pool.clone();
             blocking(move || check.writable()).await?;
-            let fp = plan.identity.fingerprint();
+            let fp = identity.fingerprint();
             let lease = store.foreground(fp)?;
             let _guard = lease.state().lifecycle.clone().write_owned().await;
             let probes = (0..pool.layout.width()).map(|shard| {
@@ -112,7 +113,7 @@ impl Store {
     pub async fn write_part<R>(
         self: &Arc<Self>,
         scope: [u8; 16],
-        ticket: String,
+        key: String,
         part: u64,
         reader: R,
     ) -> Result<()>
@@ -121,7 +122,26 @@ impl Store {
     {
         let store = self.clone();
         joined(self.activity.clone(), async move {
-            store.write_part_owned(scope, &ticket, part, reader).await
+            store
+                .write_part_owned(scope, &key, part, false, reader)
+                .await
+        })
+        .await
+    }
+
+    /// Native continuation uses the immutable LINK key and a byte offset.
+    pub async fn write_at<R: AsyncRead + Unpin + Send + 'static>(
+        self: &Arc<Self>,
+        scope: [u8; 16],
+        key: String,
+        offset: u64,
+        reader: R,
+    ) -> Result<()> {
+        let store = self.clone();
+        joined(self.activity.clone(), async move {
+            store
+                .write_part_owned(scope, &key, offset, true, reader)
+                .await
         })
         .await
     }
@@ -129,18 +149,29 @@ impl Store {
     async fn write_part_owned<R>(
         self: Arc<Self>,
         scope: [u8; 16],
-        ticket: &str,
-        part: u64,
+        key: &str,
+        position: u64,
+        byte_offset: bool,
         mut reader: R,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send,
     {
         self.operation_gate.ensure_mutations_allowed()?;
-        let plan = self.inspect_upload(scope, ticket)?;
+        let plan = self.inspect_upload(scope, key).await?;
+        let part = if byte_offset {
+            if !position.is_multiple_of(plan.part_bytes) {
+                return Err(Error::Invalid(
+                    "upload offset must align to the declared part size".into(),
+                ));
+            }
+            position / plan.part_bytes
+        } else {
+            position
+        };
         plan.part_length(part)?;
         if now() >= plan.expires_at {
-            return Err(Error::Conflict("upload ticket has expired".into()));
+            return Err(Error::Conflict("upload key has expired".into()));
         }
         let pool = self.pool(plan.identity)?;
         let io = self.upload_io(scope, "multipart upload part").await?;
@@ -155,7 +186,7 @@ impl Store {
         self.forget_part(fp, part);
         let files = {
             let _prepare = state.prepare.lock().await;
-            required(self.files(pool.clone(), plan, true).await?)?
+            required(self.files(pool.clone(), plan).await?)?
         };
         let root = write_frames(
             &pool,
@@ -206,7 +237,7 @@ impl Store {
     pub async fn upload_status(
         self: &Arc<Self>,
         scope: [u8; 16],
-        ticket: String,
+        key: String,
         start: u64,
         limit: u64,
     ) -> Result<UploadStatus> {
@@ -216,7 +247,7 @@ impl Store {
             if limit == 0 || limit > 4096 {
                 return Err(Error::Invalid("status page size must be 1..=4096".into()));
             }
-            let plan = store.inspect_upload(scope, &ticket)?;
+            let plan = store.inspect_upload(scope, &key).await?;
             let pool = store.pool(plan.identity)?;
             let fp = plan.identity.fingerprint();
             let io = acquire_disk_io(
@@ -228,7 +259,7 @@ impl Store {
             let _admission = store.admit(&pool).await?;
             let lease = store.lease(fp)?;
             let _guard = lease.state().lifecycle.clone().read_owned().await;
-            let files = store.files(pool.clone(), plan, false).await?;
+            let files = store.files(pool.clone(), plan).await?;
             if files.iter().all(Option::is_none) {
                 return Err(Error::NotFound);
             }
@@ -270,12 +301,12 @@ impl Store {
     pub async fn finalize(
         self: &Arc<Self>,
         scope: [u8; 16],
-        ticket: String,
+        key: String,
     ) -> Result<FinalizedObject> {
         let store = self.clone();
         joined(self.activity.clone(), async move {
             store.operation_gate.ensure_mutations_allowed()?;
-            let plan = store.inspect_upload(scope, &ticket)?;
+            let plan = store.inspect_upload(scope, &key).await?;
             let pool = store.pool(plan.identity)?;
             let check = pool.clone();
             let io = acquire_disk_io(
@@ -289,11 +320,7 @@ impl Store {
             let fp = plan.identity.fingerprint();
             let lease = store.foreground(fp)?;
             let _guard = lease.state().lifecycle.clone().write_owned().await;
-            let files = required(
-                store
-                    .files(pool.clone(), plan, plan.total_bytes == 0)
-                    .await?,
-            )?;
+            let files = required(store.files(pool.clone(), plan).await?)?;
             let already_finalized = store.seal_upload(&pool, plan, &files).await?;
             // Repeating finalize also retries failed durability barriers. An
             // existing final filename alone never converts an EIO into success.
@@ -343,7 +370,7 @@ impl Store {
         validate_seal_roots(&optional)?;
         let already_finalized = files.iter().all(|f| f.finalized);
         if !already_finalized && now() >= plan.expires_at {
-            return Err(Error::Conflict("upload ticket has expired".into()));
+            return Err(Error::Conflict("upload key has expired".into()));
         }
         if !already_finalized {
             let mut codec = StripeCodec::new(&pool.layout)?;
@@ -384,6 +411,9 @@ impl Store {
 }
 
 pub(crate) fn required(files: Vec<Option<ShardFile>>) -> Result<Vec<ShardFile>> {
+    if files.iter().all(Option::is_none) {
+        return Err(Error::NotFound);
+    }
     files
         .into_iter()
         .map(|f| f.ok_or_else(|| Error::Conflict("upload is missing required shard data".into())))

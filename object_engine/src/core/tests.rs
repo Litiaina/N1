@@ -1,11 +1,14 @@
 //! Functional tests use isolated directories on RAM. These do not qualify
 //! physical member independence, power loss or sustained hardware performance.
+mod direct_io;
 mod integrity;
+mod persistence;
+mod purge;
 mod redundancy;
 use super::*;
 
 #[tokio::test]
-async fn configured_gc_age_retains_recent_expired_staging_without_touching_ticket_validity() {
+async fn configured_gc_age_retains_recent_expired_staging_until_cleanup() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     store
@@ -16,11 +19,12 @@ async fn configured_gc_age_retains_recent_expired_staging_without_touching_ticke
         .unwrap();
     let pending = store
         .init(SCOPE, 0, 1, 12288, n1_link::Durability::Durable, 1)
+        .await
         .unwrap();
     store
         .write_part(
             SCOPE,
-            pending.upload_key.clone(),
+            pending.object_key.clone(),
             0,
             std::io::Cursor::new(vec![7]),
         )
@@ -35,7 +39,7 @@ async fn configured_gc_age_retains_recent_expired_staging_without_touching_ticke
     assert!(report.retained > 0);
     assert!(
         store
-            .upload_status(SCOPE, pending.upload_key, 0, 1)
+            .upload_status(SCOPE, pending.object_key.clone(), 0, 1)
             .await
             .is_ok()
     );
@@ -86,15 +90,17 @@ fn restored_runtime_controls_govern_link_requests() {
         let store = fixture.enroll();
         let first = store
             .init(SCOPE, 0, 12288, 12288, Durability::Durable, 60)
+            .await
             .unwrap();
         let second = store
             .init(SCOPE, 0, 12288, 12288, Durability::Durable, 60)
+            .await
             .unwrap();
         set_foreground_io_target(1);
         let (reader, mut writer) = tokio::io::duplex(1024);
         let writing = {
             let store = store.clone();
-            tokio::spawn(async move { store.put(SCOPE, first.upload_key, reader).await })
+            tokio::spawn(async move { store.put(SCOPE, first.object_key.clone(), reader).await })
         };
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while disk_io_scheduler_snapshot().active_foreground != 1 {
@@ -105,10 +111,10 @@ fn restored_runtime_controls_govern_link_requests() {
         .unwrap();
         let uploading = {
             let store = store.clone();
-            let ticket = second.upload_key.clone();
+            let key = second.object_key.clone();
             tokio::spawn(async move {
                 store
-                    .put(SCOPE, ticket, std::io::Cursor::new(vec![7; 12288]))
+                    .put(SCOPE, key, std::io::Cursor::new(vec![7; 12288]))
                     .await
             })
         };
@@ -162,7 +168,7 @@ fn restored_runtime_controls_govern_link_requests() {
             .iter()
             .find(|c| c.class == "foreground_read")
             .unwrap();
-        assert_eq!(writes.completed, 2);
+        assert_eq!(writes.completed, 4); // two durable Begins plus two PUTs
         assert_eq!(writes.bytes, 24576);
         assert_eq!(reads.completed, 1);
         assert_eq!(reads.bytes, 12288);
@@ -250,12 +256,13 @@ fn source(size: usize) -> Vec<u8> {
 async fn upload(store: &Arc<Store>, data: &[u8], durability: Durability) -> InitializedUpload {
     let init = store
         .init(SCOPE, 0, data.len() as u64, 12288, durability, 3600)
+        .await
         .unwrap();
     for (i, part) in data.chunks(12288).enumerate().rev() {
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 i as u64,
                 std::io::Cursor::new(part.to_vec()),
             )
@@ -279,25 +286,26 @@ async fn multipart_out_of_order_status_and_repeated_finalize_use_same_identity()
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     store
         .write_part(
             SCOPE,
-            init.upload_key.clone(),
+            init.object_key.clone(),
             2,
             std::io::Cursor::new(data[24576..].to_vec()),
         )
         .await
         .unwrap();
     let status = store
-        .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+        .upload_status(SCOPE, init.object_key.clone(), 0, 100)
         .await
         .unwrap();
     assert_eq!(status.missing_parts, vec![0, 1]);
     assert!(!status.finalized);
     assert!(
         store
-            .finalize(SCOPE, init.upload_key.clone())
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .is_err()
     );
@@ -305,7 +313,7 @@ async fn multipart_out_of_order_status_and_repeated_finalize_use_same_identity()
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 i,
                 std::io::Cursor::new(data[i as usize * 12288..(i as usize + 1) * 12288].to_vec()),
             )
@@ -313,19 +321,19 @@ async fn multipart_out_of_order_status_and_repeated_finalize_use_same_identity()
             .unwrap();
     }
     let final1 = store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     assert!(!final1.already_finalized);
-    assert_eq!(final1.object_key, init.object_key);
+    assert_eq!(final1.object_key.clone(), init.object_key.clone());
     let final2 = store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     assert!(final2.already_finalized);
-    assert_eq!(final1.object_key, final2.object_key);
+    assert_eq!(final1.object_key.clone(), final2.object_key.clone());
     let status = store
-        .upload_status(SCOPE, init.upload_key, 0, 100)
+        .upload_status(SCOPE, init.object_key.clone(), 0, 100)
         .await
         .unwrap();
     assert!(status.finalized);
@@ -346,6 +354,7 @@ async fn durable_restart_discovers_progress_without_receipts_or_manifests() {
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     for i in [0, 2, 4] {
         let start = i * 12288;
@@ -353,7 +362,7 @@ async fn durable_restart_discovers_progress_without_receipts_or_manifests() {
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 i as u64,
                 std::io::Cursor::new(data[start..end].to_vec()),
             )
@@ -363,7 +372,7 @@ async fn durable_restart_discovers_progress_without_receipts_or_manifests() {
     drop(store);
     let store = fixture.reopen();
     let status = store
-        .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+        .upload_status(SCOPE, init.object_key.clone(), 0, 100)
         .await
         .unwrap();
     assert_eq!(status.missing_parts, vec![1, 3]);
@@ -372,14 +381,17 @@ async fn durable_restart_discovers_progress_without_receipts_or_manifests() {
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 i as u64,
                 std::io::Cursor::new(data[start..start + 12288].to_vec()),
             )
             .await
             .unwrap();
     }
-    store.finalize(SCOPE, init.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, init.object_key.clone())
+        .await
+        .unwrap();
     for path in &fixture.paths {
         assert_eq!(std::fs::read_dir(path.join(".uploads")).unwrap().count(), 0);
     }
@@ -400,12 +412,13 @@ async fn exact_duplicates_are_idempotent_and_conflicts_preserve_existing_bytes()
                 Durability::Durable,
                 3600,
             )
+            .await
             .unwrap();
         for _ in 0..2 {
             store
                 .write_part(
                     SCOPE,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     0,
                     std::io::Cursor::new(data.clone()),
                 )
@@ -419,7 +432,7 @@ async fn exact_duplicates_are_idempotent_and_conflicts_preserve_existing_bytes()
             store
                 .write_part(
                     SCOPE,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     0,
                     std::io::Cursor::new(changed.clone())
                 )
@@ -427,14 +440,14 @@ async fn exact_duplicates_are_idempotent_and_conflicts_preserve_existing_bytes()
             Err(Error::Conflict(_))
         ));
         store
-            .finalize(SCOPE, init.upload_key.clone())
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .unwrap();
         assert!(matches!(
             store
                 .write_part(
                     SCOPE,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     0,
                     std::io::Cursor::new(changed)
                 )
@@ -444,14 +457,14 @@ async fn exact_duplicates_are_idempotent_and_conflicts_preserve_existing_bytes()
         store
             .write_part(
                 SCOPE,
-                init.upload_key,
+                init.object_key.clone(),
                 0,
                 std::io::Cursor::new(data.clone()),
             )
             .await
             .unwrap();
         let (actual, _) = store
-            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap();
         assert_eq!(actual, data);
@@ -472,12 +485,13 @@ async fn short_body_never_becomes_a_complete_part_and_retry_recovers() {
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     assert!(
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 0,
                 std::io::Cursor::new(data[..13000].to_vec())
             )
@@ -486,7 +500,7 @@ async fn short_body_never_becomes_a_complete_part_and_retry_recovers() {
     );
     assert_eq!(
         store
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+            .upload_status(SCOPE, init.object_key.clone(), 0, 100)
             .await
             .unwrap()
             .missing_parts,
@@ -494,20 +508,23 @@ async fn short_body_never_becomes_a_complete_part_and_retry_recovers() {
     );
     assert!(
         store
-            .finalize(SCOPE, init.upload_key.clone())
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .is_err()
     );
     store
         .write_part(
             SCOPE,
-            init.upload_key.clone(),
+            init.object_key.clone(),
             0,
             std::io::Cursor::new(data),
         )
         .await
         .unwrap();
-    store.finalize(SCOPE, init.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, init.object_key.clone())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -516,12 +533,12 @@ async fn zero_length_objects_finalize_without_payload_or_sidecars() {
     let store = fixture.enroll();
     let init = upload(&store, &[], Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     assert!(
         store
-            .finalize(SCOPE, init.upload_key)
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .unwrap()
             .already_finalized
@@ -534,13 +551,16 @@ async fn finalize_after_partial_member_promotion_survives_restart() {
     let store = fixture.enroll();
     let data = source(24577);
     let init = upload(&store, &data, Durability::Durable).await;
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let pool = store.pool(plan.identity).unwrap();
     let fp = plan.identity.fingerprint();
     // Finalize once, then move two files back to staging to reproduce the exact
     // state of a crash between member renames, retaining the same sealed bytes.
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     for shard in 0..2 {
@@ -554,21 +574,21 @@ async fn finalize_after_partial_member_promotion_survives_restart() {
     let store = fixture.reopen();
     assert!(
         !store
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+            .upload_status(SCOPE, init.object_key.clone(), 0, 100)
             .await
             .unwrap()
             .finalized
     );
     assert!(
         !store
-            .finalize(SCOPE, init.upload_key.clone())
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .unwrap()
             .already_finalized
     );
     assert!(
         store
-            .finalize(SCOPE, init.upload_key)
+            .finalize(SCOPE, init.object_key.clone())
             .await
             .unwrap()
             .already_finalized
@@ -581,7 +601,10 @@ async fn get_and_ranges_return_exact_original_bytes_without_an_index() {
     let store = fixture.enroll();
     let data = source(200001);
     let init = upload(&store, &data, Durability::Durable).await;
-    store.finalize(SCOPE, init.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, init.object_key.clone())
+        .await
+        .unwrap();
     for (start, len) in [
         (0, data.len()),
         (0, 1),
@@ -615,7 +638,7 @@ async fn get_and_ranges_return_exact_original_bytes_without_an_index() {
             .is_err()
     );
     let health = store
-        .object_health(SCOPE, init.object_key, true)
+        .object_health(SCOPE, init.object_key.clone(), true)
         .await
         .unwrap();
     assert_eq!(health.status, "healthy");
@@ -629,10 +652,13 @@ async fn missing_and_corrupt_data_are_reconstructed_and_reported() {
     let data = source(65537);
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let pool = store.pool(plan.identity).unwrap();
     let holder = pool.holder(fp, 0).unwrap();
@@ -669,7 +695,7 @@ async fn missing_and_corrupt_data_are_reconstructed_and_reported() {
     std::fs::remove_file(second.path.join(fp.shard_path(1))).unwrap();
     assert!(
         store
-            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await
             .is_err()
     );
@@ -701,16 +727,20 @@ async fn assert_prefetched_ranges_recover_independent_bad_frames(block_bytes: u3
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     store
         .put(
             SCOPE,
-            init.upload_key.clone(),
+            init.object_key.clone(),
             std::io::Cursor::new(data.clone()),
         )
         .await
         .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let pool = store.pool(plan.identity).unwrap();
     let header = n1_link::shard::ShardHeader::new(&fixture.layout, plan, 0).unwrap();
@@ -754,7 +784,7 @@ async fn assert_prefetched_ranges_recover_independent_bad_frames(block_bytes: u3
     std::fs::remove_file(parity).unwrap();
     assert!(
         store
-            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await
             .is_err()
     );
@@ -776,22 +806,26 @@ async fn sparse_durable_tail_survives_restart_conflicting_retry_and_padding_corr
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     store
         .write_part(
             SCOPE,
-            init.upload_key.clone(),
+            init.object_key.clone(),
             0,
             std::io::Cursor::new(data.clone()),
         )
         .await
         .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let header = n1_link::shard::ShardHeader::new(&fixture.layout, plan, 0).unwrap();
     for member in store.pools[0].members.iter().flatten() {
         let meta = std::fs::metadata(member.path.join(fp.staging_path())).unwrap();
-        assert_eq!(meta.len(), header.seal_offset());
+        assert_eq!(meta.len(), header.file_bytes().unwrap());
         assert!(
             meta.blocks() * 512 < meta.len() / 4,
             "zero padding allocated physical data: {meta:?}"
@@ -801,7 +835,7 @@ async fn sparse_durable_tail_survives_restart_conflicting_retry_and_padding_corr
     let store = fixture.reopen();
     assert!(
         store
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 10)
+            .upload_status(SCOPE, init.object_key.clone(), 0, 10)
             .await
             .unwrap()
             .missing_parts
@@ -813,7 +847,7 @@ async fn sparse_durable_tail_survives_restart_conflicting_retry_and_padding_corr
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 0,
                 std::io::Cursor::new(different)
             )
@@ -821,7 +855,7 @@ async fn sparse_durable_tail_survives_restart_conflicting_retry_and_padding_corr
             .is_err()
     );
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     let pool = store.pool(plan.identity).unwrap();
@@ -855,10 +889,10 @@ async fn sparse_durable_tail_survives_restart_conflicting_retry_and_padding_corr
             .0,
         data
     );
-    store.delete(SCOPE, init.object_key).await.unwrap();
+    store.delete(SCOPE, init.object_key.clone()).await.unwrap();
     assert!(matches!(
-        store.finalize(SCOPE, init.upload_key).await,
-        Err(Error::Retired)
+        store.finalize(SCOPE, init.object_key.clone()).await,
+        Err(Error::NotFound)
     ));
 }
 
@@ -870,25 +904,25 @@ async fn delete_and_cancel_are_idempotent_and_cannot_cancel_final_objects() {
     let abandoned = upload(&store, &data, Durability::Durable).await;
     assert_eq!(
         store
-            .cancel_upload(SCOPE, abandoned.upload_key.clone())
+            .cancel_upload(SCOPE, abandoned.object_key.clone())
             .await
             .unwrap(),
         4
     );
     assert_eq!(
         store
-            .cancel_upload(SCOPE, abandoned.upload_key)
+            .cancel_upload(SCOPE, abandoned.object_key.clone())
             .await
             .unwrap(),
         0
     );
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     assert!(matches!(
-        store.cancel_upload(SCOPE, init.upload_key).await,
+        store.cancel_upload(SCOPE, init.object_key.clone()).await,
         Err(Error::Conflict(_))
     ));
     assert_eq!(
@@ -900,8 +934,8 @@ async fn delete_and_cancel_are_idempotent_and_cannot_cancel_final_objects() {
         0
     );
     assert!(matches!(
-        store.stat(SCOPE, init.object_key).await,
-        Err(Error::Retired)
+        store.stat(SCOPE, init.object_key.clone()).await,
+        Err(Error::NotFound)
     ));
 }
 
@@ -912,7 +946,10 @@ async fn cancelled_download_owner_drains_before_delete_can_proceed() {
     let store = fixture.enroll();
     let data = source(512 * 1024);
     let init = upload(&store, &data, Durability::Durable).await;
-    store.finalize(SCOPE, init.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, init.object_key.clone())
+        .await
+        .unwrap();
     let (mut receiver, sender) = tokio::io::duplex(4096);
     let s = store.clone();
     let key = init.object_key.clone();
@@ -937,8 +974,8 @@ async fn cancelled_download_owner_drains_before_delete_can_proceed() {
         4
     );
     assert!(matches!(
-        store.stat(SCOPE, init.object_key).await,
-        Err(Error::Retired)
+        store.stat(SCOPE, init.object_key.clone()).await,
+        Err(Error::NotFound)
     ));
 }
 
@@ -950,10 +987,13 @@ async fn manual_repair_preserves_healthy_inodes_and_full_original_hash() {
     let data = source(200001);
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let pool = store.pool(plan.identity).unwrap();
     let paths = (0..4)
@@ -996,7 +1036,7 @@ async fn manual_repair_preserves_healthy_inodes_and_full_original_hash() {
     );
     assert!(
         store
-            .repair(SCOPE, init.object_key)
+            .repair(SCOPE, init.object_key.clone())
             .await
             .unwrap()
             .repaired_shards
@@ -1011,10 +1051,13 @@ async fn read_repair_runs_after_verified_download_without_holding_its_reader() {
     let data = source(32769);
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let pool = store.pool(plan.identity).unwrap();
     std::fs::remove_file(pool.holder(fp, 0).unwrap().path.join(fp.shard_path(0))).unwrap();
@@ -1046,13 +1089,13 @@ async fn read_repair_runs_after_verified_download_without_holding_its_reader() {
 }
 
 #[tokio::test]
-async fn permanent_retirement_rejects_old_tickets_after_restart() {
+async fn purged_identity_rejects_continuation_after_restart() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let data = source(24577);
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     store.delete(SCOPE, init.object_key.clone()).await.unwrap();
@@ -1060,46 +1103,49 @@ async fn permanent_retirement_rejects_old_tickets_after_restart() {
     let store = fixture.reopen();
     assert!(matches!(
         store.stat(SCOPE, init.object_key.clone()).await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
         store
             .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
         store
             .object_health(SCOPE, init.object_key.clone(), true)
             .await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
         store.repair(SCOPE, init.object_key.clone()).await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
         store
             .write_part(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 0,
                 std::io::Cursor::new(data[..12288].to_vec())
             )
             .await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
         store
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
+            .upload_status(SCOPE, init.object_key.clone(), 0, 100)
             .await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
-        store.finalize(SCOPE, init.upload_key).await,
-        Err(Error::Retired)
+        store.finalize(SCOPE, init.object_key.clone()).await,
+        Err(Error::NotFound)
     ));
-    assert_eq!(store.delete(SCOPE, init.object_key).await.unwrap(), 0);
+    assert_eq!(
+        store.delete(SCOPE, init.object_key.clone()).await.unwrap(),
+        0
+    );
     for member in &fixture.paths {
         assert_eq!(
             std::fs::read_dir(member.join(".uploads")).unwrap().count(),
@@ -1109,7 +1155,7 @@ async fn permanent_retirement_rejects_old_tickets_after_restart() {
 }
 
 #[tokio::test]
-async fn delete_unfinished_or_never_written_identity_also_revokes_ticket() {
+async fn purge_unfinished_or_never_written_identity_prevents_resume() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     for written in [false, true] {
@@ -1123,144 +1169,39 @@ async fn delete_unfinished_or_never_written_identity_also_revokes_ticket() {
                 Durability::Durable,
                 3600,
             )
+            .await
             .unwrap();
         if written {
             store
                 .write_part(
                     SCOPE,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     0,
                     std::io::Cursor::new(data.clone()),
                 )
                 .await
                 .unwrap();
         }
-        assert_eq!(store.delete(SCOPE, init.object_key).await.unwrap(), 4);
+        assert_eq!(
+            store.delete(SCOPE, init.object_key.clone()).await.unwrap(),
+            4
+        );
         assert!(matches!(
             store
                 .write_part(
                     SCOPE,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     0,
                     std::io::Cursor::new(data)
                 )
                 .await,
-            Err(Error::Retired)
+            Err(Error::NotFound)
         ));
         assert!(matches!(
-            store.finalize(SCOPE, init.upload_key).await,
-            Err(Error::Retired)
+            store.finalize(SCOPE, init.object_key.clone()).await,
+            Err(Error::NotFound)
         ));
     }
-}
-
-#[tokio::test]
-async fn failed_delete_never_publishes_completed_certificate_and_retry_finishes() {
-    use n1_link::retirement::{Phase, Retirement};
-    let fixture = Fixture::new();
-    let store = fixture.enroll();
-    let data = source(12288);
-    let init = upload(&store, &data, Durability::Durable).await;
-    store
-        .finalize(SCOPE, init.upload_key.clone())
-        .await
-        .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
-    let fp = plan.identity.fingerprint();
-    let pool = store.pool(plan.identity).unwrap();
-    let blocked = pool
-        .holder(fp, 0)
-        .unwrap()
-        .path
-        .join(format!(".uploads/{fp}"));
-    // All final-file probes succeed; this blocks only publication on slot 0.
-    std::fs::write(&blocked, b"publication blocker").unwrap();
-    assert!(store.delete(SCOPE, init.object_key.clone()).await.is_err());
-    for shard in 1..4 {
-        let member = pool.holder(fp, shard).unwrap();
-        let bytes = std::fs::read(member.path.join(fp.shard_path(shard))).unwrap();
-        assert_eq!(
-            Retirement::decode(&bytes, fp, shard).unwrap().phase,
-            Phase::Retiring
-        );
-    }
-    assert!(matches!(
-        store.stat(SCOPE, init.object_key.clone()).await,
-        Err(Error::Retiring)
-    ));
-    std::fs::remove_file(blocked).unwrap();
-    drop(pool);
-    drop(store);
-    let store = fixture.reopen();
-    assert!(matches!(
-        store.finalize(SCOPE, init.upload_key).await,
-        Err(Error::Retiring)
-    ));
-    store.delete(SCOPE, init.object_key.clone()).await.unwrap();
-    assert!(matches!(
-        store.stat(SCOPE, init.object_key).await,
-        Err(Error::Retired)
-    ));
-}
-
-#[tokio::test]
-async fn completed_certificate_survives_an_unavailable_other_member() {
-    use n1_link::retirement::{Phase, Retirement};
-    let fixture = Fixture::new();
-    let store = fixture.enroll();
-    let data = source(12288);
-    let init = upload(&store, &data, Durability::Durable).await;
-    store
-        .finalize(SCOPE, init.upload_key.clone())
-        .await
-        .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
-    let fp = plan.identity.fingerprint();
-    let pool = store.pool(plan.identity).unwrap();
-    for shard in 0..4 {
-        pool.holder(fp, shard)
-            .unwrap()
-            .publish_retirement(
-                fp,
-                Retirement {
-                    phase: Phase::Retiring,
-                    shard,
-                    nonce: [55; 16],
-                    timestamp: 1,
-                },
-            )
-            .unwrap();
-    }
-    pool.holder(fp, 0)
-        .unwrap()
-        .publish_retirement(
-            fp,
-            Retirement {
-                phase: Phase::Retired,
-                shard: 0,
-                nonce: [55; 16],
-                timestamp: 1,
-            },
-        )
-        .unwrap();
-    let missing = pool.holder(fp, 1).unwrap().path.clone();
-    drop(pool);
-    drop(store);
-    let detached = fixture.base.join("detached");
-    std::fs::rename(&missing, &detached).unwrap();
-    let store = fixture.reopen();
-    assert!(matches!(
-        store.stat(SCOPE, init.object_key.clone()).await,
-        Err(Error::Retired)
-    ));
-    drop(store);
-    std::fs::rename(detached, missing).unwrap();
-    let store = fixture.reopen();
-    store.delete(SCOPE, init.object_key.clone()).await.unwrap();
-    assert!(matches!(
-        store.stat(SCOPE, init.object_key).await,
-        Err(Error::Retired)
-    ));
 }
 
 #[tokio::test]
@@ -1274,30 +1215,31 @@ async fn normal_put_and_group_batch_preserve_retry_identity_and_all_bytes() {
         let part = (size as u64).max(1).div_ceil(12288) * 12288;
         let init = store
             .init(SCOPE, 0, size as u64, part, Durability::Durable, 3600)
+            .await
             .unwrap();
         body.extend_from_slice(&data);
         objects.push((init, data));
     }
-    let tickets = objects
+    let keys = objects
         .iter()
-        .map(|(init, _)| init.upload_key.clone())
+        .map(|(init, _)| init.object_key.clone())
         .collect::<Vec<_>>();
     assert_eq!(
-        store.batch_length(SCOPE, &tickets).unwrap(),
+        store.batch_length(SCOPE, &keys).await.unwrap(),
         body.len() as u64
     );
     let completed = store
-        .put_batch(SCOPE, tickets.clone(), std::io::Cursor::new(body.clone()))
+        .put_batch(SCOPE, keys.clone(), std::io::Cursor::new(body.clone()))
         .await
         .unwrap();
     assert_eq!(completed.len(), objects.len());
     let repeated = store
-        .put_batch(SCOPE, tickets, std::io::Cursor::new(body))
+        .put_batch(SCOPE, keys, std::io::Cursor::new(body))
         .await
         .unwrap();
     assert!(repeated.iter().all(|o| o.already_finalized));
     for ((init, data), object) in objects.iter().zip(completed) {
-        assert_eq!(object.object_key, init.object_key);
+        assert_eq!(object.object_key.clone(), init.object_key.clone());
         assert_eq!(
             store
                 .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
@@ -1317,12 +1259,13 @@ async fn normal_put_and_group_batch_preserve_retry_identity_and_all_bytes() {
             Durability::Durable,
             3600,
         )
+        .await
         .unwrap();
     assert!(
         !store
             .put(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 std::io::Cursor::new(data.clone())
             )
             .await
@@ -1331,14 +1274,18 @@ async fn normal_put_and_group_batch_preserve_retry_identity_and_all_bytes() {
     );
     assert!(
         store
-            .put(SCOPE, init.upload_key, std::io::Cursor::new(data.clone()))
+            .put(
+                SCOPE,
+                init.object_key.clone(),
+                std::io::Cursor::new(data.clone())
+            )
             .await
             .unwrap()
             .already_finalized
     );
     assert_eq!(
         store
-            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
@@ -1351,23 +1298,25 @@ async fn batch_short_body_never_publishes_earlier_items_and_can_resume() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let data = source(12288);
-    let items = (0..3)
-        .map(|_| {
+    let mut items = Vec::new();
+    for _ in 0..3 {
+        items.push(
             store
                 .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let tickets = items
+                .await
+                .unwrap(),
+        );
+    }
+    let keys = items
         .iter()
-        .map(|i| i.upload_key.clone())
+        .map(|i| i.object_key.clone())
         .collect::<Vec<_>>();
     let body = data.repeat(3);
     assert!(
         store
             .put_batch(
                 SCOPE,
-                tickets.clone(),
+                keys.clone(),
                 std::io::Cursor::new(body[..13000].to_vec())
             )
             .await
@@ -1380,13 +1329,13 @@ async fn batch_short_body_never_publishes_earlier_items_and_can_resume() {
         ));
     }
     store
-        .put_batch(SCOPE, tickets, std::io::Cursor::new(body))
+        .put_batch(SCOPE, keys, std::io::Cursor::new(body))
         .await
         .unwrap();
     for item in items {
         assert_eq!(
             store
-                .download(SCOPE, item.object_key, 0, None, Vec::new())
+                .download(SCOPE, item.object_key.clone(), 0, None, Vec::new())
                 .await
                 .unwrap()
                 .0,
@@ -1421,14 +1370,16 @@ async fn cancelled_batch_owner_finishes_durable_publication_before_shutdown_drai
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let data = source(12288);
-    let items = (0..3)
-        .map(|_| {
+    let mut items = Vec::new();
+    for _ in 0..3 {
+        items.push(
             store
                 .init(SCOPE, 0, 12288, 12288, Durability::Durable, 3600)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let tickets = items.iter().map(|item| item.upload_key.clone()).collect();
+                .await
+                .unwrap(),
+        );
+    }
+    let keys = items.iter().map(|item| item.object_key.clone()).collect();
     let (input, mut output) = tokio::io::duplex(1024);
     let (started, ready) = tokio::sync::oneshot::channel();
     let worker = store.clone();
@@ -1436,7 +1387,7 @@ async fn cancelled_batch_owner_finishes_durable_publication_before_shutdown_drai
         worker
             .put_batch(
                 SCOPE,
-                tickets,
+                keys,
                 Reader {
                     input,
                     started: Some(started),
@@ -1467,7 +1418,7 @@ async fn cancelled_batch_owner_finishes_durable_publication_before_shutdown_drai
     for item in items {
         assert_eq!(
             store
-                .download(SCOPE, item.object_key, 0, None, Vec::new())
+                .download(SCOPE, item.object_key.clone(), 0, None, Vec::new())
                 .await
                 .unwrap()
                 .0,
@@ -1482,42 +1433,46 @@ async fn batches_reject_duplicate_identities_and_cannot_recreate_retired_keys() 
     let store = fixture.enroll();
     let init = store
         .init(SCOPE, 0, 0, 12288, Durability::Durable, 3600)
+        .await
         .unwrap();
     assert!(matches!(
         store
             .put_batch(
                 SCOPE,
-                vec![init.upload_key.clone(), init.upload_key.clone()],
+                vec![init.object_key.clone(), init.object_key.clone()],
                 std::io::Cursor::new(Vec::new())
             )
             .await,
         Err(Error::Invalid(_))
     ));
-    store.delete(SCOPE, init.object_key).await.unwrap();
+    store.delete(SCOPE, init.object_key.clone()).await.unwrap();
     assert!(matches!(
         store
             .put(
                 SCOPE,
-                init.upload_key.clone(),
+                init.object_key.clone(),
                 std::io::Cursor::new(Vec::new())
             )
             .await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
     assert!(matches!(
         store
             .put_batch(
                 SCOPE,
-                vec![init.upload_key],
+                vec![init.object_key.clone()],
                 std::io::Cursor::new(Vec::new())
             )
             .await,
-        Err(Error::Retired)
+        Err(Error::NotFound)
     ));
 }
 
-fn expire_staging(store: &Store, init: &InitializedUpload) {
-    let mut plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+async fn expire_staging(store: &Store, init: &InitializedUpload) {
+    let mut plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     plan.expires_at = 1;
     let pool = store.pool(plan.identity).unwrap();
     let fp = plan.identity.fingerprint();
@@ -1537,11 +1492,14 @@ async fn gc_only_reclaims_known_expired_private_uploads_and_skips_active_owners(
     let store = fixture.enroll();
     let data = source(12000);
     let expired = upload(&store, &data, Durability::Durable).await;
-    expire_staging(&store, &expired);
+    expire_staging(&store, &expired).await;
     let active = upload(&store, &data, Durability::Durable).await;
-    expire_staging(&store, &active);
+    expire_staging(&store, &active).await;
     let live = upload(&store, &data, Durability::Durable).await;
-    store.finalize(SCOPE, live.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, live.object_key.clone())
+        .await
+        .unwrap();
     let retired = upload(&store, &data, Durability::Durable).await;
     store
         .delete(SCOPE, retired.object_key.clone())
@@ -1549,7 +1507,8 @@ async fn gc_only_reclaims_known_expired_private_uploads_and_skips_active_owners(
         .unwrap();
     let fresh = upload(&store, &data, Durability::Durable).await;
     let fp = store
-        .inspect_upload(SCOPE, &active.upload_key)
+        .inspect_upload(SCOPE, &active.object_key.clone())
+        .await
         .unwrap()
         .identity
         .fingerprint();
@@ -1563,14 +1522,14 @@ async fn gc_only_reclaims_known_expired_private_uploads_and_skips_active_owners(
     assert_eq!(report.removed_shards, 4);
     assert_eq!(report.active_skipped, 1);
     assert!(report.errors.is_empty());
-    assert!(store.stat(SCOPE, live.object_key).await.is_ok());
+    assert!(store.stat(SCOPE, live.object_key.clone()).await.is_ok());
     assert!(matches!(
-        store.stat(SCOPE, retired.object_key).await,
-        Err(Error::Retired)
+        store.stat(SCOPE, retired.object_key.clone()).await,
+        Err(Error::NotFound)
     ));
     assert!(
         store
-            .upload_status(SCOPE, fresh.upload_key, 0, 100)
+            .upload_status(SCOPE, fresh.object_key.clone(), 0, 100)
             .await
             .unwrap()
             .missing_parts
@@ -1588,17 +1547,20 @@ async fn gc_only_reclaims_known_expired_private_uploads_and_skips_active_owners(
     );
 }
 #[tokio::test]
-async fn paced_scrub_repairs_damage_preserves_retirement_and_keeps_exact_data() {
+async fn paced_scrub_repairs_damage_preserves_purged_absence_and_keeps_exact_data() {
     use tokio_util::sync::CancellationToken;
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let data = source(40000);
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
+    let plan = store
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
+        .unwrap();
     let fp = plan.identity.fingerprint();
     let pool = store.pool(plan.identity).unwrap();
     let path = pool.holder(fp, 0).unwrap().path.join(fp.shard_path(0));
@@ -1621,20 +1583,21 @@ async fn paced_scrub_repairs_damage_preserves_retirement_and_keeps_exact_data() 
         .unwrap();
     assert_eq!(report.degraded, 1);
     assert_eq!(report.repaired, 1);
-    assert_eq!(report.retired, 1);
+    // A purged identity leaves no terminal file for scrub to enumerate.
+    assert_eq!(report.examined, 1);
     assert_eq!(report.incomplete, 0);
     assert!(!report.stopped);
     assert_eq!(
         store
-            .download(SCOPE, init.object_key, 0, None, Vec::new())
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
             .await
             .unwrap()
             .0,
         data
     );
     assert!(matches!(
-        store.stat(SCOPE, retired.object_key).await,
-        Err(Error::Retired)
+        store.stat(SCOPE, retired.object_key.clone()).await,
+        Err(Error::NotFound)
     ));
 }
 #[tokio::test]
@@ -1645,11 +1608,12 @@ async fn foreground_read_preempts_slow_scrub_without_waiting_for_its_io_window()
     let data = source(10000);
     let init = upload(&store, &data, Durability::Durable).await;
     store
-        .finalize(SCOPE, init.upload_key.clone())
+        .finalize(SCOPE, init.object_key.clone())
         .await
         .unwrap();
     let fp = store
-        .inspect_upload(SCOPE, &init.upload_key)
+        .inspect_upload(SCOPE, &init.object_key.clone())
+        .await
         .unwrap()
         .identity
         .fingerprint();
@@ -1674,7 +1638,7 @@ async fn foreground_read_preempts_slow_scrub_without_waiting_for_its_io_window()
     .unwrap();
     let (bytes, _) = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        store.download(SCOPE, init.object_key, 0, None, Vec::new()),
+        store.download(SCOPE, init.object_key.clone(), 0, None, Vec::new()),
     )
     .await
     .unwrap()
@@ -1690,104 +1654,20 @@ async fn foreground_read_preempts_slow_scrub_without_waiting_for_its_io_window()
 }
 
 #[tokio::test]
-async fn corrupt_retirement_fences_old_payload_and_repair_even_when_k_live_shards_remain() {
-    use n1_link::retirement::{Phase, Retirement};
-    let fixture = Fixture::new();
-    let store = fixture.enroll();
-    let bytes = source(9000);
-    let init = upload(&store, &bytes, Durability::Durable).await;
-    store
-        .finalize(SCOPE, init.upload_key.clone())
-        .await
-        .unwrap();
-    let plan = store.inspect_upload(SCOPE, &init.upload_key).unwrap();
-    let fp = plan.identity.fingerprint();
-    let holder = store.pools[0].holder(fp, 0).unwrap();
-    holder
-        .publish_retirement(
-            fp,
-            Retirement {
-                phase: Phase::Retiring,
-                shard: 0,
-                nonce: [3; 16],
-                timestamp: 1,
-            },
-        )
-        .unwrap();
-    let path = holder.path.join(fp.shard_path(0));
-    let mut record = std::fs::read(&path).unwrap();
-    record[64] ^= 1;
-    std::fs::write(path, record).unwrap();
-    assert!(matches!(
-        store.stat(SCOPE, init.object_key.clone()).await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store
-            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
-            .await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store
-            .object_health(SCOPE, init.object_key.clone(), true)
-            .await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store.repair(SCOPE, init.object_key.clone()).await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store.finalize(SCOPE, init.upload_key.clone()).await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store
-            .upload_status(SCOPE, init.upload_key.clone(), 0, 100)
-            .await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store
-            .write_part(
-                SCOPE,
-                init.upload_key.clone(),
-                0,
-                std::io::Cursor::new(bytes.clone())
-            )
-            .await,
-        Err(Error::RetirementCorrupt)
-    ));
-    assert!(matches!(
-        store
-            .put(SCOPE, init.upload_key.clone(), std::io::Cursor::new(bytes))
-            .await,
-        Err(Error::RetirementCorrupt)
-    ));
-    store.delete(SCOPE, init.object_key.clone()).await.unwrap();
-    drop(holder);
-    drop(store);
-    let reopened = fixture.reopen();
-    assert!(matches!(
-        reopened.stat(SCOPE, init.object_key).await,
-        Err(Error::Retired)
-    ));
-    assert!(matches!(
-        reopened.finalize(SCOPE, init.upload_key).await,
-        Err(Error::Retired)
-    ));
-}
-
-#[tokio::test]
 async fn metadata_operations_obey_shared_admission_before_touching_shards() {
     let fixture = Fixture::new();
     let store = fixture.enroll();
     let bytes = source(9000);
     let live = upload(&store, &bytes, Durability::Durable).await;
-    store.finalize(SCOPE, live.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, live.object_key.clone())
+        .await
+        .unwrap();
     let doomed = upload(&store, &bytes, Durability::Durable).await;
-    store.finalize(SCOPE, doomed.upload_key).await.unwrap();
+    store
+        .finalize(SCOPE, doomed.object_key.clone())
+        .await
+        .unwrap();
     let pending = upload(&store, &bytes, Durability::Durable).await;
     let mut permits = Vec::new();
     for _ in 0..16 {
@@ -1795,15 +1675,15 @@ async fn metadata_operations_obey_shared_admission_before_touching_shards() {
     }
     let stat = {
         let store = store.clone();
-        tokio::spawn(async move { store.stat(SCOPE, live.object_key).await })
+        tokio::spawn(async move { store.stat(SCOPE, live.object_key.clone()).await })
     };
     let delete = {
         let store = store.clone();
-        tokio::spawn(async move { store.delete(SCOPE, doomed.object_key).await })
+        tokio::spawn(async move { store.delete(SCOPE, doomed.object_key.clone()).await })
     };
     let cancel = {
         let store = store.clone();
-        tokio::spawn(async move { store.cancel_upload(SCOPE, pending.upload_key).await })
+        tokio::spawn(async move { store.cancel_upload(SCOPE, pending.object_key.clone()).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     assert!(!stat.is_finished());

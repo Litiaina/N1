@@ -194,6 +194,17 @@ pub async fn write_aligned_at_async(
     buffer: AlignedBuffer,
     offset: u64,
 ) -> io::Result<AlignedBuffer> {
+    let alignment = crate::core::ec::ALIGNMENT;
+    if !buffer.is_empty()
+        && (!(buffer.as_slice().as_ptr() as usize).is_multiple_of(alignment)
+            || !buffer.len().is_multiple_of(alignment)
+            || !offset.is_multiple_of(alignment as u64))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "direct I/O requires aligned buffer, offset and length",
+        ));
+    }
     if let Some(native) = &selected_backend()?.native {
         return match native
             .write_all(file, uring::Buffer::Aligned(buffer), offset)

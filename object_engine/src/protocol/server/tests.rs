@@ -244,7 +244,7 @@ async fn allocation_and_object_io_do_not_wait_for_a_stalled_monitoring_probe() {
         let plan = init(&mut client, payload.len() as u64).await;
         client
             .put(
-                plan["upload_key"].as_str().unwrap().into(),
+                plan["object_key"].as_str().unwrap().into(),
                 payload.len() as u64,
                 &mut std::io::Cursor::new(payload.clone()),
             )
@@ -456,7 +456,7 @@ async fn native_and_http_share_authentication_and_fragment_rate_quotas() {
 }
 
 #[tokio::test]
-async fn signed_downloads_preserve_scope_ranges_integrity_and_permanent_retirement() {
+async fn signed_downloads_preserve_scope_ranges_integrity_and_purged_absence() {
     let server = Server::new(false).await;
     let mut owner = server.client().await;
     let data = b"immutable signed object data".to_vec();
@@ -464,7 +464,7 @@ async fn signed_downloads_preserve_scope_ranges_integrity_and_permanent_retireme
     let key = string(&upload, "object_key");
     owner
         .put(
-            string(&upload, "upload_key"),
+            string(&upload, "object_key"),
             data.len() as u64,
             &mut &data[..],
         )
@@ -518,7 +518,7 @@ async fn signed_downloads_preserve_scope_ranges_integrity_and_permanent_retireme
         .await
         .unwrap();
     assert!(
-        matches!(anonymous.download_signed(grant, &mut Vec::new()).await, Err(NativeClientError::Native {code,..}) if code == "410")
+        matches!(anonymous.download_signed(grant, &mut Vec::new()).await, Err(NativeClientError::Native {code,..}) if code == "404")
     );
 }
 
@@ -532,7 +532,7 @@ async fn http_download_ranges_and_preconditions_preserve_immutable_bytes_and_sig
     let upload = init(&mut client, data.len() as u64).await;
     client
         .put(
-            string(&upload, "upload_key"),
+            string(&upload, "object_key"),
             data.len() as u64,
             &mut &data[..],
         )
@@ -685,7 +685,7 @@ async fn http_download_ranges_and_preconditions_preserve_immutable_bytes_and_sig
     let empty = init(&mut client, 0).await;
     client
         .control(Command::UploadFinalize {
-            upload_key: string(&empty, "upload_key"),
+            object_key: string(&empty, "object_key"),
         })
         .await
         .unwrap();
@@ -714,7 +714,7 @@ async fn maintenance_modes_gate_real_requests_and_are_independent_between_stores
     let upload = init(&mut client, 4).await;
     let key = string(&upload, "object_key");
     client
-        .put(string(&upload, "upload_key"), 4, &mut &b"data"[..])
+        .put(string(&upload, "object_key"), 4, &mut &b"data"[..])
         .await
         .unwrap();
     let read_only = server
@@ -756,6 +756,7 @@ async fn maintenance_modes_gate_real_requests_and_are_independent_between_stores
     other
         .enroll()
         .init([11; 16], 0, 0, 12288, n1_link::Durability::Durable, 60)
+        .await
         .unwrap();
     drop(quiesced);
     drop(read_only);
@@ -814,15 +815,14 @@ async fn native_streams_resume_conflicts_ranges_and_permanent_delete() {
         .map(|i| (i * 197 % 251) as u8)
         .collect::<Vec<_>>();
     let upload = init(&mut client, data.len() as u64).await;
-    let ticket = string(&upload, "upload_key");
     let key = string(&upload, "object_key");
     for part in [2, 0] {
         let start = part * 24576;
         let end = (start + 24576).min(data.len());
         client
-            .upload_part(
-                ticket.clone(),
-                part as u64,
+            .write_at(
+                key.clone(),
+                start as u64,
                 (end - start) as u64,
                 &mut std::io::Cursor::new(&data[start..end]),
             )
@@ -831,7 +831,7 @@ async fn native_streams_resume_conflicts_ranges_and_permanent_delete() {
     }
     let status = client
         .control(Command::UploadStatus {
-            upload_key: ticket.clone(),
+            object_key: key.clone(),
             start: 0,
             limit: 100,
         })
@@ -842,15 +842,15 @@ async fn native_streams_resume_conflicts_ranges_and_permanent_delete() {
     changed[1] ^= 1;
     is_status(
         client
-            .upload_part(ticket.clone(), 0, 24576, &mut std::io::Cursor::new(changed))
+            .write_at(key.clone(), 0, 24576, &mut std::io::Cursor::new(changed))
             .await,
         "409",
     );
     // The rejected body was fully drained: the same connection stays aligned.
     client
-        .upload_part(
-            ticket.clone(),
-            1,
+        .write_at(
+            key.clone(),
+            24576,
             24576,
             &mut std::io::Cursor::new(&data[24576..49152]),
         )
@@ -858,14 +858,14 @@ async fn native_streams_resume_conflicts_ranges_and_permanent_delete() {
         .unwrap();
     client
         .control(Command::UploadFinalize {
-            upload_key: ticket.clone(),
+            object_key: key.clone(),
         })
         .await
         .unwrap();
     assert_eq!(
         client
             .control(Command::UploadFinalize {
-                upload_key: ticket.clone()
+                object_key: key.clone()
             })
             .await
             .unwrap()
@@ -888,15 +888,17 @@ async fn native_streams_resume_conflicts_ranges_and_permanent_delete() {
         .unwrap();
     is_status(
         client
-            .control(Command::ObjectStat { object_key: key })
+            .control(Command::ObjectStat {
+                object_key: key.clone(),
+            })
             .await,
-        "410",
+        "404",
     );
     is_status(
         client
-            .control(Command::UploadFinalize { upload_key: ticket })
+            .control(Command::UploadFinalize { object_key: key })
             .await,
-        "410",
+        "404",
     );
 }
 
@@ -907,7 +909,7 @@ async fn fragment_scope_and_requested_permissions_apply_to_both_transports() {
     let upload = init(&mut client, 0).await;
     client
         .control(Command::UploadFinalize {
-            upload_key: string(&upload, "upload_key"),
+            object_key: string(&upload, "object_key"),
         })
         .await
         .unwrap();
@@ -979,11 +981,11 @@ async fn incomplete_client_upload_poisoned_connection_can_resume_on_new_connecti
     let server = Server::new(false).await;
     let mut client = server.client().await;
     let upload = init(&mut client, 24576).await;
-    let ticket = string(&upload, "upload_key");
+    let key = string(&upload, "object_key");
     assert!(
         client
-            .upload_part(
-                ticket.clone(),
+            .write_at(
+                key.clone(),
                 0,
                 24576,
                 &mut std::io::Cursor::new(vec![7; 13000])
@@ -999,7 +1001,7 @@ async fn incomplete_client_upload_poisoned_connection_can_resume_on_new_connecti
     let mut client = server.client().await;
     let status = client
         .control(Command::UploadStatus {
-            upload_key: ticket.clone(),
+            object_key: key.clone(),
             start: 0,
             limit: 1,
         })
@@ -1007,8 +1009,8 @@ async fn incomplete_client_upload_poisoned_connection_can_resume_on_new_connecti
         .unwrap();
     assert_eq!(status.result.unwrap()["missing_parts"], json!([0]));
     client
-        .upload_part(
-            ticket.clone(),
+        .write_at(
+            key.clone(),
             0,
             24576,
             &mut std::io::Cursor::new(vec![7; 24576]),
@@ -1016,7 +1018,7 @@ async fn incomplete_client_upload_poisoned_connection_can_resume_on_new_connecti
         .await
         .unwrap();
     client
-        .control(Command::UploadFinalize { upload_key: ticket })
+        .control(Command::UploadFinalize { object_key: key })
         .await
         .unwrap();
     let mut bytes = Vec::new();
@@ -1066,23 +1068,25 @@ async fn normal_and_batch_uploads_share_native_and_http_noa_handlers() {
     let first = init(&mut client, data.len() as u64).await;
     client
         .put(
-            string(&first, "upload_key"),
+            string(&first, "object_key"),
             data.len() as u64,
             &mut std::io::Cursor::new(data.clone()),
         )
         .await
         .unwrap();
-    let mut tickets = Vec::new();
     let mut keys = Vec::new();
     let mut body = Vec::new();
     for _ in 0..3 {
         let item = init(&mut client, data.len() as u64).await;
-        tickets.push(string(&item, "upload_key"));
         keys.push(string(&item, "object_key"));
         body.extend_from_slice(&data);
     }
     let completed = client
-        .put_batch(tickets, body.len() as u64, &mut std::io::Cursor::new(body))
+        .put_batch(
+            keys.clone(),
+            body.len() as u64,
+            &mut std::io::Cursor::new(body),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1098,7 +1102,7 @@ async fn normal_and_batch_uploads_share_native_and_http_noa_handlers() {
     let request = Request {
         id: 12,
         command: Command::UploadPut {
-            upload_key: string(&item, "upload_key"),
+            object_key: string(&item, "object_key"),
         },
         body_len: data.len() as u64,
     };
@@ -1133,10 +1137,10 @@ async fn stopping_optional_scrub_keeps_native_io_available_and_scoped_tokens_can
     let mut client = server.client().await;
     let source = vec![19; 8000];
     let item = init(&mut client, source.len() as u64).await;
-    let ticket = string(&item, "upload_key");
+    let key = string(&item, "object_key");
     client
         .put(
-            ticket.clone(),
+            key.clone(),
             source.len() as u64,
             &mut std::io::Cursor::new(source.clone()),
         )
@@ -1166,7 +1170,8 @@ async fn stopping_optional_scrub_keeps_native_io_available_and_scoped_tokens_can
     let fp = server
         .service
         .store
-        .inspect_upload([11; 16], &ticket)
+        .inspect_upload([11; 16], &key)
+        .await
         .unwrap()
         .identity
         .fingerprint();
@@ -1286,7 +1291,7 @@ async fn authenticated_native_replication_works_with_http_stopped_and_denies_sco
     let object = init(&mut client, 20000).await;
     client
         .put(
-            string(&object, "upload_key"),
+            string(&object, "object_key"),
             20000,
             &mut std::io::Cursor::new(vec![15; 20000]),
         )
@@ -1358,7 +1363,7 @@ async fn recovery_control_jobs_share_native_http_authorization_and_report_real_v
     let object = init(&mut client, 20000).await;
     client
         .put(
-            string(&object, "upload_key"),
+            string(&object, "object_key"),
             20000,
             &mut std::io::Cursor::new(vec![57; 20000]),
         )
@@ -1504,7 +1509,7 @@ async fn http_replication_uses_the_same_authenticated_recovery_protocol() {
     let object = init(&mut client, 15000).await;
     client
         .put(
-            string(&object, "upload_key"),
+            string(&object, "object_key"),
             15000,
             &mut std::io::Cursor::new(vec![29; 15000]),
         )

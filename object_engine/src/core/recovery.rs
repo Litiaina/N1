@@ -131,17 +131,19 @@ mod tests {
                     Durability::Durable,
                     3600,
                 )
+                .await
                 .unwrap();
             store
                 .put(
                     scope,
-                    init.upload_key.clone(),
+                    init.object_key.clone(),
                     std::io::Cursor::new(bytes.clone()),
                 )
                 .await
                 .unwrap();
             let fp = store
-                .inspect_upload(scope, &init.upload_key)
+                .inspect_upload(scope, &init.object_key.clone())
+                .await
                 .unwrap()
                 .identity
                 .fingerprint();
@@ -151,7 +153,7 @@ mod tests {
                 .path
                 .join(fp.shard_path(0));
             std::fs::remove_file(target).unwrap();
-            objects.push((init.object_key, bytes));
+            objects.push((init.object_key.clone(), bytes));
         }
         store.configure_read_repair(true);
         let held = tokio::time::timeout(

@@ -189,12 +189,9 @@ impl Service {
                     .ok_or_else(|| {
                         Error::Unavailable("no unsealed allocation pool matches request".into())
                     })?;
-                let store = self.store.clone();
-                let admission = store.admit_metadata(&store.pools[selected]).await?;
                 value(
-                    tokio::task::spawn_blocking(move || {
-                        let _admission = admission;
-                        store.init(
+                    self.store
+                        .init(
                             scope,
                             selected,
                             total_bytes,
@@ -206,25 +203,23 @@ impl Service {
                             },
                             ttl_seconds,
                         )
-                    })
-                    .await
-                    .map_err(|_| Error::Unavailable("init worker failed".into()))??,
+                        .await?,
                 )
             }
             Command::UploadStatus {
-                upload_key,
+                object_key,
                 start,
                 limit,
             } => value(
                 self.store
-                    .upload_status(scope, upload_key, start, limit)
+                    .upload_status(scope, object_key, start, limit)
                     .await?,
             ),
-            Command::UploadFinalize { upload_key } => {
-                value(self.store.finalize(scope, upload_key).await?)
+            Command::UploadFinalize { object_key } => {
+                value(self.store.finalize(scope, object_key).await?)
             }
-            Command::UploadCancel { upload_key } => {
-                Ok(json!({"removed_shards":self.store.cancel_upload(scope,upload_key).await?}))
+            Command::UploadCancel { object_key } => {
+                Ok(json!({"removed_shards":self.store.cancel_upload(scope,object_key).await?}))
             }
             Command::ObjectStat { object_key } => value(self.store.stat(scope, object_key).await?),
             Command::ObjectHealth { object_key, deep } => {
@@ -234,7 +229,7 @@ impl Service {
                 value(self.store.repair(scope, object_key).await?)
             }
             Command::ObjectDelete { object_key } => {
-                Ok(json!({"retired_shards":self.store.delete(scope,object_key).await?}))
+                Ok(json!({"removed_shards":self.store.delete(scope,object_key).await?}))
             }
             Command::BulkDelete { object_keys } => {
                 if object_keys.is_empty() || object_keys.len() > 256 {
@@ -252,7 +247,7 @@ impl Service {
                     {
                         results.push(match result {
                             Ok(removed) => {
-                                json!({"object_key":key,"status":200,"retired_shards":removed})
+                                json!({"object_key":key,"status":200,"removed_shards":removed})
                             }
                             Err(e) => {
                                 json!({"object_key":key,"status":e.status(),"error":e.to_string()})
@@ -465,15 +460,19 @@ impl Service {
         }
     }
 
-    pub fn upload_length(&self, claims: &Claims, ticket: &str, part: u64) -> Result<u64> {
+    pub async fn upload_length(&self, claims: &Claims, key: &str, offset: u64) -> Result<u64> {
         claims.live()?;
         if !claims.permissions.write {
             return Err(Error::Forbidden);
         }
-        let length = self
-            .store
-            .inspect_upload(claims.sub.0, ticket)?
-            .part_length(part)
+        let plan = self.store.inspect_upload(claims.sub.0, key).await?;
+        if !offset.is_multiple_of(plan.part_bytes) {
+            return Err(Error::Invalid(
+                "upload offset must align to the declared part size".into(),
+            ));
+        }
+        let length = plan
+            .part_length(offset / plan.part_bytes)
             .map_err(Error::from)?;
         if length > self.config.runtime.max_part_size {
             return Err(Error::Invalid(
@@ -542,23 +541,23 @@ impl Service {
         .await
         .map_err(|e| Error::Unavailable(e.to_string()))?
     }
-    pub fn body_length(&self, claims: &Claims, command: &Command) -> Result<u64> {
+    pub async fn body_length(&self, claims: &Claims, command: &Command) -> Result<u64> {
         self.authorize(claims, command)?;
         match command {
-            Command::UploadPart { upload_key, part } => {
-                self.upload_length(claims, upload_key, *part)
+            Command::UploadPart { object_key, offset } => {
+                self.upload_length(claims, object_key, *offset).await
             }
-            Command::UploadPut { upload_key } => {
-                let plan = self.store.inspect_upload(claims.sub.0, upload_key)?;
+            Command::UploadPut { object_key } => {
+                let plan = self.store.inspect_upload(claims.sub.0, object_key).await?;
                 if plan.parts() > 1 {
                     return Err(Error::Invalid(
-                        "normal upload needs a single-part ticket".into(),
+                        "normal upload needs a single-part object".into(),
                     ));
                 }
                 Ok(plan.total_bytes)
             }
-            Command::UploadBatch { upload_keys } => {
-                self.store.batch_length(claims.sub.0, upload_keys)
+            Command::UploadBatch { object_keys } => {
+                self.store.batch_length(claims.sub.0, object_keys).await
             }
             _ => Err(Error::Invalid(
                 "operation does not accept an object body".into(),
@@ -574,17 +573,17 @@ impl Service {
         self.authorize(claims, &command)?;
         let scope = claims.sub.0;
         match command {
-            Command::UploadPart { upload_key, part } => {
+            Command::UploadPart { object_key, offset } => {
                 self.store
-                    .write_part(scope, upload_key, part, reader)
+                    .write_at(scope, object_key, offset, reader)
                     .await?;
-                Ok(json!({"part":part,"complete":true}))
+                Ok(json!({"offset":offset,"complete":true}))
             }
-            Command::UploadPut { upload_key } => {
-                value(self.store.put(scope, upload_key, reader).await?)
+            Command::UploadPut { object_key } => {
+                value(self.store.put(scope, object_key, reader).await?)
             }
-            Command::UploadBatch { upload_keys } => {
-                Ok(json!({"objects":self.store.put_batch(scope,upload_keys,reader).await?}))
+            Command::UploadBatch { object_keys } => {
+                Ok(json!({"objects":self.store.put_batch(scope,object_keys,reader).await?}))
             }
             _ => Err(Error::Invalid(
                 "operation does not accept an object body".into(),

@@ -106,7 +106,7 @@ async fn object_pool_backup_replication_restore_and_blank_replacement_preserve_k
     .unwrap();
     native
         .put(
-            retired["upload_key"].as_str().unwrap().into(),
+            retired["object_key"].as_str().unwrap().into(),
             4096,
             &mut std::io::Cursor::new(vec![29; 4096]),
         )

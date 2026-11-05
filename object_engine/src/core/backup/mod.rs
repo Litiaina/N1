@@ -1,5 +1,5 @@
 //! LINK recovery points. Repository records live outside member object storage;
-//! they preserve exact shard bytes and terminal state, not client key catalogs.
+//! they preserve exact shard bytes without a client key catalogue.
 pub mod automation;
 pub mod capture;
 pub mod cli;
@@ -13,7 +13,6 @@ pub mod online;
 pub mod repository;
 pub mod restore;
 pub mod retention;
-mod retention_guard;
 pub mod transfer;
 pub use crypto::create_key;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

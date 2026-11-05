@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
                 let data = payload(index * part, length as usize);
                 let start = Instant::now();
                 if let Some(native) = &mut connection {
-                    native.upload_part(upload["upload_key"].as_str().ok_or("missing ticket")?.into(), index, length, &mut &data[..]).await?;
+                    native.write_at(upload["object_key"].as_str().ok_or("missing ticket")?.into(), index*part, length, &mut &data[..]).await?;
                 } else {
                     part_ack(client.put(format!("{multipart}/{}/{index}?durability=strict", upload["version_id"].as_str().ok_or("missing version")?))
                         .bearer_auth(&token).header("content-type","application/octet-stream").body(data).send().await?).await?;
@@ -280,7 +280,7 @@ async fn main() -> Result<()> {
                 .as_mut()
                 .ok_or("missing native connection")?
                 .control(Command::UploadFinalize {
-                    upload_key: upload["upload_key"]
+                    object_key: upload["object_key"]
                         .as_str()
                         .ok_or("missing ticket")?
                         .into(),

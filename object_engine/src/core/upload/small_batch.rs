@@ -1,5 +1,5 @@
-//! Normal and batch uploads share inline framing and completion. Batch owns
-//! its writes and two filesystem barriers; there is no detached commit queue.
+//! Normal and batch uploads share inline framing and completion. Each request
+//! persists data before durable publication; there is no detached commit queue.
 use crate::core::io_scheduler::IoProgress;
 use crate::core::{
     Error, Result,
@@ -20,13 +20,13 @@ impl Store {
     pub async fn put<R: AsyncRead + Unpin + Send + 'static>(
         self: &Arc<Self>,
         scope: [u8; 16],
-        ticket: String,
+        key: String,
         mut reader: R,
     ) -> Result<FinalizedObject> {
         let store = self.clone();
         joined(self.activity.clone(), async move {
             store.operation_gate.ensure_mutations_allowed()?;
-            let plan = store.inspect_upload(scope, &ticket)?;
+            let plan = store.inspect_upload(scope, &key).await?;
             single_part(plan)?;
             let pool = store.pool(plan.identity)?;
             let io = store.upload_io(scope, "normal upload").await?;
@@ -36,13 +36,33 @@ impl Store {
             let fp = plan.identity.fingerprint();
             let lease = store.foreground(fp)?;
             let _guard = lease.state().lifecycle.clone().write_owned().await;
+            let roots = pool
+                .members
+                .iter()
+                .flatten()
+                .map(|member| member.path.clone())
+                .collect::<Vec<_>>();
+            // Pin error-accounting descriptors before any payload writes, as
+            // in batch upload. Sync this object's sealed bytes before publication,
+            // then join all renames/removals in one barrier per filesystem.
+            let group = Arc::new(
+                blocking(move || {
+                    crate::core::linux_io::group::FilesystemGroup::open(&roots).map_err(Error::from)
+                })
+                .await?,
+            );
             let result = async {
                 let prepared = store
                     .prepare_complete(scope, pool, plan, &mut reader, &io.progress_handle())
                     .await?;
                 persist_files(&prepared.files).await?;
                 let _snapshot = store.snapshot_gate.clone().read_owned().await;
-                publish(&prepared, true).await?;
+                let publication = publish(&prepared, false).await;
+                // Join and persist every started publication even on failure.
+                let barrier = group.clone();
+                let persisted = blocking(move || barrier.sync_all().map_err(Error::from)).await;
+                publication?;
+                persisted?;
                 Ok(store.completed(scope, &prepared))
             }
             .await;
@@ -55,20 +75,20 @@ impl Store {
         .await
     }
 
-    /// Tickets and raw bodies use the same request order. Locks use fingerprint
+    /// Keys and raw bodies use the same request order. Locks use fingerprint
     /// order, preventing deadlocks between overlapping batches and single puts.
     /// A batch is not an all-or-nothing multi-object transaction: on a lost or
     /// failed reply clients resolve each immutable identity by retrying it.
     pub async fn put_batch<R: AsyncRead + Unpin + Send + 'static>(
         self: &Arc<Self>,
         scope: [u8; 16],
-        tickets: Vec<String>,
+        keys: Vec<String>,
         mut reader: R,
     ) -> Result<Vec<FinalizedObject>> {
         let store = self.clone();
         joined(self.activity.clone(), async move {
             store.operation_gate.ensure_mutations_allowed()?;
-            let plans = store.batch_plans(scope, &tickets)?;
+            let plans = store.batch_plans(scope, &keys).await?;
             let largest = plans
                 .iter()
                 .map(|p| store.pool(p.identity))
@@ -159,35 +179,34 @@ impl Store {
         .await
     }
 
-    pub fn batch_length(&self, scope: [u8; 16], tickets: &[String]) -> Result<u64> {
+    pub async fn batch_length(&self, scope: [u8; 16], keys: &[String]) -> Result<u64> {
         Ok(self
-            .batch_plans(scope, tickets)?
+            .batch_plans(scope, keys)
+            .await?
             .iter()
             .map(|p| p.total_bytes)
             .sum())
     }
-    fn batch_plans(&self, scope: [u8; 16], tickets: &[String]) -> Result<Vec<UploadPlan>> {
-        if tickets.is_empty() || tickets.len() > 256 {
-            return Err(Error::Invalid("batch requires 1..=256 tickets".into()));
+    async fn batch_plans(&self, scope: [u8; 16], keys: &[String]) -> Result<Vec<UploadPlan>> {
+        if keys.is_empty() || keys.len() > 256 {
+            return Err(Error::Invalid("batch requires 1..=256 keys".into()));
         }
         let mut seen = BTreeSet::new();
         let mut total = 0u64;
         let mut descriptors = 0;
-        let plans = tickets
-            .iter()
-            .map(|ticket| {
-                let plan = self.inspect_upload(scope, ticket)?;
-                single_part(plan)?;
-                if !seen.insert(plan.identity.fingerprint().0) {
-                    return Err(Error::Invalid("duplicate identity in batch".into()));
-                }
-                total = total
-                    .checked_add(plan.total_bytes)
-                    .ok_or_else(|| Error::Invalid("batch length overflow".into()))?;
-                descriptors += self.pool(plan.identity)?.layout.width();
-                Ok(plan)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut plans = Vec::with_capacity(keys.len());
+        for key in keys {
+            let plan = self.inspect_upload(scope, key).await?;
+            single_part(plan)?;
+            if !seen.insert(plan.identity.fingerprint().0) {
+                return Err(Error::Invalid("duplicate identity in batch".into()));
+            }
+            total = total
+                .checked_add(plan.total_bytes)
+                .ok_or_else(|| Error::Invalid("batch length overflow".into()))?;
+            descriptors += self.pool(plan.identity)?.layout.width();
+            plans.push(plan);
+        }
         if total > n1_link::noa::MAX_BODY_BYTES || descriptors > 1024 {
             return Err(Error::Invalid(
                 "batch exceeds byte or open-shard bound".into(),
@@ -204,9 +223,9 @@ impl Store {
         progress: &IoProgress,
     ) -> Result<Prepared> {
         let fp = plan.identity.fingerprint();
-        let files = required(self.files(pool.clone(), plan, true).await?)?;
+        let files = required(self.files(pool.clone(), plan).await?)?;
         if !files.iter().all(|f| f.finalized) && now() >= plan.expires_at {
-            return Err(Error::Conflict("upload ticket has expired".into()));
+            return Err(Error::Conflict("upload key has expired".into()));
         }
         if plan.total_bytes > 0 {
             self.forget_part(fp, 0);
@@ -244,7 +263,7 @@ impl Store {
 fn single_part(plan: UploadPlan) -> Result<()> {
     if plan.parts() > 1 {
         Err(Error::Invalid(
-            "normal/batch upload requires a single-part ticket".into(),
+            "normal/batch upload requires a single-part key".into(),
         ))
     } else {
         Ok(())

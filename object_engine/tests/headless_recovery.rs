@@ -176,6 +176,40 @@ fn phase(report: &mut Vec<Value>, name: &str, start: Instant) {
     report.push(json!({"phase":name,"passed":true,"seconds":start.elapsed().as_secs_f64()}));
 }
 
+/// Prove payload reached every staged inode before interrupting a live source.
+/// With 64 KiB blocks and four-stripe groups, 128 KiB only fills the encoder;
+/// 512 KiB crosses direct-I/O submissions. Validate bytes, not a fixed sleep.
+async fn staged_payload_written(config: &Config, key: &str) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let fp = ObjectKey::inspect(key)?.fingerprint();
+    let pool = &config.pools[0];
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let written = (0..pool.layout.width()).all(|shard| {
+            let checked = (|| -> Result<()> {
+                let slot = pool.layout.member_slot(fp, shard as u16)?;
+                let file = fs::File::open(pool.roots[slot].join(fp.staging_path()))?;
+                let mut bytes = [0; 128];
+                file.read_exact_at(&mut bytes, 0)?;
+                let header =
+                    n1_link::shard::ShardHeader::decode(&bytes, &pool.layout, fp, shard as u16)?;
+                let mut frame = vec![0; header.record_bytes() as usize];
+                file.read_exact_at(&mut frame, header.frame_offset(0)?)?;
+                n1_link::shard::decode_frame(&header, fp, 0, &frame)?;
+                Ok(())
+            })();
+            checked.is_ok()
+        });
+        if written {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("payload did not reach staged members before fault injection".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires explicit N1_WITNESS_PROJECT_ROOT and N1_WITNESS_TEST_ROOT on separate HDDs"]
 async fn physical_restart_clone_repair_and_service_identity_recovery() -> Result<()> {
@@ -261,7 +295,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let live = init(&mut client, payload.len() as u64, 5 * 1024 * 1024).await?;
     client
         .put(
-            text(&live, "upload_key")?,
+            text(&live, "object_key")?,
             payload.len() as u64,
             &mut std::io::Cursor::new(&payload),
         )
@@ -271,7 +305,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let mut body = Vec::new();
     for index in 0..8u8 {
         let upload = init(&mut client, 4096, 65536).await?;
-        tickets.push(text(&upload, "upload_key")?);
+        tickets.push(text(&upload, "object_key")?);
         body.extend_from_slice(&vec![index; 4096]);
         small.push(upload);
     }
@@ -279,11 +313,11 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
         .put_batch(tickets, body.len() as u64, &mut std::io::Cursor::new(body))
         .await?;
     let multipart = init(&mut client, 3 * 1024 * 1024, 1024 * 1024).await?;
-    let ticket = text(&multipart, "upload_key")?;
+    let ticket = text(&multipart, "object_key")?;
     client
-        .upload_part(
+        .write_at(
             ticket.clone(),
-            1,
+            1024 * 1024,
             1024 * 1024,
             &mut std::io::Cursor::new(vec![17; 1024 * 1024]),
         )
@@ -300,11 +334,11 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let upload_ticket = ticket.clone();
     let upload = tokio::spawn(async move {
         interrupted
-            .upload_part(upload_ticket, 0, 1024 * 1024, &mut reader)
+            .write_at(upload_ticket, 0, 1024 * 1024, &mut reader)
             .await
     });
-    writer.write_all(&vec![16; 128 * 1024]).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    writer.write_all(&vec![16; 512 * 1024]).await?;
+    staged_payload_written(&config, &ticket).await?;
     server.stop(libc::SIGKILL)?;
     drop(writer);
     drop(client);
@@ -328,7 +362,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let status = value(
         client
             .control(Command::UploadStatus {
-                upload_key: ticket.clone(),
+                object_key: ticket.clone(),
                 start: 0,
                 limit: 16,
             })
@@ -339,9 +373,9 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     }
     for part in [0, 2] {
         client
-            .upload_part(
+            .write_at(
                 ticket.clone(),
-                part,
+                part * 1024 * 1024,
                 1024 * 1024,
                 &mut std::io::Cursor::new(vec![16 + part as u8; 1024 * 1024]),
             )
@@ -350,13 +384,13 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let finalized = value(
         client
             .control(Command::UploadFinalize {
-                upload_key: ticket.clone(),
+                object_key: ticket.clone(),
             })
             .await?,
     )?;
     let repeated = value(
         client
-            .control(Command::UploadFinalize { upload_key: ticket })
+            .control(Command::UploadFinalize { object_key: ticket })
             .await?,
     )?;
     if finalized["object_key"] != repeated["object_key"]
@@ -385,11 +419,12 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let graceful_bytes = vec![65; 1024 * 1024];
     let graceful = init(&mut client, graceful_bytes.len() as u64, 1024 * 1024).await?;
     let mut streaming = connect(&credentials, &mut server).await?;
-    let upload_key = text(&graceful, "upload_key")?;
+    let object_key = text(&graceful, "object_key")?;
     let (mut reader, mut writer) = tokio::io::duplex(65536);
     let writing =
-        tokio::spawn(async move { streaming.put(upload_key, 1024 * 1024, &mut reader).await });
-    writer.write_all(&graceful_bytes[..128 * 1024]).await?;
+        tokio::spawn(async move { streaming.put(object_key, 1024 * 1024, &mut reader).await });
+    writer.write_all(&graceful_bytes[..512 * 1024]).await?;
+    staged_payload_written(&config, &text(&graceful, "object_key")?).await?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let health = value(client.control(Command::Health).await?)?;
@@ -409,7 +444,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     if server.child.try_wait()?.is_some() {
         return Err("engine exited before its admitted upload drained".into());
     }
-    writer.write_all(&graceful_bytes[128 * 1024..]).await?;
+    writer.write_all(&graceful_bytes[512 * 1024..]).await?;
     drop(writer);
     let response = tokio::time::timeout(Duration::from_secs(15), writing).await???;
     if value(response)?["object_key"] != graceful["object_key"] {
@@ -467,7 +502,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
         })
         .await
         .expect_err("retired object must stay gone");
-    if !error.to_string().contains("410") {
+    if !error.to_string().contains("404") {
         return Err(format!("unexpected retirement error: {error}").into());
     }
     drop(client);
@@ -524,11 +559,11 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
         return Err("clone revived a retired key".into());
     }
     let replacement_pending = init(&mut client, 3 * 65536, 65536).await?;
-    let replacement_ticket = text(&replacement_pending, "upload_key")?;
+    let replacement_ticket = text(&replacement_pending, "object_key")?;
     client
-        .upload_part(
+        .write_at(
             replacement_ticket.clone(),
-            1,
+            65536,
             65536,
             &mut std::io::Cursor::new(vec![72; 65536]),
         )
@@ -565,11 +600,11 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let mut authorized = replacement_args;
     authorized.push("--authorize".into());
     let rebuilt = offline(&authorized)?;
-    if rebuilt["reconstructed_shards"].as_u64().unwrap_or(0) == 0
-        || rebuilt["preserved_retirements"].as_u64().unwrap_or(0) == 0
-    {
+    // Eight small objects, the completed multipart and graceful PUT, and the
+    // unfinished replacement upload. The purged object contributes no file.
+    if rebuilt["reconstructed_shards"] != 11 || rebuilt["files"] != 12 {
         return Err(format!(
-            "replacement did not reconstruct payload and deletion state: {rebuilt}"
+            "replacement inventory differs from the exact live/private set: {rebuilt}"
         )
         .into());
     }
@@ -585,7 +620,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     let status = value(
         client
             .control(Command::UploadStatus {
-                upload_key: replacement_ticket.clone(),
+                object_key: replacement_ticket.clone(),
                 start: 0,
                 limit: 16,
             })
@@ -598,9 +633,9 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     }
     for part in [0, 2] {
         client
-            .upload_part(
+            .write_at(
                 replacement_ticket.clone(),
-                part,
+                part * 65536,
                 65536,
                 &mut std::io::Cursor::new(vec![71 + part as u8; 65536]),
             )
@@ -609,7 +644,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     for _ in 0..2 {
         client
             .control(Command::UploadFinalize {
-                upload_key: replacement_ticket.clone(),
+                object_key: replacement_ticket.clone(),
             })
             .await?;
     }
@@ -620,20 +655,29 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
         &replacement_bytes,
     )
     .await?;
-    if client
-        .control(Command::ObjectStat {
+    for command in [
+        Command::ObjectStat {
             object_key: retired_key.clone(),
-        })
-        .await
-        .is_ok()
-        || client
-            .control(Command::UploadFinalize {
-                upload_key: text(&live, "upload_key")?,
-            })
-            .await
-            .is_ok()
-    {
-        return Err("reconstruction revived a retired key or its old upload ticket".into());
+        },
+        Command::UploadFinalize {
+            object_key: text(&live, "object_key")?,
+        },
+    ] {
+        if !matches!(client.control(command).await,Err(n1_native_client::NativeClientError::Native{code,..}) if code=="404")
+        {
+            return Err("reconstruction did not preserve purged-key absence".into());
+        }
+    }
+    let fingerprint = ObjectKey::inspect(&retired_key)?.fingerprint();
+    for root in &config.pools[0].roots {
+        for shard in 0..config.pools[0].layout.width() {
+            if root.join(fingerprint.shard_path(shard as u16)).exists() {
+                return Err("replacement recreated a purged identity file".into());
+            }
+        }
+        if root.join(format!(".uploads/{fingerprint}")).exists() {
+            return Err("replacement left purged staging residue".into());
+        }
     }
     drop(client);
     server.stop(libc::SIGTERM)?;
@@ -728,7 +772,7 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     }
     let failed = client
         .put(
-            text(&live, "upload_key")?,
+            text(&live, "object_key")?,
             payload.len() as u64,
             &mut std::io::Cursor::new(&payload),
         )

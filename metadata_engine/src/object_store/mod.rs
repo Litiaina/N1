@@ -16,7 +16,6 @@ pub use native::{NativeObjectStore, ObjectStoreConfig};
 /// not be included in public namespace or version responses, logs, or Debug.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ObjectUpload {
-    pub upload_key: String,
     pub object_key: String,
     pub total_bytes: u64,
     pub part_bytes: u64,

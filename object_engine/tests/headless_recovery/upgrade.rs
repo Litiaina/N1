@@ -82,15 +82,15 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
     let live = init(&mut client, 65549, 131072).await?;
     client
         .put(
-            text(&live, "upload_key")?,
+            text(&live, "object_key")?,
             65549,
             &mut std::io::Cursor::new(&data[..65549]),
         )
         .await?;
     let partial = init(&mut client, data.len() as u64, 65536).await?;
-    let ticket = text(&partial, "upload_key")?;
+    let ticket = text(&partial, "object_key")?;
     client
-        .upload_part(
+        .write_at(
             ticket.clone(),
             0,
             65536,
@@ -100,7 +100,7 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
     let retired = init(&mut client, 1, 65536).await?;
     client
         .put(
-            text(&retired, "upload_key")?,
+            text(&retired, "object_key")?,
             1,
             &mut std::io::Cursor::new([7]),
         )
@@ -141,7 +141,7 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
     let status = value(
         client
             .control(Command::UploadStatus {
-                upload_key: ticket.clone(),
+                object_key: ticket.clone(),
                 start: 0,
                 limit: 4096,
             })
@@ -152,9 +152,9 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
         let start = part * 65536;
         let end = data.len().min(start + 65536);
         client
-            .upload_part(
+            .write_at(
                 ticket.clone(),
-                part as u64,
+                start as u64,
                 (end - start) as u64,
                 &mut std::io::Cursor::new(&data[start..end]),
             )
@@ -163,7 +163,7 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
     for _ in 0..2 {
         client
             .control(Command::UploadFinalize {
-                upload_key: ticket.clone(),
+                object_key: ticket.clone(),
             })
             .await?;
     }
@@ -179,11 +179,11 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
             object_key: text(&retired, "object_key")?,
         },
         Command::UploadFinalize {
-            upload_key: text(&retired, "upload_key")?,
+            object_key: text(&retired, "object_key")?,
         },
     ] {
         assert!(
-            matches!(client.control(command).await,Err(n1_native_client::NativeClientError::Native{code,..}) if code=="410")
+            matches!(client.control(command).await,Err(n1_native_client::NativeClientError::Native{code,..}) if code=="404")
         );
     }
     drop(client);

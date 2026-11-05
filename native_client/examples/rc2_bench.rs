@@ -240,7 +240,7 @@ async fn init(
     )?;
     Ok(Object {
         key: field(&response, "object_key")?,
-        ticket: field(&response, "upload_key")?,
+        ticket: field(&response, "object_key")?,
         bytes,
         hash,
     })
@@ -328,6 +328,16 @@ async fn run() -> Result<()> {
                 | "--compare-reads-link"
                 | "--compare-reads-direct"
                 | "--compare-integrity"
+                | "--compare-key-purge"
+                | "--compare-key-performance"
+                | "--compare-upload-paths"
+                | "--compare-upload-paths-smoke"
+                | "--compare-large-link"
+                | "--compare-large-ncx"
+                | "--compare-aligned-io"
+                | "--compare-aligned-large"
+                | "--compare-aligned-uploads"
+                | "--compare-aligned-smoke"
                 | "--compare-reads-ncx"
         )
     }) {
@@ -581,7 +591,7 @@ async fn run_benchmark(args: Vec<String>, include_large: bool) -> Result<()> {
             })
             .await
         {
-            Err(n1_native_client::NativeClientError::Native { code, .. }) if code == "410" => {}
+            Err(n1_native_client::NativeClientError::Native { code, .. }) if code == "404" => {}
             _ => return Err("deleted key did not remain retired".into()),
         }
     }

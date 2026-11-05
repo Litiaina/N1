@@ -3,7 +3,7 @@ use super::*;
 use n1_link::{PoolId, noa::Command as ObjectCommand};
 use n1_metadata_engine::{MetadataEngine, Options, Table};
 
-async fn auth(client: &Client, base: &str, name: &str) -> (String, String, String) {
+pub(super) async fn auth(client: &Client, base: &str, name: &str) -> (String, String, String) {
     let fragment = json_response(
         client
             .post(format!("{base}/fragments"))
@@ -76,14 +76,14 @@ async fn direct(stack: &Stack) -> n1_native_client::N1NativeClient {
         .unwrap();
     client
 }
-fn db(stack: &Stack) -> MetadataEngine {
+pub(super) fn db(stack: &Stack) -> MetadataEngine {
     MetadataEngine::open(
         stack.root.join("metadata-control/metadata"),
         Options::default(),
     )
     .unwrap()
 }
-fn links(database: &MetadataEngine) -> Vec<String> {
+pub(super) fn links(database: &MetadataEngine) -> Vec<String> {
     let mut after = None;
     let mut keys = Vec::new();
     // The test keeps its expected fragment IDs in the independent request oracle.
@@ -112,7 +112,13 @@ fn links(database: &MetadataEngine) -> Vec<String> {
     }
     keys
 }
-async fn put(client: &Client, base: &str, token: &str, path: &str, bytes: &[u8]) -> String {
+pub(super) async fn put(
+    client: &Client,
+    base: &str,
+    token: &str,
+    path: &str,
+    bytes: &[u8],
+) -> String {
     let ack = json_response(
         client
             .post(format!("{base}/upload/one-shot/{path}?durability=strict"))
@@ -140,7 +146,7 @@ async fn start(client: &Client, base: &str, token: &str, kind: &str, query: &str
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "private two-HDD metadata TTL, dry-run, outage/retry, restart, permission and exact native retirement witness"]
+#[ignore = "private two-HDD TTL, durable purge intent, partial removal/restart, permissions and scheduling"]
 async fn indexed_trash_gc_enforces_ttl_retries_after_outage_and_automatic_schedule() {
     let mut stack = Stack::new().await;
     drop(stack.metadata.take());
@@ -242,12 +248,65 @@ async fn indexed_trash_gc_enforces_ttl_retries_after_outage_and_automatic_schedu
     assert_eq!(conflict["affected"], 0);
     assert_eq!(conflict["conflicted_paths"], json!(["remove.bin"]));
     drop(stack.metadata.take());
-    assert_eq!(links(&db(&stack)).len(), 4);
+    let database = db(&stack);
+    assert_eq!(links(&database).len(), 4);
+    // A failed physical purge must retain the durable last-owner intent and
+    // both version keys. Model an object process crash after one member's
+    // unlink, with a still-readable survivor in this 1+1 pool.
+    let fragment = n1_metadata_engine::fragments::resolve(&database, &alias).unwrap();
+    let purging = database
+        .snapshot()
+        .scan(
+            Table::Reclamation,
+            PoolId([0; 16]),
+            "link-purging/",
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(purging.len(), 1);
+    let removed_keys = database
+        .snapshot()
+        .scan(Table::Uploads, fragment.id, "", None, 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, bytes)| {
+            let pending: Value = serde_json::from_slice(&bytes).unwrap();
+            (pending["handle"]["object_key"] == "remove.bin")
+                .then(|| pending["upload"]["object_key"].as_str().unwrap().to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(removed_keys.len(), 2);
+    drop(database);
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    let layout: n1_link::PoolLayout =
+        serde_json::from_value(settings["pools"][0]["layout"].clone()).unwrap();
+    let roots: Vec<PathBuf> =
+        serde_json::from_value(settings["pools"][0]["roots"].clone()).unwrap();
+    for key in &removed_keys {
+        let fp = n1_link::ObjectKey::inspect(key).unwrap().fingerprint();
+        let path = roots[layout.member_slot(fp, 0).unwrap()].join(fp.shard_path(0));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
     stack.start_object().await;
     stack.start_metadata().await;
     start(&client, &base, &token, "gc", "").await;
     let completed = wait(&client, &base, &token, "gc").await;
     assert_eq!(completed["phase"], "completed", "{completed}");
+    for key in &removed_keys {
+        let fp = n1_link::ObjectKey::inspect(key).unwrap().fingerprint();
+        for root in &roots {
+            assert!(!root.join(format!(".uploads/{fp}")).exists());
+            for shard in 0..layout.width() {
+                assert!(!root.join(fp.shard_path(shard as u16)).exists());
+            }
+        }
+    }
     let mut native = direct(&stack).await;
     let mut retired = 0;
     for key in &before {
@@ -256,7 +315,7 @@ async fn indexed_trash_gc_enforces_ttl_retries_after_outage_and_automatic_schedu
                 object_key: key.clone(),
             })
             .await;
-        if matches!(result,Err(n1_native_client::NativeClientError::Native{code,..})if code=="410")
+        if matches!(result,Err(n1_native_client::NativeClientError::Native{code,..})if code=="404")
         {
             retired += 1;
         }
@@ -499,7 +558,7 @@ async fn pool_migration_changes_ec_preserves_versions_and_resumes_after_process_
     let mut native = direct(&stack).await;
     for key in &before {
         assert!(
-            matches!(native.control(ObjectCommand::ObjectStat{object_key:key.clone()}).await,Err(n1_native_client::NativeClientError::Native{code,..})if code=="410")
+            matches!(native.control(ObjectCommand::ObjectStat{object_key:key.clone()}).await,Err(n1_native_client::NativeClientError::Native{code,..})if code=="404")
         );
     }
     drop(stack.metadata.take());
@@ -699,7 +758,7 @@ async fn failed_migration_retains_source_reference_and_cancel_only_retires_desti
     );
     let mut native = direct(&stack).await;
     assert!(
-        matches!(native.control(ObjectCommand::ObjectStat{object_key:destination_key}).await,Err(n1_native_client::NativeClientError::Native{code,..})if code=="410")
+        matches!(native.control(ObjectCommand::ObjectStat{object_key:destination_key}).await,Err(n1_native_client::NativeClientError::Native{code,..})if code=="404")
     );
     drop(native);
     drop(stack.metadata.take());
@@ -882,7 +941,7 @@ async fn expired_partial_upload_cleanup_survives_backend_outage_and_metadata_res
     assert_eq!(done["phase"], "completed", "{done}");
     let mut native = direct(&stack).await;
     assert!(
-        matches!(native.control(ObjectCommand::ObjectStat{object_key:key}).await,Err(n1_native_client::NativeClientError::Native{code,..})if code=="410")
+        matches!(native.control(ObjectCommand::ObjectStat{object_key:key}).await,Err(n1_native_client::NativeClientError::Native{code,..})if code=="404")
     );
     drop(native);
     drop(stack.metadata.take());

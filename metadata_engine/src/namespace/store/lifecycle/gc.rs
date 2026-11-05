@@ -157,7 +157,7 @@ impl Namespace {
             Ok(None)
         }
     }
-    /// Bounded deletion of multipart control rows, after retirement. Return
+    /// Bounded deletion of multipart control rows, after native purge. Return
     /// false while another page remains; the owning upload/key survives.
     pub(crate) fn purge_blob(&self, blob: &Blob, limit: usize) -> Result<bool> {
         self.engine.transact(ATTEMPTS, |tx| {
@@ -246,10 +246,10 @@ impl Namespace {
                 }
             }
             tx.remove(Table::Reclamation, &reference(&blob.target, &blob.key)?)?;
-            if read::<Target>(tx, Table::Reclamation, &retiring(&blob.key)?)?.as_ref()
+            if read::<Target>(tx, Table::Reclamation, &purging(&blob.key)?)?.as_ref()
                 == Some(&blob.target)
             {
-                tx.remove(Table::Reclamation, &retiring(&blob.key)?)?;
+                tx.remove(Table::Reclamation, &purging(&blob.key)?)?;
             }
             Ok(true)
         })

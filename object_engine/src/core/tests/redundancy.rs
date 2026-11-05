@@ -25,20 +25,24 @@ async fn every_shard_loss_and_corruption_set_obeys_the_exact_ec_budget() {
                     Durability::Durable,
                     3600,
                 )
+                .await
                 .unwrap();
             store
                 .put(
                     SCOPE,
-                    upload.upload_key.clone(),
+                    upload.object_key.clone(),
                     std::io::Cursor::new(bytes.clone()),
                 )
                 .await
                 .unwrap();
             store
-                .finalize(SCOPE, upload.upload_key.clone())
+                .finalize(SCOPE, upload.object_key.clone())
                 .await
                 .unwrap();
-            let plan = store.inspect_upload(SCOPE, &upload.upload_key).unwrap();
+            let plan = store
+                .inspect_upload(SCOPE, &upload.object_key.clone())
+                .await
+                .unwrap();
             let fingerprint = plan.identity.fingerprint();
             let pool = store.pool(plan.identity).unwrap();
             let paths: Vec<_> = (0..width)

@@ -21,9 +21,66 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+#[path = "comparison/uploads.rs"]
+mod uploads;
+
+fn inventory(roots: &[PathBuf; 2]) -> Result<Value> {
+    let mut pending = roots
+        .iter()
+        .map(|root| root.join("member-0"))
+        .collect::<Vec<_>>();
+    pending[1] = roots[1].join("member-1");
+    let (
+        mut files,
+        mut directories,
+        mut bytes,
+        mut allocated,
+        mut terminals,
+        mut staging,
+        mut symlinks,
+    ) = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.file_type().is_symlink() {
+                // Original NCX has .fragment aliases. Count their inodes but
+                // never follow them or count their targets a second time.
+                symlinks += 1;
+            } else if metadata.is_dir() {
+                directories += 1;
+                if path.file_name().is_some_and(|name| name == ".uploads") {
+                    staging += 1;
+                }
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                files += 1;
+                bytes += metadata.len();
+                allocated += metadata.blocks() * 512;
+                if metadata.len() == 96 {
+                    use std::io::Read;
+                    let mut magic = [0; 8];
+                    fs::File::open(entry.path())?.read_exact(&mut magic)?;
+                    if &magic == b"N1LDEL01" {
+                        terminals += 1;
+                    }
+                }
+            } else {
+                return Err("unexpected entry in benchmark members".into());
+            }
+        }
+    }
+    Ok(
+        json!({"files":files,"directories":directories,"symlinks":symlinks,"apparent_bytes":bytes,"allocated_file_bytes":allocated,"terminal_files":terminals,"per_identity_staging_directories":staging}),
+    )
+}
 
 const NCX_SHA: &str = "51594bdd793f3af33826c5f0fa76d82616a235349875f7e71b2555b0ae3e0ff1";
 const LINK_BASELINE_SHA: &str = "f7c8283633f31175da2968c14364e665f666ea288ee2b0409b8d2713b2370701";
+const PURGE_BASELINE_SHA: &str = "2395935dc899c81d685351fd59bcbfd48a97340e68dd9d5acf319a5a154fdc43";
+const KEY_BASELINE_SHA: &str = "17c64f33bb7a5fff9d0d8c77c41a9ea75e37ddac6527af1777e28eb92111ae57";
+const ALIGNED_BASELINE_SHA: &str =
+    "a1e77c3f5f3ade7d952fe79eab77c62f5fb863115fe129a7742c17c954dba47e";
 const NATIVE_BASELINE_SHA: &str =
     "f017966129b74894ea80d5c27bde0b446e5e77533ebb9f4fdfd294768e6000ed";
 const DIRECT_BASELINE_SHA: &str =
@@ -213,9 +270,100 @@ impl OldClient {
         Ok(())
     }
 }
+/// Frozen pre-purge LINK wire adapter, confined to this benchmark. Production
+/// APIs and SDKs expose only the key-based contract.
+struct FrozenLink {
+    stream: TcpStream,
+    sequence: u64,
+}
+impl FrozenLink {
+    async fn send(&mut self, op: &str, args: Value, body_len: u64) -> Result<u64> {
+        self.sequence += 1;
+        let frame = rmp_serde::to_vec_named(
+            &json!({"id":self.sequence,"command":{"op":op,"args":args},"body_len":body_len}),
+        )?;
+        self.stream.write_u32(frame.len().try_into()?).await?;
+        self.stream.write_all(&frame).await?;
+        self.stream.flush().await?;
+        Ok(self.sequence)
+    }
+    async fn response(&mut self, id: u64) -> Result<n1_native_client::Response> {
+        let length = self.stream.read_u32().await? as usize;
+        if length == 0 || length > 8 * 1024 * 1024 {
+            return Err("invalid frozen LINK response length".into());
+        }
+        let mut bytes = vec![0; length];
+        self.stream.read_exact(&mut bytes).await?;
+        let response: n1_native_client::Response = rmp_serde::from_slice(&bytes)?;
+        if response.id != id {
+            return Err("frozen LINK response ID mismatch".into());
+        }
+        Ok(response)
+    }
+    fn check(response: n1_native_client::Response) -> Result<Value> {
+        if response.status != 200 || response.body_len != 0 {
+            return Err(format!(
+                "frozen LINK status {}: {:?}",
+                response.status, response.error
+            )
+            .into());
+        }
+        Ok(response.result.unwrap_or(Value::Null))
+    }
+    async fn control(&mut self, op: &str, args: Value) -> Result<Value> {
+        let id = self.send(op, args, 0).await?;
+        Self::check(self.response(id).await?)
+    }
+    async fn upload(
+        &mut self,
+        bytes: u64,
+        hash: &str,
+        block: Arc<Vec<u8>>,
+    ) -> Result<(Object, f64, Value)> {
+        let timer = Instant::now();
+        let upload = self.control("upload.init",json!({"pool":null,"total_bytes":bytes,"part_bytes":bytes.max(1).div_ceil(BLOCK)*BLOCK,"durable":true,"ttl_seconds":86400})).await?;
+        let init_seconds = timer.elapsed().as_secs_f64();
+        let object = Object {
+            key: field(&upload, "object_key")?,
+            ticket: field(&upload, "upload_key")?,
+            bytes,
+            hash: hash.into(),
+        };
+        let id = self
+            .send("upload.put", json!({"upload_key":object.ticket}), bytes)
+            .await?;
+        copy_exact(&mut Payload::new(block, bytes), &mut self.stream, bytes).await?;
+        Self::check(self.response(id).await?)?;
+        Ok((
+            object,
+            init_seconds,
+            json!({"block_bytes":BLOCK,"data_shards":1,"parity_shards":1}),
+        ))
+    }
+    async fn get(&mut self, object: &Object) -> Result<()> {
+        let id = self
+            .send(
+                "object.get",
+                json!({"object_key":object.key,"offset":0,"length":null}),
+                0,
+            )
+            .await?;
+        let response = self.response(id).await?;
+        if response.status != 200 || response.body_len != object.bytes {
+            return Err("frozen LINK GET status/length mismatch".into());
+        }
+        let mut sink = HashSink::default();
+        copy_exact(&mut self.stream, &mut sink, object.bytes).await?;
+        if sink.bytes != object.bytes || format!("{:x}", sink.hash.finalize()) != object.hash {
+            return Err("frozen LINK GET SHA-256 mismatch".into());
+        }
+        Ok(())
+    }
+}
 enum Client {
     Ncx(OldClient),
     Link(N1NativeClient),
+    Frozen(FrozenLink),
 }
 impl Client {
     async fn upload(
@@ -226,6 +374,7 @@ impl Client {
         block: Arc<Vec<u8>>,
     ) -> Result<(Object, f64, Value)> {
         match self {
+            Self::Frozen(client) => client.upload(bytes, hash, block).await,
             Self::Ncx(client) => {
                 let object = Object {
                     key: format!("comparison/object-{sequence:04}.bin"),
@@ -259,10 +408,15 @@ impl Client {
         match self {
             Self::Ncx(c) => c.get(object).await,
             Self::Link(c) => get(c, object).await,
+            Self::Frozen(c) => c.get(object).await,
         }
     }
     async fn stat(&mut self, object: &Object) -> Result<()> {
         match self {
+            Self::Frozen(c) => {
+                c.control("object.stat", json!({"object_key":object.key}))
+                    .await?;
+            }
             Self::Ncx(c) => {
                 c.control("namespace.stat", json!({"path":object.key}))
                     .await?;
@@ -278,6 +432,10 @@ impl Client {
     }
     async fn delete(&mut self, object: &Object) -> Result<()> {
         match self {
+            Self::Frozen(c) => {
+                c.control("object.delete", json!({"object_key":object.key}))
+                    .await?;
+            }
             Self::Ncx(c) => {
                 c.control("object.delete", json!({"object_key":object.key}))
                     .await?;
@@ -293,6 +451,15 @@ impl Client {
     }
     async fn absent(&mut self, object: &Object) -> Result<()> {
         match self {
+            Self::Frozen(c) => {
+                let id = c
+                    .send("object.stat", json!({"object_key":object.key}), 0)
+                    .await?;
+                let response = c.response(id).await?;
+                if response.status != 410 || response.body_len != 0 {
+                    return Err("frozen LINK terminal status mismatch".into());
+                }
+            }
             Self::Ncx(c) => {
                 let response = c
                     .control_raw("namespace.stat", json!({"path":object.key}))
@@ -309,7 +476,7 @@ impl Client {
                     .await
                     .err()
                     .ok_or("LINK retired object remains visible")?;
-                if !matches!(&error, n1_native_client::NativeClientError::Native { code, .. } if code == "410")
+                if !matches!(&error, n1_native_client::NativeClientError::Native { code, .. } if code == "404")
                 {
                     return Err(format!("LINK retirement returned {error}").into());
                 }
@@ -331,9 +498,23 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     let integrity_pair = args[1] == "--compare-integrity";
     let direct_pair = args[1] == "--compare-reads-direct" || integrity_pair;
     let native_pair = args[1] == "--compare-reads-link" || direct_pair;
-    let read_only = (native_pair && !integrity_pair) || args[1] == "--compare-reads-ncx";
-    let link_pair = args[1] == "--compare-link" || native_pair;
-    let baseline_sha = if direct_pair {
+    let aligned_pair = args[1].starts_with("--compare-aligned-");
+    let large_link = args[1] == "--compare-large-link" || args[1] == "--compare-aligned-large";
+    let large_only = large_link || args[1] == "--compare-large-ncx";
+    let read_only =
+        (native_pair && !integrity_pair) || args[1] == "--compare-reads-ncx" || large_only;
+    let purge_pair = args[1] == "--compare-key-purge" || large_link;
+    let upload_paths =
+        args[1].starts_with("--compare-upload-paths") || args[1] == "--compare-aligned-uploads";
+    let key_pair = args[1] == "--compare-key-performance" || upload_paths || aligned_pair;
+    let link_pair = args[1] == "--compare-link" || native_pair || purge_pair || key_pair;
+    let baseline_sha = if aligned_pair {
+        ALIGNED_BASELINE_SHA
+    } else if key_pair {
+        KEY_BASELINE_SHA
+    } else if purge_pair {
+        PURGE_BASELINE_SHA
+    } else if direct_pair {
         DIRECT_BASELINE_SHA
     } else if native_pair {
         NATIVE_BASELINE_SHA
@@ -349,16 +530,33 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         PathBuf::from(&args[4]).canonicalize()?,
         PathBuf::from(&args[5]).canonicalize()?,
     ];
-    if parents[0] != Path::new("/mnt/PROJECT-DISK-1TB")
-        || parents[1] != Path::new("/media/altear/TEST-1TB/mx-tests")
+    if parents[0] != Path::new("/mnt/HDD1TB001")
+        || parents[1] != Path::new("/mnt/HDD1TB002")
         || parents[0].metadata()?.dev() == parents[1].metadata()?.dev()
     {
         return Err(
-            "comparison requires the explicit independent PROJECT and TEST HDD parents".into(),
+            "comparison requires the independent /mnt/HDD1TB001 and /mnt/HDD1TB002 mounts".into(),
         );
     }
-    let smoke = args[1] == "--compare-smoke";
-    let order = if link_pair {
+    let smoke = args[1] == "--compare-smoke"
+        || args[1] == "--compare-upload-paths-smoke"
+        || args[1] == "--compare-aligned-smoke";
+    let order = if large_link {
+        vec![
+            "link-before",
+            "link-after",
+            "link-after",
+            "link-before",
+            "link-before",
+            "link-after",
+            "link-after",
+            "link-before",
+        ]
+    } else if large_only {
+        vec!["ncx", "link", "link", "ncx", "ncx", "link", "link", "ncx"]
+    } else if link_pair && smoke {
+        vec!["link-before", "link-after"]
+    } else if link_pair {
         vec!["link-before", "link-after", "link-after", "link-before"]
     } else if smoke {
         vec!["ncx", "link"]
@@ -438,6 +636,77 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             "Identical immutable 256 KiB 1+1 geometry; baseline sha256-v1 frame/source policy versus candidate crc32c-sha256-v2 frame/context-bound source policy. Separate new pools; existing pools are never reinterpreted."
         );
     }
+    if purge_pair {
+        provenance["baseline_source_snapshot"] =
+            json!("/mnt/PROJECT-DISK-1TB/n1-key-purge-20261105-01/source/before.tar");
+        provenance["geometry_note"] = json!(
+            "Identical 256 KiB 1+1 CRC32C/SHA-256 geometry. Frozen LINK uses tickets/terminal records; candidate creates incomplete headers at Begin, uses the same LINK key throughout, and purges to absence."
+        );
+        provenance["put_timing"] = json!(
+            "end-to-end including Begin for both; candidate persists its headers with the first durable payload or completed publication"
+        );
+        provenance["durability"] = json!("durable payload and required io_uring for both");
+        provenance["deletion"] = json!(
+            "baseline writes permanent terminal records; candidate unlinks all incomplete/final shards and persists removal; different storage residue"
+        );
+    } else if key_pair {
+        provenance["baseline_source_snapshot"] =
+            json!("/mnt/PROJECT-DISK-1TB/n1-key-purge-20261105-01/source/final-source.tar");
+        provenance["put_timing"] = json!(
+            "end-to-end including Begin for both; baseline persists empty allocation, candidate persists it with the first durable payload or completed publication"
+        );
+        provenance["durability"] = json!(
+            "Both preserve durable part and completed-object acknowledgements. Baseline also persisted unused Begin allocations; candidate uses the operator-approved allocation-only Begin and persists headers/paths with the first durable payload. Required io_uring for both."
+        );
+        provenance["deletion"] = json!("identical key-only purge to durable absence for both");
+    } else if !link_pair {
+        provenance["durability"] = json!(
+            "NCX explicit strict; LINK durable PUT with allocation-only Begin; required io_uring for both"
+        );
+        provenance["deletion"] = json!(
+            "NCX moves to recoverable trash; LINK permanently removes shard files; not equivalent lifecycle operations"
+        );
+    }
+    if upload_paths {
+        provenance["focus"] = json!(
+            "standalone native object engine: batch, standard/durable multipart, reconnect/status, finalize/repeated finalize, bounded concurrent normal PUT, exact GET and zero-residue purge"
+        );
+        provenance["large_bytes"] = Value::Null;
+        provenance["multipart_bytes"] = json!(if smoke {
+            2 * 1024 * 1024
+        } else {
+            256 * 1024 * 1024
+        });
+        provenance["part_bytes"] = json!(if smoke { 1024 * 1024 } else { 8 * 1024 * 1024 });
+        provenance["concurrent_clients"] = json!(if smoke { 2 } else { 16 });
+        provenance["not_measured"] = json!([
+            "metadata",
+            "Console",
+            "population scale",
+            "hardware power loss"
+        ]);
+    }
+    if large_only {
+        provenance["focus"] = json!(
+            "eight standalone 1 GiB trials in ABBA ABBA order; four per binary; no small-object cohort, to isolate large upload/read/stat/delete from the preceding 100-object retirement/purge workload"
+        );
+        provenance["warm_repeats"] = json!(1);
+    }
+    if aligned_pair {
+        provenance["baseline_source_snapshot"] =
+            json!("/mnt/HDD1TB001/n1-xfs-rebenchmark-20261105-01/bootstrap/current-source.tar");
+        provenance["geometry_note"] = json!(
+            "Identical immutable 256 KiB 1+1 CRC32C/SHA-256 shard bytes and LINK identity. Baseline uses buffered payload I/O; candidate streams aligned complete pages through O_DIRECT, buffering only each part's unaligned ends. Small objects remain buffered. No format change."
+        );
+        provenance["put_timing"] = json!("end-to-end including allocation-only Begin for both");
+        provenance["durability"] = json!(
+            "Identical first durable payload/header/path persistence and completed-publication barriers; required io_uring for both"
+        );
+        provenance["deletion"] = json!("identical key-only purge to durable absence for both");
+        provenance["cache"] = json!(
+            "First verified GET follows durable PUT: buffered baseline may have resident payload pages, O_DIRECT candidate does not populate interior pages. Second GET is warm for both. No cold-cache claim or global cache drop."
+        );
+    }
     private_json(&directories[0].join("provenance.json"), &provenance)?;
     let block = pattern(0x20261102);
     let large_bytes = if smoke { 1048576 } else { LARGE };
@@ -455,8 +724,21 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         for root in &roots {
             fs::DirBuilder::new().mode(0o700).create(root)?;
         }
-        let result = tokio::time::timeout(
-            Duration::from_secs(900),
+        let result = tokio::time::timeout(Duration::from_secs(900), async {
+            if upload_paths {
+                return uploads::trial(
+                    if architecture == "link-before" {
+                        &old
+                    } else {
+                        &new
+                    },
+                    architecture,
+                    &roots,
+                    block.clone(),
+                    smoke,
+                )
+                .await;
+            }
             trial(
                 if architecture == "ncx" || architecture == "link-before" {
                     &old
@@ -476,10 +758,11 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     } else {
                         COUNT
                     },
-                    warm_repeats: if read_only { 8 } else { 1 },
+                    warm_repeats: if read_only && !large_only { 8 } else { 1 },
                 },
-            ),
-        )
+            )
+            .await
+        })
         .await;
         let result = match result {
             Ok(result) => result,
@@ -614,6 +897,19 @@ async fn start(binary: &Path, architecture: &str, roots: &[PathBuf; 2]) -> Resul
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let client = if let Some(credentials) = credentials {
+        if architecture == "link-before"
+            && ![KEY_BASELINE_SHA, ALIGNED_BASELINE_SHA]
+                .contains(&format!("{:x}", Sha256::digest(fs::read(binary)?)).as_str())
+        {
+            let stream = TcpStream::connect(&address).await?;
+            stream.set_nodelay(true)?;
+            let mut client = FrozenLink {
+                stream,
+                sequence: 0,
+            };
+            client.control("auth.fragment",json!({"fragment":field(&credentials,"fragment")?,"secret":field(&credentials,"secret")?,"permissions":null,"ttl_seconds":null})).await?;
+            return Ok((owned, Client::Frozen(client)));
+        }
         let mut client = N1NativeClient::connect(&format!("n1://{address}")).await?;
         client
             .auth_fragment(
@@ -863,6 +1159,7 @@ async fn trial(
         rows.push(row);
         objects.extend(cohort);
     }
+    let before_delete = inventory(roots)?;
     let phase = Phase::start(pid)?;
     let mut samples = Vec::new();
     for object in &objects {
@@ -881,6 +1178,15 @@ async fn trial(
     for object in &objects {
         client.absent(object).await?;
     }
+    let after_delete = inventory(roots)?;
+    if (architecture == "link" || architecture == "link-after")
+        && (after_delete["files"] != 2
+            || after_delete["symlinks"] != 0
+            || after_delete["terminal_files"] != 0
+            || after_delete["per_identity_staging_directories"] != 0)
+    {
+        return Err(format!("purge left identity residue: {after_delete}").into());
+    }
     drop(client);
     if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -898,6 +1204,6 @@ async fn trial(
         .filter_map(|r| r["after"]["vm_hwm_bytes"].as_u64())
         .max();
     Ok(
-        json!({"architecture":architecture,"passed":true,"roots":roots,"clean_shutdown":true,"verified_downloads":objects.len()*(workload.warm_repeats+1),"objects_deleted":objects.len(),"sampled_peak_rss_bytes":peak,"kernel_rss_high_water_bytes":high,"phases":rows}),
+        json!({"architecture":architecture,"passed":true,"roots":roots,"clean_shutdown":true,"verified_downloads":objects.len()*(workload.warm_repeats+1),"objects_deleted":objects.len(),"before_delete_inventory":before_delete,"after_delete_inventory":after_delete,"sampled_peak_rss_bytes":peak,"kernel_rss_high_water_bytes":high,"phases":rows}),
     )
 }

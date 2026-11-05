@@ -38,14 +38,11 @@ pub enum Error {
     Unauthorized,
     Forbidden,
     RateLimited,
-    Retiring,
-    Retired,
     Invalid(String),
     Conflict(String),
     NotFound,
     Unavailable(String),
     Corrupt(String),
-    RetirementCorrupt,
     Io(io::Error),
 }
 
@@ -55,13 +52,11 @@ impl Error {
             Self::Unauthorized => 401,
             Self::Forbidden => 403,
             Self::RateLimited => 429,
-            Self::Retiring => 503,
-            Self::Retired => 410,
             Self::Invalid(_) => 400,
             Self::Conflict(_) => 409,
             Self::NotFound => 404,
             Self::Unavailable(_) => 503,
-            Self::Corrupt(_) | Self::RetirementCorrupt => 422,
+            Self::Corrupt(_) => 422,
             Self::Io(e) if matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)) => 507,
             Self::Io(_) => 500,
         }
@@ -74,9 +69,6 @@ impl fmt::Display for Error {
             Self::Unauthorized => f.write_str("authentication required or invalid"),
             Self::Forbidden => f.write_str("permission denied"),
             Self::RateLimited => f.write_str("request rate limit exceeded"),
-            Self::Retiring => f.write_str("object retirement is incomplete; retry deletion"),
-            Self::Retired => f.write_str("object key is permanently retired"),
-            Self::RetirementCorrupt => f.write_str("retirement state is corrupt; retry authenticated deletion before accessing this key"),
             Self::Invalid(s) | Self::Conflict(s) | Self::Unavailable(s) | Self::Corrupt(s) => {
                 f.write_str(s)
             }

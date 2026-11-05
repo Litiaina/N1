@@ -157,32 +157,32 @@ async fn run(cli: Cli) -> Result<()> {
                     })
                     .await?,
             )?;
-            let ticket = upload["upload_key"]
+            let key = upload["object_key"]
                 .as_str()
-                .ok_or("missing upload ticket")?
+                .ok_or("missing upload key")?
                 .to_owned();
             if part_bytes.is_none() {
-                print_result(client.put(ticket, total, &mut source).await?)?;
+                print_result(client.put(key, total, &mut source).await?)?;
                 return Ok(());
             }
-            // Emit the resumable ticket before streaming parts. The caller can
+            // Emit the resumable key before streaming parts. The caller can
             // retain this output if interruption prevents the final response.
             println!("{}", serde_json::to_string(&upload)?);
             for index in 0..total.div_ceil(part) {
                 let length = (total - index * part).min(part);
                 let mut body = (&mut source).take(length);
                 client
-                    .upload_part(ticket.clone(), index, length, &mut body)
+                    .write_at(key.clone(), index * part, length, &mut body)
                     .await?;
             }
-            Command::UploadFinalize { upload_key: ticket }
+            Command::UploadFinalize { object_key: key }
         }
         Action::Batch { files, pool } => {
             if files.is_empty() || files.len() > 256 {
                 return Err("batch requires 1..=256 files".into());
             }
             let stripe = stripe_bytes(&mut client, pool).await?;
-            let mut tickets = Vec::new();
+            let mut keys = Vec::new();
             let mut body: Box<dyn AsyncRead + Unpin + Send> = Box::new(tokio::io::empty());
             let mut total = 0u64;
             for path in files {
@@ -203,15 +203,15 @@ async fn run(cli: Cli) -> Result<()> {
                         })
                         .await?,
                 )?;
-                tickets.push(
-                    init["upload_key"]
+                keys.push(
+                    init["object_key"]
                         .as_str()
-                        .ok_or("missing upload ticket")?
+                        .ok_or("missing upload key")?
                         .to_owned(),
                 );
                 body = Box::new(body.chain(file));
             }
-            print_result(client.put_batch(tickets, total, &mut body).await?)?;
+            print_result(client.put_batch(keys, total, &mut body).await?)?;
             return Ok(());
         }
         Action::Init {
@@ -228,30 +228,30 @@ async fn run(cli: Cli) -> Result<()> {
             ttl_seconds,
         },
         Action::Part {
-            upload_key,
-            part,
+            object_key,
+            offset,
             file,
         } => {
             let mut file = input(file).await?;
             let length = file.metadata().await?.len();
             print_result(
                 client
-                    .upload_part(upload_key, part, length, &mut file)
+                    .write_at(object_key, offset, length, &mut file)
                     .await?,
             )?;
             return Ok(());
         }
         Action::Status {
-            upload_key,
+            object_key,
             start,
             limit,
         } => Command::UploadStatus {
-            upload_key,
+            object_key,
             start,
             limit,
         },
-        Action::Finalize { upload_key } => Command::UploadFinalize { upload_key },
-        Action::Cancel { upload_key } => Command::UploadCancel { upload_key },
+        Action::Finalize { object_key } => Command::UploadFinalize { object_key },
+        Action::Cancel { object_key } => Command::UploadCancel { object_key },
         Action::Get {
             key,
             output,

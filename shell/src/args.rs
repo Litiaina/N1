@@ -52,14 +52,14 @@ pub(crate) enum Action {
     },
     Part {
         #[arg(long)]
-        upload_key: String,
+        object_key: String,
         #[arg(long)]
-        part: u64,
+        offset: u64,
         file: PathBuf,
     },
     Status {
         #[arg(long)]
-        upload_key: String,
+        object_key: String,
         #[arg(long, default_value_t = 0)]
         start: u64,
         #[arg(long, default_value_t = 4096)]
@@ -67,11 +67,11 @@ pub(crate) enum Action {
     },
     Finalize {
         #[arg(long)]
-        upload_key: String,
+        object_key: String,
     },
     Cancel {
         #[arg(long)]
-        upload_key: String,
+        object_key: String,
     },
     Get {
         #[arg(long)]

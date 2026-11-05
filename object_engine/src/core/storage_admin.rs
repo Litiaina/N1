@@ -43,7 +43,7 @@ struct Selection {
 }
 #[derive(Subcommand)]
 enum Operation {
-    /// Validate registered member identities and every inline shard/terminal file.
+    /// Validate registered member identities and every inline shard file.
     Verify {
         #[arg(long)]
         config: PathBuf,
@@ -88,7 +88,6 @@ struct Report {
     files: u64,
     bytes: u64,
     reconstructed_shards: u64,
-    preserved_retirements: u64,
     unrecoverable_private_stripes: u64,
     elapsed_ms: f64,
 }
@@ -795,22 +794,24 @@ mod tests {
                 Durability::Durable,
                 3600,
             )
+            .await
             .unwrap();
         store
             .put(
                 scope,
-                live.upload_key.clone(),
+                live.object_key.clone(),
                 std::io::Cursor::new(payload.clone()),
             )
             .await
             .unwrap();
         let dead = store
             .init(scope, 0, 1, 12288, Durability::Durable, 3600)
+            .await
             .unwrap();
         store
             .put(
                 scope,
-                dead.upload_key.clone(),
+                dead.object_key.clone(),
                 std::io::Cursor::new(vec![7]),
             )
             .await
@@ -818,11 +819,12 @@ mod tests {
         store.delete(scope, dead.object_key.clone()).await.unwrap();
         let upload = store
             .init(scope, 0, 36864, 12288, Durability::Durable, 3600)
+            .await
             .unwrap();
         store
             .write_part(
                 scope,
-                upload.upload_key.clone(),
+                upload.object_key.clone(),
                 1,
                 std::io::Cursor::new(vec![41; 12288]),
             )
@@ -839,7 +841,9 @@ mod tests {
             &mut report,
         )
         .unwrap();
-        assert!(report.files >= 4);
+        // One pool marker, one live shard and one incomplete shard. Purged
+        // identities contribute no files to a member copy.
+        assert_eq!(report.files, 3);
         assert!(!target.join(RESTORE_PENDING).exists());
         let identities = store.pools[0].members[0]
             .as_ref()
@@ -856,24 +860,28 @@ mod tests {
         recovered.configure_read_repair(false);
         assert_eq!(
             recovered
-                .download(scope, live.object_key, 0, None, Vec::new())
+                .download(scope, live.object_key.clone(), 0, None, Vec::new())
                 .await
                 .unwrap()
                 .0,
             payload
         );
         assert!(matches!(
-            recovered.stat(scope, dead.object_key).await,
-            Err(super::super::Error::Retired)
+            recovered.stat(scope, dead.object_key.clone()).await,
+            Err(super::super::Error::NotFound)
         ));
         assert!(matches!(
             recovered
-                .put(scope, dead.upload_key, std::io::Cursor::new(vec![7]))
+                .put(
+                    scope,
+                    dead.object_key.clone(),
+                    std::io::Cursor::new(vec![7])
+                )
                 .await,
-            Err(super::super::Error::Retired)
+            Err(super::super::Error::NotFound)
         ));
         let status = recovered
-            .upload_status(scope, upload.upload_key.clone(), 0, 16)
+            .upload_status(scope, upload.object_key.clone(), 0, 16)
             .await
             .unwrap();
         assert_eq!(status.missing_parts, vec![0, 2]);
@@ -881,17 +889,20 @@ mod tests {
             recovered
                 .write_part(
                     scope,
-                    upload.upload_key.clone(),
+                    upload.object_key.clone(),
                     part,
                     std::io::Cursor::new(vec![41; 12288]),
                 )
                 .await
                 .unwrap();
         }
-        recovered.finalize(scope, upload.upload_key).await.unwrap();
+        recovered
+            .finalize(scope, upload.object_key.clone())
+            .await
+            .unwrap();
         assert_eq!(
             recovered
-                .download(scope, upload.object_key, 0, None, Vec::new())
+                .download(scope, upload.object_key.clone(), 0, None, Vec::new())
                 .await
                 .unwrap()
                 .0,

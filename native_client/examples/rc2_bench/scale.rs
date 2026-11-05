@@ -414,7 +414,7 @@ async fn upload_worker(
             entries.push(Entry {
                 index,
                 key: field(&init, "object_key")?,
-                ticket: field(&init, "upload_key")?,
+                ticket: field(&init, "object_key")?,
                 bytes: source.len() as u64,
                 sha256: format!("{:x}", Sha256::digest(&source)),
             });

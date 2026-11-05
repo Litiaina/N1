@@ -1,5 +1,11 @@
 # Metadata maintenance qualification — November 5, 2026
 
+This is the historical maintenance checkpoint before the key-only upload and
+purge change. Its retirement/410 observations describe that tested executable.
+The current lifecycle is specified in [LINK-FORMAT.md](LINK-FORMAT.md): one LINK
+key, existing-file continuation, zero-residue purge and metadata-owned retry
+intent. Earlier passes do not qualify a changed executable.
+
 **Passed for the scope below. RC.2 remains in development on `link`.**
 This campaign adds metadata-owned lifecycle and maintenance while preserving
 the LINK object engine. It does not change pool geometry, placement, payload

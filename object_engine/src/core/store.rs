@@ -113,7 +113,6 @@ pub(crate) struct Progress {
 
 #[derive(Debug, Serialize)]
 pub struct InitializedUpload {
-    pub upload_key: String,
     pub object_key: String,
     pub total_bytes: u64,
     pub part_bytes: u64,
@@ -281,15 +280,15 @@ impl Store {
         self.runtime.get().unwrap_or(&DEFAULT)
     }
 
-    pub fn init(
+    fn fresh_plan(
         &self,
-        scope: [u8; 16],
+        _scope: [u8; 16],
         pool_index: usize,
         total_bytes: u64,
         part_bytes: u64,
         durability: Durability,
         ttl_seconds: u64,
-    ) -> Result<InitializedUpload> {
+    ) -> Result<UploadPlan> {
         self.operation_gate.ensure_mutations_allowed()?;
         if self
             .runtime()
@@ -325,19 +324,124 @@ impl Store {
         };
         plan.validate(&pool.layout)?;
         n1_link::shard::ShardHeader::new(&pool.layout, plan, 0)?;
-        Ok(InitializedUpload {
-            upload_key: self.signer.upload_ticket(&scope, plan).as_str().into(),
-            object_key: self
-                .signer
-                .object_key(&scope, plan.identity)
-                .as_str()
-                .into(),
-            total_bytes,
-            part_bytes,
-            parts: plan.parts(),
-            expires_at: plan.expires_at,
-            durable: durability == Durability::Durable,
+        Ok(plan)
+    }
+
+    /// Begin is the sole creation boundary. Continuation only opens existing
+    /// incomplete/final files, so deleting them consumes the ability to resume.
+    pub async fn init(
+        self: &Arc<Self>,
+        scope: [u8; 16],
+        pool_index: usize,
+        total_bytes: u64,
+        part_bytes: u64,
+        durability: Durability,
+        ttl_seconds: u64,
+    ) -> Result<InitializedUpload> {
+        let store = self.clone();
+        joined(self.activity.clone(), async move {
+            let plan = store.fresh_plan(
+                scope,
+                pool_index,
+                total_bytes,
+                part_bytes,
+                durability,
+                ttl_seconds,
+            )?;
+            let pool = store.pool(plan.identity)?;
+            let io = store.upload_io(scope, "begin upload").await?;
+            let _admission = store.admit_metadata(&pool).await?;
+            let fp = plan.identity.fingerprint();
+            let lease = store.foreground(fp)?;
+            let _guard = lease.state().lifecycle.clone().write_owned().await;
+            let roots = pool
+                .members
+                .iter()
+                .flatten()
+                .map(|m| m.path.clone())
+                .collect::<Vec<_>>();
+            let group = blocking(move || {
+                super::linux_io::group::FilesystemGroup::open(&roots).map_err(Error::from)
+            })
+            .await?;
+            let jobs = (0..pool.layout.width()).map(|shard| {
+                let holder = pool.holder(fp, shard as u16);
+                let layout = pool.layout.clone();
+                blocking(move || {
+                    let member = holder?;
+                    let header = ShardHeader::new(&layout, plan, shard as u16)?;
+                    // Begin allocates only the incomplete header. Full payload
+                    // capacity is checked at the first write, as before; a
+                    // declared object length is not a disk-space reservation.
+                    member.check_capacity(128)?;
+                    let (file, new) = match member.open_stage(fp, false, true) {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            // mkdir can succeed before the shard allocation
+                            // fails (for example, ENOSPC). Reclaim only an
+                            // empty directory; never remove collision data.
+                            member.retire_empty_stage(fp, false)?;
+                            return Err(error);
+                        }
+                    };
+                    if !new {
+                        return Err(Error::Conflict(
+                            "fresh LINK identity already has incomplete data".into(),
+                        ));
+                    }
+                    if let Err(error) =
+                        super::linux_io::pwrite_all_at(&*file, &header.encode(fp), 0)
+                    {
+                        drop(file);
+                        member.unlink(Path::new(&fp.staging_path()), false)?;
+                        member.retire_empty_stage(fp, false)?;
+                        return Err(error.into());
+                    }
+                    Ok(member)
+                })
+            });
+            let results = futures_util::future::join_all(jobs).await;
+            if results.iter().any(Result::is_err) {
+                // Every worker has ended. Roll back only files created by this
+                // fresh allocation; never remove a pre-existing collision.
+                let cleanups = results
+                    .iter()
+                    .filter_map(|r| r.as_ref().ok())
+                    .map(|member| {
+                        let member = member.clone();
+                        blocking(move || {
+                            member.unlink(Path::new(&fp.staging_path()), false)?;
+                            member.retire_empty_stage(fp, false)
+                        })
+                    });
+                let cleanup = collect(futures_util::future::join_all(cleanups).await);
+                let persisted = blocking(move || group.sync_all().map_err(Error::from)).await;
+                cleanup?;
+                persisted?;
+                collect(results)?;
+                unreachable!("failed allocation returns its error")
+            }
+            // Begin acknowledges allocation, not durable payload. The first
+            // durable part persists its header and complete staging ancestry;
+            // normal/batch PUT and finalize persist data before publication.
+            // An unused allocation may disappear on power loss. It can never
+            // be recreated by a continuation request.
+            blocking(move || group.check().map_err(Error::from)).await?;
+            io.complete();
+            Ok(InitializedUpload {
+                object_key: store
+                    .signer
+                    .object_key(&scope, plan.identity)
+                    .as_str()
+                    .into(),
+                total_bytes,
+                part_bytes,
+                parts: plan.parts(),
+                expires_at: plan.expires_at,
+                durable: durability == Durability::Durable,
+            })
         })
+        .await
     }
 
     pub(crate) fn pool(&self, identity: Identity) -> Result<Arc<Pool>> {
@@ -348,11 +452,52 @@ impl Store {
             .ok_or_else(|| Error::Unavailable("LINK pool generation is not configured".into()))
     }
 
-    pub fn inspect_upload(&self, scope: [u8; 16], ticket: &str) -> Result<UploadPlan> {
-        let plan = self.signer.verify_upload(&scope, ticket)?;
-        let pool = self.pool(plan.identity)?;
-        plan.validate(&pool.layout)?;
-        Ok(plan)
+    pub async fn inspect_upload(&self, scope: [u8; 16], key: &str) -> Result<UploadPlan> {
+        let identity = self.signer.verify_object(&scope, key)?;
+        let pool = self.pool(identity)?;
+        let _admission = self.admit_metadata(&pool).await?;
+        let lease = self.lease(identity.fingerprint())?;
+        let _guard = lease.state().lifecycle.clone().read_owned().await;
+        blocking(move || {
+            let fp = identity.fingerprint();
+            let mut unavailable = false;
+            for shard in 0..pool.layout.width() {
+                let member = match pool.holder(fp, shard as u16) {
+                    Ok(m) => m,
+                    Err(Error::Unavailable(_)) => {
+                        unavailable = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                for path in [fp.shard_path(shard as u16), fp.staging_path()] {
+                    let file = match member.open_read(Path::new(&path)) {
+                        Ok(f) => f,
+                        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    };
+                    let mut bytes = [0; 128];
+                    super::linux_io::pread_exact_at(&*file, &mut bytes, 0)?;
+                    let header = ShardHeader::decode(&bytes, &pool.layout, fp, shard as u16)
+                        .map_err(|e| corrupt(e.to_string()))?;
+                    let plan = UploadPlan {
+                        identity,
+                        total_bytes: header.total_bytes,
+                        part_bytes: header.part_bytes,
+                        expires_at: header.expires_at,
+                        durability: header.durability,
+                    };
+                    plan.validate(&pool.layout)?;
+                    return Ok(plan);
+                }
+            }
+            if unavailable {
+                Err(Error::Unavailable("upload members are unavailable".into()))
+            } else {
+                Err(Error::NotFound)
+            }
+        })
+        .await
     }
 
     pub(crate) fn lease(&self, fp: Fingerprint) -> Result<Lease> {
@@ -453,7 +598,6 @@ impl Store {
         &self,
         pool: Arc<Pool>,
         plan: UploadPlan,
-        create: bool,
     ) -> Result<Vec<Option<ShardFile>>> {
         let fp = plan.identity.fingerprint();
         let jobs = (0..pool.layout.width()).map(|shard| {
@@ -466,11 +610,11 @@ impl Store {
                     Err(e) => return Err(e),
                 };
                 let final_path = fp.shard_path(shard as u16);
-                let (file, finalized, new) = match member.open_read(Path::new(&final_path)) {
-                    Ok(f) => (f, true, false),
+                let (file, finalized) = match member.open_read(Path::new(&final_path)) {
+                    Ok(f) => (f, true),
                     Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                        match member.open_stage(fp, false, create) {
-                            Ok((f, new)) => (f, false, new),
+                        match member.open_stage(fp, false, false) {
+                            Ok((f, _)) => (f, false),
                             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                                 return Ok(None);
                             }
@@ -479,20 +623,6 @@ impl Store {
                     }
                     Err(e) => return Err(e),
                 };
-                if finalized
-                    && let Some(record) =
-                        super::delete::inspect_retirement(&file, fp, shard as u16)?
-                {
-                    return Err(super::delete::terminal_error(record));
-                }
-                let expected = ShardHeader::new(&layout, plan, shard as u16)?;
-                if new || (!finalized && create && file.metadata()?.len() < 128) {
-                    if let Err(error) = member.check_capacity(expected.file_bytes()?) {
-                        let _ = member.unlink(Path::new(&fp.staging_path()), false);
-                        return Err(error);
-                    }
-                    crate::core::linux_io::pwrite_all_at(&*file, &expected.encode(fp), 0)?;
-                }
                 let mut bytes = [0; 128];
                 crate::core::linux_io::pread_exact_at(&*file, &mut bytes, 0)?;
                 let header = ShardHeader::decode(&bytes, &layout, fp, shard as u16)

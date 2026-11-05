@@ -1,6 +1,5 @@
 use super::{
     Error, Result, corrupt,
-    delete::{inspect_retirement, terminal_error},
     ec::StripeCodec,
     io_scheduler::DiskIoGuard,
     object_parser::AdaptiveStreamGuard,
@@ -128,9 +127,6 @@ impl Store {
                     }
                     Err(e) => return Err(e),
                 };
-                if let Some(record) = inspect_retirement(&file, fp, shard as u16)? {
-                    return Err(terminal_error(record));
-                }
                 let mut bytes = [0; 128];
                 crate::core::linux_io::pread_exact_at(&*file, &mut bytes, 0).map_err(|e| {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -162,23 +158,6 @@ impl Store {
         let mut files = Vec::new();
         let (mut missing, mut bad, mut unavailable) = (Vec::new(), Vec::new(), Vec::new());
         let results = futures_util::future::join_all(jobs).await;
-        // Completed retirement takes precedence over live or unavailable shards.
-        // All probes must finish before their leases can be released.
-        if results.iter().any(|r| matches!(r, Err(Error::Retired))) {
-            return Err(Error::Retired);
-        }
-        if results.iter().any(|r| matches!(r, Err(Error::Retiring))) {
-            return Err(Error::Retiring);
-        }
-        // A terminal-sized final file cannot be an ordinary complete shard.
-        // Do not use parity to expose old payload or repair over a damaged
-        // deletion fence. An explicit authenticated delete can finish it.
-        if results
-            .iter()
-            .any(|r| matches!(r, Err(Error::RetirementCorrupt)))
-        {
-            return Err(Error::RetirementCorrupt);
-        }
         for (shard, result) in results.into_iter().enumerate() {
             match result {
                 Ok(Some(file)) => files.push(Some(file)),
@@ -201,6 +180,11 @@ impl Store {
             return Err(Error::NotFound);
         }
         if count < usize::from(pool.layout.data_shards) {
+            if !bad.is_empty() && unavailable.is_empty() {
+                return Err(corrupt(
+                    "object lacks sufficient checksum-valid finalized shard headers",
+                ));
+            }
             return Err(Error::Unavailable(
                 "object lacks sufficient valid finalized shards".into(),
             ));
@@ -630,6 +614,18 @@ async fn decode_stripe_inner(
                 Err(_) => unknown.push(i as u16),
             }
         }
+    }
+    // A quorum lost to verified bad frames is an integrity failure. Preserve
+    // unavailable/unknown for actual read or device failures, rather than
+    // reporting checksum damage as transient admission pressure.
+    // Private uploads may legitimately have sparse, unwritten frames. Only
+    // finalized shards promise that every frame was durably completed.
+    if object.files.iter().flatten().all(|file| file.finalized)
+        && unknown.is_empty()
+        && !verified.bad.is_empty()
+        && verified.pieces.iter().flatten().count() < k
+    {
+        return Err(corrupt("insufficient checksum-valid shard frames"));
     }
     let source = codec.decode(
         &verified.pieces,

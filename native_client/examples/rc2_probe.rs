@@ -136,9 +136,9 @@ async fn run() -> Result<()> {
                     .await?
                     .result
                     .ok_or("missing upload")?;
-                tickets.push(text(&init, "upload_key")?);
+                tickets.push(text(&init, "object_key")?);
                 body.extend_from_slice(&source);
-                records.push(json!({"index":index,"size":size,"sha256":hash,"object_key":text(&init,"object_key")?,"upload_key":text(&init,"upload_key")?}));
+                records.push(json!({"index":index,"size":size,"sha256":hash,"object_key":text(&init,"object_key")?}));
                 bytes += size;
             }
             let timer = Instant::now();
@@ -152,7 +152,7 @@ async fn run() -> Result<()> {
                     let length = record["size"].as_u64().ok_or("missing size")? as usize;
                     client
                         .put(
-                            text(record, "upload_key")?,
+                            text(record, "object_key")?,
                             length as u64,
                             &mut std::io::Cursor::new(&body[offset..offset + length]),
                         )
@@ -177,7 +177,7 @@ async fn run() -> Result<()> {
         for line in BufReader::new(File::open(manifest)?).lines() {
             let record: Value = serde_json::from_str(&line?)?;
             let key = text(&record, "object_key")?;
-            let ticket = text(&record, "upload_key")?;
+            let ticket = text(&record, "object_key")?;
             let timer = Instant::now();
             if mode == "verify" {
                 let mut received = Vec::new();
@@ -188,7 +188,7 @@ async fn run() -> Result<()> {
                     return Err(format!("content mismatch for witness item {index}").into());
                 }
                 client
-                    .control(Command::UploadFinalize { upload_key: ticket })
+                    .control(Command::UploadFinalize { object_key: ticket })
                     .await?;
                 client
                     .control(Command::ObjectHealth {
@@ -205,7 +205,7 @@ async fn run() -> Result<()> {
                     .await?;
                 for command in [
                     Command::ObjectStat { object_key: key },
-                    Command::UploadFinalize { upload_key: ticket },
+                    Command::UploadFinalize { object_key: ticket },
                 ] {
                     match client.control(command).await {
                         Err(NativeClientError::Native { code, .. }) if code == "410" => {}

@@ -221,15 +221,9 @@ async fn put_streams_regular_file_bytes_through_native_single_part_completion() 
                 ..
             }
         ));
-        reply(
-            &mut stream,
-            req.id,
-            json!({"upload_key":"ticket","object_key":"object"}),
-            0,
-        )
-        .await;
+        reply(&mut stream, req.id, json!({"object_key":"object"}), 0).await;
         let req = request(&mut stream).await;
-        assert!(matches!(req.command,Command::UploadPut{upload_key}if upload_key=="ticket"));
+        assert!(matches!(req.command,Command::UploadPut{object_key}if object_key=="object"));
         assert_eq!(req.body_len, 9000);
         let mut received = vec![0; 9000];
         stream.read_exact(&mut received).await.unwrap();

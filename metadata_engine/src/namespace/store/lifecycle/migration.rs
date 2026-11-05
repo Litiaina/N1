@@ -160,10 +160,10 @@ impl Namespace {
                 &work.upload.object_key
             };
             tx.remove(Table::Reclamation, &reference(&work.target, retired)?)?;
-            if read::<Target>(tx, Table::Reclamation, &retiring(retired)?)?.as_ref()
+            if read::<Target>(tx, Table::Reclamation, &purging(retired)?)?.as_ref()
                 == Some(&work.target)
             {
-                tx.remove(Table::Reclamation, &retiring(retired)?)?;
+                tx.remove(Table::Reclamation, &purging(retired)?)?;
             }
             tx.remove(Table::Reclamation, &move_key(job, &work.target)?)?;
             tx.remove(

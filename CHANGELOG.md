@@ -34,8 +34,23 @@ complete API conformance or qualification.
   avoiding a fresh login per missing-status page on large multipart uploads.
 - Add CRC32C frame verification with context-bound source SHA-256 for the hybrid
   shard profile; preserve immutable integrity profiles within enrolled pools.
-- Add permanent LINK key retirement, conservative upload staging GC, object
-  recovery points, replication and explicit member verification/reconstruction.
+- Restore aligned `O_DIRECT` large uploads through the retained ECS buffers and
+  owned I/O backend. Preserve immutable framing, concurrent part boundaries,
+  checksums, admission and acknowledgement durability; keep small writes buffered.
+- Classify deferred deep-scan checks separately from confirmed corruption and
+  drain owned diagnostic work during metadata shutdown.
+- Use one LINK key from Begin through finalization and continuation that only
+  opens existing files. Persist incomplete headers and paths with the first
+  durable payload; an unused Begin allocation may disappear on power loss.
+  Purge removes all
+  identity files without terminal records; metadata or standalone clients retain
+  unacknowledged purge intent until retry succeeds.
+- Keep normal-upload data synchronization before publication and join namespace
+  persistence per filesystem. Establish the immutable shard length sparsely
+  before payload writes to avoid unused speculative allocation beyond EOF.
+- Add conservative upload staging GC, object recovery points, replication and
+  explicit member verification/reconstruction. Restoring an older recovery
+  point explicitly rolls back later writes and purges.
 - Add Rust physical qualification and failure auditing for direct objects,
   metadata transactions and original-console-to-metadata-to-object operations.
   Retire cached metadata transports before the object's native idle deadline.

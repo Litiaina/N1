@@ -257,7 +257,7 @@ versions. Object staging GC remains an independent NOA v2 operation.
 Redistribution requires distinct enrolled `source_pool` and `target_pool` IDs;
 the target must be unsealed. Optional `object_key` selects one logical object's
 versions in the selected fragment. Migration verifies a new destination LINK
-identity before switching metadata, then retires the unreferenced source. EC
+identity before switching metadata, then purges the unreferenced source. EC
 topologies may differ; logical versions/ETags do not change. This is explicit
 same-object-service pool migration. `dry_run=true` selects without copying.
 Retry incomplete migration with its original parameters, or stop it to clean up
@@ -286,7 +286,7 @@ and [the completion checklist](docs/RC2-IMPLEMENTATION.md).
 This contract performs direct object storage. Its typed operations are shared
 by the object engine and native SDK in [link/src/noa.rs](link/src/noa.rs).
 Native `n1/1` is primary; HTTP is a secondary adapter to the same handlers.
-Object keys and upload tickets are client-held capabilities, bound to a stable
+LINK object keys are client-held capabilities, bound to a stable
 object-service fragment ID and checked permissions. This service does not open
 the metadata database.
 
@@ -308,7 +308,7 @@ inactivity deadlines do not impose a fixed maximum object-transfer duration.
 
 Connections are ordered request/response streams. Authentication establishes the
 connection session. After a partial exchange, reconnect before retrying. Upload
-retries reuse the ticket, not a newly initialized identity. The client must retain
+retries reuse the same LINK key, not a newly initialized identity. The client must retain
 issued keys; N1 does not provide a list from which to recover them.
 
 ### Authentication
@@ -345,26 +345,34 @@ untrusted forwarded-address headers cannot change the quota identity.
 | Operation | Arguments | Permission / body |
 | --- | --- | --- |
 | `upload.init` | optional `pool`, `total_bytes`, `part_bytes`, `durable`, `ttl_seconds` | write; no body |
-| `upload.part` | `upload_key`, zero-based `part` | write; exact part bytes |
-| `upload.put` | `upload_key` for a single-part/empty object | write; exact total bytes |
-| `upload.batch` | `upload_keys` in body order | write; concatenated single-part bodies |
-| `upload.status` | `upload_key`, `start`, `limit` (1..4096) | read or write; validates a page of actual parts |
-| `upload.finalize` | `upload_key` | write; no body |
-| `upload.cancel` | `upload_key` | write; removes unfinished staging only |
+| `upload.part` | `object_key`, byte `offset` aligned to part size | write; exact part bytes |
+| `upload.put` | `object_key` for a single-part/empty object | write; exact total bytes |
+| `upload.batch` | `object_keys` in body order | write; concatenated single-part bodies |
+| `upload.status` | `object_key`, `start`, `limit` (1..4096) | read or write; validates a page of actual parts |
+| `upload.finalize` | `object_key` | write; no body |
+| `upload.cancel` | `object_key` | write; removes unfinished staging only |
 | `object.stat` | `object_key` | read; size, EC representation and integrity root |
 | `object.get` | `object_key`, `offset`, optional `length` | read; exact raw response bytes |
 | `object.signed_read` | `object_key`, `offset`, optional `length`, `ttl_seconds` | read; client-held range/expiry-bound grant |
 | `object.get_signed` | `grant` | verified grant; raw signed range, no connection login required |
 | `object.health` | `object_key`, `deep` | read; object-specific integrity/availability |
 | `object.repair` | `object_key` | repair; replaces damaged/missing shards |
-| `object.delete` | `object_key` | delete; permanent retirement |
+| `object.delete` | `object_key` | delete; physical purge to absence |
 | `object.bulk_delete` | explicit `object_keys` (1..256) | delete; per-key results |
 
-Init returns both `upload_key` (`N1U1.`) and final `object_key` (`N1A1.`), counts,
-expiry and durability. It creates no session manifest on disk. A single-part
-normal/batch ticket requires `part_bytes >= total_bytes` and EC alignment. Empty
-objects have zero parts and no body. Batches have at most 256 tickets, 1 GiB of
-body and 1,024 calculated open shard descriptors; duplicate identities are invalid.
+Begin returns one `object_key` (`N1A1.`), counts, geometry, expiry and durability
+after incomplete headers are created on all members. Begin acknowledges
+allocation, not payload persistence. Before the first durable payload reply,
+power loss may remove an unused allocation; its old key then returns 404.
+The `durable` flag governs part acknowledgements. A durable part persists its
+header, payload and complete staging ancestry on every member before replying.
+Normal/batch PUT and finalize persist the header with durable publication.
+There is no upload
+ticket or manifest. Writes open existing incomplete shards; only a fresh Begin
+creates them. A normal/batch object requires `part_bytes >= total_bytes` and EC
+alignment. Empty objects have zero parts and no body. Batches contain at most
+256 keys, 1 GiB of body and 1,024 calculated open shard descriptors; duplicate
+identities are invalid. The LINK key stays identical at finalization.
 
 Standard part replies do not promise persistence. Durable part replies require
 persistence on every member. Finalization, normal upload and batch success always
@@ -382,15 +390,22 @@ when outside the object; successful range output has exactly the declared length
 Signed grants last at most six hours and never outlive the issuing session token.
 They bind fragment, key, offset, length and expiry; changing those fields invalidates
 the signature. Signed access grants no other operation or connection authority.
-Current fragment read permission and permanent retirement still apply.
+Current fragment read permission and object existence still apply.
 
-Delete writes durable terminal state at calculated shard paths. `retired_shards`
-is the count newly retired by that call; repeated deletion can return zero.
-Completed retirement returns 410 to reads and rejects old upload tickets. Partial
-retirement or unavailable members can require retry (503). The object engine has no rename, namespace
-listing, object history or undelete operation; those belong to metadata.
+Delete removes incomplete/final shards and per-identity staging directories.
+`removed_shards` counts member positions with newly removed files; repeated
+purge can return zero. Success requires all members and persistence barriers.
+No per-identity record remains. Old write/status/finalize/GET return 404 and
+cannot recreate missing data. Only Begin generates a fresh random identity.
 
-### Maintenance
+Interrupted deletion has no success acknowledgement. Remaining shards do not
+encode intent; they may still be readable with sufficient EC quorum. Metadata
+keeps its durable reclamation claim/key until native deletion succeeds and
+retries after restart. Direct clients must retain and retry their own pending
+deletions. The object engine has no rename, namespace listing, object history
+or undelete operation; those belong to metadata.
+
+### Maintenance### Maintenance
 
 | Operation | Arguments | Access |
 | --- | --- | --- |
@@ -415,7 +430,7 @@ its persisted attempted-slot journal prevents duplicate admission.
 | --- | --- |
 | `GET /health` | Public version response |
 | `POST /noa` | JSON request/response, no raw body |
-| `PUT /noa/upload/{upload_key}/parts/{part}` | Exact Content-Length, raw part body |
+| `PUT /noa/upload/{object_key}/bytes/{offset}` | Exact Content-Length, raw part body |
 | `POST /noa/stream` | Exact Content-Length; native length-prefixed MessagePack request followed by raw upload bytes; JSON response |
 | `GET /noa/object/{object_key}?offset=0&length=...` | Raw verified response, exact Content-Length |
 | `HEAD /noa/object/{object_key}` | Authenticated object headers without downloading payload |
@@ -447,7 +462,7 @@ preconfigured aliases; callers cannot submit filesystem paths or encryption keys
 | `backup.capture` | `repository,boundary_seconds` | Starts committed online capture; boundary 1..300 seconds |
 | `backup.verify` | `repository,snapshot` | Starts authenticated point verification |
 | `backup.replicate` | `repository,destination,snapshot` | Starts resumable local point replication |
-| `backup.prune` | `repository,keep_last,protect` | Starts retention; keep 1..10000, retain protected point and retirement witnesses |
+| `backup.prune` | `repository,keep_last,protect` | Starts retention; keep 1..10000, retain protected point and at least one recovery point |
 | `backup.gc` | `repository,discard_incomplete` | Starts block reclamation; incomplete transfers protected unless explicitly discarded |
 | `backup.job` | none | Current/last bounded recovery job status |
 | `backup.stop` | `job_id` | Requests cooperative stop |
@@ -463,9 +478,9 @@ Restore remains an offline operator helper operation with explicit targets.
 
 400 invalid encoding, parameters or range; 401 missing/invalid authentication;
 403 denied permission; 404 absent object/upload/job; 409 conflicting immutable
-bytes, expiry or active-job conflict; 410 permanently retired identity; 413 body
+bytes, expiry or active-job conflict; 413 body
 limit; 422 verified format/integrity failure; 503 unavailable quorum, incomplete
-retirement, exhausted admission or incomplete operation; 507 ENOSPC/EDQUOT.
+purge, exhausted admission or incomplete operation; 507 ENOSPC/EDQUOT.
 A storage error is not converted into success because a final filename exists.
 
 Full product conformance also requires the named metadata contract above.

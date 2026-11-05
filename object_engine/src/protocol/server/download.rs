@@ -136,9 +136,14 @@ mod tests {
                 Durability::Durable,
                 3600,
             )
+            .await
             .unwrap();
         store
-            .put(scope, init.upload_key, std::io::Cursor::new(data.clone()))
+            .put(
+                scope,
+                init.object_key.clone(),
+                std::io::Cursor::new(data.clone()),
+            )
             .await
             .unwrap();
         let (sender, mut receiver) = tokio::io::duplex(4096);
@@ -183,8 +188,8 @@ mod tests {
         );
         store.activity.wait_idle().await.unwrap();
         assert!(matches!(
-            store.stat(scope, init.object_key).await,
-            Err(Error::Retired)
+            store.stat(scope, init.object_key.clone()).await,
+            Err(Error::NotFound)
         ));
     }
 

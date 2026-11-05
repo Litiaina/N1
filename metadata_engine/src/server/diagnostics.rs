@@ -4,7 +4,7 @@ use super::{
     App,
     error::{ApiError, ApiResult},
 };
-use crate::{RecordKey, Table, namespace::store::StoredVersion};
+use crate::{RecordKey, Table, namespace::store::StoredVersion, object_store::ObjectStoreResult};
 use n1_link::{ObjectKey, PoolId, noa::Command};
 use serde_json::{Value, json};
 use std::{
@@ -14,6 +14,32 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+enum Check {
+    Verified(u64),
+    Damaged,
+    Deferred,
+}
+fn classify(health: ObjectStoreResult<Value>) -> Check {
+    match health {
+        Ok(value) if value["status"] == "healthy" => {
+            Check::Verified(value["verified_bytes"].as_u64().unwrap_or(0))
+        }
+        Ok(value)
+            if matches!(
+                value["status"].as_str(),
+                Some("degraded" | "critical" | "lost")
+            ) =>
+        {
+            Check::Damaged
+        }
+        // 422 is the object API's explicit integrity failure. Admission,
+        // transport and lifecycle races do not prove corruption. An unverified
+        // reference stays visible in the incomplete count instead of passing.
+        Err(error) if error.status() == 422 => Check::Damaged,
+        _ => Check::Deferred,
+    }
+}
+
 struct Scan {
     fragment: PoolId,
     pool: Option<String>,
@@ -22,12 +48,19 @@ struct Scan {
 pub(super) struct Diagnostics {
     scan: Mutex<Option<Scan>>,
     admission: Arc<Semaphore>,
+    lifecycle: Mutex<Lifecycle>,
+}
+#[derive(Default)]
+struct Lifecycle {
+    stopping: bool,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Default for Diagnostics {
     fn default() -> Self {
         Self {
             scan: Mutex::new(None),
             admission: Arc::new(Semaphore::new(1)),
+            lifecycle: Mutex::new(Lifecycle::default()),
         }
     }
 }
@@ -45,20 +78,24 @@ impl Diagnostics {
         fragment: PoolId,
         pool: Option<String>,
     ) -> ApiResult<()> {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if lifecycle.stopping {
+            return Err(ApiError::invalid("integrity monitoring is shutting down"));
+        }
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             ApiError(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "an integrity scan is already running".into(),
             )
         })?;
-        let state=app.pools.iter().filter(|p|pool.as_deref().is_none_or(|id|p.id.to_string()==id)).map(|p|(p.id.to_string(),json!({"status":"running","scope":"live fragment references","versions_checked":0,"failed_versions":0,"verified_bytes":0,"elapsed_ms":0}))).collect();
+        let state=app.pools.iter().filter(|p|pool.as_deref().is_none_or(|id|p.id.to_string()==id)).map(|p|(p.id.to_string(),json!({"status":"running","scope":"live fragment references","versions_checked":0,"verified_versions":0,"failed_versions":0,"deferred_versions":0,"verified_bytes":0,"elapsed_ms":0}))).collect();
         *self.scan.lock().unwrap_or_else(|e| e.into_inner()) = Some(Scan {
             fragment,
             pool,
             state,
         });
         let this = self.clone();
-        tokio::spawn(async move {
+        lifecycle.task = Some(tokio::spawn(async move {
             let _permit = permit;
             let started = Instant::now();
             let result = this.run(&app, fragment, started).await;
@@ -66,32 +103,62 @@ impl Diagnostics {
             if let Some(scan) = scan.as_mut() {
                 for state in scan.state.values_mut() {
                     state["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
-                    state["status"] = json!(if result.is_err() {
-                        "incomplete"
-                    } else if state["failed_versions"].as_u64().unwrap_or(0) > 0 {
-                        "failed"
-                    } else {
-                        "passed"
-                    });
+                    state["status"] =
+                        json!(if state["failed_versions"].as_u64().unwrap_or(0) > 0 {
+                            "failed"
+                        } else if result.is_err()
+                            || state["deferred_versions"].as_u64().unwrap_or(0) > 0
+                        {
+                            "incomplete"
+                        } else {
+                            "passed"
+                        });
                     if let Err(error) = &result {
                         state["error"] = json!(error.to_string());
                     }
                 }
             }
-        });
+        }));
+        Ok(())
+    }
+    /// Stop between objects and drain the currently owned native check before
+    /// maintenance connections and database workers are closed. Never abort
+    /// a worker while the object server still owns its admitted I/O.
+    pub(super) async fn shutdown(&self) {
+        let task = {
+            let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            lifecycle.stopping = true;
+            lifecycle.task.take()
+        };
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+    fn ensure_running(&self) -> ApiResult<()> {
+        if self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopping
+        {
+            return Err(ApiError::invalid(
+                "integrity scan stopped during shutdown; unchecked objects are not declared healthy",
+            ));
+        }
         Ok(())
     }
     async fn run(&self, app: &Arc<App>, fragment: PoolId, started: Instant) -> ApiResult<()> {
+        let (db, objects) = app.maintenance.diagnostic_handles();
         let mut after: Option<RecordKey> = None;
         loop {
+            self.ensure_running()?;
             if started.elapsed() > Duration::from_secs(3600) {
                 return Err(ApiError::invalid(
                     "integrity scan window expired; unchecked objects are not declared healthy",
                 ));
             }
             let cursor = after.clone();
-            let page = app
-                .db
+            let page = db
                 .execute(move |db| {
                     db.snapshot()
                         .scan(Table::Versions, fragment, "", cursor.as_ref(), 128)
@@ -101,6 +168,7 @@ impl Diagnostics {
                 return Ok(());
             }
             for (key, bytes) in page {
+                self.ensure_running()?;
                 after = Some(key.clone());
                 if key.identifier().starts_with('@') {
                     continue;
@@ -117,9 +185,7 @@ impl Diagnostics {
                 // Keep admission until this object check actually ends. A
                 // caller's wall-clock timeout must not admit a second scan
                 // while the first object's I/O is still owned by the server.
-                let health = app
-                    .service
-                    .objects()
+                let health = objects
                     .control(Command::ObjectHealth {
                         object_key: stored.object_key,
                         deep: true,
@@ -130,22 +196,29 @@ impl Diagnostics {
                     if let Some(state) = scan.as_mut().and_then(|s| s.state.get_mut(&pool)) {
                         let checked = state["versions_checked"].as_u64().unwrap_or(0);
                         state["versions_checked"] = json!(checked + 1);
-                        match health {
-                            Ok(value) if value["status"] == "healthy" => {
+                        match classify(health) {
+                            Check::Verified(bytes) => {
+                                state["verified_versions"] =
+                                    json!(state["verified_versions"].as_u64().unwrap_or(0) + 1);
                                 state["verified_bytes"] = json!(
                                     state["verified_bytes"]
                                         .as_u64()
                                         .unwrap_or(0)
-                                        .saturating_add(
-                                            value["verified_bytes"].as_u64().unwrap_or(0)
-                                        )
+                                        .saturating_add(bytes)
                                 );
                             }
-                            _ => {
+                            Check::Damaged => {
                                 state["failed_versions"] =
                                     json!(state["failed_versions"].as_u64().unwrap_or(0) + 1);
                                 state["error"] = json!(
                                     "object did not pass the requested checksum verification"
+                                );
+                            }
+                            Check::Deferred => {
+                                state["deferred_versions"] =
+                                    json!(state["deferred_versions"].as_u64().unwrap_or(0) + 1);
+                                state["deferred_reason"] = json!(
+                                    "Some references could not be verified because of admission, transport, access or concurrent lifecycle changes. Retry when available; this is not a corruption verdict."
                                 );
                             }
                         }
@@ -155,5 +228,42 @@ impl Diagnostics {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object_store::ObjectStoreError;
+    use n1_native_client::NativeClientError;
+    #[test]
+    fn only_confirmed_integrity_failures_count_as_damage() {
+        for status in [400, 401, 403, 404, 409, 410, 429, 500, 502, 503, 504] {
+            let error = ObjectStoreError::Native(NativeClientError::Native {
+                code: status.to_string(),
+                message: "test".into(),
+            });
+            assert!(
+                matches!(classify(Err(error)), Check::Deferred),
+                "status {status}"
+            );
+        }
+        let error = ObjectStoreError::Native(NativeClientError::Native {
+            code: "422".into(),
+            message: "corrupt".into(),
+        });
+        assert!(matches!(classify(Err(error)), Check::Damaged));
+        assert!(matches!(
+            classify(Ok(json!({"status":"unknown"}))),
+            Check::Deferred
+        ));
+        assert!(matches!(
+            classify(Ok(json!({"status":"degraded"}))),
+            Check::Damaged
+        ));
+        assert!(matches!(
+            classify(Ok(json!({"status":"healthy","verified_bytes":123}))),
+            Check::Verified(123)
+        ));
     }
 }

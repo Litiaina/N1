@@ -101,10 +101,10 @@ impl Manager {
                         let key = blob.key.clone();
                         if self
                             .db
-                            .execute(move |db| Namespace::new(db).prepare_retirement(&target, &key))
+                            .execute(move |db| Namespace::new(db).prepare_purge(&target, &key))
                             .await?
                         {
-                            self.objects.retire(&blob.key).await?;
+                            self.objects.purge(&blob.key).await?;
                         }
                         let directory = self
                             .staging
@@ -190,10 +190,10 @@ impl Manager {
                 let key = blob.key.clone();
                 let retire = self
                     .db
-                    .execute(move |db| Namespace::new(db).prepare_retirement(&target, &key))
+                    .execute(move |db| Namespace::new(db).prepare_purge(&target, &key))
                     .await?;
                 if retire {
-                    self.objects.retire(&blob.key).await?;
+                    self.objects.purge(&blob.key).await?;
                 }
                 // This is metadata's own private multipart bridge, never a
                 // shard path. Keep the owner/key until cleanup has succeeded.

@@ -111,7 +111,6 @@ mod tests {
             handle: handle.clone(),
             object_id: version(n + 20000),
             upload: ObjectUpload {
-                upload_key: "private-test-ticket".into(),
                 object_key: "private-test-key".into(),
                 total_bytes: 8192,
                 part_bytes: 4096,

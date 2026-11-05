@@ -5,12 +5,18 @@ qualification gaps. It does not redefine the API, prescribe deployment or serve
 as a chronological work log. The product uses LINK object storage with an
 optional metadata engine; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
+**Promotion hold:** keep this checkpoint on `link`. The million-object campaign
+and remaining crash/power-loss qualification are deferred until the MCH network
+campaign. Existing process-kill/recovery passes remain valid for their stated
+scope; they do not establish hardware power-loss resilience. Full-stack
+performance remains a separate gate before promotion to `main`.
+
 ## Implemented components
 
 | Component | Current implementation |
 | --- | --- |
-| LINK object engine | Deterministic placement in immutable pools; normal/batch/standard/durable multipart; verified GET/ranges; stat/health/repair; permanent key retirement; staging GC; paced maintenance; object backups/replication and explicit member recovery |
-| N1 runtime infrastructure | Retained module structure, adaptive concurrency, I/O scheduler, io_uring, middleware, server, streaming reads, banner and backup automation |
+| LINK object engine | Deterministic placement in immutable pools; normal/batch/standard/durable multipart; verified GET/ranges; stat/health/repair; zero-residue purge; staging GC; paced maintenance; object backups/replication and explicit member recovery |
+| N1 runtime infrastructure | Retained module structure, adaptive concurrency, I/O scheduler, io_uring, aligned O_DIRECT large uploads, middleware, server, streaming reads, banner and backup automation |
 | Operator controls | INI/environment startup; IP/ports/TLS; immutable pool enrollment/append; concurrency, memory, I/O, rate, GC and healing controls |
 | Metadata storage | Procyon optimistic transactions, SyncAll commits, cross-table snapshots, bounded workers and scans, crash/recovery and offline administration |
 | Named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
@@ -30,6 +36,14 @@ loss/corruption, full metadata loss and restore, crash/resume, encrypted-replica
 recovery and actual OS unmount/remount. It is separate from population and
 hardware power-loss qualification.
 
+The [key lifecycle qualification](KEY-PURGE-20261105.md) covers the current
+single-key upload contract and zero-residue purge. Earlier retirement-state
+results remain historical; they do not qualify the current lifecycle by themselves.
+The [aligned I/O qualification](DIRECT-IO-20261105.md) records the subsequent
+large-upload change, unchanged shard format and lifecycle, physical proof,
+repeated reliability checks and matched performance results, including costs
+from cold post-upload reads/status and the measured CPU tradeoff.
+
 ## Work required before completion
 
 | Area | Remaining work / acceptance condition |
@@ -42,7 +56,7 @@ hardware power-loss qualification.
 | Console and administration | Exercise the original product workflows and deployment/administration helpers against both engines. Passing three original live tests is scoped evidence, not complete feature parity. |
 | End-to-end population | Finish each requested 500K API and Console campaign with physical census, real process restart and every acknowledged version/payload verified. Keep failed attempts and distinct machine results separate. |
 | Broader storage qualification | Two-HDD member loss/corruption, beyond-parity refusal, replica recovery after loss of both originals, replacement, INI expansion and database crash/churn pass. The EC subset matrix uses logical fixtures; qualify larger physical topologies, multiple-member replacement and hardware power loss separately. |
-| Matched performance | Measure CPU, RSS, latency and throughput on equivalent completed operations; retain cache/durability/integrity conditions and all failed trials. |
+| Matched performance | The current key lifecycle record links original-NCX, previous-LINK and pre-optimization key-only ABBA benchmarks, plus standalone batch/multipart/concurrent upload. Record CPU/RSS, latency, throughput, allocation and every individual large-object sample. Begin now persists with the first durable payload by operator choice; a Rust reopen/readback probe verifies speculative XFS EOF allocation is gone. Earlier regressions remain in their original reports. Mixed and focused large-object results must both be reported; no universal performance claim follows. Named-pipeline, saturation and population measurements remain separate gates. |
 
 ## Fixed boundaries
 

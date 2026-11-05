@@ -30,7 +30,7 @@ N1 has two main components:
 
 - **`object_engine/`** stores and verifies immutable objects. It handles normal,
   batch and multipart uploads, durable finalization, GET/ranges, object health,
-  repair, permanent key retirement, staging GC and object recovery.
+  repair, zero-residue purge, staging GC and object recovery.
 - **`metadata_engine/`** provides logical fragments, names, versions, listings,
   named upload transactions, rename, trash/recovery and exports. Its database
   foundation is ProcyonDB. It coordinates storage through the public native LINK

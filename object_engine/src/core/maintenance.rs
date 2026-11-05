@@ -27,7 +27,6 @@ pub struct MaintenanceReport {
     pub healthy: u64,
     pub degraded: u64,
     pub repaired: u64,
-    pub retired: u64,
     pub incomplete: u64,
     pub active_skipped: u64,
     pub retained: u64,
@@ -46,7 +45,6 @@ impl MaintenanceReport {
             healthy,
             degraded,
             repaired,
-            retired,
             incomplete,
             active_skipped,
             retained,
@@ -516,7 +514,6 @@ impl Store {
                     ));
                 }
             }
-            Err(Error::Retired) => report.retired += 1,
             Err(e) => report.error(e),
         }
         report
@@ -534,14 +531,9 @@ fn gc_candidate(
     let mut canonical = None;
     for shard in 0..pool.layout.width() {
         let member = pool.holder(fp, shard as u16)?;
-        // Any final file or terminal state fences staging reclamation. Incomplete
-        // finalization/deletion is resolved by the corresponding key operation.
+        // Any final file fences staging reclamation. Partial promotion must be
+        // resolved by finalize or by an explicit key-addressed purge.
         match member.open_read(Path::new(&fp.shard_path(shard as u16))) {
-            Ok(_) => return Ok(None),
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        match member.open_read(Path::new(&format!(".uploads/{fp}/retire.tmp"))) {
             Ok(_) => return Ok(None),
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),

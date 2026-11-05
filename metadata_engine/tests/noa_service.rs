@@ -10,10 +10,14 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/console_workflows.rs"]
+mod console_workflows;
 #[path = "noa_service/crash_matrix.rs"]
 mod crash_matrix;
 #[path = "noa_service/device_cycle.rs"]
 mod device_cycle;
+#[path = "noa_service/diagnostic_load.rs"]
+mod diagnostic_load;
 #[path = "noa_service/maintenance.rs"]
 mod maintenance;
 #[path = "noa_service/monitoring.rs"]
@@ -235,8 +239,11 @@ impl Stack {
         self.start_metadata_with_env(&[]).await;
     }
     async fn start_metadata_with_env(&mut self, environment: &[(&str, &str)]) {
+        let binary = std::env::var_os("N1_METADATA_TEST_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_litiaina-n1-metadata")));
         self.metadata = Some(spawn_with_env(
-            Path::new(env!("CARGO_BIN_EXE_litiaina-n1-metadata")),
+            &binary,
             &["serve", "--config", "n1_config.ini"],
             &self.root,
             "metadata.log",
@@ -784,7 +791,7 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
                 .unwrap(),
         )
         .unwrap();
-        pending["upload"]["upload_key"].as_str().unwrap().to_owned()
+        pending["upload"]["object_key"].as_str().unwrap().to_owned()
     };
     let credentials: Value = serde_json::from_slice(
         &std::fs::read(stack.object_config.with_extension("credentials.json")).unwrap(),
@@ -802,7 +809,7 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
         .await
         .unwrap();
     native_object
-        .control(n1_link::noa::Command::UploadFinalize { upload_key: ticket })
+        .control(n1_link::noa::Command::UploadFinalize { object_key: ticket })
         .await
         .unwrap();
     drop(native_object);

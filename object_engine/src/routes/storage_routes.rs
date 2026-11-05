@@ -34,7 +34,7 @@ pub fn router(service: Arc<Service>) -> Router {
             post(streamed).layer(DefaultBodyLimit::disable()),
         )
         .route(
-            "/noa/upload/{upload_key}/parts/{part}",
+            "/noa/upload/{object_key}/bytes/{offset}",
             put(part).layer(DefaultBodyLimit::disable()),
         )
         .route("/noa/object/{object_key}", get(download).head(head_object))
@@ -144,18 +144,18 @@ async fn control(
 }
 async fn part(
     State(service): State<Arc<Service>>,
-    Path((ticket, part)): Path<(String, u64)>,
+    Path((key, offset)): Path<(String, u64)>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     let result = async {
         let claims = claims(&service, &headers)?;
-        let expected = service.upload_length(&claims, &ticket, part)?;
+        let expected = service.upload_length(&claims, &key, offset).await?;
         service.limits.operation(
             &claims,
             &Command::UploadPart {
-                upload_key: ticket.clone(),
-                part,
+                object_key: key.clone(),
+                offset,
             },
         )?;
         if expected > MAX_BODY_BYTES {
@@ -174,9 +174,9 @@ async fn part(
         let reader = body_reader(body);
         service
             .store
-            .write_part(claims.sub.0, ticket, part, reader)
+            .write_at(claims.sub.0, key, offset, reader)
             .await?;
-        Ok(Json(json!({"part":part,"complete":true})).into_response())
+        Ok(Json(json!({"offset":offset,"complete":true})).into_response())
     }
     .await;
     result.unwrap_or_else(error)
@@ -224,7 +224,7 @@ async fn streamed(
         reader.read_exact(&mut bytes).await?;
         let request: Request = rmp_serde::from_slice(&bytes)
             .map_err(|e| Error::Invalid(format!("invalid NOA control: {e}")))?;
-        let expected = service.body_length(&claims, &request.command)?;
+        let expected = service.body_length(&claims, &request.command).await?;
         service.limits.operation(&claims, &request.command)?;
         let max = if matches!(&request.command, Command::UploadPut { .. }) {
             i64::MAX as u64

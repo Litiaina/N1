@@ -60,6 +60,31 @@ fn client(listener: &TcpListener, connections: usize) -> NativeObjectStore {
 }
 
 #[tokio::test]
+async fn absent_upload_status_is_not_synthesized_as_a_resumable_session() {
+    use n1_metadata_engine::object_store::ObjectUpload;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 1);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        login(&mut stream).await;
+        let request = read(&mut stream).await;
+        assert!(matches!(request.command, Command::UploadStatus { .. }));
+        write(&mut stream, Response::error(request.id, 404, "absent")).await;
+    });
+    let upload = ObjectUpload {
+        object_key: "N1A1.absent".into(),
+        total_bytes: 8192,
+        part_bytes: 4096,
+        parts: 2,
+        expires_at: 9_999_999_999,
+        durable: true,
+    };
+    assert_eq!(store.status(&upload, 0, 2).await.unwrap_err().status(), 404);
+    server.await.unwrap();
+    store.shutdown().await;
+}
+
+#[tokio::test]
 async fn download_reconnects_a_closed_idle_transport_before_forwarding_bytes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = client(&listener, 1);

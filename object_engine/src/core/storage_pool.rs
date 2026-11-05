@@ -495,6 +495,15 @@ impl Member {
             create,
             strict,
         )?;
+        #[cfg(test)]
+        if create
+            && std::env::var_os("N1_TEST_FAIL_STAGE_ALLOCATION")
+                .is_some_and(|path| std::path::Path::new(&path) == self.path)
+        {
+            // Exercise mkdir-success/file-allocation-failure without filling
+            // the operator's filesystem. Release binaries omit this hook.
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
+        }
         let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         if !create {
             let file = File::from(rfs::openat(&*dir, "shard.tmp", flags, Mode::empty())?);
@@ -524,6 +533,36 @@ impl Member {
             ));
         }
         Ok((Arc::new(file), new))
+    }
+
+    /// Reopen an existing, private staging inode for aligned payload writes.
+    /// Never create/truncate here: continuation cannot allocate an identity.
+    pub(crate) fn open_stage_direct(&self, fp: Fingerprint, expected: &File) -> Result<Arc<File>> {
+        let relative = fp.staging_path();
+        let path = Path::new(&relative);
+        let dir = self.directory(
+            path.parent().expect("generated staging parent"),
+            false,
+            false,
+        )?;
+        let file = File::from(rfs::openat(
+            &*dir,
+            "shard.tmp",
+            OFlags::WRONLY | OFlags::DIRECT | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let actual = file.metadata()?;
+        let expected = expected.metadata()?;
+        if !actual.is_file()
+            || actual.nlink() != 1
+            || actual.dev() != expected.dev()
+            || actual.ino() != expected.ino()
+        {
+            return Err(Error::Conflict(
+                "staged shard changed before direct I/O".into(),
+            ));
+        }
+        Ok(Arc::new(file))
     }
 
     pub fn persist_stage_parent(&self, fp: Fingerprint) -> Result<()> {
@@ -654,71 +693,6 @@ impl Member {
         source.sync_all()?;
         self.persist_final_parent(fp)?;
         self.retire_empty_stage(fp, true)
-    }
-
-    pub fn publish_retirement(
-        &self,
-        fp: Fingerprint,
-        record: n1_link::retirement::Retirement,
-    ) -> Result<()> {
-        self.publish_retirement_inner(fp, record, true)
-    }
-
-    /// The caller owns a filesystem group opened before mutation and must join
-    /// its barrier after publication, including partial publication failures.
-    /// File contents still reach stable storage before the atomic rename.
-    pub(crate) fn publish_retirement_grouped(
-        &self,
-        fp: Fingerprint,
-        record: n1_link::retirement::Retirement,
-    ) -> Result<()> {
-        self.publish_retirement_inner(fp, record, false)
-    }
-
-    fn publish_retirement_inner(
-        &self,
-        fp: Fingerprint,
-        record: n1_link::retirement::Retirement,
-        strict_directories: bool,
-    ) -> Result<()> {
-        let dir = self.directory(
-            Path::new(&format!(".uploads/{fp}")),
-            true,
-            strict_directories,
-        )?;
-        // This fixed private name is protected by the object's write owner.
-        // Unlinking a stale temporary never follows a symlink or removes data.
-        match rfs::unlinkat(&*dir, "retire.tmp", AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let mut file = File::from(rfs::openat(
-            &*dir,
-            "retire.tmp",
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )?);
-        file.write_all(&record.encode(fp))?;
-        file.sync_all()?;
-        let final_path = fp.shard_path(record.shard);
-        let path = Path::new(&final_path);
-        let dest = self.directory(
-            path.parent().expect("generated fanout"),
-            true,
-            strict_directories,
-        )?;
-        rfs::renameat(
-            &*dir,
-            "retire.tmp",
-            &*dest,
-            path.file_name().expect("generated filename"),
-        )?;
-        if strict_directories {
-            dest.sync_all()?;
-            dir.sync_all()?;
-            self.persist_final_parent(fp)?;
-        }
-        Ok(())
     }
 }
 

@@ -1,6 +1,5 @@
 use n1_link::{
     Durability, Fingerprint, Identity, KeySigner, ObjectKey, PoolId, PoolLayout, UploadPlan,
-    UploadTicket,
 };
 
 fn fixture() -> serde_json::Value {
@@ -49,7 +48,7 @@ fn signer_scope() -> (KeySigner, [u8; 16]) {
 }
 
 #[test]
-fn independent_python_identity_and_placement_vectors() {
+fn canonical_identity_and_placement_vectors() {
     let f = fixture();
     let i = identity();
     let p = pool();
@@ -74,36 +73,33 @@ fn independent_python_identity_and_placement_vectors() {
 }
 
 #[test]
-fn independent_python_authenticated_key_vectors() {
+fn canonical_authenticated_key_vectors() {
     let f = fixture();
     let (signer, scope) = signer_scope();
     let object = signer.object_key(&scope, identity());
-    let ticket = signer.upload_ticket(&scope, plan());
     assert_eq!(object.as_str(), f["object_key"].as_str().unwrap());
-    assert_eq!(ticket.as_str(), f["upload_ticket"].as_str().unwrap());
     assert_eq!(
         signer.verify_object(&scope, object.as_str()).unwrap(),
         identity()
-    );
-    assert_eq!(
-        signer.verify_upload(&scope, ticket.as_str()).unwrap(),
-        plan()
     );
 }
 
 #[test]
 fn multipart_parameters_never_change_object_identity() {
     let (signer, scope) = signer_scope();
-    for size in [0, 1, 12288, 24577, 1 << 40] {
+    for size in [0_u64, 1, 12288, 24577, 1 << 40] {
+        // Keep every fixture within the supported part-count bound, including
+        // the TiB case, while varying geometry independently of identity.
         for part in [12288, 24576, 12288 * 100] {
+            let minimum = size.div_ceil(16_777_216).div_ceil(12288) * 12288;
+            let part = part.max(minimum);
             let upload = UploadPlan {
                 total_bytes: size,
                 part_bytes: part,
                 ..plan()
             };
-            let encoded = signer.upload_ticket(&scope, upload);
-            let decoded = signer.verify_upload(&scope, encoded.as_str()).unwrap();
-            let object = signer.object_key(&scope, decoded.identity);
+            upload.validate(&pool()).unwrap();
+            let object = signer.object_key(&scope, upload.identity);
             assert_eq!(
                 ObjectKey::inspect(object.as_str()).unwrap().fingerprint(),
                 identity().fingerprint()
@@ -116,20 +112,19 @@ fn multipart_parameters_never_change_object_identity() {
 fn every_encoded_byte_is_authenticated_and_fragment_scoped() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let (signer, scope) = signer_scope();
-    let ticket = signer.upload_ticket(&scope, plan());
-    let raw = URL_SAFE_NO_PAD.decode(&ticket.as_str()[5..]).unwrap();
+    let object = signer.object_key(&scope, identity());
+    let raw = URL_SAFE_NO_PAD.decode(&object.as_str()[5..]).unwrap();
     for index in 0..raw.len() {
         let mut altered = raw.clone();
         altered[index] ^= 1;
-        let forged = format!("N1U1.{}", URL_SAFE_NO_PAD.encode(altered));
+        let forged = format!("N1A1.{}", URL_SAFE_NO_PAD.encode(altered));
         assert!(
-            signer.verify_upload(&scope, &forged).is_err(),
+            signer.verify_object(&scope, &forged).is_err(),
             "byte {index}"
         );
     }
     let mut wrong_scope = scope;
     wrong_scope[0] ^= 1;
-    assert!(signer.verify_upload(&wrong_scope, ticket.as_str()).is_err());
     let object = signer.object_key(&scope, identity());
     assert!(signer.verify_object(&wrong_scope, object.as_str()).is_err());
     assert!(
@@ -137,8 +132,6 @@ fn every_encoded_byte_is_authenticated_and_fragment_scoped() {
             .verify_object(&scope, object.as_str())
             .is_err()
     );
-    assert!(signer.verify_object(&scope, ticket.as_str()).is_err());
-    assert!(signer.verify_upload(&scope, object.as_str()).is_err());
 }
 
 #[test]
@@ -152,7 +145,6 @@ fn malformed_and_noncanonical_keys_are_rejected_without_allocation_growth() {
         assert!(ObjectKey::inspect(&format!("{}{suffix}", key.as_str())).is_err());
     }
     assert!(ObjectKey::inspect(&"A".repeat(1024 * 1024)).is_err());
-    assert!(UploadTicket::inspect(key.as_str()).is_err());
     for len in 0..120 {
         assert!(Identity::decode(&vec![0; len]).is_err());
     }

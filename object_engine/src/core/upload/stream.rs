@@ -7,7 +7,7 @@ use crate::core::{
     io_scheduler::IoProgress,
     linux_io,
     storage_pool::Pool,
-    store::{ShardFile, collect},
+    store::{ShardFile, blocking, collect},
 };
 use n1_link::{Fingerprint, UploadPlan, shard};
 use sha2::{Digest, Sha256};
@@ -96,11 +96,19 @@ impl<R: AsyncRead + Unpin> Encoder<'_, R> {
     }
 }
 
-async fn write(files: &[ShardFile], group: Group) -> Result<Vec<Vec<u8>>> {
+async fn write(
+    files: &[ShardFile],
+    group: Group,
+    direct: &mut [Option<super::direct::Writer>],
+) -> Result<Vec<Vec<u8>>> {
     collect(
-        futures_util::future::join_all(files.iter().zip(group.records).map(
-            |(file, mut record)| async move {
+        futures_util::future::join_all(files.iter().zip(group.records).zip(direct).map(
+            |((file, mut record), direct)| async move {
                 if file.finalized {
+                    return Ok(record);
+                }
+                if let Some(writer) = direct {
+                    writer.write(&record).await?;
                     return Ok(record);
                 }
                 let offset = file.header.frame_offset(group.stripes.start)?;
@@ -118,8 +126,7 @@ async fn write(files: &[ShardFile], group: Group) -> Result<Vec<Vec<u8>>> {
                 };
                 if length.saturating_sub(sparse) >= 4096 {
                     record.truncate(sparse);
-                    // Positioned extension cannot shrink a concurrently written
-                    // later multipart range, unlike ftruncate.
+                    // Positioned tail writes preserve other multipart ranges.
                     let (prefix, tail) = tokio::join!(
                         linux_io::write_owned_at_async(file.file.clone(), record, offset),
                         linux_io::write_at_async(
@@ -151,6 +158,34 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
     progress: &IoProgress,
     writer_buffer_size: usize,
 ) -> Result<[u8; 32]> {
+    // Preserve first-payload capacity admission without treating Begin's tiny
+    // persisted headers as a reservation for the entire declared object.
+    collect(
+        futures_util::future::join_all(
+            files
+                .iter()
+                .filter(|file| !file.finalized && file.readable_bytes == 128)
+                .map(|file| {
+                    let member = file.member.clone();
+                    let required = file.header.file_bytes();
+                    let file = file.file.clone();
+                    blocking(move || {
+                        let length = required?;
+                        member.check_capacity(length)?;
+                        // Sparse extension fixes the immutable shard's logical
+                        // end before payload writes. This prevents speculative
+                        // allocation beyond EOF without reserving disk blocks
+                        // or flushing a large dirty file with a final truncate.
+                        // Every writer uses the same length; this never shrinks
+                        // another multipart range. Holes are still missing
+                        // frames until their identity/checksum validates.
+                        file.set_len(length)?;
+                        Ok(())
+                    })
+                }),
+        )
+        .await,
+    )?;
     let mut encoder = Encoder {
         pool,
         files,
@@ -170,6 +205,12 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
         (writer_buffer_size / pool.layout.block_bytes as usize).clamp(1, BUFFERED_STRIPES as usize)
             as u64
     };
+    let mut direct = if plan.total_bytes >= super::direct::MIN_DIRECT_BYTES && !stripes.is_empty() {
+        super::direct::Writer::open(files, plan.identity.fingerprint(), stripes.start, buffered)
+            .await?
+    } else {
+        (0..files.len()).map(|_| None).collect()
+    };
     let mut groups = (stripes.start..stripes.end)
         .step_by(buffered as usize)
         .map(|start| start..(start + buffered).min(stripes.end));
@@ -179,7 +220,7 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
             let completed_bytes = current.source_bytes;
             let (written, prepared) = tokio::join!(biased;
                 async {
-                    let written = write(files, current).await;
+                    let written = write(files, current, &mut direct).await;
                     if written.is_ok() { progress.record(completed_bytes); }
                     written
                 }, encoder.prepare(group, spare));
@@ -188,9 +229,13 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
             current = prepared?;
         }
         let bytes = current.source_bytes;
-        write(files, current).await?;
+        write(files, current, &mut direct).await?;
         progress.record(bytes);
     }
+    collect(
+        futures_util::future::join_all(direct.iter_mut().flatten().map(|writer| writer.finish()))
+            .await,
+    )?;
     if encoder.remaining != 0 {
         return Err(Error::Invalid("multipart body length mismatch".into()));
     }

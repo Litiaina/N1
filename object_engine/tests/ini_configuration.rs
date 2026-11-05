@@ -13,7 +13,12 @@ use std::{
 use tokio::net::TcpListener;
 
 const SECRET: &str = "ini-functional-object-credential";
+// Fixtures intentionally stop and rebind their configured ports. Keep those
+// port lifetimes separate: a concurrent fixture can otherwise select a port
+// during another fixture's restart gap and satisfy the wrong readiness probe.
+static FIXTURE_PORTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Fixture {
+    _port_guard: tokio::sync::MutexGuard<'static, ()>,
     _root: tempfile::TempDir,
     root: PathBuf,
     ini: PathBuf,
@@ -37,6 +42,7 @@ async fn port() -> u16 {
 }
 impl Fixture {
     async fn new() -> Self {
+        let port_guard = FIXTURE_PORTS.lock().await;
         let mut builder = tempfile::Builder::new();
         builder.permissions(fs::Permissions::from_mode(0o700));
         let directory = match std::env::var_os("N1_INI_TEST_HDD_ROOT") {
@@ -67,6 +73,7 @@ impl Fixture {
         write!(env,"JWT_SECRET='test-jwt#quoted' # inline comment\nAUTH_KEY='{SECRET}'\nMASTER_KEY=test-master\nADMIN_KEY=test-admin\nACCESS_TOKEN_DEFAULT_TTL_SECS=120\nACCESS_TOKEN_MAX_TTL_SECS=300\nREFRESH_TOKEN_TTL_SECS=600\n").unwrap();
         env.sync_all().unwrap();
         Self {
+            _port_guard: port_guard,
             _root: directory,
             root,
             ini,
@@ -174,7 +181,7 @@ async fn put(client: &mut N1NativeClient, mut bytes: &[u8]) -> Value {
         .unwrap();
     client
         .put(
-            result["upload_key"].as_str().unwrap().into(),
+            result["object_key"].as_str().unwrap().into(),
             bytes.len() as u64,
             &mut bytes,
         )
@@ -210,16 +217,21 @@ async fn optional_size_cap_changes_policy_without_changing_identity_or_part_limi
     let server = f.start("127.0.0.1", f.native).await;
     let mut client = f.client("127.0.0.1", f.native, false).await;
     let upload = client.control(init()).await.unwrap().result.unwrap();
-    let ticket = upload["upload_key"].as_str().unwrap();
+    let ticket = upload["object_key"].as_str().unwrap();
     for (index, mut part) in bytes.chunks(16384).enumerate() {
         client
-            .upload_part(ticket.into(), index as u64, part.len() as u64, &mut part)
+            .write_at(
+                ticket.into(),
+                index as u64 * 16384,
+                part.len() as u64,
+                &mut part,
+            )
             .await
             .unwrap();
     }
     client
         .control(Command::UploadFinalize {
-            upload_key: ticket.into(),
+            object_key: ticket.into(),
         })
         .await
         .unwrap();
@@ -248,8 +260,8 @@ async fn optional_size_cap_changes_policy_without_changing_identity_or_part_limi
         .unwrap();
     assert!(
         client
-            .upload_part(
-                oversized["upload_key"].as_str().unwrap().into(),
+            .write_at(
+                oversized["object_key"].as_str().unwrap().into(),
                 0,
                 16385,
                 &mut &vec![0; 16385][..]
@@ -874,6 +886,7 @@ async fn signing_bootstrap_intent_recovers_only_the_exact_saved_key() {
     assert!(source.run("init").status.success());
     let key = fs::read(source.root.join("control/link.signing-key")).unwrap();
     let mut intent = source.registry();
+    drop(source);
     let f = Fixture::new().await;
     fs::DirBuilder::new()
         .mode(0o700)
@@ -1003,8 +1016,8 @@ async fn physical_ini_pool_expansion_and_scheduled_staging_gc_preserve_old_keys(
         .result
         .unwrap();
     client
-        .upload_part(
-            pending["upload_key"].as_str().unwrap().into(),
+        .write_at(
+            pending["object_key"].as_str().unwrap().into(),
             0,
             4096,
             &mut vec![4u8; 4096].as_slice(),
@@ -1016,7 +1029,7 @@ async fn physical_ini_pool_expansion_and_scheduled_staging_gc_preserve_old_keys(
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Err(n1_native_client::NativeClientError::Native { code, .. }) = client
             .control(Command::UploadStatus {
-                upload_key: pending["upload_key"].as_str().unwrap().into(),
+                object_key: pending["object_key"].as_str().unwrap().into(),
                 start: 0,
                 limit: 1,
             })

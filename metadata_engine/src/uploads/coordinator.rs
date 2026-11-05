@@ -485,7 +485,7 @@ async fn status_locked(
                     // native operation completed its durability barrier. Keep
                     // only durable ACKs that still pass actual reconstruction;
                     // uncertain parts are safely retransmitted with the same
-                    // immutable ticket rather than promoted into new ACKs.
+                    // LINK key rather than promoted into new ACKs.
                     let acknowledged =
                         super::progress::uploaded(&db.snapshot(), fragment, &version, expected)?;
                     let retained = acknowledged

@@ -27,38 +27,39 @@ Staging path: `<root>/.uploads/<fingerprint>/shard.tmp`.
 The fingerprint allows physical maintenance to derive peers without recovering
 the original key. There is no key catalogue or placement record.
 
-## Tickets, final keys and fragment authorization
+## One LINK key and fragment authorization
 
-Object key: `N1A1.` followed by unpadded canonical base64url of identity || tag.
+The object key is `N1A1.` followed by unpadded canonical base64url of identity || tag.
 The tag is the first 16 bytes of HMAC-SHA256(service signing secret,
 `Litiaina/LINK/object-key/v1\0` || stable fragment ID || identity).
-Fragment IDs are exactly 16 opaque bytes. Renaming a display alias or rotating a
-fragment credential does not change the stable ID or the service signing secret.
-The secret is service configuration, not a per-object file. Preserve it for
-restore; losing it prevents key validation. It must not appear in logs.
+Fragment IDs are exactly 16 opaque bytes. Display-name and credential changes
+preserve this ID. The shared signing secret is protected service configuration,
+never a per-object record. Preserve it independently for recovery.
 
-An upload plan is identity || total_bytes:u64be || part_bytes:u64be ||
-expires_at_unix_seconds:u64be || durability:u8 (0 standard, 1 durable).
-Upload ticket: `N1U1.` + unpadded canonical base64url(plan || tag), authenticated
-using domain `Litiaina/LINK/upload-ticket/v1\0` and the same stable fragment ID.
-The tag covers every plan byte. Constant-time tag verification precedes use.
-Object-key and ticket domains are distinct. Exact lengths, version, reserved
-bits and canonical encoding are required. Prefixes/tags/parameters never enter
-the fingerprint. Finalization copies the identity; it does not generate a token.
+Begin generates a fresh random identity and writes a 128-byte incomplete shard
+header on every member before returning this key. This acknowledges allocation;
+an unused allocation may disappear on power loss. The first durable part persists
+its header, payload and complete staging ancestry before acknowledgement. Normal
+PUT, batch and finalization also persist the header with durable publication.
+The same key addresses writes,
+status, finalize, reads and purge. There is no separate upload ticket. Geometry,
+size, durability and staging expiry reside in the immutable shard headers;
+progress belongs to metadata or the standalone client. None enters placement.
 
-Part numbers are zero-based. Part size must be a positive multiple of K times
-block size. The final part may be short; a zero-length object has no parts.
-All offset arithmetic is checked before allocation or filesystem operations.
+Continuation takes the key, byte offset and bytes. Offset must align to the
+immutable part size, a positive multiple of K times block size. The final part
+may be short; empty objects have no parts. Continuation only opens existing
+files. Only Begin can create a fresh identity; callers cannot ask Begin to
+reuse an old key. All offset arithmetic is checked before allocation or I/O.
 Authentication is separate from address inspection: clients can compute paths
-without possessing the service signing secret, but cannot forge another
-fragment's valid object key or alter authenticated upload parameters.
+without the signing secret, but cannot forge another fragment's valid key.
 
 ## Shard bytes and immutable integrity profiles
 
 Newly enrolled pools use `shard_format: "crc32c-sha256-v2"`. An existing pool
 with no field means exactly `sha256-v1`; this default must never change. The
 profile is part of the immutable pool marker and cannot be changed in place.
-LINK identity, placement, key/ticket encodings and file offsets are unchanged.
+LINK identity, placement, key encoding and file offsets are unchanged.
 The original `sha256-v1` encoding is specified first below.
 
 No object key, original filename, namespace, version history or path list is
@@ -114,10 +115,17 @@ frame CRC alone never authorizes returning source bytes.
 Seal magic is `N1LEND02` and seal domain is `Litiaina/LINK/shard-seal/v2\0`.
 Part/object root construction remains SHA-256 with the respective `/v2\0`
 domains; the reported algorithm is `LINK-SHA256-tree-v2`. Header/seal/identity
-hashes, object-key authentication and permanent retirement encoding stay strong
+hashes and object-key authentication stay strong
 and independent of the frame CRC. No new sidecar or index is introduced.
 
 ## Lifecycle guarantees
+
+I/O mode does not change these bytes or offsets. Large uploads use aligned
+`O_DIRECT` for complete interior pages and buffered writes only at each part's
+unaligned ends. Carrying a partial page between encoder groups avoids changing
+the format or overwriting neighboring parts. Small objects remain buffered.
+Both descriptors refer to the same existing inode, and the same persistence
+barriers govern acknowledgement.
 
 Durable part acknowledgement requires completed writes and persistence on all
 N members, including the staging organizers. Standard mode offers weaker
@@ -132,42 +140,32 @@ resolves the same identity and continues partial promotion. Reads require a
 matching finalized layout and enough verified fragments for each requested
 stripe; they never expose unchecked decoded bytes.
 
-Deletion permanently retires the identity, including identities whose upload has
-not started. The user explicitly chose durable deletion state: an old upload
-ticket must never recreate a successfully deleted key. Normal uploads add no
-sidecar or lookup index. A 96-byte terminal record replaces the payload at each
-existing calculated shard path; these records are never garbage-collected.
+Purge unlinks incomplete shards, repair temporaries and finalized shards on all
+N members and removes the per-identity staging directories. Success requires
+all workers to finish and filesystem persistence barriers to succeed. No
+terminal file, receipt, tombstone or permanent deletion index is written.
+Repeated purge succeeds with zero removals when the identity is already absent.
+Old continuation, finalize, status and GET then return Not Found (404); none can
+recreate the identity. Shared fanout directory count is bounded by the fixed
+address fanout; their allocated blocks follow filesystem behavior.
 
-Deletion has two durable phases. First all N paths become `Retiring` records;
-only after every path is terminal and staging payload is removed may any path
-become a completed `Retired` certificate. Every member worker is joined before
-advancing. A valid completed certificate therefore proves the terminal barrier
-was reached on all members. Any observed completed certificate returns HTTP/NOA
-410. Without a completed certificate, any `Retiring` record returns 503 and
-requires retrying deletion. Losing a member never restores live visibility after
-acknowledged retirement. Missing members prevent completing deletion.
+Purge is not a cross-filesystem atomic transaction. A crash after three removals
+in a 3+1 pool can leave one finalized shard. That is an unacknowledged purge;
+one shard is insufficient for K=3. With K surviving verified shards the data
+can still be readable or repairable: absence alone cannot distinguish an
+interrupted purge from member loss. Metadata retains a durable reclamation claim
+and LINK key until purge acknowledgement, fences named recovery/publication,
+and retries after restart. A standalone caller must retain and retry its own
+unacknowledged deletion. Object startup never guesses deletion intent from a
+surviving shard. No autonomous revocation after an unacknowledged call is promised.
 
-Terminal format: magic `N1LDEL01` (8 bytes), version:u8=1, phase:u8 (1 retiring,
-2 retired), shard:u16be, four reserved zeros, operation nonce:16, timestamp:u64be,
-24 reserved zeros, SHA256:32. SHA256 binds
-`Litiaina/LINK/retirement/v1\0` || fingerprint || first 64 bytes.
-The nonce is an operation identifier, not an object key. The same strict
-fingerprint, slot and byte validation applies to terminal and live files.
+## Recovery
 
-Active delete, repair, GC, promotion and part retries coordinate and retain
-ownership until all admitted I/O has drained after cancellation. TTL alone cannot
-authorize removal of a readable final object or a terminal record. Recovery
-repositories preserve terminal records alongside live shard files; restoring payload from
-an older point also preserves known retirement records from the targets and all
-available points in that repository. It must not revive a known deleted key.
-Retirement information that never reached any surviving recovery copy cannot be
-reconstructed from an older payload backup; retain current recovery points.
-
-Backup and replication records belong to their recovery repositories, outside
-the foreground object representation. Backup must preserve pool identity,
-generation, geometry, slots and service configuration needed to validate keys.
-Online capture must coordinate with publication/deletion/GC; raw live copying
-does not establish a consistent recovery point.
+Recovery captures the exact selected point. Restoring an older point is an
+explicit rollback and can restore data purged later. No terminal overlays or
+permanent deletion witnesses exist. Coordinate metadata and object recovery
+points operationally. Retention preserves protected points and refuses removal
+of the final point, without maintaining per-object deletion history.
 
 ## Conformance
 

@@ -84,21 +84,21 @@ pub enum Command {
         ttl_seconds: u64,
     },
     #[serde(rename = "upload.part")]
-    UploadPart { upload_key: String, part: u64 },
+    UploadPart { object_key: String, offset: u64 },
     #[serde(rename = "upload.put")]
-    UploadPut { upload_key: String },
+    UploadPut { object_key: String },
     #[serde(rename = "upload.batch")]
-    UploadBatch { upload_keys: Vec<String> },
+    UploadBatch { object_keys: Vec<String> },
     #[serde(rename = "upload.status")]
     UploadStatus {
-        upload_key: String,
+        object_key: String,
         start: u64,
         limit: u64,
     },
     #[serde(rename = "upload.finalize")]
-    UploadFinalize { upload_key: String },
+    UploadFinalize { object_key: String },
     #[serde(rename = "upload.cancel")]
-    UploadCancel { upload_key: String },
+    UploadCancel { object_key: String },
     #[serde(rename = "object.stat")]
     ObjectStat { object_key: String },
     #[serde(rename = "object.get")]

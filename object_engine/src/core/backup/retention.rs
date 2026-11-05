@@ -34,7 +34,6 @@ pub fn prune(repo: &Repository, keep_last: usize, protect: &str) -> Result<()> {
         .map(|Reverse((_, id))| id)
         .collect::<HashSet<_>>();
     retained.insert(protect.to_owned());
-    super::retention_guard::check(repo, |id| retained.contains(id))?;
     repo.walk_snapshots(|point| {
         if !retained.contains(&point.id) {
             forget_verified(repo, &point.id)?;
@@ -56,7 +55,6 @@ pub fn forget(repo: &Repository, id: &str) -> Result<()> {
     if count < 2 {
         return Err(invalid("refusing to remove the last recovery point"));
     }
-    super::retention_guard::check(repo, |other| other != id)?;
     forget_verified(repo, id)
 }
 fn forget_verified(repo: &Repository, id: &str) -> Result<()> {

@@ -5,7 +5,6 @@ use super::*;
 use crate::core::{
     Error as ObjectError,
     backup::restore::{FileKind, allowed_path},
-    delete::inspect_retirement,
     download::{OpenObject, decode_stripe_strict},
     ec::StripeCodec,
     store::{ShardFile, working_bytes},
@@ -13,7 +12,6 @@ use crate::core::{
 use crate::settings::config::ConfiguredPool;
 use n1_link::{
     Fingerprint,
-    retirement::{Phase, Retirement},
     shard::{self, ShardHeader},
 };
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
@@ -131,7 +129,7 @@ pub(super) async fn replace(
                 .to_str()
                 .ok_or_else(|| invalid("non-UTF8 member path"))?;
             let fp = match allowed_path(rel, &member.marker, true)? {
-                Some(FileKind::Final(fp, _) | FileKind::Retirement(fp, _)) => fp,
+                Some(FileKind::Final(fp, _)) => fp,
                 Some(FileKind::Staged(fp, _)) if rel.ends_with("/shard.tmp") => fp,
                 _ => continue,
             };
@@ -182,29 +180,6 @@ fn optional_read(member: &Member, path: &str) -> Result<Option<Arc<File>>> {
         Err(ObjectError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
-}
-
-// A terminal or private deletion intent takes precedence over old payload.
-// Retiring remains Retiring; reconstruction never manufactures a completed
-// deletion certificate from incomplete retirement intent.
-fn retirement(pool: &Pool, fp: Fingerprint, target_shard: u16) -> Result<Option<Retirement>> {
-    let mut found: Option<Retirement> = None;
-    for member in pool.members.iter().flatten() {
-        let shard = pool.layout.shard_at_slot(fp, member.marker.slot)?;
-        for path in [fp.shard_path(shard), format!(".uploads/{fp}/retire.tmp")] {
-            if let Some(file) = optional_read(member, &path)? {
-                if let Some(mut record) = inspect_retirement(&file, fp, shard)? {
-                    record.shard = target_shard;
-                    if found.is_none_or(|old| old.phase != Phase::Retired) {
-                        found = Some(record);
-                    }
-                } else if path.ends_with("/retire.tmp") {
-                    return Err(invalid("invalid private retirement intent"));
-                }
-            }
-        }
-    }
-    Ok(found)
 }
 
 fn input(pool: &Pool, fp: Fingerprint, target_shard: u16) -> Result<Option<(OpenObject, bool)>> {
@@ -311,15 +286,9 @@ async fn rebuild(
     report: &mut Report,
 ) -> Result<()> {
     let shard_index = pool.layout.shard_at_slot(fp, slot)?;
-    let terminal = retirement(pool, fp, shard_index)?;
-    let inputs = if terminal.is_none() {
-        input(pool, fp, shard_index)?
-    } else {
-        None
-    };
-    if terminal.is_none() && inputs.is_none() {
+    let Some(inputs) = input(pool, fp, shard_index)? else {
         return Ok(());
-    }
+    };
     let temporary = Path::new(WORK).join(format!("rebuild-{fp}"));
     let parent = pinned.parent(&temporary, true)?;
     let name = temporary
@@ -339,13 +308,8 @@ async fn rebuild(
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )?));
-    let relative = if let Some(record) = terminal {
-        crate::core::linux_io::write_at_async(output.clone(), record.encode(fp).to_vec(), 0)
-            .await?;
-        report.preserved_retirements += 1;
-        fp.shard_path(shard_index)
-    } else {
-        let (object, finalized) = inputs.ok_or_else(|| invalid("missing rebuild inputs"))?;
+    let relative = {
+        let (object, finalized) = inputs;
         crate::core::linux_io::write_at_async(output.clone(), object.header.encode(fp).to_vec(), 0)
             .await?;
         let mut object_hash = shard::object_hasher(
@@ -353,7 +317,7 @@ async fn rebuild(
             object.header.total_bytes,
             object.header.part_bytes,
         );
-        // A ticket may describe a huge upload that never supplied any frames.
+        // A header may describe a huge upload that never supplied any frames.
         // Its unwritten tail is not work proportional to the declared size.
         let stripes = if finalized {
             object.header.stripes()
@@ -520,11 +484,12 @@ mod tests {
                 Durability::Durable,
                 3600,
             )
+            .await
             .unwrap();
         store
             .put(
                 SCOPE,
-                upload.upload_key.clone(),
+                upload.object_key.clone(),
                 std::io::Cursor::new(data.to_vec()),
             )
             .await
@@ -558,11 +523,12 @@ mod tests {
             store.delete(SCOPE, dead.object_key.clone()).await.unwrap();
             let pending = store
                 .init(SCOPE, 0, 36864, 12288, Durability::Durable, 3600)
+                .await
                 .unwrap();
             store
                 .write_part(
                     SCOPE,
-                    pending.upload_key.clone(),
+                    pending.object_key.clone(),
                     1,
                     std::io::Cursor::new(vec![41; 12288]),
                 )
@@ -598,7 +564,6 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(report.reconstructed_shards, 3); // live, empty, private
-            assert_eq!(report.preserved_retirements, 1);
             assert!(report.unrecoverable_private_stripes >= 2);
             assert!(!target.join(RESTORE_PENDING).exists());
             assert!(!target.join(WORK).exists());
@@ -615,7 +580,7 @@ mod tests {
             recovered.configure_read_repair(false);
             assert_eq!(
                 recovered
-                    .download(SCOPE, live.object_key, 0, None, Vec::new())
+                    .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
                     .await
                     .unwrap()
                     .0,
@@ -623,22 +588,22 @@ mod tests {
             );
             assert!(
                 recovered
-                    .download(SCOPE, empty.object_key, 0, None, Vec::new())
+                    .download(SCOPE, empty.object_key.clone(), 0, None, Vec::new())
                     .await
                     .unwrap()
                     .0
                     .is_empty()
             );
             assert!(matches!(
-                recovered.stat(SCOPE, dead.object_key).await,
-                Err(ObjectError::Retired)
+                recovered.stat(SCOPE, dead.object_key.clone()).await,
+                Err(ObjectError::NotFound)
             ));
             assert!(matches!(
-                recovered.finalize(SCOPE, dead.upload_key).await,
-                Err(ObjectError::Retired)
+                recovered.finalize(SCOPE, dead.object_key.clone()).await,
+                Err(ObjectError::NotFound)
             ));
             let status = recovered
-                .upload_status(SCOPE, pending.upload_key.clone(), 0, 16)
+                .upload_status(SCOPE, pending.object_key.clone(), 0, 16)
                 .await
                 .unwrap();
             assert_eq!(status.parts, 3);
@@ -647,7 +612,7 @@ mod tests {
                 recovered
                     .write_part(
                         SCOPE,
-                        pending.upload_key.clone(),
+                        pending.object_key.clone(),
                         part,
                         std::io::Cursor::new(vec![40 + part as u8; 12288]),
                     )
@@ -655,14 +620,17 @@ mod tests {
                     .unwrap();
             }
             recovered
-                .finalize(SCOPE, pending.upload_key.clone())
+                .finalize(SCOPE, pending.object_key.clone())
                 .await
                 .unwrap();
-            recovered.finalize(SCOPE, pending.upload_key).await.unwrap();
+            recovered
+                .finalize(SCOPE, pending.object_key.clone())
+                .await
+                .unwrap();
             let expected = [vec![40; 12288], vec![41; 12288], vec![42; 12288]].concat();
             assert_eq!(
                 recovered
-                    .download(SCOPE, pending.object_key, 0, None, Vec::new())
+                    .download(SCOPE, pending.object_key.clone(), 0, None, Vec::new())
                     .await
                     .unwrap()
                     .0,
@@ -746,7 +714,7 @@ mod tests {
         let recovered = Store::new(vec![rebuilt], [17; 32], 16).unwrap();
         assert_eq!(
             recovered
-                .download(SCOPE, live.object_key, 0, None, Vec::new())
+                .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
                 .await
                 .unwrap()
                 .0,
@@ -759,20 +727,26 @@ mod tests {
         for near_end in [false, true] {
             let f = Fixture::new();
             let store = f.enroll();
-            let pending = store
-                .init(
-                    SCOPE,
-                    0,
-                    1_u64 << 40,
-                    12288 * 1024,
-                    Durability::Durable,
-                    3600,
-                )
-                .unwrap();
-            // Model already-existing private headers after a capacity change.
-            // Normal admission correctly refuses a TiB upload on this RAM fixture;
-            // no payload allocation or product capacity bypass is needed here.
-            let plan = store.inspect_upload(SCOPE, &pending.upload_key).unwrap();
+            // Model existing sparse private headers and an optional written
+            // tail. This fixture exercises replacement independently of upload
+            // admission and allocates no TiB payload or product capacity bypass.
+            let plan = n1_link::UploadPlan {
+                identity: n1_link::Identity {
+                    pool: f.layout.id,
+                    generation: f.layout.generation,
+                    token: [u8::from(near_end); 32],
+                },
+                total_bytes: 1_u64 << 40,
+                part_bytes: 12288 * 1024,
+                durability: Durability::Durable,
+                expires_at: crate::core::store::now() + 3600,
+            };
+            plan.validate(&f.layout).unwrap();
+            let object_key = store
+                .signer
+                .object_key(&SCOPE, plan.identity)
+                .as_str()
+                .to_owned();
             let fp = plan.identity.fingerprint();
             let header = ShardHeader::new(&f.layout, plan, 0).unwrap();
             let last = header.stripes() - 1;
@@ -810,7 +784,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert!(report.unrecoverable_private_stripes > 1_000_000);
-            let fp = n1_link::ObjectKey::inspect(&pending.object_key)
+            let fp = n1_link::ObjectKey::inspect(&object_key)
                 .unwrap()
                 .fingerprint();
             assert_eq!(
@@ -840,7 +814,7 @@ mod tests {
             )
             .unwrap();
             let status = recovered
-                .upload_status(SCOPE, pending.upload_key, 0, 4)
+                .upload_status(SCOPE, object_key, 0, 4)
                 .await
                 .unwrap();
             assert_eq!(status.missing_parts, vec![0, 1, 2, 3]);
@@ -855,7 +829,8 @@ mod tests {
         let bytes = vec![43; 37001];
         let live = put(&store, &bytes).await;
         let fp = store
-            .inspect_upload(SCOPE, &live.upload_key)
+            .inspect_upload(SCOPE, &live.object_key.clone())
+            .await
             .unwrap()
             .identity
             .fingerprint();
@@ -910,19 +885,22 @@ mod tests {
                 .is_err()
         );
         let status = recovered
-            .upload_status(SCOPE, live.upload_key.clone(), 0, 16)
+            .upload_status(SCOPE, live.object_key.clone(), 0, 16)
             .await
             .unwrap();
         assert!(!status.finalized);
         assert!(status.missing_parts.is_empty());
         recovered
-            .finalize(SCOPE, live.upload_key.clone())
+            .finalize(SCOPE, live.object_key.clone())
             .await
             .unwrap();
-        recovered.finalize(SCOPE, live.upload_key).await.unwrap();
+        recovered
+            .finalize(SCOPE, live.object_key.clone())
+            .await
+            .unwrap();
         assert_eq!(
             recovered
-                .download(SCOPE, live.object_key, 0, None, Vec::new())
+                .download(SCOPE, live.object_key.clone(), 0, None, Vec::new())
                 .await
                 .unwrap()
                 .0,
@@ -937,7 +915,8 @@ mod tests {
         let store = f.enroll();
         let live = put(&store, &[32; 37001]).await;
         let fp = store
-            .inspect_upload(SCOPE, &live.upload_key)
+            .inspect_upload(SCOPE, &live.object_key.clone())
+            .await
             .unwrap()
             .identity
             .fingerprint();
@@ -974,71 +953,5 @@ mod tests {
         assert_eq!(digest(&source).unwrap(), corrupted);
         assert!(!target.join(".n1-arc-pool.json").exists());
         assert!(Pool::reopen_fixture(f.layout.clone(), &c.pools[0].roots).is_err());
-    }
-
-    #[tokio::test]
-    async fn partial_retirement_never_becomes_a_completed_certificate_or_payload() {
-        let f = Fixture::new();
-        let store = f.enroll();
-        let live = put(&store, &[61; 9000]).await;
-        let fp = store
-            .inspect_upload(SCOPE, &live.upload_key)
-            .unwrap()
-            .identity
-            .fingerprint();
-        let target_slot = 0;
-        let surviving_slot = 1;
-        let shard = f.layout.shard_at_slot(fp, surviving_slot).unwrap();
-        let source = store.pools[0].members[surviving_slot].as_ref().unwrap();
-        let intent = Retirement {
-            phase: Phase::Retiring,
-            shard,
-            nonce: [43; 16],
-            timestamp: 1,
-        };
-        source.publish_retirement(fp, intent).unwrap();
-        let target = f.base.join("replacement");
-        fs::create_dir(&target).unwrap();
-        let c = config(&f, identities(&store), &target, target_slot);
-        c.ensure_state_root().unwrap();
-        drop(store);
-        let survivors = pool(&f, &c, target_slot);
-        replace(
-            &c,
-            &c.pools[0],
-            &survivors,
-            target_slot,
-            false,
-            false,
-            &mut Report::default(),
-        )
-        .await
-        .unwrap();
-        let index = f.layout.shard_at_slot(fp, target_slot).unwrap();
-        let bytes = fs::read(target.join(fp.shard_path(index))).unwrap();
-        assert_eq!(
-            Retirement::decode(&bytes, fp, index).unwrap().phase,
-            Phase::Retiring
-        );
-        drop(survivors);
-        let recovered = Store::new(
-            vec![Pool::reopen_fixture(f.layout.clone(), &c.pools[0].roots).unwrap()],
-            [17; 32],
-            16,
-        )
-        .unwrap();
-        assert!(matches!(
-            recovered.stat(SCOPE, live.object_key.clone()).await,
-            Err(ObjectError::Retiring)
-        ));
-        assert!(recovered.finalize(SCOPE, live.upload_key).await.is_err());
-        recovered
-            .delete(SCOPE, live.object_key.clone())
-            .await
-            .unwrap();
-        assert!(matches!(
-            recovered.stat(SCOPE, live.object_key).await,
-            Err(ObjectError::Retired)
-        ));
     }
 }

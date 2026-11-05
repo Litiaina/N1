@@ -3,7 +3,7 @@
 //! Run without --apply first, against a stopped database copy.
 use clap::Parser;
 use cli_core::{Credentials, Result, result};
-use n1_link::{ObjectKey, UploadTicket, noa::Command};
+use n1_link::{ObjectKey, noa::Command};
 use n1_metadata_engine::{
     Error, MetadataEngine, Options, RecordKey, Table, fragments, object_store::ObjectUpload,
 };
@@ -36,14 +36,11 @@ fn recoverable(pending: &Value, saved: &Value, now: u64) -> Result<ObjectUpload>
     }
     let upload: ObjectUpload = serde_json::from_value(pending["upload"].clone())?;
     if upload.expires_at <= now || upload.parts == 0 || upload.parts > 4096 {
-        return Err("ticket expired or exceeds this bounded recovery tool's part limit".into());
+        return Err("upload expired or exceeds this bounded recovery tool's part limit".into());
     }
-    let ticket = UploadTicket::inspect(&upload.upload_key)?;
-    if ticket.identity != ObjectKey::inspect(&upload.object_key)?
-        || ticket.total_bytes != upload.total_bytes
-        || ticket.part_bytes != upload.part_bytes
-        || ticket.parts() != upload.parts
-        || ticket.expires_at != upload.expires_at
+    ObjectKey::inspect(&upload.object_key)?;
+    if upload.part_bytes == 0
+        || upload.parts != upload.total_bytes.div_ceil(upload.part_bytes)
         || pending["handle"]["version_id"] != saved["handle"]["version_id"]
         || pending["handle"]["session_id"] != saved["handle"]["session_id"]
         || saved["handle"]["total_size_bytes"].as_u64() != Some(upload.total_bytes)
@@ -89,7 +86,7 @@ async fn main() -> Result<()> {
     let status = result(
         native
             .control(Command::UploadStatus {
-                upload_key: upload.upload_key.clone(),
+                object_key: upload.object_key.clone(),
                 start: 0,
                 limit: 4096,
             })
@@ -154,41 +151,26 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn recovery_requires_the_original_unexpired_object_and_ticket_identity() {
-        use n1_link::{Durability, Identity, KeySigner, PoolId, UploadPlan};
+    fn recovery_requires_an_unexpired_link_key_and_matching_reservation() {
+        use n1_link::{Identity, KeySigner, PoolId};
         let signer = KeySigner::new([29; 32]);
         let identity = Identity {
             pool: PoolId([11; 16]),
             generation: 1,
             token: [7; 32],
         };
-        let plan = UploadPlan {
-            identity,
-            total_bytes: 8192,
-            part_bytes: 4096,
-            expires_at: 100,
-            durability: Durability::Durable,
-        };
-        let ticket = signer.upload_ticket(&[0; 16], plan);
         let object = signer.object_key(&[0; 16], identity);
         let handle = json!({"version_id":"v","session_id":"s","total_size_bytes":8192,"part_size_bytes":4096,"expected_parts":2});
         let mut pending = json!({"completed":false,"handle":handle,"upload":{
-            "upload_key":ticket.as_str(),"object_key":object.as_str(),"total_bytes":8192,"part_bytes":4096,
+            "object_key":object.as_str(),"total_bytes":8192,"part_bytes":4096,
             "parts":2,"expires_at":100,"durable":true}});
         let saved = json!({"cancelled":true,"bridge":false,"handle":handle});
         assert!(recoverable(&pending, &saved, 99).is_ok());
         assert!(recoverable(&pending, &saved, 100).is_err());
-        pending["upload"]["object_key"] = json!(
-            signer
-                .object_key(
-                    &[0; 16],
-                    Identity {
-                        token: [8; 32],
-                        ..identity
-                    }
-                )
-                .as_str()
-        );
+        pending["handle"]["session_id"] = json!("different-session");
+        assert!(recoverable(&pending, &saved, 99).is_err());
+        pending["handle"]["session_id"] = json!("s");
+        pending["upload"]["object_key"] = json!("invalid-link");
         assert!(recoverable(&pending, &saved, 99).is_err());
     }
     #[test]

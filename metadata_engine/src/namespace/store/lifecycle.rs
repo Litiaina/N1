@@ -80,8 +80,8 @@ fn reference(target: &Target, key: &str) -> Result<RecordKey> {
         target.version
     ))
 }
-fn retiring(key: &str) -> Result<RecordKey> {
-    catalog(format!("link-retiring/{}", hash(key)))
+fn purging(key: &str) -> Result<RecordKey> {
+    catalog(format!("link-purging/{}", hash(key)))
 }
 fn owner_index(target: &Target) -> Result<RecordKey> {
     RecordKey::new(
@@ -171,10 +171,10 @@ pub(crate) fn index_upload(
     upload: &ObjectUpload,
 ) -> Result<()> {
     if tx
-        .get(Table::Reclamation, &retiring(&upload.object_key)?)?
+        .get(Table::Reclamation, &purging(&upload.object_key)?)?
         .is_some()
     {
-        return Err(Error::NameConflict("object retirement has started".into()));
+        return Err(Error::NameConflict("object purge has started".into()));
     }
     let target = Target {
         fragment,
@@ -331,8 +331,8 @@ impl Namespace {
         })
     }
     /// Removing a shared reference and testing the remaining references are one
-    /// transaction. The last owner retains its key until physical retirement ACK.
-    pub(crate) fn prepare_retirement(&self, target: &Target, key: &str) -> Result<bool> {
+    /// transaction. The last owner retains its key until physical purge ACK.
+    pub(crate) fn prepare_purge(&self, target: &Target, key: &str) -> Result<bool> {
         self.engine.transact(ATTEMPTS, |tx| {
             let own = reference(target, key)?;
             let rows = tx.scan(
@@ -346,14 +346,14 @@ impl Namespace {
                 tx.remove(Table::Reclamation, &own)?;
                 return Ok(false);
             }
-            if let Some(owner) = read::<Target>(tx, Table::Reclamation, &retiring(key)?)?
+            if let Some(owner) = read::<Target>(tx, Table::Reclamation, &purging(key)?)?
                 && owner != *target
             {
                 return Err(Error::NameConflict(
-                    "another owner is retiring this key".into(),
+                    "another owner is purging this key".into(),
                 ));
             }
-            put(tx, Table::Reclamation, &retiring(key)?, target)?;
+            put(tx, Table::Reclamation, &purging(key)?, target)?;
             Ok(true)
         })
     }
