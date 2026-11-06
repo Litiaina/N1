@@ -62,9 +62,12 @@ pub(super) async fn create(
         .await?;
     Ok((
         StatusCode::CREATED,
-        Json(
-            json!({"fragment_hash":record.alias,"fragment_id":ulid::Ulid::from_bytes(record.id.0).to_string(),"name":record.name,"message":"Fragment created"}),
-        ),
+        Json(json!({
+            "fragment_hash": record.alias,
+            "fragment_id": ulid::Ulid::from_bytes(record.id.0).to_string(),
+            "name": record.name,
+            "message": "Fragment created"
+        })),
     ))
 }
 pub(super) async fn list(
@@ -197,14 +200,54 @@ pub(super) async fn ws(
     let claims = auth::authorize(&app, &headers, "read").await?;
     let mut events = app.events.subscribe();
     Ok(socket.on_upgrade(move |mut socket| async move {
-        let expires = tokio::time::sleep(std::time::Duration::from_secs(claims.exp.saturating_sub(auth::now()))); tokio::pin!(expires);
-        loop { tokio::select! {
-            _ = &mut expires => break,
-            message = socket.recv() => { if message.is_none() || matches!(message, Some(Err(_)) | Some(Ok(axum::extract::ws::Message::Close(_)))) { break; } },
-            event = events.recv() => match event {
-                Ok(event) if event["fragment"].as_str() == Some(claims.fragment.as_str()) => { if socket.send(axum::extract::ws::Message::Text(json!({"type":"EVENT","payload":event}).to_string().into())).await.is_err() { break; } },
-                Ok(_) => (), Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { let _ = socket.send(axum::extract::ws::Message::Text(json!({"type":"EVENT","payload":{"event":"NAMESPACE_CHANGED","fragment":claims.fragment}}).to_string().into())).await; }, Err(_) => break,
+        let expires = tokio::time::sleep(std::time::Duration::from_secs(
+            claims.exp.saturating_sub(auth::now()),
+        ));
+        tokio::pin!(expires);
+        loop {
+            tokio::select! {
+                _ = &mut expires => break,
+                message = socket.recv() => {
+                    if message.is_none()
+                        || matches!(
+                            message,
+                            Some(Err(_)) | Some(Ok(axum::extract::ws::Message::Close(_)))
+                        )
+                    {
+                        break;
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(event) if event["fragment"].as_str() == Some(claims.fragment.as_str()) => {
+                        if socket
+                            .send(axum::extract::ws::Message::Text(
+                                json!({"type": "EVENT", "payload": event}).to_string().into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                json!({
+                                    "type": "EVENT",
+                                    "payload": {
+                                        "event": "NAMESPACE_CHANGED",
+                                        "fragment": claims.fragment
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                    }
+                    Err(_) => break,
+                }
             }
-        } }
+        }
     }))
 }

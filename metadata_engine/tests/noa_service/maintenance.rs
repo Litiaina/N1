@@ -1,7 +1,7 @@
 //! Actual public maintenance against independent object and metadata processes.
 use super::*;
+use m1::{MetadataEngine, Options, Table};
 use n1_link::{PoolId, noa::Command as ObjectCommand};
-use n1_metadata_engine::{MetadataEngine, Options, Table};
 
 pub(super) async fn auth(client: &Client, base: &str, name: &str) -> (String, String, String) {
     let fragment = json_response(
@@ -46,7 +46,7 @@ async fn wait(client: &Client, base: &str, token: &str, kind: &str) -> Value {
     }
 }
 fn policy(stack: &Stack, enabled: bool, ttl: u64, interval: u64, pause: u64) {
-    let path = stack.root.join("n1_config.ini");
+    let path = stack.root.join("m1_config.ini");
     let mut ini = ini::Ini::load_from_file(&path).unwrap();
     ini.with_section(Some("garbage_collector"))
         .set("enabled", enabled.to_string())
@@ -253,7 +253,7 @@ async fn indexed_trash_gc_enforces_ttl_retries_after_outage_and_automatic_schedu
     // A failed physical purge must retain the durable last-owner intent and
     // both version keys. Model an object process crash after one member's
     // unlink, with a still-readable survivor in this 1+1 pool.
-    let fragment = n1_metadata_engine::fragments::resolve(&database, &alias).unwrap();
+    let fragment = m1::fragments::resolve(&database, &alias).unwrap();
     let purging = database
         .snapshot()
         .scan(
@@ -601,7 +601,19 @@ async fn pool_migration_changes_ec_preserves_versions_and_resumes_after_process_
         assert_eq!(response.status(), 200);
         assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
     }
-    std::fs::write(stack.root.join("MIGRATION-PASSED.json"),serde_json::to_vec_pretty(&json!({"passed":true,"source":source,"destination":target,"versions":oracle.len(),"job":done,"real_sigkill":true})).unwrap()).unwrap();
+    std::fs::write(
+        stack.root.join("MIGRATION-PASSED.json"),
+        serde_json::to_vec_pretty(&json!({
+            "passed": true,
+            "source": source,
+            "destination": target,
+            "versions": oracle.len(),
+            "job": done,
+            "real_sigkill": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -800,7 +812,15 @@ async fn real_console_runs_pool_migration_and_metadata_trash_gc() {
     let (source, target) = add_destination(&mut stack).await;
     let access = stack.root.join("console-maintenance-access.json");
     let console_port = port();
-    let settings = json!({"metadata":stack.url,"fragment":alias,"token":operator,"source":source,"target":target,"console_port":console_port,"output":stack.root});
+    let settings = json!({
+        "metadata": stack.url,
+        "fragment": alias,
+        "token": operator,
+        "source": source,
+        "target": target,
+        "console_port": console_port,
+        "output": stack.root
+    });
     std::fs::write(&access, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
     std::fs::set_permissions(&access, std::fs::Permissions::from_mode(0o600)).unwrap();
     for phase in ["migration", "gc"] {
@@ -863,7 +883,18 @@ async fn real_console_runs_pool_migration_and_metadata_trash_gc() {
             assert_eq!(response.status(), 404);
         }
     }
-    std::fs::write(stack.root.join("CONSOLE-MAINTENANCE-PASSED.json"),serde_json::to_vec_pretty(&json!({"passed":true,"real_console":true,"real_services":true,"metadata_gc":true,"cross_ec_migration":true})).unwrap()).unwrap();
+    std::fs::write(
+        stack.root.join("CONSOLE-MAINTENANCE-PASSED.json"),
+        serde_json::to_vec_pretty(&json!({
+            "passed": true,
+            "real_console": true,
+            "real_services": true,
+            "metadata_gc": true,
+            "cross_ec_migration": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -881,27 +912,23 @@ async fn expired_partial_upload_cleanup_survives_backend_outage_and_metadata_res
     let (alias, token, _) = auth(&client, &base, "Expired upload witness").await;
     drop(stack.metadata.take());
     let database = db(&stack);
-    let fragment = n1_metadata_engine::fragments::resolve(&database, &alias)
-        .unwrap()
-        .id;
-    let executor = n1_metadata_engine::MetadataExecutor::new(database.clone(), 4).unwrap();
+    let fragment = m1::fragments::resolve(&database, &alias).unwrap().id;
+    let executor = m1::MetadataExecutor::new(database.clone(), 4).unwrap();
     let credentials: Value = serde_json::from_slice(
         &std::fs::read(stack.object_config.with_extension("credentials.json")).unwrap(),
     )
     .unwrap();
-    let objects = n1_metadata_engine::object_store::NativeObjectStore::new(
-        n1_metadata_engine::object_store::ObjectStoreConfig {
-            native_url: credentials["native_url"].as_str().unwrap().into(),
-            fragment: credentials["fragment"].as_str().unwrap().into(),
-            secret: credentials["secret"].as_str().unwrap().into(),
-            max_connections: 4,
-            tls: None,
-        },
-    )
+    let objects = m1::object_store::NativeObjectStore::new(m1::object_store::ObjectStoreConfig {
+        native_url: credentials["native_url"].as_str().unwrap().into(),
+        fragment: credentials["fragment"].as_str().unwrap().into(),
+        secret: credentials["secret"].as_str().unwrap().into(),
+        max_connections: 4,
+        tls: None,
+    })
     .unwrap();
-    let service = n1_metadata_engine::service::MetadataService::new(executor, objects);
+    let service = m1::service::MetadataService::new(executor, objects);
     let upload = service
-        .begin_upload(n1_metadata_engine::service::UploadRequest {
+        .begin_upload(m1::service::UploadRequest {
             fragment,
             path: "abandoned.bin".into(),
             content_type: "application/octet-stream".into(),

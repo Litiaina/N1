@@ -12,7 +12,22 @@ async fn native_finalize_failure_reconciles_lost_staging_and_cancel_removes_ackn
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
     let created=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"Staged loss","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
-    let logged=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":created["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"delete":true})).send().await.unwrap(),200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": created["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap();
     let route = format!("{base}/upload/multipart/durable");
     let shape = json!({"total_size_bytes":16384,"part_size_bytes":8192,"expected_parts":2});
@@ -129,20 +144,13 @@ async fn native_finalize_failure_reconciles_lost_staging_and_cancel_removes_ackn
         410
     );
     drop(stack.metadata.take());
-    let config =
-        n1_metadata_engine::server::ServerConfig::load(&stack.root.join("n1_config.ini")).unwrap();
-    let db = n1_metadata_engine::MetadataEngine::open(
-        &config.data_dir,
-        n1_metadata_engine::Options::default(),
-    )
-    .unwrap();
-    let fragment =
-        n1_metadata_engine::fragments::resolve(&db, created["fragment_hash"].as_str().unwrap())
-            .unwrap();
+    let config = m1::server::ServerConfig::load(&stack.root.join("m1_config.ini")).unwrap();
+    let db = m1::MetadataEngine::open(&config.data_dir, m1::Options::default()).unwrap();
+    let fragment = m1::fragments::resolve(&db, created["fragment_hash"].as_str().unwrap()).unwrap();
     assert!(
         db.snapshot()
             .scan(
-                n1_metadata_engine::Table::Reclamation,
+                m1::Table::Reclamation,
                 fragment.id,
                 &format!("upload-progress/{cancelled_version}/"),
                 None,

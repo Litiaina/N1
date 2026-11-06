@@ -85,10 +85,11 @@ pub(super) fn unique(directory: &Path, total: u64) -> Result<Value> {
     if identities.len() as u64 != total {
         return Err("distinct object identity count mismatch".into());
     }
-    Ok(
-        json!({"distinct_identities":total,"seconds":start.elapsed().as_secs_f64(),
-        "scope":"client-only fingerprint census; engine has no per-object index"}),
-    )
+    Ok(json!({
+        "distinct_identities": total,
+        "seconds": start.elapsed().as_secs_f64(),
+        "scope": "client-only fingerprint census; engine has no per-object index"
+    }))
 }
 
 #[derive(Clone, Serialize)]

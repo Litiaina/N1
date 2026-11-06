@@ -96,7 +96,13 @@ async fn metadata_cannot_report_a_complete_success_when_every_backing_shard_is_l
         None,
     )
     .await;
-    observations.push(json!({"transport":"n1://","object":"empty","ok":native_result.ok,"status":native_result.status,"bytes":native_bytes.len()}));
+    observations.push(json!({
+        "transport": "n1://",
+        "object": "empty",
+        "ok": native_result.ok,
+        "status": native_result.status,
+        "bytes": native_bytes.len()
+    }));
     if native_result.ok {
         false_successes.push("native empty GET".to_owned());
     }
@@ -134,8 +140,10 @@ async fn metadata_cannot_report_a_complete_success_when_every_backing_shard_is_l
     record(
         &stack.root.join("UNAVAILABLE-BACKEND-READ-PASSED.json"),
         &json!({
-            "passed":true,"empty_and_nonempty_objects":2,"all_backing_shards_removed":removed,
-            "successful_complete_reads":0
+            "passed": true,
+            "empty_and_nonempty_objects": 2,
+            "all_backing_shards_removed": removed,
+            "successful_complete_reads": 0
         }),
     );
 }
@@ -157,9 +165,9 @@ impl Drop for MountGuard {
             let _ = std::fs::write(
                 self.root.join("emergency-remount.json"),
                 json!({
-                    "success":output.status.success(),
-                    "stdout":String::from_utf8_lossy(&output.stdout),
-                    "stderr":String::from_utf8_lossy(&output.stderr)
+                    "success": output.status.success(),
+                    "stdout": String::from_utf8_lossy(&output.stdout),
+                    "stderr": String::from_utf8_lossy(&output.stderr)
                 })
                 .to_string(),
             );
@@ -259,10 +267,21 @@ async fn real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
         .await;
         objects.push((path, bytes, ack["version_id"].as_str().unwrap().to_owned()));
     }
-    record(&stack.root.join("device-ack-oracle.json"), &objects.iter().map(|(path, bytes, version)| {
-        use sha2::Digest;
-        json!({"path":path,"version":version,"bytes":bytes.len(),"sha256":hex::encode(sha2::Sha256::digest(bytes))})
-    }).collect::<Vec<_>>());
+    record(
+        &stack.root.join("device-ack-oracle.json"),
+        &objects
+            .iter()
+            .map(|(path, bytes, version)| {
+                use sha2::Digest;
+                json!({
+                    "path": path,
+                    "version": version,
+                    "bytes": bytes.len(),
+                    "sha256": hex::encode(sha2::Sha256::digest(bytes))
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
     exact_reads(&client, &base, &token, &objects).await;
     // Release the object process's pinned directories for a clean OS unmount.
     // Metadata remains alive on the independent first HDD throughout this test.
@@ -277,9 +296,12 @@ async fn real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
     record(
         &stack.root.join("device-unmount.json"),
         &json!({
-            "block":block,"mount":mount,"filesystem_device":filesystem,
-            "success":output.status.success(),"stdout":String::from_utf8_lossy(&output.stdout),
-            "stderr":String::from_utf8_lossy(&output.stderr)
+            "block": block,
+            "mount": mount,
+            "filesystem_device": filesystem,
+            "success": output.status.success(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr)
         }),
     );
     assert!(
@@ -323,8 +345,9 @@ async fn real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
     record(
         &stack.root.join("device-remount.json"),
         &json!({
-            "success":output.status.success(),"stdout":String::from_utf8_lossy(&output.stdout),
-            "stderr":String::from_utf8_lossy(&output.stderr)
+            "success": output.status.success(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr)
         }),
     );
     assert!(
@@ -340,10 +363,12 @@ async fn real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
     record(
         &stack.root.join("DEVICE-CYCLE-PASSED.json"),
         &json!({
-            "passed":true,"objects_and_original_versions_verified_per_phase":objects.len(),
-            "phases":["both_disks","second_filesystem_unmounted","second_filesystem_remounted"],
-            "metadata_process_unchanged":true,"os_unmount_remount":true,
-            "physical_power_cut_or_cable_pull":false
+            "passed": true,
+            "objects_and_original_versions_verified_per_phase": objects.len(),
+            "phases": ["both_disks","second_filesystem_unmounted","second_filesystem_remounted"],
+            "metadata_process_unchanged": true,
+            "os_unmount_remount": true,
+            "physical_power_cut_or_cable_pull": false
         }),
     );
 }

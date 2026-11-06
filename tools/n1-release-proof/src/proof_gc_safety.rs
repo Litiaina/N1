@@ -269,16 +269,29 @@ impl Proof {
         );
         let logs = self.scan_logs_with_expected(&[&expected_fault])?;
         self.summary = json!({
-            "status":"PASS", "proof":"gc_safety_and_mixed_workload",
-            "workload_timeout_seconds":self.args.gc_workload_timeout_seconds,
-            "topology":{"data_shards":self.data_shards,"parity_shards":self.parity_shards,"roots":self.active_disk_count},
-            "protected_files":protected.len(), "expired_orphans":expired.len(),
-            "initial_gc":initial_gc, "fragment_cleanup":fragment_cleanup,
-            "paused_one_shot":paused_upload,
-            "paused_upload_during_trash_expiry":ttl_upload,
-            "standard":standard,"mixed":mixed,"durable":durable,
-            "background":background, "injected_session_corruption":fault,"recovered_gc":retry,
-            "restart_visibility":"PASS","rss":rss,"log_scan":logs,
+            "status": "PASS",
+            "proof": "gc_safety_and_mixed_workload",
+            "workload_timeout_seconds": self.args.gc_workload_timeout_seconds,
+            "topology": {
+                "data_shards": self.data_shards,
+                "parity_shards": self.parity_shards,
+                "roots": self.active_disk_count
+            },
+            "protected_files": protected.len(),
+            "expired_orphans": expired.len(),
+            "initial_gc": initial_gc,
+            "fragment_cleanup": fragment_cleanup,
+            "paused_one_shot": paused_upload,
+            "paused_upload_during_trash_expiry": ttl_upload,
+            "standard": standard,
+            "mixed": mixed,
+            "durable": durable,
+            "background": background,
+            "injected_session_corruption": fault,
+            "recovered_gc": retry,
+            "restart_visibility": "PASS",
+            "rss": rss,
+            "log_scan": logs,
         });
         self.write_summary()?;
         Ok(())

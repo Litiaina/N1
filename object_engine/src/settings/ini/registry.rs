@@ -111,7 +111,7 @@ impl Registry {
             password_hash(secret)
         }
     }
-    pub fn validate(&self, settings: &N1Settings) -> Result<()> {
+    pub fn validate(&self, settings: &OperatorSettings) -> Result<()> {
         self.validate_existing(settings)?;
         if settings.pools.len() != self.pools.len() || self.pools.values().any(|pool| !pool.ready) {
             return Err(Error::Conflict(
@@ -121,9 +121,17 @@ impl Registry {
         }
         Ok(())
     }
-    fn validate_existing(&self, settings: &N1Settings) -> Result<()> {
+    fn validate_existing(&self, settings: &OperatorSettings) -> Result<()> {
         for (name, enrolled) in &self.pools {
-            let wanted=settings.pools.iter().find(|pool|&pool.name==name).ok_or_else(||Error::Conflict(format!("enrolled pool {name} cannot be removed from configuration; seal it to stop allocation")))?;
+            let wanted = settings
+                .pools
+                .iter()
+                .find(|pool| &pool.name == name)
+                .ok_or_else(|| {
+                    Error::Conflict(format!(
+                        "enrolled pool {name} cannot be removed from configuration; seal it to stop allocation"
+                    ))
+                })?;
             let layout = &enrolled.config.layout;
             if wanted.generation != layout.generation
                 || wanted.data_shards != layout.data_shards
@@ -164,7 +172,10 @@ pub(super) fn control_directory(path: &Path, create: bool) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn prepare(settings: &N1Settings, env: &BTreeMap<String, String>) -> Result<Registry> {
+pub(super) fn prepare(
+    settings: &OperatorSettings,
+    env: &BTreeMap<String, String>,
+) -> Result<Registry> {
     let control = &settings.control_dir;
     let registry_path = control.join(REGISTRY);
     let mut registry = match fs::symlink_metadata(&registry_path) {

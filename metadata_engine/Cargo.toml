@@ -1,12 +1,12 @@
 [package]
-name = "n1_metadata_engine"
+name = "m1"
 version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
-description = "N1 metadata transactions backed by the ProcyonDB storage engine"
+description = "Litiaina M1 metadata store backed by ProcyonDB, using N1 through NOA"
 
 [[bin]]
-name = "litiaina-n1-metadata"
+name = "litiaina-m1"
 path = "src/main.rs"
 
 [dependencies]
@@ -30,6 +30,7 @@ tower = { workspace = true, features = ["util"] }
 serde_bytes.workspace = true
 tokio-rustls = "0.26.4"
 chrono.workspace = true
+hostname.workspace = true
 libc.workspace = true
 futures-util.workspace = true
 bytes.workspace = true

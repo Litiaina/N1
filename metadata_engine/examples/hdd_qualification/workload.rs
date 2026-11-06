@@ -1,8 +1,6 @@
 use crate::{Event, Phase, Plan, Result, emit, open};
+use m1::{Error, MetadataEngine, MetadataSnapshot, MetadataTransaction, RecordKey, Table};
 use n1_link::PoolId;
-use n1_metadata_engine::{
-    Error, MetadataEngine, MetadataSnapshot, MetadataTransaction, RecordKey, Table,
-};
 use std::{
     fs,
     path::Path,
@@ -16,17 +14,17 @@ use std::{
 const FRAGMENT: PoolId = PoolId([0x31; 16]);
 
 trait ReadView {
-    fn get(&self, table: Table, key: &RecordKey) -> n1_metadata_engine::Result<Option<Vec<u8>>>;
+    fn get(&self, table: Table, key: &RecordKey) -> m1::Result<Option<Vec<u8>>>;
 }
 
 impl ReadView for MetadataTransaction {
-    fn get(&self, table: Table, key: &RecordKey) -> n1_metadata_engine::Result<Option<Vec<u8>>> {
+    fn get(&self, table: Table, key: &RecordKey) -> m1::Result<Option<Vec<u8>>> {
         MetadataTransaction::get(self, table, key)
     }
 }
 
 impl ReadView for MetadataSnapshot {
-    fn get(&self, table: Table, key: &RecordKey) -> n1_metadata_engine::Result<Option<Vec<u8>>> {
+    fn get(&self, table: Table, key: &RecordKey) -> m1::Result<Option<Vec<u8>>> {
         MetadataSnapshot::get(self, table, key)
     }
 }
@@ -59,7 +57,7 @@ fn check(
     expected: Option<Vec<u8>>,
     index: usize,
     label: &str,
-) -> n1_metadata_engine::Result<()> {
+) -> m1::Result<()> {
     if actual != expected {
         return Err(Error::Invalid(format!(
             "{label} differs for record {index}"
@@ -70,7 +68,7 @@ fn check(
 
 /// Returns true only for a completely applied batch. Mixed presence would mean
 /// cross-keyspace or within-batch atomicity was lost; never overwrite that evidence.
-fn applied(tx: &impl ReadView, phase: Phase, index: usize) -> n1_metadata_engine::Result<bool> {
+fn applied(tx: &impl ReadView, phase: Phase, index: usize) -> m1::Result<bool> {
     let current = tx.get(Table::Entries, &key(index))?;
     let original = tx.get(Table::Versions, &history(index, 0))?;
     if phase == Phase::Populate {
@@ -117,7 +115,7 @@ fn apply_batch(
     plan: &Plan,
     phase: Phase,
     batch: usize,
-) -> n1_metadata_engine::Result<usize> {
+) -> m1::Result<usize> {
     let start = batch * plan.batch;
     let end = (start + plan.batch).min(phase.count(plan));
     engine.transact(64, |tx| {
@@ -391,9 +389,13 @@ pub fn verify(root: &Path, plan: &Plan, churned: bool) -> Result<serde_json::Val
         }
         counts.push(serde_json::json!({"table":format!("{table:?}"),"records":count}));
     }
-    Ok(
-        serde_json::json!({"verified_entries":plan.entries,"churned":churned,"seconds":started.elapsed().as_secs_f64(),"counts":counts,"engine_disk_bytes":engine.disk_bytes()?}),
-    )
+    Ok(serde_json::json!({
+        "verified_entries": plan.entries,
+        "churned": churned,
+        "seconds": started.elapsed().as_secs_f64(),
+        "counts": counts,
+        "engine_disk_bytes": engine.disk_bytes()?
+    }))
 }
 
 #[cfg(test)]

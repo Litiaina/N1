@@ -1,4 +1,4 @@
-//! NOA adapters for the optional named N1 service. Both transports call the
+//! NOA adapters for M1, the metadata store. Both transports call the
 //! same domain service; object bytes cross the public native LINK boundary.
 pub(crate) mod backups;
 pub mod config;

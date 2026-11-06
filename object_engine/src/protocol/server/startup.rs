@@ -20,7 +20,14 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name="litiaina-n1",version=concat!(env!("CARGO_PKG_VERSION"),"\nstorage_format LINK-v1\nnoa v2\nnative_protocol n1/1"),about="Litiaina N1 LINK object engine")]
+#[command(
+    name = "litiaina-n1",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nstorage_format LINK-v1\nnoa v2\nnative_protocol n1/1"
+    ),
+    about = "Litiaina N1 object store built on LINK"
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Action,
@@ -286,7 +293,10 @@ async fn load(path: PathBuf, enroll: bool) -> Result<Arc<Service>> {
 async fn shutdown() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM handler");
-    tokio::select! {_=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{}}
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {}
+    }
 }
 struct Enrollment {
     config: PathBuf,
@@ -396,8 +406,12 @@ fn init(enrollment: Enrollment) -> Result<()> {
     write_json(&config, &cfg)?;
     write_json(
         &credentials,
-        &serde_json::json!({"fragment":alias,"fragment_id":PoolId(fragment_id),"secret":password,
-        "native_url":format!("{}://{}",if cfg.tls.is_some(){"n1s"}else{"n1"},native_address)}),
+        &serde_json::json!({
+            "fragment": alias,
+            "fragment_id": PoolId(fragment_id),
+            "secret": password,
+            "native_url": format!("{}://{}",if cfg.tls.is_some(){"n1s"}else{"n1"},native_address)
+        }),
     )?;
     println!(
         "Enrolled LINK pool. Configuration: {}\nCredentials: {}",

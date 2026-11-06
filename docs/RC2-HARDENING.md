@@ -9,5 +9,5 @@ plan predates the LINK architecture and is not the current RC.2 design or
 qualification checklist. Its complete historical text is preserved in Git at
 `9939ec8:docs/RC2-HARDENING.md`.
 
-The current architecture is [N1 with LINK and the optional metadata engine](../ARCHITECTURE.md).
+The current architecture is [N1 with LINK and the independent M1 metadata store](../ARCHITECTURE.md).
 Both NOA contracts are specified in [NOA.md](../NOA.md). RC.2 remains unreleased.

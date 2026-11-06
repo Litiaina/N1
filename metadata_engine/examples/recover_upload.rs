@@ -3,10 +3,8 @@
 //! Run without --apply first, against a stopped database copy.
 use clap::Parser;
 use cli_core::{Credentials, Result, result};
+use m1::{Error, MetadataEngine, Options, RecordKey, Table, fragments, object_store::ObjectUpload};
 use n1_link::{ObjectKey, noa::Command};
-use n1_metadata_engine::{
-    Error, MetadataEngine, Options, RecordKey, Table, fragments, object_store::ObjectUpload,
-};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -140,9 +138,16 @@ async fn main() -> Result<()> {
     }
     println!(
         "{}",
-        json!({"checked":true,"applied":args.apply,"handle":before["handle"],
-        "verified_surviving_parts":verified,"missing_parts":missing.len(),"shard_bytes_modified":false,
-        "identity_preserved":true,"publication_intent_restored":args.apply})
+        json!({
+            "checked": true,
+            "applied": args.apply,
+            "handle": before["handle"],
+            "verified_surviving_parts": verified,
+            "missing_parts": missing.len(),
+            "shard_bytes_modified": false,
+            "identity_preserved": true,
+            "publication_intent_restored": args.apply
+        })
     );
     Ok(())
 }
@@ -160,10 +165,25 @@ mod tests {
             token: [7; 32],
         };
         let object = signer.object_key(&[0; 16], identity);
-        let handle = json!({"version_id":"v","session_id":"s","total_size_bytes":8192,"part_size_bytes":4096,"expected_parts":2});
-        let mut pending = json!({"completed":false,"handle":handle,"upload":{
-            "object_key":object.as_str(),"total_bytes":8192,"part_bytes":4096,
-            "parts":2,"expires_at":100,"durable":true}});
+        let handle = json!({
+            "version_id": "v",
+            "session_id": "s",
+            "total_size_bytes": 8192,
+            "part_size_bytes": 4096,
+            "expected_parts": 2
+        });
+        let mut pending = json!({
+            "completed": false,
+            "handle": handle,
+            "upload": {
+                "object_key": object.as_str(),
+                "total_bytes": 8192,
+                "part_bytes": 4096,
+                "parts": 2,
+                "expires_at": 100,
+                "durable": true
+            }
+        });
         let saved = json!({"cancelled":true,"bridge":false,"handle":handle});
         assert!(recoverable(&pending, &saved, 99).is_ok());
         assert!(recoverable(&pending, &saved, 100).is_err());

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[command(
     name = "litiaina-n1-shell",
     version,
-    about = "Native NOA 2 client for LINK objects"
+    about = "Litiaina N1 native NOA v2 client for LINK objects"
 )]
 pub(crate) struct Cli {
     #[arg(long, global = true)]

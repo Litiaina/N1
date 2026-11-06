@@ -159,12 +159,18 @@ pub async fn run(
     status.schedule_utc = Some(cfg.schedule_utc);
     status.next_scheduled_at = Some(schedule.next_after(Utc::now()));
     save(&path, &status).await?;
-    tokio::select! { _ = stop.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(cfg.initial_delay_seconds)) => {} }
+    tokio::select! {
+        _ = stop.cancelled() => return Ok(()),
+        _ = tokio::time::sleep(Duration::from_secs(cfg.initial_delay_seconds)) => {}
+    }
     let mut owned: Option<String> = None;
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! { _ = stop.cancelled() => return Ok(()), _ = timer.tick() => {} }
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = timer.tick() => {}
+        }
         let now = Utc::now();
         if let Some(id) = &owned {
             match jobs.status().map_err(|e| e.to_string())? {

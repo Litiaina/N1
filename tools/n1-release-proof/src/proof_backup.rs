@@ -167,7 +167,18 @@ impl Proof {
             fs::set_permissions(&token,fs::Permissions::from_mode(0o600))?;
             let receiver_config = evidence.join("backup-operator.json");
             let secure=matches!(self.args.backup_transport.as_str(), "https" | "native-tls");
-            let mut settings=json!({"bind":http.to_string(),"native_bind":native.to_string(),"allow_plaintext":!secure,"token_file":token,"repositories":{"replica":{"path":replica,"key_file":key}}});
+            let mut settings=json!({
+                "bind": http.to_string(),
+                "native_bind": native.to_string(),
+                "allow_plaintext":!secure,
+                "token_file": token,
+                "repositories": {
+                    "replica": {
+                        "path": replica,
+                        "key_file": key
+                    }
+                }
+            });
             if secure {
                 let cert=evidence.join("backup-cert.pem");let tls_key=evidence.join("backup-tls.key");
                 let ca=evidence.join("backup-ca.pem");let ca_key=evidence.join("backup-ca.key");let csr=evidence.join("backup.csr");
@@ -240,7 +251,12 @@ impl Proof {
         let total = self.args.source_file.metadata()?.len();
         let part_size = self.args.max_part_size.min(total.div_ceil(2)).max(1);
         let count = total.div_ceil(part_size);
-        let params = json!({"content_type":"application/octet-stream","total_size_bytes":total,"expected_parts":count,"part_size_bytes":part_size});
+        let params = json!({
+            "content_type": "application/octet-stream",
+            "total_size_bytes": total,
+            "expected_parts": count,
+            "part_size_bytes": part_size
+        });
         let response = self
             .client
             .post(format!(
@@ -532,17 +548,32 @@ impl Proof {
         self.backup_cli(&repo, &key, "gc", &["--discard-incomplete"], true)?;
         self.backup_cli(&repo, &key, "verify", &["--snapshot", second_id], true)?;
         self.args.out_dir = evidence;
-        self.summary = json!({"status":"PASS","proof":"encrypted_offline_backup_and_snapshot_replication","ec":[self.data_shards,self.parity_shards],
-            "first_snapshot":first,"second_snapshot":second,"capture_seconds":capture_seconds,"incremental_capture_seconds":incremental_seconds,
-            "replication_seconds":replication_seconds,"restore_seconds":restore_seconds,"restore_interrupted_files":restore_interrupted_files,
-            "physical_power_cut":false,"backup_transport":self.args.backup_transport,"lineage":lineage,"small_objects":storm,
-            "single_member_cross_device_restore":portable_spare.is_some(),
-            "checks":["online_capture_rejected","encrypted_capture_verified","incremental_snapshot","replication_idempotent","original_roots_offline",
+        self.summary = json!({
+            "status": "PASS",
+            "proof": "encrypted_offline_backup_and_snapshot_replication",
+            "ec": [self.data_shards,self.parity_shards],
+            "first_snapshot": first,
+            "second_snapshot": second,
+            "capture_seconds": capture_seconds,
+            "incremental_capture_seconds": incremental_seconds,
+            "replication_seconds": replication_seconds,
+            "restore_seconds": restore_seconds,
+            "restore_interrupted_files": restore_interrupted_files,
+            "physical_power_cut": false,
+            "backup_transport": self.args.backup_transport,
+            "lineage": lineage,
+            "small_objects": storm,
+            "single_member_cross_device_restore": portable_spare.is_some(),
+            "checks": ["online_capture_rejected","encrypted_capture_verified","incremental_snapshot","replication_idempotent","original_roots_offline",
                 "portable_restore","sigkill_after_restore_piece_publication","interrupted_restore_startup_rejected","explicit_restore_resume",
                 "paginated_listing","version_identity_and_history","download_sha256","empty_physical_organizer","trash_recovery","durable_session_resume",
                 "range_download","new_write_and_delete","retained_older_replica","retention_gc_preserves_live_blocks","all_small_object_hashes","independent_fragment_credentials"],
-            "post_restore_version":post,"repository":repo,"replica":replica,"key_file":key,
-            "test_scope":"isolated directories; no production service restart or disk formatting"});
+            "post_restore_version": post,
+            "repository": repo,
+            "replica": replica,
+            "key_file": key,
+            "test_scope": "isolated directories; no production service restart or disk formatting"
+        });
         self.write_summary()?;
         Ok(())
     }

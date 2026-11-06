@@ -133,17 +133,29 @@ async fn execute(binary: &Path, first: &Path, second: &Path, small_only: bool) -
     private_json(
         &reports.join("provenance.json"),
         &json!({
-            "engine_binary":binary,"engine_sha256":format!("{:x}",Sha256::digest(fs::read(binary)?)),
-            "client_sha256":format!("{:x}",Sha256::digest(fs::read(executable)?)),"profile":"release",
-            "native_endpoint":format!("n1://{address}"),"http_enabled":false,"io_backend":"required io_uring",
-            "pool":configuration["pools"][0]["layout"],"concurrency":configuration["concurrency"],
-            "max_operations":configuration["max_operations"],"operation_memory_bytes":configuration["operation_memory_bytes"],
-            "rate_limits_enabled":false,"quota_note":"quotas excluded to measure storage; adaptive controller and resource limits enabled",
-            "project_device":first.metadata()?.dev(),"test_device":second.metadata()?.dev(),
-            "kernel":fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
-            "cpu_model":fs::read_to_string("/proc/cpuinfo")?.lines().find(|line|line.starts_with("model name")),
-            "scope":if small_only {"shared local workstation; one serial client; 100 individual and 100 fresh batched 4 KiB objects; 4 KiB block pool"}
-                else {"shared local workstation; one serial client; 1 GiB + 100 individual and 100 fresh batched 4 KiB objects"}
+            "engine_binary": binary,
+            "engine_sha256": format!("{:x}",Sha256::digest(fs::read(binary)?)),
+            "client_sha256": format!("{:x}",Sha256::digest(fs::read(executable)?)),
+            "profile": "release",
+            "native_endpoint": format!("n1://{address}"),
+            "http_enabled": false,
+            "io_backend": "required io_uring",
+            "pool": configuration["pools"][0]["layout"],
+            "concurrency": configuration["concurrency"],
+            "max_operations": configuration["max_operations"],
+            "operation_memory_bytes": configuration["operation_memory_bytes"],
+            "rate_limits_enabled": false,
+            "quota_note": "quotas excluded to measure storage; adaptive controller and resource limits enabled",
+            "project_device": first.metadata()?.dev(),
+            "test_device": second.metadata()?.dev(),
+            "kernel": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
+            "cpu_model": fs::read_to_string("/proc/cpuinfo")?.lines().find(|line|line.starts_with("model name")),
+            "scope": if small_only {
+                "shared local workstation; one serial client; 100 individual and 100 fresh batched 4 KiB objects; 4 KiB block pool"
+            }
+                else {
+                "shared local workstation; one serial client; 1 GiB + 100 individual and 100 fresh batched 4 KiB objects"
+            }
         }),
     )?;
     let log = OpenOptions::new()
@@ -221,8 +233,14 @@ fn summarize(reports: &Path) -> Result<()> {
             footprint.push(value);
         }
     }
-    let summary = json!({"passed":true,"server_stopped_cleanly":true,
-        "sampled_peak_rss_bytes":peak,"kernel_rss_high_water_bytes":hwm,"phases":rows,"storage":footprint});
+    let summary = json!({
+        "passed": true,
+        "server_stopped_cleanly": true,
+        "sampled_peak_rss_bytes": peak,
+        "kernel_rss_high_water_bytes": hwm,
+        "phases": rows,
+        "storage": footprint
+    });
     private_json(&reports.join("summary.json"), &summary)?;
     let has_large = summary["phases"]
         .as_array()
@@ -236,17 +254,22 @@ fn summarize(reports: &Path) -> Result<()> {
     };
     let object_count = if has_large { 201 } else { 200 };
     let mut markdown = format!(
-        "# Restored N1 LINK release benchmark\n\n\
-        One native client, loopback, independent XFS/ext4 HDDs, required io_uring. \
-        Repository release profile, adaptive controller enabled, request quotas disabled. \
-        This shared-workstation run is not a matched old/new comparison or scale qualification.\n\n\
-        Payload: {payload}. Downloads stream through a SHA-256 sink; \
-        every download checks exact length and hash. All {object_count} objects are permanently retired afterward.\n\n\
-        Sampled peak engine RSS: **{:.2} MiB** (50 ms samples). Kernel RSS high-water mark: **{:.2} MiB**. Engine stopped cleanly.\n\n\
-        | Phase | Wall seconds | Calls | MiB/s | p50 ms | p95 ms | p99 ms | CPU seconds | Peak RSS MiB |\n\
-        | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        concat!(
+            "# Restored N1 LINK release benchmark\n",
+            "\n",
+            "One native client, loopback, independent XFS/ext4 HDDs, required io_uring. Repository release profile, adaptive controller enabled, request quotas disabled. This shared-workstation run is not a matched old/new comparison or scale qualification.\n",
+            "\n",
+            "Payload: {payload}. Downloads stream through a SHA-256 sink; every download checks exact length and hash. All {object_count} objects are permanently retired afterward.\n",
+            "\n",
+            "Sampled peak engine RSS: **{:.2} MiB** (50 ms samples). Kernel RSS high-water mark: **{:.2} MiB**. Engine stopped cleanly.\n",
+            "\n",
+            "| Phase | Wall seconds | Calls | MiB/s | p50 ms | p95 ms | p99 ms | CPU seconds | Peak RSS MiB |\n",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        ),
         peak as f64 / 1048576.0,
-        hwm as f64 / 1048576.0
+        hwm as f64 / 1048576.0,
+        payload = payload,
+        object_count = object_count
     );
     for row in summary["phases"].as_array().ok_or("missing phases")? {
         let number = |field: &str| row[field].as_f64().unwrap_or(0.0);
@@ -264,7 +287,13 @@ fn summarize(reports: &Path) -> Result<()> {
             number("sampled_peak_rss_bytes") / 1048576.0
         ));
     }
-    markdown.push_str("\nBatch upload latency is one call containing 100 fresh objects; per-call percentiles are not per-object latencies. Init/auth/report persistence are excluded from PUT/GET timing; init is reported separately. Requested cold reads use per-shard POSIX_FADV_DONTNEED, without a global cache drop; hardware caches remain possible. Warm reads follow. GET timings include client SHA-256 verification.\n\n| Cohort | Source bytes | Shard logical bytes | Shard allocated bytes | Logical amplification | Allocated amplification |\n| --- | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str(concat!(
+        "\n",
+        "Batch upload latency is one call containing 100 fresh objects; per-call percentiles are not per-object latencies. Init/auth/report persistence are excluded from PUT/GET timing; init is reported separately. Requested cold reads use per-shard POSIX_FADV_DONTNEED, without a global cache drop; hardware caches remain possible. Warm reads follow. GET timings include client SHA-256 verification.\n",
+        "\n",
+        "| Cohort | Source bytes | Shard logical bytes | Shard allocated bytes | Logical amplification | Allocated amplification |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: |\n",
+    ));
     for row in summary["storage"].as_array().ok_or("missing storage")? {
         let storage = &row["storage"];
         markdown.push_str(&format!(
@@ -277,7 +306,10 @@ fn summarize(reports: &Path) -> Result<()> {
             storage["allocated_amplification"].as_f64().unwrap_or(0.0)
         ));
     }
-    markdown.push_str("\nFootprint includes redundancy, framing and shard allocation; directory metadata is excluded. Full sample vectors, process CPU/I/O counters, methodology, exact binary hashes, geometry and controller settings are in measurements.jsonl and provenance.json.\n");
+    markdown.push_str(concat!(
+        "\n",
+        "Footprint includes redundancy, framing and shard allocation; directory metadata is excluded. Full sample vectors, process CPU/I/O counters, methodology, exact binary hashes, geometry and controller settings are in measurements.jsonl and provenance.json.\n",
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

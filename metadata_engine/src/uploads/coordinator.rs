@@ -523,9 +523,20 @@ async fn status_locked(
                 .min(plan.handle.part_size_bytes)
         })
         .sum();
-    Ok(
-        serde_json::json!({"version_id":version, "session_id":plan.handle.session_id, "object_key":plan.handle.object_key, "total_size_bytes":plan.handle.total_size_bytes,"part_size_bytes":plan.handle.part_size_bytes,"expected_parts":plan.handle.expected_parts,"uploaded_parts":uploaded,"committed_parts":uploaded.len(),"uploaded_bytes":bytes,"committed_bytes":bytes,"completed":pending.completed,"durable":durable}),
-    )
+    Ok(serde_json::json!({
+        "version_id": version,
+        "session_id": plan.handle.session_id,
+        "object_key": plan.handle.object_key,
+        "total_size_bytes": plan.handle.total_size_bytes,
+        "part_size_bytes": plan.handle.part_size_bytes,
+        "expected_parts": plan.handle.expected_parts,
+        "uploaded_parts": uploaded,
+        "committed_parts": uploaded.len(),
+        "uploaded_bytes": bytes,
+        "committed_bytes": bytes,
+        "completed": pending.completed,
+        "durable": durable
+    }))
 }
 pub(crate) async fn finalize(
     app: Arc<App>,

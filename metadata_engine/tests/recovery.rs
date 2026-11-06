@@ -1,7 +1,7 @@
 //! Rust process witness: durable acknowledgements survive a forced process exit.
 use n1_link::PoolId;
 mod common;
-use n1_metadata_engine::{MetadataEngine, Options, RecordKey, Table};
+use m1::{MetadataEngine, Options, RecordKey, Table};
 use std::{
     io::{BufRead, Write},
     process::{Command, Stdio},
@@ -16,7 +16,7 @@ fn key(index: u64) -> RecordKey {
 #[test]
 #[ignore = "subprocess fixture; exercised by the crash recovery test"]
 fn metadata_crash_child() {
-    let path = std::env::var_os("N1_METADATA_CRASH_CHILD")
+    let path = std::env::var_os("M1_CRASH_CHILD")
         .expect("subprocess fixture requires a private database directory");
     let engine = MetadataEngine::open(path, Options::default()).unwrap();
     for index in 0u64..32 {
@@ -33,7 +33,7 @@ fn metadata_crash_child() {
     pending
         .put(Table::Uploads, &key(32), b"uncommitted")
         .unwrap();
-    println!("N1_METADATA_ACK=32");
+    println!("M1_ACK=32");
     std::io::stdout().flush().unwrap();
     loop {
         std::thread::park();
@@ -50,7 +50,7 @@ impl Drop for ChildGuard {
 
 #[test]
 fn durable_cross_table_acknowledgements_survive_process_kill() {
-    let directory = match std::env::var_os("N1_METADATA_TEST_ROOT") {
+    let directory = match std::env::var_os("M1_TEST_ROOT") {
         Some(parent) => common::directory(Some(std::path::Path::new(&parent))),
         None => common::directory(None),
     };
@@ -62,7 +62,7 @@ fn durable_cross_table_acknowledgements_survive_process_kill() {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("N1_METADATA_CRASH_CHILD", directory.path())
+            .env("M1_CRASH_CHILD", directory.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -72,7 +72,7 @@ fn durable_cross_table_acknowledgements_survive_process_kill() {
     let (ready, wait_ready) = mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in std::io::BufReader::new(output).lines() {
-            if line.unwrap() == "N1_METADATA_ACK=32" {
+            if line.unwrap() == "M1_ACK=32" {
                 ready.send(()).unwrap();
                 return;
             }

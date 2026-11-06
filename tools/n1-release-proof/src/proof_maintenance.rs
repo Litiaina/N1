@@ -255,7 +255,12 @@ impl Proof {
         self.assert_object_status_clean(object_key, "after_object_repair")
             .await?;
         Ok(
-            json!({"object_key": object_key, "version_id": version_id, "removed": removed, "pre_repair_status": degraded}),
+            json!({
+                "object_key": object_key,
+                "version_id": version_id,
+                "removed": removed,
+                "pre_repair_status": degraded
+            }),
         )
     }
 

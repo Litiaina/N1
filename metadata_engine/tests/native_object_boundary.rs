@@ -1,12 +1,12 @@
 //! Cross-process witness using the unchanged object binary. All payloads,
 //! metadata, configuration and logs live under explicit test HDD directories.
-use n1_link::{PoolId, noa::Command};
-use n1_metadata_engine::{
+use m1::{
     MetadataEngine, MetadataExecutor, Options, RecordKey, Table,
     namespace::Namespace,
     object_store::{NativeObjectStore, ObjectStoreConfig, ObjectUpload},
     service::{MetadataService, UploadRequest},
 };
+use n1_link::{PoolId, noa::Command};
 use n1_native_client::N1NativeClient;
 use serde_json::Value;
 use std::{
@@ -320,7 +320,14 @@ async fn metadata_uses_unchanged_link_and_link_survives_without_metadata() {
     let mut evidence = tokio::fs::File::create(root.join("PASSED.json"))
         .await
         .unwrap();
-    evidence.write_all(serde_json::to_string_pretty(&serde_json::json!({"result":"passed", "object_binary":binary, "members":[Some(first),second], "metadata":db_path, "verified_bytes":bytes.len(), "checks":["standalone LINK without metadata", "native metadata upload", "out-of-order multipart", "rename with pending upload", "cross-process restart", "finalize retry", "immutable history", "trash/recover", "empty object", "standalone LINK after metadata shutdown"]})).unwrap().as_bytes()).await.unwrap();
+    evidence.write_all(serde_json::to_string_pretty(&serde_json::json!({
+        "result": "passed",
+        "object_binary": binary,
+        "members": [Some(first),second],
+        "metadata": db_path,
+        "verified_bytes": bytes.len(),
+        "checks": ["standalone LINK without metadata", "native metadata upload", "out-of-order multipart", "rename with pending upload", "cross-process restart", "finalize retry", "immutable history", "trash/recover", "empty object", "standalone LINK after metadata shutdown"]
+    })).unwrap().as_bytes()).await.unwrap();
     evidence.sync_all().await.unwrap();
     println!("evidence: {}", root.display());
 }

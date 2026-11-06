@@ -177,9 +177,15 @@ pub async fn enforce_read_only_fast_mode_on_mutations(req: Request<Body>, next: 
         MaintenanceAccessMode::Availability => next.run(req).await,
         MaintenanceAccessMode::ReadOnly => match safety_read_only_reason() {
             Some(reason) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
-            None => (axum::http::StatusCode::FORBIDDEN, "Write/modify/delete operations are temporarily disabled: strict maintenance mode is active.").into_response(),
+            None => (
+                axum::http::StatusCode::FORBIDDEN,
+                "Write/modify/delete operations are temporarily disabled: strict maintenance mode is active.",
+            ).into_response(),
         },
-        MaintenanceAccessMode::Quiesced => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Write/modify/delete operations are temporarily disabled: scrub mode is active.").into_response(),
+        MaintenanceAccessMode::Quiesced => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Write/modify/delete operations are temporarily disabled: scrub mode is active.",
+        ).into_response(),
     }
 }
 pub async fn enforce_quiesced_mode_on_reads(req: Request<Body>, next: Next) -> Response {

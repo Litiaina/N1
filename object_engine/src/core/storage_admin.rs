@@ -237,8 +237,11 @@ fn clone_member(
         ));
     }
     let fence = serde_json::to_vec(&serde_json::json!({
-        "format":"n1-offline-link-pool-v1", "operation":"clone",
-        "member":source.marker, "source":fs::canonicalize(&source.path)?, "target":target,
+        "format": "n1-offline-link-pool-v1",
+        "operation": "clone",
+        "member": source.marker,
+        "source": fs::canonicalize(&source.path)?,
+        "target": target,
     }))?;
     if prepare_only {
         prepare(&target, &fence, false, false)?;

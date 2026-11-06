@@ -96,7 +96,16 @@ async fn run(args: Args) -> Result<()> {
         Mode::Console => "console",
         Mode::Serve => "live",
     };
-    let campaign = serde_json::json!({"format":1,"mode":prefix,"external_browser":args.external_browser,"count":args.count,"writers":args.writers,"readers":args.readers,"metadata_max_concurrent_io":args.metadata_max_concurrent_io,"payload":"u32-xor-v1-eight-sizes"});
+    let campaign = serde_json::json!({
+        "format": 1,
+        "mode": prefix,
+        "external_browser": args.external_browser,
+        "count": args.count,
+        "writers": args.writers,
+        "readers": args.readers,
+        "metadata_max_concurrent_io": args.metadata_max_concurrent_io,
+        "payload": "u32-xor-v1-eight-sizes"
+    });
     let campaign_path = args.root.join("qualification-campaign.json");
     if campaign_path.exists() {
         if serde_json::from_slice::<serde_json::Value>(&std::fs::read(&campaign_path)?)? != campaign
@@ -137,11 +146,33 @@ async fn run(args: Args) -> Result<()> {
                     .as_u64()
                     .unwrap_or(u64::from(metadata_pid)) as u32;
             }
-            let values=[("object",object_pid),("metadata",metadata_pid),("supervisor",std::process::id())].into_iter().map(|(name,pid)|{let status=std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();let rss=status.lines().find(|l|l.starts_with("VmRSS:")).and_then(|l|l.split_whitespace().nth(1)).and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);serde_json::json!({"role":name,"pid":pid,"rss_kib":rss,"stat":std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default()})}).collect::<Vec<_>>();
+            let values = [
+                ("object", object_pid),
+                ("metadata", metadata_pid),
+                ("supervisor", std::process::id()),
+            ]
+            .into_iter()
+            .map(|(name, pid)| {
+                let status =
+                    std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+                let rss = status
+                    .lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "role": name,
+                    "pid": pid,
+                    "rss_kib": rss,
+                    "stat": std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default()
+                })
+            })
+            .collect::<Vec<_>>();
             let _ = writeln!(
                 samples,
                 "{}",
-                serde_json::json!({"unix":n1_metadata_engine::middleware::auth::now(),"processes":values})
+                serde_json::json!({"unix":m1::middleware::auth::now(),"processes":values})
             );
             let _ = samples.flush();
             tokio::select! {_=stop.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>()}
@@ -224,14 +255,22 @@ async fn run(args: Args) -> Result<()> {
             let prior = report["priorAcknowledged"]
                 .as_u64()
                 .ok_or("browser prior ACK count missing")?;
-            serde_json::json!({"prior_acknowledged":prior,"acknowledged_this_invocation":args.count-prior,"total_acknowledged":args.count})
+            serde_json::json!({
+                "prior_acknowledged": prior,
+                "acknowledged_this_invocation": args.count-prior,
+                "total_acknowledged": args.count
+            })
         }
         Mode::Serve => {
             std::fs::write(
                 args.root.join("live-client.json"),
-                serde_json::to_vec_pretty(
-                    &serde_json::json!({"url":stack.config.url,"native_port":stack.config.metadata_native,"fragment":api.fragment,"fragment_key":api.secret,"auth":api.login().await?}),
-                )?,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "url": stack.config.url,
+                    "native_port": stack.config.metadata_native,
+                    "fragment": api.fragment,
+                    "fragment_key": api.secret,
+                    "auth": api.login().await?
+                }))?,
             )?;
             eprintln!(
                 "stack ready; private client configuration: {}",
@@ -263,7 +302,23 @@ async fn run(args: Args) -> Result<()> {
     let acknowledged = population["acknowledged_this_invocation"]
         .as_u64()
         .ok_or("population ACK count missing")?;
-    let report = serde_json::json!({"passed":true,"scope":format!("{prefix} -> metadata -> native LINK, two HDDs, process crash/reopen and every object verified"),"count":args.count,"logical_bytes":workload::logical_bytes(args.count),"upload_seconds":upload_seconds,"objects_per_second":acknowledged as f64/upload_seconds,"throughput_basis":"ACKs obtained in this invocation, including verified uncertain prior uploads","population":population,"inventory":inventory,"verification":verification,"root":args.root,"second_root":args.second_root,"object_binary_sha256":stack.config.object_sha256,"metadata_binary_sha256":stack.config.metadata_sha256,"harness_sha256":stack.config.harness_sha256});
+    let report = serde_json::json!({
+        "passed": true,
+        "scope": format!("{prefix} -> metadata -> native LINK, two HDDs, process crash/reopen and every object verified"),
+        "count": args.count,
+        "logical_bytes": workload::logical_bytes(args.count),
+        "upload_seconds": upload_seconds,
+        "objects_per_second": acknowledged as f64/upload_seconds,
+        "throughput_basis": "ACKs obtained in this invocation, including verified uncertain prior uploads",
+        "population": population,
+        "inventory": inventory,
+        "verification": verification,
+        "root": args.root,
+        "second_root": args.second_root,
+        "object_binary_sha256": stack.config.object_sha256,
+        "metadata_binary_sha256": stack.config.metadata_sha256,
+        "harness_sha256": stack.config.harness_sha256
+    });
     std::fs::write(
         args.root.join(format!("{prefix}-PASSED.json")),
         serde_json::to_vec_pretty(&report)?,

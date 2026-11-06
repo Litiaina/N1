@@ -1,6 +1,6 @@
 use n1_link::PoolId;
 mod common;
-use n1_metadata_engine::{Error, MetadataEngine, Options, RecordKey, Table};
+use m1::{Error, MetadataEngine, Options, RecordKey, Table};
 use std::sync::{
     Arc, Barrier,
     atomic::{AtomicBool, Ordering},

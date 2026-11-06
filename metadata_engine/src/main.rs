@@ -1,9 +1,13 @@
 use clap::{Parser, Subcommand};
-use n1_metadata_engine::{MetadataEngine, Options};
+use m1::{MetadataEngine, Options};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about = "Litiaina N1 metadata storage administration")]
+#[command(
+    name = "litiaina-m1",
+    version,
+    about = "Litiaina M1 metadata store and administration"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -13,7 +17,7 @@ struct Cli {
 enum Command {
     /// Serve the original named NOA API over native N1 and HTTP(S).
     Serve {
-        #[arg(long, default_value = "n1_config.ini")]
+        #[arg(long, default_value = "m1_config.ini")]
         config: PathBuf,
     },
     /// Create a new metadata database in an explicitly empty directory.
@@ -57,29 +61,29 @@ fn main() {
                         .map_or(4, usize::from)
                         .clamp(2, 32),
                 )
+                .thread_name("m1-runtime")
                 .enable_all()
                 .build()
-                .expect("metadata runtime")
+                .expect("M1 runtime")
                 .block_on(serve(config))
-                .map_err(|e| n1_metadata_engine::Error::Invalid(e.to_string()))
+                .map_err(|e| m1::Error::Invalid(e.to_string()))
         }
         command => run(Cli { command }),
     };
     if let Err(error) = result {
-        eprintln!("{error}");
+        eprintln!("M1: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> n1_metadata_engine::Result<()> {
+fn run(cli: Cli) -> m1::Result<()> {
     if let Command::Recount { data_dir, fragment } = cli.command {
         let db = MetadataEngine::open(data_dir, Options::default())?;
-        let fragment = n1_metadata_engine::fragments::resolve(&db, &fragment)?;
-        let usage = n1_metadata_engine::namespace::Namespace::new(db).recount_usage(fragment.id)?;
+        let fragment = m1::fragments::resolve(&db, &fragment)?;
+        let usage = m1::namespace::Namespace::new(db).recount_usage(fragment.id)?;
         println!(
             "{}",
-            serde_json::to_string(&usage)
-                .map_err(|e| n1_metadata_engine::Error::Invalid(e.to_string()))?
+            serde_json::to_string(&usage).map_err(|e| m1::Error::Invalid(e.to_string()))?
         );
         return Ok(());
     }
@@ -97,7 +101,7 @@ fn run(cli: Cli) -> n1_metadata_engine::Result<()> {
         Command::Serve { .. } => unreachable!("serve runs inside its async runtime"),
         Command::Init { data_dir } => {
             if data_dir.exists() && std::fs::read_dir(&data_dir)?.next().is_some() {
-                return Err(n1_metadata_engine::Error::Invalid(
+                return Err(m1::Error::Invalid(
                     "init requires an empty metadata directory".into(),
                 ));
             }
@@ -105,7 +109,7 @@ fn run(cli: Cli) -> n1_metadata_engine::Result<()> {
         }
         Command::Check { data_dir } => {
             if !data_dir.is_dir() || !data_dir.join("version").is_file() {
-                return Err(n1_metadata_engine::Error::Invalid(
+                return Err(m1::Error::Invalid(
                     "check requires an existing metadata database".into(),
                 ));
             }
@@ -116,15 +120,20 @@ fn run(cli: Cli) -> n1_metadata_engine::Result<()> {
     println!(
         "{}",
         serde_json::json!({
-            "component": "metadata_engine", "version": env!("CARGO_PKG_VERSION"),
-            "storage": "procyon-engine", "data_dir": path, "disk_bytes": engine.disk_bytes()?,
+            "product": "M1",
+            "component": "metadata_engine",
+            "version": env!("CARGO_PKG_VERSION"),
+            "storage": "procyon-engine",
+            "database": "ProcyonDB",
+            "data_dir": path,
+            "disk_bytes": engine.disk_bytes()?,
         })
     );
     Ok(())
 }
 
 async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use n1_metadata_engine::server::{App, ServerConfig, native, router};
+    use m1::server::{App, ServerConfig, native, router};
     let config = ServerConfig::load(&path)?;
     let http = config.http;
     let address = config.native;
@@ -142,17 +151,9 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + S
     });
     let listener = tokio::net::TcpListener::bind(address).await?;
     let app = App::open(config).await?;
-    n1_metadata_engine::exports::initialize(&app).await?;
+    m1::exports::initialize(&app).await?;
     app.start_maintenance().await?;
-    eprintln!(
-        "╔════════════════════════════════════════════════╗\n║              L I T I A I N A  N 1              ║\n╚════════════════════════════════════════════════╝\n│ Version        : {}\n│ Component      : metadata_engine\n│ Start Time     : {}\n│ PID            : {}\n│ Native         : n1://{}\n│ HTTP           : {}://{}",
-        env!("CARGO_PKG_VERSION"),
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        std::process::id(),
-        address,
-        if tls.is_some() { "https" } else { "http" },
-        http
-    );
+    print_startup_banner(address, http, tls.is_some());
     let stop = tokio_util::sync::CancellationToken::new();
     let handle = axum_server::Handle::new();
     let service = router(app.clone()).into_make_service();
@@ -174,7 +175,11 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + S
             None => axum_server::bind(http).handle(handle).serve(service).await,
         }
     });
-    tokio::select! { result=&mut native=>{result??;},result=&mut http_task=>{result??;}, _=shutdown_signal()=>() }
+    tokio::select! {
+        result = &mut native => { result??; }
+        result = &mut http_task => { result??; }
+        _ = shutdown_signal() => ()
+    }
     stop.cancel();
     graceful.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
     if !native.is_finished() {
@@ -183,7 +188,7 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + S
     if !http_task.is_finished() {
         http_task.await??;
     }
-    n1_metadata_engine::exports::shutdown().await;
+    m1::exports::shutdown().await;
     app.shutdown().await;
     Ok(())
 }
@@ -193,10 +198,42 @@ async fn shutdown_signal() {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("SIGTERM handler");
-        tokio::select! {_=tokio::signal::ctrl_c()=>(),_=terminate.recv()=>()}
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => (),
+            _ = terminate.recv() => (),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+fn print_startup_banner(native: std::net::SocketAddr, http: std::net::SocketAddr, tls: bool) {
+    let native_scheme = if tls { "n1s" } else { "n1" };
+    let http_scheme = if tls { "https" } else { "http" };
+
+    eprintln!("╔════════════════════════════════════════════════╗");
+    eprintln!("║              L I T I A I N A  M 1              ║");
+    eprintln!("╚════════════════════════════════════════════════╝");
+    eprintln!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("│ Component      : M1 metadata store");
+    eprintln!("│ Database       : ProcyonDB");
+    eprintln!("│ Status         : STARTING");
+    eprintln!(
+        "│ Start Time     : {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    eprintln!("│ PID            : {}", std::process::id());
+    eprintln!(
+        "│ Hostname       : {}",
+        hostname::get().unwrap_or_default().to_string_lossy()
+    );
+    eprintln!(
+        "│ Working Dir    : {}",
+        std::env::current_dir().unwrap_or_default().display()
+    );
+    eprintln!("│ Native         : {native_scheme}://{native}");
+    eprintln!("│ HTTP           : {http_scheme}://{http}");
+    eprintln!("╞═════════ ACTIVE CONNECTIONS ═════════╡");
 }

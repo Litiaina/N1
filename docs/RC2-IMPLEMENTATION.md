@@ -1,9 +1,9 @@
-# N1 RC.2 completion checklist
+# N1 and M1 RC.2 completion checklist
 
 **Status: development, unreleased.** This file tracks current implementation and
 qualification gaps. It does not redefine the API, prescribe deployment or serve
-as a chronological work log. The product uses LINK object storage with an
-optional metadata engine; see [ARCHITECTURE.md](../ARCHITECTURE.md).
+as a chronological work log. This repository contains the N1 LINK object store and the
+M1 metadata store, backed by ProcyonDB; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 **Promotion hold:** keep this checkpoint on `link`. The million-object campaign
 and remaining crash/power-loss qualification are deferred until the MCH network
@@ -15,11 +15,11 @@ performance remains a separate gate before promotion to `main`.
 
 | Component | Current implementation |
 | --- | --- |
-| LINK object engine | Deterministic placement in immutable pools; normal/batch/standard/durable multipart; verified GET/ranges; stat/health/repair; zero-residue purge; staging GC; paced maintenance; object backups/replication and explicit member recovery |
+| N1 object store (LINK) | Deterministic placement in immutable pools; normal/batch/standard/durable multipart; verified GET/ranges; stat/health/repair; zero-residue purge; staging GC; paced maintenance; object backups/replication and explicit member recovery |
 | N1 runtime infrastructure | Retained module structure, adaptive concurrency, I/O scheduler, io_uring, aligned O_DIRECT large uploads, middleware, server, streaming reads, banner and backup automation |
 | Operator controls | INI/environment startup; IP/ports/TLS; immutable pool enrollment/append; concurrency, memory, I/O, rate, GC and healing controls |
-| Metadata storage | Procyon optimistic transactions, SyncAll commits, cross-table snapshots, bounded workers and scans, crash/recovery and offline administration |
-| Named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
+| M1 database (ProcyonDB) | Procyon optimistic transactions, SyncAll commits, cross-table snapshots, bounded workers and scans, crash/recovery and offline administration |
+| M1 named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
 | Public adapters | Main named NOA v1 HTTP/WebSocket and native operations; independent direct LINK NOA v2; original Console runtime/proxy retained |
 | Exports | Version-pinned ZIP64/TAR construction, job state, range and signed downloads through the metadata service |
 | Monitoring | Independently sampled metadata/object node health, cached filesystem/member capacity, bounded logical usage counters, explicit integrity checks and original Console service/pool panels |

@@ -25,7 +25,23 @@ async fn object_pool_backup_replication_restore_and_blank_replacement_preserve_k
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
     let fragment=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"Portable recovery witness","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
-    let logged=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":fragment["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"modify":true,"delete":true})).send().await.unwrap(),200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": fragment["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap();
     let bytes = (0..8 * 1024 * 1024 + 19)
         .map(|n| (n % 251) as u8)
@@ -41,7 +57,23 @@ async fn object_pool_backup_replication_restore_and_blank_replacement_preserve_k
         201,
     )
     .await;
-    let operator=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":fragment["fragment_hash"],"secret":"test-only-master","read":true,"write":true,"modify":true,"delete":true})).send().await.unwrap(),200).await;
+    let operator = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": fragment["fragment_hash"],
+                "secret": "test-only-master",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let operator = operator["access_token"].as_str().unwrap();
     let backup_route = format!("{base}/maintenance/metadata/backups");
     let metadata_point = json_response(
@@ -123,11 +155,9 @@ async fn object_pool_backup_replication_restore_and_blank_replacement_preserve_k
     drop(stack.object.take());
     let restored_metadata = stack.root.join("restored-namespace-database");
     assert!(
-        n1_metadata_engine::MetadataEngine::restore_backup(&metadata_snapshot, &restored_metadata)
-            .unwrap()
-            > 0
+        m1::MetadataEngine::restore_backup(&metadata_snapshot, &restored_metadata).unwrap() > 0
     );
-    let ini_path = stack.root.join("n1_config.ini");
+    let ini_path = stack.root.join("m1_config.ini");
     let mut ini = ini::Ini::load_from_file(&ini_path).unwrap();
     ini.with_section(Some("metadata_engine"))
         .set("data_dir", restored_metadata.display().to_string());
@@ -374,7 +404,17 @@ async fn object_pool_backup_replication_restore_and_blank_replacement_preserve_k
             .await
             .is_err()
     );
-    let report = json!({"pool":pool,"backup_replicated_across_hdds":true,"portable_restore":true,"metadata_snapshot_restored":true,"metadata_and_objects_restored_together":true,"blank_member_replacement":true,"source_and_replacement_have_different_inodes":true,"bytes_verified":bytes.len(),"retirement_preserved":true});
+    let report = json!({
+        "pool": pool,
+        "backup_replicated_across_hdds": true,
+        "portable_restore": true,
+        "metadata_snapshot_restored": true,
+        "metadata_and_objects_restored_together": true,
+        "blank_member_replacement": true,
+        "source_and_replacement_have_different_inodes": true,
+        "bytes_verified": bytes.len(),
+        "retirement_preserved": true
+    });
     std::fs::write(
         stack.root.join("RECOVERY-PASSED.json"),
         serde_json::to_vec_pretty(&report).unwrap(),

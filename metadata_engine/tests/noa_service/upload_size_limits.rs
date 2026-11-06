@@ -133,14 +133,28 @@ async fn finite_and_unlimited_policy_on_real_metadata_and_object_engines() {
     let base = format!("{}/noa/v1", stack.url);
     let created = json_response(client.post(format!("{base}/fragments"))
         .json(&json!({"name":"Size policy witness","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(), 201).await;
-    let logged = json_response(client.post(format!("{base}/auth/fragment"))
-        .json(&json!({"fragment":created["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"modify":true,"delete":true}))
-        .send().await.unwrap(), 200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": created["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap();
-    let ini_path = stack.root.join("n1_config.ini");
+    let ini_path = stack.root.join("m1_config.ini");
     let mut ini = ini::Ini::load_from_file(&ini_path).unwrap();
     drop(stack.metadata.take());
-    std::fs::rename(stack.root.join("n1.env"), stack.root.join("metadata.env")).unwrap();
+    std::fs::rename(stack.root.join("m1.env"), stack.root.join("metadata.env")).unwrap();
     ini.with_section(Some("server"))
         .set("env_file", "metadata.env");
     ini.with_section(Some("set_limits"))
@@ -256,20 +270,43 @@ async fn finite_and_unlimited_policy_on_real_metadata_and_object_engines() {
             stack.start_metadata().await;
         }
         // Renew after selecting different JWT credentials for the service.
-        let logged = json_response(client.post(format!("{base}/auth/fragment"))
-            .json(&json!({"fragment":created["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"modify":true,"delete":true}))
-            .send().await.unwrap(), 200).await;
+        let logged = json_response(
+            client
+                .post(format!("{base}/auth/fragment"))
+                .json(&json!({
+                    "fragment": created["fragment_hash"],
+                    "secret": "test-only-fragment",
+                    "read": true,
+                    "write": true,
+                    "modify": true,
+                    "delete": true
+                }))
+                .send()
+                .await
+                .unwrap(),
+            200,
+        )
+        .await;
         let token = logged["access_token"].as_str().unwrap();
         transfers(&client, &base, token, &format!("unlimited-{explicit}")).await;
         large_sessions(&client, &base, token, &format!("large-{explicit}")).await;
-        assert!(!stack.root.join("n1.env").exists());
+        assert!(!stack.root.join("m1.env").exists());
     }
-    std::fs::write(stack.root.join("SIZE-POLICY-PASSED.json"), serde_json::to_vec_pretty(&json!({
-        "passed":true,"finite_cap_bytes":262144,"real_payload_bytes":2097159,
-        "stream_modes":["content-length","chunked"],"large_admission_bytes":[15_u64<<30,1_u64<<40],
-        "unlimited_modes":["omitted","explicit"],"large_payloads_transferred":false,
-        "part_size_and_count_limits_enforced":true
-    })).unwrap()).unwrap();
+    std::fs::write(
+        stack.root.join("SIZE-POLICY-PASSED.json"),
+        serde_json::to_vec_pretty(&json!({
+            "passed": true,
+            "finite_cap_bytes": 262144,
+            "real_payload_bytes": 2097159,
+            "stream_modes": ["content-length","chunked"],
+            "large_admission_bytes": [15_u64<<30,1_u64<<40],
+            "unlimited_modes": ["omitted","explicit"],
+            "large_payloads_transferred": false,
+            "part_size_and_count_limits_enforced": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -298,9 +335,23 @@ async fn running_deployment_unlimited_upload_smoke() {
             .unwrap()
             .trim_end_matches('/')
     );
-    let logged = json_response(client.post(format!("{base}/auth/fragment"))
-        .json(&json!({"fragment":access["fragment"],"secret":access["fragment_key"],"read":true,"write":true,"modify":true,"delete":true}))
-        .send().await.unwrap(), 200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": access["fragment"],
+                "secret": access["fragment_key"],
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap();
     let prefix = format!("__n1-size-test/{}", ulid::Ulid::new());
     transfers(&client, &base, token, &prefix).await;
@@ -308,10 +359,16 @@ async fn running_deployment_unlimited_upload_smoke() {
     if let Some(report) = std::env::var_os("N1_SIZE_TEST_REPORT") {
         std::fs::write(
             report,
-            serde_json::to_vec_pretty(&json!({"passed":true,"payload_bytes":2097159,
-            "byte_verified_transfers":2,"large_admission_bytes":[15_u64<<30,1_u64<<40],
-            "large_session_modes":["standard","durable"],"resume_and_cancel":true,
-            "large_payloads_transferred":false,"part_size_and_count_limits_enforced":true}))
+            serde_json::to_vec_pretty(&json!({
+                "passed": true,
+                "payload_bytes": 2097159,
+                "byte_verified_transfers": 2,
+                "large_admission_bytes": [15_u64<<30,1_u64<<40],
+                "large_session_modes": ["standard","durable"],
+                "resume_and_cancel": true,
+                "large_payloads_transferred": false,
+                "part_size_and_count_limits_enforced": true
+            }))
             .unwrap(),
         )
         .unwrap();
@@ -351,12 +408,31 @@ async fn running_deployment_large_multipart_round_trip() {
             .unwrap()
             .trim_end_matches('/')
     );
-    let logged = json_response(client.post(format!("{base}/auth/fragment"))
-        .json(&json!({"fragment":access["fragment"],"secret":access["fragment_key"],"read":true,"write":true,"modify":true,"delete":true}))
-        .send().await.unwrap(), 200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": access["fragment"],
+                "secret": access["fragment_key"],
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let mut token = logged["access_token"].as_str().unwrap().to_owned();
     let path = format!("__n1-size-test/{}/large-round-trip.bin", ulid::Ulid::new());
-    let shape = json!({"content_type":"application/octet-stream","total_size_bytes":total,"part_size_bytes":part,"expected_parts":total.div_ceil(part)});
+    let shape = json!({
+        "content_type": "application/octet-stream",
+        "total_size_bytes": total,
+        "part_size_bytes": part,
+        "expected_parts": total.div_ceil(part)
+    });
     let upload = json_response(
         client
             .post(format!("{base}/upload/multipart/durable/init/{path}"))
@@ -376,9 +452,23 @@ async fn running_deployment_large_multipart_round_trip() {
     let mut auth_at = std::time::Instant::now();
     for index in 0..total.div_ceil(part) {
         if auth_at.elapsed() > Duration::from_secs(300) {
-            let logged = json_response(client.post(format!("{base}/auth/fragment"))
-                .json(&json!({"fragment":access["fragment"],"secret":access["fragment_key"],"read":true,"write":true,"modify":true,"delete":true}))
-                .send().await.unwrap(), 200).await;
+            let logged = json_response(
+                client
+                    .post(format!("{base}/auth/fragment"))
+                    .json(&json!({
+                        "fragment": access["fragment"],
+                        "secret": access["fragment_key"],
+                        "read": true,
+                        "write": true,
+                        "modify": true,
+                        "delete": true
+                    }))
+                    .send()
+                    .await
+                    .unwrap(),
+                200,
+            )
+            .await;
             token = logged["access_token"].as_str().unwrap().to_owned();
             auth_at = std::time::Instant::now();
         }
@@ -463,11 +553,20 @@ async fn running_deployment_large_multipart_round_trip() {
     }
     assert_eq!(offset, total);
     let download_seconds = started.elapsed().as_secs_f64();
-    let report = json!({"passed":true,"bytes":total,"part_bytes":part,"parts":total.div_ceil(part),
-        "durability":"strict","every_downloaded_byte_compared":true,"repeated_finalize_identical":true,
-        "upload_seconds":upload_seconds,"download_seconds":download_seconds,
-        "upload_mib_per_second":total as f64 / 1048576.0 / upload_seconds,
-        "download_mib_per_second":total as f64 / 1048576.0 / download_seconds,"retained_named_fixture":path});
+    let report = json!({
+        "passed": true,
+        "bytes": total,
+        "part_bytes": part,
+        "parts": total.div_ceil(part),
+        "durability": "strict",
+        "every_downloaded_byte_compared": true,
+        "repeated_finalize_identical": true,
+        "upload_seconds": upload_seconds,
+        "download_seconds": download_seconds,
+        "upload_mib_per_second": total as f64 / 1048576.0 / upload_seconds,
+        "download_mib_per_second": total as f64 / 1048576.0 / download_seconds,
+        "retained_named_fixture": path
+    });
     if let Some(path) = std::env::var_os("N1_SIZE_TEST_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }

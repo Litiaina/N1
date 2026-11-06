@@ -10,7 +10,7 @@ use crate::{
 };
 use std::{collections::BTreeMap, net::SocketAddr};
 
-pub(super) fn validate(settings: &N1Settings) -> Result<()> {
+pub(super) fn validate(settings: &OperatorSettings) -> Result<()> {
     runtime(settings).validate()?;
     // Validate scheduling even before the first pool marker is written.
     maintenance(settings).validate()?;
@@ -29,7 +29,7 @@ pub(super) fn validate(settings: &N1Settings) -> Result<()> {
     Ok(())
 }
 
-fn runtime(s: &N1Settings) -> RuntimeConfig {
+fn runtime(s: &OperatorSettings) -> RuntimeConfig {
     RuntimeConfig {
         io_control: crate::io_control::IoControlConfig {
             foreground_wait_timeout_ms: s.io_control.foreground_wait_timeout_ms,
@@ -58,7 +58,7 @@ fn runtime(s: &N1Settings) -> RuntimeConfig {
     }
 }
 
-fn maintenance(s: &N1Settings) -> MaintenanceConfig {
+fn maintenance(s: &OperatorSettings) -> MaintenanceConfig {
     MaintenanceConfig {
         gc: Some(Schedule {
             every_seconds: s.garbage_collector.cleanup_interval_seconds,
@@ -81,7 +81,7 @@ fn maintenance(s: &N1Settings) -> MaintenanceConfig {
 }
 
 pub(super) fn config(
-    s: &N1Settings,
+    s: &OperatorSettings,
     env: &BTreeMap<String, String>,
     registry: &Registry,
 ) -> Result<Config> {

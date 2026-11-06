@@ -29,9 +29,32 @@ pub async fn serve(
     let mut workers = JoinSet::new();
     loop {
         tokio::select! {
-            _=stop.cancelled()=>break,
-            done=workers.join_next(),if !workers.is_empty()=>{let _=done;},
-            accepted=listener.accept()=>{let(socket,_)=accepted?;let Ok(permit)=slots.clone().try_acquire_owned()else{drop(socket);continue;};socket.set_nodelay(true)?;let app=app.clone();let tls=tls.clone();workers.spawn(async move{let _permit=permit;if let Some(tls)=tls{if let Ok(Ok(socket))=tokio::time::timeout(Duration::from_secs(15),tls.accept(socket)).await{let _=connection(socket,app).await;}}else{let _=connection(socket,app).await;}});}
+            _ = stop.cancelled() => break,
+            done = workers.join_next(), if !workers.is_empty() => {
+                let _ = done;
+            }
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    drop(socket);
+                    continue;
+                };
+                socket.set_nodelay(true)?;
+                let app = app.clone();
+                let tls = tls.clone();
+                workers.spawn(async move {
+                    let _permit = permit;
+                    if let Some(tls) = tls {
+                        if let Ok(Ok(socket)) =
+                            tokio::time::timeout(Duration::from_secs(15), tls.accept(socket)).await
+                        {
+                            let _ = connection(socket, app).await;
+                        }
+                    } else {
+                        let _ = connection(socket, app).await;
+                    }
+                });
+            }
         }
     }
     if tokio::time::timeout(Duration::from_secs(30), async {
@@ -104,9 +127,12 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 ));
             }
             let result = match request.op.as_str() {
-                "ping" => Ok(
-                    json!({"protocol":types::N1_NATIVE_PROTOCOL_VERSION,"server":"Litiaina N1","transport":"n1://","object_api_version":2}),
-                ),
+                "ping" => Ok(json!({
+                    "protocol": types::N1_NATIVE_PROTOCOL_VERSION,
+                    "server": "Litiaina M1",
+                    "transport": "n1://",
+                    "object_api_version": 2
+                })),
                 "auth.clear" | "logout" => {
                     token = None;
                     Ok(json!({"authenticated":false}))
@@ -309,5 +335,14 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 }
 fn session_json(claims: &auth::Claims) -> Value {
-    json!({"authenticated":true,"fragment":claims.fragment,"read":claims.read,"write":claims.write,"modify":claims.modify,"delete":claims.delete,"operator":claims.operator,"expires_at":claims.exp})
+    json!({
+        "authenticated": true,
+        "fragment": claims.fragment,
+        "read": claims.read,
+        "write": claims.write,
+        "modify": claims.modify,
+        "delete": claims.delete,
+        "operator": claims.operator,
+        "expires_at": claims.exp
+    })
 }

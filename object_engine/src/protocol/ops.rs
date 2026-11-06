@@ -74,7 +74,13 @@ impl Service {
         }))
     }
     pub fn ping(&self) -> Value {
-        json!({"engine":"Litiaina N1","version":env!("CARGO_PKG_VERSION"),"placement":"LINK-v1","noa":NOA_VERSION,"native_protocol":WIRE_VERSION})
+        json!({
+            "engine": "Litiaina N1",
+            "version": env!("CARGO_PKG_VERSION"),
+            "placement": "LINK-v1",
+            "noa": NOA_VERSION,
+            "native_protocol": WIRE_VERSION
+        })
     }
 
     pub fn authorize(&self, claims: &Claims, command: &Command) -> Result<()> {
@@ -435,25 +441,50 @@ impl Service {
                 let stale = observed
                     .age_seconds
                     .is_none_or(|age| age > observed.interval_seconds.saturating_mul(2));
-                Ok(
-                    json!({"engine":self.ping(),"node":snapshot["node"],"status":if stale {json!("pending")}else{snapshot["status"].clone()},"observation":observed,
-                    "io":crate::io_control::io_control_snapshot(),"system":snapshot["system"],"capacity":snapshot["capacity"],"pools":snapshot["pools"],
-                    "operations":self.store.activity.status()?,"monitor":self.store.monitor.lock().unwrap_or_else(|error|error.into_inner()).clone(),
-                    "maintenance":crate::core::auto_healing::status(&self.store.operation_gate),"job":self.jobs.status()?,
-                    "configuration":{"native_address":self.config.native_address,"http_address":self.config.http_address,"max_connections":self.config.max_connections,
-                    "max_operations":self.config.max_operations,"operation_memory_bytes":self.config.operation_memory_bytes,"concurrency":self.config.concurrency,
-                    "runtime":self.config.runtime,"read_repair":self.config.read_repair,"scheduled_maintenance":self.config.maintenance}}),
-                )
+                Ok(json!({
+                    "engine": self.ping(),
+                    "node": snapshot["node"],
+                    "status": if stale {
+                        json!("pending")
+                    }else{
+                        snapshot["status"].clone()
+                    },
+                    "observation": observed,
+                    "io": crate::io_control::io_control_snapshot(),
+                    "system": snapshot["system"],
+                    "capacity": snapshot["capacity"],
+                    "pools": snapshot["pools"],
+                    "operations": self.store.activity.status()?,
+                    "monitor": self.store.monitor.lock().unwrap_or_else(|error|error.into_inner()).clone(),
+                    "maintenance": crate::core::auto_healing::status(&self.store.operation_gate),
+                    "job": self.jobs.status()?,
+                    "configuration": {
+                        "native_address": self.config.native_address,
+                        "http_address": self.config.http_address,
+                        "max_connections": self.config.max_connections,
+                        "max_operations": self.config.max_operations,
+                        "operation_memory_bytes": self.config.operation_memory_bytes,
+                        "concurrency": self.config.concurrency,
+                        "runtime": self.config.runtime,
+                        "read_repair": self.config.read_repair,
+                        "scheduled_maintenance": self.config.maintenance
+                    }
+                }))
             }
             // Allocation discovery is immutable configuration, not monitoring.
             // Keep it independent of a slow/cold filesystem observation. Live
             // member readiness and capacity belong to the cached Health call.
-            Command::Pools => Ok(
-                json!({"pools":self.config.pools.iter().enumerate().map(|(i,p)|json!({
-                "id":p.layout.id,"generation":p.layout.generation,"data_shards":p.layout.data_shards,"parity_shards":p.layout.parity_shards,
-                "block_bytes":p.layout.block_bytes,"sealed":p.sealed,"available_members":self.store.pools[i].members.iter().filter(|m|m.is_some()).count()
-            })).collect::<Vec<_>>() }),
-            ),
+            Command::Pools => Ok(json!({
+                "pools": self.config.pools.iter().enumerate().map(|(i,p)|json!({
+                    "id": p.layout.id,
+                    "generation": p.layout.generation,
+                    "data_shards": p.layout.data_shards,
+                    "parity_shards": p.layout.parity_shards,
+                    "block_bytes": p.layout.block_bytes,
+                    "sealed": p.sealed,
+                    "available_members": self.store.pools[i].members.iter().filter(|m|m.is_some()).count()
+                })).collect::<Vec<_>>()
+            })),
             _ => Err(Error::Invalid(
                 "operation requires the streaming or authentication entry point".into(),
             )),

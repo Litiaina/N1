@@ -1,7 +1,7 @@
 //! Offline qualification-only census. Production metadata never opens members.
 use super::{Result, setup::Config};
+use m1::{MetadataEngine, Options, RecordKey, Table};
 use n1_link::{Fingerprint, KeySigner, PoolId, PoolLayout};
-use n1_metadata_engine::{MetadataEngine, Options, RecordKey, Table};
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::Path};
 pub(super) fn census(config: &Config, alias: &str, mode: &str, count: u64) -> Result<Value> {
@@ -165,7 +165,15 @@ pub(super) fn census(config: &Config, alias: &str, mode: &str, count: u64) -> Re
     if physical != versions * pool.width() as u64 || staged != 0 {
         return Err(format!("census expected {} shards and no staging, found {physical} shards / {staged} staging files",versions*pool.width()as u64).into());
     }
-    Ok(
-        json!({"named_objects":entries,"immutable_versions":versions,"unique_LINK_identities":fingerprints.len(),"physical_shards":physical,"unreferenced_shards":0,"wrong_placements":0,"staged_files":staged,"pending_publications":0,"seconds":start.elapsed().as_secs_f64()}),
-    )
+    Ok(json!({
+        "named_objects": entries,
+        "immutable_versions": versions,
+        "unique_LINK_identities": fingerprints.len(),
+        "physical_shards": physical,
+        "unreferenced_shards": 0,
+        "wrong_placements": 0,
+        "staged_files": staged,
+        "pending_publications": 0,
+        "seconds": start.elapsed().as_secs_f64()
+    }))
 }

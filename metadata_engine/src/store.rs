@@ -85,7 +85,7 @@ impl MetadataEngine {
             && std::fs::read_dir(path)?.next().is_some()
         {
             return Err(Error::Incompatible(
-                "metadata directory is not an N1 database or an empty directory".into(),
+                "metadata directory is not an M1 database or an empty directory".into(),
             ));
         }
         let db = OptimisticTxDatabase::builder(path)

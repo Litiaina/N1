@@ -125,12 +125,25 @@ pub fn run(args: Vec<String>) -> Result<()> {
             }
             let wall = start.elapsed().as_secs_f64();
             let after = process(std::process::id())?;
-            rows.push(json!({"round":round+1,"case":names[case],"source_bytes":BYTES,"wall_seconds":wall,"cpu_seconds":after["cpu_seconds"].as_f64().unwrap_or(0.0)-before["cpu_seconds"].as_f64().unwrap_or(0.0),"source_mib_per_second":BYTES as f64 / 1048576.0 / wall}));
+            rows.push(json!({
+                "round": round+1,
+                "case": names[case],
+                "source_bytes": BYTES,
+                "wall_seconds": wall,
+                "cpu_seconds": after["cpu_seconds"].as_f64().unwrap_or(0.0)-before["cpu_seconds"].as_f64().unwrap_or(0.0),
+                "source_mib_per_second": BYTES as f64 / 1048576.0 / wall
+            }));
         }
     }
     private_json(
         output,
-        &json!({"passed":true,"scope":"three rotating-order rounds; hot in-memory buffer; excludes storage, transport, metadata lookup and EC reconstruction; comparison of checksum work, not full-pipeline causal attribution","block_bytes":BLOCK,"source_bytes_per_case":BYTES,"cases":rows}),
+        &json!({
+            "passed": true,
+            "scope": "three rotating-order rounds; hot in-memory buffer; excludes storage, transport, metadata lookup and EC reconstruction; comparison of checksum work, not full-pipeline causal attribution",
+            "block_bytes": BLOCK,
+            "source_bytes_per_case": BYTES,
+            "cases": rows
+        }),
     )?;
     println!("Rust checksum CPU profile: {}", output.display());
     Ok(())

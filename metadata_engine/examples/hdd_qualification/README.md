@@ -1,13 +1,13 @@
-# Physical metadata qualification
+# M1 / ProcyonDB physical storage qualification
 
-`hdd_qualification` tests the metadata storage foundation through its public Rust
+`hdd_qualification` tests M1's ProcyonDB storage foundation through its public Rust
 API. It does not upload object payloads, provide a namespace service, or test
 NOA conformance. All workload generation, concurrent readers/writers, process
 faults, restart validation and exact-byte checks are implemented in Rust.
 
 ```sh
-cargo test -p n1_metadata_engine --example hdd_qualification --locked
-cargo build --release -p n1_metadata_engine --example hdd_qualification --locked
+cargo test -p m1 --example hdd_qualification --locked
+cargo build --release -p m1 --example hdd_qualification --locked
 /path/to/target/release/examples/hdd_qualification run \
   --root /absolute/path/on/HDD/new-run-directory \
   --entries 1000000 --churn 100000 --batch 256 --writers 8 --readers 4

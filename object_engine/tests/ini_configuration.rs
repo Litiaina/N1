@@ -59,9 +59,58 @@ impl Fixture {
         }
         fs::create_dir(root.join("a0")).unwrap();
         let config = format!(
-            "[server]\nhost=127.0.0.1\nhttps_port={http}\nnative_port={native}\nnative_max_connections=7\ncert_path=\nkey_path=\n[disk_config]\nfs_storage_path={}\n[storage_pool.A]\ngeneration=1\nroots={}\ndata_shards=1\nparity_shards=0\nsealed=false\n[upload_config]\nmax_concurrent_io=3\nadaptive_concurrency_enabled=false\nadaptive_concurrency_interval_ms=1500\nwriter_buffer_size=4096\nupload_memory_budget_bytes=67108864\nstream_max_concurrency=4\nstream_chunk_size=65536\nstream_readahead_bytes=131072\nstream_locality_bias_enabled=false\nupload_io_gate_enabled=false\nupload_part_strict_durability_default=true\nmax_part_size=16384\nstripe_block_size=4096\n[io_control]\nforeground_wait_timeout_ms=1100\nstall_threshold_ms=1500\nslow_io_threshold_ms=20\nlatency_samples_per_class=128\n[set_limits]\nmax_file_size=1048576\n[rate_limiter_config]\nenable_rate_limiting=false\n[garbage_collector]\ncleanup_interval_seconds=60\nfile_ttl_seconds=60\ntrash_retention_seconds=2592000\n[auto_healing]\nenabled=false\nscrub_schedule_utc=\ninitial_scan_delay_seconds=0\n",
+            concat!(
+                "[server]\n",
+                "host=127.0.0.1\n",
+                "https_port={http}\n",
+                "native_port={native}\n",
+                "native_max_connections=7\n",
+                "cert_path=\n",
+                "key_path=\n",
+                "[disk_config]\n",
+                "fs_storage_path={}\n",
+                "[storage_pool.A]\n",
+                "generation=1\n",
+                "roots={}\n",
+                "data_shards=1\n",
+                "parity_shards=0\n",
+                "sealed=false\n",
+                "[upload_config]\n",
+                "max_concurrent_io=3\n",
+                "adaptive_concurrency_enabled=false\n",
+                "adaptive_concurrency_interval_ms=1500\n",
+                "writer_buffer_size=4096\n",
+                "upload_memory_budget_bytes=67108864\n",
+                "stream_max_concurrency=4\n",
+                "stream_chunk_size=65536\n",
+                "stream_readahead_bytes=131072\n",
+                "stream_locality_bias_enabled=false\n",
+                "upload_io_gate_enabled=false\n",
+                "upload_part_strict_durability_default=true\n",
+                "max_part_size=16384\n",
+                "stripe_block_size=4096\n",
+                "[io_control]\n",
+                "foreground_wait_timeout_ms=1100\n",
+                "stall_threshold_ms=1500\n",
+                "slow_io_threshold_ms=20\n",
+                "latency_samples_per_class=128\n",
+                "[set_limits]\n",
+                "max_file_size=1048576\n",
+                "[rate_limiter_config]\n",
+                "enable_rate_limiting=false\n",
+                "[garbage_collector]\n",
+                "cleanup_interval_seconds=60\n",
+                "file_ttl_seconds=60\n",
+                "trash_retention_seconds=2592000\n",
+                "[auto_healing]\n",
+                "enabled=false\n",
+                "scrub_schedule_utc=\n",
+                "initial_scan_delay_seconds=0\n",
+            ),
             root.join("control").display(),
-            root.join("a0").display()
+            root.join("a0").display(),
+            http = http,
+            native = native
         );
         fs::write(&ini, config).unwrap();
         let mut env = OpenOptions::new()
@@ -70,7 +119,20 @@ impl Fixture {
             .mode(0o600)
             .open(root.join("n1.env"))
             .unwrap();
-        write!(env,"JWT_SECRET='test-jwt#quoted' # inline comment\nAUTH_KEY='{SECRET}'\nMASTER_KEY=test-master\nADMIN_KEY=test-admin\nACCESS_TOKEN_DEFAULT_TTL_SECS=120\nACCESS_TOKEN_MAX_TTL_SECS=300\nREFRESH_TOKEN_TTL_SECS=600\n").unwrap();
+        write!(
+            env,
+            concat!(
+                "JWT_SECRET='test-jwt#quoted' # inline comment\n",
+                "AUTH_KEY='{SECRET}'\n",
+                "MASTER_KEY=test-master\n",
+                "ADMIN_KEY=test-admin\n",
+                "ACCESS_TOKEN_DEFAULT_TTL_SECS=120\n",
+                "ACCESS_TOKEN_MAX_TTL_SECS=300\n",
+                "REFRESH_TOKEN_TTL_SECS=600\n",
+            ),
+            SECRET = SECRET
+        )
+        .unwrap();
         env.sync_all().unwrap();
         Self {
             _port_guard: port_guard,
@@ -1065,7 +1127,21 @@ async fn physical_ini_pool_expansion_and_scheduled_staging_gc_preserve_old_keys(
     );
     drop(client);
     drop(server);
-    fs::write(f.root.join("PASSED.json"),serde_json::to_vec_pretty(&serde_json::json!({"passed":true,"scope":"INI enrollment/restart/two-HDD expansion and scheduled staging GC", "primary":f.root,"secondary":second,"pool_a":old.pool,"pool_b":new.pool,"verified_bytes":bytes.len(),"scheduled_gc_reclaimed":true})).unwrap()).unwrap();
+    fs::write(
+        f.root.join("PASSED.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "passed": true,
+            "scope": "INI enrollment/restart/two-HDD expansion and scheduled staging GC",
+            "primary": f.root,
+            "secondary": second,
+            "pool_a": old.pool,
+            "pool_b": new.pool,
+            "verified_bytes": bytes.len(),
+            "scheduled_gc_reclaimed": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let kept = f._root.keep();
     println!("physical INI evidence: {}", kept.display());
 }

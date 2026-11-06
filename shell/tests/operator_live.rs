@@ -262,7 +262,35 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
     assert!(generated.status.success());
     private(
         &operator,
-        &json!({"bind":format!("127.0.0.1:{operator_port}"),"token_file":token_file,"tls_cert":certificate,"tls_key":private_key,"allowed_origins":[format!("http://127.0.0.1:{console_port}")],"repositories":{"primary":{"path":repo,"key_file":key}},"engine_config":source,"engine_binary":binary,"online_source":{"credentials_file":source.with_extension("credentials.json"),"repository":"primary"},"replicas":{"remote":{"credentials_file":receiver.with_extension("credentials.json"),"repository":"primary"}},"restore_targets":{"empty":restore_ini},"capture_boundary_seconds":30}),
+        &json!({
+            "bind": format!("127.0.0.1:{operator_port}"),
+            "token_file": token_file,
+            "tls_cert": certificate,
+            "tls_key": private_key,
+            "allowed_origins": [format!("http://127.0.0.1:{console_port}")],
+            "repositories": {
+                "primary": {
+                    "path": repo,
+                    "key_file": key
+                }
+            },
+            "engine_config": source,
+            "engine_binary": binary,
+            "online_source": {
+                "credentials_file": source.with_extension("credentials.json"),
+                "repository": "primary"
+            },
+            "replicas": {
+                "remote": {
+                    "credentials_file": receiver.with_extension("credentials.json"),
+                    "repository": "primary"
+                }
+            },
+            "restore_targets": {
+                "empty": restore_ini
+            },
+            "capture_boundary_seconds": 30
+        }),
     );
     let mut operator_process = start(
         &shell,
@@ -274,7 +302,13 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
     let fixture = root.join("browser.json");
     private(
         &fixture,
-        &json!({"operator":format!("https://127.0.0.1:{operator_port}"),"certificate":certificate,"token_file":token_file,"console_port":console_port,"root":root}),
+        &json!({
+            "operator": format!("https://127.0.0.1:{operator_port}"),
+            "certificate": certificate,
+            "token_file": token_file,
+            "console_port": console_port,
+            "root": root
+        }),
     );
     let console =
         PathBuf::from(std::env::var_os("N1_CONSOLE_REPO").expect("Console repo required"));
@@ -400,6 +434,13 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
     );
     private(
         &root.join("PASSED.json"),
-        &json!({"passed":true,"scope":"real Console, HTTP operator, native replication and 1+0 RAM restore","snapshot":snapshot,"payload_bytes_verified":bytes.len(),"permanent_retirement_verified":true,"replica_verified":true}),
+        &json!({
+            "passed": true,
+            "scope": "real Console, HTTP operator, native replication and 1+0 RAM restore",
+            "snapshot": snapshot,
+            "payload_bytes_verified": bytes.len(),
+            "permanent_retirement_verified": true,
+            "replica_verified": true
+        }),
     );
 }

@@ -1,7 +1,7 @@
 //! Inspect a stopped database copy without printing LINK capabilities or secrets.
 //! Opening an active database is rejected by the normal exclusive database lock.
 use clap::Parser;
-use n1_metadata_engine::{MetadataEngine, Options, RecordKey, Table, fragments};
+use m1::{MetadataEngine, Options, RecordKey, Table, fragments};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -44,11 +44,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &RecordKey::new(fragment.id, format!("pending/{version}"))?,
                 )?
                 .is_some();
-            rows.push(json!({"handle":pending["handle"],"completed":pending["completed"],
-                "created_at_unix":pending["created_at_unix"],"expires_at":pending["upload"]["expires_at"],
-                "has_publication_intent":has_intent,"has_multipart_plan":plan.is_some(),
-                "cancelled":plan.as_ref().map(|p|p["cancelled"].clone()),
-                "durable_mode":plan.as_ref().map(|p|p["durable"].clone())}));
+            rows.push(json!({
+                "handle": pending["handle"],
+                "completed": pending["completed"],
+                "created_at_unix": pending["created_at_unix"],
+                "expires_at": pending["upload"]["expires_at"],
+                "has_publication_intent": has_intent,
+                "has_multipart_plan": plan.is_some(),
+                "cancelled": plan.as_ref().map(|p|p["cancelled"].clone()),
+                "durable_mode": plan.as_ref().map(|p|p["durable"].clone())
+            }));
         }
     }
     println!(

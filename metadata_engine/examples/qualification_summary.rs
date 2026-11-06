@@ -15,7 +15,15 @@ fn distribution(mut values: Vec<f64>) -> Value {
     }
     values.sort_unstable_by(f64::total_cmp);
     let quantile = |p: f64| values[((values.len() as f64 * p).ceil() as usize).saturating_sub(1)];
-    json!({"samples":values.len(),"minimum":values[0],"mean":values.iter().sum::<f64>()/values.len() as f64,"p50":quantile(0.5),"p95":quantile(0.95),"p99":quantile(0.99),"maximum":values[values.len()-1]})
+    json!({
+        "samples": values.len(),
+        "minimum": values[0],
+        "mean": values.iter().sum::<f64>()/values.len() as f64,
+        "p50": quantile(0.5),
+        "p95": quantile(0.95),
+        "p99": quantile(0.99),
+        "maximum": values[values.len()-1]
+    })
 }
 #[derive(Default)]
 struct Process {
@@ -95,7 +103,19 @@ fn run(root: &Path, mode: &str) -> Result<Value> {
     if ticks <= 0 {
         return Err("could not read Linux clock tick frequency".into());
     }
-    let process_rows=processes.iter().map(|(pid,p)| json!({"pid":pid,"role":p.role,"samples":p.samples,"maximum_sampled_rss_kib":p.peak_rss_kib,"observed_user_seconds":p.user_ticks as f64/ticks as f64,"observed_system_seconds":p.system_ticks as f64/ticks as f64})).collect::<Vec<_>>();
+    let process_rows = processes
+        .iter()
+        .map(|(pid, p)| {
+            json!({
+                "pid": pid,
+                "role": p.role,
+                "samples": p.samples,
+                "maximum_sampled_rss_kib": p.peak_rss_kib,
+                "observed_user_seconds": p.user_ticks as f64/ticks as f64,
+                "observed_system_seconds": p.system_ticks as f64/ticks as f64
+            })
+        })
+        .collect::<Vec<_>>();
     let mut browser_heap = Vec::new();
     let mut retained = Vec::new();
     let browser_path = root.join("console-browser-resources.jsonl");
@@ -110,9 +130,25 @@ fn run(root: &Path, mode: &str) -> Result<Value> {
             Ok(())
         })?;
     }
-    Ok(
-        json!({"scope":"Read-only evidence summary; does not create or replace a campaign pass","terminal_report":passed,"http_batch_latency_milliseconds":distribution(latency),"objects_per_http_batch":distribution(batch_sizes),"resources":{"samples":samples,"first_unix":first_unix,"last_unix":last_unix,"combined_sampled_rss_kib":distribution(combined_rss),"processes":process_rows,"limits":"One-second snapshots can miss peaks and final CPU work before exit. Combined RSS covers object, metadata and Rust supervisor only; shared mappings can be counted more than once. CPU values are sampled cumulative counters, not GNU-time totals."},"browser":{"javascript_used_heap_bytes":distribution(browser_heap),"retained_upload_items":distribution(retained),"limits":"JavaScript heap is not browser process RSS; Chromium/native allocations are outside it."}}),
-    )
+    Ok(json!({
+        "scope": "Read-only evidence summary; does not create or replace a campaign pass",
+        "terminal_report": passed,
+        "http_batch_latency_milliseconds": distribution(latency),
+        "objects_per_http_batch": distribution(batch_sizes),
+        "resources": {
+            "samples": samples,
+            "first_unix": first_unix,
+            "last_unix": last_unix,
+            "combined_sampled_rss_kib": distribution(combined_rss),
+            "processes": process_rows,
+            "limits": "One-second snapshots can miss peaks and final CPU work before exit. Combined RSS covers object, metadata and Rust supervisor only; shared mappings can be counted more than once. CPU values are sampled cumulative counters, not GNU-time totals."
+        },
+        "browser": {
+            "javascript_used_heap_bytes": distribution(browser_heap),
+            "retained_upload_items": distribution(retained),
+            "limits": "JavaScript heap is not browser process RSS; Chromium/native allocations are outside it."
+        }
+    }))
 }
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();

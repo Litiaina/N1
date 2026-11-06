@@ -4,8 +4,15 @@ impl Proof {
         use tokio::io::AsyncWriteExt;
         let mut stream = TcpStream::connect(("127.0.0.1", self.native_port())).await?;
         ensure_native_ok(&native_round_trip(&mut stream, "flat-auth", "auth.fragment",
-            json!({"fragment":self.fragment,"secret":self.args.fragment_key,
-                "read":true,"write":true,"modify":true,"delete":true,"expires_in":3600}), None).await?,
+            json!({
+                "fragment": self.fragment,
+                "secret": self.args.fragment_key,
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true,
+                "expires_in": 3600
+            }), None).await?,
             "flat native auth")?;
         let mut samples = Vec::new();
         for embedded in [false, true] {
@@ -383,12 +390,26 @@ impl Proof {
             .await?;
         self.assert_health_clean("flat final").await?;
         self.stop_server()?;
-        self.summary = json!({"status":"PASS", "proof":"n1_v4_flat_namespace", "topology":"3+1",
-            "namespace_replicas":2, "wide_objects":count, "listing_page_ms":latency,
-            "same_key_versions":32, "file_prefix_coexistence":"PASS", "copy_delete_payload_immutability":"PASS",
-            "prefix_partial_conflicts":"PASS", "prefix_trash_recover":"PASS", "internal_suffix_keys":"PASS",
-            "ncx_corruption_repair":"PASS", "degraded_cold_restart":"PASS", "degraded_mutation_fence":"PASS",
-            "concurrent_standard_batch":batch,"native_direct_publication":"PASS","public_upload_layout_redacted":"PASS"});
+        self.summary = json!({
+            "status": "PASS",
+            "proof": "n1_v4_flat_namespace",
+            "topology": "3+1",
+            "namespace_replicas": 2,
+            "wide_objects": count,
+            "listing_page_ms": latency,
+            "same_key_versions": 32,
+            "file_prefix_coexistence": "PASS",
+            "copy_delete_payload_immutability": "PASS",
+            "prefix_partial_conflicts": "PASS",
+            "prefix_trash_recover": "PASS",
+            "internal_suffix_keys": "PASS",
+            "ncx_corruption_repair": "PASS",
+            "degraded_cold_restart": "PASS",
+            "degraded_mutation_fence": "PASS",
+            "concurrent_standard_batch": batch,
+            "native_direct_publication": "PASS",
+            "public_upload_layout_redacted": "PASS"
+        });
         self.write_summary()?;
         Ok(())
     }
@@ -516,9 +537,24 @@ impl Proof {
         self.assert_download_sha256("new/object.bin", &checksum)
             .await?;
         self.stop_server()?;
-        self.summary = json!({"status":"PASS", "proof":"n1_v4_mixed_pool_expansion", "old_pool":"1+0", "new_pool":"2+1",
-            "old_pool_immutable":"PASS", "new_pool_placement":"PASS", "no_mandatory_rebalance":"PASS", "restart":"PASS", "geometry_edit_rejected":"PASS", "pool_removal_rejected_without_identity_writes":"PASS",
-            "pool_health_http_native":"PASS", "pool_health_scoping":"PASS", "pool_health_failure_isolation":"PASS", "pool_health_crc_detection_without_repair":"PASS", "existing_key_version_expands_into_new_pool":"PASS", "cross_pool_version_reference_verified":"PASS"});
+        self.summary = json!({
+            "status": "PASS",
+            "proof": "n1_v4_mixed_pool_expansion",
+            "old_pool": "1+0",
+            "new_pool": "2+1",
+            "old_pool_immutable": "PASS",
+            "new_pool_placement": "PASS",
+            "no_mandatory_rebalance": "PASS",
+            "restart": "PASS",
+            "geometry_edit_rejected": "PASS",
+            "pool_removal_rejected_without_identity_writes": "PASS",
+            "pool_health_http_native": "PASS",
+            "pool_health_scoping": "PASS",
+            "pool_health_failure_isolation": "PASS",
+            "pool_health_crc_detection_without_repair": "PASS",
+            "existing_key_version_expands_into_new_pool": "PASS",
+            "cross_pool_version_reference_verified": "PASS"
+        });
         self.write_summary()?;
         Ok(())
     }
@@ -553,7 +589,15 @@ impl Proof {
         if self.client.get(&url).bearer_auth(&self.token).query(&[("fragment", other)]).send().await?.status() != StatusCode::FORBIDDEN {
             return Err("pool diagnostics exposed another authenticated fragment's content scope".into());
         }
-        let auth = self.client.post(format!("{}/noa/v1/auth/fragment", self.base_url)).json(&json!({"fragment":self.fragment,"secret":self.args.fragment_key,"read":false,"write":true,"modify":false,"delete":false,"expires_in":3600})).send().await?;
+        let auth = self.client.post(format!("{}/noa/v1/auth/fragment", self.base_url)).json(&json!({
+            "fragment": self.fragment,
+            "secret": self.args.fragment_key,
+            "read": false,
+            "write": true,
+            "modify": false,
+            "delete": false,
+            "expires_in": 3600
+        })).send().await?;
         if auth.status() != StatusCode::OK { return Err("pool proof could not obtain a write-only token".into()); }
         let write_only = auth.json::<AuthResponse>().await?.access_token;
         if self.client.get(&url).bearer_auth(write_only).send().await?.status() != StatusCode::FORBIDDEN {

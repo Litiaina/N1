@@ -1,8 +1,15 @@
-# N1 metadata engine
+# M1 — Litiaina metadata store
 
-N1's optional metadata component is built on the ProcyonDB transactional storage
-core in [`storage/`](storage). It is a main Cargo workspace component alongside
-[`object_engine/`](../object_engine). The object engine runs independently.
+M1 is the metadata store in the N1 repository. It is built on the **ProcyonDB**
+transactional storage core in [`storage/`](storage). Cargo package/crate `m1`
+builds the `litiaina-m1` binary. N1, the independent **LINK object store**, lives
+in [`object_engine/`](../object_engine) and does not depend on M1 or ProcyonDB.
+
+`Console / named client → M1 → N1 (LINK) → shards`
+
+M1's defaults are `m1_config.ini` and an optional private `m1.env`; explicit
+config paths, `[server] env_file` and service environment provisioning remain
+available. The integration INI section retains its `[metadata_engine]` name.
 
 The integrated foundation provides durable optimistic transactions, consistent
 snapshots, fragment-scoped record keys, bounded prefix pagination, owned blocking
@@ -14,7 +21,7 @@ original console. INI configuration preserves operator listen, TLS and resource
 controls. Remaining product integration and qualification gates are tracked in
 [the implementation ledger](../docs/RC2-IMPLEMENTATION.md).
 
-See [the architecture, API boundary and validation contract](../docs/METADATA-ENGINE.md)
+See [the architecture, API boundary and validation contract](../docs/M1.md)
 and [the storage provenance](storage/UPSTREAM.md).
 
 The [Rust physical qualification harness](examples/hdd_qualification/README.md)

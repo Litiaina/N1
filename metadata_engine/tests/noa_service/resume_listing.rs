@@ -12,8 +12,22 @@ async fn interrupted_upload_listing_and_resume_survive_metadata_restart() {
     let base = format!("{}/noa/v1", stack.url);
     let created = json_response(client.post(format!("{base}/fragments"))
         .json(&json!({"name":"Resume witness","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
-    let logged = json_response(client.post(format!("{base}/auth/fragment"))
-        .json(&json!({"fragment":created["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"delete":true})).send().await.unwrap(),200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": created["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap();
     for durable in [false, true] {
         let route = format!(

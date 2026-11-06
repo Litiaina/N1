@@ -431,9 +431,12 @@ impl Manager {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.tick().await; // First scheduled pass follows one interval.
                 loop {
-                    tokio::select! { _=this.stop.cancelled()=>break,_=interval.tick()=>{
-                        let _=this.start(Kind::Gc,this.default_request(None)).await;
-                    } }
+                    tokio::select! {
+                        _ = this.stop.cancelled() => break,
+                        _ = interval.tick() => {
+                            let _ = this.start(Kind::Gc, this.default_request(None)).await;
+                        }
+                    }
                 }
             });
             *self.scheduler.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);

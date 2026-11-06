@@ -44,6 +44,9 @@ async fn monitoring_is_scoped_cached_independent_and_metadata_backup_restores_na
         first["components"]["object"]["status"], "healthy",
         "{first}"
     );
+    assert_eq!(first["components"]["metadata"]["product"], "M1");
+    assert_eq!(first["components"]["metadata"]["database"], "ProcyonDB");
+    assert_eq!(first["components"]["object"]["product"], "N1");
     let metadata_pid = first["components"]["metadata"]["node"]["pid"]
         .as_u64()
         .unwrap();
@@ -236,12 +239,12 @@ async fn monitoring_is_scoped_cached_independent_and_metadata_backup_restores_na
     let file = stack.root.join("downloaded.n1meta");
     std::fs::write(&file, &archive).unwrap();
     let restored = stack.root.join("restored-metadata");
-    assert!(n1_metadata_engine::MetadataEngine::restore_backup(&file, &restored).unwrap() > 0);
+    assert!(m1::MetadataEngine::restore_backup(&file, &restored).unwrap() > 0);
     drop(stack.metadata.take());
-    let mut ini = ini::Ini::load_from_file(stack.root.join("n1_config.ini")).unwrap();
+    let mut ini = ini::Ini::load_from_file(stack.root.join("m1_config.ini")).unwrap();
     ini.with_section(Some("metadata_engine"))
         .set("data_dir", restored.display().to_string());
-    ini.write_to_file(stack.root.join("n1_config.ini")).unwrap();
+    ini.write_to_file(stack.root.join("m1_config.ini")).unwrap();
     stack.start_metadata().await;
     let response = client
         .get(format!("{base}/objects/get/{path}"))

@@ -59,7 +59,22 @@ async fn durable_part_acknowledgements_resume_without_object_reads_after_both_pr
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
     let created=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"ACK resume","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
-    let logged=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":created["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"delete":true})).send().await.unwrap(),200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": created["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap();
     for durable in [false, true] {
         let route = format!(
@@ -200,21 +215,14 @@ async fn durable_part_acknowledgements_resume_without_object_reads_after_both_pr
         );
         // Publication atomically removed every progress page.
         drop(stack.metadata.take());
-        let config =
-            n1_metadata_engine::server::ServerConfig::load(&stack.root.join("n1_config.ini"))
-                .unwrap();
-        let db = n1_metadata_engine::MetadataEngine::open(
-            &config.data_dir,
-            n1_metadata_engine::Options::default(),
-        )
-        .unwrap();
+        let config = m1::server::ServerConfig::load(&stack.root.join("m1_config.ini")).unwrap();
+        let db = m1::MetadataEngine::open(&config.data_dir, m1::Options::default()).unwrap();
         let fragment =
-            n1_metadata_engine::fragments::resolve(&db, created["fragment_hash"].as_str().unwrap())
-                .unwrap();
+            m1::fragments::resolve(&db, created["fragment_hash"].as_str().unwrap()).unwrap();
         assert!(
             db.snapshot()
                 .scan(
-                    n1_metadata_engine::Table::Reclamation,
+                    m1::Table::Reclamation,
                     fragment.id,
                     &format!("upload-progress/{version}/"),
                     None,

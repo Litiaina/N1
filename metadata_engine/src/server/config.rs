@@ -58,10 +58,10 @@ impl ServerConfig {
     }
 
     pub fn load(path: &Path) -> ApiResult<Self> {
-        let settings = cli_core::settings::N1Settings::load_metadata(path)
+        let settings = cli_core::settings::OperatorSettings::load_metadata(path)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
         let env = settings
-            .read_env()
+            .read_env("m1.env")
             .map_err(|_| ApiError::invalid("invalid or incomplete service credentials"))?;
         let ini = ini::Ini::load_from_file(path)
             .map_err(|_| ApiError::invalid("cannot read metadata INI"))?;

@@ -4,10 +4,12 @@ Imported from Litiaina's ProcyonDB repository, directory `engine/`, commit
 `7ee9a0685540b1d5a1d182379122d74b436907b2` (the source project remains unchanged).
 Repository: <https://github.com/Litiaina/procyon-db>.
 Package/library names remain `procyon-engine` / `procyon_engine`.
+This database foundation is used inside **M1**, the metadata store. **N1** is
+the independent LINK object store and has no ProcyonDB dependency.
 All original source modules, regression tests and binary recovery fixtures were
 retained. The original full Procyon project is archived with the integration
 evidence; its generic document service, Procyon wire protocols, HTTP listeners,
-shell, benchmark executable and development certificates are not N1 services.
+shell, benchmark executable and development certificates are not N1 or M1 services.
 
 Copyright and the existing `LICENSE-APACHE` and `LICENSE-MIT` notices are retained.
 The Fjall-derived source is not represented as newly authored N1 database code.

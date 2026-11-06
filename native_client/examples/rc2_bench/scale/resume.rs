@@ -140,13 +140,17 @@ async fn execute(
     private_json(
         &directory.join("resume-ready.json"),
         &json!({
-            "original_root":root,"source_checkpoint":source,"engine_sha256":engine_sha,
-            "client_sha256":format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?)),
-            "objects":count,"preserved_acknowledged":preserved,"prefixes":snapshots,
-            "preparation_seconds":preparation.elapsed().as_secs_f64(),
-            "policy":"acknowledged prefix is read-only; unacknowledged intents reuse the exact ticket; original files never modified",
-            "timing":"initial interrupted phase has sampled timing only; resume metrics describe remaining PUT work, not an uninterrupted full-campaign benchmark",
-            "client_journals":"fdatasync on bounded blocking workers; no persistence I/O on Tokio runtime threads"
+            "original_root": root,
+            "source_checkpoint": source,
+            "engine_sha256": engine_sha,
+            "client_sha256": format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?)),
+            "objects": count,
+            "preserved_acknowledged": preserved,
+            "prefixes": snapshots,
+            "preparation_seconds": preparation.elapsed().as_secs_f64(),
+            "policy": "acknowledged prefix is read-only; unacknowledged intents reuse the exact ticket; original files never modified",
+            "timing": "initial interrupted phase has sampled timing only; resume metrics describe remaining PUT work, not an uninterrupted full-campaign benchmark",
+            "client_journals": "fdatasync on bounded blocking workers; no persistence I/O on Tokio runtime threads"
         }),
     )?;
     File::open(directory)?.sync_all()?;
@@ -258,13 +262,23 @@ async fn execute(
     private_json(
         &directory.join("PASSED.json"),
         &json!({
-            "passed":true,"durably_acknowledged":count,"verified_after_sigkill":count,
-            "preserved_acknowledged_objects_not_reuploaded":preserved,"resumed_acknowledgements":count-preserved,
-            "unacknowledged_intents_retried":progress.retried.load(Ordering::Relaxed),
-            "lost_reply_objects_already_finalized":progress.already_finalized.load(Ordering::Relaxed),
-            "upload":upload,"verification":verification,"restart_seconds":restart_seconds,
-            "source_bytes":original_bytes+bytes,"crash_status":status.to_string(),"failures":0,"clean_final_shutdown":true,
-            "original_root":root,"source_checkpoint":source,"engine_sha256":engine_sha
+            "passed": true,
+            "durably_acknowledged": count,
+            "verified_after_sigkill": count,
+            "preserved_acknowledged_objects_not_reuploaded": preserved,
+            "resumed_acknowledgements": count-preserved,
+            "unacknowledged_intents_retried": progress.retried.load(Ordering::Relaxed),
+            "lost_reply_objects_already_finalized": progress.already_finalized.load(Ordering::Relaxed),
+            "upload": upload,
+            "verification": verification,
+            "restart_seconds": restart_seconds,
+            "source_bytes": original_bytes+bytes,
+            "crash_status": status.to_string(),
+            "failures": 0,
+            "clean_final_shutdown": true,
+            "original_root": root,
+            "source_checkpoint": source,
+            "engine_sha256": engine_sha
         }),
     )?;
     println!(

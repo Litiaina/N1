@@ -70,7 +70,11 @@ fn start(root: &Path, component: &str, binary: &Path, output: &Path) -> Result<S
     Ok(Server(
         Command::new(binary)
             .arg("--config")
-            .arg(root.join(component).join("n1_config.ini"))
+            .arg(root.join(component).join(if component == "metadata" {
+                "m1_config.ini"
+            } else {
+                "n1_config.ini"
+            }))
             .current_dir(root.join(component))
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
@@ -249,7 +253,19 @@ async fn main() -> Result<()> {
             .ok_or("fixture identity missing")?
     );
     let alias = hex::encode(Sha256::digest(label.as_bytes()));
-    let login=client.post(url.join("/noa/v1/auth/fragment")?).json(&json!({"fragment":alias,"secret":config["fragment_secret"],"read":true,"write":false,"modify":false,"delete":false,"expires_in":3600})).send().await?;
+    let login = client
+        .post(url.join("/noa/v1/auth/fragment")?)
+        .json(&json!({
+            "fragment": alias,
+            "secret": config["fragment_secret"],
+            "read": true,
+            "write": false,
+            "modify": false,
+            "delete": false,
+            "expires_in": 3600
+        }))
+        .send()
+        .await?;
     if login.status() != 200 {
         return Err("audit read-only login failed".into());
     }
@@ -295,7 +311,21 @@ async fn main() -> Result<()> {
         )
         .await?;
     }
-    let report = json!({"passed":true,"scope":"Every journaled ACK and any captured successful mixed-batch row, exact original executables, read-only API token after process restart; no PUT or failed-row retry","verified_journaled_acks":acknowledgements.len(),"verified_ack_bytes":verified_ack_bytes,"verified_success_rows":successes.len(),"verified_bytes":total,"mixed_response_captured":response.is_some(),"captured_failed_rows":response.as_ref().map(|_|rows.len()-successes.len()),"version_mismatches":0,"payload_mismatches":0,"failed_campaign_remains_failed":true,"original_metadata_snapshot":"metadata-before-reopen","note":"Unacknowledged outcomes outside a captured response are not classified. Ordinary server startup may reconcile physically completed pending metadata publications; the pre-open database copy is retained."});
+    let report = json!({
+        "passed": true,
+        "scope": "Every journaled ACK and any captured successful mixed-batch row, exact original executables, read-only API token after process restart; no PUT or failed-row retry",
+        "verified_journaled_acks": acknowledgements.len(),
+        "verified_ack_bytes": verified_ack_bytes,
+        "verified_success_rows": successes.len(),
+        "verified_bytes": total,
+        "mixed_response_captured": response.is_some(),
+        "captured_failed_rows": response.as_ref().map(|_|rows.len()-successes.len()),
+        "version_mismatches": 0,
+        "payload_mismatches": 0,
+        "failed_campaign_remains_failed": true,
+        "original_metadata_snapshot": "metadata-before-reopen",
+        "note": "Unacknowledged outcomes outside a captured response are not classified. Ordinary server startup may reconcile physically completed pending metadata publications; the pre-open database copy is retained."
+    });
     let mut output = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)

@@ -155,7 +155,13 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
                 crate::settings::config::Config::load(&config)?,
             )?;
             let point = capture::offline(&repo, &service.store)?;
-            serde_json::json!({"id":point.id,"capture_mode":point.capture_mode,"files":point.files,"source_bytes":point.source_bytes,"service_control":point.service_control.is_some()})
+            serde_json::json!({
+                "id": point.id,
+                "capture_mode": point.capture_mode,
+                "files": point.files,
+                "source_bytes": point.source_bytes,
+                "service_control": point.service_control.is_some()
+            })
         }
         Action::List {
             repository,
@@ -195,7 +201,12 @@ pub fn run_from(args: Vec<std::ffi::OsString>) -> Result<()> {
             if let Some(output) = &output_config {
                 super::control::restore(&repo, &point, output, &target)?;
             }
-            serde_json::json!({"restored":snapshot,"targets":target,"configuration":output_config,"service_control_available":point.service_control.is_some()})
+            serde_json::json!({
+                "restored": snapshot,
+                "targets": target,
+                "configuration": output_config,
+                "service_control_available": point.service_control.is_some()
+            })
         }
         Action::Replicate {
             repository,

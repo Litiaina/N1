@@ -637,7 +637,21 @@ mod tests {
         .await;
         let stat = request(stream).await;
         assert!(matches!(stat.command, Command::ObjectStat { .. }));
-        respond(stream, Response::ok(stat.id, json!({"total_bytes":17,"data_shards":1,"parity_shards":1,"finalized_shards":2,"integrity_algorithm":"LINK-SHA256-tree-v2","integrity_root":"ab".repeat(32)}))).await;
+        respond(
+            stream,
+            Response::ok(
+                stat.id,
+                json!({
+                    "total_bytes": 17,
+                    "data_shards": 1,
+                    "parity_shards": 1,
+                    "finalized_shards": 2,
+                    "integrity_algorithm": "LINK-SHA256-tree-v2",
+                    "integrity_root": "ab".repeat(32)
+                }),
+            ),
+        )
+        .await;
     }
 
     #[tokio::test]

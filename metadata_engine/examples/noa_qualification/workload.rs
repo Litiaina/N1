@@ -69,7 +69,20 @@ impl Api {
         Ok(api)
     }
     pub async fn login(&self) -> Result<Value> {
-        let response=self.client.post(format!("{}/noa/v1/auth/fragment",self.url)).json(&json!({"fragment":self.fragment,"secret":self.secret,"read":true,"write":true,"modify":true,"delete":true,"expires_in":86400})).send().await?;
+        let response = self
+            .client
+            .post(format!("{}/noa/v1/auth/fragment", self.url))
+            .json(&json!({
+                "fragment": self.fragment,
+                "secret": self.secret,
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true,
+                "expires_in": 86400
+            }))
+            .send()
+            .await?;
         if response.status() != 200 {
             return Err(format!(
                 "qualification authentication returned {}",
@@ -80,7 +93,7 @@ impl Api {
         Ok(response.json().await?)
     }
     async fn token(&self) -> Result<String> {
-        let now = n1_metadata_engine::middleware::auth::now();
+        let now = m1::middleware::auth::now();
         {
             let token = self.token.read().await;
             if token.1 > now + 60 {
@@ -190,7 +203,12 @@ pub async fn populate(api: Api, root: &Path, count: u64, writers: usize) -> Resu
     writeln!(samples,"{}",json!({"count":missing.len(),"milliseconds":begin.elapsed().as_secs_f64()*1000.0}))?;samples.flush()?;
    }
    writeln!(journal,"{}",serde_json::to_string(&rows)?)?;journal.flush()?;journal.sync_all()?;let current=done.fetch_add(rows.len()as u64,Ordering::Relaxed)+rows.len()as u64;
-   if current/10000!=(current-rows.len()as u64)/10000{println!("{}",json!({"event":"api-upload-progress","acknowledged":current,"count":count,"elapsed_seconds":started.elapsed().as_secs_f64()}));}
+   if current/10000!=(current-rows.len()as u64)/10000{println!("{}",json!({
+       "event": "api-upload-progress",
+       "acknowledged": current,
+       "count": count,
+       "elapsed_seconds": started.elapsed().as_secs_f64()
+   }));}
   }Ok::<(),Box<dyn std::error::Error+Send+Sync>>(())
  });
     }
@@ -254,11 +272,27 @@ pub async fn verify(
             let mut bytes = 0u64;
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= count { break; }
-                bytes += verify_object(&api, &mode, index, acks[index as usize].ok_or("missing expected version")?).await?;
+                if index >= count {
+                    break;
+                }
+                bytes += verify_object(
+                    &api,
+                    &mode,
+                    index,
+                    acks[index as usize].ok_or("missing expected version")?,
+                )
+                .await?;
                 let current = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if current.is_multiple_of(10000) {
-                    println!("{}", json!({"event":"post-restart-verify-progress", "verified":current,"count":count,"elapsed_seconds":start.elapsed().as_secs_f64()}));
+                    println!(
+                        "{}",
+                        json!({
+                            "event": "post-restart-verify-progress",
+                            "verified": current,
+                            "count": count,
+                            "elapsed_seconds": start.elapsed().as_secs_f64()
+                        })
+                    );
                 }
             }
             Ok::<u64, Box<dyn std::error::Error + Send + Sync>>(bytes)
@@ -271,9 +305,13 @@ pub async fn verify(
     if bytes != logical_bytes(count) {
         return Err("verification logical byte count mismatch".into());
     }
-    Ok(
-        json!({"verified":done.load(Ordering::Relaxed),"bytes":bytes,"seconds":start.elapsed().as_secs_f64(),"payload_mismatches":0,"version_mismatches":0}),
-    )
+    Ok(json!({
+        "verified": done.load(Ordering::Relaxed),
+        "bytes": bytes,
+        "seconds": start.elapsed().as_secs_f64(),
+        "payload_mismatches": 0,
+        "version_mismatches": 0
+    }))
 }
 
 async fn verify_object(

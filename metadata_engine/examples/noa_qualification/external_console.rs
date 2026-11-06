@@ -25,7 +25,14 @@ fn private_json(path: &Path) -> Result<Value> {
 }
 pub(super) async fn run(args: &Args, api: &Api, url: &str) -> Result<Value> {
     let nonce = ulid::Ulid::new().to_string();
-    let client = json!({"format":1,"nonce":nonce,"count":args.count,"fragment":api.fragment,"api_url":url,"auth":api.login().await?});
+    let client = json!({
+        "format": 1,
+        "nonce": nonce,
+        "count": args.count,
+        "fragment": api.fragment,
+        "api_url": url,
+        "auth": api.login().await?
+    });
     let target = args.root.join("external-console-client.json");
     let temporary = args
         .root
@@ -68,9 +75,12 @@ pub(super) async fn run(args: &Args, api: &Api, url: &str) -> Result<Value> {
                         "external browser did not acknowledge this entire population".into(),
                     );
                 }
-                return Ok(
-                    json!({"prior_acknowledged":prior,"acknowledged_this_invocation":args.count-prior,"total_acknowledged":args.count,"browser_host":"external; original console and proxy through operator SSH forwarding"}),
-                );
+                return Ok(json!({
+                    "prior_acknowledged": prior,
+                    "acknowledged_this_invocation": args.count-prior,
+                    "total_acknowledged": args.count,
+                    "browser_host": "external; original console and proxy through operator SSH forwarding"
+                }));
             }
         }
         if tokio::time::Instant::now() >= deadline {

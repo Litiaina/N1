@@ -147,9 +147,23 @@ async fn main() -> Result<()> {
             .ok_or("missing metadata URL")?
             .trim_end_matches('/')
     );
-    let logged = http(client.post(format!("{base}/auth/fragment"))
-        .json(&json!({"fragment":access["fragment"],"secret":access["fragment_key"],"read":true,"write":true,"modify":true,"delete":true,"expires_in":21600}))
-        .send().await?, 200).await?;
+    let logged = http(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": access["fragment"],
+                "secret": access["fragment_key"],
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true,
+                "expires_in": 21600
+            }))
+            .send()
+            .await?,
+        200,
+    )
+    .await?;
     let token = logged["access_token"]
         .as_str()
         .ok_or("missing token")?
@@ -159,7 +173,12 @@ async fn main() -> Result<()> {
         ulid::Ulid::new(),
         args.mode
     );
-    let shape = json!({"content_type":"application/octet-stream","total_size_bytes":args.bytes,"part_size_bytes":args.part_bytes,"expected_parts":args.bytes.div_ceil(args.part_bytes)});
+    let shape = json!({
+        "content_type": "application/octet-stream",
+        "total_size_bytes": args.bytes,
+        "part_size_bytes": args.part_bytes,
+        "expected_parts": args.bytes.div_ceil(args.part_bytes)
+    });
     let multipart = format!(
         "{base}/upload/multipart{}",
         if args.session_mode == "durable" {
@@ -339,7 +358,14 @@ async fn main() -> Result<()> {
         if length != args.bytes || &actual_hash != expected_hash {
             return Err("full download length/SHA-256 mismatch".into());
         }
-        download_report = json!({"bytes":length,"seconds":seconds,"mib_per_second":length as f64/1048576.0/seconds,"headers_seconds":headers_seconds,"sha256":actual_hash,"resources":download_watch.finish().await?});
+        download_report = json!({
+            "bytes": length,
+            "seconds": seconds,
+            "mib_per_second": length as f64/1048576.0/seconds,
+            "headers_seconds": headers_seconds,
+            "sha256": actual_hash,
+            "resources": download_watch.finish().await?
+        });
     }
     // Verification is outside the measured upload interval.
     for offset in if args.full_download {
@@ -378,12 +404,40 @@ async fn main() -> Result<()> {
             return Err("sample payload mismatch".into());
         }
     }
-    let report = json!({"passed":true,"mode":args.mode,"bytes":args.bytes,"part_bytes":args.part_bytes,"concurrency":args.concurrency,
-        "durability":"strict","init_seconds":init_seconds,"parts_seconds":parts_seconds,"finalize_seconds":finalize_seconds,
-        "upload_seconds":seconds,"upload_mib_per_second":args.bytes as f64 / 1048576.0 / seconds,
-        "part_latency":latency(rows.iter().map(|v|v["milliseconds"].as_f64().unwrap()).collect()),"resources":resource,
-        "verified_ranges":if args.full_download {0} else {3},"verified_bytes":if args.full_download {args.bytes} else {196608},"full_download_verified":args.full_download,"download":download_report,
-        "session_mode":args.session_mode,"expected_source_sha256":expected_hash,"retained_named_path":if args.mode!="native" {Some(named)} else {None}});
+    let report = json!({
+        "passed": true,
+        "mode": args.mode,
+        "bytes": args.bytes,
+        "part_bytes": args.part_bytes,
+        "concurrency": args.concurrency,
+        "durability": "strict",
+        "init_seconds": init_seconds,
+        "parts_seconds": parts_seconds,
+        "finalize_seconds": finalize_seconds,
+        "upload_seconds": seconds,
+        "upload_mib_per_second": args.bytes as f64 / 1048576.0 / seconds,
+        "part_latency": latency(rows.iter().map(|v|v["milliseconds"].as_f64().unwrap()).collect()),
+        "resources": resource,
+        "verified_ranges": if args.full_download {
+            0
+        } else {
+            3
+        },
+        "verified_bytes": if args.full_download {
+            args.bytes
+        } else {
+            196608
+        },
+        "full_download_verified": args.full_download,
+        "download": download_report,
+        "session_mode": args.session_mode,
+        "expected_source_sha256": expected_hash,
+        "retained_named_path": if args.mode!="native" {
+            Some(named)
+        } else {
+            None
+        }
+    });
     std::fs::write(
         args.output.join("PASSED.json"),
         serde_json::to_vec_pretty(&report)?,

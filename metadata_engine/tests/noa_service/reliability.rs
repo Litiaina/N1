@@ -1,8 +1,8 @@
 //! Destructive faults target only newly-created fixture directories. External
 //! client oracles and immutable backup archives survive all injected failures.
 use super::*;
+use m1::{MetadataEngine, Options, RecordKey, Table};
 use n1_link::{PoolId, noa::Command as ObjectCommand};
-use n1_metadata_engine::{MetadataEngine, Options, RecordKey, Table};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::Write, os::unix::fs::OpenOptionsExt};
 
@@ -36,8 +36,12 @@ pub(super) async fn fragment(client: &Client, base: &str, name: &str) -> (String
         client
             .post(format!("{base}/auth/fragment"))
             .json(&json!({
-                "fragment":alias,"secret":"test-only-fragment","read":true,
-                "write":true,"modify":true,"delete":true
+                "fragment": alias,
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
             }))
             .send()
             .await
@@ -210,15 +214,10 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
     // Close every metadata owner before taking a complete, stable backup. No
     // acknowledged operation after this point is claimed to be in the snapshot.
     drop(stack.metadata.take());
-    let config =
-        n1_metadata_engine::server::ServerConfig::load(&stack.root.join("n1_config.ini")).unwrap();
+    let config = m1::server::ServerConfig::load(&stack.root.join("m1_config.ini")).unwrap();
     let db = MetadataEngine::open(&config.data_dir, Options::default()).unwrap();
     for (alias, _) in &identities {
-        scopes.push(
-            n1_metadata_engine::fragments::resolve(&db, alias)
-                .unwrap()
-                .id,
-        );
+        scopes.push(m1::fragments::resolve(&db, alias).unwrap().id);
     }
     let before = records(&db, &scopes);
     let mut native_keys = BTreeMap::new();
@@ -256,8 +255,10 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
     record(
         &stack.root.join("backup-oracle.json"),
         &json!({
-            "records":archived_records,"sha256":hex::encode(Sha256::digest(&backup)),
-            "acknowledged_versions":acknowledged.len(),"scopes":scopes.len()
+            "records": archived_records,
+            "sha256": hex::encode(Sha256::digest(&backup)),
+            "acknowledged_versions": acknowledged.len(),
+            "scopes": scopes.len()
         }),
     );
     // The original database and metadata staging disappear from their real
@@ -433,11 +434,16 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
     record(
         &stack.root.join("METADATA-LOSS-PASSED.json"),
         &json!({
-            "passed":true,"original_database_and_staging_unavailable":true,
-            "native_reads_without_metadata":acknowledged.len(),"all_snapshot_records_identical":true,
-            "fragments":identities.len(),"versions_verified":acknowledged.len(),
-            "corrupt_archives_refused":4,"trash_rename_permissions_verified":true,
-            "durable_uploads_resumed":partials.len(),"original_snapshot_sha256":hex::encode(Sha256::digest(&backup))
+            "passed": true,
+            "original_database_and_staging_unavailable": true,
+            "native_reads_without_metadata": acknowledged.len(),
+            "all_snapshot_records_identical": true,
+            "fragments": identities.len(),
+            "versions_verified": acknowledged.len(),
+            "corrupt_archives_refused": 4,
+            "trash_rename_permissions_verified": true,
+            "durable_uploads_resumed": partials.len(),
+            "original_snapshot_sha256": hex::encode(Sha256::digest(&backup))
         }),
     );
 }
@@ -538,10 +544,9 @@ async fn each_physical_member_loss_and_corruption_preserves_named_bytes_or_retur
     // Fault actual immutable shard files. Native reads/repair must authenticate
     // decoded source bytes; a successful HTTP header alone is not a passing GET.
     drop(stack.metadata.take());
-    let config =
-        n1_metadata_engine::server::ServerConfig::load(&stack.root.join("n1_config.ini")).unwrap();
+    let config = m1::server::ServerConfig::load(&stack.root.join("m1_config.ini")).unwrap();
     let db = MetadataEngine::open(&config.data_dir, Options::default()).unwrap();
-    let fragment = n1_metadata_engine::fragments::resolve(&db, "Member fault matrix").unwrap();
+    let fragment = m1::fragments::resolve(&db, "Member fault matrix").unwrap();
     let rows = db
         .snapshot()
         .scan(Table::Versions, fragment.id, "", None, 1000)
@@ -661,10 +666,13 @@ async fn each_physical_member_loss_and_corruption_preserves_named_bytes_or_retur
     record(
         &stack.root.join("MEMBER-LOSS-PASSED.json"),
         &json!({
-            "passed":true,"member_unavailability_cases":2,"named_objects_verified_each_time":objects.len(),
-            "corruption_and_over_budget_cases":cases,"silent_success_beyond_parity":false,
-            "final_cold_restart_exact_bytes_and_versions":true,
-            "fault_method":"private member root detached, no physical cable or device power interruption"
+            "passed": true,
+            "member_unavailability_cases": 2,
+            "named_objects_verified_each_time": objects.len(),
+            "corruption_and_over_budget_cases": cases,
+            "silent_success_beyond_parity": false,
+            "final_cold_restart_exact_bytes_and_versions": true,
+            "fault_method": "private member root detached, no physical cable or device power interruption"
         }),
     );
 }

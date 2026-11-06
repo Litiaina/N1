@@ -1,9 +1,15 @@
-# N1 testing
+# N1 and M1 testing
 
-This is the current testing guide for N1's LINK object engine, metadata engine
-and original Console integration. It records evidence, not the architecture or
+This is the current testing guide for the **N1 LINK object store**, the
+**M1 metadata store backed by ProcyonDB**, and original Console integration.
+It records evidence, not the architecture or
 operator procedure. Product behavior is defined by [NOA.md](NOA.md); remaining
 completion gates are in [docs/RC2-IMPLEMENTATION.md](docs/RC2-IMPLEMENTATION.md).
+
+Current Cargo packages are `n1` (object store) and `m1` (metadata store); their
+server binaries are `litiaina-n1` and `litiaina-m1`. Historical evidence retains
+the names and executable hashes used when each campaign ran. Renaming does not
+extend those results to a new binary or replace its regression checks.
 
 ## What each test proves
 
@@ -20,6 +26,21 @@ Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
 selected HDD/RAM locations; never put population fixtures on the source NVMe.
 
+## N1/M1 naming verification — November 6, 2026
+
+The formalized `n1` / `m1` workspace passed **474 default tests**, with **37
+explicit opt-in/helper cases ignored**, and **81 documentation tests**. Scoped
+strict Clippy and formatting checks passed. Three explicit two-XFS-HDD service
+cases additionally verified M1 → N1 operations/restart, monitoring with metadata
+backup/restore, and finite/unlimited size policy with isolated secrets.
+
+The service checks assert both signature banners, M1's HTTP/native identity,
+`m1_config.ini` / `m1.env` defaults and independent N1/M1 monitoring labels.
+Evidence is under `/mnt/HDD1TB001/n1-m1-naming-20261106-01/reports`.
+These are functional checks of the naming/readability checkpoint, not new
+throughput, million-object or hardware power-loss results. The MCH promotion
+hold remains in the completion checklist.
+
 ## Key-only lifecycle qualification — November 5, 2026
 
 The current upload/purge contract uses one LINK key, existing-only continuation
@@ -28,7 +49,7 @@ and zero per-identity residue after acknowledged purge. The
 crash/recovery and matched benchmark evidence. Earlier results below describe
 their original checkpoints, including the former permanent-retirement contract.
 
-The current optimization checkpoint passed **472 default workspace tests**, with
+That upload-optimization checkpoint passed **472 default workspace tests**, with
 **36 explicit opt-in/helper exclusions**, **81 documentation cases**, strict
 scoped Clippy and **13 selected two-HDD service/native cases**. Five persistence
 cases and eleven purge cases were also repeated on PROJECT. Matched standalone
@@ -78,7 +99,7 @@ export N1_CONSOLE_REPO=/path/to/console
 export N1_CONSOLE_TEST_DIST=/path/to/built-console
 export N1_BROWSER_NODE=/path/to/node
 export PLAYWRIGHT_BROWSERS_PATH=/path/to/installed-browsers
-cargo test --release -p n1_metadata_engine --test noa_service --locked -- \
+cargo test --release -p m1 --test noa_service --locked -- \
   --ignored --nocapture --test-threads=1 \
   --skip running_deployment_ --skip monitoring_performance:: \
   --skip real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
@@ -131,8 +152,8 @@ adequate space before invoking these commands:
 export N1_LINK_TEST_ROOT="$TMPDIR/n1-link-tests"
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
-cargo test -p n1_metadata_engine -p procyon-engine --doc --locked
-cargo clippy -p n1 -p n1_metadata_engine -p cli_core -p n1_shell --all-targets --no-deps --locked -- -D warnings
+cargo test -p m1 -p procyon-engine --doc --locked
+cargo clippy -p n1 -p m1 -p cli_core -p n1_shell --all-targets --no-deps --locked -- -D warnings
 ```
 
 Use `--offline` only when the locked dependencies are already available.

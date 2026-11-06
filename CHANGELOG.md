@@ -6,9 +6,21 @@ This file records product changes. Architecture is defined in
 
 ## Unreleased — 1.0.0-RC.2
 
-RC.2 introduces N1's LINK architecture and optional metadata engine. It has not
+RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It has not
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
+
+- Formalize the two systems in this repository: **N1** is the object store,
+  **M1** is the metadata store, **LINK** is N1's key algorithm and storage
+  architecture, and **ProcyonDB** is M1's database foundation. Keep the
+  `object_engine/` and `metadata_engine/` source structure. Cargo packages are
+  `n1` and `m1`; their binaries are `litiaina-n1` and `litiaina-m1`.
+- Give M1 the `L I T I A I N A  M 1` banner and readable per-line startup output;
+  retain N1's signature banner. M1 defaults to `m1_config.ini` / `m1.env`;
+  explicit operator paths, INI controls and native NOA protocols are retained.
+- Expand dense JSON/control-flow macros and embedded configuration strings for
+  readability. Clarify component module maps and shared `OperatorSettings`
+  naming while retaining the existing engine structure and LINK storage logic.
 
 - Introduce **LINK — Litiaina Immutable Native Key** for deterministic object
   addressing and shard placement within immutable storage pools. Remove NCX/NDX

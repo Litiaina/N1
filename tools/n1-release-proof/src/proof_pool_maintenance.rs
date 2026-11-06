@@ -79,8 +79,12 @@ impl Proof {
             )
             .into());
         }
-        measures.push(json!({"operation":operation,"expected_success":success,"elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
-            "report":serde_json::from_slice::<Value>(&output.stdout).ok()}));
+        measures.push(json!({
+            "operation": operation,
+            "expected_success": success,
+            "elapsed_ms": start.elapsed().as_secs_f64()*1000.0,
+            "report": serde_json::from_slice::<Value>(&output.stdout).ok()
+        }));
         Ok(())
     }
 
@@ -217,7 +221,12 @@ impl Proof {
         let part_size = self.args.max_part_size.min(total.div_ceil(2)).max(1);
         let count = total.div_ceil(part_size);
         let response = self.client.post(format!("{}/noa/v1/upload/multipart/durable/init/pool-durable.bin",self.base_url))
-            .bearer_auth(&self.token).json(&json!({"content_type":"application/octet-stream","total_size_bytes":total,"expected_parts":count,"part_size_bytes":part_size})).send().await?;
+            .bearer_auth(&self.token).json(&json!({
+                "content_type": "application/octet-stream",
+                "total_size_bytes": total,
+                "expected_parts": count,
+                "part_size_bytes": part_size
+            })).send().await?;
         if response.status() != StatusCode::CREATED {
             return Err(response.text().await?.into());
         }
@@ -364,7 +373,12 @@ impl Proof {
         self.upload_durable_part_range(&init.version_id, 1, count, part_size)
             .await?;
         let response = self.client.post(format!("{}/noa/v1/upload/multipart/durable/{}/{}/finalize?object_key=pool-durable.bin",self.base_url,init.version_id,init.session_id))
-            .bearer_auth(&self.token).json(&json!({"content_type":"application/octet-stream","total_size_bytes":total,"expected_parts":count,"part_size_bytes":part_size})).send().await?;
+            .bearer_auth(&self.token).json(&json!({
+                "content_type": "application/octet-stream",
+                "total_size_bytes": total,
+                "expected_parts": count,
+                "part_size_bytes": part_size
+            })).send().await?;
         if !response.status().is_success() {
             return Err(format!(
                 "durable continuation after device change: {}",
@@ -402,9 +416,21 @@ impl Proof {
         self.stop_server()?;
         self.pool_cli("verify", &[], true, &mut measures)?;
         drop(mount);
-        self.summary = json!({"status":"PASS","proof":"pool_maintenance","ec":[self.data_shards,self.parity_shards],"member":self.args.pool_member,"objects":expected.len(),"lineage":lineage,
-            "checks":["active_engine_exclusion","partial_copy_rejection","same_size_corruption_rejection","sigkill_clone_resume","byte_exact_source_immutability","cross_device_same_path_clone","listing_readback","blank_member_refusal","verified_identity_activation","trash_recovery","durable_receipt_continuation","post_cutover_upload_and_rename"],
-            "replacement_tested":self.parity_shards>0,"clone_interrupted_files":clone_interrupted_files,"replace_interrupted_files":replace_interrupted_files,"measurements":measures,"physical_power_cut":false,"replica_faults_tested":replica_faults_tested});
+        self.summary = json!({
+            "status": "PASS",
+            "proof": "pool_maintenance",
+            "ec": [self.data_shards,self.parity_shards],
+            "member": self.args.pool_member,
+            "objects": expected.len(),
+            "lineage": lineage,
+            "checks": ["active_engine_exclusion","partial_copy_rejection","same_size_corruption_rejection","sigkill_clone_resume","byte_exact_source_immutability","cross_device_same_path_clone","listing_readback","blank_member_refusal","verified_identity_activation","trash_recovery","durable_receipt_continuation","post_cutover_upload_and_rename"],
+            "replacement_tested": self.parity_shards>0,
+            "clone_interrupted_files": clone_interrupted_files,
+            "replace_interrupted_files": replace_interrupted_files,
+            "measurements": measures,
+            "physical_power_cut": false,
+            "replica_faults_tested": replica_faults_tested
+        });
         self.write_summary()?;
         Ok(())
     }

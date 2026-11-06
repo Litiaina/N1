@@ -247,18 +247,30 @@ async fn execute(binary: &Path, a: &Path, b: &Path, count: u64) -> Result<()> {
     private_json(
         &a.join("provenance.json"),
         &json!({
-            "engine_sha256":format!("{:x}",Sha256::digest(fs::read(binary)?)),"engine_binary":binary,
-            "client_sha256":format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?)),
-            "objects":count,"sizes_bytes":SIZES,"distribution":"round robin by immutable client index",
-            "workers":WORKERS,"batch_limit":BATCH,"durable":true,"http_enabled":false,"native_endpoint":login.endpoint,
-            "pool":configuration["pools"][0]["layout"],"concurrency":configuration["concurrency"],
-            "max_operations":configuration["max_operations"],"operation_memory_bytes":configuration["operation_memory_bytes"],
-            "rate_limits_enabled":false,"adaptive_controller_enabled":true,"io_backend":"required io_uring",
-            "project_device":a.metadata()?.dev(),"test_device":b.metadata()?.dev(),
-            "journal":"each batch intents fdatasynced before PUT; acknowledgements fdatasynced after reply; keys retained only by client",
-            "verification":"every acknowledged key, length and SHA-256 after SIGKILL/restart; no global cache eviction",
-            "timing":"upload wall includes init, source generation, network, durable PUT and client journal barriers; batch PUT latency excludes init/journals",
-            "kernel":fs::read_to_string("/proc/sys/kernel/osrelease")?.trim()
+            "engine_sha256": format!("{:x}",Sha256::digest(fs::read(binary)?)),
+            "engine_binary": binary,
+            "client_sha256": format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?)),
+            "objects": count,
+            "sizes_bytes": SIZES,
+            "distribution": "round robin by immutable client index",
+            "workers": WORKERS,
+            "batch_limit": BATCH,
+            "durable": true,
+            "http_enabled": false,
+            "native_endpoint": login.endpoint,
+            "pool": configuration["pools"][0]["layout"],
+            "concurrency": configuration["concurrency"],
+            "max_operations": configuration["max_operations"],
+            "operation_memory_bytes": configuration["operation_memory_bytes"],
+            "rate_limits_enabled": false,
+            "adaptive_controller_enabled": true,
+            "io_backend": "required io_uring",
+            "project_device": a.metadata()?.dev(),
+            "test_device": b.metadata()?.dev(),
+            "journal": "each batch intents fdatasynced before PUT; acknowledgements fdatasynced after reply; keys retained only by client",
+            "verification": "every acknowledged key, length and SHA-256 after SIGKILL/restart; no global cache eviction",
+            "timing": "upload wall includes init, source generation, network, durable PUT and client journal barriers; batch PUT latency excludes init/journals",
+            "kernel": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim()
         }),
     )?;
     let mut server = spawn(binary, &config, &a.join("upload-engine.log"))?;
@@ -374,7 +386,18 @@ async fn execute(binary: &Path, a: &Path, b: &Path, count: u64) -> Result<()> {
     private_json(&a.join("verification-result.json"), &verification)?;
     private_json(
         &a.join("PASSED.json"),
-        &json!({"passed":true,"durably_acknowledged":count,"verified_after_sigkill":count,"upload":upload,"verification":verification,"restart_seconds":restart_seconds,"crash_status":status.to_string(),"failures":0,"clean_final_shutdown":true,"data_retained":true}),
+        &json!({
+            "passed": true,
+            "durably_acknowledged": count,
+            "verified_after_sigkill": count,
+            "upload": upload,
+            "verification": verification,
+            "restart_seconds": restart_seconds,
+            "crash_status": status.to_string(),
+            "failures": 0,
+            "clean_final_shutdown": true,
+            "data_retained": true
+        }),
     )?;
     println!(
         "scale PASS: {count} durable uploads and exact verified GETs after SIGKILL; {}",
@@ -524,7 +547,13 @@ async fn monitor(
             }
             _ = interval.tick() => {
                 let completed = done.load(Ordering::Relaxed);
-                let row = json!({"phase":name,"completed":completed,"total":total,"seconds":start.elapsed().as_secs_f64(),"process":process(pid)?});
+                let row = json!({
+                    "phase": name,
+                    "completed": completed,
+                    "total": total,
+                    "seconds": start.elapsed().as_secs_f64(),
+                    "process": process(pid)?
+                });
                 let mut data = serde_json::to_vec(&row)?;
                 data.push(b'\n');
                 events = tokio::task::spawn_blocking(move || -> Result<File> {

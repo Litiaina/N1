@@ -153,7 +153,12 @@ impl Stack {
                 ("object", object_http, object_native),
                 ("metadata", metadata_http, metadata_native),
             ] {
-                let path = args.root.join(component).join("n1_config.ini");
+                let config_file = if component == "metadata" {
+                    "m1_config.ini"
+                } else {
+                    "n1_config.ini"
+                };
+                let path = args.root.join(component).join(config_file);
                 cli_core::settings::create_default_config_ini(&path)?;
                 let mut ini = ini::Ini::load_from_file(&path)?;
                 ini.with_section(Some("server"))
@@ -205,7 +210,12 @@ impl Stack {
                         .set("object_connections", "32");
                 }
                 ini.write_to_file(&path)?;
-                let env = args.root.join(component).join("n1.env");
+                let secrets_file = if component == "metadata" {
+                    "m1.env"
+                } else {
+                    "n1.env"
+                };
+                let env = args.root.join(component).join(secrets_file);
                 std::fs::write(
                     &env,
                     format!(
@@ -251,7 +261,16 @@ impl Stack {
         Ok(Process(
             Command::new(binary)
                 .arg("--config")
-                .arg(self.config.root.join(component).join("n1_config.ini"))
+                .arg(
+                    self.config
+                        .root
+                        .join(component)
+                        .join(if component == "metadata" {
+                            "m1_config.ini"
+                        } else {
+                            "n1_config.ini"
+                        }),
+                )
                 .current_dir(self.config.root.join(component))
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
@@ -296,9 +315,12 @@ impl Stack {
             {
                 std::fs::write(
                     self.config.root.join("stack-ready.json"),
-                    serde_json::to_vec(
-                        &serde_json::json!({"url":self.config.url,"object_pid":self.object.as_ref().unwrap().0.id(),"metadata_pid":self.metadata.as_ref().unwrap().0.id(),"native_port":self.config.metadata_native}),
-                    )?,
+                    serde_json::to_vec(&serde_json::json!({
+                        "url": self.config.url,
+                        "object_pid": self.object.as_ref().unwrap().0.id(),
+                        "metadata_pid": self.metadata.as_ref().unwrap().0.id(),
+                        "native_port": self.config.metadata_native
+                    }))?,
                 )?;
                 return Ok(());
             }

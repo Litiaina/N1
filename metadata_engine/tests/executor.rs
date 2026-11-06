@@ -1,6 +1,6 @@
 use n1_link::PoolId;
 mod common;
-use n1_metadata_engine::{Error, MetadataEngine, MetadataExecutor, Options, RecordKey, Table};
+use m1::{Error, MetadataEngine, MetadataExecutor, Options, RecordKey, Table};
 use std::{sync::mpsc, time::Duration};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

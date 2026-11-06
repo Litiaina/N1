@@ -184,9 +184,13 @@ async fn issue(app: &App, claims: Claims, family: Option<String>) -> ApiResult<s
     app.db
         .execute(move |db| db.transact(64, |tx| tx.put(crate::Table::Reclamation, &key, &bytes)))
         .await?;
-    Ok(
-        serde_json::json!({"access_token": token, "token_type":"Bearer", "expires_in":claims.exp.saturating_sub(now()), "refresh_token":refresh_token, "refresh_expires_in":app.config.refresh_ttl}),
-    )
+    Ok(serde_json::json!({
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": claims.exp.saturating_sub(now()),
+        "refresh_token": refresh_token,
+        "refresh_expires_in": app.config.refresh_ttl
+    }))
 }
 pub async fn refresh(app: &App, token: String, logout: bool) -> ApiResult<serde_json::Value> {
     let key = fragments::key(format!(

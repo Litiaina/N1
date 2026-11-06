@@ -49,7 +49,10 @@ pub async fn serve_until(
     };
     let mut workers = tokio::task::JoinSet::new();
     loop {
-        let accepted = tokio::select! {_=stop.cancelled()=>break,result=listener.accept()=>result};
+        let accepted = tokio::select! {
+            _ = stop.cancelled() => break,
+            result = listener.accept() => result
+        };
         let (stream, peer) = accepted?;
         let Ok(permit) = connections.clone().try_acquire_owned() else {
             drop(stream);
@@ -99,7 +102,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         } else {
             MAX_PREAUTH_BYTES
         };
-        let frame = tokio::select! {_=stop.cancelled()=>return Ok(()),frame=read_frame::<_,Request>(&mut socket,limit,control_memory.clone())=>frame};
+        let frame = tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            frame = read_frame::<_, Request>(&mut socket, limit, control_memory.clone()) => frame
+        };
         let Some((mut request, _control_memory)) = frame? else {
             return Ok(());
         };

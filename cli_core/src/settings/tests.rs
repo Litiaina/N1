@@ -63,7 +63,7 @@ fn original_controls_are_loaded_without_renaming_or_json() {
         .set("slow_io_threshold_ms", "90")
         .set("latency_samples_per_class", "257");
     ini.write_to_file(&path).unwrap();
-    let config = N1Settings::load(&path).unwrap();
+    let config = OperatorSettings::load(&path).unwrap();
     assert_eq!(config.server.host.to_string(), "192.168.0.12");
     assert_eq!(config.server.https_port, 21001);
     assert_eq!(config.server.native_port, 21002);
@@ -85,7 +85,7 @@ fn original_controls_are_loaded_without_renaming_or_json() {
 #[test]
 fn adding_pool_b_preserves_pool_a_configuration() {
     let (path, _guard) = fixture();
-    let first = N1Settings::load(&path).unwrap();
+    let first = OperatorSettings::load(&path).unwrap();
     let mut ini = ini::Ini::load_from_file(&path).unwrap();
     let base = path.parent().unwrap();
     ini.with_section(Some("storage_pool.B"))
@@ -102,7 +102,7 @@ fn adding_pool_b_preserves_pool_a_configuration() {
         .set("parity_shards", "1")
         .set("sealed", "false");
     ini.write_to_file(&path).unwrap();
-    let updated = N1Settings::load(&path).unwrap();
+    let updated = OperatorSettings::load(&path).unwrap();
     assert_eq!(updated.pools.len(), 2);
     assert_eq!(updated.pools[0], first.pools[0]);
     assert_eq!(updated.pools[1].name, "B");
@@ -113,17 +113,22 @@ fn metadata_load_does_not_require_or_parse_object_pool_members() {
     let mut ini = ini::Ini::load_from_file(&path).unwrap();
     ini.delete(Some("storage_pool.A"));
     ini.write_to_file(&path).unwrap();
-    let metadata = N1Settings::load_metadata(&path).unwrap();
+    let metadata = OperatorSettings::load_metadata(&path).unwrap();
     assert!(metadata.pools.is_empty());
-    assert!(N1Settings::load(&path).is_err());
+    assert!(OperatorSettings::load(&path).is_err());
 
     // Member paths and geometry belong to the independent object process.
     ini.with_section(Some("storage_pool.remote"))
         .set("roots", "/unmounted/object/members")
         .set("data_shards", "invalid");
     ini.write_to_file(&path).unwrap();
-    assert!(N1Settings::load_metadata(&path).unwrap().pools.is_empty());
-    assert!(N1Settings::load(&path).is_err());
+    assert!(
+        OperatorSettings::load_metadata(&path)
+            .unwrap()
+            .pools
+            .is_empty()
+    );
+    assert!(OperatorSettings::load(&path).is_err());
 }
 #[test]
 fn invalid_limits_and_overlapping_roots_are_rejected() {
@@ -140,7 +145,7 @@ fn invalid_limits_and_overlapping_roots_are_rejected() {
         ini.with_section(Some(section)).set(key, value);
         ini.write_to_file(&path).unwrap();
         assert!(
-            N1Settings::load(&path).is_err(),
+            OperatorSettings::load(&path).is_err(),
             "{section}.{key} accepted {value}"
         );
     }
@@ -165,8 +170,8 @@ fn object_size_cap_is_optional_for_both_components() {
                 .set("max_file_size", value);
         }
         ini.write_to_file(&path).unwrap();
-        let object = N1Settings::load(&path).unwrap();
-        let metadata = N1Settings::load_metadata(&path).unwrap();
+        let object = OperatorSettings::load(&path).unwrap();
+        let metadata = OperatorSettings::load_metadata(&path).unwrap();
         assert_eq!(object.max_file_size, expected);
         assert_eq!(metadata.max_file_size, expected);
         assert_eq!(object.upload.max_part_size, metadata.upload.max_part_size);
@@ -183,9 +188,12 @@ fn object_size_cap_is_optional_for_both_components() {
         ini.with_section(Some("set_limits"))
             .set("max_file_size", invalid);
         ini.write_to_file(&path).unwrap();
-        assert!(N1Settings::load(&path).is_err(), "accepted {invalid:?}");
         assert!(
-            N1Settings::load_metadata(&path).is_err(),
+            OperatorSettings::load(&path).is_err(),
+            "accepted {invalid:?}"
+        );
+        assert!(
+            OperatorSettings::load_metadata(&path).is_err(),
             "accepted {invalid:?}"
         );
     }
@@ -196,11 +204,11 @@ fn object_size_cap_is_optional_for_both_components() {
 fn isolated_secret_provisioning_child() {
     let path =
         std::env::var_os("N1_SETTINGS_ENV_TEST_CONFIG").expect("isolated child config required");
-    for config in [
-        N1Settings::load(Path::new(&path)),
-        N1Settings::load_metadata(Path::new(&path)),
+    for (config, default_file) in [
+        (OperatorSettings::load(Path::new(&path)), "n1.env"),
+        (OperatorSettings::load_metadata(Path::new(&path)), "m1.env"),
     ] {
-        let result = config.unwrap().read_env();
+        let result = config.unwrap().read_env(default_file);
         if std::env::var_os("N1_SETTINGS_ENV_TEST_REJECT").is_some() {
             assert!(result.is_err());
         } else {

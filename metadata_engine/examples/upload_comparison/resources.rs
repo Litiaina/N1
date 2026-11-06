@@ -34,10 +34,16 @@ fn process(pid: u32) -> Result<Value> {
             .find_map(|l| l.strip_prefix(field)?.trim().parse::<u64>().ok())
             .unwrap_or(0)
     };
-    Ok(
-        json!({"pid":pid,"rss_kib":rss,"user_seconds":fields[11].parse::<u64>()? as f64/ticks,"system_seconds":fields[12].parse::<u64>()? as f64/ticks,
-        "read_bytes":bytes("read_bytes:"),"write_bytes":bytes("write_bytes:"),"rchar":bytes("rchar:"),"wchar":bytes("wchar:")}),
-    )
+    Ok(json!({
+        "pid": pid,
+        "rss_kib": rss,
+        "user_seconds": fields[11].parse::<u64>()? as f64/ticks,
+        "system_seconds": fields[12].parse::<u64>()? as f64/ticks,
+        "read_bytes": bytes("read_bytes:"),
+        "write_bytes": bytes("write_bytes:"),
+        "rchar": bytes("rchar:"),
+        "wchar": bytes("wchar:")
+    }))
 }
 fn disks() -> Result<Value> {
     let text = fs::read_to_string("/proc/diskstats")?;
@@ -48,7 +54,21 @@ fn disks() -> Result<Value> {
             continue;
         }
         let n = |i: usize| p[i].parse::<u64>().unwrap_or(0);
-        out.insert(p[2].into(),json!({"reads":n(3),"read_bytes":n(5)*512,"read_ms":n(6),"writes":n(7),"write_bytes":n(9)*512,"write_ms":n(10),"busy_ms":n(12),"weighted_ms":n(13),"flushes":p.get(18).and_then(|s|s.parse::<u64>().ok()).unwrap_or(0),"flush_ms":p.get(19).and_then(|s|s.parse::<u64>().ok()).unwrap_or(0)}));
+        out.insert(
+            p[2].into(),
+            json!({
+                "reads": n(3),
+                "read_bytes": n(5)*512,
+                "read_ms": n(6),
+                "writes": n(7),
+                "write_bytes": n(9)*512,
+                "write_ms": n(10),
+                "busy_ms": n(12),
+                "weighted_ms": n(13),
+                "flushes": p.get(18).and_then(|s|s.parse::<u64>().ok()).unwrap_or(0),
+                "flush_ms": p.get(19).and_then(|s|s.parse::<u64>().ok()).unwrap_or(0)
+            }),
+        );
     }
     Ok(out.into())
 }
@@ -88,7 +108,12 @@ impl Watch {
                 }
                 serde_json::to_writer(
                     &mut file,
-                    &json!({"seconds":start.elapsed().as_secs_f64(),"processes":values,"disks":disks()?,"io_pressure":fs::read_to_string("/proc/pressure/io")?}),
+                    &json!({
+                        "seconds": start.elapsed().as_secs_f64(),
+                        "processes": values,
+                        "disks": disks()?,
+                        "io_pressure": fs::read_to_string("/proc/pressure/io")?
+                    }),
                 )?;
                 file.write_all(b"\n")?;
                 file.flush()?;
@@ -116,8 +141,17 @@ impl Watch {
             let a = &after["processes"][i];
             let delta =
                 |field: &str| a[field].as_f64().unwrap_or(0.0) - b[field].as_f64().unwrap_or(0.0);
-            processes.push(json!({"role":role,"peak_sampled_rss_kib":peak[i].max(a["rss_kib"].as_u64().unwrap_or(0)),"user_seconds":delta("user_seconds"),"system_seconds":delta("system_seconds"),
-                "cpu_percent_one_core":100.0*(delta("user_seconds")+delta("system_seconds"))/seconds,"read_bytes":delta("read_bytes"),"write_bytes":delta("write_bytes"),"logical_read_bytes":delta("rchar"),"logical_write_bytes":delta("wchar")}));
+            processes.push(json!({
+                "role": role,
+                "peak_sampled_rss_kib": peak[i].max(a["rss_kib"].as_u64().unwrap_or(0)),
+                "user_seconds": delta("user_seconds"),
+                "system_seconds": delta("system_seconds"),
+                "cpu_percent_one_core": 100.0*(delta("user_seconds")+delta("system_seconds"))/seconds,
+                "read_bytes": delta("read_bytes"),
+                "write_bytes": delta("write_bytes"),
+                "logical_read_bytes": delta("rchar"),
+                "logical_write_bytes": delta("wchar")
+            }));
         }
         let mut disk = serde_json::Map::new();
         for device in ["sda", "sdc", "sdd"] {
@@ -125,9 +159,20 @@ impl Watch {
             let a = &after["disks"][device];
             let delta =
                 |field: &str| a[field].as_f64().unwrap_or(0.0) - b[field].as_f64().unwrap_or(0.0);
-            disk.insert(device.into(),json!({"write_mib_per_second":delta("write_bytes")/1048576.0/seconds,"read_mib_per_second":delta("read_bytes")/1048576.0/seconds,
-                "write_bytes":delta("write_bytes"),"read_bytes":delta("read_bytes"),"busy_percent":delta("busy_ms")/10.0/seconds,
-                "write_await_ms":delta("write_ms")/delta("writes").max(1.0),"read_await_ms":delta("read_ms")/delta("reads").max(1.0),"flushes":delta("flushes"),"flush_ms":delta("flush_ms")}));
+            disk.insert(
+                device.into(),
+                json!({
+                    "write_mib_per_second": delta("write_bytes")/1048576.0/seconds,
+                    "read_mib_per_second": delta("read_bytes")/1048576.0/seconds,
+                    "write_bytes": delta("write_bytes"),
+                    "read_bytes": delta("read_bytes"),
+                    "busy_percent": delta("busy_ms")/10.0/seconds,
+                    "write_await_ms": delta("write_ms")/delta("writes").max(1.0),
+                    "read_await_ms": delta("read_ms")/delta("reads").max(1.0),
+                    "flushes": delta("flushes"),
+                    "flush_ms": delta("flush_ms")
+                }),
+            );
         }
         Ok(json!({"processes":processes,"disks":disk,"seconds":seconds}))
     }

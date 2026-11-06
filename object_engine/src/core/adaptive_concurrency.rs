@@ -122,7 +122,10 @@ pub async fn run_adaptive_concurrency_until(stop: tokio_util::sync::Cancellation
 
     loop {
         if !enabled() {
-            tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(interval_ms())) => {} }
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms())) => {}
+            }
             continue;
         }
 
@@ -178,7 +181,10 @@ pub async fn run_adaptive_concurrency_until(stop: tokio_util::sync::Cancellation
             readahead_atomic.store(next, Ordering::Relaxed);
         }
 
-        tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(interval_ms())) => {} }
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_millis(interval_ms())) => {}
+        }
     }
 }
 

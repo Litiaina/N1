@@ -96,9 +96,9 @@ export N1_OBJECT_TEST_FIRST_ROOT=/mnt/hdd-a/n1-reliability/members
 export N1_OBJECT_TEST_SECOND_ROOT=/mnt/hdd-b/n1-reliability/members
 mkdir -p "$N1_OBJECT_TEST_ROOT" "$N1_OBJECT_TEST_FIRST_ROOT" "$N1_OBJECT_TEST_SECOND_ROOT"
 chmod 700 "$N1_OBJECT_TEST_ROOT" "$N1_OBJECT_TEST_FIRST_ROOT" "$N1_OBJECT_TEST_SECOND_ROOT"
-cargo build --locked --release -p n1 -p n1_metadata_engine -p n1_shell --bins
+cargo build --locked --release -p n1 -p m1 -p n1_shell --bins
 export N1_OBJECT_TEST_BINARY="$CARGO_TARGET_DIR/release/litiaina-n1"
-cargo test --release --locked -p n1_metadata_engine --test noa_service -- \
+cargo test --release --locked -p m1 --test noa_service -- \
   --ignored --nocapture --test-threads=1 --skip running_deployment_ \
   --skip monitoring_performance:: \
   --skip real_second_hdd_unmount_degraded_reads_and_remount_keep_every_named_ack
@@ -117,7 +117,7 @@ For each HDD independently, run the Rust metadata crash/churn supervisor with a
 fresh `--root`:
 
 ```sh
-cargo build --release --locked -p n1_metadata_engine --example hdd_qualification
+cargo build --release --locked -p m1 --example hdd_qualification
 "$CARGO_TARGET_DIR/release/examples/hdd_qualification" run \
   --root /mnt/hdd-a/n1-reliability/database \
   --entries 16384 --churn 4096 --batch 128 --writers 8 --readers 4

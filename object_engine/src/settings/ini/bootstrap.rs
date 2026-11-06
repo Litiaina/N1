@@ -50,7 +50,22 @@ pub(super) fn ensure(path: &Path) -> Result<()> {
     // Existing operator configurations may use service credentials or an
     // explicit secrets file. Starting those must not write a sibling env file.
     if new_config {
-        publish(&path.with_file_name("n1.env"),Some(b"# N1 service secrets. Configure before starting the server.\nJWT_SECRET=\nAUTH_KEY=\nMASTER_KEY=\nADMIN_KEY=\nACCESS_TOKEN_DEFAULT_TTL_SECS=900\nACCESS_TOKEN_MAX_TTL_SECS=3600\nREFRESH_TOKEN_TTL_SECS=604800\n"))?;
+        publish(
+            &path.with_file_name("n1.env"),
+            Some(
+                concat!(
+                    "# N1 service secrets. Configure before starting the server.\n",
+                    "JWT_SECRET=\n",
+                    "AUTH_KEY=\n",
+                    "MASTER_KEY=\n",
+                    "ADMIN_KEY=\n",
+                    "ACCESS_TOKEN_DEFAULT_TTL_SECS=900\n",
+                    "ACCESS_TOKEN_MAX_TTL_SECS=3600\n",
+                    "REFRESH_TOKEN_TTL_SECS=604800\n",
+                )
+                .as_bytes(),
+            ),
+        )?;
     }
     Ok(())
 }

@@ -1,22 +1,22 @@
-# N1 architecture
+# N1 and M1 architecture
 
-N1 is a single-node object storage system built on **LINK — Litiaina Immutable
-Native Key**. LINK is N1's native object-addressing and shard-placement
-architecture. An optional metadata engine supplies the named-object product
-used by Console. These are two components of N1, with separate responsibilities
-and a public native API between them.
+This repository contains two independent systems: **N1**, the single-node
+object store, and **M1**, the metadata store. **LINK — Litiaina Immutable Native
+Key** is N1's key algorithm and storage architecture. **ProcyonDB** is the
+transactional database used inside M1. The public native NOA API connects M1
+to N1; either service may run on a separate machine.
 
-`Console / named client → metadata_engine → native LINK object_engine → shards`
+`Console / named client → M1 → native N1 (LINK) → shards`
 
-`Client with its own metadata → native LINK object_engine → shards`
+`Client with its own metadata → native N1 (LINK) → shards`
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| `object_engine/` | LINK keys, immutable pools/EC, upload bytes, verified reads, repair, zero-residue purge, staging GC and object recovery | Human names, logical versions, namespace lists or a metadata database |
-| `metadata_engine/` | Logical fragments, names, maximum-ULID version selection, upload transactions, listings, rename, trash/recovery, permissions and exports | Shard placement, member-root access or an alternate object format |
+| N1 — `object_engine/` | LINK keys, immutable pools/EC, upload bytes, verified reads, repair, zero-residue purge, staging GC and object recovery | Human names, logical versions, namespace lists or a metadata database |
+| M1 — `metadata_engine/` | Logical fragments, names, maximum-ULID version selection, upload transactions, listings, rename, trash/recovery, permissions and exports | Shard placement, member-root access or an alternate object format |
 | Console (separate repository) | Existing user interface and workflows through metadata's NOA v1 API | Storage authority or replacement metadata semantics |
 
-The object engine builds and operates independently. Metadata uses
+N1 builds and operates independently of M1 and ProcyonDB. M1 uses
 `n1_native_client`, not object-engine internals. An external metadata service
 can use the same LINK interface. Metadata availability is not a prerequisite for
 a client holding a valid object key and object-service credentials.
@@ -35,13 +35,40 @@ profiles. Expansion adds another complete pool; it does not redistribute objects
 or reinterpret old keys. The exact algorithm, key bytes and disk encoding are
 in [LINK-FORMAT.md](docs/LINK-FORMAT.md).
 
-The product retains N1's adaptive concurrency, scheduler, streaming I/O,
+N1 retains its adaptive concurrency, scheduler, streaming I/O,
 io_uring, middleware, native server, repair and backup infrastructure. The
 object Cargo package is still `n1`; existing executable names and the original
 startup banner are preserved. Versions come from Cargo, not release labels in
 keys or upload directories.
 
-Logical user fragments are managed by metadata. The object service separately
+## Repository structure and naming
+
+Directory names describe responsibilities; Cargo packages and binaries identify
+the systems. Keep the existing module structure within each engine.
+
+| Directory | Cargo package / Rust crate | Executable | Identity |
+| --- | --- | --- | --- |
+| `object_engine/` | `n1` | `litiaina-n1`, `litiaina-n1-backup` | N1 object store |
+| `metadata_engine/` | `m1` | `litiaina-m1` | M1 metadata store |
+| `link/` | `n1_link` | Library | LINK algorithm, canonical keys, placement and shard format |
+| `metadata_engine/storage/` | `procyon-engine` / `procyon_engine` | Library | ProcyonDB transactional storage foundation inside M1 |
+| `native_client/` | `n1_native_client` | Library and examples | N1 native NOA v2 client used by M1 and direct clients |
+| `cli_core/` | `cli_core` | Library | Shared operator settings, monitoring and CLI utilities |
+| `shell/` | `n1_shell` | `litiaina-n1-shell` | N1 native CLI and object-backup operator host |
+| `tools/`, `scripts/` | Qualification and operator tooling | Various | Workloads and deployment helpers; not additional storage systems |
+
+N1's default files are `n1_config.ini` and `n1.env`; M1's are `m1_config.ini`
+and `m1.env`. Each service retains its `[server]` controls and can select an
+explicit config/secrets path or use its service environment. M1's integration
+section remains `[metadata_engine]`. It names a responsibility, not a third
+system. The native `n1://` / `n1s://` schemes and NOA wire identifiers are
+protocol names and do not change when the metadata service is called M1.
+
+Both server banners keep the signature `L I T I A I N A` heading, followed by
+`N 1` or `M 1`. Version, start time, PID and operational details appear on
+separate source and output lines. Runtime versions come from Cargo metadata.
+
+Logical user fragments are managed by M1. N1 separately
 authenticates its clients/service fragments; metadata's backend credential is
 not a user's logical fragment password. The term is **fragment**, never bucket.
 
@@ -124,7 +151,7 @@ announcement or a migration guide.
 
 Within the object engine, the removal boundary is name/version metadata,
 NCX/NDX lookup and explicitly discarded namespace/export operations. Logical
-metadata belongs to the optional metadata component. Tested infrastructure is retained and
+metadata belongs to M1. Tested infrastructure is retained and
 adapted where the shard representation changes; fewer source files is not an
 acceptance criterion. The implementation ledger records remaining adaptations.
 
@@ -413,6 +440,12 @@ hostname, working directory and runtime thread settings. The original local
 `YYYY-MM-DD HH:MM:SS` log timer and nonblocking stderr logger are retained.
 The logger guard flushes during shutdown; machine-readable maintenance output
 and CLI version/help do not receive the server banner.
+
+M1 prints its own `L I T I A I N A  M 1` boxed banner from
+`metadata_engine/src/main.rs`, with Cargo version, ProcyonDB identity, start
+time, PID, hostname, working directory and the selected native/HTTP(S) listeners.
+It uses one readable source statement per output line. Its offline commands
+keep machine-readable output separate from server startup diagnostics.
 
 ## Native NOA and HTTP
 

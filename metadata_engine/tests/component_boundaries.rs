@@ -48,9 +48,9 @@ fn object_engine_build_graph_is_independent_of_metadata_and_procyon() {
         seen
     };
     let object = dependencies("n1");
-    assert!(!object.contains("n1_metadata_engine"));
+    assert!(!object.contains("m1"));
     assert!(!object.contains("procyon-engine"));
-    let metadata = dependencies("n1_metadata_engine");
+    let metadata = dependencies("m1");
     assert!(metadata.contains("n1_native_client"));
     assert!(
         !metadata.contains("n1"),

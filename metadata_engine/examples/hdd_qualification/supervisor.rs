@@ -163,13 +163,27 @@ fn run_child(root: &Path, plan: &Plan, phase: Phase, interrupt: bool) -> Result<
             / 1000.0
     };
     let result = json!({
-        "phase":name,"seconds":started.elapsed().as_secs_f64(),"sigkill_injected":killed,
-        "acknowledged_records":population(&acks,plan,phase),"prior_acknowledged_records_verified_without_writing":verified_prior,
-        "newly_acknowledged_records":received_records,"records_actually_mutated":created,
-        "concurrent_reader_checks_for_completed_child":if done {Some(checks)} else {None},
-        "child_rss_hwm_kib_observed":peak_kib,
-        "durable_batch_latency_ms":{"samples":latencies.len(),"p50":percentile(50),"p95":percentile(95),"p99":percentile(99),"max":latencies.last().copied().unwrap_or_default() as f64 /1000.0},
-        "latency_scope":"whole bounded metadata transaction, includes contention and fsync; not single-object upload latency"
+        "phase": name,
+        "seconds": started.elapsed().as_secs_f64(),
+        "sigkill_injected": killed,
+        "acknowledged_records": population(&acks,plan,phase),
+        "prior_acknowledged_records_verified_without_writing": verified_prior,
+        "newly_acknowledged_records": received_records,
+        "records_actually_mutated": created,
+        "concurrent_reader_checks_for_completed_child": if done {
+            Some(checks)
+        } else {
+            None
+        },
+        "child_rss_hwm_kib_observed": peak_kib,
+        "durable_batch_latency_ms": {
+            "samples": latencies.len(),
+            "p50": percentile(50),
+            "p95": percentile(95),
+            "p99": percentile(99),
+            "max": latencies.last().copied().unwrap_or_default() as f64 /1000.0
+        },
+        "latency_scope": "whole bounded metadata transaction, includes contention and fsync; not single-object upload latency"
     });
     save(&root.join(format!("{name}.result.json")), &result)?;
     Ok(result)
@@ -202,11 +216,17 @@ pub fn run(root: &Path, plan: Plan) -> Result<()> {
         let final_state = verify(root, &plan, true)?;
         // Reopen once more after every verification handle has been released.
         drop(open(root)?);
-        Ok(
-            json!({"passed":true,"scope":"metadata storage foundation; no NOA namespace service or object uploads", "plan":plan,
-            "population_interrupted":interrupted,"population_resumed":resumed,"population_verified":population,
-            "churn_interrupted":churn_interrupted,"churn_resumed":churn_resumed,"final_verified":final_state}),
-        )
+        Ok(json!({
+            "passed": true,
+            "scope": "metadata storage foundation; no NOA namespace service or object uploads",
+            "plan": plan,
+            "population_interrupted": interrupted,
+            "population_resumed": resumed,
+            "population_verified": population,
+            "churn_interrupted": churn_interrupted,
+            "churn_resumed": churn_resumed,
+            "final_verified": final_state
+        }))
     })();
     match result {
         Ok(result) => {

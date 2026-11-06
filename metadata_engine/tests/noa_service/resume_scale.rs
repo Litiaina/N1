@@ -20,7 +20,12 @@ async fn measured_status(
         json!((0..128).collect::<Vec<_>>())
     );
     assert_eq!(result["expected_parts"], 1920);
-    json!({"seconds":seconds,"native_io_submissions":after-before,"acknowledged_parts":128,"acknowledged_bytes":1_u64<<30})
+    json!({
+        "seconds": seconds,
+        "native_io_submissions": after-before,
+        "acknowledged_parts": 128,
+        "acknowledged_bytes": 1_u64<<30
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -69,27 +74,16 @@ async fn large_resume_uses_metadata_pages_and_submits_no_payload_reads_even_afte
     // Reconstruct the same upload's index from actual frames once, using the
     // existing fallback for an upload without acknowledged metadata coverage.
     drop(stack.metadata.take());
-    let config =
-        n1_metadata_engine::server::ServerConfig::load(&stack.root.join("n1_config.ini")).unwrap();
-    let db = n1_metadata_engine::MetadataEngine::open(
-        &config.data_dir,
-        n1_metadata_engine::Options::default(),
-    )
-    .unwrap();
-    let fragment =
-        n1_metadata_engine::fragments::resolve(&db, created["fragment_hash"].as_str().unwrap())
-            .unwrap();
-    let key =
-        n1_metadata_engine::RecordKey::new(fragment.id, format!("upload-plan/{version}")).unwrap();
+    let config = m1::server::ServerConfig::load(&stack.root.join("m1_config.ini")).unwrap();
+    let db = m1::MetadataEngine::open(&config.data_dir, m1::Options::default()).unwrap();
+    let fragment = m1::fragments::resolve(&db, created["fragment_hash"].as_str().unwrap()).unwrap();
+    let key = m1::RecordKey::new(fragment.id, format!("upload-plan/{version}")).unwrap();
     db.transact(64, |tx| {
-        let mut saved: Value = serde_json::from_slice(
-            &tx.get(n1_metadata_engine::Table::Reclamation, &key)?
-                .unwrap(),
-        )
-        .unwrap();
+        let mut saved: Value =
+            serde_json::from_slice(&tx.get(m1::Table::Reclamation, &key)?.unwrap()).unwrap();
         saved["acknowledgements_indexed"] = json!(false);
         tx.put(
-            n1_metadata_engine::Table::Reclamation,
+            m1::Table::Reclamation,
             &key,
             &serde_json::to_vec(&saved).unwrap(),
         )
@@ -110,30 +104,18 @@ async fn large_resume_uses_metadata_pages_and_submits_no_payload_reads_even_afte
     // Model uncertain native completion: valid frames exist, but their metadata
     // ACK was never committed. Reconstruction must not invent a durable ACK.
     drop(stack.metadata.take());
-    let db = n1_metadata_engine::MetadataEngine::open(
-        &config.data_dir,
-        n1_metadata_engine::Options::default(),
-    )
-    .unwrap();
-    let progress_key = n1_metadata_engine::RecordKey::new(
-        fragment.id,
-        format!("upload-progress/{version}/000000"),
-    )
-    .unwrap();
+    let db = m1::MetadataEngine::open(&config.data_dir, m1::Options::default()).unwrap();
+    let progress_key =
+        m1::RecordKey::new(fragment.id, format!("upload-progress/{version}/000000")).unwrap();
     db.transact(64, |tx| {
-        let mut bits = tx
-            .get(n1_metadata_engine::Table::Reclamation, &progress_key)?
-            .unwrap();
+        let mut bits = tx.get(m1::Table::Reclamation, &progress_key)?.unwrap();
         bits[15] &= !(1 << 7);
-        tx.put(n1_metadata_engine::Table::Reclamation, &progress_key, &bits)?;
-        let mut saved: Value = serde_json::from_slice(
-            &tx.get(n1_metadata_engine::Table::Reclamation, &key)?
-                .unwrap(),
-        )
-        .unwrap();
+        tx.put(m1::Table::Reclamation, &progress_key, &bits)?;
+        let mut saved: Value =
+            serde_json::from_slice(&tx.get(m1::Table::Reclamation, &key)?.unwrap()).unwrap();
         saved["acknowledgements_indexed"] = json!(false);
         tx.put(
-            n1_metadata_engine::Table::Reclamation,
+            m1::Table::Reclamation,
             &key,
             &serde_json::to_vec(&saved).unwrap(),
         )
@@ -150,7 +132,22 @@ async fn large_resume_uses_metadata_pages_and_submits_no_payload_reads_even_afte
         status(&client, &route, token, version).await["uploaded_parts"],
         json!((0..128).collect::<Vec<_>>())
     );
-    let report = json!({"passed":true,"reserved_object_bytes":15_u64<<30,"uploaded_fixture_bytes":1_u64<<30,"part_bytes":8<<20,"parts_uploaded":128,"durability":"strict","fixture_upload_seconds":fixture_upload_seconds,"warm_indexed":warm,"full_reconstruction":reconstruction,"rebuilt_index":rebuilt,"both_engines_restarted":cold,"uncertain_native_completion_was_retransmitted":true,"object_fully_uploaded":false,"test_roots":stack.root});
+    let report = json!({
+        "passed": true,
+        "reserved_object_bytes": 15_u64<<30,
+        "uploaded_fixture_bytes": 1_u64<<30,
+        "part_bytes": 8<<20,
+        "parts_uploaded": 128,
+        "durability": "strict",
+        "fixture_upload_seconds": fixture_upload_seconds,
+        "warm_indexed": warm,
+        "full_reconstruction": reconstruction,
+        "rebuilt_index": rebuilt,
+        "both_engines_restarted": cold,
+        "uncertain_native_completion_was_retransmitted": true,
+        "object_fully_uploaded": false,
+        "test_roots": stack.root
+    });
     std::fs::write(
         stack.root.join("resume-scale.json"),
         serde_json::to_vec_pretty(&report).unwrap(),

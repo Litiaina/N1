@@ -229,14 +229,25 @@ impl Jobs {
     ) {
         let jobs = self.clone();
         tokio::spawn(async move {
-            tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(schedule.start_delay_seconds))=>{}}
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(schedule.start_delay_seconds)) => {}
+            }
             let mut timer = tokio::time::interval(Duration::from_secs(schedule.every_seconds));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {_=stop.cancelled()=>return,_=timer.tick()=>{
-                    let started=match &options{Some(options)=>jobs.scrub(store.clone(),options.clone()),None=>jobs.gc(store.clone())};
-                    if let Err(e)=started{tracing::debug!("scheduled maintenance skipped: {e}");}
-                }}
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = timer.tick() => {
+                        let started = match &options {
+                            Some(options) => jobs.scrub(store.clone(), options.clone()),
+                            None => jobs.gc(store.clone()),
+                        };
+                        if let Err(e) = started {
+                            tracing::debug!("scheduled maintenance skipped: {e}");
+                        }
+                    }
+                }
             }
         });
     }

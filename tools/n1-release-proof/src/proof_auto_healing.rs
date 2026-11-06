@@ -437,8 +437,14 @@ impl Proof {
                 }
             }
             results.push(
-                json!({"endpoint":endpoint,"same_length_bitrot":true,"returned_bytes_verified":true,
-                "physical_shard_repaired":true,"ndx_unchanged":true,"read_ms":read_ms}),
+                json!({
+                    "endpoint": endpoint,
+                    "same_length_bitrot": true,
+                    "returned_bytes_verified": true,
+                    "physical_shard_repaired": true,
+                    "ndx_unchanged": true,
+                    "read_ms": read_ms
+                }),
             );
         }
         Ok(json!({"paths":results}))
@@ -495,9 +501,13 @@ impl Proof {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Ok(json!({"corrupt_objects":OBJECTS,"concurrent_readers":READERS,
-            "all_responses_sha256_verified":true,"all_shards_physically_repaired":true,
-            "elapsed_seconds":started.elapsed().as_secs_f64()}))
+        Ok(json!({
+            "corrupt_objects": OBJECTS,
+            "concurrent_readers": READERS,
+            "all_responses_sha256_verified": true,
+            "all_shards_physically_repaired": true,
+            "elapsed_seconds": started.elapsed().as_secs_f64()
+        }))
     }
 
     async fn prove_explicit_checksum_gate(&self) -> ProofResult<Value> {
@@ -556,8 +566,10 @@ impl Proof {
         let read_integrity = self.prove_read_bitrot_paths().await?;
         let concurrent_read_integrity = self.prove_concurrent_bitrot_reads().await?;
         fs::write(self.args.out_dir.join("read-integrity.json"), serde_json::to_vec_pretty(&json!({
-            "status":"PASS", "scope":"read paths only; not the complete fault matrix or scale qualification",
-            "read_integrity":&read_integrity,"concurrent_read_integrity":&concurrent_read_integrity,
+            "status": "PASS",
+            "scope": "read paths only; not the complete fault matrix or scale qualification",
+            "read_integrity":&read_integrity,
+            "concurrent_read_integrity":&concurrent_read_integrity,
         }))?)?;
         let object_key = format!("{}auto-healing/source.bin", self.args.prefix);
         let payload = deterministic_payload(2 * 1024 * 1024, b"n1-auto-healing-proof");
@@ -790,14 +802,30 @@ impl Proof {
             "object_key": object_key,
             "version_id": version_id,
             "startup": startup,
-            "recover_on_read": {"removed_and_restored": removed_on_read},
-            "explicit_repair": {"removed_and_restored": removed_by_scan, "status": scheduled_repair},
+            "recover_on_read": {
+                "removed_and_restored": removed_on_read
+            },
+            "explicit_repair": {
+                "removed_and_restored": removed_by_scan,
+                "status": scheduled_repair
+            },
             "read_integrity": read_integrity,
             "concurrent_read_integrity": concurrent_read_integrity,
             "explicit_checksum_gate": explicit_checksum_gate,
-            "missing_root": {"root": root, "health": missing_health, "mutation": rejected_mutation, "restored": restored_health},
-            "identity_mismatch": {"health": replacement_health, "restored": identity_restored_health},
-            "unrecoverable_fail_safe": {"health": scan_failure, "recovered": recovered_from_fault},
+            "missing_root": {
+                "root": root,
+                "health": missing_health,
+                "mutation": rejected_mutation,
+                "restored": restored_health
+            },
+            "identity_mismatch": {
+                "health": replacement_health,
+                "restored": identity_restored_health
+            },
+            "unrecoverable_fail_safe": {
+                "health": scan_failure,
+                "recovered": recovered_from_fault
+            },
             "ec_change": {
                 "enrolled_geometry_edit_rejected": true,
                 "startup": ec_change_startup,

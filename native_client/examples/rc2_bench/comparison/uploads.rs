@@ -355,7 +355,24 @@ pub(super) async fn trial(
         .iter()
         .filter_map(|r| r["after"]["vm_hwm_bytes"].as_u64())
         .max();
-    Ok(
-        json!({"architecture":architecture,"passed":true,"clean_shutdown":true,"standalone_object_engine":true,"metadata_process_started":false,"smoke_only":smoke,"roots":roots,"small_count_per_method":count,"concurrent_clients":concurrency,"multipart_bytes":bytes,"part_bytes":part_bytes,"verified_downloads":objects.len(),"objects_deleted":objects.len(),"before_delete_inventory":before_delete,"after_delete_inventory":after_delete,"sampled_peak_rss_bytes":peak,"kernel_rss_high_water_bytes":high,"phases":rows}),
-    )
+    Ok(json!({
+        "architecture": architecture,
+        "passed": true,
+        "clean_shutdown": true,
+        "standalone_object_engine": true,
+        "metadata_process_started": false,
+        "smoke_only": smoke,
+        "roots": roots,
+        "small_count_per_method": count,
+        "concurrent_clients": concurrency,
+        "multipart_bytes": bytes,
+        "part_bytes": part_bytes,
+        "verified_downloads": objects.len(),
+        "objects_deleted": objects.len(),
+        "before_delete_inventory": before_delete,
+        "after_delete_inventory": after_delete,
+        "sampled_peak_rss_bytes": peak,
+        "kernel_rss_high_water_bytes": high,
+        "phases": rows
+    }))
 }

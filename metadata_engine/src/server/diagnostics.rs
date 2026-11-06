@@ -88,7 +88,26 @@ impl Diagnostics {
                 "an integrity scan is already running".into(),
             )
         })?;
-        let state=app.pools.iter().filter(|p|pool.as_deref().is_none_or(|id|p.id.to_string()==id)).map(|p|(p.id.to_string(),json!({"status":"running","scope":"live fragment references","versions_checked":0,"verified_versions":0,"failed_versions":0,"deferred_versions":0,"verified_bytes":0,"elapsed_ms":0}))).collect();
+        let state = app
+            .pools
+            .iter()
+            .filter(|p| pool.as_deref().is_none_or(|id| p.id.to_string() == id))
+            .map(|p| {
+                (
+                    p.id.to_string(),
+                    json!({
+                        "status": "running",
+                        "scope": "live fragment references",
+                        "versions_checked": 0,
+                        "verified_versions": 0,
+                        "failed_versions": 0,
+                        "deferred_versions": 0,
+                        "verified_bytes": 0,
+                        "elapsed_ms": 0
+                    }),
+                )
+            })
+            .collect();
         *self.scan.lock().unwrap_or_else(|e| e.into_inner()) = Some(Scan {
             fragment,
             pool,
@@ -217,9 +236,11 @@ impl Diagnostics {
                             Check::Deferred => {
                                 state["deferred_versions"] =
                                     json!(state["deferred_versions"].as_u64().unwrap_or(0) + 1);
-                                state["deferred_reason"] = json!(
-                                    "Some references could not be verified because of admission, transport, access or concurrent lifecycle changes. Retry when available; this is not a corruption verdict."
-                                );
+                                state["deferred_reason"] = json!(concat!(
+                                    "Some references could not be verified because of admission, ",
+                                    "transport, access or concurrent lifecycle changes. ",
+                                    "Retry when available; this is not a corruption verdict."
+                                ));
                             }
                         }
                         state["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);

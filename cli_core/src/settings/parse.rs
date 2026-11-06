@@ -14,7 +14,7 @@ pub(super) fn read_regular(path: &Path, private: bool) -> Result<Vec<u8>> {
     let mut file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
-        return Err("N1 configuration must be a regular file of at most 4 MiB".into());
+        return Err("operator configuration must be a regular file of at most 4 MiB".into());
     }
     #[cfg(unix)]
     {
@@ -30,7 +30,7 @@ pub(super) fn read_regular(path: &Path, private: bool) -> Result<Vec<u8>> {
         .take(4 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > 4 * 1024 * 1024 {
-        return Err("N1 configuration grew beyond 4 MiB".into());
+        return Err("operator configuration grew beyond 4 MiB".into());
     }
     Ok(bytes)
 }
@@ -132,19 +132,21 @@ fn absolute(base: &Path, value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub(super) fn load(path: &Path) -> Result<N1Settings> {
+pub(super) fn load(path: &Path) -> Result<OperatorSettings> {
     load_for_component(path, true)
 }
-pub(super) fn load_metadata(path: &Path) -> Result<N1Settings> {
+pub(super) fn load_metadata(path: &Path) -> Result<OperatorSettings> {
     load_for_component(path, false)
 }
-fn load_for_component(path: &Path, owns_members: bool) -> Result<N1Settings> {
+fn load_for_component(path: &Path, owns_members: bool) -> Result<OperatorSettings> {
     let source = if path.is_absolute() {
         path.to_owned()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let base = source.parent().ok_or("N1 configuration has no parent")?;
+    let base = source
+        .parent()
+        .ok_or("operator configuration has no parent")?;
     let bytes = read_regular(&source, false)?;
     let ini = Ini::load_from_str(std::str::from_utf8(&bytes)?)?;
     let section = |name: &str| Section {
@@ -152,7 +154,7 @@ fn load_for_component(path: &Path, owns_members: bool) -> Result<N1Settings> {
         name: name.to_owned(),
     };
     if ini.section(Some("server")).is_none() || ini.section(Some("disk_config")).is_none() {
-        return Err("N1 configuration requires [server] and [disk_config]".into());
+        return Err("operator configuration requires [server] and [disk_config]".into());
     }
     let server = section("server");
     let cert = server.text("cert_path", "");
@@ -474,7 +476,7 @@ fn load_for_component(path: &Path, owns_members: bool) -> Result<N1Settings> {
     if !matches!(partition, 32 | 64 | 256) {
         return Err("[index_config] partition_count must be 32, 64 or 256".into());
     }
-    Ok(N1Settings {
+    Ok(OperatorSettings {
         source,
         server,
         control_dir,

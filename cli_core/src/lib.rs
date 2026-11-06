@@ -1,4 +1,4 @@
-//! Native LINK client configuration and allocation discovery shared by CLI tools.
+//! Shared N1/M1 operator configuration, monitoring and native N1 CLI utilities.
 pub mod monitoring;
 pub mod settings;
 #[cfg(target_os = "linux")]

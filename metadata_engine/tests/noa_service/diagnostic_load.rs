@@ -1,6 +1,6 @@
 //! Busy admission is incomplete verification; actual damaged frames must fail.
 use super::*;
-use n1_metadata_engine::object_store::{NativeObjectStore, ObjectStoreConfig};
+use m1::object_store::{NativeObjectStore, ObjectStoreConfig};
 
 async fn scan(client: &Client, base: &str, token: &str) -> Value {
     json_response(

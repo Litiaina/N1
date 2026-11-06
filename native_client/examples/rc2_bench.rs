@@ -154,9 +154,14 @@ fn process(pid: u32) -> Result<Value> {
         .collect::<Vec<_>>();
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     let cpu = (fields[11].parse::<u64>()? + fields[12].parse::<u64>()?) as f64 / ticks;
-    Ok(
-        json!({"rss_bytes":kb("VmRSS:"),"vm_hwm_bytes":kb("VmHWM:"),"swap_bytes":kb("VmSwap:"),"read_bytes":count("read_bytes:"),"write_bytes":count("write_bytes:"),"cpu_seconds":cpu}),
-    )
+    Ok(json!({
+        "rss_bytes": kb("VmRSS:"),
+        "vm_hwm_bytes": kb("VmHWM:"),
+        "swap_bytes": kb("VmSwap:"),
+        "read_bytes": count("read_bytes:"),
+        "write_bytes": count("write_bytes:"),
+        "cpu_seconds": cpu
+    }))
 }
 struct Phase {
     start: Instant,
@@ -206,12 +211,34 @@ impl Phase {
                 .unwrap_or(0)
                 .saturating_sub(self.before[field].as_u64().unwrap_or(0))
         };
-        Ok(
-            json!({"phase":name,"wall_seconds":elapsed,"source_bytes":bytes,"operations":times.len(),"mib_per_second":bytes as f64/1048576.0/elapsed,"operations_per_second":times.len()as f64/elapsed,
-            "latency_ms":{"min":sorted.first().map(|v|v*1000.0),"p50":percentile(0.50).map(|v|v*1000.0),"p95":percentile(0.95).map(|v|v*1000.0),"p99":percentile(0.99).map(|v|v*1000.0),"max":sorted.last().map(|v|v*1000.0),"mean":if times.is_empty(){None}else{Some(times.iter().sum::<f64>()/times.len()as f64*1000.0)}},
-            "samples_seconds":times,"rss_before_bytes":self.before["rss_bytes"],"rss_after_bytes":after["rss_bytes"],"sampled_peak_rss_bytes":peak,
-            "server_cpu_seconds":after["cpu_seconds"].as_f64().unwrap_or(0.0)-self.before["cpu_seconds"].as_f64().unwrap_or(0.0),"server_read_bytes":delta("read_bytes"),"server_write_bytes":delta("write_bytes"),"after":after}),
-        )
+        Ok(json!({
+            "phase": name,
+            "wall_seconds": elapsed,
+            "source_bytes": bytes,
+            "operations": times.len(),
+            "mib_per_second": bytes as f64/1048576.0/elapsed,
+            "operations_per_second": times.len()as f64/elapsed,
+            "latency_ms": {
+                "min": sorted.first().map(|v|v*1000.0),
+                "p50": percentile(0.50).map(|v|v*1000.0),
+                "p95": percentile(0.95).map(|v|v*1000.0),
+                "p99": percentile(0.99).map(|v|v*1000.0),
+                "max": sorted.last().map(|v|v*1000.0),
+                "mean": if times.is_empty(){
+                    None
+                }else{
+                    Some(times.iter().sum::<f64>()/times.len()as f64*1000.0)
+                }
+            },
+            "samples_seconds": times,
+            "rss_before_bytes": self.before["rss_bytes"],
+            "rss_after_bytes": after["rss_bytes"],
+            "sampled_peak_rss_bytes": peak,
+            "server_cpu_seconds": after["cpu_seconds"].as_f64().unwrap_or(0.0)-self.before["cpu_seconds"].as_f64().unwrap_or(0.0),
+            "server_read_bytes": delta("read_bytes"),
+            "server_write_bytes": delta("write_bytes"),
+            "after": after
+        }))
     }
 }
 #[derive(Clone)]
@@ -294,9 +321,16 @@ fn footprint(
         }
     }
     let source = objects.iter().map(|o| o.bytes).sum::<u64>();
-    Ok(
-        json!({"files":files,"source_bytes":source,"logical_shard_bytes":logical,"allocated_shard_bytes":allocated,"logical_amplification":logical as f64/source as f64,"allocated_amplification":allocated as f64/source as f64,"payload_cache_drop_requested":evict,"includes_directory_metadata":false}),
-    )
+    Ok(json!({
+        "files": files,
+        "source_bytes": source,
+        "logical_shard_bytes": logical,
+        "allocated_shard_bytes": allocated,
+        "logical_amplification": logical as f64/source as f64,
+        "allocated_amplification": allocated as f64/source as f64,
+        "payload_cache_drop_requested": evict,
+        "includes_directory_metadata": false
+    }))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -392,7 +426,31 @@ async fn run_benchmark(args: Vec<String>, include_large: bool) -> Result<()> {
     let small_hash = expected(&block, SMALL);
     append(
         &events,
-        &json!({"phase":"methodology","build":if cfg!(debug_assertions){"debug"}else{"release"},"large_bytes":if include_large {LARGE} else {0},"small_bytes":SMALL,"small_count_per_method":COUNT,"concurrency":1,"source":"repeating 1 MiB SplitMix64 pattern; bounded streaming generator","download":"SHA-256 sink; verification included in GET wall time","initialization_and_auth":"auth excluded; init timed separately","durability":"normal/batch acknowledgement includes final persistence barriers","cache":"per-shard fadvise DONTNEED before cold reads; warm reads follow; no global cache drop","expected_hash_compute_seconds":hash_started.elapsed().as_secs_f64(),"large_sha256":large_hash,"small_sha256":small_hash,"before":start_health}),
+        &json!({
+            "phase": "methodology",
+            "build": if cfg!(debug_assertions){
+                "debug"
+            }else{
+                "release"
+            },
+            "large_bytes": if include_large {
+                LARGE
+            } else {
+                0
+            },
+            "small_bytes": SMALL,
+            "small_count_per_method": COUNT,
+            "concurrency": 1,
+            "source": "repeating 1 MiB SplitMix64 pattern; bounded streaming generator",
+            "download": "SHA-256 sink; verification included in GET wall time",
+            "initialization_and_auth": "auth excluded; init timed separately",
+            "durability": "normal/batch acknowledgement includes final persistence barriers",
+            "cache": "per-shard fadvise DONTNEED before cold reads; warm reads follow; no global cache drop",
+            "expected_hash_compute_seconds": hash_started.elapsed().as_secs_f64(),
+            "large_sha256": large_hash,
+            "small_sha256": small_hash,
+            "before": start_health
+        }),
     )?;
     let stripe = u64::from(layout.data_shards) * u64::from(layout.block_bytes);
     let mut all = Vec::new();
@@ -597,7 +655,13 @@ async fn run_benchmark(args: Vec<String>, include_large: bool) -> Result<()> {
     }
     append(
         &events,
-        &json!({"phase":"complete","result":"passed","objects":all.len(),"download_sha256_checks":2*all.len(),"after":value(client.control(Command::Health).await?)?}),
+        &json!({
+            "phase": "complete",
+            "result": "passed",
+            "objects": all.len(),
+            "download_sha256_checks": 2*all.len(),
+            "after": value(client.control(Command::Health).await?)?
+        }),
     )?;
     println!("benchmark passed; measurements: {}", events.display());
     Ok(())

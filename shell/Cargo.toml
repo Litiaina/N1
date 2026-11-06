@@ -2,6 +2,7 @@
 name = "n1_shell"
 version.workspace = true
 edition = "2024"
+description = "Litiaina N1 native CLI and object-backup operator host"
 
 [[bin]]
 name = "litiaina-n1-shell"

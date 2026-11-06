@@ -2,6 +2,7 @@
 name = "cli_core"
 version.workspace = true
 edition = "2024"
+description = "Shared operator configuration, monitoring and CLI utilities for N1 and M1"
 
 [dependencies]
 n1_native_client = { path = "../native_client" }

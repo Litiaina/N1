@@ -211,7 +211,9 @@ async fn put_streams_regular_file_bytes_through_native_single_part_completion() 
         let mut stream = auth(listener).await;
         let req = request(&mut stream).await;
         assert!(matches!(req.command, Command::Pools));
-        reply(&mut stream,req.id,json!({"pools":[{"id":"00000000000000000000000000000000","sealed":false,"data_shards":1,"block_bytes":4096}]}),0).await;
+        reply(&mut stream,req.id,json!({
+            "pools": [{"id":"00000000000000000000000000000000","sealed":false,"data_shards":1,"block_bytes":4096}]
+        }),0).await;
         let req = request(&mut stream).await;
         assert!(matches!(
             req.command,

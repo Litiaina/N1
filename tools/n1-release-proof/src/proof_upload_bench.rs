@@ -1073,7 +1073,11 @@ fn upload_benchmark_concurrency_policy(
     effective: usize,
 ) -> Value {
     json!({
-        "requested": if requested == 0 { Value::Null } else { json!(requested) },
+        "requested": if requested == 0 {
+            Value::Null
+        } else {
+            json!(requested)
+        },
         "effective": effective,
         "active_disk_count": active_disk_count,
         "policy": if requested == 0 {

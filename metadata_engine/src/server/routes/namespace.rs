@@ -37,7 +37,15 @@ pub(super) async fn retired(
     ))
 }
 pub(super) fn version_json(path: &str, v: &PublishedVersion) -> Value {
-    json!({"object_key":path,"object_id":v.object_id,"version_id":v.version_id,"content_type":v.content_type,"total_size_bytes":v.total_size_bytes,"created_at":v.created_at_unix,"created_at_unix":v.created_at_unix})
+    json!({
+        "object_key": path,
+        "object_id": v.object_id,
+        "version_id": v.version_id,
+        "content_type": v.content_type,
+        "total_size_bytes": v.total_size_bytes,
+        "created_at": v.created_at_unix,
+        "created_at_unix": v.created_at_unix
+    })
 }
 fn file_entry(path: String, v: PublishedVersion) -> PosixEntry {
     PosixEntry {
@@ -141,9 +149,16 @@ pub(super) async fn stat(
         .execute(move |db| Namespace::new(db).stat(id, &lookup, None))
         .await;
     match file {
-        Ok(v) => Ok(Json(
-            json!({"path":path,"kind":"file","is_virtual":false,"scan_trash":false,"size_bytes":v.total_size_bytes,"version_id":v.version_id,"content_type":v.content_type,"modified_at_unix":v.created_at_unix}),
-        )),
+        Ok(v) => Ok(Json(json!({
+            "path": path,
+            "kind": "file",
+            "is_virtual": false,
+            "scan_trash": false,
+            "size_bytes": v.total_size_bytes,
+            "version_id": v.version_id,
+            "content_type": v.content_type,
+            "modified_at_unix": v.created_at_unix
+        }))),
         Err(crate::Error::NotFound) => {
             let prefix = if path.is_empty() {
                 String::new()
@@ -212,7 +227,16 @@ pub(super) async fn objects(
     let mut common_prefixes = Vec::new();
     let mut objects = Vec::new();
     for row in page.entries {
-        entries.push(json!({"record":row.path.strip_prefix(&prefix).unwrap_or(&row.path).trim_end_matches('/'),"kind":if row.directory{"directory"}else{"file"},"size_bytes":0,"created_at_unix_nanos":0}));
+        entries.push(json!({
+            "record": row.path.strip_prefix(&prefix).unwrap_or(&row.path).trim_end_matches('/'),
+            "kind": if row.directory{
+                "directory"
+            }else{
+                "file"
+            },
+            "size_bytes": 0,
+            "created_at_unix_nanos": 0
+        }));
         if row.directory {
             common_prefixes.push(row.path);
         } else if include_metadata {
@@ -223,9 +247,15 @@ pub(super) async fn objects(
         }
     }
     let next = page.after.map(|a| cursor::encode(&app, &scope, &a));
-    Ok(Json(
-        json!({"prefix":prefix,"limit":limit,"entries":entries,"objects":objects,"common_prefixes":common_prefixes,"continuation_token":next,"next_continuation_token":next}),
-    ))
+    Ok(Json(json!({
+        "prefix": prefix,
+        "limit": limit,
+        "entries": entries,
+        "objects": objects,
+        "common_prefixes": common_prefixes,
+        "continuation_token": next,
+        "next_continuation_token": next
+    })))
 }
 
 async fn matching(app: &App, id: PoolId, path: &str) -> ApiResult<(bool, Vec<String>)> {
@@ -342,9 +372,20 @@ pub(super) async fn rename(
         paths = page.files.into_iter().map(|f| f.path).collect();
     }
     app.emit(id);
-    Ok(Json(
-        json!({"operation":"rename","kind":if directory{"directory"}else{"file"},"affected":affected,"affected_paths":affected,"source_path":from,"destination_path":to,"conflicted_paths":conflicts,"failed_paths":failures}),
-    ))
+    Ok(Json(json!({
+        "operation": "rename",
+        "kind": if directory{
+            "directory"
+        }else{
+            "file"
+        },
+        "affected": affected,
+        "affected_paths": affected,
+        "source_path": from,
+        "destination_path": to,
+        "conflicted_paths": conflicts,
+        "failed_paths": failures
+    })))
 }
 pub(super) async fn trash(
     State(app): State<Arc<App>>,
@@ -398,9 +439,19 @@ async fn trash_path(app: &App, headers: &HeaderMap, path: &str) -> ApiResult<Val
         paths = page.files.into_iter().map(|f| f.path).collect();
     }
     app.emit(id);
-    Ok(
-        json!({"operation":"trash","kind":if directory{"directory"}else{"file"},"affected":affected,"affected_paths":affected,"trash_entry_id":last_id,"failed_paths":failures,"conflicted_paths":[]}),
-    )
+    Ok(json!({
+        "operation": "trash",
+        "kind": if directory{
+            "directory"
+        }else{
+            "file"
+        },
+        "affected": affected,
+        "affected_paths": affected,
+        "trash_entry_id": last_id,
+        "failed_paths": failures,
+        "conflicted_paths": []
+    }))
 }
 pub(super) async fn delete(
     State(app): State<Arc<App>>,
@@ -495,9 +546,13 @@ async fn recover_path(
         }
     }
     app.emit(id);
-    Ok(
-        json!({"operation":"recover","affected":affected,"affected_paths":affected,"conflicted_paths":conflicts,"failed_paths":failures}),
-    )
+    Ok(json!({
+        "operation": "recover",
+        "affected": affected,
+        "affected_paths": affected,
+        "conflicted_paths": conflicts,
+        "failed_paths": failures
+    }))
 }
 pub(super) async fn recover_all(
     State(app): State<Arc<App>>,
@@ -527,7 +582,21 @@ pub(super) async fn trash_list(
         .execute(move |db| Namespace::new(db).trash_page(id, after.as_deref(), limit))
         .await?;
     let next = rows.last().map(|r| cursor::encode(&app, &scope, &r.0));
-    let entries:Vec<Value>=rows.into_iter().filter(|r|!r.1.restored).map(|(key,t,v)|json!({"object_key":t.path,"path":t.path,"kind":"file","trash_entry_id":key.trim_start_matches("trash/"),"deleted_at_unix":t.deleted_at_unix,"size_bytes":v.total_size_bytes,"version_id":v.version_id})).collect();
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| !r.1.restored)
+        .map(|(key, t, v)| {
+            json!({
+                "object_key": t.path,
+                "path": t.path,
+                "kind": "file",
+                "trash_entry_id": key.trim_start_matches("trash/"),
+                "deleted_at_unix": t.deleted_at_unix,
+                "size_bytes": v.total_size_bytes,
+                "version_id": v.version_id
+            })
+        })
+        .collect();
     Ok(Json(
         json!({"entries":entries,"objects":entries,"continuation_token":next}),
     ))

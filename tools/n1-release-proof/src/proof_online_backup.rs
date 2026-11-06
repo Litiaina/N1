@@ -28,7 +28,18 @@ impl Proof {
         self.backup_cli(&repo,&key,"keygen",&[],true)?;self.backup_cli(&repo,&key,"init",&[],true)?;self.backup_cli(&replica,&key,"init",&[],true)?;
         let token_file=evidence.join("operator.token");let secret=format!("{}{}",ulid::Ulid::new(),ulid::Ulid::new());
         fs::write(&token_file,&secret)?;fs::set_permissions(&token_file,fs::Permissions::from_mode(0o600))?;
-        let settings=json!({"bind":"127.0.0.1:0","token_file":token_file,"engine_config":config,"capture_boundary_seconds":30,"repositories":{"primary":{"path":repo,"key_file":key}}});
+        let settings=json!({
+            "bind": "127.0.0.1:0",
+            "token_file": token_file,
+            "engine_config": config,
+            "capture_boundary_seconds": 30,
+            "repositories": {
+                "primary": {
+                    "path": repo,
+                    "key_file": key
+                }
+            }
+        });
         let operator=evidence.join("live-operator.json");fs::write(&operator,serde_json::to_vec(&settings)?)?;fs::set_permissions(operator,fs::Permissions::from_mode(0o600))?;
         self.start_server("online-source").await?;self.create_fragment().await?;self.auth().await?;
         let original_pid=self.server.as_ref().ok_or("missing engine")?.id();
@@ -48,7 +59,12 @@ impl Proof {
         let mut unfinished_versions=Vec::new();
         for pending_key in ["online-unfinished.bin",large_key] {
             let response=self.client.post(format!("{}/noa/v1/upload/multipart/durable/init/{pending_key}",self.base_url)).bearer_auth(&self.token)
-                .json(&json!({"content_type":"application/octet-stream","total_size_bytes":bytes,"expected_parts":bytes.div_ceil(16*1024*1024),"part_size_bytes":16*1024*1024})).send().await?;
+                .json(&json!({
+                    "content_type": "application/octet-stream",
+                    "total_size_bytes": bytes,
+                    "expected_parts": bytes.div_ceil(16*1024*1024),
+                    "part_size_bytes": 16*1024*1024
+                })).send().await?;
             if response.status()!=StatusCode::CREATED { return Err(format!("durable setup: {}",response.text().await?).into()); }
             let init:MultipartInit=response.json().await?;
             self.upload_durable_part_range(&init.version_id,0,1,16*1024*1024).await?;unfinished_versions.push(init.version_id);
@@ -109,7 +125,31 @@ impl Proof {
         // Real scheduled workflow; the unit deliberately does NOT exist. An
         // online job must not invoke a service stop/start/status subprocess.
         let job_file=evidence.join("online-job.json");
-        fs::write(&job_file,serde_json::to_vec(&json!({"enabled":true,"service":{"unit":"n1-online-proof-does-not-exist.service","user":true},"engine_config":config,"repository":repo,"key_file":key,"state_dir":evidence.join("online-job-state"),"online_source":{"url":self.base_url,"repository":"primary","token_file":token_file,"ca_file":evidence.join("cert.pem")},"capture_timeout_seconds":300,"operation_timeout_seconds":300,"keep_last":0,"replica":{"repository":replica,"key_file":key,"keep_last":0}}))?)?;
+        fs::write(&job_file,serde_json::to_vec(&json!({
+            "enabled": true,
+            "service": {
+                "unit": "n1-online-proof-does-not-exist.service",
+                "user": true
+            },
+            "engine_config": config,
+            "repository": repo,
+            "key_file": key,
+            "state_dir": evidence.join("online-job-state"),
+            "online_source": {
+                "url": self.base_url,
+                "repository": "primary",
+                "token_file": token_file,
+                "ca_file": evidence.join("cert.pem")
+            },
+            "capture_timeout_seconds": 300,
+            "operation_timeout_seconds": 300,
+            "keep_last": 0,
+            "replica": {
+                "repository": replica,
+                "key_file": key,
+                "keep_last": 0
+            }
+        }))?)?;
         fs::set_permissions(&job_file,fs::Permissions::from_mode(0o600))?;
         let active_pid=self.server.as_ref().ok_or("missing restarted engine")?.id();
         let scheduled=Command::new(&shell).args(["backup","run-job","--config"]).arg(&job_file).output()?;
@@ -146,7 +186,21 @@ impl Proof {
         let after=self.posix_stat("online-after.bin",false).await;
         if after.is_ok() { return Err("post-selection new key appeared in older snapshot".into()); }
         self.stop_server()?;
-        self.summary=json!({"status":"PASS","scenario":"online_committed_backup","ec":[self.data_shards,self.parity_shards],"first":first,"second_native":second,"pin_observed_ms":pin_observed_ms,"concurrent_mutation_ms":concurrent_mutation_ms,"original_engine_pid":original_pid,"objects_verified":hashes.len()+2,"repository":repo,"replica":replica,"key_file":key,"checks":["dedicated_operator_auth","engine_not_stopped","copy_while_mutating","committed_version_set","new_and_existing_durable_parts_excluded","post_pin_rename_upload_recover","fragment_delete_retains_pinned_data","native_online_capture","replication_verify","relocated_reversed_members_restore","all_hashes_and_listing","old_version_history","trash_recovery","post_selection_new_key_excluded"]});
+        self.summary=json!({
+            "status": "PASS",
+            "scenario": "online_committed_backup",
+            "ec": [self.data_shards,self.parity_shards],
+            "first": first,
+            "second_native": second,
+            "pin_observed_ms": pin_observed_ms,
+            "concurrent_mutation_ms": concurrent_mutation_ms,
+            "original_engine_pid": original_pid,
+            "objects_verified": hashes.len()+2,
+            "repository": repo,
+            "replica": replica,
+            "key_file": key,
+            "checks": ["dedicated_operator_auth","engine_not_stopped","copy_while_mutating","committed_version_set","new_and_existing_durable_parts_excluded","post_pin_rename_upload_recover","fragment_delete_retains_pinned_data","native_online_capture","replication_verify","relocated_reversed_members_restore","all_hashes_and_listing","old_version_history","trash_recovery","post_selection_new_key_excluded"]
+        });
         self.summary["first_snapshot"]=first;self.summary["second_snapshot"]=second;
         self.summary["checks"].as_array_mut().unwrap().extend([json!("engine_sigkill_during_capture"),json!("interrupted_view_cleanup"),json!("last_completed_point_preserved")]);
         self.summary["checks"].as_array_mut().unwrap().extend([json!("https_source_ca_validation"),json!("scheduled_online_no_service_transition"),json!("scheduled_verify_replication_healthy")]);

@@ -1,6 +1,11 @@
-# MCH scale qualification
+# Historical NCX/NDX MCH scale qualification
 
-## Current investigation — October 26, 2026
+This record predates the N1 LINK object store and M1 metadata store separation.
+Its frozen binaries, Python harness results and namespace workloads belong to
+the original engine. Current Rust qualification commands and scope are in
+[TESTING.md](../TESTING.md); this record is not a deployment guide for N1 + M1.
+
+## Investigation — October 26, 2026
 
 The October 24 grouped run stopped at **713,184 acknowledged versions** after
 foreground admission expired; it did not pass the million-object gate. The last

@@ -12,7 +12,14 @@ pub(super) async fn observe(service: Arc<Service>) -> Observation {
         let node = system::node_identity().await;
         match tokio::task::spawn_blocking(move || pools(&service)).await {
             Ok((pools, capacity, status)) => json!({"node":node,"system":system,"pools":pools,"capacity":capacity,"status":status}),
-            Err(_) => json!({"node":node,"system":system,"pools":[],"capacity":null,"status":"unavailable","error":"member observer failed"}),
+            Err(_) => json!({
+                "node": node,
+                "system": system,
+                "pools": [],
+                "capacity": null,
+                "status": "unavailable",
+                "error": "member observer failed"
+            }),
         }
     }).await
 }
@@ -26,7 +33,13 @@ fn pools(service: &Service) -> (Vec<Value>, Value, &'static str) {
         let (mut readable, mut writable) = (0, 0);
         let mut smallest = u64::MAX;
         for slot in 0..pool.layout.width() {
-            let mut row = json!({"slot":slot,"member_id":config.members[slot],"path":config.roots[slot],"status":"offline", "role":"object_member"});
+            let mut row = json!({
+                "slot": slot,
+                "member_id": config.members[slot],
+                "path": config.roots[slot],
+                "status": "offline",
+                "role": "object_member"
+            });
             let probe = pool.members[slot]
                 .as_ref()
                 .ok_or_else(|| "configured member is unavailable".to_string())
@@ -79,11 +92,27 @@ fn pools(service: &Service) -> (Vec<Value>, Value, &'static str) {
         if readiness != "ready" {
             all_complete = false;
         }
-        pools.push(json!({"id":pool.layout.id,"generation":pool.layout.generation,"data_shards":pool.layout.data_shards,
-            "parity_shards":pool.layout.parity_shards,"block_bytes":pool.layout.block_bytes,"sealed":config.sealed,
-            "available_members":readable,"writable_members":writable,"readiness":readiness,"members":members,
-            "estimated_data_available_bytes":if readable==pool.layout.width() {Some(smallest.saturating_mul(pool.layout.data_shards.into()))} else {None},
-            "integrity":{"status":"not_scanned","scope":"member bindings and filesystem counters only"}}));
+        pools.push(json!({
+            "id": pool.layout.id,
+            "generation": pool.layout.generation,
+            "data_shards": pool.layout.data_shards,
+            "parity_shards": pool.layout.parity_shards,
+            "block_bytes": pool.layout.block_bytes,
+            "sealed": config.sealed,
+            "available_members": readable,
+            "writable_members": writable,
+            "readiness": readiness,
+            "members": members,
+            "estimated_data_available_bytes": if readable==pool.layout.width() {
+                Some(smallest.saturating_mul(pool.layout.data_shards.into()))
+            } else {
+                None
+            },
+            "integrity": {
+                "status": "not_scanned",
+                "scope": "member bindings and filesystem counters only"
+            }
+        }));
     }
     let write = pools
         .iter()
@@ -93,7 +122,13 @@ fn pools(service: &Service) -> (Vec<Value>, Value, &'static str) {
     }
     (
         pools,
-        json!({"capacity_allocated":total,"capacity_used":used,"capacity_available":free,"filesystem_count":seen.len(),"complete":all_complete}),
+        json!({
+            "capacity_allocated": total,
+            "capacity_used": used,
+            "capacity_available": free,
+            "filesystem_count": seen.len(),
+            "complete": all_complete
+        }),
         if all_complete { "healthy" } else { "degraded" },
     )
 }

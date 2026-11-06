@@ -166,7 +166,16 @@ async fn run() -> Result<()> {
             let _ = response;
             append(
                 report,
-                json!({"operation":if batch_start%16==0{"batch"}else{"normal_group"},"count":records.len(),"seconds":elapsed,"rss_bytes":rss()}),
+                json!({
+                    "operation": if batch_start%16==0{
+                        "batch"
+                    }else{
+                        "normal_group"
+                    },
+                    "count": records.len(),
+                    "seconds": elapsed,
+                    "rss_bytes": rss()
+                }),
             )?;
             for record in records {
                 append(manifest, record)?;
@@ -233,7 +242,24 @@ async fn run() -> Result<()> {
             .copied()
     };
     let after = client.control(Command::Health).await?.result;
-    let summary = json!({"result":"passed","scope":"headless local witness; no scale or power-loss qualification","mode":mode,"objects":count,"source_bytes":bytes,"wall_seconds":start.elapsed().as_secs_f64(),"sample_p50_seconds":percentile(0.50),"sample_p95_seconds":percentile(0.95),"sample_p99_seconds":percentile(0.99),"build":if cfg!(debug_assertions){"debug"}else{"release"},"before":before,"after":after});
+    let summary = json!({
+        "result": "passed",
+        "scope": "headless local witness; no scale or power-loss qualification",
+        "mode": mode,
+        "objects": count,
+        "source_bytes": bytes,
+        "wall_seconds": start.elapsed().as_secs_f64(),
+        "sample_p50_seconds": percentile(0.50),
+        "sample_p95_seconds": percentile(0.95),
+        "sample_p99_seconds": percentile(0.99),
+        "build": if cfg!(debug_assertions){
+            "debug"
+        }else{
+            "release"
+        },
+        "before": before,
+        "after": after
+    });
     append(report, summary.clone())?;
     println!("{}", serde_json::to_string(&summary)?);
     Ok(())

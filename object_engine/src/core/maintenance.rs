@@ -113,7 +113,13 @@ impl WorkControl {
         tokio::select! {
             _ = self.cancel.cancelled() => {},
             _ = self.object_cancelled() => {},
-            _ = async {if self.window==Duration::MAX {std::future::pending::<()>().await;} else {tokio::time::sleep(self.window.saturating_sub(self.start.elapsed())).await;}} => {},
+            _ = async {
+                if self.window == Duration::MAX {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep(self.window.saturating_sub(self.start.elapsed())).await;
+                }
+            } => {},
         }
     }
     async fn object_cancelled(&self) {
@@ -146,7 +152,11 @@ impl WorkControl {
             .saturating_add(bytes);
         let next = Duration::from_secs_f64(charged as f64 / self.rate as f64).min(self.window);
         if let Some(delay) = next.checked_sub(self.start.elapsed()) {
-            tokio::select! {_=self.cancel.cancelled()=>{},_=self.object_cancelled()=>{},_=tokio::time::sleep(delay)=>{}}
+            tokio::select! {
+                _ = self.cancel.cancelled() => {},
+                _ = self.object_cancelled() => {},
+                _ = tokio::time::sleep(delay) => {}
+            }
         }
         if self.stopped() {
             Err(Error::Conflict(
@@ -337,7 +347,10 @@ impl Store {
                 report.examined += 1;
                 io.heartbeat();
                 if super::io_scheduler::foreground_io_pending() {
-                    tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::sleep(Duration::from_millis(25)) => {} }
+                    tokio::select! {
+                        _ = cancel.cancelled() => {},
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
                 }
                 let lease = match self.lease(fp) {
                     Ok(lease) => lease,
@@ -421,7 +434,10 @@ impl Store {
             loop {
                 let mut batch = Vec::new();
                 while batch.len() < self.runtime().object_scan_concurrency {
-                    let item = tokio::select! {_=cancel.cancelled()=>None,item=scan.recv()=>item};
+                    let item = tokio::select! {
+                        _ = cancel.cancelled() => None,
+                        item = scan.recv() => item
+                    };
                     let Some(item) = item else { break };
                     match item {
                         Ok(fp) if seen.new_item(fp) => batch.push(fp),
@@ -439,7 +455,10 @@ impl Store {
                 }
                 let pause = Duration::from_millis(self.runtime().scheduled_scrub_pause_millis);
                 if !pause.is_zero() {
-                    tokio::select! {_=cancel.cancelled()=>{},_=tokio::time::sleep(pause)=>{}}
+                    tokio::select! {
+                        _ = cancel.cancelled() => {},
+                        _ = tokio::time::sleep(pause) => {}
+                    }
                 }
                 let reports = futures_util::future::join_all(batch.into_iter().map(|fp| {
                     self.scrub_candidate(pool.clone(), fp, control.clone(), options.repair)

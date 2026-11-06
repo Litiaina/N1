@@ -95,10 +95,13 @@ pub fn status_value(path: &Path) -> Result<serde_json::Value> {
         && status.phase == "complete"
         && status.restart.is_none()
         && age.is_some_and(|age| age >= 0 && age as u64 <= config.max_age_seconds);
-    Ok(
-        serde_json::json!({"enabled":config.enabled,"healthy":healthy,
-        "max_age_seconds":config.max_age_seconds,"last_success_age_seconds":age,"status":status}),
-    )
+    Ok(serde_json::json!({
+        "enabled": config.enabled,
+        "healthy": healthy,
+        "max_age_seconds": config.max_age_seconds,
+        "last_success_age_seconds": age,
+        "status": status
+    }))
 }
 pub fn run_enabled(path: &Path) -> Result<serde_json::Value> {
     if !config::Config::load(path)?.enabled {

@@ -40,7 +40,12 @@ impl Proof {
         let part_size = self.args.max_part_size.min(total.div_ceil(2)).max(1);
         let count = total.div_ceil(part_size);
         let response = self.client.post(format!("{}/noa/v1/upload/multipart/durable/init/relocation-durable.bin",self.base_url))
-            .bearer_auth(&self.token).json(&json!({"content_type":"application/octet-stream","total_size_bytes":total,"expected_parts":count,"part_size_bytes":part_size})).send().await?;
+            .bearer_auth(&self.token).json(&json!({
+                "content_type": "application/octet-stream",
+                "total_size_bytes": total,
+                "expected_parts": count,
+                "part_size_bytes": part_size
+            })).send().await?;
         if response.status() != StatusCode::CREATED { return Err(response.text().await?.into()); }
         let init: MultipartInit = response.json().await?;
         self.upload_durable_part_range(&init.version_id, 0, 1, part_size).await?;
@@ -105,7 +110,12 @@ impl Proof {
         self.auth().await?;
         self.upload_durable_part_range(&init.version_id, 1, count, part_size).await?;
         let response = self.client.post(format!("{}/noa/v1/upload/multipart/durable/{}/{}/finalize?object_key=relocation-durable.bin",self.base_url,init.version_id,init.session_id))
-            .bearer_auth(&self.token).json(&json!({"content_type":"application/octet-stream","total_size_bytes":total,"expected_parts":count,"part_size_bytes":part_size})).send().await?;
+            .bearer_auth(&self.token).json(&json!({
+                "content_type": "application/octet-stream",
+                "total_size_bytes": total,
+                "expected_parts": count,
+                "part_size_bytes": part_size
+            })).send().await?;
         if !response.status().is_success() { return Err(response.text().await?.into()); }
         self.assert_download_sha256("relocation-durable.bin", &self.sha256_file(&self.args.source_file).await?).await?;
         expected.insert("relocation-durable.bin".into());
@@ -166,11 +176,24 @@ impl Proof {
         self.assert_download_sha256("post-relocation-renamed.bin", &sha256_bytes(b"logical member upload")).await?;
         self.stop_server()?;
         self.pool_cli("verify", &[], true, &mut measures)?;
-        self.summary = json!({"status":"PASS","proof":"pool_relocation","ec":[self.data_shards,self.parity_shards],"member":slot,
-            "legacy_seed":self.args.baseline_binary.is_some(),"cross_device_clone":copied.is_some(),"original_paths_unavailable":true,"committed_bytes_unchanged":true,
-            "checks":["descriptor_upgrade","reversed_discovery","unchanged_ndx_payload","listing_readback","wrong_identity_refusal","incomplete_copy_refusal","durable_continuation","trash_recovery","batch_and_native_upload","new_path_replacement_resume","recover_on_read","automatic_healing","post_relocation_rename"],
-            "lineage":lineage,"batch":batch,"direct":direct,"measurements":measures,"interrupted_replacement_files":interrupted_files,
-            "physical_power_cut":false,"production_data_touched":false});
+        self.summary = json!({
+            "status": "PASS",
+            "proof": "pool_relocation",
+            "ec": [self.data_shards,self.parity_shards],
+            "member": slot,
+            "legacy_seed": self.args.baseline_binary.is_some(),
+            "cross_device_clone": copied.is_some(),
+            "original_paths_unavailable": true,
+            "committed_bytes_unchanged": true,
+            "checks": ["descriptor_upgrade","reversed_discovery","unchanged_ndx_payload","listing_readback","wrong_identity_refusal","incomplete_copy_refusal","durable_continuation","trash_recovery","batch_and_native_upload","new_path_replacement_resume","recover_on_read","automatic_healing","post_relocation_rename"],
+            "lineage": lineage,
+            "batch": batch,
+            "direct": direct,
+            "measurements": measures,
+            "interrupted_replacement_files": interrupted_files,
+            "physical_power_cut": false,
+            "production_data_touched": false
+        });
         self.write_summary()?;
         Ok(())
     }

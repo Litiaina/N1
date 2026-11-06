@@ -80,6 +80,8 @@ fn print_startup_banner(runtime_config: RuntimeThreadConfig) {
     tracing::info!("║              L I T I A I N A  N 1              ║");
     tracing::info!("╚════════════════════════════════════════════════╝");
     tracing::info!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("│ Component      : N1 object store");
+    tracing::info!("│ Architecture   : LINK — Litiaina Immutable Native Key");
     tracing::info!("│ Status         : STARTING");
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ PID            : {}", std::process::id());

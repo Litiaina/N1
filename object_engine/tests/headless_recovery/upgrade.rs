@@ -191,12 +191,17 @@ async fn execute(baseline: &Path, a: &Path, b: &Path) -> Result<()> {
     private_json(
         &a.join("result.json"),
         &json!({
-            "passed":true,"baseline_sha256":format!("{:x}",Sha256::digest(fs::read(baseline)?)),
-            "candidate_sha256":format!("{:x}",Sha256::digest(fs::read(&*ENGINE)?)),
-            "pool_format":"unchanged sha256-v1; absent configuration field",
-            "unchanged_shard_hashes_and_inodes":true,"resumed_parts":[2,1],"finalize_twice":true,
-            "acknowledged_objects_verified_after_sigkill":2,"permanent_retirement_verified_after_restart":true,
-            "project_device":a.metadata()?.dev(),"test_device":b.metadata()?.dev()
+            "passed": true,
+            "baseline_sha256": format!("{:x}",Sha256::digest(fs::read(baseline)?)),
+            "candidate_sha256": format!("{:x}",Sha256::digest(fs::read(&*ENGINE)?)),
+            "pool_format": "unchanged sha256-v1; absent configuration field",
+            "unchanged_shard_hashes_and_inodes": true,
+            "resumed_parts": [2,1],
+            "finalize_twice": true,
+            "acknowledged_objects_verified_after_sigkill": 2,
+            "permanent_retirement_verified_after_restart": true,
+            "project_device": a.metadata()?.dev(),
+            "test_device": b.metadata()?.dev()
         }),
     )?;
     Ok(())

@@ -86,11 +86,16 @@ pub(super) async fn pools(
             pool["integrity"] = integrity;
         }
     }
-    Ok(Json(
-        json!({"architecture":"LINK","fragment":claims.fragment,"pools":pools,"observation":observed,
-        "object_status":object["status"],"error":object["error"],
-        "allocation_policy":"newest complete unsealed pool","metadata_store":"procyon-engine"}),
-    ))
+    Ok(Json(json!({
+        "architecture": "LINK",
+        "fragment": claims.fragment,
+        "pools": pools,
+        "observation": observed,
+        "object_status": object["status"],
+        "error": object["error"],
+        "allocation_policy": "newest complete unsealed pool",
+        "metadata_store": "procyon-engine"
+    })))
 }
 pub(super) async fn capacity(
     State(app): State<Arc<App>>,
@@ -330,7 +335,8 @@ pub(super) async fn fragment_init(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     auth::authorize(&app, &headers, "maintenance").await?;
-    Ok(Json(
-        json!({"initialized":true,"message":"Logical fragment metadata is transactionally initialized; LINK has no per-fragment directories"}),
-    ))
+    Ok(Json(json!({
+        "initialized": true,
+        "message": "Logical fragment metadata is transactionally initialized; LINK has no per-fragment directories"
+    })))
 }

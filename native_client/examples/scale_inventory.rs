@@ -225,8 +225,16 @@ fn run() -> Result<()> {
         }
         logical += count.logical;
         allocated += count.allocated;
-        members.push(json!({"slot":slot,"root":root,"device":root.metadata()?.dev(),"shards":count.files,
-            "logical_shard_bytes":count.logical,"allocated_data_file_bytes":count.allocated,"fanout_directories":count.directories,"staging_entries":0}));
+        members.push(json!({
+            "slot": slot,
+            "root": root,
+            "device": root.metadata()?.dev(),
+            "shards": count.files,
+            "logical_shard_bytes": count.logical,
+            "allocated_data_file_bytes": count.allocated,
+            "fanout_directories": count.directories,
+            "staging_entries": 0
+        }));
     }
     if objects.values().any(|value| value.members != 3) {
         return Err("some client identities lack one of their two shards".into());
@@ -247,12 +255,23 @@ fn run() -> Result<()> {
         .open(output)?;
     serde_json::to_writer_pretty(
         &mut file,
-        &json!({"passed":true,"distinct_client_identities":total,"physical_shards":2*total,
-        "every_client_identity_has_both_correctly_placed_shards":true,"unreferenced_shards":0,"staging_entries":0,
-        "source_bytes":source_bytes,"logical_shard_bytes":logical,"allocated_data_file_bytes":allocated,
-        "logical_amplification":logical as f64/source_bytes as f64,"allocated_file_amplification":allocated as f64/source_bytes as f64,
-        "allocation_scope":"data-file st_blocks only; excludes directory/inode/journal/filesystem overhead",
-        "seconds":start.elapsed().as_secs_f64(),"members":members,"scope":"post-shutdown metadata census; full payload GET verification is recorded separately"}),
+        &json!({
+            "passed": true,
+            "distinct_client_identities": total,
+            "physical_shards": 2*total,
+            "every_client_identity_has_both_correctly_placed_shards": true,
+            "unreferenced_shards": 0,
+            "staging_entries": 0,
+            "source_bytes": source_bytes,
+            "logical_shard_bytes": logical,
+            "allocated_data_file_bytes": allocated,
+            "logical_amplification": logical as f64/source_bytes as f64,
+            "allocated_file_amplification": allocated as f64/source_bytes as f64,
+            "allocation_scope": "data-file st_blocks only; excludes directory/inode/journal/filesystem overhead",
+            "seconds": start.elapsed().as_secs_f64(),
+            "members": members,
+            "scope": "post-shutdown metadata census; full payload GET verification is recorded separately"
+        }),
     )?;
     file.write_all(b"\n")?;
     file.sync_all()?;

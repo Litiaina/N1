@@ -1,4 +1,4 @@
-//! The original N1 operator configuration shared by the engine and tools.
+//! Operator configuration shared by N1, M1 and administration tools.
 //! INI controls are operator input; immutable enrollment identities are private
 //! persisted state. Editing addresses or limits must never regenerate identities.
 mod autotune;
@@ -16,7 +16,7 @@ use std::{
 };
 
 #[derive(Clone, Debug, Serialize)]
-pub struct N1Settings {
+pub struct OperatorSettings {
     pub source: PathBuf,
     pub server: Server,
     pub control_dir: PathBuf,
@@ -130,7 +130,7 @@ pub struct Export {
     pub max_concurrent_downloads: usize,
     pub max_retained_bytes: u64,
 }
-impl N1Settings {
+impl OperatorSettings {
     pub fn load(path: &Path) -> crate::Result<Self> {
         parse::load(path)
     }
@@ -139,12 +139,14 @@ impl N1Settings {
     pub fn load_metadata(path: &Path) -> crate::Result<Self> {
         parse::load_metadata(path)
     }
-    pub fn read_env(&self) -> crate::Result<BTreeMap<String, String>> {
+    /// Read this service's selected secrets file, or its named adjacent default.
+    /// N1 uses `n1.env`; M1 uses `m1.env`. Service environment values take priority.
+    pub fn read_env(&self, default_file: &str) -> crate::Result<BTreeMap<String, String>> {
         let path = self
             .server
             .env_file
             .clone()
-            .unwrap_or_else(|| self.source.with_file_name("n1.env"));
+            .unwrap_or_else(|| self.source.with_file_name(default_file));
         let bytes = match parse::read_regular(&path, true) {
             Ok(bytes) => bytes,
             Err(error)

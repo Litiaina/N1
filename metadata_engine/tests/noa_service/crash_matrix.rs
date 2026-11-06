@@ -54,9 +54,14 @@ async fn inflight_process_crash_matrix_preserves_all_prior_acks_and_only_resumes
         record(
             &stack.root.join(format!("before-crash-{case}.json")),
             &json!({
-                "target":target,"session":session,"version":version,"acknowledged_parts":[0],
-                "incomplete_part":1,"body_prefix_bytes":prefix,"body_expected_bytes":middle.len(),
-                "prior_complete_objects":acknowledged.len()
+                "target": target,
+                "session": session,
+                "version": version,
+                "acknowledged_parts": [0],
+                "incomplete_part": 1,
+                "body_prefix_bytes": prefix,
+                "body_expected_bytes": middle.len(),
+                "prior_complete_objects": acknowledged.len()
             }),
         );
         let mut socket = tokio::net::TcpStream::connect(stack.url.trim_start_matches("http://"))
@@ -151,7 +156,12 @@ async fn inflight_process_crash_matrix_preserves_all_prior_acks_and_only_resumes
             );
             assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
         }
-        cases.push(json!({"target":target,"partial_body_bytes":prefix,"prior_and_current_objects_verified":acknowledged.len(),"passed":true}));
+        cases.push(json!({
+            "target": target,
+            "partial_body_bytes": prefix,
+            "prior_and_current_objects_verified": acknowledged.len(),
+            "passed": true
+        }));
         eprintln!(
             "In-flight crash passed: {target}, {prefix} source bytes, {} exact objects",
             acknowledged.len()
@@ -181,9 +191,13 @@ async fn inflight_process_crash_matrix_preserves_all_prior_acks_and_only_resumes
     record(
         &stack.root.join("INFLIGHT-CRASH-PASSED.json"),
         &json!({
-            "passed":true,"cases":cases,"completed_objects":acknowledged.len(),
-            "incomplete_request_acknowledged":false,"acknowledged_parts_lost":false,
-            "conflicting_retry_overwrote_data":false,"final_cold_restart_verified":true
+            "passed": true,
+            "cases": cases,
+            "completed_objects": acknowledged.len(),
+            "incomplete_request_acknowledged": false,
+            "acknowledged_parts_lost": false,
+            "conflicting_retry_overwrote_data": false,
+            "final_cold_restart_verified": true
         }),
     );
 }

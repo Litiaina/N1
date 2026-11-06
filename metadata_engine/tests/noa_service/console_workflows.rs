@@ -62,13 +62,13 @@ async fn console_operator_backup_restores_versions_and_runs_original_upload_work
     }
     let archive = stack.root.join("console-downloaded.n1meta");
     let restored = stack.root.join("console-restored-metadata");
-    let records = n1_metadata_engine::MetadataEngine::restore_backup(&archive, &restored).unwrap();
+    let records = m1::MetadataEngine::restore_backup(&archive, &restored).unwrap();
     assert!(records > 0);
     drop(stack.metadata.take());
-    let mut ini = ini::Ini::load_from_file(stack.root.join("n1_config.ini")).unwrap();
+    let mut ini = ini::Ini::load_from_file(stack.root.join("m1_config.ini")).unwrap();
     ini.with_section(Some("metadata_engine"))
         .set("data_dir", restored.display().to_string());
-    ini.write_to_file(stack.root.join("n1_config.ini")).unwrap();
+    ini.write_to_file(stack.root.join("m1_config.ini")).unwrap();
     stack.start_metadata().await;
     for (version, expected) in [(&one, &first), (&two, &second)] {
         let read = client
@@ -95,6 +95,13 @@ async fn console_operator_backup_restores_versions_and_runs_original_upload_work
     );
     reliability::record(
         &stack.root.join("CONSOLE-WHOLE-PRODUCT-PASSED.json"),
-        &json!({"passed":true,"downloaded_console_snapshot_restored":true,"both_immutable_versions_exact":true,"trash_state_restored":true,"restored_records":records,"original_live_console_cases":4}),
+        &json!({
+            "passed": true,
+            "downloaded_console_snapshot_restored": true,
+            "both_immutable_versions_exact": true,
+            "trash_state_restored": true,
+            "restored_records": records,
+            "original_live_console_cases": 4
+        }),
     );
 }

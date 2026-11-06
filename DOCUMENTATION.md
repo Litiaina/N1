@@ -1,19 +1,21 @@
-# N1 operator guide
+# N1 and M1 operator guide
 
-This is the operator guide for N1 with LINK and the optional metadata engine.
+This is the operator guide for **N1**, the LINK object store, and **M1**, the
+independent metadata store backed by **ProcyonDB**. Both systems live in this
+repository. N1 operates without M1; Console's named-object workflows use both.
 RC.2 is in development. Server settings use INI; secrets come from a private
 file or the service environment. No migration from earlier development configurations
 or storage formats is required or promised.
 
 For a named N1 deployment, the connection path is:
 
-`Console / named client → metadata_engine → native LINK object_engine → shards`
+`Console / named client → M1 → native N1 (LINK) → shards`
 
 A client that owns its metadata can use `object_engine` directly. The table below
 uses object ports 19001/19002 and public metadata ports 50001/50002; these are
 examples, all editable under each service's `[server]` section.
 
-| Setting | Object engine | Metadata engine |
+| Setting | N1 (`object_engine/`) | M1 (`metadata_engine/`) |
 | --- | --- | --- |
 | HTTP(S) listener | Internal 19001 | Public 50001; Console connects here |
 | Native listener | Internal 19002, `n1/1` | Public 50002, named `n1/0.5` |
@@ -22,7 +24,7 @@ examples, all editable under each service's `[server]` section.
 
 ## Prepare and start the services
 
-Build `n1` and `n1_metadata_engine` from the workspace. Give each service its
+Build `n1` and `m1` from the workspace. Give each service its
 own configuration and control directories, with separate secrets. Starting the
 object binary without a prepared configuration creates templates and stops;
 complete them before retrying. Both services require `JWT_SECRET`,
@@ -37,7 +39,7 @@ LINK deployments can choose their own ports. Start it with:
 
 Configure metadata as shown in the next section and run:
 
-`litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini`
+`litiaina-m1 serve --config /etc/litiaina/metadata/m1_config.ini`
 
 Point the original Console at metadata's HTTPS address, not at LINK's internal
 object listener. Use certificates valid for the actual client/server names.
@@ -101,10 +103,10 @@ control lease fences enrollment against an active server. Interrupted enrollment
 resumes its recorded identities; missing signing keys for established storage
 are rejected rather than regenerated.
 
-## Optional named metadata service
+## M1 metadata service
 
 The object service works independently over native NOA v2. Named N1 clients,
-including the existing Console, connect to `litiaina-n1-metadata`. Its original
+including the existing Console, connect to `litiaina-m1`. Its original
 NOA v1 HTTP endpoints and named native operations resolve names and versions,
 then stream bytes through the object's native interface. The Console's product
 layout and workflows are retained.
@@ -114,6 +116,11 @@ directory and listening ports. In the metadata INI, `[server]` controls the
 public client address and TLS exactly as above. `[disk_config]` selects metadata
 control storage. Metadata does not enroll disks or require pool-root sections;
 it obtains immutable pool profiles from the object service.
+
+M1's default configuration is `m1_config.ini`, with an optional adjacent
+`m1.env`. N1 retains `n1_config.ini` and `n1.env`. On either service,
+`--config` and `[server] env_file` select explicit paths. Exported service
+credentials override file values; neither service requires an environment file.
 
 For a named N1 deployment, put the public ports on metadata:
 `https_port=50001` and `native_port=50002`. Assign the independent object process
@@ -152,7 +159,7 @@ coordination and trash live in metadata. Its database and staging directories
 must be real owner-only directories. LINK keys remain private to this service.
 
 ```sh
-litiaina-n1-metadata serve --config /etc/litiaina/metadata/n1_config.ini
+litiaina-m1 serve --config /etc/litiaina/metadata/m1_config.ini
 ```
 
 An external metadata implementation can use the object interface directly.
@@ -179,7 +186,7 @@ check. Its result is a live observation, not a consistent backup snapshot.
 Fragment live-byte counts are transactionally maintained in 256 counter shards;
 capacity queries read those bounded counters, never enumerate all names. An
 absent counter is reported as unknown. The explicit offline administration
-command `litiaina-n1-metadata recount --data-dir DATABASE --fragment FRAGMENT`
+command `litiaina-m1 recount --data-dir DATABASE --fragment FRAGMENT`
 rebuilds those counters when an operator requests a full recount.
 
 The **Metadata backups** panel requires master-key operator authentication and
@@ -191,13 +198,13 @@ expire after two minutes. Snapshots contain private LINK credentials; protect
 them like the database. Restore only into a new directory:
 
 ```sh
-litiaina-n1-metadata restore --snapshot SNAPSHOT.n1meta --data-dir /new/metadata-db
+litiaina-m1 restore --snapshot SNAPSHOT.n1meta --data-dir /new/metadata-db
 ```
 
 The metadata snapshot includes named transactions and upload controls; staged
 payload bytes and object shards are separate. Preserve metadata staging for
 bridged unfinished uploads and preserve an object recovery point, pool identities,
-service signing keys, INI, secrets and TLS material. For a coordinated whole-N1
+service signing keys, INI, secrets and TLS material. For a coordinated N1 + M1
 recovery point, pause writers, pool migration and deletion/GC affecting the captured objects,
 capture metadata and object state, verify both, then resume. Independent live
 captures alone do not guarantee a shared point in time.
@@ -346,8 +353,8 @@ Values accepting `auto` retain their host-derived defaults. Pool geometry and
 knobs for changing already stored objects. Operational tuning does not alter
 existing LINK identities.
 
-There is no configured total-object size cap by default. In **both** engines'
-`n1_config.ini`, omit `max_file_size` or set:
+There is no configured total-object size cap by default. In N1's
+`n1_config.ini` and M1's `m1_config.ini`, omit `max_file_size` or set:
 
 ```ini
 [set_limits]
@@ -369,8 +376,9 @@ respectively. Relative secrets paths resolve beside the selected INI. An
 explicit secrets file must exist, be regular, and have owner-only permissions;
 symlinks are rejected. Do not put these files in source control.
 
-When `env_file` is omitted, an owner-only `n1.env` beside the INI is read if
-present. It is optional when the service supplies all required secrets through
+When `env_file` is omitted, N1 reads an owner-only `n1.env` beside its INI and
+M1 reads an owner-only `m1.env` beside its INI, if present.
+The file is optional when the service supplies all required secrets through
 the process environment. Exported values override matching file values. A bad
 or insecure file still fails startup; it is not silently ignored.
 

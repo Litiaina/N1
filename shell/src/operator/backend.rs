@@ -132,7 +132,14 @@ async fn list(request: &Request, store: &Store) -> Result<Value> {
         let cursor=names.first().cloned();let mut snapshots=Vec::new();
         for id in names.into_iter().rev() {
             let point=repo.snapshot(&id)?;
-            snapshots.push(json!({"snapshot":point.id,"created_at":point.created_at,"members":point.roots.len(),"source_bytes":point.source_bytes,"records":point.records,"capture_mode":point.capture_mode}));
+            snapshots.push(json!({
+                "snapshot": point.id,
+                "created_at": point.created_at,
+                "members": point.roots.len(),
+                "source_bytes": point.source_bytes,
+                "records": point.records,
+                "capture_mode": point.capture_mode
+            }));
         }
         Ok(json!({"snapshots":snapshots,"has_more":has_more,"cursor":if has_more {cursor}else{None}}))
     }).await?
@@ -220,7 +227,7 @@ pub(super) async fn execute(config: &Config, request: &Request) -> Result<Value>
                 .restore_targets
                 .get(&request.target)
                 .ok_or("unknown restore target alias")?;
-            let settings = cli_core::settings::N1Settings::load(target)?;
+            let settings = cli_core::settings::OperatorSettings::load(target)?;
             for pool in settings.pools {
                 for root in pool.roots {
                     flag(&mut args, "--target", root);

@@ -70,9 +70,15 @@ fn inventory(roots: &[PathBuf; 2]) -> Result<Value> {
             }
         }
     }
-    Ok(
-        json!({"files":files,"directories":directories,"symlinks":symlinks,"apparent_bytes":bytes,"allocated_file_bytes":allocated,"terminal_files":terminals,"per_identity_staging_directories":staging}),
-    )
+    Ok(json!({
+        "files": files,
+        "directories": directories,
+        "symlinks": symlinks,
+        "apparent_bytes": bytes,
+        "allocated_file_bytes": allocated,
+        "terminal_files": terminals,
+        "per_identity_staging_directories": staging
+    }))
 }
 
 const NCX_SHA: &str = "51594bdd793f3af33826c5f0fa76d82616a235349875f7e71b2555b0ae3e0ff1";
@@ -240,9 +246,11 @@ impl OldClient {
         {
             return Err("NCX upload returned unexpected size or EC topology".into());
         }
-        Ok(
-            json!({"block_bytes":metadata["stripe_size_bytes"],"data_shards":metadata["data_shards"],"parity_shards":metadata["parity_shards"]}),
-        )
+        Ok(json!({
+            "block_bytes": metadata["stripe_size_bytes"],
+            "data_shards": metadata["data_shards"],
+            "parity_shards": metadata["parity_shards"]
+        }))
     }
     async fn get(&mut self, object: &Object) -> Result<()> {
         let id = self
@@ -321,7 +329,18 @@ impl FrozenLink {
         block: Arc<Vec<u8>>,
     ) -> Result<(Object, f64, Value)> {
         let timer = Instant::now();
-        let upload = self.control("upload.init",json!({"pool":null,"total_bytes":bytes,"part_bytes":bytes.max(1).div_ceil(BLOCK)*BLOCK,"durable":true,"ttl_seconds":86400})).await?;
+        let upload = self
+            .control(
+                "upload.init",
+                json!({
+                    "pool": null,
+                    "total_bytes": bytes,
+                    "part_bytes": bytes.max(1).div_ceil(BLOCK)*BLOCK,
+                    "durable": true,
+                    "ttl_seconds": 86400
+                }),
+            )
+            .await?;
         let init_seconds = timer.elapsed().as_secs_f64();
         let object = Object {
             key: field(&upload, "object_key")?,
@@ -580,7 +599,47 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         fs::DirBuilder::new().mode(0o700).create(directory)?;
     }
     println!("Comparison evidence: {}", directories[0].display());
-    let provenance = json!({"old_binary":old,"old_sha256":NCX_SHA,"old_clean_source_head":"f1e78c58963b28efb6ae382fe95b1b4d61cc8008","new_binary":new,"new_sha256":format!("{:x}",Sha256::digest(fs::read(&new)?)),"client_sha256":format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?)),"smoke_only":smoke,"order":if smoke {vec!["ncx","link"]} else {vec!["ncx","link","link","ncx"]},"members":{"devices":[parents[0].metadata()?.dev(),parents[1].metadata()?.dev()],"data_shards":1,"parity_shards":1,"block_bytes":BLOCK},"large_bytes":if smoke {1048576} else {LARGE},"small_bytes":SMALL,"small_count":if smoke {3} else {COUNT},"transport":"one authenticated native loopback TCP client; no payload TLS for either","cache":"first GET follows durable PUT; second GET warm; no cold-cache claim or global cache drop","put_timing":"end-to-end including LINK init; NCX one-shot includes internal initialization","durability":"NCX explicit strict; LINK durable ticket; required io_uring both","deletion":"NCX moves to recoverable trash; LINK permanently retires key; not equivalent guarantees","not_measured":["batch (old native protocol has no batch upload operation)","multipart","repair","GC","backup","replication","concurrent saturation","scale"],"kernel":fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),"cpu":fs::read_to_string("/proc/cpuinfo")?.lines().find(|l|l.starts_with("model name")),"old_http_listener":"mandatory idle HTTPS listener; benchmark payload uses native only","background":"desktop/editor remain active; no concurrent test or build intended"});
+    let provenance = json!({
+        "old_binary": old,
+        "old_sha256": NCX_SHA,
+        "old_clean_source_head": "f1e78c58963b28efb6ae382fe95b1b4d61cc8008",
+        "new_binary": new,
+        "new_sha256": format!("{:x}",Sha256::digest(fs::read(&new)?)),
+        "client_sha256": format!("{:x}",Sha256::digest(fs::read(std::env::current_exe()?)?)),
+        "smoke_only": smoke,
+        "order": if smoke {
+            vec!["ncx","link"]
+        } else {
+            vec!["ncx","link","link","ncx"]
+        },
+        "members": {
+            "devices": [parents[0].metadata()?.dev(),parents[1].metadata()?.dev()],
+            "data_shards": 1,
+            "parity_shards": 1,
+            "block_bytes": BLOCK
+        },
+        "large_bytes": if smoke {
+            1048576
+        } else {
+            LARGE
+        },
+        "small_bytes": SMALL,
+        "small_count": if smoke {
+            3
+        } else {
+            COUNT
+        },
+        "transport": "one authenticated native loopback TCP client; no payload TLS for either",
+        "cache": "first GET follows durable PUT; second GET warm; no cold-cache claim or global cache drop",
+        "put_timing": "end-to-end including LINK init; NCX one-shot includes internal initialization",
+        "durability": "NCX explicit strict; LINK durable ticket; required io_uring both",
+        "deletion": "NCX moves to recoverable trash; LINK permanently retires key; not equivalent guarantees",
+        "not_measured": ["batch (old native protocol has no batch upload operation)","multipart","repair","GC","backup","replication","concurrent saturation","scale"],
+        "kernel": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
+        "cpu": fs::read_to_string("/proc/cpuinfo")?.lines().find(|l|l.starts_with("model name")),
+        "old_http_listener": "mandatory idle HTTPS listener; benchmark payload uses native only",
+        "background": "desktop/editor remain active; no concurrent test or build intended"
+    });
     let mut provenance = provenance;
     provenance["order"] = json!(order);
     provenance["old_sha256"] = json!(baseline_sha);
@@ -907,7 +966,17 @@ async fn start(binary: &Path, architecture: &str, roots: &[PathBuf; 2]) -> Resul
                 stream,
                 sequence: 0,
             };
-            client.control("auth.fragment",json!({"fragment":field(&credentials,"fragment")?,"secret":field(&credentials,"secret")?,"permissions":null,"ttl_seconds":null})).await?;
+            client
+                .control(
+                    "auth.fragment",
+                    json!({
+                        "fragment": field(&credentials,"fragment")?,
+                        "secret": field(&credentials,"secret")?,
+                        "permissions": null,
+                        "ttl_seconds": null
+                    }),
+                )
+                .await?;
             return Ok((owned, Client::Frozen(client)));
         }
         let mut client = N1NativeClient::connect(&format!("n1://{address}")).await?;
@@ -928,7 +997,20 @@ async fn start(binary: &Path, architecture: &str, roots: &[PathBuf; 2]) -> Resul
             )
             .await?;
         let fragment = field(&created, "fragment_hash")?;
-        client.control("auth.fragment",json!({"fragment":fragment,"secret":SECRET,"read":true,"write":true,"modify":true,"delete":true,"expires_in":21600})).await?;
+        client
+            .control(
+                "auth.fragment",
+                json!({
+                    "fragment": fragment,
+                    "secret": SECRET,
+                    "read": true,
+                    "write": true,
+                    "modify": true,
+                    "delete": true,
+                    "expires_in": 21600
+                }),
+            )
+            .await?;
         Client::Ncx(client)
     };
     Ok((owned, client))
@@ -961,7 +1043,16 @@ fn configure_old(directory: &Path, members: &[PathBuf; 2], address: &str) -> Res
     fs::write(
         directory.join("n1.env"),
         format!(
-            "JWT_SECRET=isolated-comparison-jwt-secret-20261102\nMASTER_KEY={MASTER}\nAUTH_KEY={MASTER}\nADMIN_KEY={MASTER}\nACCESS_TOKEN_DEFAULT_TTL_SECS=3600\nACCESS_TOKEN_MAX_TTL_SECS=21600\nREFRESH_TOKEN_TTL_SECS=604800\n"
+            concat!(
+                "JWT_SECRET=isolated-comparison-jwt-secret-20261102\n",
+                "MASTER_KEY={MASTER}\n",
+                "AUTH_KEY={MASTER}\n",
+                "ADMIN_KEY={MASTER}\n",
+                "ACCESS_TOKEN_DEFAULT_TTL_SECS=3600\n",
+                "ACCESS_TOKEN_MAX_TTL_SECS=21600\n",
+                "REFRESH_TOKEN_TTL_SECS=604800\n",
+            ),
+            MASTER = MASTER
         ),
     )?;
     let https = port()?.parse::<std::net::SocketAddr>()?.port();
@@ -1203,7 +1294,17 @@ async fn trial(
         .iter()
         .filter_map(|r| r["after"]["vm_hwm_bytes"].as_u64())
         .max();
-    Ok(
-        json!({"architecture":architecture,"passed":true,"roots":roots,"clean_shutdown":true,"verified_downloads":objects.len()*(workload.warm_repeats+1),"objects_deleted":objects.len(),"before_delete_inventory":before_delete,"after_delete_inventory":after_delete,"sampled_peak_rss_bytes":peak,"kernel_rss_high_water_bytes":high,"phases":rows}),
-    )
+    Ok(json!({
+        "architecture": architecture,
+        "passed": true,
+        "roots": roots,
+        "clean_shutdown": true,
+        "verified_downloads": objects.len()*(workload.warm_repeats+1),
+        "objects_deleted": objects.len(),
+        "before_delete_inventory": before_delete,
+        "after_delete_inventory": after_delete,
+        "sampled_peak_rss_bytes": peak,
+        "kernel_rss_high_water_bytes": high,
+        "phases": rows
+    }))
 }

@@ -2,6 +2,7 @@
 name = "n1_native_client"
 version.workspace = true
 edition = "2024"
+description = "Native NOA v2 client for the Litiaina N1 LINK object store"
 
 [dependencies]
 n1_link = { path = "../link" }

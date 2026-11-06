@@ -325,14 +325,30 @@ pub async fn websocket_server(
     let mut buffer = vec![0; 64 * 1024];
     loop {
         tokio::select! {
-            read=tokio::time::timeout(IDLE,local.read(&mut buffer))=>{
-                let n=read.map_err(|_|invalid("replication adapter stalled"))??;if n==0{let _=socket.send(W::Close(None)).await;return Ok(());}
-                tokio::time::timeout(IDLE,socket.send(W::Binary(buffer[..n].to_vec().into()))).await.map_err(|_|invalid("replication HTTP peer stalled"))??;
-            },
-            frame=tokio::time::timeout(IDLE,socket.recv())=>match frame.map_err(|_|invalid("replication HTTP peer stalled"))?{
-                Some(Ok(W::Binary(data)))=>{if data.len()>64*1024{return Err(invalid("replication websocket frame exceeds limit"));}write_all(&mut local,&data).await?;},
-                Some(Ok(W::Ping(_)|W::Pong(_)))=>{},Some(Ok(W::Close(_)))|None=>return Ok(()),Some(Ok(_))=>return Err(invalid("replication requires binary frames")),Some(Err(e))=>return Err(e.into()),
-            },
+            read = tokio::time::timeout(IDLE, local.read(&mut buffer)) => {
+                let n = read.map_err(|_| invalid("replication adapter stalled"))??;
+                if n == 0 {
+                    let _ = socket.send(W::Close(None)).await;
+                    return Ok(());
+                }
+                tokio::time::timeout(IDLE, socket.send(W::Binary(buffer[..n].to_vec().into())))
+                    .await
+                    .map_err(|_| invalid("replication HTTP peer stalled"))??;
+            }
+            frame = tokio::time::timeout(IDLE, socket.recv()) => {
+                match frame.map_err(|_| invalid("replication HTTP peer stalled"))? {
+                    Some(Ok(W::Binary(data))) => {
+                        if data.len() > 64 * 1024 {
+                            return Err(invalid("replication websocket frame exceeds limit"));
+                        }
+                        write_all(&mut local, &data).await?;
+                    }
+                    Some(Ok(W::Ping(_) | W::Pong(_))) => {}
+                    Some(Ok(W::Close(_))) | None => return Ok(()),
+                    Some(Ok(_)) => return Err(invalid("replication requires binary frames")),
+                    Some(Err(e)) => return Err(e.into()),
+                }
+            }
         }
     }
 }
@@ -345,14 +361,30 @@ async fn websocket_client<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buffer = vec![0; 64 * 1024];
     loop {
         tokio::select! {
-            read=tokio::time::timeout(IDLE,local.read(&mut buffer))=>{
-                let n=read.map_err(|_|invalid("replication adapter stalled"))??;if n==0{let _=socket.close(None).await;return Ok(());}
-                tokio::time::timeout(IDLE,socket.send(W::Binary(buffer[..n].to_vec().into()))).await.map_err(|_|invalid("replication HTTP peer stalled"))??;
-            },
-            frame=tokio::time::timeout(IDLE,socket.next())=>match frame.map_err(|_|invalid("replication HTTP peer stalled"))?{
-                Some(Ok(W::Binary(data)))=>{if data.len()>64*1024{return Err(invalid("replication websocket frame exceeds limit"));}write_all(&mut local,&data).await?;},
-                Some(Ok(W::Ping(_)|W::Pong(_)))=>{},Some(Ok(W::Close(_)))|None=>return Ok(()),Some(Ok(_))=>return Err(invalid("replication requires binary frames")),Some(Err(e))=>return Err(e.into()),
-            },
+            read = tokio::time::timeout(IDLE, local.read(&mut buffer)) => {
+                let n = read.map_err(|_| invalid("replication adapter stalled"))??;
+                if n == 0 {
+                    let _ = socket.close(None).await;
+                    return Ok(());
+                }
+                tokio::time::timeout(IDLE, socket.send(W::Binary(buffer[..n].to_vec().into())))
+                    .await
+                    .map_err(|_| invalid("replication HTTP peer stalled"))??;
+            }
+            frame = tokio::time::timeout(IDLE, socket.next()) => {
+                match frame.map_err(|_| invalid("replication HTTP peer stalled"))? {
+                    Some(Ok(W::Binary(data))) => {
+                        if data.len() > 64 * 1024 {
+                            return Err(invalid("replication websocket frame exceeds limit"));
+                        }
+                        write_all(&mut local, &data).await?;
+                    }
+                    Some(Ok(W::Ping(_) | W::Pong(_))) => {}
+                    Some(Ok(W::Close(_))) | None => return Ok(()),
+                    Some(Ok(_)) => return Err(invalid("replication requires binary frames")),
+                    Some(Err(e)) => return Err(e.into()),
+                }
+            }
         }
     }
 }

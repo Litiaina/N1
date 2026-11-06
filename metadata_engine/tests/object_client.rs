@@ -1,7 +1,7 @@
 //! The native protocol is deliberately exercised at the transport boundary,
 //! including cancellation between frames and independent in-flight calls.
+use m1::object_store::{NativeObjectStore, ObjectStoreConfig};
 use n1_link::noa::{Command, Request, Response};
-use n1_metadata_engine::object_store::{NativeObjectStore, ObjectStoreConfig};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -45,7 +45,14 @@ async fn login(stream: &mut TcpStream) -> bool {
 fn stat(id: u64) -> Response {
     Response::ok(
         id,
-        json!({"total_bytes":17,"data_shards":1,"parity_shards":1,"finalized_shards":2,"integrity_algorithm":"LINK-SHA256-tree-v2","integrity_root":"ab".repeat(32)}),
+        json!({
+            "total_bytes": 17,
+            "data_shards": 1,
+            "parity_shards": 1,
+            "finalized_shards": 2,
+            "integrity_algorithm": "LINK-SHA256-tree-v2",
+            "integrity_root": "ab".repeat(32)
+        }),
     )
 }
 fn client(listener: &TcpListener, connections: usize) -> NativeObjectStore {
@@ -61,7 +68,7 @@ fn client(listener: &TcpListener, connections: usize) -> NativeObjectStore {
 
 #[tokio::test]
 async fn absent_upload_status_is_not_synthesized_as_a_resumable_session() {
-    use n1_metadata_engine::object_store::ObjectUpload;
+    use m1::object_store::ObjectUpload;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = client(&listener, 1);
     let server = tokio::spawn(async move {

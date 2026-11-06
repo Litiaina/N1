@@ -232,11 +232,17 @@ pub(super) async fn self_test(args: Vec<String>) -> Result<()> {
     private_json(
         &report.join("PASSED.json"),
         &json!({
-            "passed":true,"objects":4099,"client_and_server_process_group_sigkill":true,
-            "acknowledged_corruption_was_rejected_without_reupload_or_inode_change":true,
-            "injected_header_bytes_restored_exactly":true,"resume_of_interrupted_resume":true,
-            "all_gets_verified_after_sigkill":true,"original_ack_journals_unchanged":true,
-            "fixture":fixture,"rejected_verification":rejected,"successful_verification":passed
+            "passed": true,
+            "objects": 4099,
+            "client_and_server_process_group_sigkill": true,
+            "acknowledged_corruption_was_rejected_without_reupload_or_inode_change": true,
+            "injected_header_bytes_restored_exactly": true,
+            "resume_of_interrupted_resume": true,
+            "all_gets_verified_after_sigkill": true,
+            "original_ack_journals_unchanged": true,
+            "fixture": fixture,
+            "rejected_verification": rejected,
+            "successful_verification": passed
         }),
     )?;
     println!("physical resume witness PASS: {}", report.display());

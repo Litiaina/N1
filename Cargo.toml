@@ -1,12 +1,15 @@
 [workspace]
 members = [
-    "link",
-    "cli_core",
+    # The two systems: N1 object store and M1 metadata store.
     "object_engine",
     "metadata_engine",
+    # ProcyonDB is M1's database foundation.
     "metadata_engine/storage",
-    "shell",
+    # Shared LINK algorithm, public N1 client and operator utilities.
+    "link",
     "native_client",
+    "cli_core",
+    "shell",
     "tools/n1-release-proof",
 ]
 resolver = "2"

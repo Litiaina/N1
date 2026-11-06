@@ -107,14 +107,21 @@ impl Host {
         backend::validate(&self.config, &request)?;
         match request.operation.as_str() {
             "capabilities" => {
-                return Ok(
-                    json!({"protocol":"LINK-backup-operator-v1","repositories":self.config.repositories.keys().collect::<Vec<_>>(),"replicas":self.config.replicas.keys().collect::<Vec<_>>(),"restore_targets":self.config.restore_targets.keys().collect::<Vec<_>>(),"jobs":self.config.jobs.keys().collect::<Vec<_>>(),"capture_requires_stopped_engine":true,"online_committed_capture":self.config.online_source.is_some(),"capture_boundary_seconds":self.config.capture_boundary_seconds}),
-                );
+                return Ok(json!({
+                    "protocol": "LINK-backup-operator-v1",
+                    "repositories": self.config.repositories.keys().collect::<Vec<_>>(),
+                    "replicas": self.config.replicas.keys().collect::<Vec<_>>(),
+                    "restore_targets": self.config.restore_targets.keys().collect::<Vec<_>>(),
+                    "jobs": self.config.jobs.keys().collect::<Vec<_>>(),
+                    "capture_requires_stopped_engine": true,
+                    "online_committed_capture": self.config.online_source.is_some(),
+                    "capture_boundary_seconds": self.config.capture_boundary_seconds
+                }));
             }
             "operations" => {
-                return Ok(
-                    json!({"operations":self.jobs.lock().map_err(|_|"operator job state poisoned")?.iter().cloned().collect::<Vec<_>>()}),
-                );
+                return Ok(json!({
+                    "operations": self.jobs.lock().map_err(|_|"operator job state poisoned")?.iter().cloned().collect::<Vec<_>>()
+                }));
             }
             _ => (),
         }

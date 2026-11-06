@@ -33,13 +33,22 @@ fn process(pid: u64) -> Value {
                 .rsplit_once(") ")
                 .and_then(|(_, tail)| tail.chars().next());
             if state == Some('D') {
-                blocked.push(json!({"tid":task.file_name().to_string_lossy(),"stat":stat,
-                    "syscall":read(path.join("syscall")),"kernel_stack":read(path.join("stack"))}));
+                blocked.push(json!({
+                    "tid": task.file_name().to_string_lossy(),
+                    "stat": stat,
+                    "syscall": read(path.join("syscall")),
+                    "kernel_stack": read(path.join("stack"))
+                }));
             }
         }
     }
-    json!({"pid":pid,"stat":read(root.join("stat")),"io":read(root.join("io")),
-        "wait_channels":waits,"uninterruptible_threads":blocked})
+    json!({
+        "pid": pid,
+        "stat": read(root.join("stat")),
+        "io": read(root.join("io")),
+        "wait_channels": waits,
+        "uninterruptible_threads": blocked
+    })
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -83,9 +92,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(
             output,
             "{}",
-            json!({"unix":n1_metadata_engine::middleware::auth::now(),
-            "processes":processes,"diskstats":disks,"io_pressure":read("/proc/pressure/io"),
-            "meminfo":read("/proc/meminfo")})
+            json!({
+                "unix": m1::middleware::auth::now(),
+                "processes": processes,
+                "diskstats": disks,
+                "io_pressure": read("/proc/pressure/io"),
+                "meminfo": read("/proc/meminfo")
+            })
         )?;
         output.flush()?;
         std::thread::sleep(std::time::Duration::from_secs(5));

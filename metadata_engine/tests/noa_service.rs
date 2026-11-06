@@ -1,5 +1,5 @@
 //! Real public metadata -> native object API qualification. No mocked engine.
-use n1_metadata_engine::server::native::types::{NativeRequest, NativeResponse};
+use m1::server::native::types::{NativeRequest, NativeResponse};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 #[cfg(unix)]
@@ -62,7 +62,8 @@ fn port() -> u16 {
         .port()
 }
 fn spawn(binary: &Path, args: &[&str], root: &Path, log: &str) -> Process {
-    spawn_with_env(binary, args, root, log, &[])
+    // This fixture verifies the informational N1 startup banner explicitly.
+    spawn_with_env(binary, args, root, log, &[("RUST_LOG", "info")])
 }
 fn spawn_with_env(
     binary: &Path,
@@ -155,7 +156,7 @@ impl Stack {
         .unwrap();
         let http = port();
         let native = port();
-        let ini_path = root.join("n1_config.ini");
+        let ini_path = root.join("m1_config.ini");
         cli_core::settings::create_default_config_ini(ini_path.to_str().unwrap()).unwrap();
         let mut ini = ini::Ini::load_from_file(&ini_path).unwrap();
         ini.with_section(Some("server"))
@@ -192,7 +193,7 @@ impl Stack {
             root.join("metadata-backups").display().to_string(),
         );
         ini.write_to_file(&ini_path).unwrap();
-        let env = root.join("n1.env");
+        let env = root.join("m1.env");
         std::fs::write(&env,format!("JWT_SECRET=test-only-private-metadata-jwt-{}\nAUTH_KEY={}\nMASTER_KEY=test-only-master\nADMIN_KEY=test-only-admin\n",ulid::Ulid::new(),credentials["secret"].as_str().unwrap())).unwrap();
         std::fs::set_permissions(env, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut stack = Self {
@@ -239,12 +240,12 @@ impl Stack {
         self.start_metadata_with_env(&[]).await;
     }
     async fn start_metadata_with_env(&mut self, environment: &[(&str, &str)]) {
-        let binary = std::env::var_os("N1_METADATA_TEST_BINARY")
+        let binary = std::env::var_os("M1_TEST_BINARY")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_litiaina-n1-metadata")));
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_litiaina-m1")));
         self.metadata = Some(spawn_with_env(
             &binary,
-            &["serve", "--config", "n1_config.ini"],
+            &["serve"],
             &self.root,
             "metadata.log",
             environment,
@@ -321,14 +322,45 @@ async fn native(
 #[ignore = "real public API witness requires an explicit object binary and HDD roots"]
 async fn public_noa_metadata_object_restart_and_native_contract() {
     let mut stack = Stack::new().await;
+    let metadata_banner = std::fs::read_to_string(stack.root.join("metadata.log")).unwrap();
+    let object_banner = std::fs::read_to_string(stack.root.join("object.log")).unwrap();
+    assert!(metadata_banner.contains("L I T I A I N A  M 1"));
+    assert!(metadata_banner.contains("M1 metadata store"));
+    assert!(metadata_banner.contains("Database       : ProcyonDB"));
+    assert!(metadata_banner.contains("Start Time     :"));
+    assert!(!metadata_banner.contains("L I T I A I N A  N 1"));
+    assert!(object_banner.contains("L I T I A I N A  N 1"));
+    assert!(object_banner.contains("N1 object store"));
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
+    let ping = json_response(
+        client.get(format!("{base}/ping")).send().await.unwrap(),
+        200,
+    )
+    .await;
+    assert_eq!(ping["engine"], "m1");
     let created=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"NOA witness","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
     let fragment = created["fragment_hash"].as_str().unwrap();
-    let logged=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":fragment,"secret":"test-only-fragment","read":true,"write":true,"modify":true,"delete":true})).send().await.unwrap(),200).await;
+    let logged = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": fragment,
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = logged["access_token"].as_str().unwrap().to_owned();
     let bytes = (0..131195).map(|n| (n % 251) as u8).collect::<Vec<_>>();
     let path = "a/hello.bin";
@@ -410,7 +442,12 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
     );
     // Same upload shape reuses its identity; external parts intentionally do not
     // align to the pool's immutable stripe width.
-    let shape = json!({"content_type":"application/octet-stream","total_size_bytes":bytes.len(),"expected_parts":3,"part_size_bytes":50001});
+    let shape = json!({
+        "content_type": "application/octet-stream",
+        "total_size_bytes": bytes.len(),
+        "expected_parts": 3,
+        "part_size_bytes": 50001
+    });
     let init_url = format!("{base}/upload/multipart/durable/init/resume.bin");
     let upload = json_response(
         client
@@ -524,6 +561,11 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", stack.native))
         .await
         .unwrap();
+    let (ping, _) = native(&mut socket, "ping", json!({}), None).await;
+    assert!(ping.ok);
+    let ping: Value = serde_json::from_str(ping.payload.as_deref().unwrap()).unwrap();
+    assert_eq!(ping["server"], "Litiaina M1");
+    assert_eq!(ping["protocol"], "n1/0.5");
     let (authenticated, _) = native(&mut socket, "auth.bearer", json!({"token":token}), None).await;
     assert!(authenticated.ok, "{:?}", authenticated.error);
     let (put, body) = native(
@@ -771,9 +813,9 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
     .await;
     drop(stack.metadata.take());
     let ticket = {
-        let db = n1_metadata_engine::MetadataEngine::open(
+        let db = m1::MetadataEngine::open(
             stack.root.join("metadata-control/metadata"),
-            n1_metadata_engine::Options::default(),
+            m1::Options::default(),
         )
         .unwrap();
         let fragment_id = n1_link::PoolId(
@@ -784,8 +826,8 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
         let pending: Value = serde_json::from_slice(
             &db.snapshot()
                 .get(
-                    n1_metadata_engine::Table::Uploads,
-                    &n1_metadata_engine::RecordKey::new(fragment_id, rv).unwrap(),
+                    m1::Table::Uploads,
+                    &m1::RecordKey::new(fragment_id, rv).unwrap(),
                 )
                 .unwrap()
                 .unwrap(),
@@ -893,5 +935,9 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
             &archive[archive.len() - 97..]
         );
     }
-    std::fs::write(stack.root.join("PASSED.json"),serde_json::to_vec_pretty(&json!({"passed":true,"scope":"public HTTP and original native metadata to LINK; real process restarts, immutable versions, range, multipart bridge, grouped batch, permissions, trash/recovery, signed reads, refresh reuse, retained ZIP64/TAR export builder and signed ranged artifact downloads","fragment":fragment})).unwrap()).unwrap();
+    std::fs::write(stack.root.join("PASSED.json"),serde_json::to_vec_pretty(&json!({
+        "passed": true,
+        "scope": "public HTTP and original native metadata to LINK; real process restarts, immutable versions, range, multipart bridge, grouped batch, permissions, trash/recovery, signed reads, refresh reuse, retained ZIP64/TAR export builder and signed ranged artifact downloads",
+        "fragment": fragment
+    })).unwrap()).unwrap();
 }

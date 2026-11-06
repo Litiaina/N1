@@ -1779,6 +1779,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "m1"
+version = "1.0.0-RC.2"
+dependencies = [
+ "argon2",
+ "async_zip",
+ "axum",
+ "axum-server",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "cli_core",
+ "futures-util",
+ "hex",
+ "hmac",
+ "hostname",
+ "jsonwebtoken",
+ "libc",
+ "n1_link",
+ "n1_native_client",
+ "percent-encoding",
+ "procyon-engine",
+ "rand 0.8.5",
+ "reqwest",
+ "rmp-serde",
+ "rust-ini",
+ "rustls",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tar",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1938,49 +1982,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
-]
-
-[[package]]
-name = "n1_metadata_engine"
-version = "1.0.0-RC.2"
-dependencies = [
- "argon2",
- "async_zip",
- "axum",
- "axum-server",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "cli_core",
- "futures-util",
- "hex",
- "hmac",
- "jsonwebtoken",
- "libc",
- "n1_link",
- "n1_native_client",
- "percent-encoding",
- "procyon-engine",
- "rand 0.8.5",
- "reqwest",
- "rmp-serde",
- "rust-ini",
- "rustls",
- "serde",
- "serde_bytes",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-tar",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "ulid",
 ]
 
 [[package]]

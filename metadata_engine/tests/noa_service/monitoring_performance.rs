@@ -36,7 +36,23 @@ async fn monitoring_cpu_rss_latency_and_zero_payload_io() {
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
     let fragment=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"Monitoring CPU witness","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
-    let login=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":fragment["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"modify":true,"delete":true})).send().await.unwrap(),200).await;
+    let login = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": fragment["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = login["access_token"].as_str().unwrap().to_owned();
     // Exercise populated accounting shards, rather than measuring only an
     // empty fragment. These real uploads are outside the measurement window.
@@ -149,11 +165,27 @@ async fn monitoring_cpu_rss_latency_and_zero_payload_io() {
                 .expect("missing live backend counter"),
             "monitoring submitted object payload I/O"
         );
-        let nodes = pids.iter().enumerate().map(|(i,pid)| {
-            assert_eq!(first[i].start,last[i].start,"measured process changed");
-            let cpu_seconds = (last[i].ticks-first[i].ticks)as f64/hz as f64;
-            json!({"role":if i==0 {"metadata"}else{"object"},"pid":pid,"cpu_seconds":cpu_seconds,"cpu_one_core_percent":100.*cpu_seconds/seconds,"sampled_peak_rss_bytes":peak[i],"rss_before_bytes":first[i].rss,"rss_after_bytes":last[i].rss})
-        }).collect::<Vec<_>>();
+        let nodes = pids
+            .iter()
+            .enumerate()
+            .map(|(i, pid)| {
+                assert_eq!(first[i].start, last[i].start, "measured process changed");
+                let cpu_seconds = (last[i].ticks - first[i].ticks) as f64 / hz as f64;
+                json!({
+                    "role": if i==0 {
+                        "metadata"
+                    }else{
+                        "object"
+                    },
+                    "pid": pid,
+                    "cpu_seconds": cpu_seconds,
+                    "cpu_one_core_percent": 100.*cpu_seconds/seconds,
+                    "sampled_peak_rss_bytes": peak[i],
+                    "rss_before_bytes": first[i].rss,
+                    "rss_after_bytes": last[i].rss
+                })
+            })
+            .collect::<Vec<_>>();
         latencies.sort_by(f64::total_cmp);
         let quantile = |percent: usize| {
             if latencies.is_empty() {
@@ -167,9 +199,32 @@ async fn monitoring_cpu_rss_latency_and_zero_payload_io() {
                 )
             }
         };
-        runs.push(json!({"monitoring":monitoring,"seconds":seconds,"requests":latencies.len(),"latency_p50_ms":quantile(50),"latency_p95_ms":quantile(95),"latency_p99_ms":quantile(99),"nodes":nodes,"metadata_samples_before":before["components"]["metadata"]["observation"]["sequence"],"metadata_samples_after":after["components"]["metadata"]["observation"]["sequence"],"object_payload_io_submitted_delta":0}));
+        runs.push(json!({
+            "monitoring": monitoring,
+            "seconds": seconds,
+            "requests": latencies.len(),
+            "latency_p50_ms": quantile(50),
+            "latency_p95_ms": quantile(95),
+            "latency_p99_ms": quantile(99),
+            "nodes": nodes,
+            "metadata_samples_before": before["components"]["metadata"]["observation"]["sequence"],
+            "metadata_samples_after": after["components"]["metadata"]["observation"]["sequence"],
+            "object_payload_io_submitted_delta": 0
+        }));
     }
-    std::fs::write(stack.root.join("MONITORING-CPU-RSS.json"),serde_json::to_vec_pretty(&json!({"passed":true,"scope":"private quiet service processes; control-plane CPU/RSS, not HDD transfer throughput","seed_objects":1024,"object_monitor_interval_seconds":1,"order":"A B B A A B","clients":4,"poll_millis":100,"resource_sample_millis":100,"metadata_binary":env!("CARGO_BIN_EXE_litiaina-n1-metadata"),"object_binary":stack.object_binary,"runs":runs})).unwrap()).unwrap();
+    std::fs::write(stack.root.join("MONITORING-CPU-RSS.json"),serde_json::to_vec_pretty(&json!({
+        "passed": true,
+        "scope": "private quiet service processes; control-plane CPU/RSS, not HDD transfer throughput",
+        "seed_objects": 1024,
+        "object_monitor_interval_seconds": 1,
+        "order": "A B B A A B",
+        "clients": 4,
+        "poll_millis": 100,
+        "resource_sample_millis": 100,
+        "metadata_binary": env!("CARGO_BIN_EXE_litiaina-m1"),
+        "object_binary": stack.object_binary,
+        "runs": runs
+    })).unwrap()).unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "six matched 256 MiB two-HDD transfers with monitoring pressure"]
@@ -181,7 +236,7 @@ async fn matched_monitoring_overhead_upload_download_integrity_and_no_scan_witne
         serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
     settings["runtime"]["monitor_interval_seconds"] = json!(30);
     std::fs::write(&stack.object_config, serde_json::to_vec(&settings).unwrap()).unwrap();
-    let config = stack.root.join("n1_config.ini");
+    let config = stack.root.join("m1_config.ini");
     let mut ini = ini::Ini::load_from_file(&config).unwrap();
     ini.with_section(Some("upload_config"))
         .set("monitor_interval_seconds", "30");
@@ -194,7 +249,23 @@ async fn matched_monitoring_overhead_upload_download_integrity_and_no_scan_witne
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
     let fragment=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"Monitoring overhead","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
-    let login=json_response(client.post(format!("{base}/auth/fragment")).json(&json!({"fragment":fragment["fragment_hash"],"secret":"test-only-fragment","read":true,"write":true,"modify":true,"delete":true})).send().await.unwrap(),200).await;
+    let login = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({
+                "fragment": fragment["fragment_hash"],
+                "secret": "test-only-fragment",
+                "read": true,
+                "write": true,
+                "modify": true,
+                "delete": true
+            }))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
     let token = login["access_token"].as_str().unwrap().to_owned();
     // The part generator is outside transfer timings and has fixed memory.
     let part = (0..8 * 1024 * 1024)
@@ -325,9 +396,31 @@ async fn matched_monitoring_overhead_upload_download_integrity_and_no_scan_witne
         )
         .await;
         latencies.sort_by(f64::total_cmp);
-        results.push(json!({"run":run,"monitoring":monitoring,"bytes":received,"upload_seconds":upload_seconds,"download_seconds":download_seconds,"upload_mib_s":256./upload_seconds,"download_mib_s":256./download_seconds,"monitoring_requests":requests.load(Ordering::Relaxed),"part_p50_ms":latencies[15],"part_p95_ms":latencies[30],"sha256_verified":true,"metadata_sample_sequence_before":warm["components"]["metadata"]["observation"]["sequence"],"metadata_sample_sequence_after":end["components"]["metadata"]["observation"]["sequence"]}));
+        results.push(json!({
+            "run": run,
+            "monitoring": monitoring,
+            "bytes": received,
+            "upload_seconds": upload_seconds,
+            "download_seconds": download_seconds,
+            "upload_mib_s": 256./upload_seconds,
+            "download_mib_s": 256./download_seconds,
+            "monitoring_requests": requests.load(Ordering::Relaxed),
+            "part_p50_ms": latencies[15],
+            "part_p95_ms": latencies[30],
+            "sha256_verified": true,
+            "metadata_sample_sequence_before": warm["components"]["metadata"]["observation"]["sequence"],
+            "metadata_sample_sequence_after": end["components"]["metadata"]["observation"]["sequence"]
+        }));
     }
-    let report = json!({"runs":results,"part_bytes":part.len(),"concurrent_monitor_clients":4,"monitor_interval_seconds":30,"order":"A B B A A B","cache_dropped":false,"cold_disk_claim":false});
+    let report = json!({
+        "runs": results,
+        "part_bytes": part.len(),
+        "concurrent_monitor_clients": 4,
+        "monitor_interval_seconds": 30,
+        "order": "A B B A A B",
+        "cache_dropped": false,
+        "cold_disk_claim": false
+    });
     std::fs::write(
         stack.root.join("MONITORING-OVERHEAD.json"),
         serde_json::to_vec_pretty(&report).unwrap(),

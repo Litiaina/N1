@@ -86,8 +86,11 @@ pub(super) async fn replace(
         .map(|m| fs::canonicalize(&m.path))
         .collect::<std::io::Result<_>>()?;
     let fence = serde_json::to_vec(&serde_json::json!({
-        "format":"n1-offline-link-pool-v1", "operation":"replace",
-        "member":marker, "sources":sources, "target":target,
+        "format": "n1-offline-link-pool-v1",
+        "operation": "replace",
+        "member": marker,
+        "sources": sources,
+        "target": target,
     }))?;
     prepare(&target, &fence, resume, false)?;
     let marker_path = target.join(".n1-arc-pool.json");
@@ -664,7 +667,14 @@ mod tests {
             .flatten()
             .map(|m| fs::canonicalize(&m.path).unwrap())
             .collect();
-        let fence=serde_json::to_vec(&serde_json::json!({"format":"n1-offline-link-pool-v1","operation":"replace","member":marker,"sources":sources,"target":target})).unwrap();
+        let fence = serde_json::to_vec(&serde_json::json!({
+            "format": "n1-offline-link-pool-v1",
+            "operation": "replace",
+            "member": marker,
+            "sources": sources,
+            "target": target
+        }))
+        .unwrap();
         prepare(&target, &fence, false, false).unwrap();
         fs::write(target.join("unexpected"), b"not replacement output").unwrap();
         assert!(

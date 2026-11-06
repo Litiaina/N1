@@ -1,4 +1,7 @@
-//! LINK v1: canonical identities, authenticated object keys and immutable upload geometry.
+//! LINK (Litiaina Immutable Native Key), N1's key algorithm and storage architecture.
+//!
+//! Versioned canonical identities, authenticated object keys, deterministic shard
+//! placement and immutable upload geometry are shared by N1 and its clients.
 //!
 //! This crate has no filesystem, HTTP, engine configuration, clock, or object
 //! catalogue dependency. Native and HTTP use these exact same calculations.

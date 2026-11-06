@@ -1,16 +1,17 @@
 # Node Object API (NOA)
 
-NOA defines both parts of N1's public operation contract. **NOA v1 is the named
-metadata interface; NOA v2 is the direct LINK object interface.** Neither
+NOA defines the public operation contracts of the two systems in this repository.
+**M1**, the ProcyonDB-backed metadata store, serves **NOA v1** for named objects.
+**N1**, the LINK object store, serves **NOA v2** for direct object keys. Neither
 replaces the other. API and wire versions are independent of the binary version
 in Cargo metadata. N1 RC.2 is still in development; full product conformance has
 not yet been established.
 
 | Client or component | Connects to | Contract |
 | --- | --- | --- |
-| Console and applications using fragments, names and versions | Metadata engine | NOA v1, HTTP(S)/WebSocket; named native wire `n1/0.5` |
-| Metadata engine forwarding object bytes | Object engine | NOA v2 over native `n1/1` |
-| Applications managing their own metadata and LINK keys | Object engine directly | NOA v2 over native `n1/1`; optional HTTP adapter |
+| Console and applications using fragments, names and versions | M1 | NOA v1, HTTP(S)/WebSocket; named native wire `n1/0.5` |
+| M1 forwarding object bytes | N1 | NOA v2 over native `n1/1` |
+| Applications managing their own metadata and LINK keys | N1 directly | NOA v2 over native `n1/1`; optional HTTP adapter |
 
 Native URLs are `n1://host:port` or certificate-verified `n1s://host:port`.
 The selected engine determines the wire schema; `n1/0.5` and `n1/1` are distinct
@@ -26,10 +27,10 @@ Fragment tokens do not authorize this endpoint. Metadata snapshots remain
 metadata-service NOA v1 operations. See [the operator guide](DOCUMENTATION.md)
 for configuration and coordinated recovery.
 
-## NOA v1 — metadata engine
+## NOA v1 — M1 metadata store
 
 This is the retained named-object standard under `/noa/v1`. It is a requirement
-of N1's metadata engine, not an old-storage compatibility mode. The inventories
+of M1, not an old-storage compatibility mode. The inventories
 below retain the original contract; missing implementation must not be hidden
 by deleting operations from this document.
 
@@ -81,6 +82,9 @@ means unknown logical usage, never zero measured usage.
 `GET /noa/v1/maintenance/fragments/{fragment}/health` return
 `components.metadata` and `components.object`, each with its own node, process,
 metrics and observation age. Fragment scoping is authorized before observing.
+The existing `metadata` and `object` role keys identify M1 and N1 respectively:
+`components.metadata.product` is `M1`, its `database` is `ProcyonDB`, and
+`components.object.product` is `N1`.
 `GET /noa/v1/maintenance/pools/health` reports native object-pool members and
 capacity. Normal calls never scan payloads. `deep_scan=true` explicitly starts
 one asynchronous integrity check; subsequent `deep_scan=false` requests read
@@ -281,7 +285,7 @@ errors and retry behavior, not just route names. A registered route or a passing
 conformance. Current evidence and remaining gates are in [TESTING.md](TESTING.md)
 and [the completion checklist](docs/RC2-IMPLEMENTATION.md).
 
-## NOA v2 — object engine and LINK
+## NOA v2 — N1 object store with LINK
 
 This contract performs direct object storage. Its typed operations are shared
 by the object engine and native SDK in [link/src/noa.rs](link/src/noa.rs).

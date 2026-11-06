@@ -67,14 +67,23 @@ pub(crate) async fn list(
             let name=entry.file_name();let Some(id)=name.to_str().and_then(|s|s.strip_suffix(".n1meta")) else{continue;};
             if identity(id).is_err(){continue;}
             let stat=entry.metadata()?;
-            if stat.is_file()&&!entry.file_type()?.is_symlink() {snapshots.push(json!({"id":id,"bytes":stat.len(),"created_at":stat.modified().ok().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d|d.as_secs())}));}
+            if stat.is_file()&&!entry.file_type()?.is_symlink() {snapshots.push(json!({
+                "id": id,
+                "bytes": stat.len(),
+                "created_at": stat.modified().ok().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d|d.as_secs())
+            }));}
         }
         snapshots.sort_by(|a,b|b["id"].as_str().cmp(&a["id"].as_str()));
         Ok(snapshots)
     }).await.map_err(|_|ApiError::invalid("metadata snapshot listing worker failed"))??;
-    Ok(Json(
-        json!({"component":"metadata_engine","snapshots":snapshots,"job":app.backups.state.lock().unwrap_or_else(|e|e.into_inner()).clone(),"payloads_included":false,"download_requires_operator":true}),
-    ))
+    Ok(Json(json!({
+        "product": "M1",
+        "component": "metadata_engine",
+        "snapshots": snapshots,
+        "job": app.backups.state.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+        "payloads_included": false,
+        "download_requires_operator": true
+    })))
 }
 pub(crate) async fn create(
     State(app): State<Arc<App>>,
@@ -101,28 +110,56 @@ pub(crate) async fn create(
     let worker_id = id.clone();
     let db = app.db.observation_handle();
     let status = app.backups.clone();
-    std::thread::Builder::new().name("metadata-backup".into()).spawn(move || {
-        let _permit=permit;
-        // This dedicated thread exits after capture; lowering its priority
-        // cannot change a later foreground task in Tokio's blocking pool.
-        let old=unsafe {libc::getpriority(libc::PRIO_PROCESS,0)};
-        let _=unsafe {libc::setpriority(libc::PRIO_PROCESS,0,old.max(10))};
-        let result=(||->crate::Result<Value> {
-            let partial=dir.join(format!("{worker_id}.partial"));
-            let complete=dir.join(format!("{worker_id}.n1meta"));
-            let file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&partial)?;
-            let mut output=std::io::BufWriter::with_capacity(256*1024,file);
-            let records=db.backup(&mut output)?;
-            output.flush()?;output.get_ref().sync_all()?;
-            let bytes=output.get_ref().metadata()?.len();drop(output);
-            std::fs::rename(partial,complete)?;std::fs::File::open(&dir)?.sync_all()?;
-            Ok(json!({"id":worker_id,"phase":"completed","records":records,"bytes":bytes,"finished_at":auth::now(),"capture_mode":"mvcc_snapshot","payloads_included":false}))
-        })();
-        *status.state.lock().unwrap_or_else(|e|e.into_inner())=match result {Ok(value)=>value,Err(_)=>json!({"id":worker_id,"phase":"incomplete","error":"metadata snapshot creation failed; partial evidence retained","finished_at":auth::now()})};
-    }).map_err(|_| {
-        *app.backups.state.lock().unwrap_or_else(|e|e.into_inner())=json!({"id":id,"phase":"incomplete","error":"cannot start backup worker"});
-        ApiError::invalid("cannot start metadata backup worker")
-    })?;
+    std::thread::Builder::new()
+        .name("metadata-backup".into())
+        .spawn(move || {
+            let _permit = permit;
+            // This dedicated thread exits after capture; lowering its priority
+            // cannot change a later foreground task in Tokio's blocking pool.
+            let old = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, old.max(10)) };
+            let result = (|| -> crate::Result<Value> {
+                let partial = dir.join(format!("{worker_id}.partial"));
+                let complete = dir.join(format!("{worker_id}.n1meta"));
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&partial)?;
+                let mut output = std::io::BufWriter::with_capacity(256 * 1024, file);
+                let records = db.backup(&mut output)?;
+                output.flush()?;
+                output.get_ref().sync_all()?;
+                let bytes = output.get_ref().metadata()?.len();
+                drop(output);
+                std::fs::rename(partial, complete)?;
+                std::fs::File::open(&dir)?.sync_all()?;
+                Ok(json!({
+                    "id": worker_id,
+                    "phase": "completed",
+                    "records": records,
+                    "bytes": bytes,
+                    "finished_at": auth::now(),
+                    "capture_mode": "mvcc_snapshot",
+                    "payloads_included": false
+                }))
+            })();
+            *status.state.lock().unwrap_or_else(|e| e.into_inner()) = match result {
+                Ok(value) => value,
+                Err(_) => json!({
+                    "id": worker_id,
+                    "phase": "incomplete",
+                    "error": "metadata snapshot creation failed; partial evidence retained",
+                    "finished_at": auth::now()
+                }),
+            };
+        })
+        .map_err(|_| {
+            *app.backups.state.lock().unwrap_or_else(|e| e.into_inner()) =
+                json!({"id":id,"phase":"incomplete","error":"cannot start backup worker"});
+            ApiError::invalid("cannot start metadata backup worker")
+        })?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({"id":id,"phase":"running"})),

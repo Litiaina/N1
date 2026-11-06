@@ -50,7 +50,7 @@ impl MetadataEngine {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let stage = parent.join(format!(".n1-metadata-restore-{}", ulid::Ulid::new()));
+        let stage = parent.join(format!(".m1-restore-{}", ulid::Ulid::new()));
         std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
         // Keep failed restore evidence; it is never published as the target.
         let mut file = OpenOptions::new()

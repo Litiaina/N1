@@ -789,12 +789,19 @@ async fn witness(a: &Path, b: &Path) -> Result<()> {
     );
     private_json(
         &a.join("result.json"),
-        &json!({"passed":true,"implementation":"Rust process harness + native SDK",
-        "engine_version":env!("CARGO_PKG_VERSION"),"engine_sha256":format!("{:x}",Sha256::digest(fs::read(&*ENGINE)?)),
-        "engine_binary":*ENGINE,
-        "initial_shard_format":config.pools[0].layout.shard_format,
-        "project_device":a.metadata()?.dev(),"test_device":b.metadata()?.dev(),"io_backend":"required io_uring",
-        "phases":report,"data_directories":[a,b]}),
+        &json!({
+            "passed": true,
+            "implementation": "Rust process harness + native SDK",
+            "engine_version": env!("CARGO_PKG_VERSION"),
+            "engine_sha256": format!("{:x}",Sha256::digest(fs::read(&*ENGINE)?)),
+            "engine_binary":*ENGINE,
+            "initial_shard_format": config.pools[0].layout.shard_format,
+            "project_device": a.metadata()?.dev(),
+            "test_device": b.metadata()?.dev(),
+            "io_backend": "required io_uring",
+            "phases": report,
+            "data_directories": [a,b]
+        }),
     )?;
     Ok(())
 }

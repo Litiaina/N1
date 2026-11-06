@@ -4,7 +4,7 @@
 mod hdd_qualification;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use n1_metadata_engine::{MetadataEngine, Options};
+use m1::{MetadataEngine, Options};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
