@@ -79,6 +79,14 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/noa/v1/objects/download/chunk", get(read::chunk))
         .route("/noa/v1/objects/signed-url", post(read::signed_url))
         .route("/noa/v1/objects/signed-read", get(read::signed_read))
+        .route(
+            "/noa/v1/objects/archive",
+            post(crate::exports::archive::selected).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
+        .route(
+            "/noa/v1/objects/archive/manifest",
+            post(crate::exports::archive::manifest),
+        )
         .route("/noa/v1/upload/one-shot/{*key}", post(upload::one_shot))
         .route(
             "/noa/v1/upload/batch",
@@ -193,6 +201,10 @@ pub fn router(app: Arc<App>) -> Router {
             "/noa/v1/signed-exports/download",
             get(crate::exports::routes::signed_download),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            crate::middleware::rate_limiter::admit,
+        ))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(
             CorsLayer::new()

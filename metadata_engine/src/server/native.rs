@@ -34,7 +34,7 @@ pub async fn serve(
                 let _ = done;
             }
             accepted = listener.accept() => {
-                let (socket, _) = accepted?;
+                let (socket, peer) = accepted?;
                 let Ok(permit) = slots.clone().try_acquire_owned() else {
                     drop(socket);
                     continue;
@@ -48,10 +48,10 @@ pub async fn serve(
                         if let Ok(Ok(socket)) =
                             tokio::time::timeout(Duration::from_secs(15), tls.accept(socket)).await
                         {
-                            let _ = connection(socket, app).await;
+                            let _ = connection(socket, app, peer).await;
                         }
                     } else {
-                        let _ = connection(socket, app).await;
+                        let _ = connection(socket, app, peer).await;
                     }
                 });
             }
@@ -71,9 +71,12 @@ pub async fn serve(
 async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     socket: S,
     app: Arc<App>,
+    peer: std::net::SocketAddr,
 ) -> io::Result<()> {
     let (mut input, mut output) = tokio::io::split(socket);
-    let router = super::router(app.clone());
+    let router = super::router(app.clone()).layer(axum::Extension(
+        crate::middleware::rate_limiter::NativeAdmitted,
+    ));
     let mut token: Option<String> = None;
     loop {
         let limit = if token.is_some() {
@@ -90,6 +93,22 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         else {
             return Ok(());
         };
+        let authentication = matches!(
+            request.op.as_str(),
+            "auth.fragment" | "auth.bearer" | "auth.refresh" | "fragment.create"
+        );
+        if let Err(error) = app.rate_limits.peer(peer.ip(), authentication) {
+            frame::write_response(
+                &mut output,
+                &NativeResponse::err(request.id, "429", error.1),
+            )
+            .await?;
+            // Unread raw bytes cannot become the next control frame.
+            if request.body_len.unwrap_or(0) > 0 {
+                return Ok(());
+            }
+            continue;
+        }
         let body_len = request.body_len.unwrap_or(0);
         if body_len > types::MAX_NATIVE_BODY_BYTES as u64 {
             return Err(io::Error::new(
@@ -189,6 +208,46 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             frame::write_response(&mut output, &response).await?;
             continue;
         }
+        // Charge the fragment before accepting raw bytes. Router middleware
+        // skips this private, already-admitted native request, so HTTP/native
+        // share quotas without double charging or losing a 429 to a broken pipe.
+        if app.rate_limits.enabled
+            && let Some(token) = &token
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(io::Error::other)?,
+            );
+            if let Ok(claims) = auth::decode_claims(&app, &headers) {
+                let upload = matches!(
+                    request.op.as_str(),
+                    "upload.one_shot"
+                        | "object.upload.one_shot"
+                        | "multipart.init"
+                        | "upload.multipart.init"
+                        | "multipart.put_part"
+                        | "upload.multipart.put_part"
+                        | "multipart.finalize"
+                        | "upload.multipart.finalize"
+                        | "multipart.cancel"
+                        | "upload.multipart.cancel"
+                );
+                if let Err(error) = app.rate_limits.operation(&claims.fragment, upload) {
+                    frame::write_response(
+                        &mut output,
+                        &NativeResponse::err(request.id, "429", error.1),
+                    )
+                    .await?;
+                    if body_len > 0 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        }
         if body_len > 0 || request.body.is_some() {
             let mut headers = HeaderMap::new();
             if let Some(token) = &token {
@@ -199,13 +258,18 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         .map_err(io::Error::other)?,
                 );
             }
-            if auth::authorize(&app, &headers, "write").await.is_err() {
+            let permission = if request.op == "object.archive_manifest" {
+                "read"
+            } else {
+                "write"
+            };
+            if auth::authorize(&app, &headers, permission).await.is_err() {
                 frame::write_response(
                     &mut output,
                     &NativeResponse::err(
                         request.id,
                         "401",
-                        "authenticate with write permission before sending bytes",
+                        format!("authenticate with {permission} permission before sending bytes"),
                     ),
                 )
                 .await?;
@@ -217,6 +281,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     | "object.upload.one_shot"
                     | "multipart.put_part"
                     | "upload.multipart.put_part"
+                    | "object.archive_manifest"
             ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

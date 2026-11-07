@@ -119,6 +119,7 @@ pub(super) async fn initialize(app: &Arc<App>) -> ApiResult<()> {
             downloads: Arc::new(Semaphore::new(downloads)),
         })
         .map_err(|_| ApiError::invalid("one metadata service may run per process"))?;
+    super::archive::recover().await?;
     let mut after = None;
     loop {
         let cursor = after.clone();
@@ -185,10 +186,17 @@ pub(super) async fn enqueue(record: PersistedExport) -> ApiResult<()> {
                 let request = record.request.clone();
                 let fragment = record.fragment.clone();
                 let manifest = manifest_path(&record.id)?;
+                let cancelled = progress.cancel.clone();
                 let (count, bytes) = ctx
                     .db
                     .execute(move |db| {
-                        super::manifest::capture(&db, &fragment, &request, &manifest)
+                        super::manifest::capture_with_cancel(
+                            &db,
+                            &fragment,
+                            &request,
+                            &manifest,
+                            Some(&cancelled),
+                        )
                     })
                     .await?;
                 record.objects_total = count;
@@ -229,19 +237,23 @@ pub(super) async fn enqueue(record: PersistedExport) -> ApiResult<()> {
                 ExportPhase::Failed
             };
             record.error = Some(error.to_string());
-            let _ = save(record).await;
+            let _ = save(record.clone()).await;
         }
         ctx.jobs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
-        let job = id.clone();
-        if let Err(error) = ctx
-            .db
-            .execute(move |db| crate::namespace::Namespace::new(db).unpin_job(&job))
-            .await
-        {
-            tracing::error!(%error,"export source pins retained after cleanup failure");
+        // A graceful stop queues the same immutable manifest for restart.
+        // Its source versions must stay pinned while the service is down.
+        if record.phase.is_terminal() {
+            let job = id.clone();
+            if let Err(error) = ctx
+                .db
+                .execute(move |db| crate::namespace::Namespace::new(db).unpin_job(&job))
+                .await
+            {
+                tracing::error!(%error,"export source pins retained after cleanup failure");
+            }
         }
     });
     let mut tasks = ctx.tasks.lock().unwrap_or_else(|e| e.into_inner());

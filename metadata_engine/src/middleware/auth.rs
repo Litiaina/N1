@@ -243,7 +243,7 @@ pub async fn refresh(app: &App, token: String, logout: bool) -> ApiResult<serde_
     record.claims.exp = now() + app.config.access_ttl;
     issue(app, record.claims, Some(record.family)).await
 }
-pub async fn authorize(app: &App, headers: &HeaderMap, permission: &str) -> ApiResult<Claims> {
+pub(crate) fn decode_claims(app: &App, headers: &HeaderMap) -> ApiResult<Claims> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -251,13 +251,16 @@ pub async fn authorize(app: &App, headers: &HeaderMap, permission: &str) -> ApiR
         .ok_or_else(ApiError::unauthorized)?;
     let mut validation = Validation::new(Algorithm::HS256);
     validation.leeway = 0;
-    let claims = decode::<Claims>(
+    Ok(decode::<Claims>(
         token,
         &DecodingKey::from_secret(app.config.jwt_secret.as_bytes()),
         &validation,
     )
     .map_err(|_| ApiError::unauthorized())?
-    .claims;
+    .claims)
+}
+pub async fn authorize(app: &App, headers: &HeaderMap, permission: &str) -> ApiResult<Claims> {
+    let claims = decode_claims(app, headers)?;
     let identity = claims.fragment.clone();
     let fragment: Fragment = app
         .db

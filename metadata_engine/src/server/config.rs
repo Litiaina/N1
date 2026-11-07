@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub file_ttl_seconds: u64,
     pub maintenance: crate::maintenance::Config,
     pub export: cli_core::settings::Export,
+    pub rate_limits: cli_core::settings::RateLimits,
+    pub(crate) accel: super::accel::Config,
 }
 impl ServerConfig {
     /// No configured cap still preserves LINK's source-length representation.
@@ -175,6 +177,8 @@ impl ServerConfig {
             file_ttl_seconds: settings.garbage_collector.file_ttl_seconds,
             maintenance,
             export: settings.export,
+            rate_limits: settings.rate_limits,
+            accel: super::accel::Config::load(&env)?,
         };
         if result.access_ttl == 0
             || result.access_ttl > result.access_max_ttl

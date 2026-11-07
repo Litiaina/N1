@@ -1792,6 +1792,7 @@ dependencies = [
  "clap",
  "cli_core",
  "futures-util",
+ "governor",
  "hex",
  "hmac",
  "hostname",

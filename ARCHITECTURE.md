@@ -114,6 +114,25 @@ while keeping its admission and shutdown guards. It never replays partial
 downloads or writes. This adds no RPC to healthy reads and does not change
 LINK placement or the object engine's storage path.
 
+Optional Accel reads follow that same authorization and version-resolution
+boundary. M1 requests the current named path with a pinned version; cache-origin
+callbacks use the ordinary authorized read route and bypass cache recursion.
+A rename racing the callback can miss, in which case M1 uses its already-resolved
+LINK reference. Cache response identity/geometry is checked before publishing
+headers. Mid-stream failure ends the response without a second origin stream.
+
+M1's request quotas share actual-peer authentication/global budgets and canonical
+fragment view/upload budgets across HTTP and native clients. Native admission
+precedes raw-body transfer. Fragment limiter keys use the stable 16-byte identity;
+requests do not allocate string keys or sweep all limiter entries. An owned,
+cancellable blocking worker periodically removes replenished idle entries.
+HTTP and HTTPS listeners disable Nagle buffering, as the native listener does.
+Unconfigured Accel reads bypass request-header preparation.
+Direct archives share the retained export worker,
+queue and buffer budgets, pin immutable versions and hold only a bounded stream
+in memory. M1 owns temporary manifests and recovery cleanup intents; these add
+no records to N1's shard layout.
+
 The following sections describe the storage design. Current incomplete product
 work is listed only in [the completion checklist](docs/RC2-IMPLEMENTATION.md);
 verification evidence belongs in [TESTING.md](TESTING.md). This is not a release
@@ -131,9 +150,10 @@ announcement or a migration guide.
 | `metadata_engine/src/service.rs` | Persist upload identity before bytes, finalize through LINK, then publish metadata atomically |
 | `metadata_engine/src/object_store` | Bounded concurrent native NOA client connections; no member-root or shard-format access |
 | `metadata_engine/src/server` | Named HTTP/WebSocket and native adapters, INI startup and recovery of unfinished publications |
-| `metadata_engine/src/fragments`, `metadata_engine/src/middleware` | Logical fragment identities, aliases, permissions, authentication and refresh rotation |
+| `metadata_engine/src/fragments`, `metadata_engine/src/middleware` | Logical fragment identities, aliases, permissions, authentication, refresh rotation and shared HTTP/native request quotas |
+| `metadata_engine/src/server/accel.rs` | Optional authorized search/read acceleration, response validation and origin fallback |
 | `metadata_engine/src/uploads` | Multipart sessions, durable acknowledged-part metadata and bounded HDD re-chunking for non-aligned client part geometry |
-| `metadata_engine/src/exports` | Retained bounded ZIP64/TAR builder reading immutable versions through native object requests |
+| `metadata_engine/src/exports` | Retained bounded ZIP64/TAR builder, direct selected/manifest archive streaming, immutable source pins and M1 crash cleanup |
 | `metadata_engine/storage` | Retained Procyon storage core, upstream fixes, recovery fixtures and tests |
 | `object_engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
 | `object_engine/src/core/upload/activity.rs` | Owned operation lifetime, shutdown admission and control-lease retention |

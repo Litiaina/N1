@@ -353,6 +353,47 @@ Values accepting `auto` retain their host-derived defaults. Pool geometry and
 knobs for changing already stored objects. Operational tuning does not alter
 existing LINK identities.
 
+M1 enforces the same `[rate_limiter_config]` rate/burst controls on its HTTP and
+named native listeners. Global/auth budgets use the actual TCP peer; forwarding
+headers do not override it. View/upload budgets use the canonical fragment,
+shared across tokens and transports. HTTP rejection returns 429 with
+`Retry-After`; native rejection returns 429 without accepting an upload body.
+Set `enable_rate_limiting=false` to disable this policy. Configure a trusted
+proxy's aggregate peer budget for its actual traffic rather than assuming
+client-provided headers select independent quotas.
+
+Optional Accel integration belongs to M1. Set these in M1's service environment
+or private `m1.env`, then restart M1:
+
+```dotenv
+N1_ACCEL_READ_URL=http://127.0.0.1:9100
+N1_ACCEL_READ_BACKEND_ID=n1-primary
+N1_ACCEL_SEARCH_URL=http://127.0.0.1:9100
+N1_ACCEL_SEARCH_BACKEND_ID=n1-primary
+```
+
+Configure the corresponding Accel backend to use M1's public named origin and
+JWT verification secret. URLs accept HTTP(S), without embedded credentials,
+query or fragment; backend IDs accept letters, digits, `_` and `-`. Omit either
+URL to disable that integration; backend IDs default to `n1-primary`. M1 verifies
+permissions and resolves the version before using Accel. Failed read headers or
+invalid response geometry fall back to N1; a failed body ends the download.
+Search requires the optional accelerator and returns 503 when unavailable.
+HTTPS uses the host trust store; private-CA deployment remains a qualification
+gate and certificate verification is never disabled.
+
+Direct `/noa/v1/objects/archive` accepts selected keys/entries in JSON. Prefixes,
+`export_all` or more than 1,000 explicit entries choose TAR. JSON selection bodies
+are bounded to 4 MiB. For larger inventories, POST newline-delimited keys to
+`/noa/v1/objects/archive/manifest`; an optional
+`VERSION<TAB>KEY` pins a historical version. Manifest lines are limited to 8 KiB;
+TAR capture uses a disk spool and one metadata snapshot rather than retaining the
+whole inventory in RAM. These requests share `[export]` worker/queue and buffer
+admission. Export expiry prevents later downloads, but background retained-artifact
+cleanup and `max_retained_bytes` enforcement are still unimplemented RC.2 gates.
+For large named native archives, use export creation/status/download; its known
+artifact length supports raw streaming beyond the 8 MiB control-response bound.
+
 There is no configured total-object size cap by default. In N1's
 `n1_config.ini` and M1's `m1_config.ini`, omit `max_file_size` or set:
 

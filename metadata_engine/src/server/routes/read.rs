@@ -173,6 +173,37 @@ pub(crate) async fn stream(
     let etag = format!("\"{}\"", stored.metadata.version_id)
         .parse::<axum::http::HeaderValue>()
         .expect("version ETag");
+    if length > 0 && app.accel.reads_enabled() {
+        let mut cache_headers = headers.clone();
+        if chunk.is_some() {
+            cache_headers.insert(
+                header::RANGE,
+                format!("bytes={offset}-{}", offset + length - 1)
+                    .parse()
+                    .expect("validated range"),
+            );
+        }
+        let filename = path.rsplit('/').next().unwrap_or("download");
+        if let Some(mut response) = app
+            .accel
+            .read(
+                &app,
+                fragment,
+                &path,
+                &stored.metadata.version_id,
+                total,
+                &cache_headers,
+                attachment,
+                filename,
+            )
+            .await
+        {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
+            return Ok(response);
+        }
+    }
     let body = if length == 0 {
         // Content-Length: 0 completes the client exchange at the headers.
         // Validate the native read before publishing those headers: a later

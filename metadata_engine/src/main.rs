@@ -156,7 +156,7 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + S
     print_startup_banner(address, http, tls.is_some());
     let stop = tokio_util::sync::CancellationToken::new();
     let handle = axum_server::Handle::new();
-    let service = router(app.clone()).into_make_service();
+    let service = router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let mut native = tokio::spawn(native::serve(
         listener,
         app.clone(),
@@ -168,11 +168,18 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + S
         match tls {
             Some(tls) => {
                 axum_server::bind_rustls(http, tls)
+                    .map(|acceptor| acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()))
                     .handle(handle)
                     .serve(service)
                     .await
             }
-            None => axum_server::bind(http).handle(handle).serve(service).await,
+            None => {
+                axum_server::bind(http)
+                    .acceptor(axum_server::accept::NoDelayAcceptor::new())
+                    .handle(handle)
+                    .serve(service)
+                    .await
+            }
         }
     });
     tokio::select! {

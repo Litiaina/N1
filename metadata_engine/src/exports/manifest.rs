@@ -19,11 +19,12 @@ pub(super) fn validate_archive_path(path: &str) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn capture(
+pub(super) fn capture_with_cancel(
     db: &MetadataEngine,
     fragment: &str,
     request: &DownloadArchiveRequest,
     path: &Path,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(u64, u64)> {
     let id = n1_link::PoolId(
         ulid::Ulid::from_string(fragment)
@@ -76,6 +77,9 @@ pub(super) fn capture(
         .collect();
     let mut names = BTreeSet::new();
     let mut emit = |entry: ExportManifestEntry| -> Result<()> {
+        if cancelled.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(Error::Closed);
+        }
         validate_archive_path(&entry.archive_path)?;
         let job = path
             .file_stem()
@@ -181,4 +185,94 @@ pub(super) fn capture(
     )?
     .sync_all()?;
     Ok((count, bytes))
+}
+
+/// The NOA manifest is newline-delimited keys, optionally VERSION<TAB>KEY.
+/// Read one bounded line at a time, against one metadata snapshot. No Vec or
+/// deduplication set grows with the caller's inventory.
+pub(super) fn capture_lines(
+    db: &MetadataEngine,
+    fragment: &str,
+    input: &Path,
+    path: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    use std::io::{BufRead, Read};
+    let id = n1_link::PoolId(
+        ulid::Ulid::from_string(fragment)
+            .map_err(|_| Error::Invalid("invalid archive fragment".into()))?
+            .to_bytes(),
+    );
+    let view = db.snapshot();
+    let job = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| Error::Invalid("invalid archive identity".into()))?;
+    let temporary = path.with_extension("partial");
+    let mut options = std::fs::OpenOptions::new();
+    use std::os::unix::fs::OpenOptionsExt;
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut output = std::io::BufWriter::new(options.open(&temporary)?);
+    let mut input = std::io::BufReader::new(std::fs::File::open(input)?);
+    let mut line = Vec::with_capacity(8192);
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        line.clear();
+        let count = input.by_ref().take(8193).read_until(b'\n', &mut line)?;
+        if count == 0 {
+            break;
+        }
+        if line.len() > 8192 {
+            return Err(Error::Invalid(
+                "archive manifest line exceeds 8192 bytes".into(),
+            ));
+        }
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| Error::Invalid("archive manifest must be UTF-8".into()))?
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (version, key) = text
+            .split_once('\t')
+            .map_or((None, text), |(version, key)| (Some(version), key));
+        let key = crate::namespace::paths::normalize_path(key)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        validate_archive_path(&key)?;
+        let stored = Namespace::resolve_from_snapshot(&view, id, &key, version)?;
+        let entry = ExportManifestEntry {
+            archive_path: key,
+            object_id: stored.metadata.object_id,
+            version_id: stored.metadata.version_id,
+            source_offset_bytes: 0,
+            size_bytes: stored.metadata.total_size_bytes,
+        };
+        Namespace::new(db.clone()).pin(
+            &crate::namespace::store::lifecycle::Target {
+                fragment: id,
+                object: entry.object_id.clone(),
+                version: entry.version_id.clone(),
+            },
+            job,
+        )?;
+        serde_json::to_writer(&mut output, &entry)
+            .map_err(|_| Error::Invalid("cannot encode archive manifest".into()))?;
+        output.write_all(b"\n")?;
+    }
+    output.flush()?;
+    output.get_ref().sync_all()?;
+    drop(output);
+    std::fs::rename(temporary, path)?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| Error::Invalid("manifest has no parent".into()))?,
+    )?
+    .sync_all()?;
+    Ok(())
 }

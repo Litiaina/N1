@@ -157,7 +157,7 @@ not add empty-trash, hard-delete, or per-version-delete semantics.
 
 Snapshot is a read-authorized NDJSON projection feed with a completion marker.
 Search proxies to optional Accel. Optional `N1_ACCEL_READ_URL` also accelerates
-version-pinned object bytes after N1 authorization/resolution, including existing
+version-pinned object bytes after M1 authorization/resolution, including existing
 Console media URLs. Pre-header failure falls back to N1; mid-stream failure
 terminates the response. Accel never becomes namespace or durability authority.
 Exports pin immutable versions, build durable ZIP/TAR artifacts and support
@@ -497,17 +497,25 @@ implements the main fragment, namespace, upload, versioned-read and export
 paths, with integration and original-console tests. It is **not yet a full
 NOA v1 conformance pass**. Specific remaining differences include:
 
-- Direct archive/manifest routes and fragment-scoped maintenance routes from
-  the v1 inventory are not all registered by the metadata router.
-- The optional Accel search/read integration is not connected; search currently
-  returns an unavailable response.
-- Metadata retention/reclamation needs completion. Object staging GC does not
-  reclaim namespace history. Metadata snapshots and object recovery are separate
-  operations; a matching whole-product point requires the documented operator
-  pause. Independent live snapshots do not provide an atomic cross-service point.
-- Maintenance authorization/results and all retained request/response/retry
-  semantics still require complete contract qualification. Redistribution must
-  respect immutable pools; its current rejection is not a conformance pass.
+- Retained export artifact expiry/cleanup, disk accounting and restart admission
+  still require completion and qualification. Direct ZIP64/TAR and streamed TAR
+  manifest routes are implemented; their bounded-worker, disconnect, process-crash
+  cleanup and source-failure tests are separate from retained artifact lifecycle.
+- Named native responses without a known content length retain the 8 MiB
+  control-response bound. Large native archive consumers use the export-job
+  download path, whose durable artifact has a known length. Unbounded direct
+  archive streaming is not implied by registration of a native operation name.
+- Request/response fields, permissions, errors and retry semantics require the
+  complete contract campaign. Named request quotas and configured optional Accel
+  search/read now have scoped HTTP/native integration tests, not a blanket
+  conformance result. Search returns 503 when Accel is absent or unavailable;
+  object reads preserve their pre-header origin fallback.
+- Indexed metadata TTL reclamation, scoped integrity/healing and verified pool
+  migration are implemented. Their remaining physical topology, scale and fault
+  gates remain in the completion checklist. Metadata snapshots and object
+  recovery are separate operations; a matching whole-product point requires the
+  documented operator pause. Independent live snapshots do not provide an atomic
+  cross-service point.
 
 A v2 storage pass, a metadata KV test or a successful Console upload does not
 close these gaps. [The completion checklist](docs/RC2-IMPLEMENTATION.md) owns the

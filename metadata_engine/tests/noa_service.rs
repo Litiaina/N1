@@ -10,6 +10,12 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[path = "noa_service/accel.rs"]
+mod accel;
+#[path = "noa_service/admission.rs"]
+mod admission;
+#[path = "noa_service/archives.rs"]
+mod archives;
 #[path = "noa_service/console_workflows.rs"]
 mod console_workflows;
 #[path = "noa_service/crash_matrix.rs"]
@@ -26,6 +32,8 @@ mod monitoring;
 mod monitoring_performance;
 #[path = "noa_service/object_recovery.rs"]
 mod object_recovery;
+#[path = "noa_service/preparation_bench.rs"]
+mod preparation_bench;
 #[path = "noa_service/reliability.rs"]
 mod reliability;
 #[path = "noa_service/resume_damage.rs"]
@@ -36,6 +44,8 @@ mod resume_listing;
 mod resume_progress;
 #[path = "noa_service/resume_scale.rs"]
 mod resume_scale;
+#[path = "noa_service/upload_regression.rs"]
+mod upload_regression;
 #[path = "noa_service/upload_size_limits.rs"]
 mod upload_size_limits;
 struct Process(Child);
@@ -181,6 +191,10 @@ impl Stack {
             .set("upload_memory_budget_bytes", "67108864");
         ini.with_section(Some("upload_config"))
             .set("monitor_interval_seconds", "1");
+        // Functional/fault witnesses are not request-rate campaigns. Explicit
+        // quota tests below re-enable and exercise the operator policy.
+        ini.with_section(Some("rate_limiter_config"))
+            .set("enable_rate_limiting", "false");
         ini.with_section(Some("metadata_engine"))
             .set(
                 "object_native_url",

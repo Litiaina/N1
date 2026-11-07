@@ -1,5 +1,6 @@
 //! NOA adapters for M1, the metadata store. Both transports call the
 //! same domain service; object bytes cross the public native LINK boundary.
+pub(crate) mod accel;
 pub(crate) mod backups;
 pub mod config;
 mod diagnostics;
@@ -29,6 +30,8 @@ pub struct App {
     pub auth_slots: Arc<Semaphore>,
     pub upload_slots: Arc<Semaphore>,
     pub upload_memory: Arc<Semaphore>,
+    pub(crate) rate_limits: Arc<crate::middleware::rate_limiter::RateLimits>,
+    pub(crate) accel: accel::Accel,
     pub events: tokio::sync::broadcast::Sender<serde_json::Value>,
     upload_locks: Mutex<HashMap<String, Weak<RwLock<()>>>>,
     pub(crate) pools: Vec<PoolProfile>,
@@ -120,6 +123,10 @@ impl App {
             auth_slots: Arc::new(Semaphore::new(4)),
             upload_slots: Arc::new(Semaphore::new(config.upload_concurrency)),
             upload_memory: Arc::new(Semaphore::new(memory_units)),
+            rate_limits: Arc::new(crate::middleware::rate_limiter::RateLimits::new(
+                &config.rate_limits,
+            )),
+            accel: accel::Accel::new(&config.accel)?,
             config,
             events,
             upload_locks: Mutex::new(HashMap::new()),
@@ -152,6 +159,7 @@ impl App {
         let _ = self.events.send(serde_json::json!({"event":"NAMESPACE_CHANGED", "fragment":ulid::Ulid::from_bytes(fragment.0).to_string()}));
     }
     pub async fn shutdown(&self) {
+        self.rate_limits.shutdown().await;
         self.diagnostics.shutdown().await;
         self.maintenance.shutdown().await;
         self.backups.drain().await;
@@ -159,6 +167,7 @@ impl App {
         self.service.shutdown().await;
     }
     pub async fn start_maintenance(&self) -> error::ApiResult<()> {
+        self.rate_limits.start();
         self.maintenance.resume_and_schedule().await
     }
 }

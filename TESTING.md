@@ -32,6 +32,125 @@ Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
 selected HDD/RAM locations; never put population fixtures on the source NVMe.
 
+## Performance acceptance for feature changes
+
+A functional pass does not close a feature change that regresses an established
+workload. Preserve the optimized baseline binary before changing code, measure
+the candidate with the same durability, checksums, geometry and concurrency,
+and retain each operation's latency, CPU, RSS and verified output. Report N1
+alone separately from the M1-to-N1 pipeline. A gain in one operation cannot
+compensate for a regression in another.
+
+For a suspected regression, alternate binaries against the same running N1,
+metadata database and physical pool; retain individual request samples and audit
+LINK placement. Compare the feature enabled and disabled to isolate its cost.
+Profile the affected stages, fix avoidable overhead and repeat the affected
+integrity/recovery tests before calling the optimization complete. HDD variation
+requires repeated controlled measurements; neither a single slower run nor a
+single faster run establishes the code's cost. Do not weaken durable ACKs or
+verification to satisfy a performance comparison.
+
+The Rust opt-in
+`upload_regression::alternating_small_uploads_on_one_database_and_pool` runs
+twelve balanced phases: committed baseline, candidate with quotas, and candidate
+without quotas. It saves raw PUT/verified GET samples, CPU/RSS and each sampled
+version's data-member slot. Three warmups per phase are excluded. Its final audit
+requires every phase; interrupted results cannot be promoted to complete.
+`service::performance::small_upload_stage_profile` separately times native Begin,
+durable M1 reservation, pending lookup, durable N1 PUT, stat and durable M1
+publication. That opt-in test instrumentation is absent from shipped binaries.
+Explicit private roots, executable paths and fresh report paths are required.
+`upload_regression::alternating_namespace_mutations_on_one_database` isolates
+rename/trash on fixed names, with byte verification after each phase. Its
+RAM-only mode separates software cost from HDD waits; it is not durability
+qualification.
+
+## RC.2 preparation — November 7, 2026
+
+The initial preparation checkpoint passes **479 default tests**, with **44 explicit
+opt-in/helper exclusions**, and **81 documentation tests**. Strict M1 Clippy
+and workspace formatting pass. Eight isolated two-XFS-HDD service cases pass
+against the optimized M1 candidate and the same optimized N1 binary.
+
+These cover shared HTTP/native request quotas, actual Accel search/read plus
+upstream fault behavior, decoded ZIP64/TAR archives, pinned historical versions,
+permissions, manifest input limits, client disconnects, SIGKILL cleanup, missing
+empty backend objects, and graceful export shutdown/restart with source pins.
+The existing named/native restart, monitoring/metadata-backup and size-policy
+cases also pass. N1, LINK, native-client/shared-CLI/shell source and the README
+remain unchanged in this preparation batch; Console was not edited.
+
+A Rust benchmark runs baseline/candidate/candidate/baseline using an independently
+rebuilt committed `main` and the optimized candidate. Each run verifies 100 ×
+4 KiB objects and 256 MiB of strict durable multipart data, then measures rename
+and trash. CPU, peak RSS and latency distributions are retained. Results are
+mixed: candidate large-upload time averages 20.1% lower, while small-upload time
+averages 14.1% higher. The initial large-GET comparison used different data-member
+placements. A second ABBA replay holds the same object, version and N1 process
+constant: baseline 7.3104 s versus candidate 7.3340 s, 0.32% higher, with every
+payload verified. This screen did not isolate small-write cost; the controlled
+follow-up below investigates it. No all-operation parity or old-NCX comparison
+is inferred from this screen.
+
+Evidence, raw results, failed attempts, exact binaries, reproduction scripts and
+source preservation are under
+`/mnt/HDD1TB001/n1-rc2-preparation-20261107-01`; see its
+[preparation report](/mnt/HDD1TB001/n1-rc2-preparation-20261107-01/reports/PREPARATION-RESULTS.md)
+and [benchmark report](/mnt/HDD1TB001/n1-rc2-preparation-20261107-01/reports/BENCHMARK-RESULTS.md).
+Historical absolute `/mnt/PROJECT-DISK-1TB` links below identify their original
+report locations; five are unavailable on this machine and were not reverified.
+Retained artifact TTL/disk-limit implementation, complete contract/Console
+coverage and the scheduled MCH scale/physical-fault/power-loss gates remain open.
+
+### Controlled performance follow-up
+
+The follow-up removes M1's foreground limiter sweep and per-request String
+limiter keys, disables Nagle buffering on HTTP/HTTPS, and skips Accel header
+preparation when unconfigured. N1, LINK, the native client, ProcyonDB's storage
+core, CLI/shell, README and Console remain unchanged. Durable ACKs and integrity
+verification are preserved.
+
+The workspace checkpoint passes **481 default tests**, with **48 opt-in/helper
+exclusions**, followed by **81 documentation tests**. After the final quota
+rounding correction, all **42 M1 unit tests** and strict all-target Clippy pass.
+Nine actual-service cases pass against the optimized checkpoint; the final
+binary separately repeats HTTP/native quotas, named/native restart and verified
+TLS upload/full/ranged reads. A real 60-second cleanup test verifies idle
+reclamation without replenishing a busy client's quota.
+
+Two twelve-phase HDD campaigns each retain 128 measured uploads per variant.
+The first optimized candidate averages 424.067 ms versus 477.834 ms baseline;
+the final-binary repeat averages 375.886 ms versus 323.833 ms baseline. Both
+observations are retained: upload means reverse, so no upload speedup is claimed.
+Pooling the two optimized checkpoints descriptively gives 399.976 versus
+400.833 ms (0.21% lower), but candidate p95/p99 are higher. This is not a
+tail-latency parity pass. Verified small-read means improve reproducibly from
+43.747 to 1.571 ms. A single-member RAM-only software diagnostic averages
+3.098 versus 3.125 ms per upload across 512 samples per variant, with comparable
+CPU; it does not qualify physical durability.
+
+Separate actual-call profiling puts 99.54% of elapsed upload time inside durable
+N1 PUT and M1 reservation/publication calls. An fsync-only diagnostic trace finds
+metadata-journal waits up to 1.503 s; it does not count io_uring operations or
+serve as a throughput benchmark. A same-object 256 MiB read replay averages
+7.3472 versus 7.3516 s with full SHA-256/ETag verification.
+
+The complete methods, individual samples, slower tails, exact binaries and
+failed attempts are in the
+[performance investigation](/mnt/HDD1TB001/n1-upload-regression-20261107-01/reports/PERFORMANCE-RESULTS.md).
+The original mixed workload is repeated with the final binary; see its
+[per-operation results](/mnt/HDD1TB001/n1-upload-regression-20261107-01/reports/FULL-WORKLOAD.md).
+Its mean small-upload time is 12.51% lower, mean multipart-upload time 1.85%
+lower, and mean small GET 44.997 to 1.658 ms. Rename averages 13.83% more time
+and some other percentiles/RSS increase; they are not hidden by a faster total.
+A follow-up on identical names and one database measures rename at 1.118 versus
+1.130 ms in RAM, and 67.717 versus 56.192 ms on HDD. Trash remains mixed,
+including a 0.190 ms higher mean in the RAM diagnostic. Raw samples, CPU and
+the interpretation are retained in the investigation report. No universal
+per-operation parity claim follows.
+These local checks do not close saturation, current-lifecycle population,
+hardware power-loss or all-operation tail-latency release gates.
+
 ## N1/M1 naming verification — November 6, 2026
 
 The formalized `n1` / `m1` workspace passed **474 default tests**, with **37

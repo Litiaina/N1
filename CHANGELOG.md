@@ -10,6 +10,24 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Enforce M1's configured request quotas across HTTP and named native NOA,
+  sharing peer and fragment budgets across connections and token changes.
+- Keep M1 limiter cleanup off request/I/O workers, use fixed-size fragment
+  identities for quota lookup, and drain the cleanup task during shutdown.
+- Disable Nagle buffering on M1 HTTP/HTTPS listeners and bypass optional Accel
+  header preparation when no read accelerator is configured. Preserve N1's
+  object path, integrity checks and durable acknowledgement barriers.
+- Add controlled Rust upload regression measurements with alternating binaries
+  on the same database/pool, placement audits, individual latency samples,
+  CPU/RSS, complete payload readback and separate durable-stage profiling.
+- Connect M1 to optional Accel search and version-pinned reads; validate cache
+  response identity/geometry, preserve origin fallback before headers and fail
+  truncated streams without replaying a partial response.
+- Restore direct selected ZIP64/TAR and streaming-manifest TAR archives with
+  bounded export admission, immutable source pins and M1 crash cleanup. Preserve
+  source errors even for zero-length TAR entries; retain queued export pins
+  during graceful shutdown.
+
 - Make N1 LINK + M1 the mainstream system on `main`. Preserve the former
   NCX/NDX engine as **N1 Lite** in the independent `Litiaina/N1-Lite` repository,
   with separate engine, binary, configuration and service identities. This

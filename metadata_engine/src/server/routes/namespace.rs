@@ -650,12 +650,10 @@ async fn bulk(
 pub(super) async fn search(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> ApiResult<Response> {
     auth::authorize(&app, &headers, "read").await?;
-    Err(ApiError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Namespace search accelerator is not configured".into(),
-    ))
+    app.accel.search(&headers, query.as_deref()).await
 }
 pub(super) async fn snapshot(
     State(app): State<Arc<App>>,

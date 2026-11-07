@@ -186,7 +186,7 @@ type ChunkWriteResult = Result<(u64, PathBuf, u64, String), AppError>;
 struct PreparedEntry {
     manifest: ExportManifestEntry,
     receiver: mpsc::Receiver<Result<Bytes, std::io::Error>>,
-    task: JoinHandle<()>,
+    task: JoinHandle<std::io::Result<()>>,
 }
 
 struct ManifestPrefetcher {
@@ -196,6 +196,12 @@ struct ManifestPrefetcher {
     progress: Arc<ActiveProgress>,
     concurrency: usize,
     exhausted: bool,
+}
+
+impl Drop for ManifestPrefetcher {
+    fn drop(&mut self) {
+        self.abort_remaining();
+    }
 }
 
 impl ManifestPrefetcher {
@@ -322,9 +328,15 @@ fn spawn_object_reader(
         }
         .await;
 
-        if let Err(error) = result {
-            let _ = sender.send(Err(error)).await;
+        if let Err(error) = &result {
+            // TAR consumes the declared length, so it may never poll a final
+            // stream error (including any error for an empty object). The join
+            // result must independently preserve source verification failures.
+            let _ = sender
+                .send(Err(std::io::Error::new(error.kind(), error.to_string())))
+                .await;
         }
+        result
     });
     PreparedEntry {
         manifest,
@@ -333,10 +345,12 @@ fn spawn_object_reader(
     }
 }
 
-async fn finish_prepared_entry(task: JoinHandle<()>) -> Result<(), AppError> {
-    task.await.map_err(|error| {
-        AppError::InternalServerError(format!("N1 export object reader task failed: {error}"))
-    })
+async fn finish_prepared_entry(task: JoinHandle<std::io::Result<()>>) -> Result<(), AppError> {
+    task.await
+        .map_err(|error| {
+            AppError::InternalServerError(format!("N1 export object reader task failed: {error}"))
+        })?
+        .map_err(|error| AppError::Io(error, "verify export source".into()))
 }
 
 async fn build_zip(
@@ -682,5 +696,48 @@ pub(super) async fn build_artifact(
             cleanup_artifact_chunks(id).await;
             Err(error)
         }
+    }
+}
+
+/// Direct archives reuse the retained bounded ZIP64/TAR writer and source
+/// reader. They do not create a second copy as persistent artifact chunks.
+pub(super) async fn write_stream(
+    id: &str,
+    fragment: &str,
+    format: &str,
+    writer: tokio::io::DuplexStream,
+    progress: Arc<ActiveProgress>,
+) -> Result<(), AppError> {
+    let path = manifest_path(id)?;
+    let overhead = if format == "zip" {
+        (fs::metadata(&path)
+            .await
+            .map_err(|e| AppError::Io(e, "stat archive manifest".into()))?
+            .len() as usize)
+            .saturating_mul(ZIP_DIRECTORY_SAFETY_MULTIPLIER)
+            .saturating_add(ZIP_DIRECTORY_FIXED_BYTES)
+    } else {
+        0
+    };
+    let plan = export_buffer_plan_with_overhead(super::store::export_config(), 1, overhead)?;
+    let _buffer = acquire_buffer_admission(plan.admitted_bytes).await?;
+    if format == "tar" {
+        build_tar(
+            &path,
+            fragment.to_owned(),
+            writer,
+            progress,
+            plan.object_read_concurrency,
+        )
+        .await
+    } else {
+        build_zip(
+            &path,
+            fragment.to_owned(),
+            writer,
+            progress,
+            plan.object_read_concurrency,
+        )
+        .await
     }
 }

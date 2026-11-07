@@ -27,6 +27,8 @@ pub(super) async fn dispatch(
     let (method, mut uri) = match request.op.as_str() {
         "namespace.list" | "posix.list" => ("GET", "/noa/v1/posix/list".into()),
         "namespace.stat" | "posix.stat" => ("GET", "/noa/v1/posix/stat".into()),
+        "namespace.search" => ("GET", "/noa/v1/namespace/search".into()),
+        "namespace.snapshot" => ("GET", "/noa/v1/namespace/snapshot".into()),
         "namespace.mkdir" | "posix.mkdir" => ("POST", "/noa/v1/posix/mkdir".into()),
         "namespace.rename" | "posix.rename" | "posix.move" => {
             ("POST", "/noa/v1/posix/rename".into())
@@ -58,6 +60,19 @@ pub(super) async fn dispatch(
             format!("/noa/v1/objects/recover/{}", field("object_key")?),
         ),
         "object.rename" => ("POST", "/noa/v1/objects/rename".into()),
+        "object.archive" => ("POST", "/noa/v1/objects/archive".into()),
+        "object.archive_manifest" => ("POST", "/noa/v1/objects/archive/manifest".into()),
+        "export.create" => ("POST", "/noa/v1/exports".into()),
+        "export.status" => ("GET", format!("/noa/v1/exports/{}", field("export_id")?)),
+        "export.download" => (
+            "GET",
+            format!("/noa/v1/exports/{}/download", field("export_id")?),
+        ),
+        "export.cancel" => ("DELETE", format!("/noa/v1/exports/{}", field("export_id")?)),
+        "export.signed_url" => (
+            "POST",
+            format!("/noa/v1/exports/{}/signed-url", field("export_id")?),
+        ),
         "object.bulk_delete" | "object.bulk.delete" => {
             ("POST", "/noa/v1/objects/bulk-delete".into())
         }

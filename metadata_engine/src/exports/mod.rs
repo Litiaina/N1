@@ -1,5 +1,6 @@
 //! Restart-safe archive jobs. The original bounded ZIP64/TAR builder is retained;
 //! its immutable-version reader now uses metadata and the native object client.
+pub(crate) mod archive;
 mod builder;
 mod manifest;
 mod models;

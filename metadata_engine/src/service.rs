@@ -18,6 +18,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use ulid::Ulid;
 pub(crate) mod batch;
+#[cfg(test)]
+#[path = "service/performance.rs"]
+mod performance;
 
 pub struct UploadRequest {
     pub fragment: PoolId,
