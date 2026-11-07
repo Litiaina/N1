@@ -39,6 +39,11 @@ This repository contains two systems:
 **LINK** is N1's key algorithm and storage architecture. **ProcyonDB** is the
 transactional database used inside M1; it is not another object store.
 
+`main` contains the mainstream **N1 LINK + M1** system. The former NCX/NDX
+engine is a separate product, **N1 Lite**, in the
+[N1-Lite repository](https://github.com/Litiaina/N1-Lite). It has its own engine,
+builds, binaries, configuration and operator documentation.
+
 The original Console connects to M1's NOA v1 interface. M1 forwards object
 operations to N1 over native NOA v2. Applications that manage their own names
 and LINK keys can use N1 independently, without M1 or ProcyonDB.

@@ -10,6 +10,11 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Make N1 LINK + M1 the mainstream system on `main`. Preserve the former
+  NCX/NDX engine as **N1 Lite** in the independent `Litiaina/N1-Lite` repository,
+  with separate engine, binary, configuration and service identities. This
+  branch promotion is not an RC.2 release;
+  outstanding API, scale, fault and performance gates remain required.
 - Formalize the two systems in this repository: **N1** is the object store,
   **M1** is the metadata store, **LINK** is N1's key algorithm and storage
   architecture, and **ProcyonDB** is M1's database foundation. Keep the
@@ -92,7 +97,7 @@ population outcomes are not release notes; see [TESTING.md](TESTING.md).
 
 ## Earlier architecture
 
-The entries below describe the former NCX/NDX engine and its historical releases
+The entries below describe **N1 Lite**, the former NCX/NDX engine, and its historical releases
 or private development labels. They do not describe LINK storage or imply
 compatibility with RC.2. The pre-LINK unreleased notes are preserved in Git at
 `9939ec8:CHANGELOG.md`, rather than being presented as current RC.2 changes.

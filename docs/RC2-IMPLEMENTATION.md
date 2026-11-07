@@ -5,11 +5,17 @@ qualification gaps. It does not redefine the API, prescribe deployment or serve
 as a chronological work log. This repository contains the N1 LINK object store and the
 M1 metadata store, backed by ProcyonDB; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
-**Promotion hold:** keep this checkpoint on `link`. The million-object campaign
-and remaining crash/power-loss qualification are deferred until the MCH network
-campaign. Existing process-kill/recovery passes remain valid for their stated
-scope; they do not establish hardware power-loss resilience. Full-stack
-performance remains a separate gate before promotion to `main`.
+**Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
+development branch. The former NCX/NDX engine is the independent **N1 Lite**
+product in `Litiaina/N1-Lite`, with its own engine and operational identities.
+Promoting development to `main` does not release RC.2
+or close any acceptance gate.
+
+**Release hold:** the million-object campaign and remaining crash/power-loss
+qualification are deferred until the MCH network campaign. Existing
+process-kill/recovery passes remain valid for their stated scope; they do not
+establish hardware power-loss resilience. Full-stack performance and the
+completion gates below remain required before releasing RC.2.
 
 ## Implemented components
 
@@ -30,7 +36,7 @@ performance remains a separate gate before promotion to `main`.
 Implemented is not synonymous with fully qualified. [TESTING.md](../TESTING.md)
 records completed checks and separates object-only, metadata-KV and full-stack
 results. Each report identifies its source checkpoint and executable hashes;
-the current work remains on `link` with `main` held. The completed local
+current development is on `main`, with RC.2 unreleased. The completed local
 [November 4 reliability qualification](RELIABILITY-20261104.md) covers member
 loss/corruption, full metadata loss and restore, crash/resume, encrypted-replica
 recovery and actual OS unmount/remount. It is separate from population and

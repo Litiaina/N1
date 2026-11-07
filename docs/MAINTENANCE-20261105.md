@@ -147,5 +147,6 @@ separate admission does not eliminate physical I/O contention.
 This campaign does not rerun 500K object population, forcibly unmount the HDD
 used by the independent user deployment, simulate firmware/power failure or
 qualify larger physical EC topologies. Prior evidence retains its own scope.
-RC.2 remains unreleased and `main` is held. Other completion gates remain in
+At this campaign's checkpoint, RC.2 was unreleased and `main` was held. Current
+development is on `main`; RC.2 remains unreleased. Other completion gates remain in
 [RC2-IMPLEMENTATION.md](RC2-IMPLEMENTATION.md).

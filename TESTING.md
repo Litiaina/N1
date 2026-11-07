@@ -11,6 +11,12 @@ server binaries are `litiaina-n1` and `litiaina-m1`. Historical evidence retains
 the names and executable hashes used when each campaign ran. Renaming does not
 extend those results to a new binary or replace its regression checks.
 
+`main` now develops N1 LINK + M1; the former NCX/NDX engine is **N1 Lite** in the
+independent `Litiaina/N1-Lite` repository. This product separation does not
+change earlier test outcomes or close the
+RC.2 release gates. Historical mentions of a held `main` describe the policy at
+the time of those campaigns.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |
@@ -38,8 +44,8 @@ The service checks assert both signature banners, M1's HTTP/native identity,
 `m1_config.ini` / `m1.env` defaults and independent N1/M1 monitoring labels.
 Evidence is under `/mnt/HDD1TB001/n1-m1-naming-20261106-01/reports`.
 These are functional checks of the naming/readability checkpoint, not new
-throughput, million-object or hardware power-loss results. The MCH promotion
-hold remains in the completion checklist.
+throughput, million-object or hardware power-loss results. The MCH qualification
+and RC.2 release hold remain in the completion checklist.
 
 ## Key-only lifecycle qualification — November 5, 2026
 
@@ -255,7 +261,7 @@ production Console runtime is unchanged by this regression test.
 
 ## Earlier monitoring and recovery checkpoint — November 4, 2026
 
-The later monitoring work remains on `link`; `main` is held. Authoritative
+At this monitoring checkpoint, work was on `link` and `main` was held. Authoritative
 evidence is on `altear@192.168.254.107` under
 `/mnt/DATA_SSD/n1-local-test-20261103-01/health-monitoring-01`. Task-owned HDD
 roots are under `/media/altear/PROJECT-1TB/n1-monitoring-20261104` and
