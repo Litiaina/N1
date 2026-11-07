@@ -21,7 +21,8 @@ original console. INI configuration preserves operator listen, TLS and resource
 controls. Remaining product integration and qualification gates are tracked in
 [the implementation ledger](../docs/RC2-IMPLEMENTATION.md).
 
-See [the architecture, API boundary and validation contract](../docs/M1.md)
+See the [M1 API reference and request/response examples](../docs/api/M1.md),
+[the architecture, API boundary and validation contract](../docs/M1.md)
 and [the storage provenance](storage/UPSTREAM.md).
 
 The [Rust physical qualification harness](examples/hdd_qualification/README.md)

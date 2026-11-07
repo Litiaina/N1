@@ -7,6 +7,16 @@ replaces the other. API and wire versions are independent of the binary version
 in Cargo metadata. N1 RC.2 is still in development; full product conformance has
 not yet been established.
 
+For request/response fields, executable examples and complete client workflows:
+
+- **[M1 API reference and examples](docs/api/M1.md):** fragment authentication,
+  named uploads/resume, reads, listings, trash, archives, monitoring and backups.
+- **[N1 API reference and examples](docs/api/N1.md):** native LINK client,
+  upload/resume/finalize, verified reads, physical purge and operator recovery.
+
+This document remains the shared standard and operation inventory. The guides
+describe current handlers and identify implementation limits explicitly.
+
 | Client or component | Connects to | Contract |
 | --- | --- | --- |
 | Console and applications using fragments, names and versions | M1 | NOA v1, HTTP(S)/WebSocket; named native wire `n1/0.5` |
@@ -48,6 +58,20 @@ Responses carry the matching ID, `ok`, optional status/payload/error and body
 metadata. These are the existing named frames in
 [types.rs](metadata_engine/src/server/native/types.rs). They must not be decoded
 using the LINK frame schema below.
+
+For example, after obtaining a fragment access token, upload a named file:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  -H "Authorization: Bearer $M1_TOKEN" -H 'Content-Type: text/plain' \
+  --data-binary @hello.txt \
+  "$M1_BASE/noa/v1/upload/one-shot/docs/hello.txt?durability=strict"
+```
+
+Success is HTTP 201 with `object_key`, `object_id`, `version_id`, `content_type`,
+`total_size_bytes`, `created_at` and `created_at_unix`. Follow the
+[complete M1 walkthrough](docs/api/M1.md#create-a-fragment-and-log-in) to create
+a fragment, obtain the token, resume multipart and use the other operations.
 
 ### Connectivity And Authentication
 
@@ -294,6 +318,24 @@ LINK object keys are client-held capabilities, bound to a stable
 object-service fragment ID and checked permissions. This service does not open
 the metadata database.
 
+Example native control map, encoded as MessagePack after its four-byte length:
+
+```json
+{
+  "id":1,
+  "command":{"op":"upload.status","args":{
+    "object_key":"<server-issued-LINK-key>","start":0,"limit":4096
+  }},
+  "body_len":0
+}
+```
+
+This runs on an authenticated N1 connection. Its response contains a bounded
+page with `finalized`, `finalized_shards`, `parts`, `checked_start`,
+`checked_end`, `missing_parts` and `unavailable_members`. The
+[N1 guide](docs/api/N1.md) includes authentication, every command's fields,
+response examples and an executable native Rust upload/resume/read/purge client.
+
 ### Native framing
 
 Each control frame is a four-byte unsigned big-endian length followed by a
@@ -409,7 +451,7 @@ retries after restart. Direct clients must retain and retry their own pending
 deletions. The object engine has no rename, namespace listing, object history
 or undelete operation; those belong to metadata.
 
-### Maintenance### Maintenance
+### Maintenance
 
 | Operation | Arguments | Access |
 | --- | --- | --- |

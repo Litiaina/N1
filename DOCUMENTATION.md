@@ -1,5 +1,8 @@
 # N1 and M1 operator guide
 
+Client request/response documentation is in the [M1 API guide](docs/api/M1.md)
+and [N1 API guide](docs/api/N1.md). The shared contract is [NOA.md](NOA.md).
+
 This is the operator guide for **N1**, the LINK object store, and **M1**, the
 independent metadata store backed by **ProcyonDB**. Both systems live in this
 repository. N1 operates without M1; Console's named-object workflows use both.
@@ -326,7 +329,7 @@ must retain their own pending deletion request. There is no rename, history,
 trash or undelete API in the object engine. Metadata provides those named
 operations for Console.
 
-## Optional maintenance## Optional maintenance
+## Optional maintenance
 
 Change the existing INI controls and restart the relevant service:
 

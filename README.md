@@ -83,6 +83,8 @@ services and connect Console to metadata.
 | [Operator guide](DOCUMENTATION.md) | Configure, start, tune and recover N1 and M1; enroll N1 pools |
 | [Architecture](ARCHITECTURE.md) | System names, repository structure, LINK placement and N1/M1 boundaries |
 | [NOA standard](NOA.md) | Both the named metadata v1 contract and direct LINK v2 contract |
+| [M1 API reference](docs/api/M1.md) | Named requests, responses, curl examples, multipart resume, maintenance and backups |
+| [N1 API reference](docs/api/N1.md) | Native LINK requests, responses, executable Rust walkthrough and secondary HTTP examples |
 | [Testing](TESTING.md) | Reproduce tests and distinguish qualified results from running campaigns |
 | [Changelog](CHANGELOG.md) | Product changes; older engine history is explicitly separated |
 

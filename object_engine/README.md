@@ -15,5 +15,6 @@ utility modules retain their responsibilities. Default operator files are
 and service environment credentials are supported.
 
 See the [operator guide](../DOCUMENTATION.md),
-[architecture and module map](../ARCHITECTURE.md), [NOA contract](../NOA.md)
+[architecture and module map](../ARCHITECTURE.md), [NOA contract](../NOA.md),
+[N1 API reference and native examples](../docs/api/N1.md)
 and [qualification guide](../TESTING.md).
