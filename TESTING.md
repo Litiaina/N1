@@ -30,7 +30,58 @@ the time of those campaigns.
 Workloads and verification are Rust. Original Console tests use its existing
 Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
-selected HDD/RAM locations; never put population fixtures on the source NVMe.
+selected SSD/HDD/RAM locations for each profile; never put population fixtures
+on the source NVMe.
+
+## Million-object full-stack qualification — November 8, 2026
+
+**PASSED:** source `8dbba3201414a7b986c0cacb41c3c525b021c274` completed
+**1,000,000 fresh named uploads through M1 → native N1 LINK**, followed by
+actual SIGKILL of both engines, offline census, restart and full readback of
+every original acknowledged version and payload. This closes the requested
+API population count of at least 500,000 objects for this checkpoint/profile.
+
+The main PC at `192.168.254.107` used an i5-12600K and approximately 31 GiB RAM.
+M1's database, binaries, control and journals were on `/mnt/DATA_SSD`; the 1+1
+pool used the independent XFS HDDs at `/media/altear/HDD1TB001` and
+`/media/altear/HDD1TB002`. Eight writers submitted strict durable batches of up
+to 256 objects; M1 admission was four and N1 admission sixteen. Required
+io_uring initialized without fallback. Request quotas and scheduled scrubs
+were disabled for this functional scale profile.
+
+| Check | Result |
+| --- | ---: |
+| Fresh durable ACKs / named objects / immutable versions / unique LINK identities | 1,000,000 each |
+| Physical shard files | 2,000,000 |
+| Original versions and complete payloads verified after restart | 1,000,000 |
+| Verified logical bytes | 13,968,125,000 |
+| Payload / version mismatches | 0 / 0 |
+| Unreferenced / misplaced shards | 0 / 0 |
+| Staged files / pending publications | 0 / 0 |
+| Durable population time / rate | 21,030.620 s / 47.550 objects/s |
+| Offline census / full post-restart readback | 8.476 s / 4,050.595 s |
+| Maximum sampled N1 / M1 process RSS | 160.87 / 441.05 MiB |
+
+The separate preflight passed **315 library tests**, zero failed, with five
+explicit ignored cases; it was not a full-workspace rerun. A separate 4,096-object
+smoke passed census and complete original-version/byte verification after
+killing and reopening both engines. These checks retain their separate counts.
+
+The 3,907 batch requests measured mean **43.009 s**, p50 **36.017 s**, p95
+**88.600 s**, p99 **103.618 s**, maximum **123.906 s**. Each sample covers up
+to 256 objects under concurrency, not an individual-object PUT. RSS/CPU were
+sampled once per second; cache was not dropped. This campaign does not establish
+a matched old/new performance comparison or all-operation latency parity.
+
+The [million-object qualification report](docs/MILLION-OBJECTS-20261108.md)
+records configuration, methodology, per-process CPU/RSS, executable hashes,
+reproduction and evidence paths. Terminal oracles and raw fixtures remain on
+that host under `/mnt/DATA_SSD/n1-rc2-million-20261108.ZsO460`; the campaign
+completed successfully and its task processes ended.
+
+This is a full-stack API and process-crash/reopen pass. Console population,
+standalone-only million-object qualification, MCH four-HDD minimum-hardware and
+physical power-loss gates remain separate. **RC.2 remains unreleased.**
 
 ## Performance acceptance for feature changes
 
@@ -148,8 +199,9 @@ A follow-up on identical names and one database measures rename at 1.118 versus
 including a 0.190 ms higher mean in the RAM diagnostic. Raw samples, CPU and
 the interpretation are retained in the investigation report. No universal
 per-operation parity claim follows.
-These local checks do not close saturation, current-lifecycle population,
-hardware power-loss or all-operation tail-latency release gates.
+These November 7 checks did not close saturation, current-lifecycle population,
+hardware power-loss or all-operation tail-latency release gates. The subsequent
+full-stack million-object population pass is recorded separately above.
 
 ## N1/M1 naming verification — November 6, 2026
 
@@ -503,14 +555,17 @@ full-stack report; they are not relabelled as scale passes.
 The [aligned direct-I/O qualification](docs/DIRECT-IO-20261105.md) records the
 current large-upload writer, physical page-cache proof, repeated fault/recovery
 checks and matched buffered-LINK/NCX comparisons. It includes per-phase CPU/RSS,
-latency, allocation and adverse measurements. The two current HDD mounts are
-`/mnt/HDD1TB001` and `/mnt/HDD1TB002`; source/build/data evidence lives on HDDs.
+latency, allocation and adverse measurements. That November 5 campaign used
+`/mnt/HDD1TB001` and `/mnt/HDD1TB002`, with source/build/data evidence on HDDs.
+The November 8 main-PC campaign uses DATA_SSD for M1/control/builds and the HDDs
+at `/media/altear/HDD1TB001` and `/media/altear/HDD1TB002`, as recorded in its
+[report](docs/MILLION-OBJECTS-20261108.md).
 
 Compare the same workload, integrity/durability policy, hardware, concurrency,
 cache state and completed operation semantics. Report upload/download latency,
 throughput, CPU and sampled RSS separately. A metadata KV batch latency is not a
 per-object upload latency; CDP heap is not total browser RSS; a process SIGKILL
-is not a physical power cut. Permanent LINK retirement is not the same operation
+is not a physical power cut. Physical LINK purge is not the same operation
 as moving a named object to trash.
 
 The direct old/new comparison is retained in

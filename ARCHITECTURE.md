@@ -557,9 +557,13 @@ Filesystems supporting data/hole queries avoid scanning unwritten sparse gaps;
 others use a conservative sequential scan. Reconstruction failures keep the
 target inactive. Physical two-member loss/recovery, replacement and INI pool
 expansion are qualified in the [November 4 reliability record](docs/RELIABILITY-20261104.md).
+The [November 8 million-object qualification](docs/MILLION-OBJECTS-20261108.md)
+verifies fresh M1 → N1 population, exact two-HDD shard placement and every
+original payload/version after killing and reopening both engines, with M1's
+database on a separate SSD.
 Larger physical topologies, multiple-member replacement and hardware power-loss
 qualification remain separate gates.
 
-Builds, fixtures and qualification results are kept outside the source tree.
+Builds, fixtures and raw qualification evidence are kept outside the source tree.
 [TESTING.md](TESTING.md) records exact hardware, binaries, commands and scope;
 object-only, metadata-KV and complete named-service results are distinct.

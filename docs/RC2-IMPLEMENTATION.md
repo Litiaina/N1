@@ -11,11 +11,15 @@ product in `Litiaina/N1-Lite`, with its own engine and operational identities.
 Promoting development to `main` does not release RC.2
 or close any acceptance gate.
 
-**Release hold:** the million-object campaign and remaining crash/power-loss
-qualification are deferred until the MCH network campaign. Existing
-process-kill/recovery passes remain valid for their stated scope; they do not
-establish hardware power-loss resilience. Full-stack performance and the
-completion gates below remain required before releasing RC.2.
+**Release hold:** the [November 8 full-stack million-object campaign](MILLION-OBJECTS-20261108.md)
+passed on the main PC, with M1 on DATA_SSD and N1 on two XFS HDDs. Its complete
+original-version/payload readback after killing and reopening both engines
+closes the requested API population count for that checkpoint/profile.
+Standalone-only and original Console population, MCH minimum-hardware and
+remaining fault/power-loss qualification retain their separate gates. A
+process-kill/recovery pass does not establish hardware power-loss resilience.
+Full-stack performance and the completion gates below remain required before
+releasing RC.2.
 
 ## Planned MCH hardening — November 11, 2026
 
@@ -45,7 +49,7 @@ The final campaign must retain these separate acceptance results:
 | --- | --- |
 | Candidate identity | Clean source checkpoint, compiler/build flags, executable hashes, independent N1/M1 configuration, exact physical member/control/database placement |
 | Contract and operations | Named HTTP/native and direct LINK operations; original Console workflows; permissions, refresh/revocation, IP/ports/TLS and effective concurrency/rate/GC/healing controls |
-| Current-lifecycle scale | Requested 500K full-stack and million-object standalone campaigns, physical census and complete acknowledged-payload/version readback after restart; bounded RSS/CPU and no per-purged-identity residue |
+| Current-lifecycle scale | Main-PC API population passed at one million objects on November 8. Qualify the final candidate on MCH, the requested original Console 500K path and separate million-object standalone path; retain physical census, complete acknowledged-payload/version readback after restart, RSS/CPU and purge-residue checks |
 | Storage faults | Four-drive physical 3+1 and 2+2 layouts, failures within/beyond parity, corruption detection, unavailable members, replacement and verified operator-driven repair; geometry remains immutable |
 | Metadata and transactions | Lost metadata/staging, snapshot restore, pinned history/permissions, concurrent publication/GC/migration, interrupted purge and process crashes at named/object boundaries |
 | Recovery and maintenance | Same/different-node object recovery, metadata backups, coordinated whole-product recovery, cross-EC migration and retry/stop; degraded or deferred diagnostics remain distinct from verified corruption |
@@ -91,6 +95,13 @@ large-upload change, unchanged shard format and lifecycle, physical proof,
 repeated reliability checks and matched performance results, including costs
 from cold post-upload reads/status and the measured CPU tradeoff.
 
+The [November 8 million-object qualification](MILLION-OBJECTS-20261108.md)
+passes fresh M1 → N1 population, two-million-shard census and complete original
+payload/version readback after SIGKILL/reopen of both engines. It records the
+SSD database/two-HDD pool profile, exact source/binaries, batch latency and
+sampled per-process CPU/RSS. It is separate from the standalone-only, Console,
+MCH topology and physical power-loss gates.
+
 ## Work required before completion
 
 | Area | Remaining work / acceptance condition |
@@ -101,9 +112,9 @@ from cold post-upload reads/status and the measured CPU tradeoff.
 | Metadata request quotas | Implemented and locally checked across HTTP/native, token changes and spoofed forwarding headers. Qualify final-candidate defaults, sustained overload, idle bucket reclamation, TLS/proxy deployment and impact on the MCH workload. Do not infer coverage from object-engine middleware. |
 | Optional Accel | Real Accel integration and fault-response checks are implemented. Qualify deployment TLS/CA configuration, sustained load, restart and the complete conditional/range/header matrix; preserve authoritative M1 resolution and fallback rules. |
 | Console and administration | Exercise the original product workflows and deployment/administration helpers against both engines. Passing three original live tests is scoped evidence, not complete feature parity. |
-| End-to-end population | Finish each requested 500K API and Console campaign with physical census, real process restart and every acknowledged version/payload verified. Keep failed attempts and distinct machine results separate. |
+| End-to-end population | API M1 → N1 passed one million fresh objects on the main PC at `8dbba32`, with physical census, real process restart and every acknowledged version/payload verified. Complete the requested original Console 500K campaign and final-candidate MCH qualification; the separate standalone-only million-object gate remains open. Keep failed attempts and distinct machine results separate. |
 | Broader storage qualification | Two-HDD member loss/corruption, beyond-parity refusal, replica recovery after loss of both originals, replacement, INI expansion and database crash/churn pass. The EC subset matrix uses logical fixtures; qualify larger physical topologies, multiple-member replacement and hardware power loss separately. |
-| Matched performance | The current key lifecycle record links original-NCX, previous-LINK and pre-optimization key-only ABBA benchmarks, plus standalone batch/multipart/concurrent upload. Record CPU/RSS, latency, throughput, allocation and every individual large-object sample. Begin now persists with the first durable payload by operator choice; a Rust reopen/readback probe verifies speculative XFS EOF allocation is gone. Earlier regressions remain in their original reports. Mixed and focused large-object results must both be reported; no universal performance claim follows. Named-pipeline, saturation and population measurements remain separate gates. |
+| Matched performance | The current key lifecycle record links original-NCX, previous-LINK and pre-optimization key-only ABBA benchmarks, plus standalone batch/multipart/concurrent upload. Record CPU/RSS, latency, throughput, allocation and every individual large-object sample. Begin now persists with the first durable payload by operator choice; a Rust reopen/readback probe verifies speculative XFS EOF allocation is gone. Earlier regressions remain in their original reports. Mixed and focused large-object results must both be reported; no universal performance claim follows. November 8 records sustained named-pipeline population metrics, not a matched old/new comparison. Matched named-pipeline, saturation and MCH tail-latency acceptance remain open. |
 
 The November 7 preparation screen and controlled local follow-up are recorded
 in [TESTING.md](../TESTING.md). The initial ABBA screen measured 14.1% more small
@@ -112,9 +123,10 @@ constant, alternates binaries and quotas, retains each request latency, audits
 placement and profiles durable calls. Upload averages reverse across campaigns;
 M1 listener buffering and request-path limiter maintenance were corrected, but
 neither an upload speedup nor tail-latency parity is claimed.
-Both the original and follow-up measurements remain available. Durability,
-population, saturation and MCH hardware qualification remain separate gates;
-an average improvement does not establish universal tail-latency parity.
+Both the original and follow-up measurements remain available. The subsequent
+November 8 full-stack population pass is recorded separately. Remaining
+standalone/Console population, saturation, MCH hardware and power-loss gates
+are not closed by an average improvement or by this population pass.
 
 ## Fixed boundaries
 
