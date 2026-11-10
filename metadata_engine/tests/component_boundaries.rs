@@ -6,7 +6,7 @@ use std::{
 };
 
 #[test]
-fn object_engine_build_graph_is_independent_of_metadata_and_procyon() {
+fn object_engine_is_independent_and_metadata_has_no_external_database_engine() {
     let output = Command::new(env!("CARGO"))
         .args([
             "metadata",
@@ -50,7 +50,21 @@ fn object_engine_build_graph_is_independent_of_metadata_and_procyon() {
     let object = dependencies("n1");
     assert!(!object.contains("m1"));
     assert!(!object.contains("procyon-engine"));
+    assert!(!object.contains("m1_storage"));
     let metadata = dependencies("m1");
+    assert!(metadata.contains("m1_storage"));
+    for external in [
+        "procyon-engine",
+        "fjall",
+        "lsm-tree",
+        "surrealkv",
+        "rusqlite",
+    ] {
+        assert!(
+            !metadata.contains(external),
+            "M1 must own its database implementation: {external}"
+        );
+    }
     assert!(metadata.contains("n1_native_client"));
     assert!(
         !metadata.contains("n1"),

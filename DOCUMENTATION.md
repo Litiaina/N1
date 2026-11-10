@@ -4,7 +4,7 @@ Client request/response documentation is in the [M1 API guide](docs/api/M1.md)
 and [N1 API guide](docs/api/N1.md). The shared contract is [NOA.md](NOA.md).
 
 This is the operator guide for **N1**, the LINK object store, and **M1**, the
-independent metadata store backed by **ProcyonDB**. Both systems live in this
+independent metadata store with its own specialized transactional database. Both systems live in this
 repository. N1 operates without M1; Console's named-object workflows use both.
 RC.2 is in development. Server settings use INI; secrets come from a private
 file or the service environment. No migration from earlier development configurations

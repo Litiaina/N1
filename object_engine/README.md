@@ -7,7 +7,7 @@ builds `litiaina-n1` and `litiaina-n1-backup`.
 N1 owns immutable pools, shard I/O, upload/finalize, reads, integrity, repair,
 physical purge and object recovery. **M1**, in [`metadata_engine/`](../metadata_engine),
 owns names, logical versions, permissions and named-object lifecycle, using
-ProcyonDB. N1 runs independently of M1 and its database.
+M1's database. N1 runs independently of M1 and its database.
 
 The existing `core/`, `middleware/`, `protocol/`, `routes/`, `settings/` and
 utility modules retain their responsibilities. Default operator files are

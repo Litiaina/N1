@@ -45,7 +45,7 @@ async fn monitoring_is_scoped_cached_independent_and_metadata_backup_restores_na
         "{first}"
     );
     assert_eq!(first["components"]["metadata"]["product"], "M1");
-    assert_eq!(first["components"]["metadata"]["database"], "ProcyonDB");
+    assert_eq!(first["components"]["metadata"]["database"], "M1");
     assert_eq!(first["components"]["object"]["product"], "N1");
     let metadata_pid = first["components"]["metadata"]["node"]["pid"]
         .as_u64()

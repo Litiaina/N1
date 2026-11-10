@@ -108,7 +108,7 @@ fn run(cli: Cli) -> m1::Result<()> {
             data_dir
         }
         Command::Check { data_dir } => {
-            if !data_dir.is_dir() || !data_dir.join("version").is_file() {
+            if !data_dir.is_dir() || !data_dir.join("FORMAT").is_file() {
                 return Err(m1::Error::Invalid(
                     "check requires an existing metadata database".into(),
                 ));
@@ -117,14 +117,16 @@ fn run(cli: Cli) -> m1::Result<()> {
         }
     };
     let engine = MetadataEngine::open(&path, Options::default())?;
+    let verified_records = engine.verify()?;
     println!(
         "{}",
         serde_json::json!({
             "product": "M1",
             "component": "metadata_engine",
             "version": env!("CARGO_PKG_VERSION"),
-            "storage": "procyon-engine",
-            "database": "ProcyonDB",
+            "storage": "m1_storage",
+            "database": "M1",
+            "verified_records": verified_records,
             "data_dir": path,
             "disk_bytes": engine.disk_bytes()?,
         })
@@ -225,7 +227,7 @@ fn print_startup_banner(native: std::net::SocketAddr, http: std::net::SocketAddr
     eprintln!("╚════════════════════════════════════════════════╝");
     eprintln!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
     eprintln!("│ Component      : M1 metadata store");
-    eprintln!("│ Database       : ProcyonDB");
+    eprintln!("│ Database       : M1 native storage");
     eprintln!("│ Status         : STARTING");
     eprintln!(
         "│ Start Time     : {}",

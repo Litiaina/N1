@@ -4,7 +4,7 @@ use std::fmt;
 pub enum Error {
     Invalid(String),
     Incompatible(String),
-    Storage(procyon_engine::Error),
+    Storage(m1_storage::Error),
     Io(std::io::Error),
     Conflict,
     NotFound,
@@ -41,9 +41,14 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<procyon_engine::Error> for Error {
-    fn from(error: procyon_engine::Error) -> Self {
-        Self::Storage(error)
+impl From<m1_storage::Error> for Error {
+    fn from(error: m1_storage::Error) -> Self {
+        match error {
+            m1_storage::Error::Conflict => Self::Conflict,
+            m1_storage::Error::Invalid(message) => Self::Invalid(message),
+            m1_storage::Error::Incompatible(message) => Self::Incompatible(message),
+            other => Self::Storage(other),
+        }
     }
 }
 

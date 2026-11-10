@@ -1,7 +1,7 @@
 # Node Object API (NOA)
 
 NOA defines the public operation contracts of the two systems in this repository.
-**M1**, the ProcyonDB-backed metadata store, serves **NOA v1** for named objects.
+**M1**, the metadata store with its own transactional database, serves **NOA v1** for named objects.
 **N1**, the LINK object store, serves **NOA v2** for direct object keys. Neither
 replaces the other. API and wire versions are independent of the binary version
 in Cargo metadata. N1 RC.2 is still in development; full product conformance has
@@ -107,7 +107,7 @@ means unknown logical usage, never zero measured usage.
 `components.metadata` and `components.object`, each with its own node, process,
 metrics and observation age. Fragment scoping is authorized before observing.
 The existing `metadata` and `object` role keys identify M1 and N1 respectively:
-`components.metadata.product` is `M1`, its `database` is `ProcyonDB`, and
+`components.metadata.product` and its `database` are `M1`, and
 `components.object.product` is `N1`.
 `GET /noa/v1/maintenance/pools/health` reports native object-pool members and
 capacity. Normal calls never scan payloads. `deep_scan=true` explicitly starts

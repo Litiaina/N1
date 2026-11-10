@@ -368,7 +368,7 @@ fn rejects_foreign_directories_and_keeps_process_lock_until_last_owner() {
     drop(engine);
     assert!(matches!(
         MetadataEngine::open(directory.path(), Options::default()),
-        Err(Error::Storage(procyon_engine::Error::Locked))
+        Err(Error::Storage(m1_storage::Error::Locked))
     ));
     drop(view);
     drop(open(directory.path()));
@@ -378,88 +378,79 @@ fn rejects_foreign_directories_and_keeps_process_lock_until_last_owner() {
 fn format_mismatch_is_rejected_and_not_rewritten() {
     let directory = common::directory(None);
     drop(open(directory.path()));
-    let invalid = br#"{"product":"N1-METADATA","schema":999,"key_encoding":"fragment16-utf8-v1"}"#;
-    {
-        let db = procyon_engine::Database::builder(directory.path())
-            .open()
-            .unwrap();
-        let table = db
-            .keyspace("n1_system", procyon_engine::KeyspaceCreateOptions::default)
-            .unwrap();
-        table.insert(b"format", invalid.as_slice()).unwrap();
-        db.persist(procyon_engine::PersistMode::SyncAll).unwrap();
-    }
+    let path = directory.path().join("FORMAT");
+    let mut invalid = std::fs::read(&path).unwrap();
+    invalid[8..12].copy_from_slice(&999u32.to_be_bytes());
+    let crc = crc32c::crc32c(&invalid[..28]);
+    invalid[28..32].copy_from_slice(&crc.to_be_bytes());
+    std::fs::write(&path, &invalid).unwrap();
     assert!(matches!(
         MetadataEngine::open(directory.path(), Options::default()),
         Err(Error::Incompatible(_))
     ));
-    let db = procyon_engine::Database::builder(directory.path())
-        .open()
-        .unwrap();
-    let table = db
-        .keyspace("n1_system", procyon_engine::KeyspaceCreateOptions::default)
-        .unwrap();
-    assert_eq!(table.get(b"format").unwrap().unwrap().as_ref(), invalid);
+    assert_eq!(std::fs::read(path).unwrap(), invalid);
 }
 
 #[test]
-fn initialized_database_never_silently_recreates_a_missing_table() {
-    let directory = common::directory(None);
-    drop(open(directory.path()));
-    {
-        let db = procyon_engine::Database::builder(directory.path())
-            .open()
-            .unwrap();
-        let table = db
-            .keyspace(
-                "n1_versions",
-                procyon_engine::KeyspaceCreateOptions::default,
-            )
-            .unwrap();
-        db.delete_keyspace(table).unwrap();
-        db.persist(procyon_engine::PersistMode::SyncAll).unwrap();
-    }
-    assert!(matches!(
-        MetadataEngine::open(directory.path(), Options::default()),
-        Err(Error::Incompatible(_))
-    ));
-    let db = procyon_engine::Database::builder(directory.path())
-        .open()
+fn initialized_database_never_silently_recreates_a_missing_generation() {
+    let parent = common::directory(None);
+    let path = parent.path().join("db");
+    let db = open(&path);
+    db.transact(1, |tx| tx.put(Table::Versions, &key("existing"), b"keep"))
         .unwrap();
-    assert!(!db.keyspace_exists("n1_versions"));
+    drop(db);
+    let generation = path.join("store-00000000000000000001.m1");
+    let saved = parent.path().join("saved-generation");
+    std::fs::rename(&generation, &saved).unwrap();
+    assert!(MetadataEngine::open(&path, Options::default()).is_err());
+    assert!(!generation.exists());
+    std::fs::rename(saved, generation).unwrap();
+    assert_eq!(
+        open(&path)
+            .snapshot()
+            .get(Table::Versions, &key("existing"))
+            .unwrap()
+            .unwrap(),
+        b"keep"
+    );
 }
 
 #[test]
 fn incomplete_creation_can_finish_but_missing_format_with_data_is_rejected() {
     let directory = common::directory(None);
-    {
-        let db = procyon_engine::Database::builder(directory.path())
-            .open()
-            .unwrap();
-        db.keyspace("n1_entries", procyon_engine::KeyspaceCreateOptions::default)
-            .unwrap();
-    }
-    let engine = open(directory.path());
-    engine
-        .transact(1, |tx| {
-            tx.put(Table::Entries, &key("existing"), b"preserve")
-        })
-        .unwrap();
-    drop(engine);
-    {
-        let db = procyon_engine::Database::builder(directory.path())
-            .open()
-            .unwrap();
-        let system = db
-            .keyspace("n1_system", procyon_engine::KeyspaceCreateOptions::default)
-            .unwrap();
-        system.remove(b"format").unwrap();
-        db.persist(procyon_engine::PersistMode::SyncAll).unwrap();
-    }
+    drop(open(directory.path()));
+    // Complete immutable FORMAT and an empty first generation are sufficient
+    // to finish a creation interrupted before CURRENT publication.
+    std::fs::remove_file(directory.path().join("CURRENT")).unwrap();
+    let db = open(directory.path());
+    db.transact(1, |tx| {
+        tx.put(Table::Entries, &key("existing"), b"preserve")
+    })
+    .unwrap();
+    drop(db);
+    std::fs::remove_file(directory.path().join("FORMAT")).unwrap();
     assert!(matches!(
         MetadataEngine::open(directory.path(), Options::default()),
         Err(Error::Incompatible(_))
     ));
+    assert!(!directory.path().join("FORMAT").exists());
+}
+
+#[test]
+fn missing_current_with_committed_data_fails_without_reinitializing() {
+    let directory = common::directory(None);
+    let db = open(directory.path());
+    db.transact(1, |tx| {
+        tx.put(Table::Entries, &key("existing"), b"preserve")
+    })
+    .unwrap();
+    drop(db);
+    let generation = directory.path().join("store-00000000000000000001.m1");
+    let before = std::fs::read(&generation).unwrap();
+    std::fs::remove_file(directory.path().join("CURRENT")).unwrap();
+    assert!(MetadataEngine::open(directory.path(), Options::default()).is_err());
+    assert_eq!(std::fs::read(generation).unwrap(), before);
+    assert!(!directory.path().join("CURRENT").exists());
 }
 
 #[test]

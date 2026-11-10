@@ -1,6 +1,6 @@
-# M1 / ProcyonDB physical storage qualification
+# M1 physical storage qualification
 
-`hdd_qualification` tests M1's ProcyonDB storage foundation through its public Rust
+`hdd_qualification` tests M1's selected storage implementation through its public Rust
 API. It does not upload object payloads, provide a namespace service, or test
 NOA conformance. All workload generation, concurrent readers/writers, process
 faults, restart validation and exact-byte checks are implemented in Rust.
@@ -21,8 +21,8 @@ directory and reports on HDDs. No machine-wide cache dropping is performed.
 
 Each entry has deterministic 128/256/512/1024-byte values, an immutable original
 history fixture, and a key containing its index. The database uses a 32 MiB cache,
-1 MiB memtable rotation thresholds and 64 MiB journal rotation thresholds to
-exercise flush, compaction and replay. Eight writers operate on disjoint bounded
+1 MiB write-buffer bounds and a 64 MiB checkpoint threshold to exercise
+checkpoint copying, reclamation and replay. Eight writers operate on disjoint bounded
 transactions. Four readers repeatedly check entries against their history using
 one snapshot per check, with a 1 ms pause between checks. This is a consistency
 load, not a saturated random-read throughput benchmark.
@@ -33,7 +33,7 @@ The new child first verifies all previous acknowledgements without writing them.
 Uncertain, unacknowledged batches must be completely present or completely
 absent; a partial cross-table or within-batch state fails without overwriting
 the evidence. Complete uncertain batches are preserved. The remaining batches
-are committed with the engine's normal `SyncAll` semantics.
+are committed with the engine's normal synchronized durability semantics.
 
 After verifying every entry, the supervisor repeats the kill/resume sequence
 during churn. Four out of five selected entries receive a new revision and a

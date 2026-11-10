@@ -2,7 +2,7 @@
 
 LINK means **Litiaina Immutable Native Key**, N1's key algorithm and storage
 architecture. N1 implements object storage; M1 uses N1's public API and keeps
-its ProcyonDB metadata outside object members. This is a new format, not a migration
+its metadata database outside object members. This is a new format, not a migration
 or compatibility layer for RC.1. A single engine exclusively owns each pool.
 No RC.2 release is qualified by this specification alone.
 

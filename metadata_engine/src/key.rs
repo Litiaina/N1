@@ -19,15 +19,6 @@ impl Table {
         Self::Reclamation,
     ];
 
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Entries => "n1_entries",
-            Self::Versions => "n1_versions",
-            Self::Uploads => "n1_uploads",
-            Self::Reclamation => "n1_reclamation",
-        }
-    }
-
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Entries => 0,

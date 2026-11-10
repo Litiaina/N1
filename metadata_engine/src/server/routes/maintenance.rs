@@ -94,7 +94,7 @@ pub(super) async fn pools(
         "object_status": object["status"],
         "error": object["error"],
         "allocation_policy": "newest complete unsealed pool",
-        "metadata_store": "procyon-engine"
+        "metadata_store": "m1_storage"
     })))
 }
 pub(super) async fn capacity(

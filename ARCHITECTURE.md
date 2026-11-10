@@ -2,9 +2,9 @@
 
 This repository contains two independent systems: **N1**, the single-node
 object store, and **M1**, the metadata store. **LINK — Litiaina Immutable Native
-Key** is N1's key algorithm and storage architecture. **ProcyonDB** is the
-transactional database used inside M1. The public native NOA API connects M1
-to N1; either service may run on a separate machine.
+Key** is N1's key algorithm and storage architecture. M1 owns its specialized
+transactional database in `metadata_engine/storage/`. The public native NOA API
+connects M1 to N1; either service may run on a separate machine.
 
 The `main` branch develops N1 LINK and M1. **N1 Lite** is the former combined
 NCX/NDX engine in the separate
@@ -22,7 +22,7 @@ does not build or depend on N1 Lite.
 | M1 — `metadata_engine/` | Logical fragments, names, maximum-ULID version selection, upload transactions, listings, rename, trash/recovery, permissions and exports | Shard placement, member-root access or an alternate object format |
 | Console (separate repository) | Existing user interface and workflows through metadata's NOA v1 API | Storage authority or replacement metadata semantics |
 
-N1 builds and operates independently of M1 and ProcyonDB. M1 uses
+N1 builds and operates independently of M1 and its database. M1 uses
 `n1_native_client`, not object-engine internals. An external metadata service
 can use the same LINK interface. Metadata availability is not a prerequisite for
 a client holding a valid object key and object-service credentials.
@@ -57,7 +57,7 @@ the systems. Keep the existing module structure within each engine.
 | `object_engine/` | `n1` | `litiaina-n1`, `litiaina-n1-backup` | N1 object store |
 | `metadata_engine/` | `m1` | `litiaina-m1` | M1 metadata store |
 | `link/` | `n1_link` | Library | LINK algorithm, canonical keys, placement and shard format |
-| `metadata_engine/storage/` | `procyon-engine` / `procyon_engine` | Library | ProcyonDB transactional storage foundation inside M1 |
+| `metadata_engine/storage/` | `m1_storage` | Library | Independently implemented ordered transactional storage inside M1 |
 | `native_client/` | `n1_native_client` | Library and examples | N1 native NOA v2 client used by M1 and direct clients |
 | `cli_core/` | `cli_core` | Library | Shared operator settings, monitoring and CLI utilities |
 | `shell/` | `n1_shell` | `litiaina-n1-shell` | N1 native CLI and object-backup operator host |
@@ -73,6 +73,40 @@ protocol names and do not change when the metadata service is called M1.
 Both server banners keep the signature `L I T I A I N A` heading, followed by
 `N 1` or `M 1`. Version, start time, PID and operational details appear on
 separate source and output lines. Runtime versions come from Cargo metadata.
+
+## M1 database
+
+M1's storage crate is implemented in this repository. Its on-disk ordered tree
+contains all four metadata tables under one atomic root. Values remain on disk;
+a byte-budgeted, sharded node cache and streaming scans avoid a catalogue-sized
+in-memory index. The service adapter in `metadata_engine/src/store.rs` translates
+domain keys and errors; storage algorithms live in separate `database`, `format`,
+`tree`, `transaction`, `worker` and `checkpoint` modules.
+
+Readers hold immutable snapshot roots and do not wait for a writer's disk sync.
+Writers prepare concurrently. Optimistic validation checks point reads, writes
+and observed range predicates before one coordinator appends a compatible group.
+The coordinator orders durable commits and root publication; it is not a lock
+around request preparation, reads or object transfer. Successful acknowledgement
+follows file synchronization. Append/sync errors stop later writes until reopen.
+
+Checkpoints copy a pinned view and replay concurrent changes in a background
+worker. The coordinator finishes the bounded tail and durably replaces the root
+descriptor. Existing readers keep the old generation until release. No key's
+deletion requires a permanent per-key file in this database. Metadata policy
+still decides which histories, upload state, pins and reclamation intents remain.
+
+M1's portable SHA-256-verified metadata snapshot format remains separate from
+the database file format. Restores build and verify a fresh directory before
+publication. N1 payload backup and LINK placement remain independent.
+
+See the [storage module guide](metadata_engine/storage/README.md),
+[versioned file format](metadata_engine/storage/FORMAT.md) and
+[SQLite source study](metadata_engine/storage/SQLITE-NOTES.md). SQLite supplied
+reliability design lessons; its implementation and database dependencies are
+not incorporated. Current qualification is recorded in [TESTING.md](TESTING.md).
+
+## Fragment ownership
 
 Logical user fragments are managed by M1. N1 separately
 authenticates its clients/service fragments; metadata's backend credential is
@@ -143,7 +177,7 @@ announcement or a migration guide.
 | Location | Responsibility |
 | --- | --- |
 | `link/src` | Canonical immutable identity, placement, key authentication and inline format |
-| `metadata_engine/src/store.rs` | Procyon-backed durable cross-table transactions and snapshots |
+| `metadata_engine/src/store.rs` | Service adapter for durable cross-table transactions, snapshots and bounded scans |
 | `metadata_engine/src/key.rs` | Exact UTF-8 metadata identifiers scoped by stable fragment ID |
 | `metadata_engine/src/executor.rs` | Bounded blocking database workers, cancellation ownership and draining |
 | `metadata_engine/src/namespace` | Logical name bindings, maximum-ULID heads, immutable version references, rename, trash and recovery |
@@ -154,7 +188,7 @@ announcement or a migration guide.
 | `metadata_engine/src/server/accel.rs` | Optional authorized search/read acceleration, response validation and origin fallback |
 | `metadata_engine/src/uploads` | Multipart sessions, durable acknowledged-part metadata and bounded HDD re-chunking for non-aligned client part geometry |
 | `metadata_engine/src/exports` | Retained bounded ZIP64/TAR builder, direct selected/manifest archive streaming, immutable source pins and M1 crash cleanup |
-| `metadata_engine/storage` | Retained Procyon storage core, upstream fixes, recovery fixtures and tests |
+| `metadata_engine/storage` | M1's own ordered tree, journal/recovery, optimistic transactions, cache and online checkpoints; see its module map |
 | `object_engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
 | `object_engine/src/core/upload/activity.rs` | Owned operation lifetime, shutdown admission and control-lease retention |
 | `object_engine/src/core/download.rs` | Verified streamed/ranged reads and read-repair admission |
@@ -468,7 +502,7 @@ The logger guard flushes during shutdown; machine-readable maintenance output
 and CLI version/help do not receive the server banner.
 
 M1 prints its own `L I T I A I N A  M 1` boxed banner from
-`metadata_engine/src/main.rs`, with Cargo version, ProcyonDB identity, start
+`metadata_engine/src/main.rs`, with Cargo version, M1 storage identity, start
 time, PID, hostname, working directory and the selected native/HTTP(S) listeners.
 It uses one readable source statement per output line. Its offline commands
 keep machine-readable output separate from server startup diagnostics.

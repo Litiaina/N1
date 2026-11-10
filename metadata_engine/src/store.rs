@@ -1,16 +1,10 @@
+//! M1's service-facing storage boundary. Domain records and NOA semantics stay
+//! here; the independent m1_storage crate owns pages, transactions and recovery.
 use crate::{Error, RecordKey, Result, Table};
 use n1_link::PoolId;
-use procyon_engine::{
-    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx,
-    PersistMode, Readable, Snapshot,
-};
-use serde::{Deserialize, Serialize};
 use std::{ops::Bound, path::Path, sync::Arc};
 mod backup;
 
-const FORMAT_KEY: &[u8] = b"format";
-const SYSTEM: &str = "n1_system";
-const SCHEMA_VERSION: u32 = 1;
 const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSACTION_WRITES: usize = 4096;
@@ -20,8 +14,9 @@ const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cache_bytes: u64,
-    /// Active memtable rotation threshold for each keyspace, not a process RSS cap.
+    /// Retained operator setting: bounds batching memory, not a process RSS cap.
     pub memtable_bytes: u64,
+    /// Minimum changed-data threshold for background checkpoint admission.
     pub journal_bytes: u64,
     pub background_workers: usize,
 }
@@ -37,154 +32,59 @@ impl Default for Options {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Format {
-    product: String,
-    schema: u32,
-    key_encoding: String,
-}
-
-impl Default for Format {
-    fn default() -> Self {
-        Self {
-            product: "N1-METADATA".into(),
-            schema: SCHEMA_VERSION,
-            key_encoding: "fragment16-utf8-v1".into(),
-        }
-    }
-}
-
 struct Inner {
-    db: OptimisticTxDatabase,
-    tables: [OptimisticTxKeyspace; 4],
+    db: m1_storage::Database,
 }
 
-/// Owns the database lock and background maintenance through cloned handles.
-/// Only one process can open a metadata directory at a time.
+/// Process/file ownership survives through every transaction and snapshot.
 #[derive(Clone)]
 pub struct MetadataEngine(Arc<Inner>);
 
 impl MetadataEngine {
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
-        if options.background_workers == 0
-            || options.background_workers > 64
+        if !(1..=64).contains(&options.background_workers)
             || options.cache_bytes < 1024 * 1024
             || options.memtable_bytes < 1024 * 1024
             || options.journal_bytes < 64 * 1024 * 1024
         {
             return Err(Error::Invalid("invalid metadata resource limits".into()));
         }
-        let path = path.as_ref();
-        private_database_directory(path)?;
-        // Never adopt a directory containing application data or another engine.
-        // Procyon's own VERSION marker is necessary but not sufficient; the
-        // keyspace and format checks below verify this is an N1 database.
-        if path.exists()
-            && !path.join("version").exists()
-            && std::fs::read_dir(path)?.next().is_some()
-        {
-            return Err(Error::Incompatible(
-                "metadata directory is not an M1 database or an empty directory".into(),
-            ));
-        }
-        let db = OptimisticTxDatabase::builder(path)
-            .cache_size(options.cache_bytes)
-            .max_journaling_size(options.journal_bytes)
-            .worker_threads(options.background_workers)
-            .open()?;
-        for name in db.list_keyspace_names() {
-            if name.as_ref() != SYSTEM
-                && !Table::ALL.iter().any(|table| name.as_ref() == table.name())
-            {
-                return Err(Error::Incompatible(
-                    "foreign metadata keyspace; refusing adoption".into(),
-                ));
-            }
-        }
-        let system = db.keyspace(SYSTEM, KeyspaceCreateOptions::default)?;
-        if let Some(bytes) = system.get(FORMAT_KEY)? {
-            let format: Format = serde_json::from_slice(&bytes).map_err(|error| {
-                Error::Incompatible(format!("invalid metadata format: {error}"))
-            })?;
-            if format != Format::default() {
-                return Err(Error::Incompatible(
-                    "unsupported metadata storage format".into(),
-                ));
-            }
-            if Table::ALL
-                .iter()
-                .any(|table| !db.keyspace_exists(table.name()))
-            {
-                return Err(Error::Incompatible(
-                    "a metadata keyspace is missing from an initialized database".into(),
-                ));
-            }
-        }
-        let table_options =
-            || KeyspaceCreateOptions::default().max_memtable_size(options.memtable_bytes);
-        let tables = [
-            db.keyspace(Table::Entries.name(), table_options)?,
-            db.keyspace(Table::Versions.name(), table_options)?,
-            db.keyspace(Table::Uploads.name(), table_options)?,
-            db.keyspace(Table::Reclamation.name(), table_options)?,
-        ];
-        let mut tx = db.write_tx()?.durability(Some(PersistMode::SyncAll));
-        if let Some(bytes) = tx.get(&system, FORMAT_KEY)? {
-            let format: Format = serde_json::from_slice(&bytes).map_err(|error| {
-                Error::Incompatible(format!("invalid metadata format: {error}"))
-            })?;
-            if format != Format::default() {
-                return Err(Error::Incompatible(
-                    "unsupported metadata storage format".into(),
-                ));
-            }
-        } else {
-            // A crash during initial creation may leave empty keyspaces. Finish
-            // initialization only if there is no data to reinterpret.
-            if tx.first_key_value(&system).is_some()
-                || tables
-                    .iter()
-                    .any(|table| tx.first_key_value(table).is_some())
-            {
-                return Err(Error::Incompatible(
-                    "metadata format record is missing from a populated database".into(),
-                ));
-            }
-            let bytes = serde_json::to_vec(&Format::default())
-                .map_err(|error| Error::Invalid(error.to_string()))?;
-            tx.insert(&system, FORMAT_KEY, bytes);
-        }
-        tx.commit()?.map_err(|_| Error::Conflict)?;
-        Ok(Self(Arc::new(Inner { db, tables })))
+        private_database_directory(path.as_ref())?;
+        let db = m1_storage::Database::open(
+            path,
+            m1_storage::Options {
+                cache_bytes: options.cache_bytes,
+                write_buffer_bytes: options.memtable_bytes,
+                journal_bytes: options.journal_bytes,
+                background_workers: options.background_workers,
+            },
+        )?;
+        Ok(Self(Arc::new(Inner { db })))
     }
 
     pub fn snapshot(&self) -> MetadataSnapshot {
         MetadataSnapshot {
-            engine: self.clone(),
-            snapshot: self.0.db.read_tx(),
+            view: self.0.db.snapshot(),
         }
     }
 
     pub fn write(&self) -> Result<MetadataTransaction> {
         Ok(MetadataTransaction {
-            engine: self.clone(),
-            tx: self.0.db.write_tx()?.durability(Some(PersistMode::SyncAll)),
+            tx: self.0.db.write()?,
             writes: 0,
             bytes: 0,
             failed: false,
         })
     }
 
-    /// Retries the complete read/modify/write operation after serialization
-    /// conflicts. The closure must have no external side effects or object I/O.
-    /// Storage failures are returned immediately, never retried as conflicts.
+    /// Retry only serialization conflicts. Closures must not perform external
+    /// side effects or object I/O, because a conflicted attempt is discarded.
     pub fn transact<T>(
         &self,
         attempts: usize,
         mut apply: impl FnMut(&mut MetadataTransaction) -> Result<T>,
     ) -> Result<T> {
-        if attempts == 0 || attempts > 1024 {
+        if !(1..=1024).contains(&attempts) {
             return Err(Error::Invalid("transaction attempts must be 1–1024".into()));
         }
         for _ in 0..attempts {
@@ -200,17 +100,15 @@ impl MetadataEngine {
     }
 
     pub fn disk_bytes(&self) -> Result<u64> {
-        Ok(self.0.db.disk_space()?)
+        Ok(self.0.db.disk_bytes()?)
     }
 
-    fn table(&self, table: Table) -> &OptimisticTxKeyspace {
-        &self.0.tables[table.index()]
+    pub fn verify(&self) -> Result<u64> {
+        Ok(self.0.db.verify()?.records)
     }
 }
 
-/// Metadata now retains LINK access credentials. Protect the database boundary
-/// before Procyon creates journals or background files, regardless of umask.
-/// Existing directories are never silently chmod'd or adopted through symlinks.
+// A metadata database contains private LINK access credentials.
 fn private_database_directory(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
@@ -247,47 +145,32 @@ fn private_database_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A stable cross-table view. Hold one snapshot for both index and entry reads.
-/// Drop it after a request/page to allow old versions to be reclaimed.
+/// A stable cross-table view, retained only for a request/page or backup.
 pub struct MetadataSnapshot {
-    engine: MetadataEngine,
-    snapshot: Snapshot,
+    view: m1_storage::Snapshot,
 }
 
 impl MetadataSnapshot {
-    /// Startup index construction only, before request admission. Routine
-    /// maintenance seeks its own indexed prefixes instead of using this scan.
+    /// Startup index construction; routine maintenance uses indexed prefixes.
     pub(crate) fn scan_all(
         &self,
         table: Table,
         after: Option<&RecordKey>,
         limit: usize,
     ) -> Result<Vec<(RecordKey, Vec<u8>)>> {
-        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-            return Err(Error::Invalid("metadata page size must be 1–1000".into()));
-        }
-        let start = after.map_or(Bound::Unbounded, |key| {
-            Bound::Excluded(procyon_engine::Slice::from(key.encode()))
-        });
-        let mut result = Vec::new();
-        let mut bytes = 0;
-        for row in self
-            .snapshot
-            .range(
-                self.engine.table(table),
-                (start, Bound::<procyon_engine::Slice>::Unbounded),
-            )
-            .take(limit)
-        {
-            let (key, value) = row.into_inner()?;
-            bytes += key.len() + value.len();
-            if bytes > MAX_PAGE_BYTES {
-                break;
-            }
-            result.push((RecordKey::decode(&key)?, value.to_vec()));
-        }
-        Ok(result)
+        validate_limit(limit)?;
+        let start = after.map_or_else(
+            || Bound::Included(vec![table.index() as u8]),
+            |key| Bound::Excluded(storage_key(table, key)),
+        );
+        collect_page(
+            self.view
+                .range(start, Bound::Excluded(vec![table.index() as u8 + 1]))?,
+            table,
+            limit,
+        )
     }
+
     pub(crate) fn scan_from(
         &self,
         table: Table,
@@ -296,22 +179,16 @@ impl MetadataSnapshot {
         from: &RecordKey,
         limit: usize,
     ) -> Result<Vec<(RecordKey, Vec<u8>)>> {
-        scan(
-            &self.snapshot,
-            &self.engine,
-            table,
-            fragment,
-            prefix,
-            Some(ScanStart::At(from)),
-            limit,
-        )
-    }
-    pub fn get(&self, table: Table, key: &RecordKey) -> Result<Option<Vec<u8>>> {
-        read(&self.snapshot, &self.engine, table, key)
+        validate_limit(limit)?;
+        let (start, end) = scan_bounds(table, fragment, prefix, Some((from, true)))?;
+        collect_page(self.view.range(start, end)?, table, limit)
     }
 
-    /// Keyset pagination seeks directly after the last key, within this snapshot.
-    /// A new snapshot for a later page is a new view, not a global listing snapshot.
+    pub fn get(&self, table: Table, key: &RecordKey) -> Result<Option<Vec<u8>>> {
+        Ok(self.view.get(&storage_key(table, key))?)
+    }
+
+    /// Later pages using a new snapshot have a new view, not one global listing.
     pub fn scan(
         &self,
         table: Table,
@@ -320,23 +197,15 @@ impl MetadataSnapshot {
         after: Option<&RecordKey>,
         limit: usize,
     ) -> Result<Vec<(RecordKey, Vec<u8>)>> {
-        scan(
-            &self.snapshot,
-            &self.engine,
-            table,
-            fragment,
-            prefix,
-            after.map(ScanStart::After),
-            limit,
-        )
+        validate_limit(limit)?;
+        let (start, end) = scan_bounds(table, fragment, prefix, after.map(|key| (key, false)))?;
+        collect_page(self.view.range(start, end)?, table, limit)
     }
 }
 
-/// Concurrent optimistic transaction. Reads, including ranges, participate in
-/// conflict validation. A successful write commit waits for SyncAll.
+/// Concurrent optimistic transaction; successful commits are synchronized.
 pub struct MetadataTransaction {
-    engine: MetadataEngine,
-    tx: OptimisticWriteTx,
+    tx: m1_storage::Transaction,
     writes: usize,
     bytes: usize,
     failed: bool,
@@ -344,7 +213,7 @@ pub struct MetadataTransaction {
 
 impl MetadataTransaction {
     pub fn get(&self, table: Table, key: &RecordKey) -> Result<Option<Vec<u8>>> {
-        read(&self.tx, &self.engine, table, key)
+        Ok(self.tx.get(&storage_key(table, key))?)
     }
 
     pub fn scan(
@@ -355,32 +224,27 @@ impl MetadataTransaction {
         after: Option<&RecordKey>,
         limit: usize,
     ) -> Result<Vec<(RecordKey, Vec<u8>)>> {
-        scan(
-            &self.tx,
-            &self.engine,
-            table,
-            fragment,
-            prefix,
-            after.map(ScanStart::After),
-            limit,
-        )
+        validate_limit(limit)?;
+        let (start, end) = scan_bounds(table, fragment, prefix, after.map(|key| (key, false)))?;
+        self.tx
+            .scan(start, end, limit, MAX_PAGE_BYTES)?
+            .into_iter()
+            .map(|(key, value)| Ok((decode_key(table, &key)?, value)))
+            .collect()
     }
 
     pub fn put(&mut self, table: Table, key: &RecordKey, value: &[u8]) -> Result<()> {
         self.reserve(key, value.len())?;
-        self.tx
-            .insert(self.engine.table(table), key.encode(), value);
+        self.tx.put(&storage_key(table, key), value)?;
         Ok(())
     }
 
     pub fn remove(&mut self, table: Table, key: &RecordKey) -> Result<()> {
         self.reserve(key, 0)?;
-        self.tx.remove(self.engine.table(table), key.encode());
+        self.tx.remove(&storage_key(table, key))?;
         Ok(())
     }
 
-    /// A conditional update and its predicate belong to the same transaction.
-    /// False leaves this key unchanged. Other changes in the transaction remain.
     pub fn compare_exchange(
         &mut self,
         table: Table,
@@ -404,7 +268,7 @@ impl MetadataTransaction {
                 "metadata transaction exceeded its limits and must be discarded".into(),
             ));
         }
-        self.tx.commit()?.map_err(|_| Error::Conflict)
+        Ok(self.tx.commit()?)
     }
 
     fn reserve(&mut self, key: &RecordKey, value_len: usize) -> Result<()> {
@@ -424,64 +288,81 @@ impl MetadataTransaction {
     }
 }
 
-fn read(
-    view: &impl Readable,
-    engine: &MetadataEngine,
-    table: Table,
-    key: &RecordKey,
-) -> Result<Option<Vec<u8>>> {
-    Ok(view
-        .get(engine.table(table), key.encode())?
-        .map(|value| value.to_vec()))
+fn storage_key(table: Table, key: &RecordKey) -> Vec<u8> {
+    let mut bytes = vec![table.index() as u8];
+    bytes.extend_from_slice(&key.encode());
+    bytes
 }
 
-enum ScanStart<'a> {
-    After(&'a RecordKey),
-    At(&'a RecordKey),
+fn decode_key(table: Table, key: &[u8]) -> Result<RecordKey> {
+    if key.first() != Some(&(table.index() as u8)) {
+        return Err(Error::Incompatible(
+            "metadata cursor crossed its table boundary".into(),
+        ));
+    }
+    RecordKey::decode(&key[1..])
 }
-fn scan(
-    view: &impl Readable,
-    engine: &MetadataEngine,
+
+fn validate_limit(limit: usize) -> Result<()> {
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return Err(Error::Invalid("metadata page size must be 1–1000".into()));
+    }
+    Ok(())
+}
+
+fn collect_page(
+    rows: m1_storage::Scan,
+    table: Table,
+    limit: usize,
+) -> Result<Vec<(RecordKey, Vec<u8>)>> {
+    let mut page = Vec::with_capacity(limit);
+    let mut bytes = 0;
+    for row in rows.take(limit) {
+        let (key, value) = row?;
+        let size = key.len() + value.len();
+        if bytes + size > MAX_PAGE_BYTES {
+            break;
+        }
+        bytes += size;
+        page.push((decode_key(table, &key)?, value));
+    }
+    Ok(page)
+}
+
+type ScanBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+fn scan_bounds(
     table: Table,
     fragment: PoolId,
     prefix: &str,
-    after: Option<ScanStart<'_>>,
-    limit: usize,
-) -> Result<Vec<(RecordKey, Vec<u8>)>> {
-    if limit == 0 || limit > MAX_PAGE_SIZE {
-        return Err(Error::Invalid("metadata page size must be 1–1000".into()));
+    after: Option<(&RecordKey, bool)>,
+) -> Result<ScanBounds> {
+    let mut encoded = vec![table.index() as u8];
+    encoded.extend_from_slice(&RecordKey::prefix(fragment, prefix)?);
+    let mut upper = encoded.clone();
+    while upper.last() == Some(&255) {
+        upper.pop();
     }
-    let encoded = RecordKey::prefix(fragment, prefix)?;
-    let (start, end) = procyon_engine::util::prefix_to_range(&encoded);
-    let start = if let Some(after) = after {
-        let (after, inclusive) = match after {
-            ScanStart::After(key) => (key, false),
-            ScanStart::At(key) => (key, true),
-        };
-        if after.fragment() != fragment || !after.identifier().starts_with(prefix) {
-            return Err(Error::Invalid(
-                "metadata cursor is outside the requested prefix".into(),
-            ));
+    let end = match upper.last_mut() {
+        Some(last) => {
+            *last += 1;
+            Bound::Excluded(upper)
         }
-        let key = procyon_engine::Slice::from(after.encode());
-        if inclusive {
-            Bound::Included(key)
-        } else {
-            Bound::Excluded(key)
-        }
-    } else {
-        start
+        None => Bound::Unbounded,
     };
-    let mut page = Vec::with_capacity(limit);
-    let mut page_bytes = 0;
-    for item in view.range(engine.table(table), (start, end)).take(limit) {
-        let (key, value) = item.into_inner()?;
-        let item_bytes = key.len() + value.len();
-        if page_bytes + item_bytes > MAX_PAGE_BYTES {
-            break;
+    let start = match after {
+        Some((key, inclusive)) => {
+            if key.fragment() != fragment || !key.identifier().starts_with(prefix) {
+                return Err(Error::Invalid(
+                    "metadata cursor is outside the requested prefix".into(),
+                ));
+            }
+            if inclusive {
+                Bound::Included(storage_key(table, key))
+            } else {
+                Bound::Excluded(storage_key(table, key))
+            }
         }
-        page_bytes += item_bytes;
-        page.push((RecordKey::decode(&key)?, value.to_vec()));
-    }
-    Ok(page)
+        None => Bound::Included(encoded),
+    };
+    Ok((start, end))
 }

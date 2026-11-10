@@ -32,10 +32,12 @@ fn resources(pid: u32) -> Value {
 }
 
 fn distribution(mut samples: Vec<f64>) -> Value {
+    let completion_order_ms = samples.clone();
     samples.sort_by(f64::total_cmp);
     let percentile = |p: f64| samples[(samples.len() as f64 * p).ceil() as usize - 1];
     json!({"samples":samples.len(),"sum_ms":samples.iter().sum::<f64>(),
-        "p50_ms":percentile(0.5),"p95_ms":percentile(0.95),"p99_ms":percentile(0.99)})
+        "p50_ms":percentile(0.5),"p95_ms":percentile(0.95),"p99_ms":percentile(0.99),
+        "completion_order_ms":completion_order_ms})
 }
 
 fn source(part: u64, bytes: usize) -> Vec<u8> {
@@ -55,6 +57,14 @@ async fn matched_named_upload_read_and_mutation_measurement() {
     );
     assert!(!output.exists(), "never overwrite a measurement");
     let mut stack = Stack::with_block_bytes(262144).await;
+    let object_config: Value =
+        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    let layout = &object_config["pools"][0]["layout"];
+    let ec = format!(
+        "{}+{}",
+        layout["data_shards"].as_u64().unwrap(),
+        layout["parity_shards"].as_u64().unwrap()
+    );
     drop(stack.metadata.take());
     let path = stack.root.join("m1_config.ini");
     let mut ini = ini::Ini::load_from_file(&path).unwrap();
@@ -213,7 +223,7 @@ async fn matched_named_upload_read_and_mutation_measurement() {
         .await;
         trash.push(now.elapsed().as_secs_f64() * 1000.0);
     }
-    let result = json!({"fixture":stack.root,"block_bytes":262144,"ec":"1+1","rate_limiting_configured":true,
+    let result = json!({"fixture":stack.root,"block_bytes":262144,"ec":ec,"rate_limiting_configured":true,
         "accel_configured":false,"small_bytes":4096,"small_objects":100,"large_bytes":PARTS*PART_BYTES as u64,
         "part_bytes":PART_BYTES,"part_concurrency":4,"wall_seconds":started.elapsed().as_secs_f64(),
         "small_upload":distribution(upload),"small_get":distribution(read),"rename":distribution(rename),"trash":distribution(trash),

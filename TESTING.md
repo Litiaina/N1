@@ -1,7 +1,7 @@
 # N1 and M1 testing
 
 This is the current testing guide for the **N1 LINK object store**, the
-**M1 metadata store backed by ProcyonDB**, and original Console integration.
+**M1 metadata store with its own specialized database**, and original Console integration.
 It records evidence, not the architecture or
 operator procedure. Product behavior is defined by [NOA.md](NOA.md); remaining
 completion gates are in [docs/RC2-IMPLEMENTATION.md](docs/RC2-IMPLEMENTATION.md).
@@ -22,7 +22,7 @@ the time of those campaigns.
 | Layer | Required checks | Does not prove |
 | --- | --- | --- |
 | LINK/object engine | Key encoding and placement, EC/integrity, upload/finalize idempotence, exact GET/ranges, repair, purge, GC and recovery | Names, metadata transactions or Console behavior |
-| Procyon/metadata storage | Concurrent writers/readers, atomic cross-table updates, snapshots, crash/recovery, conflict handling | Object payload durability or the NOA service contract |
+| M1 database | Concurrent writers/readers, atomic cross-table updates, snapshots, crash/recovery, conflict handling | Object payload durability or the NOA service contract |
 | Metadata service → object engine | Pending identity before bytes, durable object completion before named publication, version/name semantics and exact reads after restart | Every Console workflow or full retained API parity |
 | Original Console → metadata → object engine | Real production UI/API requests, original upload schemes, resume, listings and downloads | An API simulated by mocked responses, or untested administrative features |
 | Scale/fault campaign | Every acknowledged version retained, physical placement census, zero unexpected staged/unreferenced files, process crash/reopen and complete readback | Power-loss, cold-cache performance or topology failure modes that were not injected |
@@ -32,6 +32,76 @@ Node/Playwright tooling and a real headless Chromium browser. No Python is used
 in the current qualification campaigns. Keep data, logs and build output on the
 selected SSD/HDD/RAM locations for each profile; never put population fixtures
 on the source NVMe.
+
+## M1 owned-storage qualification — November 10–11, 2026
+
+M1 now uses its independently implemented `m1_storage` database. Its final local
+checkpoint passes **374 default tests, zero failed**, with 50 explicit opt-in/helper
+exclusions. Strict M1/storage Clippy and workspace formatting pass. Documentation
+test commands succeed with zero runnable examples for these two crates.
+
+The final SSD database campaign passes **1,000,000 metadata entries plus 100,000
+mutations**, two actual SIGKILLs, prior-ACK checks before resume writes, full
+value/history verification and exact final counts. It takes **43.08 s**, with
+maximum observed database child RSS **96.75 MiB**. These are metadata KV fixtures,
+not a million named object uploads. All **18 selected real M1 → N1 service
+checks** pass on DATA_SSD, followed by offline verification of all 2,080,000
+live records in the million-entry database.
+
+The matched old/new/new/old 100K-entry/10K-mutation database campaign averages
+**17.035 → 3.920 s (4.35× faster)**, including recovery and verification.
+The matched named pipeline has mixed results: 256 MiB multipart upload averages
+**0.871 → 0.884 s**, while the 100-small-PUT latency sum rises **27.31%** and
+M1 process CPU rises **15.30%**. Small-operation and tail-latency acceptance
+remain open; the batch gain does not establish all-operation parity. These
+software controls use one SSD and **1+0** geometry, with both services on it.
+The [owned-storage report](docs/M1-STORAGE-20261110.md) retains every phase,
+operation's distributions, resources, failures, binary hashes and reproduction.
+
+After the operator reboot, **final candidate 10** also passes independent
+**million-entry/100K-mutation campaigns on each HDD**, two SIGKILLs per drive,
+and exact final counts of 2,080,000 live records per database. It passes
+**8,192 fresh named M1 → N1 uploads**, census and full original-version/byte
+readback after killing and reopening both engines, plus **all 24 selected
+physical service cases**. These include member loss/corruption, beyond-parity
+refusal, backup/restore, replacement, cross-EC migration, durable resume,
+archives, healing, GC, diagnostics, Accel, TLS and quotas. The matched HDD
+100K/10K database comparison averages **85.50 → 17.98 s (4.76× faster)**.
+
+Both USB HDDs subsequently go offline again during the named-service
+comparison, and XFS shuts down both filesystems. The final failing phase uses
+the **old Procyon-backed M1**; the incomplete comparison is not an accepted
+speedup or a new-core database regression. After a second operator reboot,
+both retained databases pass complete verification again and all 8,192
+original named objects pass readback: **zero new uploads and zero mismatches**.
+The shared USB hub remains present; reboot alone does not resolve its recurring
+transport fault. The next fresh comparison aborts on renewed UAS errors on
+both drives, at 02:15:04–05 on November 11. Its guard stops the old-baseline
+phase immediately; there is no accepted HDD named-service comparison.
+Hardware evidence and each successful/failed phase are retained.
+
+A repeated SSD comparison keeps large upload/GET means within 1%, but the
+new M1's small-PUT sum rises **35.79%**, with recurring approximately 95 ms
+tails. Direct Rust stage profiling measures about **0.736 ms** extra across
+the two durable metadata stages and does not reproduce that HTTP tail.
+The subsequent [clean-HDD retest](docs/M1-CLEAN-HDD-20261111.md) archives selected
+old evidence, recreates both disposable XFS filesystems with their labels,
+UUIDs and mount points retained, then repeats the frozen workloads. Both
+million-KV campaigns, the 8,192-object named campaign and all 24 selected service
+cases pass again. Its matched database comparison averages **77.740 → 18.495 s
+(4.20× faster)**. USB errors recur on both drives during the first old-M1
+upload-comparison phase; the guard stops the run at 03:21:13. Formatting does
+not resolve the transport fault, and no overall campaign pass or named-service
+speedup follows from this aborted comparison.
+
+Small-upload performance acceptance remains open. A new-core million-object
+named campaign, Console, four-drive and controlled power-loss qualification
+also remain separate gates.
+
+The report separates each binary, fixture, failure and comparison. Historical
+Procyon-backed results below remain valid for their original checkpoints;
+**they do not qualify the replacement database**. N1 LINK's implementation,
+native client, shared operator code, Shell and Console are unchanged.
 
 ## Million-object full-stack qualification — November 8, 2026
 
@@ -329,7 +399,7 @@ adequate space before invoking these commands:
 export N1_LINK_TEST_ROOT="$TMPDIR/n1-link-tests"
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
-cargo test -p m1 -p procyon-engine --doc --locked
+cargo test -p m1 -p m1_storage --doc --locked
 cargo clippy -p n1 -p m1 -p cli_core -p n1_shell --all-targets --no-deps --locked -- -D warnings
 ```
 
@@ -337,8 +407,9 @@ Use `--offline` only when the locked dependencies are already available.
 Physical tests and subprocess helpers marked ignored require their documented
 environment or supervisor; an ignored case is not a pass. Inspect the test
 summary and opt-in physical witness logs separately. The scoped Clippy command
-above does not claim that imported Procyon or the historical release-proof tool
-passes a whole-workspace lint invocation.
+above does not claim that the historical release-proof tool passes a
+whole-workspace lint invocation. Earlier Procyon-backed results retain their
+original source/binary scope; they do not qualify M1's replacement database.
 
 The source contains the following Rust physical harnesses:
 

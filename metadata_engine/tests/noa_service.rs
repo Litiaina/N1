@@ -65,11 +65,19 @@ struct Stack {
     object_config: PathBuf,
 }
 fn port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Closing a probe lets the OS immediately return the same port again.
+    // Keep allocations distinct within this fixture process so HTTP/native
+    // listeners cannot receive identical configuration before either starts.
+    static ALLOCATED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    let mut allocated = ALLOCATED.get_or_init(Default::default).lock().unwrap();
+    loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if allocated.insert(port) {
+            return port;
+        }
+    }
 }
 fn spawn(binary: &Path, args: &[&str], root: &Path, log: &str) -> Process {
     // This fixture verifies the informational N1 startup banner explicitly.
@@ -159,6 +167,10 @@ impl Stack {
         let mut object_settings: Value =
             serde_json::from_slice(&std::fs::read(&object_config).unwrap()).unwrap();
         object_settings["runtime"]["monitor_interval_seconds"] = json!(1);
+        // Functional/recovery witnesses must not turn a fast archive or scan
+        // into a test of N1's default 30-reads/s quota. M1 quota cases below
+        // explicitly enable their policy; N1's own quota tests are separate.
+        object_settings["rate_limits"]["enabled"] = json!(false);
         std::fs::write(
             &object_config,
             serde_json::to_vec_pretty(&object_settings).unwrap(),
@@ -340,7 +352,7 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
     let object_banner = std::fs::read_to_string(stack.root.join("object.log")).unwrap();
     assert!(metadata_banner.contains("L I T I A I N A  M 1"));
     assert!(metadata_banner.contains("M1 metadata store"));
-    assert!(metadata_banner.contains("Database       : ProcyonDB"));
+    assert!(metadata_banner.contains("Database       : M1 native storage"));
     assert!(metadata_banner.contains("Start Time     :"));
     assert!(!metadata_banner.contains("L I T I A I N A  N 1"));
     assert!(object_banner.contains("L I T I A I N A  N 1"));

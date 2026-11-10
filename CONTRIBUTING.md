@@ -26,8 +26,8 @@ or a commitment to implement them.
 ## Internal maintenance
 
 Use **N1** for the object store, **M1** for the metadata store, **LINK** for
-N1's key algorithm and storage architecture, and **ProcyonDB** for M1's database
-foundation. Source directories describe responsibilities: `object_engine/`,
+N1's key algorithm and storage architecture, and **M1 storage** for M1's own
+transactional database. Source directories describe responsibilities: `object_engine/`,
 `metadata_engine/` and `link/`. The architecture guide maps their modules.
 
 Run `cargo fmt --all --check` before a checkpoint. Keep banners, JSON responses

@@ -42,13 +42,19 @@ pub(super) fn create_multipart_range_reader(
     let key = version.key.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
     tokio::spawn(async move {
-        if objects
+        if let Err(error) = objects
             .download(&key, offset, Some(length), &mut output)
             .await
-            .is_err()
         {
+            // ObjectStoreError's public display excludes LINK access keys.
+            // Retain the status so operators can distinguish admission,
+            // transport and source-integrity failures without logging secrets.
+            tracing::warn!(status = error.status(), error = %error, "export object read failed");
             let _ = tx
-                .send(std::io::Error::other("export object read failed"))
+                .send(std::io::Error::other(format!(
+                    "export object read failed (status {})",
+                    error.status()
+                )))
                 .await;
         }
         let _ = output.shutdown().await;

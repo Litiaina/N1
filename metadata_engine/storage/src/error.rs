@@ -1,83 +1,45 @@
-// Copyright (c) 2024-present, fjall-rs
-// This source code is licensed under both the Apache 2.0 and MIT License
-// (found in the LICENSE-* files in the repository)
+use std::{fmt, io};
 
-use crate::{
-    CompressionType, journal::error::RecoveryError as JournalRecoveryError, version::FormatVersion,
-};
-
-/// Errors that may occur in the storage engine
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum Error {
-    /// Error inside LSM-tree
-    Storage(lsm_tree::Error),
-
-    /// I/O error
-    Io(std::io::Error),
-
-    /// Error during journal recovery
-    JournalRecovery(JournalRecoveryError),
-
-    /// Invalid or unparsable data format version
-    InvalidVersion(Option<FormatVersion>),
-
-    /// Decompression failed
-    Decompress(CompressionType),
-
-    /// Invalid journal trailer detected
-    InvalidTrailer,
-
-    /// Invalid tag detected during decoding
-    InvalidTag((&'static str, u8)),
-
-    /// A previous flush / commit operation failed, indicating a hardware-related failure
-    ///
-    /// Future writes will not be accepted as consistency cannot be guaranteed.
-    ///
-    /// **At this point, it's best to let the application crash and try to recover.**
-    ///
-    /// More info: <https://www.usenix.org/system/files/atc20-rebello.pdf>
-    Poisoned,
-
-    /// Keyspace is deleted
-    KeyspaceDeleted,
-
-    /// Database is locked.
+    Io(io::Error),
     Locked,
-
-    /// Database is unrecoverable, see logs for details
-    Unrecoverable,
+    Invalid(String),
+    Incompatible(String),
+    Corrupt(String),
+    Conflict,
+    Closed,
+    Poisoned,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ProcyonEngineError: {self:?}")
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(inner: std::io::Error) -> Self {
-        Self::Io(inner)
-    }
-}
-
-impl From<lsm_tree::Error> for Error {
-    fn from(inner: lsm_tree::Error) -> Self {
-        Self::Storage(inner)
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Locked => f.write_str("M1 database is already open"),
+            Self::Invalid(message) | Self::Incompatible(message) | Self::Corrupt(message) => {
+                f.write_str(message)
+            }
+            Self::Conflict => f.write_str("metadata transaction conflict"),
+            Self::Closed => f.write_str("M1 storage coordinator is closed"),
+            Self::Poisoned => f.write_str("M1 storage requires reopen after a storage failure"),
+        }
     }
 }
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Storage(inner) => Some(inner),
-            Self::Io(inner) => Some(inner),
-            Self::JournalRecovery(inner) => Some(inner),
+            Self::Io(error) => Some(error),
             _ => None,
         }
     }
 }
 
-/// Result helper type
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

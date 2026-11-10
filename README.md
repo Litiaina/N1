@@ -10,7 +10,7 @@
   <h1>Litiaina N1</h1>
 
   <p>
-    <b>N1 is a high-performance single-node object store built on LINK (Litiaina Immutable Native Key). M1 is its independent metadata store, backed by ProcyonDB, for named-object management.</b>
+    <b>N1 is a high-performance single-node object store built on LINK (Litiaina Immutable Native Key). M1 is its independent metadata store with a specialized transactional database for named-object management.</b>
   </p>
 
 </div>
@@ -33,11 +33,12 @@ This repository contains two systems:
   repair, zero-residue purge, staging GC and object recovery.
 - **M1 — `metadata_engine/`** provides logical fragments, names, versions, listings,
   named upload transactions, rename, trash/recovery and exports. Its database
-  foundation is ProcyonDB. It coordinates storage through the public native LINK
-  interface, without importing object-engine internals.
+  engine is independently implemented in `metadata_engine/storage/`. It coordinates
+  storage through the public native LINK interface, without importing
+  object-engine internals.
 
-**LINK** is N1's key algorithm and storage architecture. **ProcyonDB** is the
-transactional database used inside M1; it is not another object store.
+**LINK** is N1's key algorithm and storage architecture. **M1 storage** is the
+specialized transactional database inside M1; it is not another object store.
 
 `main` contains the mainstream **N1 LINK + M1** system. The former NCX/NDX
 engine is a separate product, **N1 Lite**, in the
@@ -46,7 +47,7 @@ builds, binaries, configuration and operator documentation.
 
 The original Console connects to M1's NOA v1 interface. M1 forwards object
 operations to N1 over native NOA v2. Applications that manage their own names
-and LINK keys can use N1 independently, without M1 or ProcyonDB.
+and LINK keys can use N1 independently, without M1 or its database.
 
 `Console / named client → M1 → N1 (LINK) → shards`
 

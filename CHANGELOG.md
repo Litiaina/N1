@@ -10,6 +10,13 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Replace M1's imported Procyon/Fjall database with the independently implemented
+  `m1_storage` crate: ordered on-disk tree, snapshot readers, optimistic writers,
+  synchronized group commits, checksummed recovery and online checkpoints.
+  Preserve the existing M1 service/domain modules, NOA and operator controls;
+  N1 LINK's implementation is unchanged. Requalify this storage implementation
+  independently of the historical Procyon-backed population results.
+
 - Enforce M1's configured request quotas across HTTP and named native NOA,
   sharing peer and fragment budgets across connections and token changes.
 - Keep M1 limiter cleanup off request/I/O workers, use fixed-size fragment
@@ -35,7 +42,7 @@ complete API conformance or qualification.
   outstanding API, scale, fault and performance gates remain required.
 - Formalize the two systems in this repository: **N1** is the object store,
   **M1** is the metadata store, **LINK** is N1's key algorithm and storage
-  architecture, and **ProcyonDB** is M1's database foundation. Keep the
+  architecture, and M1 owns its specialized database foundation. Keep the
   `object_engine/` and `metadata_engine/` source structure. Cargo packages are
   `n1` and `m1`; their binaries are `litiaina-n1` and `litiaina-m1`.
 - Give M1 the `L I T I A I N A  M 1` banner and readable per-line startup output;
@@ -49,7 +56,7 @@ complete API conformance or qualification.
   addressing and shard placement within immutable storage pools. Remove NCX/NDX
   lookup from object storage; keep names and user-visible versions outside it.
 - Separate the workspace into an independently usable `object_engine` and an
-  optional `metadata_engine` built on the retained ProcyonDB storage core.
+  optional `metadata_engine` with an independent transactional storage boundary.
 - Add metadata-owned fragments, named uploads, immutable version references,
   maximum-ULID selection, namespace operations, trash/recovery and exports.
   Named HTTP/WebSocket and native adapters serve the original Console contract.

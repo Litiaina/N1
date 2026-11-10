@@ -1,8 +1,8 @@
-//! M1, Litiaina's metadata store, using the ProcyonDB transactional core.
+//! M1, Litiaina's metadata store, with its own transactional storage core.
 //!
 //! M1 owns fragments, names, versions, permissions and named-object lifecycle.
 //! It accesses the independent N1 object store through the public native NOA API.
-//! N1 does not depend on M1 or ProcyonDB. Storage transactions live in `store`;
+//! N1 does not depend on M1. Storage transactions live in `store`;
 //! public NOA request semantics belong to the service adapters in `server`.
 mod error;
 mod executor;

@@ -11,7 +11,7 @@ const MAGIC: &[u8] = b"N1-METADATA-SNAPSHOT\0\x01";
 
 impl MetadataEngine {
     pub fn backup(&self, writer: &mut impl Write) -> Result<u64> {
-        let snapshot = self.0.db.read_tx();
+        let snapshot = self.snapshot();
         let mut digest = Sha256::new();
         let mut write = |bytes: &[u8]| -> Result<()> {
             writer.write_all(bytes)?;
@@ -21,16 +21,24 @@ impl MetadataEngine {
         write(MAGIC)?;
         let mut count = 0u64;
         for table in Table::ALL {
-            for row in snapshot.iter(self.table(table)) {
-                let (key, value) = row.into_inner()?;
-                write(&[table.index() as u8])?;
-                write(&(key.len() as u32).to_be_bytes())?;
-                write(&(value.len() as u32).to_be_bytes())?;
-                write(&key)?;
-                write(&value)?;
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Invalid("snapshot record count overflow".into()))?;
+            let mut after = None;
+            loop {
+                let rows = snapshot.scan_all(table, after.as_ref(), MAX_PAGE_SIZE)?;
+                if rows.is_empty() {
+                    break;
+                }
+                for (key, value) in rows {
+                    after = Some(key.clone());
+                    let key = key.encode();
+                    write(&[table.index() as u8])?;
+                    write(&(key.len() as u32).to_be_bytes())?;
+                    write(&(value.len() as u32).to_be_bytes())?;
+                    write(&key)?;
+                    write(&value)?;
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Invalid("snapshot record count overflow".into()))?;
+                }
             }
         }
         write(&[255])?;

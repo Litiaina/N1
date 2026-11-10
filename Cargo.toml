@@ -3,7 +3,7 @@ members = [
     # The two systems: N1 object store and M1 metadata store.
     "object_engine",
     "metadata_engine",
-    # ProcyonDB is M1's database foundation.
+    # M1's independently implemented transactional storage engine.
     "metadata_engine/storage",
     # Shared LINK algorithm, public N1 client and operator utilities.
     "link",

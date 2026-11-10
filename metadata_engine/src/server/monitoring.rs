@@ -46,8 +46,8 @@ pub(super) async fn metadata(app: &Arc<App>) -> Observation {
                     "node": node,
                     "system": system,
                     "storage": storage,
-                    "engine": "procyon-engine",
-                    "database": "ProcyonDB"
+                    "engine": "m1_storage",
+                    "database": "M1"
                 }),
                 Err(_) => json!({
                     "node": node,

@@ -3,7 +3,7 @@
 **Status: development, unreleased.** This file tracks current implementation and
 qualification gaps. It does not redefine the API, prescribe deployment or serve
 as a chronological work log. This repository contains the N1 LINK object store and the
-M1 metadata store, backed by ProcyonDB; see [ARCHITECTURE.md](../ARCHITECTURE.md).
+M1 metadata store with its own specialized database; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
@@ -20,6 +20,42 @@ remaining fault/power-loss qualification retain their separate gates. A
 process-kill/recovery pass does not establish hardware power-loss resilience.
 Full-stack performance and the completion gates below remain required before
 releasing RC.2.
+
+**M1 storage replacement — November 10:** the Procyon/Fjall implementation has
+been replaced by the independent `m1_storage` crate. Its ordered tree, optimistic
+transactions, snapshots, durable group commits and checkpoints preserve the
+existing service boundary. Earlier full-stack/KV passes qualify their original
+binaries, not this replacement. New-core recovery, concurrency, physical service
+and matched performance qualification must be recorded before its release.
+N1 LINK's implementation is unchanged. The
+[owned-storage qualification](M1-STORAGE-20261110.md) records the new core's
+million-entry process-crash/recovery pass, retained service checks and matched
+comparisons. The final local workspace has 374 passing tests, zero failed.
+After reboot, the final candidate passes a million KV entries plus 100K
+mutations independently on each HDD, 8,192 fresh named two-HDD uploads with
+full post-SIGKILL readback, and all 24 selected physical service cases.
+Both USB HDDs subsequently go offline again during the named-service comparison;
+the final failed phase uses the old Procyon-backed M1. After another operator
+reboot, both retained databases and all 8,192 original objects pass verification
+without re-uploading acknowledged data. The shared USB path remains unchanged;
+another fresh comparison aborts on both drives' renewed UAS errors, before
+completing its first old-baseline phase.
+A complete healthy named-service HDD comparison, new-core million-object
+named population, Console, four-drive and controlled power-loss qualification
+retain their separate gates.
+The final SSD campaign passes a million KV entries plus 100K mutations, 18
+real-service cases and complete offline record verification. The batched database
+comparisons improve, but the SSD named-service repetitions retain small-upload
+latency regressions. Direct Rust stage profiling does not reproduce the HTTP
+tail or settle its cause. Performance acceptance remains open for those costs.
+
+The later [clean-HDD retest](M1-CLEAN-HDD-20261111.md) repeats both million-KV
+campaigns, the 8K named campaign, all 24 service cases and a matched database
+comparison successfully after recreating XFS on both disposable HDDs. USB
+faults recur on both drives during the first old-M1 upload-benchmark phase;
+the guard stops the campaign. Fresh filesystems do not close the transport
+or end-to-end performance gate. Completed integrity passes are retained
+separately from the aborted comparison.
 
 ## Planned MCH hardening — November 11, 2026
 
@@ -67,7 +103,7 @@ fixture/setup errors out of pass counts while retaining their logs.
 | N1 object store (LINK) | Deterministic placement in immutable pools; normal/batch/standard/durable multipart; verified GET/ranges; stat/health/repair; zero-residue purge; staging GC; paced maintenance; object backups/replication and explicit member recovery |
 | N1 runtime infrastructure | Retained module structure, adaptive concurrency, I/O scheduler, io_uring, aligned O_DIRECT large uploads, middleware, server, streaming reads, banner and backup automation |
 | Operator controls | INI/environment startup; IP/ports/TLS; immutable pool enrollment/append; concurrency, memory, I/O, rate, GC and healing controls |
-| M1 database (ProcyonDB) | Procyon optimistic transactions, SyncAll commits, cross-table snapshots, bounded workers and scans, crash/recovery and offline administration |
+| M1 database (`m1_storage`) | Independently implemented ordered copy-on-write tree, optimistic transactions, synchronized group commits, cross-table snapshots, bounded cache/scans and online checkpoints; replacement qualification tracked separately |
 | M1 named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
 | Public adapters | Main named NOA v1 HTTP/WebSocket and native operations; independent direct LINK NOA v2; original Console runtime/proxy retained |
 | Exports and direct archives | Retained version-pinned ZIP64/TAR writer; direct selected/manifest archives with bounded workers, cancellable capture and M1-owned crash cleanup; export job state, range and signed downloads |
