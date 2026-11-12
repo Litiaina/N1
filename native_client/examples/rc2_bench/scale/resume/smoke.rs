@@ -84,12 +84,7 @@ pub(super) async fn self_test(args: Vec<String>) -> Result<()> {
     let engine = PathBuf::from(&args[2]).canonicalize()?;
     let project = PathBuf::from(&args[3]).canonicalize()?;
     let test = PathBuf::from(&args[4]).canonicalize()?;
-    if project != Path::new("/mnt/PROJECT-DISK-1TB")
-        || test != Path::new("/media/altear/TEST-1TB/mx-tests")
-        || project.metadata()?.dev() == test.metadata()?.dev()
-    {
-        return Err("resume self-test requires the two selected HDDs".into());
-    }
+    validate_parents(&project, &test)?;
     let report = project.join(format!(
         "n1-scale-resume-witness-{}",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()

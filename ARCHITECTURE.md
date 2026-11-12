@@ -167,6 +167,16 @@ queue and buffer budgets, pin immutable versions and hold only a bounded stream
 in memory. M1 owns temporary manifests and recovery cleanup intents; these add
 no records to N1's shard layout.
 
+Retained archives reserve their worst-case stored size through a transactional
+M1 byte counter before materialization, then charge their actual size when
+ready. Ordered expiry rows let cleanup query bounded pages instead of walking
+objects. Active builders/downloads hold per-job leases; cleanup removes files
+and manifests durably before deleting job state and releasing its charge.
+Restart admission uses the configured bounded queue without requiring every
+persisted job to fit at startup. The lifecycle implementation lives in
+`exports/lifecycle.rs` and `exports/scheduler.rs`; the existing ZIP64/TAR writer
+remains in `exports/builder.rs`.
+
 The following sections describe the storage design. Current incomplete product
 work is listed only in [the completion checklist](docs/RC2-IMPLEMENTATION.md);
 verification evidence belongs in [TESTING.md](TESTING.md). This is not a release
@@ -577,7 +587,10 @@ ordinary startup never adopts an empty replacement. The Rust physical witness
 tests this path with original keys and purged-key absence.
 
 Explicit offline `pool replace --authorize` rebuilds one configured blank slot
-from all surviving peers while retaining the immutable member map. It uses the
+from at least K validated surviving peers while retaining the immutable member
+map. Multiple losses within parity are replaced one authorized slot at a time;
+other absent or unregistered roots remain unavailable until their replacements.
+An offline command never enrolls another blank target implicitly. It uses the
 same control/root leases, operation-bound fence, expected inventory and final
 synchronization as the retained maintenance workflow. Stripe memory is bounded
 by the configured budget. Healthy peers are never rewritten. Completed payload

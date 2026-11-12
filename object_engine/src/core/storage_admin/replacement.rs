@@ -32,11 +32,12 @@ pub(super) async fn replace(
     if pool
         .members
         .iter()
-        .enumerate()
-        .any(|(s, m)| s != slot && m.is_none())
+        .filter(|member| member.is_some())
+        .count()
+        < usize::from(pool.layout.data_shards)
     {
         return Err(invalid(
-            "single-member replacement requires every surviving peer",
+            "replacement requires at least K surviving enrolled members",
         ));
     }
     if working_bytes(pool) > config.operation_memory_bytes {
@@ -509,6 +510,145 @@ mod tests {
     }
     fn pool(f: &Fixture, c: &Config, slot: usize) -> Pool {
         Pool::survivors_fixture(f.layout.clone(), &c.pools[0].roots, slot).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_lost_members_are_replaced_from_the_surviving_two_member_quorum() {
+        replace_two_lost_members(false).await;
+    }
+
+    #[tokio::test]
+    async fn two_connected_blank_replacements_do_not_enroll_an_unauthorized_peer() {
+        replace_two_lost_members(true).await;
+    }
+
+    async fn replace_two_lost_members(blank_peers: bool) {
+        let mut f = Fixture::new();
+        f.layout.data_shards = 2;
+        f.layout.parity_shards = 2;
+        let store = f.enroll();
+        let bytes = (0..37001).map(|i| (i * 71 % 251) as u8).collect::<Vec<_>>();
+        let live = put(&store, &bytes).await;
+        let empty = put(&store, &[]).await;
+        let pending = store
+            .init(SCOPE, 0, 49152, 16384, Durability::Durable, 3600)
+            .await
+            .unwrap();
+        store
+            .write_part(
+                SCOPE,
+                pending.object_key.clone(),
+                1,
+                std::io::Cursor::new(vec![41; 16384]),
+            )
+            .await
+            .unwrap();
+        let targets = [f.base.join("replacement-0"), f.base.join("replacement-1")];
+        let mut c = config(&f, identities(&store), &targets[0], 0);
+        c.ensure_state_root().unwrap();
+        let mut unchanged = Vec::new();
+        for member in store.pools[0].members[2..].iter().flatten() {
+            for entry in walk(&member.path) {
+                let entry = entry.unwrap();
+                if entry.file_type().is_file() {
+                    unchanged.push((
+                        entry.path().to_owned(),
+                        entry.metadata().unwrap().ino(),
+                        digest(entry.path()).unwrap(),
+                    ));
+                }
+            }
+        }
+        drop(store);
+        for slot in 0..2 {
+            fs::rename(&f.paths[slot], f.base.join(format!("lost-{slot}"))).unwrap();
+        }
+        if blank_peers {
+            for (slot, target) in targets.iter().enumerate() {
+                fs::create_dir(target).unwrap();
+                c.pools[0].roots[slot] = target.clone();
+            }
+            // Ordinary startup must still reject unregistered roots.
+            assert!(Pool::reopen_fixture(f.layout.clone(), &c.pools[0].roots).is_err());
+            // A present but corrupt marker is never treated as a blank peer.
+            fs::write(targets[1].join(".n1-arc-pool.json"), b"foreign-marker").unwrap();
+            assert!(Pool::survivors_fixture(f.layout.clone(), &c.pools[0].roots, 0).is_err());
+            fs::remove_file(targets[1].join(".n1-arc-pool.json")).unwrap();
+        }
+        let withheld = f.base.join("third-loss");
+        fs::rename(&f.paths[2], &withheld).unwrap();
+        assert!(Pool::survivors_fixture(f.layout.clone(), &c.pools[0].roots, 0).is_err());
+        assert!(!targets[0].join(".n1-arc-pool.json").exists());
+        fs::rename(withheld, &f.paths[2]).unwrap();
+        for (slot, target) in targets.iter().enumerate() {
+            // Only the selected target is enrolled by each authorized command.
+            // The other lost slot remains unavailable until its own replacement.
+            if !blank_peers {
+                fs::create_dir(target).unwrap();
+            }
+            c.pools[0].roots[slot] = target.clone();
+            let survivors = pool(&f, &c, slot);
+            let mut report = Report::default();
+            replace(&c, &c.pools[0], &survivors, slot, false, false, &mut report)
+                .await
+                .unwrap();
+            assert_eq!(report.reconstructed_shards, 3);
+            assert!(!target.join(RESTORE_PENDING).exists());
+            if blank_peers && slot == 0 {
+                assert_eq!(fs::read_dir(&targets[1]).unwrap().count(), 0);
+            }
+        }
+        for (path, inode, hash) in unchanged {
+            assert_eq!(path.metadata().unwrap().ino(), inode);
+            assert_eq!(digest(&path).unwrap(), hash);
+        }
+        let recovered = Store::new(
+            vec![Pool::reopen_fixture(f.layout.clone(), &c.pools[0].roots).unwrap()],
+            [17; 32],
+            16,
+        )
+        .unwrap();
+        for (key, expected) in [(live.object_key, bytes), (empty.object_key, Vec::new())] {
+            assert_eq!(
+                recovered
+                    .download(SCOPE, key, 0, None, Vec::new())
+                    .await
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
+        assert_eq!(
+            recovered
+                .upload_status(SCOPE, pending.object_key.clone(), 0, 16)
+                .await
+                .unwrap()
+                .missing_parts,
+            vec![0, 2]
+        );
+        for part in [0, 2] {
+            recovered
+                .write_part(
+                    SCOPE,
+                    pending.object_key.clone(),
+                    part,
+                    std::io::Cursor::new(vec![41; 16384]),
+                )
+                .await
+                .unwrap();
+        }
+        recovered
+            .finalize(SCOPE, pending.object_key.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .download(SCOPE, pending.object_key, 0, None, Vec::new())
+                .await
+                .unwrap()
+                .0,
+            vec![41; 49152]
+        );
     }
 
     #[tokio::test]

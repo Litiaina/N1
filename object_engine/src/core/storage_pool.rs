@@ -275,7 +275,8 @@ impl Pool {
         Self::open_selected(layout, paths, independent, None)
     }
 
-    /// Explicit offline replacement omits exactly the authorized logical slot.
+    /// Explicit offline replacement omits the authorized logical slot. Other
+    /// roots without a marker remain unavailable, never enrolled or written.
     /// Ordinary startup always validates every configured path it can open.
     pub(crate) fn open_survivors(
         layout: PoolLayout,
@@ -325,12 +326,22 @@ impl Pool {
                 Err(rustix::io::Errno::NOENT) => {}
                 Err(e) => return Err(e.into()),
             }
-            let mut marker_file = File::from(rfs::openat(
+            let mut marker_file = match rfs::openat(
                 &root,
                 MARKER,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                 Mode::empty(),
-            )?);
+            ) {
+                Ok(file) => File::from(file),
+                // Several lost members may already have blank replacement
+                // disks connected. Only the selected target may be enrolled;
+                // require K validated peers below and leave other roots alone.
+                Err(rustix::io::Errno::NOENT) if replacing.is_some() => {
+                    members.push(None);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if !marker_file.metadata()?.is_file() || marker_file.metadata()?.len() > 65536 {
                 return Err(Error::Invalid("invalid pool marker file".into()));
             }

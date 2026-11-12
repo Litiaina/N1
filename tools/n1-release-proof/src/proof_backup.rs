@@ -201,7 +201,15 @@ impl Proof {
             let child=Command::new(&self.args.binary).args(["backup","serve","--config"]).arg(&receiver_config).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).process_group(0).spawn()?;
             let guard=BackupReceiverGuard(child);
             let deadline=Instant::now()+Duration::from_secs(30);
-            loop { if std::net::TcpStream::connect(http).is_ok() {break;} if Instant::now()>deadline {return Err("owned backup receiver did not start".into());} std::thread::sleep(Duration::from_millis(20)); }
+            loop {
+                if std::net::TcpStream::connect(http).is_ok() {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    return Err("owned backup receiver did not start".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Some(guard)
         } else { None };
         self.start_server("backup-source").await?;

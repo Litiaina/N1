@@ -2,9 +2,11 @@
 //! its immutable-version reader now uses metadata and the native object client.
 pub(crate) mod archive;
 mod builder;
+mod lifecycle;
 mod manifest;
 mod models;
 pub(crate) mod routes;
+mod scheduler;
 mod source;
 pub(crate) mod store;
 use serde::{Deserialize, Serialize};

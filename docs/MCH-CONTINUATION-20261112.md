@@ -1,0 +1,174 @@
+# MCH qualification continuation — November 12, 2026
+
+**Original campaign continuation only; RC.2 remains unreleased.** Completed
+population, post-restart readback and both full member-loss readbacks now pass
+within their recorded scope. Only expiry cleanup and final censuses remain.
+No fresh population, commit, push, tag or
+release is authorized by this continuation.
+
+## Placement and preservation
+
+The new private MCH root is `/mnt/DISK0/n1-rc2-continuation-20261112-01`.
+Source, compiled helpers, imported evidence and a recovered copy of the stopped
+M1 database are on its SATA XFS HDD. Rust 1.92 builds use the previous campaign's
+task-local Cargo cache, target and vendored dependencies. Installed services,
+global toolchains and existing campaigns are untouched.
+
+The portable checkpoint remains unchanged at
+`/home/altear/DEV_TEST/n1-m1-rc2-preserved-20261112.PLPlQD`. MCH received its frozen
+source, original ACK journals, endpoint identity, reports and compressed M1
+database. All four database files match the original stopped-file SHA-256
+manifest before opening. The original compressed import remains intact.
+
+Both original USB XFS HDDs were mounted by the operator on the workstation.
+Their UUIDs were verified against the preserved checkpoint. N1 served the
+original local shards with member 1 detached for the remaining loss readback;
+the original directory is now restored. No data, marker or
+LINK identity was regenerated. New local evidence lives at
+`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01`.
+
+## Retrieved completed MCH results
+
+The previous run, `/mnt/DISK0/n1-rc2-mch-20261111-01`, completed before the
+operator left its network. Its final markers and raw reports now confirm:
+
+- 21 selected real-service checks passed, including four export lifecycle and
+  cleanup-error cases.
+- The 4,096-object M1 → N1 campaign passed crash/reopen, every original payload
+  and version, and exact metadata/physical census: 8,192 shards, no unfinished
+  publication, staging or unreferenced shard.
+- Native storage regression passed 19 cases with zero failures and one
+  parent-invoked child-helper exclusion. Documentation checks succeeded with
+  no runnable examples.
+- The eight-phase same-database/same-N1 export screen completed. Its mean
+  upload sums are 12.142 s baseline and 11.863 s candidate; rename is 3.536 /
+  3.535 s and trash 3.450 / 3.505 s. M1 CPU is 0.720 / 0.730 s per phase.
+  Each phase contains 100 objects. Broader performance acceptance remains open;
+  these results do not replace the earlier failed screens or native-M1 CPU gate.
+
+Detailed measurements and frozen executable hashes remain in the
+[November 11 handover](RC2-HANDOVER-20261111.md).
+
+## Original million-object continuation
+
+The recovered M1 copy passes the explicit full database integrity check:
+**7,001,423 records**, with 4,673,335,380 reported disk bytes. This checks the
+native database structure and records; it is separate from object readback.
+Evidence is `reports/home-million-integrity.json` and its GNU-time report.
+
+The first strict metadata census rejected unfinished publication intents after
+finding the original million acknowledged versions. The original failure log
+and generated reference list are retained; that list is marked unaccepted.
+Diagnostics identify **192 incomplete, unacknowledged attempts**, all for indices
+500,672–501,055 around the midpoint crash. None is completed or matches its
+logical entry's acknowledged version. Their actual stored expiries are
+November 12, **21:49:23–21:49:32 Asia/Manila**. A zero-pending census cannot pass
+before their lifecycle completes. These expiries and the real clock must be
+preserved. Final census must follow normal configured lifecycle reclamation;
+no incomplete census is counted as a pass.
+
+The remaining member-1-loss readback **passed on November 12 at approximately
+13:37 Asia/Manila**: **1,000,000 objects**, **13,968,125,000 bytes**, **zero
+payload mismatches** and **zero version mismatches**. Verification took
+**11,757.437 seconds / 3 h 15 min 57 s**. The verifier and local loss-fixture
+controller both exited 0, the original ACK hashes stayed unchanged, and the
+original member directory was restored. The task-owned N1 and M1 services are
+stopped while the final-stage controller waits for actual TTL expiry.
+
+`original-member-1-only/PASSED.json` has SHA-256
+`aef7111641de2e1527bbb994e2e93e3d11a8b66e4a78c67d86aeca4a3f3661c5`;
+the preserved local copy matches MCH. This is completion of the interrupted
+phase against original data, not a new population or a matched performance
+comparison. Final cleanup is scheduled no earlier than **21:52:32 Asia/Manila**
+(three minutes after the latest recorded intent expiry). No final-census pass
+is claimed yet.
+
+The interrupted second member-loss readback ran again from zero against
+all original ACKs. A read-only Rust helper reuses the existing payload/version
+oracle while allowing a recorded API-address change. It checks the original
+endpoint digest against the frozen campaign, refuses changes to identity or
+credentials, hashes ACK journals before/after, never provisions a fragment and
+never uploads an object. It records the rebuilt verifier separately instead of
+editing the frozen campaign's executable binding. Its provenance regression
+passes on MCH, as does strict release-profile Clippy. This verifies the same
+original million identities. The earlier 720,000 counter has no per-index
+checkpoint, so the interrupted phase started its readback at zero. No completed
+readback phase is repeated.
+
+N1 uses its exact original executable and the original two HDDs on the
+workstation. M1 uses the byte-verified preserved database on MCH with the
+same-source MCH executable: the original home executable requires newer glibc.
+The changed host, compiler, binary hash and API address are recorded separately.
+N1 listens at `192.168.0.40`; M1 verifies its leaf against the original CA.
+Original credentials, ACKs, versions and LINK identity remain unchanged.
+
+Current evidence is `reports/ORIGINAL-ONLY-STATUS`,
+`original-member-1-only.log`, `original-member-1-only.time` and
+`original-member-1-only/{prepared,PASSED,FAILED}.json` on MCH. A pass requires the
+full count, bytes and version checks, plus unchanged ACK hashes. The first
+local launcher requested a descriptor limit above the host's hard limit; no
+verifier ran in that attempt. Its log and the remote startup timeout are
+preserved. The corrected launcher respects the existing hard limit.
+
+The detached local `evidence/finish-original-only.sh` preserved the verifier's
+reports and returned the original member directory. It now waits for the
+actual intent TTL, then runs normal configured GC with both
+original members present, and stops the services for the final metadata and
+physical censuses. It performs no further payload-readback pass. A census
+failure stops this sequence with its evidence intact; completion requires all
+remaining witnesses to succeed. Local status is
+`reports/ORIGINAL-FINAL-STAGES-STATUS`; terminal success is
+`reports/ORIGINAL-CAMPAIGN-COMPLETED`, not a release marker.
+
+## Extra campaigns stopped after scope correction
+
+Additional populations were started in error instead of continuing only the
+preserved campaign. The operator explicitly rejected this work. The extra
+controllers, their queued successors and the bulk shard-copy processes are
+stopped. Their partial evidence is retained; none is a completed million-object
+result or a prerequisite for finishing the original campaign.
+
+The native scale helper retains the existing bounded workers, intent/ACK
+journals, deterministic bytes, SHA-256 readback and process-crash logic. Its
+test-only CLI now accepts selected independent filesystems and `--objects N`,
+instead of binding qualification to obsolete workstation mount paths. It
+refuses the system filesystem; this test bound is not an object-engine limit.
+
+The first 4,099-object native attempt hit `EMFILE` after 1,024 ACKs: the launcher
+inherited SSH's soft descriptor limit of 1,024 instead of the packaged N1
+service's 1,048,576. Its error, fixture and ACKs are retained. With the packaged
+limit applied only to the task process, the same frozen engine/client resumed
+that fixture, preserved all prior ACKs and verified all 4,099 original identities
+after SIGKILL. The separate physical interruption/corruption witness also passed,
+including refusal to overwrite damaged acknowledged data and byte-exact journal
+preservation. No engine code changed to obtain these results.
+
+The current Console source and dependencies were frozen from commit
+`89fd5b9e7f41cab7df418e39048ee6b43506835c`, including its existing working changes,
+and freshly built on MCH. No Console implementation was edited. Node 22.23.3
+and the already available Chromium 149.0.7827.55 runtime are task-scoped;
+no system package or deployed service changed. The real production Console
+preflight passed **128 ACKs**, both-service SIGKILL/reopen, all original payloads
+and versions, and exact census: **256 shards**, zero staging, unreferenced
+shards or pending publication. It used 1,787,920 logical bytes and one real
+batch request; its browser report has zero failed/unknown/scanner results and
+zero retained upload items on completion. This is a preflight, not a million
+pass or a physical million-entry directory traversal.
+
+| Extra stage | Preserved state after operator correction |
+| --- | --- |
+| Standalone N1 | Stopped around 120,320 ACKs. Partial population and journals retained; not a million pass. |
+| Bulk original-shard copy | Stopped with partial archives. No complete-transfer claim. Original local HDDs remain the continuation target. |
+| Fresh MCH M1 → N1 | Queued controller stopped; do not start a replacement population. |
+| Original Console → M1 → N1 | 128-object preflight passed. Queued million campaign stopped. |
+| Additional post-GC million readback | Queued controller stopped. Do not repeat completed readbacks. |
+
+Historical `STANDALONE-*`, `ORIGINAL-CONTINUATION-*`, `OWNED-MILLION-*`,
+`CONSOLE-CAMPAIGN-*`, `POST-GC-READBACK-*` and archived
+`CURRENT.stopped-extra-campaigns.json` describe those stopped controllers.
+The replacement `CURRENT.json` identifies only the original continuation and
+links its live progress/status files. The scope
+correction is retained in `OPERATOR-SCOPE-CORRECTION`; operator termination is
+not an engine failure. Partial archives do not replace original data. Process
+termination and unavailable directories do not establish physical host
+power-loss resilience.

@@ -535,6 +535,7 @@ pub(super) async fn persist_archive_chunks<R: AsyncRead + Unpin>(
     roots: Vec<PathBuf>,
     config: ExportConfig,
     progress: Arc<ActiveProgress>,
+    max_artifact_bytes: u64,
 ) -> Result<BuiltArtifact, AppError> {
     let roots = Arc::new(roots);
     let plan = export_buffer_plan(&config, roots.len());
@@ -547,41 +548,61 @@ pub(super) async fn persist_archive_chunks<R: AsyncRead + Unpin>(
     let mut index = 0_u64;
     let mut total_size = 0_u64;
 
-    loop {
-        progress.ensure_running()?;
-        while tasks.len() >= plan.artifact_write_concurrency {
-            collect_chunk_result(&mut tasks, &mut completed_chunks, &progress).await?;
-        }
-        let mut chunk = BytesMut::with_capacity(plan.artifact_chunk_size_bytes);
-        while chunk.len() < plan.artifact_chunk_size_bytes {
-            let prior_len = chunk.len();
-            let read = reader.read_buf(&mut chunk).await.map_err(|error| {
-                AppError::Io(error, "read generated export archive".to_string())
-            })?;
-            if read == 0 {
+    let produced = async {
+        loop {
+            progress.ensure_running()?;
+            while tasks.len() >= plan.artifact_write_concurrency {
+                collect_chunk_result(&mut tasks, &mut completed_chunks, &progress).await?;
+            }
+            let mut chunk = BytesMut::with_capacity(plan.artifact_chunk_size_bytes);
+            while chunk.len() < plan.artifact_chunk_size_bytes {
+                let prior_len = chunk.len();
+                let read = reader.read_buf(&mut chunk).await.map_err(|error| {
+                    AppError::Io(error, "read generated export archive".to_string())
+                })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&chunk[prior_len..prior_len + read]);
+                total_size = total_size.saturating_add(read as u64);
+                if max_artifact_bytes != 0 && total_size > max_artifact_bytes {
+                    return Err(AppError::ServiceUnavailable(
+                        "Export artifact exceeds its reserved capacity".into(),
+                    ));
+                }
+            }
+            if chunk.is_empty() {
                 break;
             }
-            hasher.update(&chunk[prior_len..prior_len + read]);
-            total_size = total_size.saturating_add(read as u64);
+            let task_roots = Arc::clone(&roots);
+            let task_id = id.clone();
+            let root_index = (start_root + index as usize) % roots.len();
+            tasks.spawn(write_chunk_with_failover(
+                task_id,
+                index,
+                chunk.freeze(),
+                task_roots,
+                root_index,
+            ));
+            index = index.saturating_add(1);
         }
-        if chunk.is_empty() {
-            break;
-        }
-        let task_roots = Arc::clone(&roots);
-        let task_id = id.clone();
-        let root_index = (start_root + index as usize) % roots.len();
-        tasks.spawn(write_chunk_with_failover(
-            task_id,
-            index,
-            chunk.freeze(),
-            task_roots,
-            root_index,
-        ));
-        index = index.saturating_add(1);
+        Ok::<(), AppError>(())
     }
+    .await;
 
+    // Already-issued filesystem work must settle before its directory can be
+    // reclaimed. Dropping/aborting these tasks can leave blocking I/O running
+    // after cancellation and recreate files behind the cleanup worker.
+    let mut failure = produced.err();
     while !tasks.is_empty() {
-        collect_chunk_result(&mut tasks, &mut completed_chunks, &progress).await?;
+        if let Err(error) = collect_chunk_result(&mut tasks, &mut completed_chunks, &progress).await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     completed_chunks.sort_by_key(|(index, _, _, _)| *index);
     let mut logical_offset = 0_u64;
@@ -618,8 +639,13 @@ pub(super) async fn build_artifact(
     roots: Vec<PathBuf>,
     config: &ExportConfig,
     progress: Arc<ActiveProgress>,
+    max_artifact_bytes: u64,
 ) -> Result<BuiltArtifact, AppError> {
-    cleanup_artifact_chunks(id).await;
+    super::lifecycle::cleanup_chunks(id)
+        .await
+        .map_err(|error| {
+            AppError::InternalServerError(format!("export artifact cleanup failed: {error}"))
+        })?;
     let manifest_path = manifest_path(id)?;
     let format_overhead_bytes = if format == "zip" {
         let manifest_bytes = fs::metadata(&manifest_path)
@@ -658,7 +684,15 @@ pub(super) async fn build_artifact(
     sink_config.artifact_write_concurrency = plan.artifact_write_concurrency;
     let sink_progress = Arc::clone(&progress);
     let sink = tokio::spawn(async move {
-        persist_archive_chunks(reader, sink_id, roots, sink_config, sink_progress).await
+        persist_archive_chunks(
+            reader,
+            sink_id,
+            roots,
+            sink_config,
+            sink_progress,
+            max_artifact_bytes,
+        )
+        .await
     });
 
     let build_result = match format {

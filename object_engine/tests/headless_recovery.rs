@@ -21,6 +21,8 @@ static ENGINE: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_litiaina-n1")))
 });
+#[path = "headless_recovery/four_members.rs"]
+mod four_members;
 #[path = "headless_recovery/upgrade.rs"]
 mod upgrade;
 

@@ -87,8 +87,9 @@ pub(crate) async fn create(
         chunks: Vec::new(),
         error: None,
     };
-    store::save(record.clone()).await?;
-    if let Err(error) = store::enqueue(record.clone()).await {
+    let permit = store::admit()?;
+    store::insert(record.clone()).await?;
+    if let Err(error) = store::enqueue_admitted(record.clone(), permit) {
         let mut failed = record;
         failed.phase = ExportPhase::Failed;
         failed.error = Some(error.to_string());
@@ -135,7 +136,7 @@ pub(crate) async fn cancel(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let claims = auth::authorize(&app, &headers, "read").await?;
-    let mut record = store::load(&id).await?;
+    let record = store::load(&id).await?;
     check_record(&record, &claims)?;
     if let Some(progress) = store::context()
         .jobs
@@ -145,8 +146,7 @@ pub(crate) async fn cancel(
     {
         progress.cancel.store(true, Ordering::Release);
     }
-    record.phase = ExportPhase::Cancelled;
-    store::save(record).await?;
+    store::cancel(id.clone()).await?;
     Ok(Json(json!({"export_id":id,"phase":"cancelled"})))
 }
 pub(crate) async fn download(
@@ -160,6 +160,7 @@ pub(crate) async fn download(
     stream(record, headers).await
 }
 async fn stream(record: PersistedExport, headers: HeaderMap) -> ApiResult<Response> {
+    let (record, lease) = super::lifecycle::lease(&record.id).await?;
     if record.phase != ExportPhase::Ready {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -189,16 +190,10 @@ async fn stream(record: PersistedExport, headers: HeaderMap) -> ApiResult<Respon
     } else {
         (0, total)
     };
-    let permit = store::context()
-        .downloads
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::invalid("export downloads closed"))?;
     let chunks = record.chunks;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     tokio::spawn(async move {
-        let _permit = permit;
+        let _lease = lease;
         let result = async {
             for chunk in chunks {
                 let start = offset.max(chunk.logical_offset);

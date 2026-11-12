@@ -295,6 +295,9 @@ async fn run(args: Args) -> Result<()> {
         tokio::task::spawn_blocking(move || inventory::census(&config, &alias, &mode, count))
             .await??;
     stack.restart().await?;
+    // Reauthenticate against the recovered namespace without provisioning a
+    // fragment. Verification must not recreate state lost during the crash.
+    let api = workload::Api::attach(&stack.config, prefix).await?;
     let verification =
         workload::verify(api.clone(), &args.root, args.count, args.readers, prefix).await?;
     monitor_stop.cancel();

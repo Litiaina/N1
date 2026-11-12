@@ -24,6 +24,10 @@ mod crash_matrix;
 mod device_cycle;
 #[path = "noa_service/diagnostic_load.rs"]
 mod diagnostic_load;
+#[path = "noa_service/export_lifecycle.rs"]
+mod export_lifecycle;
+#[path = "noa_service/export_performance.rs"]
+mod export_performance;
 #[path = "noa_service/maintenance.rs"]
 mod maintenance;
 #[path = "noa_service/monitoring.rs"]
@@ -269,8 +273,11 @@ impl Stack {
         let binary = std::env::var_os("M1_TEST_BINARY")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_litiaina-m1")));
+        self.start_metadata_binary(&binary, environment).await;
+    }
+    async fn start_metadata_binary(&mut self, binary: &Path, environment: &[(&str, &str)]) {
         self.metadata = Some(spawn_with_env(
-            &binary,
+            binary,
             &["serve"],
             &self.root,
             "metadata.log",

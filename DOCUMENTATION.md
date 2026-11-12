@@ -44,6 +44,12 @@ Configure metadata as shown in the next section and run:
 
 `litiaina-m1 serve --config /etc/litiaina/metadata/m1_config.ini`
 
+A manual launch inherits its shell's file-descriptor limits. The packaged N1
+systemd service sets `LimitNOFILE=1048576`; a shell qualification using the same
+concurrent batch profile should use that limit too. Where its hard limit allows,
+`ulimit -Sn 1048576` applies it to the current shell and its children without
+changing system-wide settings.
+
 Point the original Console at metadata's HTTPS address, not at LINK's internal
 object listener. Use certificates valid for the actual client/server names.
 `n1s://` verifies TLS for native connections as well.

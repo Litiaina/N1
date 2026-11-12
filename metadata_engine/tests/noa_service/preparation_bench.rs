@@ -5,7 +5,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
-fn resources(pid: u32) -> Value {
+pub(super) fn resources(pid: u32) -> Value {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let kib = |key: &str| {
         status
@@ -31,7 +31,7 @@ fn resources(pid: u32) -> Value {
         "rss_kib":kib("VmRSS:"),"peak_rss_kib":kib("VmHWM:")})
 }
 
-fn distribution(mut samples: Vec<f64>) -> Value {
+pub(super) fn distribution(mut samples: Vec<f64>) -> Value {
     let completion_order_ms = samples.clone();
     samples.sort_by(f64::total_cmp);
     let percentile = |p: f64| samples[(samples.len() as f64 * p).ceil() as usize - 1];
@@ -56,6 +56,10 @@ async fn matched_named_upload_read_and_mutation_measurement() {
         std::env::var_os("N1_PREPARATION_BENCH_OUTPUT").expect("explicit benchmark output"),
     );
     assert!(!output.exists(), "never overwrite a measurement");
+    let small_objects = std::env::var("N1_PREPARATION_BENCH_SMALL_OBJECTS")
+        .map(|value| value.parse::<usize>().expect("valid small object count"))
+        .unwrap_or(100);
+    assert!((1..=10000).contains(&small_objects));
     let mut stack = Stack::with_block_bytes(262144).await;
     let object_config: Value =
         serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
@@ -91,7 +95,7 @@ async fn matched_named_upload_read_and_mutation_measurement() {
     let metadata_first = resources(stack.metadata.as_ref().unwrap().0.id());
     let started = Instant::now();
     let mut upload = Vec::new();
-    for index in 0..100 {
+    for index in 0..small_objects {
         let now = Instant::now();
         json_response(
             client
@@ -109,7 +113,7 @@ async fn matched_named_upload_read_and_mutation_measurement() {
         upload.push(now.elapsed().as_secs_f64() * 1000.0);
     }
     let mut read = Vec::new();
-    for index in 0..100 {
+    for index in 0..small_objects {
         let now = Instant::now();
         let response = client
             .get(format!("{base}/objects/get/small-{index:03}.bin"))
@@ -204,7 +208,7 @@ async fn matched_named_upload_read_and_mutation_measurement() {
     let download_seconds = now.elapsed().as_secs_f64();
     let mut rename = Vec::new();
     let mut trash = Vec::new();
-    for index in 0..100 {
+    for index in 0..small_objects {
         let now = Instant::now();
         json_response(client.post(format!("{base}/objects/rename")).bearer_auth(&token)
             .json(&json!({"source_key":format!("small-{index:03}.bin"),"destination_key":format!("renamed-{index:03}.bin")}))
@@ -224,7 +228,7 @@ async fn matched_named_upload_read_and_mutation_measurement() {
         trash.push(now.elapsed().as_secs_f64() * 1000.0);
     }
     let result = json!({"fixture":stack.root,"block_bytes":262144,"ec":ec,"rate_limiting_configured":true,
-        "accel_configured":false,"small_bytes":4096,"small_objects":100,"large_bytes":PARTS*PART_BYTES as u64,
+        "accel_configured":false,"small_bytes":4096,"small_objects":small_objects,"large_bytes":PARTS*PART_BYTES as u64,
         "part_bytes":PART_BYTES,"part_concurrency":4,"wall_seconds":started.elapsed().as_secs_f64(),
         "small_upload":distribution(upload),"small_get":distribution(read),"rename":distribution(rename),"trash":distribution(trash),
         "large":{"upload_seconds":upload_seconds,"download_seconds":download_seconds,"init_ms":init_ms,"finalize_ms":finalize_ms,"parts":distribution(part_samples),"sha256_verified":true},

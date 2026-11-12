@@ -151,28 +151,23 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     if args.get(1).is_some_and(|v| v == "--scale-test-resume") {
         return resume::self_test(args).await;
     }
-    if cfg!(debug_assertions) || args.len() != 5 {
+    if cfg!(debug_assertions) || ![5, 7].contains(&args.len()) {
         return Err(
-            "usage (release client): rc2_bench --scale[‑smoke] engine PROJECT-parent TEST-parent"
+            "usage (release client): rc2_bench --scale[‑smoke] engine first-HDD-parent second-HDD-parent [--objects N]"
                 .into(),
         );
     }
     let binary = PathBuf::from(&args[2]).canonicalize()?;
     let project = PathBuf::from(&args[3]).canonicalize()?;
     let test = PathBuf::from(&args[4]).canonicalize()?;
-    if project != Path::new("/mnt/PROJECT-DISK-1TB")
-        || test != Path::new("/media/altear/TEST-1TB/mx-tests")
-        || project.metadata()?.dev() == test.metadata()?.dev()
-    {
-        return Err(
-            "scale witness requires the explicitly selected two independent HDD parents".into(),
-        );
-    }
-    let count = if args[1] == "--scale-smoke" {
-        4099
-    } else {
-        500_000
+    validate_parents(&project, &test)?;
+    let count = match (args[1].as_str(), args.get(5), args.get(6)) {
+        ("--scale-smoke", None, None) => 4099,
+        ("--scale", None, None) => 500_000,
+        ("--scale", Some(flag), Some(value)) if flag == "--objects" => value.parse()?,
+        _ => return Err("--objects is supported only by --scale".into()),
     };
+    validate_count(count)?;
     let name = format!(
         "n1-scale-{count}-{}-{}",
         std::process::id(),
@@ -192,6 +187,29 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         )?;
     }
     result
+}
+
+fn validate_count(count: u64) -> Result<()> {
+    if !(1..=10_000_000).contains(&count) {
+        return Err("scale count must be between 1 and 10000000".into());
+    }
+    Ok(())
+}
+
+fn validate_parents(first: &Path, second: &Path) -> Result<()> {
+    let system_device = Path::new("/").metadata()?.dev();
+    if !first.is_dir()
+        || !second.is_dir()
+        || first.metadata()?.dev() == second.metadata()?.dev()
+        || [first, second]
+            .iter()
+            .any(|path| path.metadata().is_ok_and(|m| m.dev() == system_device))
+    {
+        return Err(
+            "scale requires two selected independent filesystems outside the system disk".into(),
+        );
+    }
+    Ok(())
 }
 
 async fn execute(binary: &Path, a: &Path, b: &Path, count: u64) -> Result<()> {

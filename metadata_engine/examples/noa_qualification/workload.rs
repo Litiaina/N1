@@ -38,6 +38,12 @@ pub struct Api {
 }
 impl Api {
     pub async fn open(config: &Config, mode: &str) -> Result<Self> {
+        Self::connect(config, mode, true).await
+    }
+    pub async fn attach(config: &Config, mode: &str) -> Result<Self> {
+        Self::connect(config, mode, false).await
+    }
+    async fn connect(config: &Config, mode: &str, create_fragment: bool) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             // Reqwest 0.12 defaults TCP_USER_TIMEOUT to 30 seconds on Linux.
@@ -50,13 +56,15 @@ impl Api {
         let label = format!("N1 qualification {} {mode}", config.identity);
         use sha2::Digest;
         let fragment = hex::encode(sha2::Sha256::digest(label.as_bytes()));
-        let created = client
-            .post(format!("{}/noa/v1/fragments", config.url))
-            .json(&json!({"name":label,"secret":config.master,"key":config.fragment_secret}))
-            .send()
-            .await?;
-        if created.status() != 201 && created.status() != 409 {
-            return Err(format!("fragment provisioning returned {}", created.status()).into());
+        if create_fragment {
+            let created = client
+                .post(format!("{}/noa/v1/fragments", config.url))
+                .json(&json!({"name":label,"secret":config.master,"key":config.fragment_secret}))
+                .send()
+                .await?;
+            if created.status() != 201 && created.status() != 409 {
+                return Err(format!("fragment provisioning returned {}", created.status()).into());
+            }
         }
         let api = Self {
             client,

@@ -30,12 +30,11 @@ pub(super) async fn run(args: Vec<String>) -> Result<()> {
     }
     let binary = PathBuf::from(&args[2]).canonicalize()?;
     let root = PathBuf::from(&args[3]).canonicalize()?;
-    if root.parent() != Some(Path::new("/mnt/PROJECT-DISK-1TB"))
-        || !root
-            .file_name()
-            .is_some_and(|v| v.to_string_lossy().starts_with("n1-scale-"))
+    if !root
+        .file_name()
+        .is_some_and(|v| v.to_string_lossy().starts_with("n1-scale-"))
     {
-        return Err("resume requires a private scale fixture directly on PROJECT HDD".into());
+        return Err("resume requires a private n1-scale fixture".into());
     }
     let _lease = client_lease(&root)?;
     let original: Value = serde_json::from_reader(File::open(root.join("provenance.json"))?)?;
@@ -47,17 +46,17 @@ pub(super) async fn run(args: Vec<String>) -> Result<()> {
         return Err("resume engine/workload differs from original immutable campaign".into());
     }
     let count = original["objects"].as_u64().ok_or("missing object count")?;
-    if ![1027, 4099, 500_000].contains(&count) {
-        return Err("unknown scale fixture workload".into());
-    }
+    validate_count(count)?;
     let config = root.join("service.json");
     let configuration: Value = serde_json::from_reader(File::open(&config)?)?;
     let roots: Vec<PathBuf> = serde_json::from_value(configuration["pools"][0]["roots"].clone())?;
-    let second = Path::new("/media/altear/TEST-1TB/mx-tests")
-        .join(root.file_name().ok_or("invalid root")?)
-        .join("member-1");
-    if roots != [root.join("member-0"), second]
-        || roots[0].metadata()?.dev() == roots[1].metadata()?.dev()
+    if roots.len() != 2 {
+        return Err("resume requires exactly two enrolled members".into());
+    }
+    validate_parents(&roots[0], &roots[1])?;
+    if roots[0] != root.join("member-0")
+        || roots[1].file_name() != Some(std::ffi::OsStr::new("member-1"))
+        || roots[1].parent().and_then(Path::file_name) != root.file_name()
         || original["project_device"] != roots[0].metadata()?.dev()
         || original["test_device"] != roots[1].metadata()?.dev()
         || configuration["pools"][0]["layout"] != original["pool"]

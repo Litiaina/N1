@@ -1,3 +1,9 @@
+struct MultipartResumeSource<'a> {
+    path: &'a Path,
+    total_size: usize,
+    part_size: usize,
+}
+
 impl Proof {
     async fn run_multipart_resume_proof(&mut self) -> ProofResult<()> {
         self.validate()?;
@@ -52,7 +58,8 @@ impl Proof {
             )
             .await?;
         self.assert_list_contains(&native_key).await?;
-        self.assert_download_sha256(&native_key, &source_sha).await?;
+        self.assert_download_sha256(&native_key, &source_sha)
+            .await?;
         rss_samples.push(self.rss_sample("after_native_resume"));
 
         self.assert_health_clean("multipart_resume_final").await?;
@@ -124,9 +131,11 @@ impl Proof {
         let mut part_samples = self
             .http_upload_part_batches(
                 &init.version_id,
-                path,
-                total_size,
-                part_size,
+                MultipartResumeSource {
+                    path,
+                    total_size,
+                    part_size,
+                },
                 0,
                 restart_after_parts,
                 concurrency,
@@ -139,9 +148,11 @@ impl Proof {
         part_samples.extend(
             self.http_upload_part_batches(
                 &init.version_id,
-                path,
-                total_size,
-                part_size,
+                MultipartResumeSource {
+                    path,
+                    total_size,
+                    part_size,
+                },
                 restart_after_parts,
                 expected_parts,
                 concurrency,
@@ -195,13 +206,16 @@ impl Proof {
     async fn http_upload_part_batches(
         &self,
         version_id: &str,
-        path: &Path,
-        total_size: usize,
-        part_size: usize,
+        source: MultipartResumeSource<'_>,
         start_part: usize,
         end_part: usize,
         concurrency: usize,
     ) -> ProofResult<Vec<Value>> {
+        let MultipartResumeSource {
+            path,
+            total_size,
+            part_size,
+        } = source;
         let mut part_samples = Vec::new();
         for batch_start in (start_part..end_part).step_by(concurrency.max(1)) {
             let batch_end = (batch_start + concurrency.max(1)).min(end_part);
@@ -300,9 +314,11 @@ impl Proof {
         let mut part_samples = self
             .native_upload_part_batches(
                 &version_id,
-                path,
-                total_size,
-                part_size,
+                MultipartResumeSource {
+                    path,
+                    total_size,
+                    part_size,
+                },
                 0,
                 restart_after_parts,
                 concurrency,
@@ -316,9 +332,11 @@ impl Proof {
         part_samples.extend(
             self.native_upload_part_batches(
                 &version_id,
-                path,
-                total_size,
-                part_size,
+                MultipartResumeSource {
+                    path,
+                    total_size,
+                    part_size,
+                },
                 restart_after_parts,
                 expected_parts,
                 concurrency,
@@ -372,14 +390,17 @@ impl Proof {
     async fn native_upload_part_batches(
         &self,
         version_id: &str,
-        path: &Path,
-        total_size: usize,
-        part_size: usize,
+        source: MultipartResumeSource<'_>,
         start_part: usize,
         end_part: usize,
         concurrency: usize,
         label: &str,
     ) -> ProofResult<Vec<Value>> {
+        let MultipartResumeSource {
+            path,
+            total_size,
+            part_size,
+        } = source;
         let concurrency = concurrency.max(1);
         let mut streams = Vec::new();
         for slot in 0..concurrency {

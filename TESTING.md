@@ -33,6 +33,61 @@ in the current qualification campaigns. Keep data, logs and build output on the
 selected SSD/HDD/RAM locations for each profile; never put population fixtures
 on the source NVMe.
 
+## MCH RC.2 qualification — November 11, 2026
+
+The [current handover](docs/RC2-HANDOVER-20261111.md) records four SATA/XFS
+HDDs, frozen binaries, failures and remaining gates. N1 passes **201 library
+cases**, zero failed, two exclusions, plus physical 3+1/2+2 witnesses covering
+24 loss combinations, corruption/exact repair, beyond-parity refusal and one/
+two simultaneously connected blank replacements. The corrected encrypted
+backup/service-identity witness also passes. These faults use private member
+directories; they do not simulate host power loss.
+
+The current local workspace passes **378 default tests, zero failed**, with
+56 explicit opt-in/helper exclusions. Workspace strict Clippy and formatting
+pass. MCH's final export candidate passes **21 real-service cases**, including
+per-artifact cleanup error isolation. Retrieved on November 12, the controlled
+same-database screen, 4,096-object named crash/recovery/census and 19 native
+storage regressions also completed successfully. One parent-invoked storage
+helper is explicitly excluded. See the [MCH continuation](docs/MCH-CONTINUATION-20261112.md).
+Keep these results separate from the
+[home split-node qualification](docs/SPLIT-NODE-20261111.md): N1 on two local
+HDDs, M1 and its database on the main PC's DATA_SSD, with a real native TLS hop.
+That profile now passes its fresh 378-test workspace regression, actual
+both-process kills and complete 4,096-object readback, each member's loss,
+snapshot/database-loss recovery and a fresh 256-object physical-census
+preflight. Its owned-M1 million campaign was stopped by the operator on
+November 12: population, full post-restart readback and full member-0-loss
+readback passed; member-1-loss readback reached 720,000 reported checks before
+interruption. The November 12 continuation then **passed the complete original
+million-object member-1-loss readback**, 13,968,125,000 bytes, zero payload/version
+mismatches in 11,757.437 seconds, with unchanged original ACK hashes. Member 1
+is restored; final censuses await normal TTL cleanup. A portable
+source/evidence/database checkpoint is under `/home/altear/DEV_TEST`; see the
+handover for its exact path and restart constraints. The
+eight-phase export-feature screen records nearly equal M1 CPU but a 13.6%
+higher candidate upload mean with large per-phase variation; acceptance remains
+open. See that report for raw evidence and scope.
+
+The [November 12 continuation](docs/MCH-CONTINUATION-20261112.md) records the
+preserved million-object database's complete 7,001,423-record integrity pass,
+the native 4,099-object recovery and interruption/corruption resume witnesses,
+and an actual original-Console 128-object crash/recovery/census pass. Extra
+populations and their queued successors were stopped after the operator's scope
+correction. Only the original campaign's expiry cleanup and final censuses
+remain. The read-only helper has its own regression and
+strict Clippy checks. The 378-test workspace count above predates that helper.
+
+Performance acceptance remains open. Native M1 has lower mutation latency than
+Procyon on the completed HDD matrix but costs 50.7% more M1 CPU at 1,000 objects.
+The first export candidate's fresh-fixture screen regresses small upload sum
+by 14.1% with nearly equal M1 CPU. The controlled same-database follow-up does
+not reproduce a broad export-worker slowdown: upload sum is 2.3% lower, rename
+effectively unchanged and trash 1.6% higher; M1 CPU is 0.720 / 0.730 s per phase.
+These 100-object phases do not settle saturation or broader performance acceptance.
+Neither a functional pass nor these small populations establishes a new-core
+million-object or Console result. RC.2 remains unreleased.
+
 ## M1 owned-storage qualification — November 10–11, 2026
 
 M1 now uses its independently implemented `m1_storage` database. Its final local
