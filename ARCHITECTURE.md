@@ -200,6 +200,8 @@ announcement or a migration guide.
 | `metadata_engine/src/exports` | Retained bounded ZIP64/TAR builder, direct selected/manifest archive streaming, immutable source pins and M1 crash cleanup |
 | `metadata_engine/storage` | M1's own ordered tree, journal/recovery, optimistic transactions, cache and online checkpoints; see its module map |
 | `object_engine/src/core/upload.rs` | Normal/durable multipart lifecycle and shared batch barriers |
+| `object_engine/src/core/upload/publication.rs` | Joined namespace publication shared by normal, batch and multipart uploads |
+| `object_engine/src/core/store/progress.rs` | Bounded volatile part roots and incremental object-checksum prefix |
 | `object_engine/src/core/upload/activity.rs` | Owned operation lifetime, shutdown admission and control-lease retention |
 | `object_engine/src/core/download.rs` | Verified streamed/ranged reads and read-repair admission |
 | `object_engine/src/core/adaptive_concurrency.rs` | Original controller with cancellable service lifecycle |
@@ -343,9 +345,24 @@ At the first payload write the calculated shard length is established sparsely,
 after capacity admission. This prevents speculative allocation beyond EOF;
 holes remain missing frames, even though the logical length is already complete.
 
-Finalization validates completeness, writes seals, persists payload, moves staged
-files to calculated final paths with no replacement, and persists directory
-changes. Publication across separate filesystems is not a transaction. A lost
+Finalization consumes completion state, moves staged files to calculated final
+paths with no replacement, and persists the affected directories concurrently.
+It performs O(pool width) operations: no part traversal, payload reread, or
+whole-filesystem flush. Normal mode folds completed roots in memory and persists
+the sealed payload at finalize. Durable mode persists each part before recording
+completion; the last writer drains overlapping writes, checks its generation,
+then writes and persists an ordered completion flag/root inside the existing
+shard footer. Payload persistence precedes that proof. Finalize can read this
+fixed-size proof after cache eviction or restart. The seal remains under
+`.uploads` until explicit publication. Completed payload retries validate bytes
+without rewriting them. A surviving completion footer can restore a peer's
+missing footer because its ordering covers all members' payloads.
+Without a live successful-flush confirmation, finalize refreshes and persists
+the staged footer before publication; page-cache visibility cannot certify its
+own persistence after an earlier failed flush.
+Started member publication workers and their barrier finish even if a peer fails
+or the caller disappears; success requires every required persistence result.
+Publication across separate filesystems is not a transaction. A lost
 reply or crash between member moves can leave partial publication; retrying the
 same key completes that identity. Repeated finalization rechecks persistence.
 Enough matching finalized shards may already be readable after a lost reply.
@@ -360,9 +377,23 @@ before success. Batches are bounded by count, bytes and open shard descriptors.
 They are not all-or-nothing transactions across objects; clients resolve lost
 replies by retrying the same identities. There is no background commit queue.
 
-A bounded volatile cache accelerates recently completed part roots. Actual shard
-bytes remain recovery authority. Cache eviction or restart triggers validation;
-it does not lose upload identity or make incomplete parts complete.
+A bounded volatile cache folds the contiguous prefix of completed part roots
+into the object checksum during transfer. Finalization can finish from that
+prefix without rereading payloads or retaining every part root, including when
+the object exceeds 4,096 parts. Out-of-order roots and recently retained retry
+roots share a global limit of 262,144 records, with at most 1,024 cached uploads.
+Only the most recent 64 folded roots are retained per upload; their older
+checksum contributions stay in fixed-size SHA state. This also bounds the cache
+destruction work on successful finalize. Acknowledged-part retries validate
+bytes without rewriting them or discarding the prefix. Mutating writes
+invalidate affected completion state before touching payload.
+After normal-mode cache loss, clients explicitly reconcile paginated upload
+status or resume before finalizing. Finalize returns a conflict if no completion
+proof is available; it never silently scans the object. Status validates actual
+shard bytes and rebuilds the volatile prefix. Durable completed uploads use
+their ordered footer directly. Incomplete parts never become complete by size.
+Arbitrary out-of-order holes cannot grow memory without bound. These accelerators
+introduce no disk records, changes to shard layout or additional GC scan roots.
 
 ## Reads, health and repair
 

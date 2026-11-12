@@ -7,16 +7,16 @@ use n1_link::{Durability, Fingerprint, Identity, KeySigner, UploadPlan};
 use rand::{RngCore, rngs::OsRng};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fs::File,
     path::Path,
     sync::{Arc, Mutex, Weak, atomic::AtomicBool},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 
-pub(crate) const CACHE_UPLOADS: usize = 64;
-pub(crate) const CACHE_PARTS: usize = 4096;
+mod progress;
+use progress::ProgressCache;
 
 pub struct Store {
     pub(crate) activity: Arc<super::upload::activity::Activity>,
@@ -25,7 +25,7 @@ pub struct Store {
     pub pools: Vec<Arc<Pool>>,
     pub(crate) signer: KeySigner,
     registry: Arc<Mutex<HashMap<Fingerprint, Weak<ActiveObject>>>>,
-    pub(crate) progress: Mutex<HashMap<Fingerprint, Progress>>,
+    pub(crate) progress: Mutex<ProgressCache>,
     pub(crate) admission: Arc<Semaphore>,
     background_admission: Arc<Semaphore>,
     memory: Arc<Semaphore>,
@@ -104,13 +104,6 @@ impl Drop for Lease {
     }
 }
 
-pub(crate) struct Progress {
-    pub plan: UploadPlan,
-    pub roots: BTreeMap<u64, [u8; 32]>,
-    pub touched: Instant,
-    pub parents_persisted: bool,
-}
-
 #[derive(Debug, Serialize)]
 pub struct InitializedUpload {
     pub object_key: String,
@@ -141,6 +134,7 @@ pub struct UploadStatus {
 
 #[derive(Clone)]
 pub(crate) struct ShardFile {
+    pub completion_proof: bool,
     pub member: Arc<Member>,
     pub file: Arc<File>,
     pub header: ShardHeader,
@@ -197,7 +191,7 @@ impl Store {
             pools: pools.into_iter().map(Arc::new).collect(),
             signer: KeySigner::new(signing_secret),
             registry: Arc::new(Mutex::new(HashMap::new())),
-            progress: Mutex::new(HashMap::new()),
+            progress: Mutex::new(ProgressCache::default()),
             admission: Arc::new(Semaphore::new(concurrent_operations)),
             background_admission: Arc::new(Semaphore::new((concurrent_operations / 4).clamp(1, 8))),
             memory: Arc::new(Semaphore::new(memory_bytes / 65536)),
@@ -536,22 +530,20 @@ impl Store {
         plan: UploadPlan,
         part: u64,
     ) -> Option<[u8; 32]> {
-        self.progress
-            .lock()
-            .ok()?
-            .get_mut(&fp)
-            .filter(|p| p.plan == plan)
-            .and_then(|p| {
-                p.touched = Instant::now();
-                p.roots.get(&part).copied()
-            })
+        self.progress.lock().ok()?.root(fp, plan, part)
+    }
+
+    pub(crate) fn completion_state(
+        &self,
+        fp: Fingerprint,
+        plan: UploadPlan,
+    ) -> Option<(sha2::Sha256, u64)> {
+        self.progress.lock().ok()?.completion(fp, plan)
     }
 
     pub(crate) fn forget_part(&self, fp: Fingerprint, part: u64) {
-        if let Ok(mut cache) = self.progress.lock()
-            && let Some(p) = cache.get_mut(&fp)
-        {
-            p.roots.remove(&part);
+        if let Ok(mut cache) = self.progress.lock() {
+            cache.invalidate(fp, part);
         }
     }
 
@@ -562,35 +554,16 @@ impl Store {
         part: u64,
         root: [u8; 32],
     ) {
-        if plan.parts() > CACHE_PARTS as u64 {
-            return;
-        }
-        if let Ok(mut cache) = self.progress.lock() {
-            if !cache.contains_key(&fp)
-                && cache.len() >= CACHE_UPLOADS
-                && let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, p)| p.touched)
-                    .map(|(fp, _)| *fp)
-            {
-                cache.remove(&oldest);
-            }
-            let p = cache.entry(fp).or_insert_with(|| Progress {
-                plan,
-                roots: BTreeMap::new(),
-                touched: Instant::now(),
-                parents_persisted: false,
-            });
-            if p.plan == plan {
-                p.roots.insert(part, root);
-                p.touched = Instant::now();
-            }
+        if let Ok(pool) = self.pool(plan.identity)
+            && let Ok(mut cache) = self.progress.lock()
+        {
+            cache.remember(fp, plan, pool.layout.shard_format, part, root);
         }
     }
 
     pub(crate) fn forget(&self, fp: Fingerprint) {
         if let Ok(mut cache) = self.progress.lock() {
-            cache.remove(&fp);
+            cache.remove(fp);
         }
     }
 
@@ -635,21 +608,31 @@ impl Store {
                 if file.metadata()?.len() > header.file_bytes()? {
                     return Err(corrupt("shard has unexpected trailing bytes"));
                 }
+                let readable_bytes = file.metadata()?.len();
+                let mut completion_proof = false;
                 let root = if finalized {
                     if file.metadata()?.len() != header.file_bytes()? {
                         return Err(corrupt("final shard length differs from format"));
                     }
                     let mut seal = [0; 96];
                     crate::core::linux_io::pread_exact_at(&*file, &mut seal, header.seal_offset())?;
+                    completion_proof =
+                        n1_link::shard::decode_completion_seal(&header, fp, &seal).is_ok();
                     Some(
                         n1_link::shard::decode_seal(&header, fp, &seal)
                             .map_err(|e| corrupt(e.to_string()))?,
                     )
+                } else if readable_bytes == header.file_bytes()? {
+                    let mut seal = [0; n1_link::shard::SEAL_BYTES];
+                    crate::core::linux_io::pread_exact_at(&*file, &mut seal, header.seal_offset())?;
+                    let root = n1_link::shard::decode_completion_seal(&header, fp, &seal).ok();
+                    completion_proof = root.is_some();
+                    root
                 } else {
                     None
                 };
-                let readable_bytes = file.metadata()?.len();
                 Ok(Some(ShardFile {
+                    completion_proof,
                     member,
                     file,
                     header,

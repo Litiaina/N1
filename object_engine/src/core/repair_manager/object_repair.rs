@@ -241,16 +241,27 @@ impl Store {
                 ));
             }
             collect(
-                futures_util::future::join_all(files.iter().map(|(_, file, header)| async move {
-                    crate::core::linux_io::write_at_async(
-                        file.clone(),
-                        shard::encode_seal(header, fp, object.root).to_vec(),
-                        header.seal_offset(),
-                    )
-                    .await?;
-                    crate::core::linux_io::fdatasync_async(file.clone())
-                        .await
-                        .map_err(Error::from)
+                futures_util::future::join_all(files.iter().map(|(_, file, header)| {
+                    let completion_proof = object
+                        .files
+                        .get(usize::from(header.shard))
+                        .and_then(Option::as_ref)
+                        .is_some_and(|file| file.completion_proof);
+                    async move {
+                        crate::core::linux_io::write_at_async(
+                            file.clone(),
+                            if completion_proof {
+                                shard::encode_completion_seal(header, fp, object.root).to_vec()
+                            } else {
+                                shard::encode_seal(header, fp, object.root).to_vec()
+                            },
+                            header.seal_offset(),
+                        )
+                        .await?;
+                        crate::core::linux_io::fdatasync_async(file.clone())
+                            .await
+                            .map_err(Error::from)
+                    }
                 }))
                 .await,
             )?;

@@ -308,10 +308,30 @@ pub fn decode_frame<'a>(
 /// Written inside the shard only after all parts have been validated. The root
 /// is an ordered part/stripe integrity tree, not SHA256(concatenated user bytes).
 pub fn encode_seal(header: &ShardHeader, fp: Fingerprint, root: [u8; 32]) -> [u8; SEAL_BYTES] {
+    encode_seal_kind(header, fp, root, false)
+}
+
+/// Completion evidence: every member's payload was persisted before any such
+/// seal was written. Callers must persist the seal before acknowledging it.
+pub fn encode_completion_seal(
+    header: &ShardHeader,
+    fp: Fingerprint,
+    root: [u8; 32],
+) -> [u8; SEAL_BYTES] {
+    encode_seal_kind(header, fp, root, true)
+}
+
+fn encode_seal_kind(
+    header: &ShardHeader,
+    fp: Fingerprint,
+    root: [u8; 32],
+    completion: bool,
+) -> [u8; SEAL_BYTES] {
     let mut out = [0; SEAL_BYTES];
     out[..8].copy_from_slice(header.format.choose(b"N1LEND01", b"N1LEND02"));
     out[8..16].copy_from_slice(&header.total_bytes.to_be_bytes());
     out[16..24].copy_from_slice(&header.stripes().to_be_bytes());
+    out[24..32].copy_from_slice(&u64::from(completion).to_be_bytes());
     out[32..64].copy_from_slice(&root);
     let h = header.encode(fp);
     let sum = checksum(
@@ -331,7 +351,7 @@ pub fn decode_seal(header: &ShardHeader, fp: Fingerprint, bytes: &[u8]) -> Resul
         || &bytes[..8] != header.format.choose(b"N1LEND01", b"N1LEND02")
         || read64(bytes, 8) != header.total_bytes
         || read64(bytes, 16) != header.stripes()
-        || bytes[24..32] != [0; 8]
+        || read64(bytes, 24) > 1
         || checksum(
             header.format.choose(
                 b"Litiaina/LINK/shard-seal/v1\0",
@@ -344,6 +364,18 @@ pub fn decode_seal(header: &ShardHeader, fp: Fingerprint, bytes: &[u8]) -> Resul
         return Err(Error("shard has no valid final seal"));
     }
     Ok(bytes[32..64].try_into().expect("fixed root"))
+}
+
+pub fn decode_completion_seal(
+    header: &ShardHeader,
+    fp: Fingerprint,
+    bytes: &[u8],
+) -> Result<[u8; 32]> {
+    let root = decode_seal(header, fp, bytes)?;
+    if read64(bytes, 24) != 1 {
+        return Err(Error("shard has no durable completion evidence"));
+    }
+    Ok(root)
 }
 
 pub fn part_hasher(format: ShardFormat, part: u64) -> Sha256 {

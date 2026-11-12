@@ -16,6 +16,11 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 const BUFFERED_STRIPES: u64 = 4;
 
+pub(crate) struct WriteOptions {
+    pub buffer_size: usize,
+    pub immutable_part: bool,
+}
+
 struct Group {
     stripes: Range<u64>,
     source_bytes: u64,
@@ -32,6 +37,7 @@ struct Encoder<'a, R> {
     source: Vec<u8>,
     remaining: u64,
     root: Sha256,
+    immutable: bool,
 }
 impl<R: AsyncRead + Unpin> Encoder<'_, R> {
     async fn prepare(&mut self, stripes: Range<u64>, mut records: Vec<Vec<u8>>) -> Result<Group> {
@@ -79,7 +85,7 @@ impl<R: AsyncRead + Unpin> Encoder<'_, R> {
                             "part retry conflicts with existing immutable bytes".into(),
                         ));
                     }
-                } else if file.finalized {
+                } else if file.finalized || self.immutable {
                     return Err(corrupt("finalized shard requires repair before retry"));
                 }
             }
@@ -100,11 +106,12 @@ async fn write(
     files: &[ShardFile],
     group: Group,
     direct: &mut [Option<super::direct::Writer>],
+    immutable: bool,
 ) -> Result<Vec<Vec<u8>>> {
     collect(
         futures_util::future::join_all(files.iter().zip(group.records).zip(direct).map(
             |((file, mut record), direct)| async move {
-                if file.finalized {
+                if file.finalized || immutable {
                     return Ok(record);
                 }
                 if let Some(writer) = direct {
@@ -156,15 +163,16 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
     part: u64,
     reader: &mut R,
     progress: &IoProgress,
-    writer_buffer_size: usize,
+    options: WriteOptions,
 ) -> Result<[u8; 32]> {
+    let immutable = options.immutable_part || files.iter().any(|file| file.root.is_some());
     // Preserve first-payload capacity admission without treating Begin's tiny
     // persisted headers as a reservation for the entire declared object.
     collect(
         futures_util::future::join_all(
             files
                 .iter()
-                .filter(|file| !file.finalized && file.readable_bytes == 128)
+                .filter(|file| !immutable && !file.finalized && file.readable_bytes == 128)
                 .map(|file| {
                     let member = file.member.clone();
                     let required = file.header.file_bytes();
@@ -195,22 +203,25 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
         source: Vec::new(),
         remaining: plan.part_length(part)?,
         root: shard::part_hasher(pool.layout.shard_format, part),
+        immutable,
     };
     let buffers = || (0..files.len()).map(|_| Vec::new()).collect::<Vec<_>>();
     let mut spare = buffers();
     let stripes = files[0].header.part_stripes(part)?;
-    let buffered = if writer_buffer_size == 0 {
+    let buffered = if options.buffer_size == 0 {
         BUFFERED_STRIPES
     } else {
-        (writer_buffer_size / pool.layout.block_bytes as usize).clamp(1, BUFFERED_STRIPES as usize)
+        (options.buffer_size / pool.layout.block_bytes as usize).clamp(1, BUFFERED_STRIPES as usize)
             as u64
     };
-    let mut direct = if plan.total_bytes >= super::direct::MIN_DIRECT_BYTES && !stripes.is_empty() {
-        super::direct::Writer::open(files, plan.identity.fingerprint(), stripes.start, buffered)
-            .await?
-    } else {
-        (0..files.len()).map(|_| None).collect()
-    };
+    let mut direct =
+        if !immutable && plan.total_bytes >= super::direct::MIN_DIRECT_BYTES && !stripes.is_empty()
+        {
+            super::direct::Writer::open(files, plan.identity.fingerprint(), stripes.start, buffered)
+                .await?
+        } else {
+            (0..files.len()).map(|_| None).collect()
+        };
     let mut groups = (stripes.start..stripes.end)
         .step_by(buffered as usize)
         .map(|start| start..(start + buffered).min(stripes.end));
@@ -220,7 +231,7 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
             let completed_bytes = current.source_bytes;
             let (written, prepared) = tokio::join!(biased;
                 async {
-                    let written = write(files, current, &mut direct).await;
+                    let written = write(files, current, &mut direct, immutable).await;
                     if written.is_ok() { progress.record(completed_bytes); }
                     written
                 }, encoder.prepare(group, spare));
@@ -229,7 +240,7 @@ pub(crate) async fn write_frames<R: AsyncRead + Unpin>(
             current = prepared?;
         }
         let bytes = current.source_bytes;
-        write(files, current, &mut direct).await?;
+        write(files, current, &mut direct, immutable).await?;
         progress.record(bytes);
     }
     collect(

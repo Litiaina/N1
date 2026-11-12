@@ -619,6 +619,18 @@ impl Member {
         Ok(())
     }
 
+    /// Exact namespace dependencies of a promoted shard and retired staging
+    /// directory. Callers join every fsync; no whole-filesystem flush is needed.
+    pub(crate) fn publication_directories(&self, fp: Fingerprint) -> Result<Vec<Arc<File>>> {
+        let (a, b) = fp.fanout();
+        Ok(vec![
+            self.directory(Path::new(&format!("{a}/{b}")), false, false)?,
+            self.directory(Path::new(&a), false, false)?,
+            self.root.clone(),
+            self.directory(Path::new(".uploads"), false, false)?,
+        ])
+    }
+
     pub fn retire_empty_stage(&self, fp: Fingerprint, strict: bool) -> Result<()> {
         let uploads = self.directory(Path::new(".uploads"), false, false)?;
         match rfs::unlinkat(&*uploads, fp.to_string(), AtFlags::REMOVEDIR) {

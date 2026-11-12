@@ -1,6 +1,8 @@
 //! Functional tests use isolated directories on RAM. These do not qualify
 //! physical member independence, power loss or sustained hardware performance.
 mod direct_io;
+mod finalization;
+mod finalize_crash;
 mod integrity;
 mod persistence;
 mod purge;

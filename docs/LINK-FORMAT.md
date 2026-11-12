@@ -85,10 +85,15 @@ padding may occupy sparse filesystem holes: its logical record bytes, offsets,
 length and checksums are unchanged. A valid frame header and both payload/source
 integrity checks are still required; file length or a hole alone proves nothing.
 
-Seal: magic `N1LEND01`, total_bytes:u64be, stripes:u64be, eight reserved zeros,
+Seal: magic `N1LEND01`, total_bytes:u64be, stripes:u64be, completion_flags:u64be,
 integrity root:32, seal SHA256:32. Seal SHA256 binds
 `Litiaina/LINK/shard-seal/v1\0` || fingerprint || complete header || first 64
 seal bytes. Finalized files have exactly the calculated length, without tails.
+`completion_flags=0` is an ordinary publication seal. `completion_flags=1`
+certifies that all members' payload writes and persistence completed before
+this footer was written. The footer is then persisted before completion ACK.
+Other flag values are rejected. The checksum covers these flags. Both use the
+same 96-byte inline footer and calculated paths; no sidecar is introduced.
 
 Part root = SHA256(`Litiaina/LINK/part-root/v1\0` || part_index:u64be || ordered
 source hashes of that part's stripes). Object root = SHA256(
@@ -135,9 +140,14 @@ persistence guarantees on the same format. No part receipt/manifest sidecars
 are written. Restart recovery validates the staged records. Memory acceleration
 is bounded to active uploads and cannot become correctness authority.
 
-Finalization validates completion, writes final seals, persists data, promotes
+Finalization validates completion, persists sealed data, promotes
 with no replacement and persists directory changes. Promotion is not a
-cross-filesystem transaction. A lost reply can leave a readable object; retry
+cross-filesystem transaction. Durable completion may persist an ordered footer
+while all shards remain staged. It grants no read visibility. Its payload-first
+ordering allows fixed-size recovery checks after restart. Ordinary staged seals
+do not provide that guarantee. Normal mode needs its in-memory completion state
+or explicit status reconciliation. Finalize never traverses parts or payloads.
+A lost reply can leave a readable object; retry
 resolves the same identity and continues partial promotion. Reads require a
 matching finalized layout and enough verified fragments for each requested
 stripe; they never expose unchecked decoded bytes.

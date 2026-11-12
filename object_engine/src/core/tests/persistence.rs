@@ -109,6 +109,13 @@ async fn first_durable_payload_cannot_ack_before_staging_ancestry_is_persisted()
     output.write_all(&data).await.unwrap();
     output.shutdown().await.unwrap();
     assert!(caller.await.unwrap().is_err());
+    let plan = store.inspect_upload(SCOPE, &init.object_key).await.unwrap();
+    assert!(
+        store
+            .completion_state(fp, plan)
+            .is_none_or(|(_, parts)| parts == 0)
+    );
+    assert!(store.cached_root(fp, plan, 0).is_none());
     std::fs::rename(&displaced, &parent).unwrap();
     store
         .write_at(

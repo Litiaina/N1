@@ -1,10 +1,14 @@
 pub(crate) mod activity;
+mod completion;
 mod direct;
+mod publication;
 mod small_batch;
 mod stream;
+use completion::{PreparedPart, refresh_completion_seals, write_completion_seals, write_seals};
 use once_cell::sync::OnceCell;
+use publication::{persist_publication, publish_files};
 use std::sync::atomic::AtomicUsize;
-pub(crate) use stream::write_frames;
+pub(crate) use stream::{WriteOptions, write_frames};
 pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
 pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 use super::io_scheduler::{DiskIoClass, DiskIoGuard, IoProgress, acquire_disk_io};
@@ -183,11 +187,18 @@ impl Store {
         let state = lease.state().clone();
         let _lifecycle = state.lifecycle.clone().read_owned().await;
         let _part = state.parts[part as usize % 64].lock().await;
-        self.forget_part(fp, part);
         let files = {
             let _prepare = state.prepare.lock().await;
             required(self.files(pool.clone(), plan).await?)?
         };
+        let read_only = files.iter().any(|file| file.root.is_some())
+            || self
+                .completion_state(fp, plan)
+                .is_some_and(|(_, prefix)| part < prefix)
+            || self.cached_root(fp, plan, part).is_some();
+        if !read_only {
+            self.forget_part(fp, part);
+        }
         let root = write_frames(
             &pool,
             &files,
@@ -195,16 +206,25 @@ impl Store {
             part,
             &mut reader,
             &io.progress_handle(),
-            self.runtime().writer_buffer_size,
+            WriteOptions {
+                buffer_size: self.runtime().writer_buffer_size,
+                immutable_part: read_only,
+            },
         )
         .await?;
+        let mut prepared = PreparedPart {
+            store: self.clone(),
+            fp,
+            part,
+            acknowledged: read_only,
+        };
         if plan.durability == Durability::Durable {
             persist_files(&files).await?;
             let persisted = self
                 .progress
                 .lock()
                 .ok()
-                .and_then(|cache| cache.get(&fp).map(|p| p.parents_persisted))
+                .map(|cache| cache.parents_persisted(fp, plan))
                 .unwrap_or(false);
             if !persisted {
                 collect(
@@ -223,13 +243,50 @@ impl Store {
                 )?;
             }
         }
+        if read_only {
+            io.complete();
+            return Ok(());
+        }
         self.remember_part(fp, plan, part, root);
         if plan.durability == Durability::Durable
             && let Ok(mut cache) = self.progress.lock()
-            && let Some(p) = cache.get_mut(&fp)
         {
-            p.parents_persisted = true;
+            cache.mark_parents_persisted(fp, plan);
         }
+        let seal = if plan.durability == Durability::Durable {
+            self.progress
+                .lock()
+                .ok()
+                .and_then(|cache| cache.completion_seal(fp, plan))
+        } else {
+            None
+        };
+        // Drain existing writers before establishing durable completion. New
+        // writers reopen these files and see immutable payload completion.
+        // Release the hashed part lock before upgrading the lifecycle fence.
+        if let Some(seal) = seal {
+            drop(_part);
+            drop(_lifecycle);
+            let _completion = state.lifecycle.clone().write_owned().await;
+            let current = self
+                .progress
+                .lock()
+                .ok()
+                .is_some_and(|cache| cache.seal_is_current(fp, plan, seal));
+            if current {
+                let files = required(self.files(pool.clone(), plan).await?)?;
+                if !files.iter().all(|file| file.root.is_some()) {
+                    // All members' payload is stable before the ordered seal
+                    // exists. A surviving seal is therefore recovery evidence.
+                    write_completion_seals(&files, fp, seal.root).await?;
+                    persist_files(&files).await?;
+                }
+                if let Ok(mut cache) = self.progress.lock() {
+                    cache.mark_persisted_seal(fp, plan, seal);
+                }
+            }
+        }
+        prepared.acknowledged = true;
         io.complete();
         Ok(())
     }
@@ -265,6 +322,7 @@ impl Store {
             }
             let finalized_shards = files.iter().flatten().filter(|f| f.finalized).count();
             validate_seal_roots(&files)?;
+            let completed = files.iter().flatten().any(|file| file.root.is_some());
             let end = start.saturating_add(limit).min(plan.parts());
             if start > plan.parts() {
                 return Err(Error::Invalid("status start exceeds part count".into()));
@@ -275,7 +333,17 @@ impl Store {
                 io.heartbeat();
                 let state = lease.state().clone();
                 let _part = state.parts[part as usize % 64].lock().await;
-                if verify_part(&files, fp, part, &mut codec).await?.is_none() {
+                if let Some(root) = verify_part(&files, fp, part, &mut codec).await? {
+                    let prefix = store
+                        .completion_state(fp, plan)
+                        .map_or(0, |(_, parts)| parts);
+                    if !completed
+                        && part >= prefix
+                        && store.cached_root(fp, plan, part) != Some(root)
+                    {
+                        store.remember_part(fp, plan, part, root);
+                    }
+                } else {
                     missing.push(part);
                 }
             }
@@ -320,42 +388,86 @@ impl Store {
             let fp = plan.identity.fingerprint();
             let lease = store.foreground(fp)?;
             let _guard = lease.state().lifecycle.clone().write_owned().await;
-            let files = required(store.files(pool.clone(), plan).await?)?;
-            let already_finalized = store.seal_upload(&pool, plan, &files).await?;
-            // Repeating finalize also retries failed durability barriers. An
-            // existing final filename alone never converts an EIO into success.
-            if let Err(e) = persist_files(&files).await {
-                store.forget(fp);
-                return Err(e);
+            let result = async {
+                // Pin filesystem/error-accounting descriptors before seal writes,
+                // using the same publication ordering as normal PUT.
+                let roots = pool
+                    .members
+                    .iter()
+                    .flatten()
+                    .map(|member| member.path.clone())
+                    .collect::<Vec<_>>();
+                let group = blocking(move || {
+                    crate::core::linux_io::group::FilesystemGroup::open(&roots).map_err(Error::from)
+                })
+                .await?;
+                let files = required(store.files(pool.clone(), plan).await?)?;
+                let already_finalized = files.iter().all(|f| f.finalized);
+                validate_seal_roots(&files.iter().cloned().map(Some).collect::<Vec<_>>())?;
+                let durable_root = files.iter().find_map(|file| file.root);
+                if !already_finalized && now() >= plan.expires_at {
+                    return Err(Error::Conflict("upload key has expired".into()));
+                }
+                if let Some(root) = durable_root {
+                    if files
+                        .iter()
+                        .any(|file| file.readable_bytes < file.header.seal_offset())
+                    {
+                        return Err(Error::Conflict(
+                            "completed upload requires shard repair".into(),
+                        ));
+                    }
+                    let persisted = store
+                        .progress
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.persisted_seal(fp, plan))
+                        == Some(root);
+                    if files.iter().any(|file| file.root.is_none())
+                        || (!persisted && !already_finalized)
+                    {
+                        // A crash during seal publication needs only the fixed
+                        // footer restored; the surviving proof covers payload.
+                        refresh_completion_seals(&files, fp, root).await?;
+                        persist_files(&files).await?;
+                    } else if already_finalized {
+                        // Retry durability after a lost publication reply.
+                        persist_files(&files).await?;
+                    }
+                } else {
+                    // Standard mode consumes its folded RAM completion. Missing
+                    // state is reconciled explicitly through paginated status;
+                    // finalize never reads payloads or iterates over parts.
+                    store.seal_upload(&pool, plan, &files).await?;
+                    persist_files(&files).await?;
+                }
+                let _snapshot = store.snapshot_gate.clone().read_owned().await;
+                let publication = publish_files(&files, fp).await;
+                // Every started rename/removal drains and reaches its barrier,
+                // including when a peer failed. Success requires both results.
+                let persisted = persist_publication(&files, fp).await;
+                let bindings = blocking(move || group.check().map_err(Error::from)).await;
+                publication?;
+                persisted?;
+                bindings?;
+                Ok(FinalizedObject {
+                    object_key: store
+                        .signer
+                        .object_key(&scope, plan.identity)
+                        .as_str()
+                        .into(),
+                    already_finalized,
+                    total_bytes: plan.total_bytes,
+                })
             }
-            let _snapshot = store.snapshot_gate.clone().read_owned().await;
-            collect(
-                futures_util::future::join_all(files.iter().map(|f| {
-                    let member = f.member.clone();
-                    let shard = f.header.shard;
-                    let finalized = f.finalized;
-                    blocking(move || {
-                        if !finalized {
-                            member.promote(fp, shard, true)?;
-                        } else {
-                            member.persist_final_parent(fp)?;
-                        }
-                        member.retire_empty_stage(fp, true)
-                    })
-                }))
-                .await,
-            )?;
-            store.forget(fp);
-            io.complete();
-            Ok(FinalizedObject {
-                object_key: store
-                    .signer
-                    .object_key(&scope, plan.identity)
-                    .as_str()
-                    .into(),
-                already_finalized,
-                total_bytes: plan.total_bytes,
-            })
+            .await;
+            if !matches!(result, Err(Error::Conflict(_))) {
+                store.forget(fp);
+            }
+            if result.is_ok() {
+                io.complete();
+            }
+            result
         })
         .await
     }
@@ -373,38 +485,18 @@ impl Store {
             return Err(Error::Conflict("upload key has expired".into()));
         }
         if !already_finalized {
-            let mut codec = StripeCodec::new(&pool.layout)?;
-            let mut root =
-                shard::object_hasher(pool.layout.shard_format, plan.total_bytes, plan.part_bytes);
-            for part in 0..plan.parts() {
-                let part_root = match self.cached_root(fp, plan, part) {
-                    Some(r) => r,
-                    None => verify_part_inner(&optional, fp, part, &mut codec, true)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Conflict(format!("upload part {part} is incomplete"))
-                        })?,
-                };
-                root.update(part_root);
-            }
+            let root = if let Some(root) = files.iter().find_map(|file| file.root) {
+                write_seals(files, fp, root).await?;
+                return Ok(false);
+            } else if plan.parts() == 0 {
+                shard::object_hasher(pool.layout.shard_format, plan.total_bytes, plan.part_bytes)
+            } else {
+                self.completion_state(fp, plan).filter(|(_, parts)| *parts == plan.parts())
+                    .map(|(root, _)| root)
+                    .ok_or_else(|| Error::Conflict("completion state unavailable; query upload status or resume before finalizing".into()))?
+            };
             let root: [u8; 32] = root.finalize().into();
-            if files.iter().any(|f| f.root.is_some_and(|old| old != root)) {
-                return Err(corrupt("finalized shard root conflicts with upload data"));
-            }
-            let writes = files.iter().filter(|f| !f.finalized).map(|f| {
-                crate::core::linux_io::write_at_async(
-                    f.file.clone(),
-                    encode_seal(&f.header, fp, root).to_vec(),
-                    f.header.seal_offset(),
-                )
-            });
-            collect(
-                futures_util::future::join_all(writes)
-                    .await
-                    .into_iter()
-                    .map(|r| r.map_err(Error::from))
-                    .collect(),
-            )?;
+            write_seals(files, fp, root).await?;
         }
         Ok(already_finalized)
     }
@@ -540,15 +632,6 @@ pub(crate) async fn verify_part(
     part: u64,
     codec: &mut StripeCodec,
 ) -> Result<Option<[u8; 32]>> {
-    verify_part_inner(files, fp, part, codec, false).await
-}
-async fn verify_part_inner(
-    files: &[Option<ShardFile>],
-    fp: Fingerprint,
-    part: u64,
-    codec: &mut StripeCodec,
-    rewrite: bool,
-) -> Result<Option<[u8; 32]>> {
     let Some(first) = files.iter().flatten().next() else {
         return Ok(None);
     };
@@ -583,27 +666,6 @@ async fn verify_part_inner(
         let expected = source_hash.expect("nonempty EC stripe");
         if first.header.source_hash(fp, stripe, &source)? != expected {
             return Err(corrupt("decoded stripe checksum mismatch"));
-        }
-        if rewrite {
-            let writes = files
-                .iter()
-                .flatten()
-                .zip(frames)
-                .filter(|(file, _)| !file.finalized)
-                .map(|(file, bytes)| {
-                    crate::core::linux_io::write_at_async(
-                        file.file.clone(),
-                        bytes.expect("verified frame").bytes().to_vec(),
-                        file.header.frame_offset(stripe).expect("validated stripe"),
-                    )
-                });
-            collect(
-                futures_util::future::join_all(writes)
-                    .await
-                    .into_iter()
-                    .map(|r| r.map_err(Error::from))
-                    .collect(),
-            )?;
         }
         root.update(expected);
     }

@@ -116,3 +116,18 @@ fn empty_objects_have_headers_and_seals_but_no_frames() {
     assert!(h.frame_offset(0).is_err());
     assert!(decode_seal(&h, fp, &encode_seal(&h, fp, [0; 32])).is_ok());
 }
+
+#[test]
+fn durable_completion_proof_is_distinct_and_checksum_bound() {
+    let (_, _, header, fp) = setup();
+    let root = [19; 32];
+    assert!(decode_completion_seal(&header, fp, &encode_seal(&header, fp, root)).is_err());
+    let seal = encode_completion_seal(&header, fp, root);
+    assert_eq!(decode_completion_seal(&header, fp, &seal).unwrap(), root);
+    assert_eq!(decode_seal(&header, fp, &seal).unwrap(), root);
+    for byte in 0..SEAL_BYTES {
+        let mut corrupt = seal;
+        corrupt[byte] ^= 1;
+        assert!(decode_completion_seal(&header, fp, &corrupt).is_err());
+    }
+}

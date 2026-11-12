@@ -4,8 +4,8 @@ use crate::core::io_scheduler::IoProgress;
 use crate::core::{
     Error, Result,
     storage_pool::Pool,
-    store::{FinalizedObject, ShardFile, Store, blocking, collect, joined, now},
-    upload::{persist_files, required, write_frames},
+    store::{FinalizedObject, ShardFile, Store, blocking, joined, now},
+    upload::{WriteOptions, persist_files, required, write_frames},
 };
 use n1_link::UploadPlan;
 use std::{collections::BTreeSet, sync::Arc};
@@ -57,7 +57,7 @@ impl Store {
                     .await?;
                 persist_files(&prepared.files).await?;
                 let _snapshot = store.snapshot_gate.clone().read_owned().await;
-                let publication = publish(&prepared, false).await;
+                let publication = publish(&prepared).await;
                 // Join and persist every started publication even on failure.
                 let barrier = group.clone();
                 let persisted = blocking(move || barrier.sync_all().map_err(Error::from)).await;
@@ -149,7 +149,7 @@ impl Store {
                 let _snapshot = store.snapshot_gate.clone().read_owned().await;
                 let mut publication = None;
                 for object in &prepared {
-                    if let Err(e) = publish(object, false).await
+                    if let Err(e) = publish(object).await
                         && publication.is_none()
                     {
                         publication = Some(e);
@@ -236,7 +236,10 @@ impl Store {
                 0,
                 reader,
                 progress,
-                self.runtime().writer_buffer_size,
+                WriteOptions {
+                    buffer_size: self.runtime().writer_buffer_size,
+                    immutable_part: false,
+                },
             )
             .await?;
             self.remember_part(fp, plan, 0, root);
@@ -269,23 +272,6 @@ fn single_part(plan: UploadPlan) -> Result<()> {
         Ok(())
     }
 }
-async fn publish(object: &Prepared, strict: bool) -> Result<()> {
-    let fp = object.plan.identity.fingerprint();
-    collect(
-        futures_util::future::join_all(object.files.iter().map(|file| {
-            let member = file.member.clone();
-            let shard = file.header.shard;
-            let finalized = file.finalized;
-            blocking(move || {
-                if !finalized {
-                    member.promote(fp, shard, strict)?;
-                } else if strict {
-                    member.persist_final_parent(fp)?;
-                }
-                member.retire_empty_stage(fp, strict)
-            })
-        }))
-        .await,
-    )?;
-    Ok(())
+async fn publish(object: &Prepared) -> Result<()> {
+    super::publish_files(&object.files, object.plan.identity.fingerprint()).await
 }

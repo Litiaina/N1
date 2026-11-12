@@ -78,6 +78,35 @@ correction. Only the original campaign's expiry cleanup and final censuses
 remain. The read-only helper has its own regression and
 strict Clippy checks. The 378-test workspace count above predates that helper.
 
+The [MCH throughput measurement](docs/MCH-THROUGHPUT-20261112.md) uses NVMe M1
+and the interactive four-HDD 3+1 N1 pool, with an isolated benchmark database.
+Three repetitions verify 900 small objects and nine 1 GiB objects, then reclaim
+all 909 through scoped GC with zero failures/deferred work. Individual and batch
+small uploads, large one-shot and durable multipart, init/status/finalize/retry,
+per-process CPU/RSS and every original payload/version are recorded. This is
+server-local current-build performance, with warm immediate reads; it does not
+close matched-baseline, browser/LAN, saturation or million-object gates.
+The follow-up standalone native N1 measurement verifies and purges three
+additional 1 GiB multipart objects without M1 requests. Finalize averages
+59.73 ms, versus 70.43 ms for aligned M1 and 9,317.64 ms for M1's incompatible
+part-geometry bridge. The same report preserves every trial and the timing
+differences; no runtime code changed for these measurements.
+The [15 GiB native N1 follow-up](docs/N1-STANDALONE-15GIB-20261112.md) also
+passes: 320 durable 48 MiB parts, four writers, complete SHA-256 readback,
+repeated finalize and four-shard purge. Whole upload is 95.45 s / 160.92 MiB/s;
+finalize is 100.67 ms. This is one large-object trial, not a fault or tail-latency
+qualification.
+
+The subsequent [finalization and media qualification](docs/FINALIZATION-20261112.md)
+compares the preceding LINK binary with the bounded finalization change using
+the same Rust client/compiler. It measures native N1 without M1 on DATA_SSD
+1+0, HDD 1+0 and HDD 1+1, including per-stage p50/p95/p99, complete 1 GiB and
+15 GiB uploads, CPU/RSS and adverse observations. The final workspace passes
+396 tests with zero failures; a dedicated actual SIGKILL witness on DATA_SSD
+passes cold completion recovery, exact readback and purge. These are separate
+results from the original MCH measurements above. They do not extend the
+million-object result to this changed runtime or prove physical power loss.
+
 Performance acceptance remains open. Native M1 has lower mutation latency than
 Procyon on the completed HDD matrix but costs 50.7% more M1 CPU at 1,000 objects.
 The first export candidate's fresh-fixture screen regresses small upload sum

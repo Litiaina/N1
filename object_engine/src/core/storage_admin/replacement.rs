@@ -212,6 +212,7 @@ fn input(pool: &Pool, fp: Fingerprint, target_shard: u16) -> Result<Option<(Open
         }
         expected = Some(normalized);
         let len = file.metadata()?.len();
+        let mut completion_proof = false;
         let seal = if finalized {
             if len != header.file_bytes()? {
                 return Err(invalid("invalid finalized source length"));
@@ -219,6 +220,7 @@ fn input(pool: &Pool, fp: Fingerprint, target_shard: u16) -> Result<Option<(Open
             let mut bytes = [0; shard::SEAL_BYTES];
             crate::core::linux_io::pread_exact_at(&*file, &mut bytes, header.seal_offset())?;
             let seal = shard::decode_seal(&header, fp, &bytes)?;
+            completion_proof = shard::decode_completion_seal(&header, fp, &bytes).is_ok();
             if root.is_some_and(|old| old != seal) {
                 return Err(invalid("surviving object seals disagree"));
             }
@@ -229,6 +231,7 @@ fn input(pool: &Pool, fp: Fingerprint, target_shard: u16) -> Result<Option<(Open
             None
         };
         files[usize::from(shard)] = Some(ShardFile {
+            completion_proof,
             member: member.clone(),
             file,
             header,
@@ -407,7 +410,16 @@ async fn rebuild(
             }
             crate::core::linux_io::write_at_async(
                 output.clone(),
-                shard::encode_seal(&object.header, fp, object.root).to_vec(),
+                if object
+                    .files
+                    .iter()
+                    .flatten()
+                    .any(|file| file.completion_proof)
+                {
+                    shard::encode_completion_seal(&object.header, fp, object.root).to_vec()
+                } else {
+                    shard::encode_seal(&object.header, fp, object.root).to_vec()
+                },
                 object.header.seal_offset(),
             )
             .await?;

@@ -146,6 +146,7 @@ impl Store {
                     shard::decode_seal(&header, fp, &seal).map_err(|e| corrupt(e.to_string()))?;
                 let readable_bytes = file.metadata()?.len();
                 Ok(Some(ShardFile {
+                    completion_proof: shard::decode_completion_seal(&header, fp, &seal).is_ok(),
                     member,
                     file,
                     header,
