@@ -1,10 +1,11 @@
 # Home split-node qualification — November 11, 2026
 
-**Reliability preflight passed; original million-object campaign resumed on
-November 12; RC.2 remains unreleased.** Population, full post-restart readback
+**Reliability preflight and original million-object campaign passed;
+RC.2 remains unreleased.** Population, full post-restart readback
 and both full member-loss readbacks are complete. The continued member-1 phase
 passed all 1,000,000 original objects with zero payload/version mismatches;
-only normal expiry cleanup and final censuses remain. See the
+normal expiry cleanup and final censuses subsequently passed on November 12.
+See the [final closure](HOME-QUALIFICATION-20261113.md) and
 [continuation report](MCH-CONTINUATION-20261112.md) for the current placement,
 preserved identities and scope correction. No replacement population is running.
 
@@ -131,8 +132,8 @@ intentionally terminated (exit 143). On November 12, the interrupted phase
 continued from zero against the original ACKs and **passed all 1,000,000 objects /
 13,968,125,000 bytes**, zero payload/version mismatches, **11,757.437 seconds**.
 The partial counter was not used to skip objects. Its verifier exited 0 and
-checked unchanged ACK hashes before and after the pass. Final censuses remain
-pending normal TTL cleanup.
+checked unchanged ACK hashes before and after the pass. Final natural-expiry GC
+and censuses subsequently passed with all original identities unchanged.
 
 The home processes were stopped for travel. Results, source, executables, original
 ACKs and a compressed M1 database checkpoint are preserved at
@@ -142,7 +143,7 @@ database. Original N1 shard files remain on their HDDs. Both drives are now
 mounted with their original UUIDs. The continuation serves those same shards
 from the workstation, with the verified M1 checkpoint on MCH. Member 1 was
 detached only for its unfinished readback and is now restored. Both task-owned
-services are stopped until final cleanup. No reformat,
+services are stopped after final cleanup. No reformat,
 new enrollment or replacement population is performed.
 
 The original campaign's sequence and current disposition are:
@@ -158,11 +159,14 @@ The original campaign's sequence and current disposition are:
    complete, with the original member directories restored.
 5. Stop the services for independent metadata/ACK and physical-placement
    censuses, require exactly two shards per referenced version with zero
-   staging/unreferenced files, and run the offline M1 integrity check: final
-   censuses await normal reclamation of 192 unacknowledged crash-era intents.
-   Their recorded TTL expires November 12 at 21:49 Asia/Manila; final cleanup
-   starts no earlier than 21:52:32. The preserved
-   database already passes its complete integrity check on MCH.
+   staging/unreferenced files, and run the offline M1 integrity check: complete.
+   Normal automatic GC reclaimed 192 unacknowledged crash-era intents after
+   their actual expiry, with zero failures/deferred work. Final metadata counts
+   are one million names, immutable versions and unique LINK references, zero
+   pending publications. The physical census found exactly two million shards
+   on two filesystems, no staged/unreferenced/misplaced shards. The final database
+   check verified 7,000,272 records. No population or full readback was repeated
+   for this closure; original ACK journals remain byte-identical.
 
 `reports/MILLION-STATUS`, `MILLION-LAST-ACK`, `MILLION-CONTROLLER.pid`,
 `million-events.log` and `million-controller.log` are on the local report root.

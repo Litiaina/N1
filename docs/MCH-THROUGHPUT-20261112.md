@@ -7,7 +7,8 @@ immutable-version checks. All **900 small objects and nine 1 GiB objects**
 were subsequently reclaimed through scoped metadata GC, with zero failures or
 deferred objects. A subsequent **native TLS → N1-only** measurement verified
 and purged another three 1 GiB objects, isolating N1 finalization from M1.
-The interactive Console and its M1 database remain available. RC.2 remains
+The interactive Console and its M1 database remained available at the end of
+this measurement. RC.2 remains
 unreleased.
 
 These tables retain the original MCH snapshot. The later
@@ -15,6 +16,9 @@ These tables retain the original MCH snapshot. The later
 optimized runtime against its preceding LINK baseline on DATA_SSD 1+0 and
 HDD 1+0/1+1, including p50/p95/p99, CPU/RSS and recovery checks. Its different
 hosts and topology do not replace the MCH 3+1 measurements here.
+The [subsequent home qualification](HOME-QUALIFICATION-20261113.md) records
+M1 restart recovery, current-candidate service/Console checks, matched adapter
+performance and monitoring overhead. No additional MCH run is included there.
 
 ## Placement and method
 

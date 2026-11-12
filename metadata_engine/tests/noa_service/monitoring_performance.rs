@@ -1,4 +1,6 @@
 //! Matched transfer runs with and without concurrent monitoring traffic.
+#[path = "monitoring_performance/read_replay.rs"]
+mod read_replay;
 use super::*;
 use sha2::{Digest, Sha256};
 use std::sync::{

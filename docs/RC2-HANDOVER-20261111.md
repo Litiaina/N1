@@ -14,9 +14,13 @@ the complete member-0-loss readback passed. Member-1-loss readback reached
 720,000 reported checks before interruption. On November 12, that unfinished
 phase resumed against the original N1 shards and byte-verified M1 checkpoint/
 ACKs on MCH, then **passed all 1,000,000 original objects / 13,968,125,000 bytes**
-with zero payload/version mismatches in **11,757.437 seconds**. Only normal
-expiry cleanup and final censuses remain. No completed phase was repeated;
-no fresh population is authorized.
+with zero payload/version mismatches in **11,757.437 seconds**. Natural-expiry
+cleanup and final censuses subsequently passed at home: 192 expired attempts
+reclaimed, one million named/version/LINK references, exactly two million
+shards and no pending, staged, misplaced or unreferenced objects. The original
+ACK hashes are unchanged. The [final closure report](HOME-QUALIFICATION-20261113.md)
+separates this frozen-checkpoint result from newer-runtime qualification.
+No completed phase was repeated; no fresh population is authorized.
 
 The portable checkpoint is
 `/home/altear/DEV_TEST/n1-m1-rc2-preserved-20261112.PLPlQD`.
@@ -181,9 +185,10 @@ Unfinished work is not a pass. Earlier failed markers remain historical.
 - Performance acceptance: native M1 CPU cost, the failed fresh-fixture export
   screen, saturation and tail latency. The controlled same-database follow-up
   is complete within its 100-object scope; broader performance acceptance is open.
-- A fresh million **named objects with owned M1**, separate standalone N1
-  million and original Console population. Neither million KV fixtures nor the
-  November 8 Procyon-backed named-object pass substitutes for these results.
+- The owned-M1 original million named-object campaign is now complete, including
+  final GC and censuses. Newer-runtime qualification, separate standalone N1
+  population and original Console population retain their own gates. Neither
+  KV fixtures nor historical binaries substitute for these results.
 - Complete NOA field/error/permission/retry coverage, the remaining native
   direct-archive response limit, conditional Accel and final Console/operator
   workflows under load.

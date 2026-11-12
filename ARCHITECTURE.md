@@ -128,6 +128,17 @@ reconciliation. It is not discarded as an orphan by guessing from filenames.
 An overwrite keeps the old named version visible until publication. A rename
 changes metadata; it never renames or rewrites the immutable shard payload.
 
+The native adapter's completion recovery is isolated in
+`metadata_engine/src/object_store/native/finalization.rs`. Healthy finalization
+sends one native command. If N1 explicitly reports lost volatile completion,
+M1 validates paginated upload status and retries finalization once, without
+re-uploading bytes or allocating another LINK identity. Pages contain at most
+4,096 parts and target at most 64 MiB of declared payload; a single larger part
+still requires one request. Missing/unavailable data cannot become success.
+This exceptional cold reconciliation may read existing frames; it is separate
+from N1's O(pool width) finalization and M1's zero-payload-I/O indexed resume
+status. Purged keys and unrelated conflicts do not trigger reconstruction.
+
 Metadata owns trash TTL, indexed reclamation, scoped integrity/healing jobs and
 explicit pool migration. Trash is claimed transactionally after expiry; object
 deletion uses the native API, and metadata ownership survives until its ACK.

@@ -16,6 +16,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore},
 };
+mod finalization;
 
 /// Internal service credentials, distinct from a user's logical fragment.
 /// Authorization of logical names belongs to metadata, before this boundary.
@@ -471,24 +472,15 @@ impl NativeObjectStore {
         if limit == 0 || limit > 4096 || start > upload.parts {
             return Err(ObjectStoreError::Invalid("invalid upload status page"));
         }
-        // Begin has already persisted incomplete headers. Absence means the
-        // identity is gone, never an untouched session that may be recreated.
+        // Status only examines existing incomplete shards. Absence never
+        // authorizes recreating an identity through a continuation request.
+        let limit = finalization::status_page_limit(upload, limit)?;
         self.command(Command::UploadStatus {
             object_key: upload.object_key.clone(),
             start,
             limit,
         })
         .await
-    }
-
-    pub async fn finalize(&self, upload: &ObjectUpload) -> ObjectStoreResult<ObjectFinalization> {
-        let result: ObjectFinalization = self
-            .command(Command::UploadFinalize {
-                object_key: upload.object_key.clone(),
-            })
-            .await?;
-        check_finalization(upload, &result)?;
-        Ok(result)
     }
 
     pub async fn cancel(&self, upload: &ObjectUpload) -> ObjectStoreResult<serde_json::Value> {

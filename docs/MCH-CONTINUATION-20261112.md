@@ -2,7 +2,9 @@
 
 **Original campaign continuation only; RC.2 remains unreleased.** Completed
 population, post-restart readback and both full member-loss readbacks now pass
-within their recorded scope. Only expiry cleanup and final censuses remain.
+within their recorded scope. The remaining natural-expiry cleanup and final
+censuses **completed on November 12 at home**, using the original binaries and
+byte-matched database. See [final closure and current-candidate checks](HOME-QUALIFICATION-20261113.md).
 No fresh population, commit, push, tag or
 release is authorized by this continuation.
 
@@ -73,15 +75,21 @@ payload mismatches** and **zero version mismatches**. Verification took
 **11,757.437 seconds / 3 h 15 min 57 s**. The verifier and local loss-fixture
 controller both exited 0, the original ACK hashes stayed unchanged, and the
 original member directory was restored. The task-owned N1 and M1 services are
-stopped while the final-stage controller waits for actual TTL expiry.
+stopped before the final-stage controller waited for actual TTL expiry.
 
 `original-member-1-only/PASSED.json` has SHA-256
 `aef7111641de2e1527bbb994e2e93e3d11a8b66e4a78c67d86aeca4a3f3661c5`;
 the preserved local copy matches MCH. This is completion of the interrupted
 phase against original data, not a new population or a matched performance
-comparison. Final cleanup is scheduled no earlier than **21:52:32 Asia/Manila**
-(three minutes after the latest recorded intent expiry). No final-census pass
-is claimed yet.
+comparison. Final cleanup began after **21:52:32 Asia/Manila**
+(three minutes after the latest recorded intent expiry), without changing TTLs
+or the clock. Normal automatic GC reclaimed all **192** pending attempts with
+zero failures/deferred work. The stopped-database census then confirmed
+**1,000,000 names, 1,000,000 immutable versions, 1,000,000 unique LINK identities
+and zero pending publications**; the offline integrity check verified
+**7,000,272 records**. The two-HDD physical census found **2,000,000 shards**,
+zero staging, zero unreferenced shards and zero wrong placements. Original ACK
+hashes remained unchanged. All final controllers exited 0.
 
 The interrupted second member-loss readback ran again from zero against
 all original ACKs. A read-only Rust helper reuses the existing payload/version
@@ -111,14 +119,17 @@ verifier ran in that attempt. Its log and the remote startup timeout are
 preserved. The corrected launcher respects the existing hard limit.
 
 The detached local `evidence/finish-original-only.sh` preserved the verifier's
-reports and returned the original member directory. It now waits for the
-actual intent TTL, then runs normal configured GC with both
-original members present, and stops the services for the final metadata and
-physical censuses. It performs no further payload-readback pass. A census
-failure stops this sequence with its evidence intact; completion requires all
-remaining witnesses to succeed. Local status is
-`reports/ORIGINAL-FINAL-STAGES-STATUS`; terminal success is
-`reports/ORIGINAL-CAMPAIGN-COMPLETED`, not a release marker.
+reports and returned the original member directory. The final home controllers
+were frozen as `source/finish-original-home02.sh` and
+`source/finish-original-metadata-home02.sh` under
+`/mnt/HDD1TB001/n1-rc2-home-qualification-20261112-02`. They reused the original
+stopped main-PC database after verifying all four files against the portable
+checkpoint, and the exact original N1/M1 executables. MCH was not contacted for
+these final stages. Their reports retain the previous stopped launchers too;
+`ORIGINAL-FINAL02-EXIT=0` and `ORIGINAL-CAMPAIGN-COMPLETED` identify terminal
+success. No payload readback or population was repeated for census closure.
+This completes the original campaign at its frozen checkpoint, not a million
+qualification of the subsequently changed finalization runtime or an RC.2 release.
 
 ## Extra campaigns stopped after scope correction
 

@@ -1,5 +1,7 @@
 //! The native protocol is deliberately exercised at the transport boundary,
 //! including cancellation between frames and independent in-flight calls.
+#[path = "object_client/finalization.rs"]
+mod finalization;
 use m1::object_store::{NativeObjectStore, ObjectStoreConfig};
 use n1_link::noa::{Command, Request, Response};
 use serde_json::json;

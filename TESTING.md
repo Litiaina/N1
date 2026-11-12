@@ -62,7 +62,12 @@ readback passed; member-1-loss readback reached 720,000 reported checks before
 interruption. The November 12 continuation then **passed the complete original
 million-object member-1-loss readback**, 13,968,125,000 bytes, zero payload/version
 mismatches in 11,757.437 seconds, with unchanged original ACK hashes. Member 1
-is restored; final censuses await normal TTL cleanup. A portable
+is restored. Final natural-expiry cleanup and censuses subsequently passed:
+192 expired attempts reclaimed without errors, one million names/versions/LINK
+references, exactly two million shards and no pending, staged, misplaced or
+unreferenced objects. The final database integrity check verified 7,000,272
+records. See the [home closure report](docs/HOME-QUALIFICATION-20261113.md).
+A portable
 source/evidence/database checkpoint is under `/home/altear/DEV_TEST`; see the
 handover for its exact path and restart constraints. The
 eight-phase export-feature screen records nearly equal M1 CPU but a 13.6%
@@ -74,8 +79,9 @@ preserved million-object database's complete 7,001,423-record integrity pass,
 the native 4,099-object recovery and interruption/corruption resume witnesses,
 and an actual original-Console 128-object crash/recovery/census pass. Extra
 populations and their queued successors were stopped after the operator's scope
-correction. Only the original campaign's expiry cleanup and final censuses
-remain. The read-only helper has its own regression and
+correction. The original campaign's expiry cleanup and final censuses have now
+completed at its frozen binaries, without another population or payload pass.
+The read-only helper has its own regression and
 strict Clippy checks. The 378-test workspace count above predates that helper.
 
 The [MCH throughput measurement](docs/MCH-THROUGHPUT-20261112.md) uses NVMe M1
@@ -107,6 +113,17 @@ passes cold completion recovery, exact readback and purge. These are separate
 results from the original MCH measurements above. They do not extend the
 million-object result to this changed runtime or prove physical power loss.
 
+The [November 13 home qualification](docs/HOME-QUALIFICATION-20261113.md)
+then closes the original campaign's final GC/censuses and tests the newer
+runtime separately. A real both-process-resume test exposed an M1 completion
+recovery gap, now fixed through bounded public N1 status reconciliation.
+The final checkpoint passes **401 default workspace tests**, 29 distinct
+real-service cases across SSD and two HDDs, original Console browser workflows
+and the frozen Console's 45 Node tests. Matched M1-adapter screens retain both
+the adverse first rename tail and the reversed follow-up, per-request samples
+and CPU/RSS. These checks do not qualify physical power loss or substitute for
+the deferred current-candidate four-HDD MCH run.
+
 Performance acceptance remains open. Native M1 has lower mutation latency than
 Procyon on the completed HDD matrix but costs 50.7% more M1 CPU at 1,000 objects.
 The first export candidate's fresh-fixture screen regresses small upload sum
@@ -114,8 +131,9 @@ by 14.1% with nearly equal M1 CPU. The controlled same-database follow-up does
 not reproduce a broad export-worker slowdown: upload sum is 2.3% lower, rename
 effectively unchanged and trash 1.6% higher; M1 CPU is 0.720 / 0.730 s per phase.
 These 100-object phases do not settle saturation or broader performance acceptance.
-Neither a functional pass nor these small populations establishes a new-core
-million-object or Console result. RC.2 remains unreleased.
+These small performance populations do not qualify Console scale or later
+runtime changes. The original owned-M1 million result is separately recorded
+above. RC.2 remains unreleased.
 
 ## M1 owned-storage qualification — November 10–11, 2026
 
