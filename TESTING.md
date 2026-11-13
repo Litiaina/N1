@@ -41,6 +41,13 @@ two-HDD restart/boundary witnesses and four original Console browser workflows.
 Its 400-object matched multipart run improves small-object latency and CPU;
 adverse large-file controls and their follow-up remain separately recorded.
 
+The [concurrent-status/resource report](docs/M1-RESOURCE-RECOVERY-20261114.md)
+reproduces an M1 status lock blockage, verifies its correction under actual
+kernel write delay and records matched idle/active latency. All 425 default
+checks pass; selected SSD, physical-HDD, original Console and short cgroup
+memory-pressure checks pass. Fixture failures and adverse timings remain
+explicit. Hardware power loss and broader final acceptance remain separate.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |

@@ -439,6 +439,18 @@ pub(crate) async fn status(
     durable: bool,
 ) -> ApiResult<serde_json::Value> {
     let lock = app.upload_lock(fragment, version);
+    {
+        let _guard = lock.read().await;
+        let saved = plan(app, fragment, version, durable).await?;
+        if !saved.bridge && saved.acknowledgements_indexed {
+            // Indexed progress is a database snapshot. Parts already hold a
+            // shared lease; observing their last committed ACK must not wait
+            // for a slow client's body or a delayed durability barrier.
+            return status_from_plan(app, fragment, version, durable, saved).await;
+        }
+    }
+    // Reconciliation can change the saved ACK index. Keep its exclusive lease
+    // and reload after upgrading so finalize/cancel/GC cannot cross the query.
     let _guard = lock.write().await;
     status_locked(app, fragment, version, durable).await
 }
@@ -449,6 +461,15 @@ async fn status_locked(
     durable: bool,
 ) -> ApiResult<serde_json::Value> {
     let plan = plan(app, fragment, version, durable).await?;
+    status_from_plan(app, fragment, version, durable, plan).await
+}
+async fn status_from_plan(
+    app: &App,
+    fragment: PoolId,
+    version: &str,
+    durable: bool,
+    plan: Plan,
+) -> ApiResult<serde_json::Value> {
     let pending = app.service.pending(fragment, version, None).await?;
     let mut uploaded = Vec::new();
     if pending.completed {

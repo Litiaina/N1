@@ -42,6 +42,15 @@ two physical HDD witnesses and four original Console browser cases pass.
 The matched small multipart run improves latency and CPU; adverse large-file
 controls remain explicit performance acceptance work.
 
+The [concurrent-status/resource qualification](M1-RESOURCE-RECOVERY-20261114.md)
+then closes an indexed M1 status request waiting behind active part writers.
+The corrected M1 passes an actual private kernel write-delay/restart witness,
+15 selected SSD cases, four physical-HDD cases, four original Console workflows
+and a short real cgroup pressure profile. All 425 default workspace tests pass.
+This covers the recorded local resource profiles; broader sustained saturation,
+physical power loss, final MCH hardware and complete contract/performance
+acceptance remain required.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

@@ -10,6 +10,11 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Allow indexed M1 multipart status to observe committed ACKs while a part
+  body or disk write is still in flight. Keep exclusive reconciliation and
+  lifecycle mutation. Add real kernel I/O-delay, concurrent status and
+  bounded memory-pressure/recovery qualification with N1 unchanged.
+
 - Stream a nonempty single-part M1 upload directly to N1 when it fits the
   native part capacity, preserving client geometry, identity, ACK/GC fences
   and restart recovery. Keep the existing bridge for empty uploads, larger

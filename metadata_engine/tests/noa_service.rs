@@ -60,6 +60,8 @@ mod resume_scale;
 mod single_part;
 #[path = "noa_service/staged_recovery.rs"]
 mod staged_recovery;
+#[path = "noa_service/stalled_io.rs"]
+mod stalled_io;
 #[path = "noa_service/upload_regression.rs"]
 mod upload_regression;
 #[path = "noa_service/upload_size_limits.rs"]
