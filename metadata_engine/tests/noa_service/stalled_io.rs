@@ -15,7 +15,12 @@ async fn wait_for(path: &Path) {
     }
 }
 
-async fn measure_status(client: &Client, route: &str, token: &str, version: &str) -> Value {
+pub(super) async fn measure_status(
+    client: &Client,
+    route: &str,
+    token: &str,
+    version: &str,
+) -> Value {
     let mut elapsed = Vec::new();
     for _ in 0..100 {
         let since = std::time::Instant::now();

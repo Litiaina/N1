@@ -16,6 +16,8 @@ mod accel;
 mod admission;
 #[path = "noa_service/archives.rs"]
 mod archives;
+#[path = "noa_service/bridge_status.rs"]
+mod bridge_status;
 #[path = "noa_service/console_workflows.rs"]
 mod console_workflows;
 #[path = "noa_service/crash_matrix.rs"]

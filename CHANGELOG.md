@@ -10,6 +10,11 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Extend concurrent M1 status queries to read-only staged receipts. Preserve
+  acknowledged-file checks and exclude in-flight temporary files; retain
+  exclusive reconciliation and lifecycle changes. Add a reproduced bridge
+  lock witness and high-resolution process CPU measurements for short queries.
+
 - Allow indexed M1 multipart status to observe committed ACKs while a part
   body or disk write is still in flight. Keep exclusive reconciliation and
   lifecycle mutation. Add real kernel I/O-delay, concurrent status and

@@ -442,10 +442,10 @@ pub(crate) async fn status(
     {
         let _guard = lock.read().await;
         let saved = plan(app, fragment, version, durable).await?;
-        if !saved.bridge && saved.acknowledgements_indexed {
-            // Indexed progress is a database snapshot. Parts already hold a
-            // shared lease; observing their last committed ACK must not wait
-            // for a slow client's body or a delayed durability barrier.
+        if saved.bridge || saved.acknowledgements_indexed {
+            // Native ACK snapshots and bridge receipt/file probes are read
+            // only. Parts already hold a shared lease; observing committed
+            // ACKs must not wait for a body or a delayed durability barrier.
             return status_from_plan(app, fragment, version, durable, saved).await;
         }
     }

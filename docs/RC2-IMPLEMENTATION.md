@@ -51,6 +51,13 @@ This covers the recorded local resource profiles; broader sustained saturation,
 physical power loss, final MCH hardware and complete contract/performance
 acceptance remain required.
 
+The [bridge-status follow-up](M1-BRIDGE-STATUS-20261114.md) then passes the
+equivalent active-body query for staged receipts, retaining file-size checks
+and existing ACK/finalize/GC rules. All 16 selected service cases, two HDD
+witnesses, four original Console workflows and the repeated local kernel-delay
+and memory-pressure profiles pass. Its measured idle tails remain explicit;
+the broader final acceptance conditions above are unchanged.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

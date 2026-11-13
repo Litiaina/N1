@@ -6,6 +6,21 @@ use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 pub(super) fn resources(pid: u32) -> Value {
+    // Short control queries can finish within one /proc accounting tick.
+    // This process CPU clock includes all threads and retains exited-thread
+    // time; summing only currently visible /proc task files would lose it.
+    let cpu_clock_ns = unsafe {
+        let mut clock = 0;
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        if libc::clock_getcpuclockid(pid as libc::pid_t, &mut clock) == 0
+            && libc::clock_gettime(clock, time.as_mut_ptr()) == 0
+        {
+            let time = time.assume_init();
+            Some(time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64)
+        } else {
+            None
+        }
+    };
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let kib = |key: &str| {
         status
@@ -28,7 +43,7 @@ pub(super) fn resources(pid: u32) -> Value {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     json!({"user_seconds":fields[11].parse::<u64>().unwrap() as f64/ticks,
         "system_seconds":fields[12].parse::<u64>().unwrap() as f64/ticks,
-        "rss_kib":kib("VmRSS:"),"peak_rss_kib":kib("VmHWM:")})
+        "rss_kib":kib("VmRSS:"),"peak_rss_kib":kib("VmHWM:"),"cpu_clock_ns":cpu_clock_ns})
 }
 
 pub(super) fn distribution(mut samples: Vec<f64>) -> Value {

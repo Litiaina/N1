@@ -3,7 +3,7 @@
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
 
-fn temporary_parts(staging: &Path, version: &str) -> Vec<PathBuf> {
+pub(super) fn temporary_parts(staging: &Path, version: &str) -> Vec<PathBuf> {
     std::fs::read_dir(staging)
         .unwrap()
         .flat_map(|entry| {

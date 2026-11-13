@@ -48,6 +48,12 @@ checks pass; selected SSD, physical-HDD, original Console and short cgroup
 memory-pressure checks pass. Fixture failures and adverse timings remain
 explicit. Hardware power loss and broader final acceptance remain separate.
 
+The [bridge-status qualification](docs/M1-BRIDGE-STATUS-20261114.md) extends
+read-only status concurrency to staged receipts. The old bridge blockage
+reproduces; all 16 selected service cases, both HDD cases, four original Console
+workflows and repeated kernel-delay/memory-pressure profiles pass. It retains
+matched latency, high-resolution process CPU, RSS and adverse idle tails.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |
