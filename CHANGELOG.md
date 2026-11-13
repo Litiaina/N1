@@ -10,6 +10,10 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Extend explicit N1 object repair to completed, unpublished staging. Reconstruct
+  verified shards in `.uploads/` without publication; retain read-only completed
+  upload retries and require a separate finalize operation.
+
 - Add opt-in M1 multipart size negotiation before LINK Begin, with saved-identity
   reuse across explicit and negotiated callers. Aligned chosen parts stream to
   N1 without an M1 payload spool; explicit geometry and resume remain stable.

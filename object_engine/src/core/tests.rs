@@ -7,6 +7,7 @@ mod integrity;
 mod persistence;
 mod purge;
 mod redundancy;
+mod staged_recovery;
 use super::*;
 
 #[tokio::test]

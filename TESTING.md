@@ -23,6 +23,12 @@ measurements with N1 frozen, Console checks and a separately reproduced native
 staging-recovery limitation. Rejected eager-forwarding implementations remain
 in the private evidence archive, not the selected runtime.
 
+The [completed-staging recovery report](docs/STAGED-RECOVERY-20261114.md)
+reproduces the explicit-repair failure on the frozen N1 and verifies recovery
+without publication on two HDDs. It preserves the original read-only retry
+contract, rejected experiment and matched small/large performance observations.
+Hardware power-loss and remaining release gates are separate.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |

@@ -54,6 +54,8 @@ mod resume_listing;
 mod resume_progress;
 #[path = "noa_service/resume_scale.rs"]
 mod resume_scale;
+#[path = "noa_service/staged_recovery.rs"]
+mod staged_recovery;
 #[path = "noa_service/upload_regression.rs"]
 mod upload_regression;
 #[path = "noa_service/upload_size_limits.rs"]

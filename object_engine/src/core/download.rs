@@ -114,12 +114,27 @@ impl Store {
         pool: Arc<super::storage_pool::Pool>,
         fp: Fingerprint,
     ) -> Result<OpenObject> {
+        self.open_sealed_fingerprint(pool, fp, false).await
+    }
+
+    /// Repair alone may inspect completed, unpublished staging. Ordinary reads
+    /// and retries keep their existing publication and immutability boundaries.
+    pub(crate) async fn open_sealed_fingerprint(
+        &self,
+        pool: Arc<super::storage_pool::Pool>,
+        fp: Fingerprint,
+        staged: bool,
+    ) -> Result<OpenObject> {
         let jobs = (0..pool.layout.width()).map(|shard| {
             let holder = pool.holder(fp, shard as u16);
             let layout = pool.layout.clone();
             blocking(move || {
                 let member = holder?;
-                let path = fp.shard_path(shard as u16);
+                let path = if staged {
+                    fp.staging_path()
+                } else {
+                    fp.shard_path(shard as u16)
+                };
                 let file = match member.open_read(Path::new(&path)) {
                     Ok(file) => file,
                     Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -142,15 +157,19 @@ impl Store {
                 }
                 let mut seal = [0; 96];
                 crate::core::linux_io::pread_exact_at(&*file, &mut seal, header.seal_offset())?;
-                let root =
-                    shard::decode_seal(&header, fp, &seal).map_err(|e| corrupt(e.to_string()))?;
+                let root = if staged {
+                    shard::decode_completion_seal(&header, fp, &seal)
+                } else {
+                    shard::decode_seal(&header, fp, &seal)
+                }
+                .map_err(|e| corrupt(e.to_string()))?;
                 let readable_bytes = file.metadata()?.len();
                 Ok(Some(ShardFile {
                     completion_proof: shard::decode_completion_seal(&header, fp, &seal).is_ok(),
                     member,
                     file,
                     header,
-                    finalized: true,
+                    finalized: !staged,
                     root: Some(root),
                     readable_bytes,
                 }))

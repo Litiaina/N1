@@ -717,6 +717,15 @@ impl Member {
         self.persist_final_parent(fp)?;
         self.retire_empty_stage(fp, true)
     }
+
+    /// Replace incomplete storage only after full EC/root verification. This
+    /// operation never publishes an object into its calculated final location.
+    pub fn publish_staged_repair(&self, fp: Fingerprint, shard: u16) -> Result<()> {
+        let dir = self.directory(Path::new(&format!(".uploads/{fp}")), false, false)?;
+        rfs::renameat(&*dir, format!("repair.s{shard}.tmp"), &*dir, "shard.tmp")?;
+        dir.sync_all()?;
+        self.persist_stage_parent(fp)
+    }
 }
 
 fn open_root(path: &Path) -> Result<File> {

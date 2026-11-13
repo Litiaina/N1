@@ -158,8 +158,10 @@ A separate fault probe also found a real existing recovery limitation: after
 every staged native part is complete, truncating one sealed staging shard can
 make finalize correctly refuse publication while replay is also refused as
 immutable. Nothing incomplete was published. Recovery of this particular
-completed-but-unpublished damaged upload remains a required follow-up; the
-partial-upload-loss pass is not a substitute.
+completed-but-unpublished damaged upload was a required follow-up; the
+partial-upload-loss pass is not a substitute. The later
+[explicit N1 repair qualification](STAGED-RECOVERY-20261114.md) closes this
+specific gap without changing upload retry immutability.
 
 ## Evidence
 

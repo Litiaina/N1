@@ -147,7 +147,14 @@ impl Store {
         let work = control.as_deref().unwrap_or(&manual_control);
         let _guard = lease.state().lifecycle.clone().write_owned().await;
         work.charge(0).await?;
-        let object = self.open_fingerprint(pool.clone(), fp).await?;
+        let (object, staged) = match self.open_fingerprint(pool.clone(), fp).await {
+            Ok(object) => (object, false),
+            Err(Error::NotFound) => (
+                self.open_sealed_fingerprint(pool.clone(), fp, true).await?,
+                true,
+            ),
+            Err(error) => return Err(error),
+        };
         let health = check_health(
             &object,
             &pool.layout,
@@ -242,11 +249,12 @@ impl Store {
             }
             collect(
                 futures_util::future::join_all(files.iter().map(|(_, file, header)| {
-                    let completion_proof = object
-                        .files
-                        .get(usize::from(header.shard))
-                        .and_then(Option::as_ref)
-                        .is_some_and(|file| file.completion_proof);
+                    let completion_proof = staged
+                        || object
+                            .files
+                            .get(usize::from(header.shard))
+                            .and_then(Option::as_ref)
+                            .is_some_and(|file| file.completion_proof);
                     async move {
                         crate::core::linux_io::write_at_async(
                             file.clone(),
@@ -271,7 +279,13 @@ impl Store {
                 futures_util::future::join_all(files.iter().map(|(member, _, header)| {
                     let m = member.clone();
                     let shard = header.shard;
-                    blocking(move || m.publish_repair(fp, shard))
+                    blocking(move || {
+                        if staged {
+                            m.publish_staged_repair(fp, shard)
+                        } else {
+                            m.publish_repair(fp, shard)
+                        }
+                    })
                 }))
                 .await,
             )?;
