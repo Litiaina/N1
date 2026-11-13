@@ -1,6 +1,6 @@
 //! A single metadata snapshot selects immutable versions into a bounded HDD
 //! manifest. Renames and subsequent head updates cannot change a captured job.
-use super::{DownloadArchiveRequest, models::ExportManifestEntry};
+use super::{DownloadArchiveRequest, length::ManifestSummary, models::ExportManifestEntry};
 use crate::{Error, MetadataEngine, Result, namespace::Namespace};
 use std::{collections::BTreeSet, io::Write, path::Path};
 pub(super) fn validate_archive_path(path: &str) -> Result<()> {
@@ -25,7 +25,7 @@ pub(super) fn capture_with_cancel(
     request: &DownloadArchiveRequest,
     path: &Path,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<(u64, u64)> {
+) -> Result<ManifestSummary> {
     let id = n1_link::PoolId(
         ulid::Ulid::from_string(fragment)
             .map_err(|_| Error::Invalid("invalid export fragment".into()))?
@@ -41,7 +41,7 @@ pub(super) fn capture_with_cancel(
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = std::io::BufWriter::new(options.open(&temp)?);
-    let (mut count, mut bytes) = (0u64, 0u64);
+    let mut summary = ManifestSummary::default();
     let normalize = |s: &str| -> Result<String> {
         let s = crate::namespace::paths::normalize_path(s)
             .map_err(|e| Error::Invalid(e.to_string()))?;
@@ -97,10 +97,7 @@ pub(super) fn capture_with_cancel(
             .map_err(|_| Error::Invalid("cannot encode export manifest".into()))?;
         file.write_all(&line)?;
         file.write_all(b"\n")?;
-        count += 1;
-        bytes = bytes
-            .checked_add(entry.size_bytes)
-            .ok_or_else(|| Error::Invalid("export source size overflow".into()))?;
+        summary.record(&entry)?;
         Ok(())
     };
     for key in &request.keys {
@@ -184,7 +181,7 @@ pub(super) fn capture_with_cancel(
             .ok_or_else(|| Error::Invalid("manifest has no parent".into()))?,
     )?
     .sync_all()?;
-    Ok((count, bytes))
+    Ok(summary)
 }
 
 /// The NOA manifest is newline-delimited keys, optionally VERSION<TAB>KEY.
@@ -196,7 +193,7 @@ pub(super) fn capture_lines(
     input: &Path,
     path: &Path,
     cancelled: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
+) -> Result<ManifestSummary> {
     use std::io::{BufRead, Read};
     let id = n1_link::PoolId(
         ulid::Ulid::from_string(fragment)
@@ -219,6 +216,7 @@ pub(super) fn capture_lines(
     let mut output = std::io::BufWriter::new(options.open(&temporary)?);
     let mut input = std::io::BufReader::new(std::fs::File::open(input)?);
     let mut line = Vec::with_capacity(8192);
+    let mut summary = ManifestSummary::default();
     loop {
         if cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Closed);
@@ -264,6 +262,7 @@ pub(super) fn capture_lines(
         serde_json::to_writer(&mut output, &entry)
             .map_err(|_| Error::Invalid("cannot encode archive manifest".into()))?;
         output.write_all(b"\n")?;
+        summary.record(&entry)?;
     }
     output.flush()?;
     output.get_ref().sync_all()?;
@@ -274,5 +273,5 @@ pub(super) fn capture_lines(
             .ok_or_else(|| Error::Invalid("manifest has no parent".into()))?,
     )?
     .sync_all()?;
-    Ok(())
+    Ok(summary)
 }

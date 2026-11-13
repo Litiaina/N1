@@ -35,6 +35,101 @@ async fn direct_stage_open_is_existing_only_and_checks_inode_and_flags() {
 }
 
 #[tokio::test]
+async fn sparse_upload_retry_preserves_written_frames_after_an_interrupted_part() {
+    interrupted_part(4096, 3 * 1024 * 1024).await;
+}
+
+#[tokio::test]
+async fn sparse_large_parts_preserve_restart_holes_and_conflicting_retries() {
+    interrupted_part(262144, 12 * 1024 * 1024).await;
+}
+
+async fn interrupted_part(block_bytes: u32, part_bytes: usize) {
+    for durability in [Durability::Standard, Durability::Durable] {
+        let mut fixture = Fixture::new();
+        fixture.layout.block_bytes = block_bytes;
+        let store = fixture.enroll();
+        let data = source(2 * part_bytes);
+        let init = store
+            .init(
+                SCOPE,
+                0,
+                data.len() as u64,
+                part_bytes as u64,
+                durability,
+                3600,
+            )
+            .await
+            .unwrap();
+        // Several complete frame groups precede the truncated input. The
+        // interrupted part therefore contains real records followed by holes.
+        assert!(
+            store
+                .write_part(
+                    SCOPE,
+                    init.object_key.clone(),
+                    0,
+                    std::io::Cursor::new(data[..part_bytes / 2].to_vec()),
+                )
+                .await
+                .is_err()
+        );
+        drop(store);
+        let store = fixture.reopen();
+        // Unwritten sparse ranges are not acknowledged parts and cannot make
+        // an interrupted upload appear complete after a restart.
+        let status = store
+            .upload_status(SCOPE, init.object_key.clone(), 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(status.missing_parts, vec![0, 1]);
+        assert!(
+            store
+                .finalize(SCOPE, init.object_key.clone())
+                .await
+                .is_err()
+        );
+        let mut conflicting = data[..part_bytes].to_vec();
+        conflicting[0] ^= 1;
+        assert!(matches!(
+            store
+                .write_part(
+                    SCOPE,
+                    init.object_key.clone(),
+                    0,
+                    std::io::Cursor::new(conflicting)
+                )
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        // Fill the other part first, then resume the partially written range.
+        // Extent queries must not hide either existing records or their bytes.
+        for part in [1, 0] {
+            let start = part * part_bytes;
+            store
+                .write_part(
+                    SCOPE,
+                    init.object_key.clone(),
+                    part as u64,
+                    std::io::Cursor::new(data[start..start + part_bytes].to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .finalize(SCOPE, init.object_key.clone())
+            .await
+            .unwrap();
+        let (download, _) = store
+            .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(download, data);
+        store.delete(SCOPE, init.object_key).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn direct_multipart_preserves_shared_boundary_pages_retries_and_restart() {
     for writer_buffer_size in [0, 4096, 12288] {
         let fixture = Fixture::new();

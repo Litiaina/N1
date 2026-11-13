@@ -539,14 +539,18 @@ implements the main fragment, namespace, upload, versioned-read and export
 paths, with integration and original-console tests. It is **not yet a full
 NOA v1 conformance pass**. Specific remaining differences include:
 
-- Retained export artifact expiry/cleanup, disk accounting and restart admission
-  still require completion and qualification. Direct ZIP64/TAR and streamed TAR
-  manifest routes are implemented; their bounded-worker, disconnect, process-crash
-  cleanup and source-failure tests are separate from retained artifact lifecycle.
-- Named native responses without a known content length retain the 8 MiB
-  control-response bound. Large native archive consumers use the export-job
-  download path, whose durable artifact has a known length. Unbounded direct
-  archive streaming is not implied by registration of a native operation name.
+- Retained export artifact expiry/cleanup, transactional disk accounting and
+  restart admission are implemented with service coverage. Final-candidate
+  performance/contract acceptance remains tracked in the completion checklist.
+  Direct ZIP64/TAR and streamed TAR-manifest bounded-worker, disconnect,
+  process-crash cleanup and source-failure tests are separate from that lifecycle.
+- Direct named-native ZIP64/TAR and TAR-manifest archives compute their exact
+  length during immutable manifest capture and stream bytes after the response
+  frame. Their payload is not subject to the 8 MiB control-frame bound. Final
+  bytes follow source verification and pin/manifest cleanup; a partial exchange
+  requires reconnecting. Other unknown-length control responses remain bounded.
+  See the [MCH qualification](docs/MCH-OPTIMIZATION-20261113.md) for the >9 MiB
+  regression, old-binary reproduction and candidate coverage.
 - Request/response fields, permissions, errors and retry semantics require the
   complete contract campaign. Named request quotas and configured optional Accel
   search/read now have scoped HTTP/native integration tests, not a blanket

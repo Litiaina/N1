@@ -58,6 +58,110 @@ async fn no_archive_residue(stack: &mut Stack) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated N1 and M1 processes with physical fixture roots"]
+async fn native_archives_stream_beyond_control_limit_and_finish_cleanup() {
+    let mut stack = Stack::with_block_bytes(262144).await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .unwrap();
+    let base = format!("{}/noa/v1", stack.url);
+    let (_, token, _) = maintenance::auth(&client, &base, "native-archives").await;
+    let data = (0..9 * 1024 * 1024 + 17)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    json_response(
+        client
+            .post(format!("{base}/upload/one-shot/source.bin"))
+            .bearer_auth(&token)
+            .body(data.clone())
+            .send()
+            .await
+            .unwrap(),
+        201,
+    )
+    .await;
+    let path = format!("nested/{}/file.bin", "星".repeat(70));
+    let expected = BTreeMap::from([(path.clone(), data.clone())]);
+    for format in ["tar", "zip"] {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", stack.native))
+            .await
+            .unwrap();
+        assert!(
+            native(&mut socket, "auth.bearer", json!({"token":token}), None)
+                .await
+                .0
+                .ok
+        );
+        let started = std::time::Instant::now();
+        let (response, bytes) = native(
+            &mut socket,
+            "object.archive",
+            json!({"entries":[{"object_key":"source.bin","archive_path":path}],"format":format}),
+            None,
+        )
+        .await;
+        assert!(response.ok);
+        assert_eq!(response.status, Some(200));
+        assert!(bytes.len() > 8 * 1024 * 1024);
+        assert_eq!(response.body_len, Some(bytes.len() as u64));
+        let elapsed = started.elapsed().as_secs_f64();
+        reliability::record(
+            &stack.root.join(format!("native-archive-{format}.json")),
+            &json!({"format":format,"source_bytes":data.len(),"archive_bytes":bytes.len(),
+                "stream_seconds":elapsed,"stream_mib_s":bytes.len() as f64 / 1048576.0 / elapsed,
+                "includes_capture_verification_and_cleanup":true}),
+        );
+        let actual = if format == "tar" {
+            unpack_tar(&bytes).await
+        } else {
+            unpack_zip(bytes).await
+        };
+        assert_eq!(actual, expected);
+        // The same connection remains aligned after the streamed body.
+        assert!(
+            native(
+                &mut socket,
+                "namespace.stat",
+                json!({"path":"source.bin"}),
+                None
+            )
+            .await
+            .0
+            .ok
+        );
+        drop(socket);
+        // A completed body must have released pins and durable cleanup intents,
+        // even if M1 is killed immediately instead of being allowed idle time.
+        no_archive_residue(&mut stack).await;
+    }
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", stack.native))
+        .await
+        .unwrap();
+    assert!(
+        native(&mut socket, "auth.bearer", json!({"token":token}), None)
+            .await
+            .0
+            .ok
+    );
+    let (response, bytes) = native(
+        &mut socket,
+        "object.archive_manifest",
+        json!({"format":"tar"}),
+        Some(b"source.bin\n"),
+    )
+    .await;
+    assert_eq!(response.status, Some(200));
+    assert_eq!(response.body_len, Some(bytes.len() as u64));
+    assert_eq!(
+        unpack_tar(&bytes).await,
+        BTreeMap::from([("source.bin".into(), data)])
+    );
+    drop(socket);
+    no_archive_residue(&mut stack).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated N1 and M1 processes with physical fixture roots"]
 async fn selected_and_manifest_archives_preserve_versions_formats_permissions_and_cleanup() {
     let mut stack = Stack::new().await;
     let client = Client::builder()

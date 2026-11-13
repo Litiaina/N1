@@ -37,8 +37,10 @@ fn process(pid: u32) -> Result<Value> {
             .trim()
             .parse()?)
     };
+    let user = fields[11].parse::<u64>()? as f64 / ticks;
+    let system = fields[12].parse::<u64>()? as f64 / ticks;
     Ok(
-        json!({"pid":pid,"start_ticks":fields[19],"cpu_seconds":(fields[11].parse::<u64>()?+fields[12].parse::<u64>()?) as f64/ticks,
+        json!({"pid":pid,"start_ticks":fields[19],"cpu_seconds":user+system,"user_seconds":user,"system_seconds":system,
         "rss_kib":kib("VmRSS:")?,"lifetime_peak_rss_kib":kib("VmHWM:")?,"swap_kib":kib("VmSwap:")?,
         "read_bytes":counter("read_bytes:")?,"write_bytes":counter("write_bytes:")?}),
     )
@@ -96,6 +98,8 @@ impl Measure {
             let cpu =
                 after["cpu_seconds"].as_f64().unwrap() - before["cpu_seconds"].as_f64().unwrap();
             processes.insert(name,json!({"cpu_seconds":cpu,"cpu_percent_of_one_core":cpu/seconds*100.0,
+                "user_seconds":after["user_seconds"].as_f64().unwrap()-before["user_seconds"].as_f64().unwrap(),
+                "system_seconds":after["system_seconds"].as_f64().unwrap()-before["system_seconds"].as_f64().unwrap(),
                 "sampled_peak_rss_kib":peak.get(name).copied().unwrap_or(0).max(before["rss_kib"].as_u64().unwrap()).max(after["rss_kib"].as_u64().unwrap()),
                 "read_bytes":after["read_bytes"].as_u64().unwrap().saturating_sub(before["read_bytes"].as_u64().unwrap()),
                 "write_bytes":after["write_bytes"].as_u64().unwrap().saturating_sub(before["write_bytes"].as_u64().unwrap()),"before":before,"after":after}));

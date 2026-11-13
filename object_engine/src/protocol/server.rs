@@ -2,6 +2,7 @@
 //! or Response. Declared object bytes follow outside the control frame.
 mod download;
 pub mod startup;
+mod upload;
 use crate::{
     core::{Error, Result},
     middleware::auth_middleware::Claims,
@@ -317,6 +318,19 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             .await?;
                             return Ok(());
                         }
+                        if let Command::UploadPart { object_key, offset } = command {
+                            socket = upload::stream(
+                                socket,
+                                service.clone(),
+                                id,
+                                claims.clone(),
+                                object_key,
+                                offset,
+                                request.body_len,
+                            )
+                            .await?;
+                            continue;
+                        }
                         let (reader, mut writer) = tokio::io::duplex(256 * 1024);
                         let service = service.clone();
                         let claims = claims.clone();
@@ -382,20 +396,31 @@ async fn feed_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut accepted = true;
     while remaining > 0 {
         let take = (remaining as usize).min(buffer.len());
-        let read = tokio::time::timeout(Duration::from_secs(30), reader.read(&mut buffer[..take]))
+        // TLS commonly returns one 16 KiB record per read. Accumulate into
+        // the existing bounded buffer before waking the owned upload task;
+        // forwarding every record needlessly alternates producer/consumer.
+        // Reset the idle deadline on each successful read, not each full chunk.
+        let mut filled = 0;
+        while filled < take {
+            let read = tokio::time::timeout(
+                Duration::from_secs(30),
+                reader.read(&mut buffer[filled..take]),
+            )
             .await
             .map_err(|_| Error::Unavailable("native upload stalled".into()))??;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "incomplete native upload body",
-            )
-            .into());
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete native upload body",
+                )
+                .into());
+            }
+            filled += read;
         }
-        if accepted && writer.write_all(&buffer[..read]).await.is_err() {
+        if accepted && writer.write_all(&buffer[..filled]).await.is_err() {
             accepted = false;
         }
-        remaining -= read as u64;
+        remaining -= filled as u64;
     }
     Ok(())
 }

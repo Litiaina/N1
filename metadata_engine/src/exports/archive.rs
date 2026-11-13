@@ -156,7 +156,7 @@ async fn start(
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), progress.clone());
     let (ready_tx, ready_rx) = oneshot::channel();
-    let (error_tx, mut error_rx) = tokio::sync::mpsc::channel(1);
+    let (completion_tx, completion_rx) = oneshot::channel();
     let (reader, writer) = tokio::io::duplex(256 * 1024);
     let worker_format = format.clone();
     let task = tokio::spawn(async move {
@@ -180,9 +180,11 @@ async fn start(
             .await
         }
         .await;
-        if let Err(error) = cleanup(&id).await {
+        let cleaned = cleanup(&id).await;
+        if let Err(error) = &cleaned {
             tracing::error!(%id, %error, "archive cleanup intent retained");
         }
+        let result = result.and(cleaned);
         ctx.jobs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -192,11 +194,12 @@ async fn start(
         if let Err(error) = result {
             if let Some(ready) = ready.take() {
                 let _ = ready.send(Err(error));
+                let _ = completion_tx.send(Ok(()));
             } else {
-                let _ = error_tx
-                    .send(std::io::Error::other(error.to_string()))
-                    .await;
+                let _ = completion_tx.send(Err(std::io::Error::other(error.to_string())));
             }
+        } else {
+            let _ = completion_tx.send(Ok(()));
         }
     });
     {
@@ -204,21 +207,21 @@ async fn start(
         tasks.retain(|t| !t.is_finished());
         tasks.push(task);
     }
-    ready_rx
+    let content_length = ready_rx
         .await
         .map_err(|_| ApiError::invalid("archive worker stopped"))??;
-    let stream = tokio_util::io::ReaderStream::new(reader)
-        .chain(futures_util::stream::once(async move {
-            match error_rx.recv().await {
-                Some(error) => Err(error),
-                None => Ok(bytes::Bytes::new()),
-            }
-        }))
-        .map(move |chunk| {
-            let _keep = &guard;
-            chunk
-        });
+    let stream = super::archive_stream::completed_stream(reader, completion_rx).map(move |chunk| {
+        let _keep = &guard;
+        chunk
+    });
     let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        "content-length",
+        content_length
+            .to_string()
+            .parse()
+            .expect("u64 content length"),
+    );
     response.headers_mut().insert(
         "content-type",
         if format == "tar" {
@@ -292,7 +295,7 @@ async fn build(
     format: &str,
     selection: Selection,
     progress: Arc<ActiveProgress>,
-    ready: &mut Option<oneshot::Sender<ApiResult<()>>>,
+    ready: &mut Option<oneshot::Sender<ApiResult<u64>>>,
     writer: tokio::io::DuplexStream,
 ) -> ApiResult<()> {
     let ctx = store::context();
@@ -307,13 +310,13 @@ async fn build(
     let path = store::manifest_path(id)?;
     let identity = fragment.to_owned();
     let cancelled = progress.cancel.clone();
-    match selection {
+    let summary = match selection {
         Selection::Json(request) => {
             ctx.db
                 .execute(move |db| {
                     capture::capture_with_cancel(&db, &identity, &request, &path, Some(&cancelled))
                 })
-                .await?;
+                .await?
         }
         Selection::Lines(body) => {
             let input = spool(id, body, &cancelled).await?;
@@ -321,13 +324,13 @@ async fn build(
                 .execute(move |db| {
                     capture::capture_lines(&db, &identity, &input, &path, &cancelled)
                 })
-                .await?;
+                .await?
         }
-    }
+    };
     if ready
         .take()
         .expect("single ready response")
-        .send(Ok(()))
+        .send(Ok(summary.archive_bytes(format)))
         .is_err()
     {
         return Err(ApiError::invalid("archive client disconnected"));

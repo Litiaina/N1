@@ -176,7 +176,12 @@ Unconfigured Accel reads bypass request-header preparation.
 Direct archives share the retained export worker,
 queue and buffer budgets, pin immutable versions and hold only a bounded stream
 in memory. M1 owns temporary manifests and recovery cleanup intents; these add
-no records to N1's shard layout.
+no records to N1's shard layout. During capture, a constant-size summary counts
+the retained stored ZIP64/GNU TAR framing. Direct HTTP and named-native archives
+therefore stream with an exact Content-Length without materializing another
+archive or reading payloads to determine its size. The final bounded chunk waits
+for source verification and pin/manifest cleanup; a late failure cannot complete
+a successful response merely because all declared bytes have already arrived.
 
 Retained archives reserve their worst-case stored size through a transactional
 M1 byte counter before materialization, then charge their actual size when
@@ -337,6 +342,13 @@ frame positions and checksums stay unchanged. Original data and codec parity fee
 framing directly. Codec workspaces are initialized only when that operation
 needs them.
 
+Large-upload frames are assembled directly in the aligned output buffers.
+Canonical frame headers checksum the borrowed payload before it is copied into
+that output; no intermediate full-payload record or payload zero-fill is needed.
+The two encoder/I/O turns stay within the existing admission budget, and each
+member carries less than one page between turns. Checksums and on-disk bytes
+are identical to the contiguous frame encoder used by the other paths.
+
 For objects of at least 1 MiB, complete pages stream through an existing-only
 `O_DIRECT` descriptor on the same staging inode. The writer reuses ECS's aligned
 buffer and the owned I/O backend, carrying a partial page between groups. Only
@@ -346,6 +358,25 @@ cannot overwrite each other's boundary bytes. This needs no format change,
 read-modify-write, sidecar or extra persistence barrier. Direct-open/write errors
 fail the request; there is no buffered replay after an I/O error. File-data and
 publication persistence still precede the same acknowledgements.
+
+When opening a large part's checked direct descriptor, the writer captures one
+filesystem-reported sparse interval under that part's exclusive lock. Groups
+wholly inside that interval have no old frames to read or compare. Written
+retry regions retain checksum and byte comparisons; other parts cannot change
+this part's frame bytes. Unsupported extent queries use the ordinary reader,
+while actual I/O errors fail the request. The interval state is bounded by pool
+width and introduces no persistent index or new file format.
+
+Native multipart uploads keep the socket in the engine's activity-owned worker,
+as native downloads do. The encoder reads the bounded request body directly;
+no relay task or duplex body copy is required. Sender deadlines apply only to
+pending network reads, excluding disk/admission time. A rejected part drains
+exactly its remaining body before the next control frame. Caller cancellation
+cannot release the shard lease while owned I/O is still active.
+
+Normal and batch native requests retain their bounded body relay. Its receive
+loop coalesces transport fragments into the existing 128 KiB handoff buffer,
+preserving exact tails, rejection draining and progress-based idle deadlines.
 
 Smaller objects retain buffered writes. For a new buffered partial tail, known zero padding can remain sparse; its
 logical bytes, positions and checksums are identical to a fully written record.

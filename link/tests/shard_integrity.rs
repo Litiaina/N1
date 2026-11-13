@@ -70,6 +70,48 @@ fn sparse_holes_torn_writes_wrong_offsets_and_foreign_objects_fail() {
 }
 
 #[test]
+fn appended_frames_preserve_prefix_and_clear_reused_header_bytes() {
+    let (pool, plan, _, fp) = setup();
+    for format in [
+        n1_link::ShardFormat::Sha256V1,
+        n1_link::ShardFormat::Crc32cSha256V2,
+    ] {
+        let pool = PoolLayout {
+            shard_format: format,
+            ..pool.clone()
+        };
+        let h = ShardHeader::new(&pool, plan, 0).unwrap();
+        let frame_bytes = FRAME_HEADER_BYTES + h.block_bytes as usize;
+        let prefix = [0x7d; 37];
+        let mut buffer = vec![0xff; prefix.len() + 3 * frame_bytes];
+        buffer.clear();
+        buffer.extend_from_slice(&prefix);
+        for stripe in 0..h.stripes() {
+            let payload = vec![stripe as u8 + 1; h.block_bytes as usize];
+            let source = vec![stripe as u8 + 1; h.source_bytes_in_stripe(stripe).unwrap() as usize];
+            let hash = h.source_hash(fp, stripe, &source).unwrap();
+            append_frame(&h, fp, stripe, hash, &payload, &mut buffer).unwrap();
+        }
+        assert_eq!(&buffer[..prefix.len()], prefix);
+        for stripe in 0..h.stripes() {
+            let start = prefix.len() + stripe as usize * frame_bytes;
+            let bytes = &buffer[start..start + frame_bytes];
+            let decoded = decode_frame(&h, fp, stripe, bytes).unwrap();
+            assert_eq!(
+                encode_frame_header(&h, fp, stripe, decoded.source_hash, decoded.payload).unwrap(),
+                bytes[..FRAME_HEADER_BYTES]
+            );
+            assert!(decoded.payload.iter().all(|b| *b == stripe as u8 + 1));
+            assert_eq!(&bytes[22..24], &[0; 2]);
+            assert_eq!(&bytes[88..96], &[0; 8]);
+            if format == n1_link::ShardFormat::Crc32cSha256V2 {
+                assert_eq!(&bytes[60..88], &[0; 28]);
+            }
+        }
+    }
+}
+
+#[test]
 fn final_seals_are_bound_to_full_header_and_object_identity() {
     let (_, _, h, fp) = setup();
     let root = [5; 32];

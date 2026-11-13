@@ -142,15 +142,24 @@ MCH topology and physical power-loss gates.
 
 | Area | Remaining work / acceptance condition |
 | --- | --- |
-| Full NOA v1 surface | Direct archive/manifest routes are implemented. Complete field-level responses, permissions, errors and retry qualification against the original standard. Known-length native artifact downloads stream; unknown-length direct archive responses retain the native 8 MiB control bound. Scoped GC/healing/migration have explicit physical and browser coverage in the maintenance qualification. Registered route names alone are insufficient. |
+| Full NOA v1 surface | Direct archive/manifest routes are implemented. Native ZIP64/TAR/manifest responses now stream with a length calculated during immutable metadata capture; the >8 MiB failure reproduces on the old binary and passes on the corrected M1, including cleanup and existing archive faults. See [MCH continuation](MCH-OPTIMIZATION-20261113.md). Complete field-level responses, permissions, errors and retry qualification against the original standard remain required. Scoped GC/healing/migration have explicit physical and browser coverage. Registered route names alone are insufficient. |
 | Export lifecycle | Indexed TTL cleanup, transactional retained-byte reservations and bounded restart admission are implemented. Four new real-process lifecycle/error-isolation cases and the existing service checks pass on MCH (21 total). The home's eight-phase same-database screen records nearly equal M1 CPU but a 13.6% higher candidate upload mean with substantial phase variation; performance acceptance remains open. See the November 11 handover and split-node report. |
 | Named-service recovery | Full metadata/staging loss, verified snapshot restore, named history/permissions/resume and metadata/object/both process crashes pass on two local HDDs. The current-finalization integration exposed lost volatile completion after a partial-upload restart; M1 now performs narrowly triggered, byte/part-bounded public status reconciliation and one retry. Four real resume cases and the ten current two-HDD reliability cases pass; see [home qualification](HOME-QUALIFICATION-20261113.md). Preserve the documented operator pause; independent live captures are not an atomic cross-service snapshot. Qualify host power loss and additional crash points separately. |
-| Metadata request quotas | Implemented and locally checked across HTTP/native, token changes and spoofed forwarding headers. Qualify final-candidate defaults, sustained overload, idle bucket reclamation, TLS/proxy deployment and impact on the MCH workload. Do not infer coverage from object-engine middleware. |
-| Optional Accel | Real Accel integration and fault-response checks are implemented. Qualify deployment TLS/CA configuration, sustained load, restart and the complete conditional/range/header matrix; preserve authoritative M1 resolution and fallback rules. |
+| Metadata request quotas | Shared HTTP/native mixed overload passes on MCH with 16 workers, exact budget checks and every ACK verified after both processes restart; the real 60-second idle-bucket cleanup also passes. Matched on/off performance samples are retained. Final deployment defaults, proxy policy and broader saturation/maintenance impact remain separate. Do not infer coverage from object-engine middleware. |
+| Optional Accel | Real integration and fault-response checks are implemented. The November 13 MCH witness additionally passes real private-CA HTTPS, untrusted-CA/wrong-host rejection, 64 concurrent pinned reads and Accel restart using process-local CA trust. Broader sustained load and the complete conditional/range/header matrix remain separate; preserve authoritative M1 resolution and fallback rules. |
 | Console and administration | The November 13 home qualification passes operator master-key authorization, metadata backup/list/download/restore, original upload workflows and four live browser cases, plus 45 tests of the unchanged Console. Full contract/administration coverage and deployment/load acceptance remain separate; these scoped passes are not complete feature parity. |
 | End-to-end population | Historical Procyon-backed API M1 → N1 passed one million objects at `8dbba32`. The original owned-M1 split-node million campaign now also passes every required phase, including final automatic GC and exact censuses. Later runtime changes, original Console and standalone-only scale qualification retain separate gates; no replacement campaigns are running or queued. |
 | Broader storage qualification | Four distinct MCH HDDs pass 3+1 and 2+2: all 24 loss combinations through the first count beyond parity, corruption/exact repair, beyond-parity refusal and sequential replacement after one/two simultaneous losses. The final connected-blank-target rerun and encrypted backup/service-identity witness both pass. A separate home profile places N1 on two HDDs and M1 on another host's DATA_SSD; see `SPLIT-NODE-20261111.md`. Hardware power loss remains separate. |
 | Matched performance | The current key lifecycle record links original-NCX, previous-LINK and pre-optimization key-only ABBA benchmarks, plus standalone batch/multipart/concurrent upload. Record CPU/RSS, latency, throughput, allocation and every individual large-object sample. Begin now persists with the first durable payload by operator choice; a Rust reopen/readback probe verifies speculative XFS EOF allocation is gone. Earlier regressions remain in their original reports. Mixed and focused large-object results must both be reported; no universal performance claim follows. November 8 records sustained named-pipeline population metrics, not a matched old/new comparison. Matched named-pipeline, saturation and MCH tail-latency acceptance remain open. |
+
+The [November 13 home standalone continuation](HOME-OPTIMIZATION-20261113.md)
+records the subsequent N1 copy-removal candidate, compiler-matched 15 GiB
+comparisons on SSD 1+0 and physical HDD 1+1, expanded small-object/read controls
+and an attached 100 GiB pass with full SHA-256 readback and zero-residue purge.
+Observed large-upload CPU cost falls; HDD throughput stays near its LINK
+reference. Adverse small tails remain recorded. Its exact N1 checkpoint is held
+fixed for M1 profiling; it does not close the final MCH, saturation or hardware
+power-loss gates.
 
 The November 7 preparation screen and controlled local follow-up are recorded
 in [TESTING.md](../TESTING.md). The initial ABBA screen measured 14.1% more small
@@ -173,6 +182,28 @@ same-object warm and file-cache-advised read replays do not reproduce an earlier
 mixed-workload throughput loss, but retain M1 CPU overhead and every adverse
 sample. These results do not close the deferred current-candidate MCH,
 saturation, physical power-loss or remaining contract/scale gates.
+
+The [November 13 MCH optimization continuation](MCH-OPTIMIZATION-20261113.md)
+qualifies the sparse-write shortcut separately: 218 N1 library cases, physical
+direct-I/O proof, renewed four-HDD 3+1/2+2 faults, 32 matched large uploads,
+1,536 small lifecycle samples and 32 fixed-object verified GETs. The corrected
+M1 native archive case, 34 selected real-service/Console cases, 407 default
+workspace tests, mixed HTTP/native overload with post-crash ACK readback,
+idle-quota cleanup and private-CA Accel HTTPS also pass. Matched M1 and named
+pipeline measurements are complete, with adverse samples retained. A balanced
+HDD 1+1 confirmation reproduces an 8.21% sparse-only upload regression. Subsequent
+allocation-window and larger-buffer experiments are rejected and removed.
+The current sparse/receive candidate passes 222 N1 library tests, five physical
+direct-I/O cases and renewed four-HDD faults. Its separate 32-large/1,536-small
+matched matrix improves aggregate upload throughput in all five groups, but
+retains higher four-HDD CPU time and some adverse small-object tails. Scoped
+counters show fewer cycles/instructions at lower CPU frequency; strict
+CPU-time/tail acceptance remains open. The exact current candidate subsequently
+passes 36 selected public-service/Console cases, 411 default workspace tests and
+strict workspace/all-target Clippy, with all 349 Rust source files matching the
+workstation manifest. Incompatible M1 multipart geometry retains its measured
+staging-copy cost. These results do not qualify the rejected experiments,
+repeat the prior million population or establish physical power-loss resilience.
 
 ## Fixed boundaries
 

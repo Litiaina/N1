@@ -1,5 +1,7 @@
 //! Real socket tests, with RAM-backed functional members. The product never
 //! relaxes its independent-filesystem enrollment guard for these fixtures.
+#[path = "tests/body.rs"]
+mod body;
 use crate::{
     core::tests::Fixture,
     middleware::auth_middleware::Auth,

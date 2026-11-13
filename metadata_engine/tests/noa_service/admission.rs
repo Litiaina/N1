@@ -1,5 +1,7 @@
 //! Operator quotas must be shared across HTTP/native and token rotations.
 use super::*;
+#[path = "admission/overload.rs"]
+mod overload;
 
 fn policy(stack: &Stack, enabled: bool, auth: u32) {
     let path = stack.root.join("m1_config.ini");

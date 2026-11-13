@@ -101,6 +101,12 @@ async fn run(args: &Args) -> Result<()> {
     if !(1..=5).contains(&config.repeats) {
         return Err("repeats must be 1..=5".into());
     }
+    if config.object_pid == 0
+        || config.metadata_pid == 0
+        || config.object_pid == config.metadata_pid
+    {
+        return Err("named measurements require distinct running N1 and M1 process IDs".into());
+    }
     let url = reqwest::Url::parse(&config.url)?;
     if !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) || url.scheme() != "https" {
         return Err("benchmark must target the isolated loopback TLS M1".into());
@@ -121,7 +127,10 @@ async fn run(args: &Args) -> Result<()> {
         ("M1", config.metadata_pid),
         ("interactive_Console", config.console_pid),
         ("client", std::process::id()),
-    ];
+    ]
+    .into_iter()
+    .filter(|(_, pid)| *pid != 0)
+    .collect::<Vec<_>>();
     let source = block();
     let mut hash = Sha256::new();
     for _ in 0..1024 {

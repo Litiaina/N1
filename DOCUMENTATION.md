@@ -388,8 +388,18 @@ URL to disable that integration; backend IDs default to `n1-primary`. M1 verifie
 permissions and resolves the version before using Accel. Failed read headers or
 invalid response geometry fall back to N1; a failed body ends the download.
 Search requires the optional accelerator and returns 503 when unavailable.
-HTTPS uses the host trust store; private-CA deployment remains a qualification
-gate and certificate verification is never disabled.
+HTTPS uses the host trust store. The qualified Linux M1 build also accepts a
+private CA bundle through its **process/service environment**:
+
+```sh
+SSL_CERT_FILE=/etc/litiaina/accel-ca.pem ./litiaina-m1 serve --config /etc/litiaina/m1_config.ini
+```
+
+This setting belongs in the service environment; putting `SSL_CERT_FILE` only
+inside `m1.env` does not export it to the TLS library. Keep certificate and
+hostname verification enabled. The [MCH TLS witness](docs/MCH-OPTIMIZATION-20261113.md)
+checks trusted/untrusted CAs, wrong hostnames, concurrent pinned reads and actual
+Accel restart without changing the global trust store.
 
 Direct `/noa/v1/objects/archive` accepts selected keys/entries in JSON. Prefixes,
 `export_all` or more than 1,000 explicit entries choose TAR. JSON selection bodies
@@ -398,10 +408,13 @@ are bounded to 4 MiB. For larger inventories, POST newline-delimited keys to
 `VERSION<TAB>KEY` pins a historical version. Manifest lines are limited to 8 KiB;
 TAR capture uses a disk spool and one metadata snapshot rather than retaining the
 whole inventory in RAM. These requests share `[export]` worker/queue and buffer
-admission. Export expiry prevents later downloads, but background retained-artifact
-cleanup and `max_retained_bytes` enforcement are still unimplemented RC.2 gates.
-For large named native archives, use export creation/status/download; its known
-artifact length supports raw streaming beyond the 8 MiB control-response bound.
+admission. Retained export jobs use indexed expiry, transactional retained-byte
+reservations, download leases and restart cleanup; the
+[qualification checklist](docs/RC2-IMPLEMENTATION.md) tracks final acceptance.
+Direct named-native ZIP64/TAR and TAR-manifest archives also stream beyond the
+8 MiB control-frame bound: M1 counts framing bytes during immutable manifest
+capture, then streams the retained writer's output with an exact length. The
+last chunk waits for source verification and pin/manifest cleanup.
 
 There is no configured total-object size cap by default. In N1's
 `n1_config.ini` and M1's `m1_config.ini`, omit `max_file_size` or set:

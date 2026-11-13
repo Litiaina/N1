@@ -252,7 +252,7 @@ pub(super) fn enqueue_admitted(
                 let fragment = record.fragment.clone();
                 let manifest = manifest_path(&record.id)?;
                 let cancelled = progress.cancel.clone();
-                let (count, bytes) = ctx
+                let summary = ctx
                     .db
                     .execute(move |db| {
                         super::manifest::capture_with_cancel(
@@ -264,8 +264,8 @@ pub(super) fn enqueue_admitted(
                         )
                     })
                     .await?;
-                record.objects_total = count;
-                record.source_bytes_total = bytes;
+                record.objects_total = summary.objects;
+                record.source_bytes_total = summary.source_bytes;
                 record.manifest_ready = true;
                 save(record.clone()).await?;
             }

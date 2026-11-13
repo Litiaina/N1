@@ -17,6 +17,8 @@ use tokio::io::AsyncWrite;
 const PART: u64 = 48 * 1024 * 1024;
 #[path = "standalone/latency.rs"]
 mod latency;
+#[path = "standalone/replay.rs"]
+mod replay;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,11 +36,21 @@ struct Config {
     #[serde(default)]
     resume_identity: Option<PathBuf>,
     #[serde(default)]
+    read_replay: Option<replay::Config>,
+    /// Diagnostic fixture only: preserve the verified identity for later reads.
+    #[serde(default)]
+    retain_object: bool,
+    #[serde(default)]
     latency_objects: usize,
     #[serde(default = "repeats")]
     repeats: usize,
     #[serde(default = "default_bytes")]
     total_bytes: u64,
+    #[serde(default = "default_upload_ttl")]
+    upload_ttl_seconds: u64,
+}
+fn default_upload_ttl() -> u64 {
+    3600
 }
 fn default_bytes() -> u64 {
     LARGE
@@ -56,6 +68,7 @@ struct Payload {
     width: u64,
     part: Bytes,
     sha256: String,
+    upload_ttl_seconds: u64,
 }
 
 struct Api {
@@ -77,6 +90,7 @@ struct HashSink {
     bytes: u64,
     total_bytes: u64,
     next_report: u64,
+    started: Instant,
 }
 impl HashSink {
     fn new(total_bytes: u64) -> Self {
@@ -85,6 +99,7 @@ impl HashSink {
             bytes: 0,
             total_bytes,
             next_report: LARGE,
+            started: Instant::now(),
         }
     }
 }
@@ -99,7 +114,8 @@ impl AsyncWrite for HashSink {
         if self.bytes >= self.next_report {
             println!(
                 "{}",
-                json!({"phase":"download","received_bytes":self.bytes,"total_bytes":self.total_bytes})
+                json!({"phase":"download","received_bytes":self.bytes,"total_bytes":self.total_bytes,
+                    "elapsed_seconds":self.started.elapsed().as_secs_f64()})
             );
             self.next_report = (self.bytes / LARGE + 1) * LARGE;
         }
@@ -129,13 +145,26 @@ pub async fn run(config: &Path, output: &Path) -> Result<()> {
     if !loopback_tls || !(1..=5).contains(&config.repeats) {
         return Err("standalone benchmark requires local loopback TLS N1 and 1..=5 repeats".into());
     }
+    if (config.read_replay.is_some()
+        && (config.resume_identity.is_some() || config.latency_objects != 0))
+        || (config.retain_object
+            && (config.resume_identity.is_some()
+                || config.read_replay.is_some()
+                || config.latency_objects != 0
+                || config.repeats != 1))
+    {
+        return Err("incompatible standalone diagnostic modes".into());
+    }
     // Bound this diagnostic workload; these are not N1's object-size limits.
-    if !(LARGE..=64 * LARGE).contains(&config.total_bytes)
+    if !(LARGE..=128 * LARGE).contains(&config.total_bytes)
         || !config.total_bytes.is_multiple_of(1 << 20)
     {
-        return Err("benchmark size must be 1..=64 GiB in whole MiB".into());
+        return Err("benchmark size must be 1..=128 GiB in whole MiB".into());
     }
     let total_bytes = config.total_bytes;
+    if !(60..=604800).contains(&config.upload_ttl_seconds) {
+        return Err("benchmark upload TTL must be between one minute and one week".into());
+    }
     if config.expected_data_shards == 0
         || config.expected_data_shards > 32
         || config.expected_parity_shards > 32
@@ -219,13 +248,15 @@ pub async fn run(config: &Path, output: &Path) -> Result<()> {
         width: config.expected_data_shards + config.expected_parity_shards,
         part: Bytes::from(source.repeat(48)),
         sha256: hex::encode(expected.finalize()),
+        upload_ttl_seconds: config.upload_ttl_seconds,
     };
     write_json(
         &output.join("methodology.json"),
         &json!({
-            "path":"server-local native TLS -> N1 -> configured HDD EC pool; no M1 calls",
+            "path":"server-local native TLS -> N1 -> configured EC pool; no M1 calls",
             "repeats":config.repeats,"large_bytes":total_bytes,"large_sha256":payload.sha256,
             "part_bytes":PART,"part_count":total_bytes.div_ceil(PART),"part_concurrency":4,
+            "upload_ttl_seconds":payload.upload_ttl_seconds,
             "pool":pool,"strict_durability":true,"incompatible_8_mib_init_status":if !(8 * 1024 * 1024_u64).is_multiple_of(config.expected_data_shards * 262144) { Some(400) } else { None },
             "payload":"same repeated precomputed 1 MiB SplitMix64 block as M1 benchmark; bounded 48 MiB part buffer, no fixture file",
             "download":"streamed SHA-256, exact length and N1 geometry check included in timing; same LINK key used throughout",
@@ -240,6 +271,9 @@ pub async fn run(config: &Path, output: &Path) -> Result<()> {
     if let Some(identity) = config.resume_identity {
         return recover_existing(&api, &payload, &pids, &identity, output).await;
     }
+    if let Some(replay) = config.read_replay {
+        return replay::run(&api, &payload, &pids, replay, output).await;
+    }
     if config.latency_objects > 0 {
         if config.latency_objects > 2000 {
             return Err("latency workload limit is 2,000 objects per durability mode".into());
@@ -247,17 +281,26 @@ pub async fn run(config: &Path, output: &Path) -> Result<()> {
         return latency::run(&api, &payload, &pids, output, config.latency_objects).await;
     }
     for repeat in 1..=config.repeats {
-        let row = large(&api, &mut client, &payload, &pids, output, repeat).await?;
+        let row = large(
+            &api,
+            &mut client,
+            &payload,
+            &pids,
+            output,
+            repeat,
+            config.retain_object,
+        )
+        .await?;
         write_json(&output.join(format!("large-r{repeat}.json")), &row)?;
         println!(
             "{}",
-            json!({"repeat":repeat,"init_ms":row["details"]["init_ms"],"parts_seconds":row["details"]["parts_seconds"],"finalize_ms":row["details"]["finalize_ms"],"mib_per_second":row["upload"]["mib_per_second"],"verified_and_purged":true})
+            json!({"repeat":repeat,"init_ms":row["details"]["init_ms"],"parts_seconds":row["details"]["parts_seconds"],"finalize_ms":row["details"]["finalize_ms"],"mib_per_second":row["upload"]["mib_per_second"],"verified_and_purged":!config.retain_object})
         );
         rows.push(row);
     }
     write_json(
         &output.join("PASSED.json"),
-        &json!({"passed":true,"rows":rows,"verified_and_purged":config.repeats,"no_m1_requests":true}),
+        &json!({"passed":true,"rows":rows,"verified_and_purged":if config.retain_object {0} else {config.repeats},"retained_for_replay":config.retain_object,"no_m1_requests":true}),
     )
 }
 
@@ -268,6 +311,7 @@ async fn large(
     pids: &Pids,
     output: &Path,
     repeat: usize,
+    retain: bool,
 ) -> Result<Value> {
     let total_bytes = payload.total_bytes;
     let mut writers = Vec::new();
@@ -278,6 +322,10 @@ async fn large(
         "{}",
         json!({"phase":"init","repeat":repeat,"total_bytes":total_bytes,"parts":total_bytes.div_ceil(PART)})
     );
+    // Observe existing live counters outside the upload timer. No monitor
+    // polling or new instrumentation runs inside the payload pipeline.
+    let backend_before =
+        cli_core::result(client.control(Command::Health).await?)?["io"]["backend"].clone();
     let phase = Measure::start(pids)?;
     let started = Instant::now();
     let plan = cli_core::result(
@@ -287,7 +335,7 @@ async fn large(
                 total_bytes,
                 part_bytes: PART,
                 durable: true,
-                ttl_seconds: 3600,
+                ttl_seconds: payload.upload_ttl_seconds,
             })
             .await?,
     )?;
@@ -306,7 +354,7 @@ async fn large(
     let journal_start = Instant::now();
     write_json(
         &output.join(format!("identity-r{repeat}.json")),
-        &json!({"object_key":key,"plan":plan}),
+        &json!({"object_key":key,"plan":plan,"source_sha256":payload.sha256}),
     )?;
     let identity_journal_ms = journal_start.elapsed().as_secs_f64() * 1000.0;
     let parts_start = Instant::now();
@@ -369,7 +417,19 @@ async fn large(
     {
         return Err("unexpected first-finalize identity, size or state".into());
     }
-    let upload = phase.finish(total_bytes, 1).await?;
+    let mut upload = phase.finish(total_bytes, 1).await?;
+    let backend_after =
+        cli_core::result(client.control(Command::Health).await?)?["io"]["backend"].clone();
+    upload["io_backend"] = json!({"before":backend_before,"after":backend_after});
+    // Preserve upload measurements before a potentially long readback. A
+    // completed upload is not a verification pass until the final report.
+    write_json(
+        &output.join(format!("upload-r{repeat}.json")),
+        &json!({"object_key":key,"upload":upload,"init_ms":init_ms,
+            "identity_journal_ms":identity_journal_ms,"parts_seconds":parts_seconds,
+            "finalize_ms":finalize_ms,"part_latency":distribution(samples.clone()),
+            "readback_verified":false}),
+    )?;
     println!(
         "{}",
         json!({"phase":"finalized","finalize_ms":finalize_ms,"init_ms":init_ms,"upload_seconds":upload["wall_seconds"],"mib_per_second":upload["mib_per_second"]})
@@ -401,6 +461,13 @@ async fn large(
         return Err("native GET length, SHA-256 or LINK identity mismatch".into());
     }
     let download = phase.finish(total_bytes, 1).await?;
+    if retain {
+        return Ok(json!({"repeat":repeat,"upload":upload,"download":download,
+            "details":{"init_ms":init_ms,"identity_journal_ms":identity_journal_ms,
+            "parts_seconds":parts_seconds,"part_latency":distribution(samples),
+            "finalize_ms":finalize_ms,"repeated_finalize_ms":repeated_finalize_ms},
+            "sha256_verified":true,"retained_for_replay":true,"purged_status":null}));
+    }
     let started = Instant::now();
     let removed = cli_core::result(
         client

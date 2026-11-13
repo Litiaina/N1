@@ -1,5 +1,7 @@
 //! Actual independently built Accel -> M1 -> native N1 read/search integration.
 use super::*;
+#[path = "accel/tls.rs"]
+mod tls;
 use futures_util::StreamExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

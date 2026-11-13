@@ -33,7 +33,54 @@ in the current qualification campaigns. Keep data, logs and build output on the
 selected SSD/HDD/RAM locations for each profile; never put population fixtures
 on the source NVMe.
 
+## Home standalone optimization — November 13, 2026
+
+The [standalone optimization report](docs/HOME-OPTIMIZATION-20261113.md) records
+compiler-matched 15 GiB reference/candidate comparisons on DATA_SSD 1+0 and two
+physical XFS HDDs in 1+1, small-object latency distributions, same-identity read
+controls and hardware-counter diagnostics. The candidate passes 269 N1/LINK
+release tests, zero failures, plus the separately enabled physical direct-I/O
+reopen witness and strict Clippy. All 116 runtime source files match its build
+snapshot. The attached 100 GiB run passes full SHA-256/length readback, repeated
+finalize, purge/404 and the physical marker-only census on both HDDs. It records
+73.81 MiB/s upload, 44.28 MiB/s GET, 26.97 ms finalize and 118.69 MiB whole-run
+peak N1 RSS. Earlier completed million and MCH campaigns
+are preserved rather than restarted. The report retains adverse tails and
+separates observed efficiency from unmeasured hardware saturation.
+An additional two-HDD ABBA passes 2,048 complete small-object lifecycles. Its
+512 samples per implementation/mode do not reproduce the earlier p99 regression;
+both distributions, remaining median/p95 costs and the renewed marker-only
+physical census are retained separately.
+
 ## MCH RC.2 qualification — November 11, 2026
+
+The [November 13 continuation](docs/MCH-OPTIMIZATION-20261113.md) records the
+subsequent sparse-upload optimization: 32 matched large transfers, 1,536 small
+multipart lifecycle samples, 32 identical-object GET replays and renewed
+four-HDD 3+1/2+2 faults. Native N1 passes 218 default library tests and all four
+physical direct-I/O cases. The report retains adverse latency/throughput samples
+and separates NVMe/HDD, CPU and cache conditions. M1's large native archive
+regression reproduces on the old binary and passes with the correction. The
+same continuation passes 34 selected service/Console cases, 407 default workspace
+checks, mixed HTTP/native overload with post-crash ACK verification, the real
+idle-quota lifecycle, private-CA Accel HTTPS and strict workspace Clippy.
+Matched M1 and named-pipeline comparisons retain their adverse samples. A
+balanced HDD 1+1 confirmation reproduces an 8.21% upload regression in the
+sparse-only candidate. Subsequent allocation-window and larger-buffer experiments
+are rejected and removed. The current sparse/receive candidate passes 222 N1
+library tests, five physical direct-I/O cases and the four-HDD fault witness.
+Its separate matched matrix completes 32 large transfers and 1,536 small
+lifecycles with verified readback/purge. Upload throughput improves in all five
+groups, while the four-HDD CPU-time increases and some small-object tails remain
+explicit acceptance concerns. Scoped hardware counters show fewer cycles,
+instructions and context switches at lower CPU clocks; they do not erase those
+adverse timings. The final candidate passes 36 selected public-service/Console
+checks, 411 default workspace tests and strict workspace/all-target Clippy;
+349 Rust files match the tested source manifest. Sixty workspace opt-in/helper
+cases and nine service exclusions remain explicit, with scoped opt-in passes
+reported separately rather than counted twice.
+These results do not repeat or replace previous million-object campaigns or
+prove host power loss.
 
 The [current handover](docs/RC2-HANDOVER-20261111.md) records four SATA/XFS
 HDDs, frozen binaries, failures and remaining gates. N1 passes **201 library

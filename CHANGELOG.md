@@ -34,6 +34,18 @@ complete API conformance or qualification.
   bounded export admission, immutable source pins and M1 crash cleanup. Preserve
   source errors even for zero-length TAR entries; retain queued export pins
   during graceful shutdown.
+- Stream direct named-native archives beyond the control-frame bound, using an
+  exact length counted during immutable metadata capture. Hold the final bounded
+  chunk until source verification and pin/manifest cleanup complete.
+- Coalesce short native transport reads within the existing receive buffer. Keep immutable
+  framing, retry validation, upload ownership and durability barriers intact;
+  matched performance qualification remains required.
+- Construct large-upload frames directly in reusable aligned output buffers,
+  avoiding payload zero-fill and an intermediate aligned-buffer copy. Stream
+  native multipart bodies in the existing activity owner without a body relay;
+  retain exact body bounds, rejection draining, cancellation ownership and
+  sender-stall detection. Preserve checksums, partial-page isolation, normal/
+  batch adapters, pool placement and durable acknowledgement barriers.
 
 - Make N1 LINK + M1 the mainstream system on `main`. Preserve the former
   NCX/NDX engine as **N1 Lite** in the independent `Litiaina/N1-Lite` repository,
@@ -79,6 +91,9 @@ complete API conformance or qualification.
 - Restore aligned `O_DIRECT` large uploads through the retained ECS buffers and
   owned I/O backend. Preserve immutable framing, concurrent part boundaries,
   checksums, admission and acknowledgement durability; keep small writes buffered.
+- Skip reads of proven sparse frame groups on large uploads. Keep ordinary
+  validation for written retries and unsupported extent queries; preserve the
+  shard format, integrity checks, publication ordering and durability barriers.
 - Classify deferred deep-scan checks separately from confirmed corruption and
   drain owned diagnostic work during metadata shutdown.
 - Use one LINK key from Begin through finalization and continuation that only

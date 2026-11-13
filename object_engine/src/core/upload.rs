@@ -150,7 +150,10 @@ impl Store {
         .await
     }
 
-    async fn write_part_owned<R>(
+    /// The caller must keep this operation in an Activity-owned worker until
+    /// all admitted I/O drains. Native streaming owns its socket in that worker;
+    /// ordinary callers use the public cancellation-safe wrappers above.
+    pub(crate) async fn write_part_owned<R>(
         self: Arc<Self>,
         scope: [u8; 16],
         key: &str,

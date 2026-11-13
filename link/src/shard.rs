@@ -263,23 +263,36 @@ pub fn append_frame(
     payload: &[u8],
     buffer: &mut Vec<u8>,
 ) -> Result<()> {
+    let encoded = encode_frame_header(header, fp, stripe, source_hash, payload)?;
+    buffer.reserve(FRAME_HEADER_BYTES + payload.len());
+    buffer.extend_from_slice(&encoded);
+    buffer.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Encode the canonical header while borrowing its payload. The checksum binds
+/// the same bytes as a contiguous frame, allowing aligned streaming writers to
+/// construct that frame without an intermediate owned payload copy.
+pub fn encode_frame_header(
+    header: &ShardHeader,
+    fp: Fingerprint,
+    stripe: u64,
+    source_hash: [u8; 32],
+    payload: &[u8],
+) -> Result<[u8; FRAME_HEADER_BYTES]> {
     if payload.len() != header.block_bytes as usize {
         return Err(Error("incorrect EC fragment size"));
     }
     let source_bytes = header.source_bytes_in_stripe(stripe)?;
-    let start = buffer.len();
-    buffer.resize(start + FRAME_HEADER_BYTES + payload.len(), 0);
-    let out = &mut buffer[start..];
-    out[..FRAME_HEADER_BYTES].fill(0);
+    let mut out = [0; FRAME_HEADER_BYTES];
     out[..8].copy_from_slice(header.format.choose(b"N1LFRM01", b"N1LFRM02"));
     out[8..16].copy_from_slice(&stripe.to_be_bytes());
     out[16..20].copy_from_slice(&source_bytes.to_be_bytes());
     out[20..22].copy_from_slice(&header.shard.to_be_bytes());
     out[24..56].copy_from_slice(&source_hash);
-    out[FRAME_HEADER_BYTES..].copy_from_slice(payload);
-    let sum = frame_checksum(header.format, fp, out);
+    let sum = frame_checksum_parts(header.format, fp, &out, payload);
     out[56..88].copy_from_slice(&sum);
-    Ok(())
+    Ok(out)
 }
 
 pub fn decode_frame<'a>(
@@ -400,15 +413,29 @@ pub fn object_hasher(format: ShardFormat, total_bytes: u64, part_bytes: u64) -> 
 }
 
 fn frame_checksum(format: ShardFormat, fp: Fingerprint, bytes: &[u8]) -> [u8; 32] {
+    frame_checksum_parts(
+        format,
+        fp,
+        &bytes[..FRAME_HEADER_BYTES],
+        &bytes[FRAME_HEADER_BYTES..],
+    )
+}
+
+fn frame_checksum_parts(
+    format: ShardFormat,
+    fp: Fingerprint,
+    header: &[u8],
+    payload: &[u8],
+) -> [u8; 32] {
     match format {
         ShardFormat::Sha256V1 => checksum(
             b"Litiaina/LINK/frame/v1\0",
             fp,
-            &[&bytes[..56], &bytes[88..]],
+            &[&header[..56], &header[88..], payload],
         ),
         ShardFormat::Crc32cSha256V2 => {
             let mut crc = crc32c::crc32c(b"Litiaina/LINK/frame/v2\0");
-            for part in [&fp.0[..], &bytes[..56], &bytes[60..]] {
+            for part in [&fp.0[..], &header[..56], &header[60..], payload] {
                 crc = crc32c::crc32c_append(crc, part);
             }
             let mut out = [0; 32];
