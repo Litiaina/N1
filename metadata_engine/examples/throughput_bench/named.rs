@@ -2,6 +2,9 @@ use super::*;
 use futures_util::{StreamExt, TryStreamExt};
 use measure::{Measure, Pids, distribution};
 use std::time::Instant;
+#[path = "named/workload.rs"]
+mod workload;
+pub use workload::{Shape, Workload};
 pub struct Api {
     pub client: reqwest::Client,
     pub base: String,
@@ -81,7 +84,13 @@ impl Api {
     }
 }
 
-pub async fn cleanup(api: &Api, run: &str, repeats: usize, batch_only: bool) -> Result<Value> {
+pub async fn cleanup(
+    api: &Api,
+    run: &str,
+    repeats: usize,
+    batch_only: bool,
+    workload: &Workload,
+) -> Result<Value> {
     let mut paths = Vec::new();
     for repeat in 0..repeats {
         if batch_only {
@@ -90,15 +99,15 @@ pub async fn cleanup(api: &Api, run: &str, repeats: usize, batch_only: bool) -> 
             }
             continue;
         }
-        for concurrency in [1, 8] {
+        for concurrency in [1, 8].into_iter().filter(|_| !workload.large_only) {
             for index in 0..100 {
                 paths.push(format!(
                     "bench/{run}/r{repeat}/small-c{concurrency}-{index:03}.bin"
                 ));
             }
         }
-        for part_mib in [0, 8, 48] {
-            paths.push(format!("bench/{run}/r{repeat}/large-part{part_mib}.bin"));
+        for part_bytes in &workload.part_bytes {
+            paths.push(format!("bench/{run}/r{repeat}/large-part{part_bytes}.bin"));
         }
     }
     for path in &paths {
@@ -294,24 +303,19 @@ pub async fn large(
     api: &Api,
     run: &str,
     repeat: usize,
-    part_mib: usize,
+    shape: Shape,
     block: Bytes,
     hash: &str,
     pids: &Pids,
 ) -> Result<Value> {
-    let path = format!("bench/{run}/r{repeat}/large-part{part_mib}.bin");
-    let payload = if part_mib == 0 {
-        block.clone()
-    } else {
-        Bytes::from(block.repeat(part_mib))
-    };
+    let Shape {
+        total_bytes,
+        part_bytes,
+    } = shape;
+    let path = format!("bench/{run}/r{repeat}/large-part{part_bytes}.bin");
     let phase = Measure::start(pids)?;
-    let (version, details) = if part_mib == 0 {
-        let source = futures_util::stream::iter(
-            (0..1024)
-                .map(|_| Ok::<_, std::io::Error>(block.clone()))
-                .collect::<Vec<_>>(),
-        );
+    let (version, details) = if part_bytes == 0 {
+        let source = workload::source(block.clone(), 0, total_bytes);
         let published = expect(
             api.client
                 .post(format!(
@@ -319,7 +323,7 @@ pub async fn large(
                     api.base
                 ))
                 .bearer_auth(&api.token)
-                .header(reqwest::header::CONTENT_LENGTH, LARGE)
+                .header(reqwest::header::CONTENT_LENGTH, total_bytes)
                 .body(reqwest::Body::wrap_stream(source))
                 .send()
                 .await?,
@@ -331,19 +335,18 @@ pub async fn large(
             json!({"multipart":false}),
         )
     } else {
-        let part_bytes = payload.len() as u64;
-        let count = LARGE.div_ceil(part_bytes);
+        let count = total_bytes.div_ceil(part_bytes);
         let start = Instant::now();
         let session=expect(api.client.post(format!("{}/upload/multipart/durable/init/{path}?durability=strict",api.base)).bearer_auth(&api.token)
-            .json(&json!({"total_size_bytes":LARGE,"expected_parts":count,"part_size_bytes":part_bytes})).send().await?,200).await?;
+            .json(&json!({"total_size_bytes":total_bytes,"expected_parts":count,"part_size_bytes":part_bytes})).send().await?,200).await?;
         let init_ms = start.elapsed().as_secs_f64() * 1000.0;
         let version = string(&session, "version_id")?;
         let session_id = string(&session, "session_id")?;
         let parts_start = Instant::now();
         let samples: Vec<f64> = futures_util::stream::iter(0..count)
             .map(|index| {
-                let payload =
-                    payload.slice(..((LARGE - index * part_bytes).min(part_bytes)) as usize);
+                let length = (total_bytes - index * part_bytes).min(part_bytes);
+                let payload = workload::source(block.clone(), index * part_bytes, length);
                 let version = &version;
                 async move {
                     let start = Instant::now();
@@ -354,7 +357,8 @@ pub async fn large(
                                 api.base
                             ))
                             .bearer_auth(&api.token)
-                            .body(payload)
+                            .header(reqwest::header::CONTENT_LENGTH, length)
+                            .body(reqwest::Body::wrap_stream(payload))
                             .send()
                             .await?,
                         200,
@@ -384,7 +388,7 @@ pub async fn large(
             "{}/upload/multipart/durable/{version}/{session_id}/finalize",
             api.base
         );
-        let body = json!({"total_size_bytes":LARGE,"expected_parts":count});
+        let body = json!({"total_size_bytes":total_bytes,"expected_parts":count});
         let start = Instant::now();
         let published = expect(
             api.client
@@ -405,9 +409,9 @@ pub async fn large(
             json!({"multipart":true,"part_bytes":part_bytes,"part_count":count,"part_concurrency":4,"init_ms":init_ms,"parts_seconds":parts_seconds,"part_latency":distribution(samples),"status_ms":status_ms,"finalize_ms":finalize_ms,"finalize_url":finalize,"finalize_body":body}),
         )
     };
-    let upload = phase.finish(LARGE, 1).await?;
+    let upload = phase.finish(total_bytes, 1).await?;
     let mut details = details;
-    if part_mib != 0 {
+    if part_bytes != 0 {
         let start = Instant::now();
         let again = expect(
             api.client
@@ -427,9 +431,9 @@ pub async fn large(
         details.as_object_mut().unwrap().remove("finalize_body");
     }
     let phase = Measure::start(pids)?;
-    api.get(&path, &version, LARGE, hash).await?;
-    let download = phase.finish(LARGE, 1).await?;
+    api.get(&path, &version, total_bytes, hash).await?;
+    let download = phase.finish(total_bytes, 1).await?;
     Ok(
-        json!({"method":if part_mib==0 {"1 GiB one-shot".to_owned()} else {format!("1 GiB durable multipart {part_mib} MiB x4")},"upload":upload,"download":download,"details":details,"sha256_verified":true}),
+        json!({"method":if part_bytes==0 {format!("{total_bytes} bytes one-shot")} else {format!("{total_bytes} bytes durable multipart {part_bytes} byte parts x4")},"upload":upload,"download":download,"details":details,"sha256_verified":true}),
     )
 }

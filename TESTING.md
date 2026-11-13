@@ -33,6 +33,20 @@ in the current qualification campaigns. Keep data, logs and build output on the
 selected SSD/HDD/RAM locations for each profile; never put population fixtures
 on the source NVMe.
 
+## M1 profiling and ENOSPC preparation — November 13, 2026
+
+The [M1 acceptance report](docs/M1-ACCEPTANCE-20261113.md) freezes the measured
+N1 native04 and compares M1's bounded staged-I/O buffers on DATA_SSD 1+0.
+Matched 1 GiB cases and 2,412 small-object lifecycles retain individual samples,
+CPU/RSS/I/O and adverse tails. The bridge's observed M1 CPU falls 57.3%, but
+its payload-forwarding finalize cost remains open. The release workspace passes
+418 tests, zero failed, with 63 explicit exclusions; strict workspace Clippy and
+formatting pass. The same seven selected service cases pass on SSD and two
+independent physical HDDs. Separate real object-full/metadata-full XFS ENOSPC
+recovery checks pass. The original million corpus and N1 runtime remain unchanged. The
+[release plan](docs/RC2-RELEASE-PLAN.md) recommends November 27 with a November 25
+go/no-go review; required acceptance conditions still control release.
+
 ## Home standalone optimization — November 13, 2026
 
 The [standalone optimization report](docs/HOME-OPTIMIZATION-20261113.md) records

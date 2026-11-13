@@ -318,16 +318,20 @@ pub(crate) async fn part<R: AsyncRead + Unpin>(
         let mut file = options.open(&temp).await?;
         let mut remaining = length;
         let mut hash = Sha256::new();
-        let mut buffer = vec![0; 64 * 1024];
+        let (mut buffer, _memory) = super::io_buffer(app).await?;
         while remaining > 0 {
             let wanted = remaining.min(buffer.len() as u64) as usize;
-            let read = source.read(&mut buffer[..wanted]).await?;
-            if read == 0 {
-                return Err(ApiError::invalid("part body ended early"));
+            // Coalesce short HTTP/native reads before submitting filesystem
+            // work. Only complete parts can receive an acknowledgement.
+            if let Err(error) = source.read_exact(&mut buffer[..wanted]).await {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(ApiError::invalid("part body ended early"));
+                }
+                return Err(error.into());
             }
-            file.write_all(&buffer[..read]).await?;
-            hash.update(&buffer[..read]);
-            remaining -= read as u64;
+            file.write_all(&buffer[..wanted]).await?;
+            hash.update(&buffer[..wanted]);
+            remaining -= wanted as u64;
         }
         if strict {
             file.sync_all().await?;
@@ -595,6 +599,7 @@ pub(crate) async fn finalize(
         let dir = directory(&app, fragment, &version);
         // Each staged part is verified before it is allowed to contribute to
         // physical publication. Memory stays bounded to one streaming buffer.
+        let (mut buffer, _memory) = super::io_buffer(&app).await?;
         for index in 0..plan.handle.expected_parts {
             let key = RecordKey::new(fragment, format!("upload-part/{version}/{index:06}"))?;
             let expected: Part = app
@@ -609,7 +614,6 @@ pub(crate) async fn finalize(
                 .await?;
             let mut file = tokio::fs::File::open(dir.join(format!("{index}.part"))).await?;
             let mut hash = Sha256::new();
-            let mut buffer = vec![0; 64 * 1024];
             let mut bytes = 0;
             loop {
                 let n = file.read(&mut buffer).await?;
@@ -626,6 +630,10 @@ pub(crate) async fn finalize(
                 ));
             }
         }
+        let capacity = buffer.len();
+        drop(buffer);
+        // Keep its permit while replacing the verification buffer with one
+        // ReaderStream buffer. Only one staged file is open at a time.
         use futures_util::{StreamExt, TryStreamExt};
         if pending.upload.parts == 0 {
             app.service
@@ -640,7 +648,7 @@ pub(crate) async fn finalize(
                     async move {
                         tokio::fs::File::open(path)
                             .await
-                            .map(tokio_util::io::ReaderStream::new)
+                            .map(|file| tokio_util::io::ReaderStream::with_capacity(file, capacity))
                     }
                 })
                 .try_flatten()

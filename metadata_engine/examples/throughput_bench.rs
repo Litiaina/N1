@@ -34,6 +34,11 @@ struct Config {
     url: String,
     ca: PathBuf,
     master_env: PathBuf,
+    /// Record the actual nodes, media and topology; do not infer them from URLs.
+    #[serde(default = "unspecified_profile")]
+    deployment_profile: String,
+    #[serde(default)]
+    workload: named::Workload,
     object_pid: u32,
     metadata_pid: u32,
     console_pid: u32,
@@ -42,6 +47,9 @@ struct Config {
 }
 fn repeats() -> usize {
     3
+}
+fn unspecified_profile() -> String {
+    "unspecified; consult the run's configuration and physical provenance".into()
 }
 fn write_json(path: &std::path::Path, value: &Value) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -101,6 +109,7 @@ async fn run(args: &Args) -> Result<()> {
     if !(1..=5).contains(&config.repeats) {
         return Err("repeats must be 1..=5".into());
     }
+    config.workload.validate()?;
     if config.object_pid == 0
         || config.metadata_pid == 0
         || config.object_pid == config.metadata_pid
@@ -133,8 +142,11 @@ async fn run(args: &Args) -> Result<()> {
     .collect::<Vec<_>>();
     let source = block();
     let mut hash = Sha256::new();
-    for _ in 0..1024 {
-        hash.update(&source);
+    let mut remaining = config.workload.total_bytes;
+    while remaining > 0 {
+        let take = remaining.min(source.len() as u64) as usize;
+        hash.update(&source[..take]);
+        remaining -= take as u64;
     }
     let expected = hex::encode(hash.finalize());
     let run = ulid::Ulid::new().to_string();
@@ -143,11 +155,12 @@ async fn run(args: &Args) -> Result<()> {
         &args.output.join("methodology.json"),
         &json!({
         "run":run,"repeats":config.repeats,"small_count":100,"small_bytes":4096,"batch_only":args.batch_only,
-            "large_bytes":LARGE,"large_sha256":expected,"strict_durability":true,
+            "large_bytes":config.workload.total_bytes,"large_sha256":expected,"strict_durability":true,
+            "multipart_part_bytes":config.workload.part_bytes,"large_only":config.workload.large_only,
             "payload":"repeated 1 MiB SplitMix64 block; prepared before timing; bounded buffers",
             "download":"streamed SHA-256 and exact length/version verification included in timing",
             "cache_policy":"no global cache drop; immediate post-upload GET; no cold-read claim",
-            "path":"server-local HTTPS -> isolated NVMe M1 -> existing native TLS N1 -> HDD 3+1",
+            "path":config.deployment_profile,
             "interactive_database_modified":false,"pids":pids,
             "client_sha256":hex::encode(Sha256::digest(fs::read(std::env::current_exe()?)?)),
             "cpu_percent":"100% means one logical CPU; process CPU delta divided by phase wall time",
@@ -170,7 +183,7 @@ async fn run(args: &Args) -> Result<()> {
             rows.push(row);
             continue;
         }
-        for concurrency in [1, 8] {
+        for concurrency in [1, 8].into_iter().filter(|_| !config.workload.large_only) {
             let mut row =
                 named::small(&api, &run, repeat, concurrency, source.slice(..4096), &pids).await?;
             row["repeat"] = json!(repeat + 1);
@@ -186,12 +199,15 @@ async fn run(args: &Args) -> Result<()> {
             );
             rows.push(row);
         }
-        for part_mib in [0, 8, 48] {
+        for &part_bytes in &config.workload.part_bytes {
             let mut row = named::large(
                 &api,
                 &run,
                 repeat,
-                part_mib,
+                named::Shape {
+                    total_bytes: config.workload.total_bytes,
+                    part_bytes,
+                },
                 source.clone(),
                 &expected,
                 &pids,
@@ -201,7 +217,7 @@ async fn run(args: &Args) -> Result<()> {
             write_json(
                 &args
                     .output
-                    .join(format!("large-r{}-part{part_mib}.json", repeat + 1)),
+                    .join(format!("large-r{}-part{part_bytes}.json", repeat + 1)),
                 &row,
             )?;
             println!(
@@ -215,7 +231,14 @@ async fn run(args: &Args) -> Result<()> {
         &args.output.join("MEASUREMENTS.json"),
         &json!({"rows":rows,"all_downloads_verified":true}),
     )?;
-    let cleanup = named::cleanup(&api, &run, config.repeats, args.batch_only).await?;
+    let cleanup = named::cleanup(
+        &api,
+        &run,
+        config.repeats,
+        args.batch_only,
+        &config.workload,
+    )
+    .await?;
     write_json(
         &args.output.join("PASSED.json"),
         &json!({"passed":true,"rows":rows,"all_downloads_verified":true,"cleanup":cleanup}),

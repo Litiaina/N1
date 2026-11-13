@@ -34,12 +34,16 @@ mod maintenance;
 mod monitoring;
 #[path = "noa_service/monitoring_performance.rs"]
 mod monitoring_performance;
+#[path = "noa_service/multipart_bridge.rs"]
+mod multipart_bridge;
 #[path = "noa_service/object_recovery.rs"]
 mod object_recovery;
 #[path = "noa_service/preparation_bench.rs"]
 mod preparation_bench;
 #[path = "noa_service/reliability.rs"]
 mod reliability;
+#[path = "noa_service/resource_exhaustion.rs"]
+mod resource_exhaustion;
 #[path = "noa_service/resume_damage.rs"]
 mod resume_damage;
 #[path = "noa_service/resume_listing.rs"]

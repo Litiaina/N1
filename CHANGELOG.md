@@ -10,6 +10,12 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Bound M1's staged multipart buffers through the existing upload-memory budget,
+  coalesce short receives and enlarge staged-file forwarding reads. Preserve
+  checksum verification before forwarding and existing durable ACK ordering.
+  Add real XFS ENOSPC/recovery and bridge memory-pressure, disconnect, retry,
+  restart and corruption checks. N1's measured LINK runtime remains unchanged.
+
 - Replace M1's imported Procyon/Fjall database with the independently implemented
   `m1_storage` crate: ordered on-disk tree, snapshot readers, optimistic writers,
   synchronized group commits, checksummed recovery and online checkpoints.

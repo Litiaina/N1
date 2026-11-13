@@ -5,6 +5,18 @@ qualification gaps. It does not redefine the API, prescribe deployment or serve
 as a chronological work log. This repository contains the N1 LINK object store and the
 M1 metadata store with its own specialized database; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
+**Recommended qualification schedule — November 13:** target November 27 for
+RC.2, with a November 25 go/no-go review (Asia/Manila). The
+[release plan](RC2-RELEASE-PLAN.md) orders the remaining work and evidence.
+Required gates still control release; a target date does not waive failures.
+
+The [first preparation batch](M1-ACCEPTANCE-20261113.md) holds N1 fixed, reduces
+M1's observed bridged-upload CPU cost and passes 418 workspace checks, the same
+seven selected service cases on SSD and two HDDs, and separate object-full/
+metadata-full XFS recovery cases. The bridge still forwards payload during
+finalize; physical power loss, broader saturation and final contract/Console
+acceptance remain open.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.
