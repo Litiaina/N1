@@ -207,6 +207,7 @@ async fn run(args: &Args) -> Result<()> {
                 named::Shape {
                     total_bytes: config.workload.total_bytes,
                     part_bytes,
+                    negotiate_part_size: config.workload.negotiate_part_size,
                 },
                 source.clone(),
                 &expected,

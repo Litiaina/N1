@@ -311,6 +311,7 @@ pub async fn large(
     let Shape {
         total_bytes,
         part_bytes,
+        negotiate_part_size,
     } = shape;
     let path = format!("bench/{run}/r{repeat}/large-part{part_bytes}.bin");
     let phase = Measure::start(pids)?;
@@ -338,8 +339,22 @@ pub async fn large(
         let count = total_bytes.div_ceil(part_bytes);
         let start = Instant::now();
         let session=expect(api.client.post(format!("{}/upload/multipart/durable/init/{path}?durability=strict",api.base)).bearer_auth(&api.token)
-            .json(&json!({"total_size_bytes":total_bytes,"expected_parts":count,"part_size_bytes":part_bytes})).send().await?,200).await?;
+            .json(&json!({"total_size_bytes":total_bytes,"expected_parts":count,"part_size_bytes":part_bytes,"negotiate_part_size":negotiate_part_size})).send().await?,200).await?;
         let init_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let requested_part_bytes = part_bytes;
+        let part_bytes = session["part_size_bytes"]
+            .as_u64()
+            .ok_or("missing init part size")?;
+        let count = session["expected_parts"]
+            .as_u64()
+            .ok_or("missing init part count")?;
+        if part_bytes == 0
+            || count != total_bytes.div_ceil(part_bytes)
+            || session["total_size_bytes"].as_u64() != Some(total_bytes)
+            || (!negotiate_part_size && part_bytes != requested_part_bytes)
+        {
+            return Err("init returned inconsistent geometry".into());
+        }
         let version = string(&session, "version_id")?;
         let session_id = string(&session, "session_id")?;
         let parts_start = Instant::now();
@@ -406,7 +421,7 @@ pub async fn large(
         }
         (
             version,
-            json!({"multipart":true,"part_bytes":part_bytes,"part_count":count,"part_concurrency":4,"init_ms":init_ms,"parts_seconds":parts_seconds,"part_latency":distribution(samples),"status_ms":status_ms,"finalize_ms":finalize_ms,"finalize_url":finalize,"finalize_body":body}),
+            json!({"multipart":true,"requested_part_bytes":requested_part_bytes,"negotiated":negotiate_part_size,"part_bytes":part_bytes,"part_count":count,"part_concurrency":4,"init_ms":init_ms,"parts_seconds":parts_seconds,"part_latency":distribution(samples),"status_ms":status_ms,"finalize_ms":finalize_ms,"finalize_url":finalize,"finalize_body":body}),
         )
     };
     let upload = phase.finish(total_bytes, 1).await?;

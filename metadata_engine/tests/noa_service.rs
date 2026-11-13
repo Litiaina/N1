@@ -36,6 +36,8 @@ mod monitoring;
 mod monitoring_performance;
 #[path = "noa_service/multipart_bridge.rs"]
 mod multipart_bridge;
+#[path = "noa_service/multipart_geometry.rs"]
+mod multipart_geometry;
 #[path = "noa_service/object_recovery.rs"]
 mod object_recovery;
 #[path = "noa_service/preparation_bench.rs"]

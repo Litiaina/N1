@@ -37,6 +37,9 @@ pub(crate) struct InitRequest {
     pub total_size_bytes: u64,
     pub expected_parts: u64,
     pub part_size_bytes: Option<u64>,
+    /// Opt in to server-selected geometry; the returned shape is authoritative.
+    #[serde(default)]
+    pub negotiate_part_size: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Part {
@@ -98,6 +101,7 @@ pub(crate) async fn init(
         total_size_bytes: u64,
         expected_parts: u64,
         part_size_bytes: u64,
+        negotiate_part_size: bool,
     }
     let part_size_bytes = request
         .part_size_bytes
@@ -106,13 +110,14 @@ pub(crate) async fn init(
         } else {
             0
         });
-    let request = Shape {
+    let mut request = Shape {
         content_type: request
             .content_type
             .unwrap_or_else(|| "application/octet-stream".into()),
         total_size_bytes: request.total_size_bytes,
         expected_parts: request.expected_parts,
         part_size_bytes,
+        negotiate_part_size: request.negotiate_part_size,
     };
     crate::namespace::store::validate_upload(&path, &request.content_type)?;
     let computed = if request.total_size_bytes == 0 {
@@ -123,7 +128,10 @@ pub(crate) async fn init(
         request.total_size_bytes.div_ceil(request.part_size_bytes)
     };
     app.config.check_object_size(request.total_size_bytes)?;
-    if request.part_size_bytes > app.config.max_part_size || request.expected_parts > 131072 {
+    if !request.negotiate_part_size
+        && (request.part_size_bytes > app.config.max_part_size
+            || request.expected_parts > super::geometry::MAX_PARTS)
+    {
         return Err(ApiError(
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
             "Multipart upload exceeds configured size or part-count limits".into(),
@@ -134,37 +142,60 @@ pub(crate) async fn init(
     {
         return Err(ApiError::invalid("invalid multipart upload shape"));
     }
-    let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&serde_json::json!([
-            path,
-            request.content_type,
-            request.total_size_bytes,
-            request.part_size_bytes,
-            durable,
-            strict
-        ]))
-        .expect("JSON upload shape"),
+    let mut fingerprint = serde_json::json!([
+        path,
+        request.content_type,
+        request.total_size_bytes,
+        request.part_size_bytes,
+        durable,
+        strict
+    ]);
+    let explicit_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&fingerprint).expect("JSON upload shape"),
     ));
-    let lock = app.upload_lock(fragment, &format!("reuse-{digest}"));
+    if request.negotiate_part_size {
+        fingerprint
+            .as_array_mut()
+            .expect("upload shape")
+            .push(serde_json::json!("negotiate"));
+    }
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&fingerprint).expect("JSON upload shape"),
+    ));
+    // Both init policies serialize on the original hint. Negotiation may
+    // discover an upload prepared by an explicit client; keep its ACKs and
+    // saved geometry instead of allocating a replacement identity.
+    let lock = app.upload_lock(fragment, &format!("reuse-{explicit_digest}"));
     let _guard = lock.write().await;
     let reuse_key = RecordKey::new(fragment, format!("upload-reuse/{digest}"))?;
     if !fresh {
-        let lookup = reuse_key.clone();
-        let existing: Option<String> = app
+        let mut lookups = vec![reuse_key.clone()];
+        if request.negotiate_part_size {
+            lookups.push(RecordKey::new(
+                fragment,
+                format!("upload-reuse/{explicit_digest}"),
+            )?);
+        }
+        let existing: Vec<String> = app
             .db
             .execute(move |db| {
-                db.snapshot()
-                    .get(Table::Reclamation, &lookup)?
-                    .map(fragments::decode)
-                    .transpose()
+                let snapshot = db.snapshot();
+                let mut versions = Vec::new();
+                for key in lookups {
+                    if let Some(bytes) = snapshot.get(Table::Reclamation, &key)? {
+                        versions.push(fragments::decode(bytes)?);
+                    }
+                }
+                Ok(versions)
             })
             .await?;
-        if let Some(version) = existing
-            && let Ok(saved) = plan(app, fragment, &version, durable).await
-        {
-            let pending = app.service.pending(fragment, &version, None).await?;
-            if !pending.completed && pending.upload.expires_at > crate::middleware::auth::now() {
-                return Ok(saved.handle);
+        for version in existing {
+            if let Ok(saved) = plan(app, fragment, &version, durable).await {
+                let pending = app.service.pending(fragment, &version, None).await?;
+                if !pending.completed && pending.upload.expires_at > crate::middleware::auth::now()
+                {
+                    return Ok(saved.handle);
+                }
             }
         }
     }
@@ -175,6 +206,14 @@ pub(crate) async fn init(
         .find(|p| !p.sealed)
         .ok_or_else(|| ApiError::invalid("all object pools are sealed"))?;
     let stripe = u64::from(profile.data_shards) * u64::from(profile.block_bytes);
+    if request.negotiate_part_size {
+        (request.part_size_bytes, request.expected_parts) = super::geometry::negotiate(
+            request.total_size_bytes,
+            request.part_size_bytes,
+            app.config.max_part_size,
+            stripe,
+        )?;
+    }
     let bridge = request.total_size_bytes == 0 || !request.part_size_bytes.is_multiple_of(stripe);
     let backend_part = if bridge {
         (app.config.max_part_size / stripe).max(1) * stripe

@@ -10,6 +10,12 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Add opt-in M1 multipart size negotiation before LINK Begin, with saved-identity
+  reuse across explicit and negotiated callers. Aligned chosen parts stream to
+  N1 without an M1 payload spool; explicit geometry and resume remain stable.
+  Preserve the measured baseline, rejected eager-forwarding prototypes and
+  adverse observations in the multipart qualification report.
+
 - Bound M1's staged multipart buffers through the existing upload-memory budget,
   coalesce short receives and enlarge staged-file forwarding reads. Preserve
   checksum verification before forwarding and existing durable ACK ordering.

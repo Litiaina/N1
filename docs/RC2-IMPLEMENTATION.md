@@ -17,6 +17,14 @@ metadata-full XFS recovery cases. The bridge still forwards payload during
 finalize; physical power loss, broader saturation and final contract/Console
 acceptance remain open.
 
+The [November 14 geometry qualification](M1-PART-GEOMETRY-20261114.md) adds
+optional native-aligned M1 init and preserves existing explicit sessions across
+negotiation. The slower eager-forwarding/spool experiment is rejected. A fault
+probe independently reproduces a completed-but-unpublished N1 staging repair
+gap: damaged sealed staging refuses finalize and its replay. It correctly
+refuses incomplete publication, but recovery of that state must be completed
+and tested before closing the recovery gate.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

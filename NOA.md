@@ -220,6 +220,13 @@ persists accepted parts; standard multipart does so when strict durability is
 selected. Relaxed standard acknowledgements do not guarantee crash persistence.
 Both publish immutable objects after finalization.
 
+M1 init optionally accepts `negotiate_part_size: true`. The supplied part size
+is then a hint; clients must use the returned `part_size_bytes` and
+`expected_parts`. M1 selects native-aligned geometry within configured limits
+before beginning the object upload. Repeated pending init returns the original
+chosen shape and identity. Explicit geometry remains the default; resume never
+changes it. See [the M1 example](docs/api/M1.md#multipart-upload-and-resume).
+
 For native-aligned named uploads with strict acknowledgements, the metadata
 engine commits completed-part bits after the object engine confirms persistence,
 before returning the part ACK. Status reads those bounded metadata pages, rather

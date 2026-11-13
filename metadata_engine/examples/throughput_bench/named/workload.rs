@@ -9,6 +9,7 @@ pub struct Workload {
     /// Zero selects one-shot. Other entries are external multipart sizes.
     pub part_bytes: Vec<u64>,
     pub large_only: bool,
+    pub negotiate_part_size: bool,
 }
 
 impl Default for Workload {
@@ -17,6 +18,7 @@ impl Default for Workload {
             total_bytes: 1 << 30,
             part_bytes: vec![0, 8 << 20, 48 << 20],
             large_only: false,
+            negotiate_part_size: false,
         }
     }
 }
@@ -45,6 +47,7 @@ impl Workload {
 pub struct Shape {
     pub total_bytes: u64,
     pub part_bytes: u64,
+    pub negotiate_part_size: bool,
 }
 
 pub fn source(

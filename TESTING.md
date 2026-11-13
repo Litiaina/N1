@@ -17,6 +17,12 @@ change earlier test outcomes or close the
 RC.2 release gates. Historical mentions of a held `main` describe the policy at
 the time of those campaigns.
 
+The [November 14 multipart geometry report](docs/M1-PART-GEOMETRY-20261114.md)
+records optional M1 negotiation, cross-client pending-session reuse, matched
+measurements with N1 frozen, Console checks and a separately reproduced native
+staging-recovery limitation. Rejected eager-forwarding implementations remain
+in the private evidence archive, not the selected runtime.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |
