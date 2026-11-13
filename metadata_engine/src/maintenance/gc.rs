@@ -91,6 +91,16 @@ impl Manager {
                 if job.request.dry_run {
                     continue;
                 }
+                // An active writer owns the same lock through file work and
+                // its ACK transaction. Defer without occupying object I/O or
+                // waiting behind a slow client. The due index retains work.
+                let lock = self
+                    .upload_locks
+                    .get(work.target.fragment, &work.target.version);
+                let Ok(_guard) = lock.try_write() else {
+                    job.deferred += 1;
+                    continue;
+                };
                 let result: ApiResult<bool> = async {
                     let blob = self
                         .db
@@ -186,6 +196,12 @@ impl Manager {
                 if self.interrupted(cancel) {
                     return Ok((false, count, bytes));
                 }
+                let lock = self
+                    .upload_locks
+                    .get(blob.target.fragment, &blob.target.version);
+                let Ok(_guard) = lock.try_write() else {
+                    return Ok((false, count, bytes));
+                };
                 let target = blob.target.clone();
                 let key = blob.key.clone();
                 let retire = self

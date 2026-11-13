@@ -17,10 +17,7 @@ use crate::{
 };
 pub use config::ServerConfig;
 pub use routes::router;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, Weak},
-};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, Semaphore};
 
 pub struct App {
@@ -33,7 +30,7 @@ pub struct App {
     pub(crate) rate_limits: Arc<crate::middleware::rate_limiter::RateLimits>,
     pub(crate) accel: accel::Accel,
     pub events: tokio::sync::broadcast::Sender<serde_json::Value>,
-    upload_locks: Mutex<HashMap<String, Weak<RwLock<()>>>>,
+    upload_locks: Arc<crate::uploads::UploadLocks>,
     pub(crate) pools: Vec<PoolProfile>,
     pub recovery_errors: Mutex<Vec<String>>,
     pub(crate) metadata_observations: Arc<cli_core::monitoring::ObservationCache>,
@@ -107,14 +104,17 @@ impl App {
                 .transpose()
                 .map_err(|_| error::ApiError::invalid("cannot load object engine CA"))?,
         })?;
+        let upload_locks = Arc::new(crate::uploads::UploadLocks::default());
         let maintenance = crate::maintenance::Manager::new(
             maintenance_db,
             background_objects,
             config.maintenance.clone(),
             pools.clone(),
             config.staging_dir.clone(),
+            upload_locks.clone(),
         );
         crate::uploads::private_directory(&config.staging_dir).await?;
+        crate::uploads::persist_staging_root(&config.staging_dir).await?;
         let (events, _) = tokio::sync::broadcast::channel(256);
         let memory_units = config.upload_memory_budget.div_ceil(65536);
         let app = Arc::new(Self {
@@ -129,7 +129,7 @@ impl App {
             accel: accel::Accel::new(&config.accel)?,
             config,
             events,
-            upload_locks: Mutex::new(HashMap::new()),
+            upload_locks,
             pools,
             recovery_errors: Mutex::new(Vec::new()),
             metadata_observations: Arc::default(),
@@ -143,17 +143,7 @@ impl App {
         Ok(app)
     }
     pub(crate) fn upload_lock(&self, fragment: n1_link::PoolId, version: &str) -> Arc<RwLock<()>> {
-        let key = format!("{fragment}/{version}");
-        let mut locks = self.upload_locks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-            return lock;
-        }
-        if locks.len() >= 1024 {
-            locks.retain(|_, v| v.strong_count() > 0);
-        }
-        let lock = Arc::new(RwLock::new(()));
-        locks.insert(key, Arc::downgrade(&lock));
-        lock
+        self.upload_locks.get(fragment, version)
     }
     pub(crate) fn emit(&self, fragment: n1_link::PoolId) {
         let _ = self.events.send(serde_json::json!({"event":"NAMESPACE_CHANGED", "fragment":ulid::Ulid::from_bytes(fragment.0).to_string()}));

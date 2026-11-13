@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+mod lifecycle;
 mod listing;
 pub(crate) use listing::list;
 
@@ -30,6 +31,9 @@ pub(crate) struct Plan {
     /// An interrupted development session without this index is reconciled once.
     #[serde(default)]
     pub acknowledgements_indexed: bool,
+    /// Established with the first strict staged payload, before its receipt.
+    #[serde(default)]
+    pub staging_parents_persisted: bool,
 }
 #[derive(Deserialize)]
 pub(crate) struct InitRequest {
@@ -244,6 +248,7 @@ pub(crate) async fn init(
         strict,
         content_type: request.content_type,
         acknowledgements_indexed: !bridge && (strict || durable),
+        staging_parents_persisted: false,
     };
     let key = plan_key(fragment, &handle.version_id)?;
     let version = handle.version_id.clone();
@@ -320,21 +325,9 @@ pub(crate) async fn part<R: AsyncRead + Unpin>(
             app.db
                 .execute(move |db| {
                     db.transact(64, |tx| {
-                        let saved: Plan = fragments::decode(
-                            tx.get(Table::Reclamation, &plan_key(fragment, &version)?)?
-                                .ok_or(crate::Error::NotFound)?,
-                        )?;
-                        let pending: crate::namespace::PendingUpload = fragments::decode(
-                            tx.get(Table::Uploads, &RecordKey::new(fragment, &version)?)?
-                                .ok_or(crate::Error::NotFound)?,
-                        )?;
                         // A cancelled HTTP future does not cancel an already-owned DB
                         // worker. Recheck lifecycle inside its retrying transaction.
-                        if saved.cancelled || pending.completed {
-                            return Err(crate::Error::NameConflict(
-                                "upload is no longer accepting parts".into(),
-                            ));
-                        }
+                        lifecycle::accepting_parts(tx, fragment, &version)?;
                         super::progress::acknowledge(tx, fragment, &version, index)
                     })
                 })
@@ -405,13 +398,25 @@ pub(crate) async fn part<R: AsyncRead + Unpin>(
             .into());
         }
         tokio::fs::rename(&temp, dir.join(format!("{index}.part"))).await?;
-        let sync_dir = dir.clone();
-        tokio::task::spawn_blocking(move || std::fs::File::open(sync_dir)?.sync_all())
-            .await
-            .map_err(|_| ApiError::invalid("staging sync worker failed"))??;
+        super::persist_part_directory(
+            &dir,
+            &app.config.staging_dir,
+            strict && !plan.staging_parents_persisted,
+        )
+        .await?;
+        let record_version = version.to_owned();
         app.db
             .execute(move |db| {
                 db.transact(64, |tx| {
+                    let mut saved = lifecycle::accepting_parts(tx, fragment, &record_version)?;
+                    if strict && !saved.staging_parents_persisted {
+                        saved.staging_parents_persisted = true;
+                        tx.put(
+                            Table::Reclamation,
+                            &plan_key(fragment, &record_version)?,
+                            &fragments::encode(&saved)?,
+                        )?;
+                    }
                     tx.put(Table::Reclamation, &part_key, &fragments::encode(&record)?)
                 })
             })

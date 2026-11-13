@@ -24,6 +24,20 @@ impl Default for Workload {
 }
 
 impl Workload {
+    /// More latency samples are safe only for bounded small-object-only runs.
+    /// This diagnostic limit does not change either server's upload policy.
+    pub fn validate_repeats(&self, repeats: usize) -> Result<()> {
+        let maximum = if self.large_only && self.total_bytes <= 64 << 10 {
+            512
+        } else {
+            5
+        };
+        if !(1..=maximum).contains(&repeats) {
+            return Err(format!("repeats must be 1..={maximum} for this workload").into());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.total_bytes == 0 || self.total_bytes > 128 << 30 {
             return Err("named benchmark source must be 1 byte..=128 GiB".into());
@@ -76,6 +90,22 @@ pub fn source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn larger_latency_samples_require_a_bounded_small_object_only_workload() {
+        let mut workload = Workload::default();
+        assert!(workload.validate_repeats(5).is_ok());
+        assert!(workload.validate_repeats(100).is_err());
+        workload.total_bytes = 4096;
+        assert!(workload.validate_repeats(100).is_err());
+        workload.large_only = true;
+        assert!(workload.validate_repeats(100).is_ok());
+        assert!(workload.validate_repeats(512).is_ok());
+        assert!(workload.validate_repeats(0).is_err());
+        assert!(workload.validate_repeats(513).is_err());
+        workload.total_bytes = (64 << 10) + 1;
+        assert!(workload.validate_repeats(100).is_err());
+    }
 
     #[tokio::test]
     async fn arbitrary_parts_reconstruct_one_source_including_short_tail() {

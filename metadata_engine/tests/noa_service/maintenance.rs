@@ -58,7 +58,7 @@ fn policy(stack: &Stack, enabled: bool, ttl: u64, interval: u64, pause: u64) {
         .set("bytes_per_second", "67108864");
     ini.write_to_file(path).unwrap();
 }
-async fn direct(stack: &Stack) -> n1_native_client::N1NativeClient {
+pub(super) async fn direct(stack: &Stack) -> n1_native_client::N1NativeClient {
     let credentials: Value = serde_json::from_slice(
         &std::fs::read(stack.object_config.with_extension("credentials.json")).unwrap(),
     )

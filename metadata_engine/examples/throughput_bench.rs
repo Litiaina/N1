@@ -106,10 +106,8 @@ async fn run(args: &Args) -> Result<()> {
         return standalone::run(&args.config, &args.output).await;
     }
     let config: Config = serde_json::from_slice(&fs::read(&args.config)?)?;
-    if !(1..=5).contains(&config.repeats) {
-        return Err("repeats must be 1..=5".into());
-    }
     config.workload.validate()?;
+    config.workload.validate_repeats(config.repeats)?;
     if config.object_pid == 0
         || config.metadata_pid == 0
         || config.object_pid == config.metadata_pid

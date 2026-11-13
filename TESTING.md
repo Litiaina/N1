@@ -29,6 +29,12 @@ without publication on two HDDs. It preserves the original read-only retry
 contract, rejected experiment and matched small/large performance observations.
 Hardware power-loss and remaining release gates are separate.
 
+The [M1 ACK/GC qualification](docs/M1-GC-ACK-20261114.md) passes 424 default
+workspace checks, strict Clippy, nine selected SSD service cases, the old/new
+two-HDD active-writer GC witness and three real XFS ENOSPC/recovery cases.
+It records first strict staging-directory persistence, transactional ACK fences
+and matched large/small multipart regressions; performance parity is not claimed.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |

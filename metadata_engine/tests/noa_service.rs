@@ -28,6 +28,8 @@ mod diagnostic_load;
 mod export_lifecycle;
 #[path = "noa_service/export_performance.rs"]
 mod export_performance;
+#[path = "noa_service/gc_concurrent.rs"]
+mod gc_concurrent;
 #[path = "noa_service/maintenance.rs"]
 mod maintenance;
 #[path = "noa_service/monitoring.rs"]

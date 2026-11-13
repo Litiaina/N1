@@ -37,12 +37,17 @@ impl From<Error> for ApiError {
             Error::Invalid(_) => StatusCode::BAD_REQUEST,
             Error::Conflict | Error::NameConflict(_) => StatusCode::CONFLICT,
             Error::Busy | Error::Closed => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Io(error) | Error::Storage(m1_storage::Error::Io(error))
+                if storage_full(error) =>
+            {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
-            "Metadata storage operation failed".into()
-        } else {
-            error.to_string()
+        let message = match status {
+            StatusCode::INTERNAL_SERVER_ERROR => "Metadata storage operation failed".into(),
+            StatusCode::INSUFFICIENT_STORAGE => "Metadata storage space exhausted".into(),
+            _ => error.to_string(),
         };
         Self(status, message)
     }
@@ -64,10 +69,44 @@ impl From<ServiceError> for ApiError {
     }
 }
 impl From<std::io::Error> for ApiError {
-    fn from(_: std::io::Error) -> Self {
-        Self(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Metadata staging I/O failed".into(),
-        )
+    fn from(error: std::io::Error) -> Self {
+        if storage_full(&error) {
+            Self(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Metadata staging storage space exhausted".into(),
+            )
+        } else {
+            Self(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Metadata staging I/O failed".into(),
+            )
+        }
+    }
+}
+
+fn storage_full(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_exhaustion_has_an_explicit_status_without_disclosing_private_paths() {
+        for code in [libc::ENOSPC, libc::EDQUOT] {
+            let raw = || std::io::Error::from_raw_os_error(code);
+            for error in [
+                ApiError::from(raw()),
+                ApiError::from(Error::Io(raw())),
+                ApiError::from(Error::Storage(m1_storage::Error::Io(raw()))),
+            ] {
+                assert_eq!(error.0, StatusCode::INSUFFICIENT_STORAGE);
+                assert!(error.1.contains("space exhausted"));
+            }
+        }
+        let other = ApiError::from(std::io::Error::other("/private/staging/path"));
+        assert_eq!(other.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!other.1.contains("/private"));
     }
 }

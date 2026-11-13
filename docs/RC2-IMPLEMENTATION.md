@@ -27,6 +27,14 @@ two-HDD witness, restores only staging, preserves retry immutability and leaves
 publication to finalize. This scoped recovery case is closed; remaining host
 power-loss, critical-transition and performance acceptance conditions remain.
 
+The [M1 ACK/GC hardening](M1-GC-ACK-20261114.md) subsequently passes 424 default
+workspace tests, nine selected real-process service cases, two-HDD active-writer
+GC and actual staging/object/metadata ENOSPC recovery. It closes the reproduced
+active-writer purge/late-ACK race without a namespace or final-shard scan. Its
+matched multipart measurements retain adverse latency, CPU and throughput;
+performance acceptance remains open alongside memory/stalled-I/O, broader
+saturation, final contract/Console and final-candidate hardware qualification.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

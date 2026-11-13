@@ -312,6 +312,17 @@ If native finalization detects lost/incomplete staging, the next status rebuilds
 the index from actual shards. These records describe acknowledged completion,
 not media health, and do not alter LINK keys, object placement or shard files.
 
+M1's durable part-ACK transaction reads the pending plan, logical owner and
+upload-GC claim before committing progress. Cancellation, publication, trash
+or reclamation which wins that race prevents a new ACK. GC shares the existing
+per-version upload lock and defers active writers through its database index;
+it does not wait behind a slow client or purge its staging concurrently.
+Bridged strict parts synchronize the file and directory links before recording
+their receipt. The configured staging ancestor chain is established at startup;
+the first strict receipt persists the new version/fragment links, and later
+parts retain the version-directory barrier. These are M1 coordination records,
+not N1 upload tickets or permanent object tombstones.
+
 The following lifecycle describes the independent object engine:
 
 Begin creates a fresh random identity and writes incomplete shard
@@ -488,6 +499,12 @@ runtime are retained. A full budget backpressures read-repair admission after
 foreground data/memory guards are released; it does not silently skip repair.
 GET completion can wait at that admission boundary. Pending requests for the
 same fingerprint coalesce under an owner that shutdown drains.
+
+Explicit repair also accepts completed, unpublished staging when sufficient
+verified completion seals and source stripes survive. It reconstructs and
+persists replacements only in `.uploads/`; publication still requires finalize.
+Completed upload retries remain read-only, and insufficient verified sources
+cannot be replaced with unchecked bytes. Ordinary GET/stat require publication.
 
 ## Purge and interrupted deletion
 

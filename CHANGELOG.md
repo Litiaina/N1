@@ -10,6 +10,12 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Fence M1 multipart ACK records against trash, publication, cancellation and
+  GC in the acknowledgement transaction. Share existing per-upload exclusion
+  with indexed GC so active writers are deferred without stalling maintenance.
+  Persist bridged staging directory links before strict receipts and return
+  explicit 507 responses for actual storage-space/quota exhaustion.
+
 - Extend explicit N1 object repair to completed, unpublished staging. Reconstruct
   verified shards in `.uploads/` without publication; retain read-only completed
   upload retries and require a separate finalize operation.

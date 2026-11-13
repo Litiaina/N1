@@ -52,3 +52,48 @@ pub(crate) async fn private_directory(path: &Path) -> ApiResult<()> {
     .await
     .map_err(|_| ApiError::invalid("staging directory worker failed"))?
 }
+
+/// Establish configured directories once at startup, including newly created
+/// ancestors. Per-part requests never walk this chain or call syncfs.
+pub(crate) async fn persist_staging_root(path: &Path) -> ApiResult<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        for directory in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::File::open(directory)?.sync_all()?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::invalid("staging root sync worker failed"))??;
+    Ok(())
+}
+
+/// The part file was synchronized before this call. Its first strict ACK also
+/// requires the version directory's link and fragment directory's link durable.
+pub(crate) async fn persist_part_directory(
+    directory: &Path,
+    root: &Path,
+    first_strict_payload: bool,
+) -> ApiResult<()> {
+    let directory = directory.to_owned();
+    let root = root.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let fragment = directory
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing staging parent"))?;
+        if fragment.parent() != Some(root.as_path()) {
+            return Err(std::io::Error::other(
+                "staging path is outside its configured root",
+            ));
+        }
+        std::fs::File::open(&directory)?.sync_all()?;
+        if first_strict_payload {
+            std::fs::File::open(fragment)?.sync_all()?;
+            std::fs::File::open(&root)?.sync_all()?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::invalid("staging sync worker failed"))??;
+    Ok(())
+}

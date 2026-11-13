@@ -130,6 +130,7 @@ mod tests {
             strict: true,
             content_type: "application/octet-stream".into(),
             acknowledgements_indexed: true,
+            staging_parents_persisted: false,
         };
         db.transact(64, |tx| {
             tx.put(

@@ -496,6 +496,23 @@ impl Namespace {
         Ok(pending)
     }
 
+    /// Include ownership in the part-ACK transaction so a concurrent trash or
+    /// reclamation claim conflicts with an already prepared acknowledgement.
+    pub(crate) fn check_upload_owner(
+        tx: &MetadataTransaction,
+        fragment: PoolId,
+        object: &str,
+    ) -> Result<()> {
+        let binding: ObjectBinding =
+            read(tx, Table::Versions, &binding_key(fragment, object)?)?.ok_or(Error::NotFound)?;
+        if binding.trashed || binding.reclaiming {
+            return Err(Error::NameConflict(
+                "upload owner is no longer accepting parts".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Call only after the existing object API has durably finalized and stat'd
     /// this exact LINK identity. No object I/O occurs inside a retrying database
     /// transaction. A lost reply can repeat this same publication safely.

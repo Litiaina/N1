@@ -8,6 +8,152 @@ enum Target {
     Metadata,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a private bounded filesystem for staging and healthy external ACK storage"]
+async fn staging_disk_full_preserves_durable_parts_and_resumes_the_same_identity() {
+    let pressure_root = PathBuf::from(std::env::var_os("N1_RESOURCE_PRESSURE_ROOT").unwrap());
+    bounded_filesystem(&pressure_root);
+    let evidence = PathBuf::from(std::env::var_os("N1_RESOURCE_EVIDENCE_ROOT").unwrap())
+        .join(format!("staging-full-{}", ulid::Ulid::new()));
+    fs::create_dir(&evidence).unwrap();
+    assert_ne!(
+        fs::metadata(&pressure_root).unwrap().dev(),
+        fs::metadata(&evidence).unwrap().dev()
+    );
+    let mut stack = Stack::with_block_bytes(262144).await;
+    drop(stack.metadata.take());
+    let config = stack.root.join("m1_config.ini");
+    let staging = pressure_root.join(format!("staging-{}", ulid::Ulid::new()));
+    let mut ini = ini::Ini::load_from_file(&config).unwrap();
+    ini.with_section(Some("metadata_engine"))
+        .set("staging_dir", staging.display().to_string());
+    ini.write_to_file(&config).unwrap();
+    stack.start_metadata().await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let base = format!("{}/noa/v1", stack.url);
+    let (_, token) = reliability::fragment(&client, &base, "staging ENOSPC").await;
+    let bytes: Vec<_> = (0..900003).map(|i| (i * 31 % 251) as u8).collect();
+    let seed = maintenance::put(&client, &base, &token, "seed.bin", &bytes[..65537]).await;
+    let route = format!("{base}/upload/multipart/durable");
+    let hint = json!({"total_size_bytes":bytes.len(),"part_size_bytes":300001,"expected_parts":3});
+    let init_url = format!("{route}/init/staged.bin");
+    let upload = json_response(
+        client
+            .post(&init_url)
+            .bearer_auth(&token)
+            .json(&hint)
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
+    let version = upload["version_id"].as_str().unwrap();
+    resume_progress::put(
+        &client,
+        &route,
+        &token,
+        version,
+        0,
+        bytes[..300001].to_vec(),
+    )
+    .await;
+    reliability::record(
+        &evidence.join("prior-acks.json"),
+        &json!({"seed":seed,"upload":upload,"uploaded_parts":[0]}),
+    );
+    let (pressure, pressure_bytes) = fill(&pressure_root);
+    let started = std::time::Instant::now();
+    let failed = client
+        .put(format!("{route}/{version}/1"))
+        .bearer_auth(&token)
+        .body(bytes[300001..600002].to_vec())
+        .send()
+        .await
+        .unwrap();
+    let status = failed.status().as_u16();
+    reliability::record(
+        &evidence.join("failed-part.json"),
+        &json!({"status":status,
+        "seconds":started.elapsed().as_secs_f64(),"response":failed.json::<Value>().await.unwrap()}),
+    );
+    assert_eq!(status, 507, "staging ENOSPC returned {status}");
+    drop(stack.metadata.take());
+    drop(stack.object.take());
+    drop(pressure);
+    stack.start_object().await;
+    stack.start_metadata().await;
+    let reused = json_response(
+        client
+            .post(&init_url)
+            .bearer_auth(&token)
+            .json(&hint)
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
+    assert_eq!(reused, upload);
+    assert_eq!(
+        resume_progress::status(&client, &route, &token, version).await["uploaded_parts"],
+        json!([0])
+    );
+    assert!(
+        read(
+            &client,
+            &base,
+            &token,
+            "seed.bin",
+            &bytes[..65537],
+            Some(&seed)
+        )
+        .await
+    );
+    for i in 1..3 {
+        resume_progress::put(
+            &client,
+            &route,
+            &token,
+            version,
+            i as u64,
+            bytes[i * 300001..(i + 1) * 300001].to_vec(),
+        )
+        .await;
+    }
+    let finish = format!(
+        "{route}/{version}/{}/finalize",
+        upload["session_id"].as_str().unwrap()
+    );
+    for _ in 0..2 {
+        let done = json_response(
+            client
+                .post(&finish)
+                .bearer_auth(&token)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap(),
+            200,
+        )
+        .await;
+        assert_eq!(done["version_id"], version);
+    }
+    assert!(read(&client, &base, &token, "staged.bin", &bytes, Some(version)).await);
+    drop(stack.metadata.take());
+    let db = maintenance::db(&stack);
+    let checked = db.verify().unwrap();
+    reliability::record(
+        &evidence.join("PASSED.json"),
+        &json!({"passed":true,
+        "pressure_bytes":pressure_bytes,"prior_part_acks":1,"same_identity":true,
+        "failed_part_status":status,"offline_records_checked":checked}),
+    );
+}
+
 struct Pressure(PathBuf);
 impl Drop for Pressure {
     fn drop(&mut self) {
@@ -48,17 +194,22 @@ fn fill(path: &Path) -> (Pressure, u64) {
         .mode(0o600)
         .open(path)
         .unwrap();
-    let block = vec![0x57; 1 << 20];
     let mut written = 0;
-    loop {
-        match file.write(&block) {
-            Ok(0) => panic!("zero-length pressure write"),
-            Ok(bytes) => {
-                written += bytes as u64;
-                assert!(written <= capacity, "filesystem did not enforce its size");
+    // A rejected 1 MiB allocation can leave enough blocks for a small part.
+    // Exhaust the remaining allocation units too, rather than treating that
+    // first large-write ENOSPC as proof that a 300 KiB part cannot fit.
+    for block_bytes in [1 << 20, 4096] {
+        let block = vec![0x57; block_bytes];
+        loop {
+            match file.write(&block) {
+                Ok(0) => panic!("zero-length pressure write"),
+                Ok(bytes) => {
+                    written += bytes as u64;
+                    assert!(written <= capacity, "filesystem did not enforce its size");
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => break,
+                Err(error) => panic!("pressure must reach actual ENOSPC: {error}"),
             }
-            Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => break,
-            Err(error) => panic!("pressure must reach actual ENOSPC: {error}"),
         }
     }
     if let Err(error) = file.sync_all() {
@@ -157,7 +308,7 @@ async fn exercise(target: Target) {
         } else {
             match target {
                 Target::Object => assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE),
-                Target::Metadata => assert!(matches!(status.as_u16(), 500 | 503)),
+                Target::Metadata => assert!(matches!(status.as_u16(), 500 | 503 | 507)),
             }
             rejected = true;
             break;

@@ -118,6 +118,7 @@ pub(crate) struct Manager {
     pub config: Config,
     pools: Vec<PoolProfile>,
     staging: std::path::PathBuf,
+    upload_locks: Arc<crate::uploads::UploadLocks>,
     slots: Mutex<BTreeMap<Kind, Slot>>,
     admission: tokio::sync::Mutex<()>,
     stopping: AtomicBool,
@@ -139,6 +140,7 @@ impl Manager {
         config: Config,
         pools: Vec<PoolProfile>,
         staging: std::path::PathBuf,
+        upload_locks: Arc<crate::uploads::UploadLocks>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -146,6 +148,7 @@ impl Manager {
             config,
             pools,
             staging,
+            upload_locks,
             slots: Mutex::new(BTreeMap::new()),
             admission: tokio::sync::Mutex::new(()),
             stopping: AtomicBool::new(false),
