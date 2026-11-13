@@ -218,12 +218,17 @@ pub(crate) async fn init(
             stripe,
         )?;
     }
-    let bridge = request.total_size_bytes == 0 || !request.part_size_bytes.is_multiple_of(stripe);
-    let backend_part = if bridge {
-        (app.config.max_part_size / stripe).max(1) * stripe
-    } else {
+    let aligned = request.part_size_bytes > 0 && request.part_size_bytes.is_multiple_of(stripe);
+    let backend_part = if aligned {
         request.part_size_bytes
+    } else {
+        (app.config.max_part_size / stripe).max(1) * stripe
     };
+    // One external part can use native part zero's short tail. It must fit:
+    // rounding the configured maximum down can leave a larger external tail.
+    // Keep the client's saved geometry whenever conversion still needs a spool.
+    let bridge = request.total_size_bytes == 0
+        || (!aligned && (request.expected_parts > 1 || request.total_size_bytes > backend_part));
     let mut handle = app
         .service
         .begin_upload(UploadRequest {

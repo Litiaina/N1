@@ -35,6 +35,13 @@ matched multipart measurements retain adverse latency, CPU and throughput;
 performance acceptance remains open alongside memory/stalled-I/O, broader
 saturation, final contract/Console and final-candidate hardware qualification.
 
+The subsequent [single-part streaming qualification](M1-SINGLE-PART-20261114.md)
+removes unnecessary M1 payload staging for a nonempty single external part
+within native capacity. All 425 default workspace checks, 11 SSD service cases,
+two physical HDD witnesses and four original Console browser cases pass.
+The matched small multipart run improves latency and CPU; adverse large-file
+controls remain explicit performance acceptance work.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

@@ -10,6 +10,11 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Stream a nonempty single-part M1 upload directly to N1 when it fits the
+  native part capacity, preserving client geometry, identity, ACK/GC fences
+  and restart recovery. Keep the existing bridge for empty uploads, larger
+  single external parts and incompatible multi-part geometry.
+
 - Fence M1 multipart ACK records against trash, publication, cancellation and
   GC in the acknowledgement transaction. Share existing per-upload exclusion
   with indexed GC so active writers are deferred without stalling maintenance.

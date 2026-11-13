@@ -35,6 +35,12 @@ two-HDD active-writer GC witness and three real XFS ENOSPC/recovery cases.
 It records first strict staging-directory persistence, transactional ACK fences
 and matched large/small multipart regressions; performance parity is not claimed.
 
+The [single-part streaming qualification](docs/M1-SINGLE-PART-20261114.md)
+passes 425 default workspace checks, 11 selected SSD service cases, both new
+two-HDD restart/boundary witnesses and four original Console browser workflows.
+Its 400-object matched multipart run improves small-object latency and CPU;
+adverse large-file controls and their follow-up remain separately recorded.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |
