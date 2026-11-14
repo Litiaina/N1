@@ -58,6 +58,15 @@ witnesses, four original Console workflows and the repeated local kernel-delay
 and memory-pressure profiles pass. Its measured idle tails remain explicit;
 the broader final acceptance conditions above are unchanged.
 
+The [M1 bridge I/O/recovery qualification](M1-BRIDGE-IO-20261114.md) removes
+object-wide checksum/cache churn and repeated flushes of a converted copy
+already backed by durable M1 source. Its selected source passes 426 default
+checks, 18 selected SSD cases, four two-HDD cases and four original Console
+upload workflows with N1 unchanged. Confirmed loss of an unused allocation is
+recovered with a fresh private LINK identity, preserving the named session and
+ACKs. The measured large-file gains and adverse controls remain scoped; final
+power-loss, MCH, saturation and complete operator/contract acceptance stay open.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

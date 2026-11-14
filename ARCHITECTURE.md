@@ -323,6 +323,23 @@ the first strict receipt persists the new version/fragment links, and later
 parts retain the version-directory barrier. These are M1 coordination records,
 not N1 upload tickets or permanent object tombstones.
 
+For bridged uploads, M1's synchronized source and receipt back the external
+durable ACK. Conversion uses normal native parts and retains that source until
+N1's durable finalization and M1 publication succeed. Each external file is
+checksum-verified before any of its bytes are forwarded, then streamed from
+the same rewound descriptor. Verification and forwarding stay adjacent rather
+than rereading an object-sized working set. The blocking verifier owns its
+memory reservation even if its caller is cancelled.
+
+An unused N1 Begin may disappear on power loss before any native payload is
+acknowledged. Before bridge conversion, M1 probes only its native allocation's
+headers with an empty status range. Confirmed total absence permits a fresh
+Begin in the same pool/generation and an atomic replacement of the private
+pending reference and expiry index. The public named session/version and M1
+source receipts remain unchanged. Cancellation, publication, trash and GC fence
+replacement. Unavailability, corruption and partial member loss do not trigger
+this recovery. The old LINK key stays missing; continuation never recreates it.
+
 The following lifecycle describes the independent object engine:
 
 Begin creates a fresh random identity and writes incomplete shard

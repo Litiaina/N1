@@ -32,8 +32,10 @@ async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publicati
         .unwrap();
     let base = format!("{}/noa/v1", stack.url);
     let (alias, token) = reliability::fragment(&client, &base, "sealed staging repair").await;
-    let bytes: Vec<_> = (0..25003).map(|i| (i * 31 % 251) as u8).collect();
-    let part_bytes = 5001;
+    // Exercise durable native parts directly. Incompatible external geometry
+    // has its own durable M1 staging and can replay normal native conversion.
+    let bytes: Vec<_> = (0..40959).map(|i| (i * 31 % 251) as u8).collect();
+    let part_bytes = 8192;
     let route = format!("{base}/upload/multipart/durable");
     let upload = json_response(
         client
@@ -77,15 +79,17 @@ async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publicati
     drop(database);
     // Model a crash after native durable completion but before named publication.
     let mut native = object_client(&stack).await;
-    native
-        .write_at(
-            key.clone(),
-            0,
-            bytes.len() as u64,
-            &mut std::io::Cursor::new(&bytes),
-        )
-        .await
-        .unwrap();
+    for (index, part) in bytes.chunks(part_bytes).enumerate() {
+        native
+            .write_at(
+                key.clone(),
+                (index * part_bytes) as u64,
+                part.len() as u64,
+                &mut std::io::Cursor::new(part),
+            )
+            .await
+            .unwrap();
+    }
     drop(native);
     drop(stack.object.take());
     let settings: Value =
@@ -138,8 +142,8 @@ async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publicati
             .write_at(
                 key.clone(),
                 0,
-                bytes.len() as u64,
-                &mut std::io::Cursor::new(&bytes)
+                part_bytes as u64,
+                &mut std::io::Cursor::new(&bytes[..part_bytes])
             )
             .await
             .is_err()

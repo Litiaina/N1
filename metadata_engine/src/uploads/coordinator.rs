@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+mod allocation;
+mod bridge;
 mod lifecycle;
 mod listing;
 pub(crate) use listing::list;
@@ -238,7 +240,11 @@ pub(crate) async fn init(
             pool: Some(profile.id),
             total_bytes: request.total_size_bytes,
             part_bytes: backend_part,
-            durable: durable || strict,
+            // Bridged ACKs are backed by M1's synchronized staged payload and
+            // receipt. Conversion can use normal N1 parts: native finalize
+            // persists all shards before named publication. Avoid flushing the
+            // second copy after every part; retain M1 staging until success.
+            durable: !bridge && (durable || strict),
             ttl_seconds: 30 * 86400,
         })
         .await?;
@@ -667,78 +673,42 @@ pub(crate) async fn finalize(
             return Err(crate::Error::NameConflict("upload is missing parts".into()).into());
         }
         let dir = directory(&app, fragment, &version);
-        // Each staged part is verified before it is allowed to contribute to
-        // physical publication. Memory stays bounded to one streaming buffer.
-        let (mut buffer, _memory) = super::io_buffer(&app).await?;
-        for index in 0..plan.handle.expected_parts {
-            let key = RecordKey::new(fragment, format!("upload-part/{version}/{index:06}"))?;
-            let expected: Part = app
-                .db
-                .execute(move |db| {
-                    fragments::decode(
-                        db.snapshot()
-                            .get(Table::Reclamation, &key)?
-                            .ok_or(crate::Error::NotFound)?,
-                    )
-                })
-                .await?;
-            let mut file = tokio::fs::File::open(dir.join(format!("{index}.part"))).await?;
-            let mut hash = Sha256::new();
-            let mut bytes = 0;
-            loop {
-                let n = file.read(&mut buffer).await?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-                bytes += n as u64;
-            }
-            if bytes != expected.bytes || hex::encode(hash.finalize()) != expected.sha256 {
-                return Err(ApiError(
-                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                    "Staged part failed its checksum".into(),
-                ));
-            }
-        }
+        let upload = allocation::ready(&app, fragment, &version, &pending.upload).await?;
+        // One memory reservation covers verification and the following file
+        // stream. No bytes from a file reach N1 before its checksum passes.
+        let (buffer, memory) = super::io_buffer(&app).await?;
+        let memory = Arc::new(memory);
         let capacity = buffer.len();
         drop(buffer);
         // Keep its permit while replacing the verification buffer with one
         // ReaderStream buffer. Only one staged file is open at a time.
-        use futures_util::{StreamExt, TryStreamExt};
-        if pending.upload.parts == 0 {
+        if upload.parts == 0 {
+            bridge::verified_file(&app, fragment, &version, &dir, 0, capacity, memory.clone())
+                .await?;
             app.service
                 .objects()
-                .put(&pending.upload, &mut tokio::io::empty())
+                .put(&upload, &mut tokio::io::empty())
                 .await?;
         }
-        let mut source = tokio_util::io::StreamReader::new(
-            futures_util::stream::iter(0..plan.handle.expected_parts)
-                .then(move |i| {
-                    let path = dir.join(format!("{i}.part"));
-                    async move {
-                        tokio::fs::File::open(path)
-                            .await
-                            .map(|file| tokio_util::io::ReaderStream::with_capacity(file, capacity))
-                    }
-                })
-                .try_flatten()
-                .boxed(),
+        let mut source = bridge::source(
+            app.clone(),
+            fragment,
+            version.clone(),
+            dir,
+            plan.handle.expected_parts,
+            capacity,
+            memory,
         );
-        for index in 0..pending.upload.parts {
-            let bytes = pending
-                .upload
+        for index in 0..upload.parts {
+            let bytes = upload
                 .total_bytes
-                .saturating_sub(index * pending.upload.part_bytes)
-                .min(pending.upload.part_bytes);
+                .saturating_sub(index * upload.part_bytes)
+                .min(upload.part_bytes);
             app.service
                 .objects()
-                .part(
-                    &pending.upload,
-                    index,
-                    bytes,
-                    &mut (&mut source).take(bytes),
-                )
-                .await?;
+                .part(&upload, index, bytes, &mut (&mut source).take(bytes))
+                .await
+                .map_err(bridge::forward_error)?;
         }
     }
     let result = match app.service.finalize(fragment, &version, &session).await {

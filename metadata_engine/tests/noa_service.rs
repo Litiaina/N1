@@ -32,6 +32,8 @@ mod export_lifecycle;
 mod export_performance;
 #[path = "noa_service/gc_concurrent.rs"]
 mod gc_concurrent;
+#[path = "noa_service/lost_allocation.rs"]
+mod lost_allocation;
 #[path = "noa_service/maintenance.rs"]
 mod maintenance;
 #[path = "noa_service/monitoring.rs"]

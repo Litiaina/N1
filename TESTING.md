@@ -54,6 +54,14 @@ reproduces; all 16 selected service cases, both HDD cases, four original Console
 workflows and repeated kernel-delay/memory-pressure profiles pass. It retains
 matched latency, high-resolution process CPU, RSS and adverse idle tails.
 
+The [bridge I/O/recovery report](docs/M1-BRIDGE-IO-20261114.md) retains large-file
+comparisons with N1 fixed, including adverse part tails and immediate readback.
+Its selected M1 passes 426 default checks, 18 SSD service cases, four two-HDD
+cases and four original Console browser workflows. A lost-unused-allocation
+witness fails on the preceding M1 and passes with a fresh private allocation,
+preserving external ACKs and leaving the old LINK missing. All selected physical
+service runs explicitly require io_uring; no N1 runtime source changes.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |

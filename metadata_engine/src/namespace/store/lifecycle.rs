@@ -1,6 +1,8 @@
 //! Transactional maintenance indexes. Routine work seeks these bounded ranges;
 //! it never walks the namespace or object-engine member directories.
 use super::*;
+mod allocation;
+pub(crate) use allocation::replace_upload_allocation;
 mod gc;
 mod migration;
 use crate::fragments::CATALOG;

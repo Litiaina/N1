@@ -10,6 +10,15 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Reduce bridged multipart conversion I/O by verifying and forwarding each
+  external file together. Retain M1's durable source until N1's final durable
+  publication, avoiding a second per-part flush of the converted copy. Keep
+  checksum errors, bounded memory ownership and immutable native retries.
+- Recover a wholly missing unused N1 allocation from an unpublished M1 upload's
+  retained source with a fresh private LINK identity. Atomically switch its
+  reference and expiry index while preserving the public session/version and
+  cancellation/GC fences; leave the old LINK key missing.
+
 - Extend concurrent M1 status queries to read-only staged receipts. Preserve
   acknowledged-file checks and exclude in-flight temporary files; retain
   exclusive reconciliation and lifecycle changes. Add a reproduced bridge
