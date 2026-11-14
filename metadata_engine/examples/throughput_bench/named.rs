@@ -248,29 +248,38 @@ pub async fn small(
 ) -> Result<Value> {
     let hash = hex::encode(Sha256::digest(&bytes));
     let phase = Measure::start(pids)?;
-    let uploaded: Vec<(String, String, f64)> = futures_util::stream::iter(0..100)
+    let uploaded: Vec<(String, String, f64, Value)> = futures_util::stream::iter(0..100)
         .map(|index| {
             let bytes = bytes.clone();
             async move {
                 let path = format!("bench/{run}/r{repeat}/small-c{concurrency}-{index:03}.bin");
+                let unix_start_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_micros() as u64;
                 let started = Instant::now();
-                let object = expect(
-                    api.client
-                        .post(format!(
-                            "{}/upload/one-shot/{path}?durability=strict",
-                            api.base
-                        ))
-                        .bearer_auth(&api.token)
-                        .body(bytes)
-                        .send()
-                        .await?,
-                    201,
-                )
-                .await?;
+                let response = api
+                    .client
+                    .post(format!(
+                        "{}/upload/one-shot/{path}?durability=strict",
+                        api.base
+                    ))
+                    .bearer_auth(&api.token)
+                    .body(bytes)
+                    .send()
+                    .await?;
+                let profile_id = response
+                    .headers()
+                    .get("x-m1-upload-profile")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                let object = expect(response, 201).await?;
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                     path,
                     string(&object, "version_id")?,
-                    started.elapsed().as_secs_f64() * 1000.0,
+                    elapsed_ms,
+                    json!({"index":index,"profile_id":profile_id,
+                        "unix_start_us":unix_start_us,"elapsed_ms":elapsed_ms}),
                 ))
             }
         })
@@ -280,7 +289,7 @@ pub async fn small(
     let upload = phase.finish(100 * 4096, 100).await?;
     let phase = Measure::start(pids)?;
     let reads: Vec<f64> = futures_util::stream::iter(uploaded.iter())
-        .map(|(path, version, _)| {
+        .map(|(path, version, _, _)| {
             let hash = &hash;
             async move {
                 let start = Instant::now();
@@ -294,9 +303,10 @@ pub async fn small(
         .try_collect()
         .await?;
     let download = phase.finish(100 * 4096, 100).await?;
+    let requests = uploaded.iter().map(|v| v.3.clone()).collect::<Vec<_>>();
     Ok(
         json!({"method":format!("100 x 4 KiB c{concurrency}"),"concurrency":concurrency,"upload":upload,"download":download,
-        "upload_latency":distribution(uploaded.into_iter().map(|v|v.2).collect()),"download_latency":distribution(reads),"verified":100}),
+        "upload_latency":distribution(uploaded.into_iter().map(|v|v.2).collect()),"requests":requests,"download_latency":distribution(reads),"verified":100}),
     )
 }
 pub async fn large(

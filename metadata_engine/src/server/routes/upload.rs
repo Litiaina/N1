@@ -43,7 +43,8 @@ pub(super) async fn one_shot(
     Query(q): Query<Q>,
     body: Body,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let claims = auth::authorize(&app, &headers, "write").await?;
+    let claims =
+        crate::upload_stage!("http.authorize", auth::authorize(&app, &headers, "write")).await?;
     let id = claims.id();
     let content_type = headers
         .get("content-type")
@@ -61,12 +62,12 @@ pub(super) async fn one_shot(
                 .ok_or_else(|| ApiError::invalid("invalid content length"))
         })
         .transpose()?;
-    let _permit = app
-        .upload_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::invalid("upload service is shutting down"))?;
+    let _permit = crate::upload_stage!(
+        "http.upload_admission",
+        app.upload_slots.clone().acquire_owned()
+    )
+    .await
+    .map_err(|_| ApiError::invalid("upload service is shutting down"))?;
     let mut source = reader(body);
     let result = if let Some(length) = length {
         put_stream(

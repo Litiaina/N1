@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(
             "/noa/v1/ping",
             get(|| async {
@@ -213,5 +213,8 @@ pub fn router(app: Arc<App>) -> Router {
                 .allow_headers(Any)
                 .expose_headers(Any),
         )
-        .with_state(app)
+        .with_state(app);
+    #[cfg(feature = "upload-profile")]
+    let router = router.layer(axum::middleware::from_fn(crate::upload_profile::request));
+    router
 }

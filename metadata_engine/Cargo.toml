@@ -9,6 +9,10 @@ description = "Litiaina M1 metadata store with its own transactional database, u
 name = "litiaina-m1"
 path = "src/main.rs"
 
+[features]
+# Per-request investigation only; absent from normal server builds.
+upload-profile = []
+
 [dependencies]
 m1_storage = { path = "storage" }
 n1_link = { path = "../link" }

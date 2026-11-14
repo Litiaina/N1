@@ -67,6 +67,13 @@ recovered with a fresh private LINK identity, preserving the named session and
 ACKs. The measured large-file gains and adverse controls remain scoped; final
 power-loss, MCH, saturation and complete operator/contract acceptance stay open.
 
+The [latency follow-up](M1-LATENCY-20261114.md) reproduces small one-shot tails
+under retained desktop load and correlates M1/N1 persistence waits with XFS
+kernel stacks. Its A–B–B–A database-medium isolation identifies shared I/O and
+N1's filesystem-wide publication barrier as concrete costs. The RAM control
+does not qualify a durable deployment or close tail acceptance. N1 remains
+unchanged; 426 default workspace tests and strict normal/diagnostic lint pass.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

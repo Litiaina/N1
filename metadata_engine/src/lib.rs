@@ -4,6 +4,23 @@
 //! It accesses the independent N1 object store through the public native NOA API.
 //! N1 does not depend on M1. Storage transactions live in `store`;
 //! public NOA request semantics belong to the service adapters in `server`.
+// The disabled arm is the original future, with no timer or wrapper allocation.
+macro_rules! upload_stage {
+    ($stage:literal, $future:expr) => {{
+        #[cfg(feature = "upload-profile")]
+        {
+            crate::upload_profile::stage($stage, $future)
+        }
+        #[cfg(not(feature = "upload-profile"))]
+        {
+            $future
+        }
+    }};
+}
+pub(crate) use upload_stage;
+#[cfg(feature = "upload-profile")]
+mod upload_profile;
+
 mod error;
 mod executor;
 pub mod exports;

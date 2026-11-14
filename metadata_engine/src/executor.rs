@@ -34,6 +34,11 @@ impl MetadataExecutor {
         &self,
         work: impl FnOnce(MetadataEngine) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        #[cfg(feature = "upload-profile")]
+        let timing = (
+            crate::upload_profile::Trace::current(),
+            std::time::Instant::now(),
+        );
         let lifecycle = self.lifecycle.clone().read_owned().await;
         let permit = self
             .permits
@@ -47,7 +52,17 @@ impl MetadataExecutor {
         tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;
             let _permit = permit;
-            work(engine)
+            #[cfg(feature = "upload-profile")]
+            let started = std::time::Instant::now();
+            #[cfg(feature = "upload-profile")]
+            let _context = crate::upload_profile::WorkerContext::enter(timing.0.clone());
+            let result = work(engine);
+            #[cfg(feature = "upload-profile")]
+            if let (Some(trace), queued) = timing {
+                trace.record("metadata.worker_queue", queued, started);
+                trace.record("metadata.worker_run", started, std::time::Instant::now());
+            }
+            result
         })
         .await
         .map_err(|error| Error::Worker(format!("metadata worker failed: {error}")))?

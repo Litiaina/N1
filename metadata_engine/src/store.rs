@@ -90,7 +90,22 @@ impl MetadataEngine {
         for _ in 0..attempts {
             let mut tx = self.write()?;
             let result = apply(&mut tx)?;
-            match tx.commit() {
+            #[cfg(feature = "upload-profile")]
+            let start = std::time::Instant::now();
+            let committed = tx.commit();
+            #[cfg(feature = "upload-profile")]
+            if let Some(trace) = crate::upload_profile::Trace::current() {
+                let name = if matches!(committed, Err(Error::Conflict)) {
+                    trace
+                        .conflicts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    "metadata.commit_conflict"
+                } else {
+                    "metadata.commit"
+                };
+                trace.record(name, start, std::time::Instant::now());
+            }
+            match committed {
                 Ok(()) => return Ok(result),
                 Err(Error::Conflict) => std::thread::yield_now(),
                 Err(error) => return Err(error),

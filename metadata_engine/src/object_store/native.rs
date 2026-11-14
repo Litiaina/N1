@@ -151,15 +151,19 @@ impl NativeObjectStore {
     }
 
     async fn connection(&self) -> ObjectStoreResult<Connection> {
-        let lifecycle = self.0.lifecycle.clone().read_owned().await;
-        let permit = self
-            .0
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ObjectStoreError::Closed)?;
-        let (client, expires_at) = self.transport(true).await?;
+        let lifecycle = crate::upload_stage!(
+            "native.lifecycle_admission",
+            self.0.lifecycle.clone().read_owned()
+        )
+        .await;
+        let permit = crate::upload_stage!(
+            "native.connection_admission",
+            self.0.permits.clone().acquire_owned()
+        )
+        .await
+        .map_err(|_| ObjectStoreError::Closed)?;
+        let (client, expires_at) =
+            crate::upload_stage!("native.transport", self.transport(true)).await?;
         Ok(Connection {
             owner: self.0.clone(),
             client,
@@ -187,10 +191,7 @@ impl NativeObjectStore {
             // session. Password verification and durable session creation are
             // needed once per renewal, not once per concurrent connection.
             // Neither authentication nor object quotas are bypassed.
-            let _login = self
-                .0
-                .logins
-                .acquire()
+            let _login = crate::upload_stage!("native.login_admission", self.0.logins.acquire())
                 .await
                 .map_err(|_| ObjectStoreError::Closed)?;
             // Another operation may have returned an authenticated connection
@@ -205,9 +206,12 @@ impl NativeObjectStore {
                     return Ok((cached.client, cached.expires_at));
                 }
             }
-            let mut client = N1NativeClient::connect_with_tls(
-                &self.0.config.native_url,
-                self.0.config.tls.clone(),
+            let mut client = crate::upload_stage!(
+                "native.connect_tls",
+                N1NativeClient::connect_with_tls(
+                    &self.0.config.native_url,
+                    self.0.config.tls.clone(),
+                )
             )
             .await?;
             let now = unix_now()?;
@@ -221,11 +225,19 @@ impl NativeObjectStore {
             let mut attempt = 0;
             let response = loop {
                 let result = match &session {
-                    Some(session) => client.auth_bearer(session.token.clone()).await,
+                    Some(session) => {
+                        crate::upload_stage!(
+                            "native.auth_bearer",
+                            client.auth_bearer(session.token.clone())
+                        )
+                        .await
+                    }
                     None => {
-                        client
-                            .auth_fragment(&self.0.config.fragment, &self.0.config.secret)
-                            .await
+                        crate::upload_stage!(
+                            "native.auth_fragment",
+                            client.auth_fragment(&self.0.config.fragment, &self.0.config.secret)
+                        )
+                        .await
                     }
                 };
                 if matches!(&result,Err(NativeClientError::Native{code,..}) if code=="429")
@@ -313,7 +325,7 @@ impl NativeObjectStore {
 
     async fn command<T: DeserializeOwned>(&self, command: Command) -> ObjectStoreResult<T> {
         let mut connection = self.connection().await?;
-        match connection.client.control(command).await {
+        match crate::upload_stage!("native.control", connection.client.control(command)).await {
             Ok(response) => {
                 let value = decode(response)?;
                 connection.release();

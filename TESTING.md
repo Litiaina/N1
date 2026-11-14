@@ -62,6 +62,14 @@ witness fails on the preceding M1 and passes with a fresh private allocation,
 preserving external ACKs and leaving the old LINK missing. All selected physical
 service runs explicitly require io_uring; no N1 runtime source changes.
 
+The [latency investigation](docs/M1-LATENCY-20261114.md) correlates client,
+server, syscall and XFS kernel waits under the operator's retained desktop load.
+An A–B–B–A control changes only M1's database between DATA_SSD and RAM while
+N1 stays on DATA_SSD. It identifies durable commit/publication waits and the
+filesystem-wide `syncfs` dependency; RAM results are diagnostic, not production
+durability or performance acceptance. Default builds exclude the new opt-in
+request profiler. All 426 default workspace checks and strict lint checks pass.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |

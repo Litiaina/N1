@@ -125,25 +125,26 @@ impl MetadataService {
         // Validate the logical input before any network work. Init has no
         // payload side effects, but cannot reserve an invalid logical key.
         crate::namespace::store::validate_upload(&request.path, &request.content_type)?;
-        let upload = self
-            .objects
-            .init(
+        let upload = crate::upload_stage!(
+            "native.begin",
+            self.objects.init(
                 request.pool,
                 request.total_bytes,
                 request.part_bytes,
                 request.durable,
                 request.ttl_seconds,
             )
-            .await?;
+        )
+        .await?;
         let version_id = Ulid::new().to_string();
         let session_id = Ulid::new().to_string();
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| Error::Invalid("system time precedes the Unix epoch".into()))?
             .as_secs() as i64;
-        Ok(self
-            .metadata
-            .execute(move |db| {
+        Ok(crate::upload_stage!(
+            "metadata.reserve",
+            self.metadata.execute(move |db| {
                 Namespace::new(db).reserve_upload(
                     request.fragment,
                     &request.path,
@@ -154,7 +155,8 @@ impl MetadataService {
                     created,
                 )
             })
-            .await?)
+        )
+        .await?)
     }
 
     pub(crate) async fn pending(
@@ -165,9 +167,15 @@ impl MetadataService {
     ) -> Result<PendingUpload> {
         let version = version_id.to_owned();
         let session = session_id.map(str::to_owned);
-        self.metadata
-            .execute(move |db| Namespace::new(db).pending(fragment, &version, session.as_deref()))
-            .await
+        crate::upload_stage!(
+            "metadata.pending",
+            self.metadata.execute(move |db| Namespace::new(db).pending(
+                fragment,
+                &version,
+                session.as_deref()
+            ))
+        )
+        .await
     }
 
     pub async fn upload_part<R: AsyncRead + Unpin>(
@@ -233,16 +241,20 @@ impl MetadataService {
     ) -> ServiceResult<PublishedVersion> {
         let _operation = self.admitted().await?;
         let pending = self.pending(fragment, version_id, Some(session_id)).await?;
-        let finalized = self.objects.put(&pending.upload, source).await?;
-        let stat = self.objects.stat(&pending.upload.object_key).await?;
+        let finalized =
+            crate::upload_stage!("native.put", self.objects.put(&pending.upload, source)).await?;
+        let stat =
+            crate::upload_stage!("native.stat", self.objects.stat(&pending.upload.object_key))
+                .await?;
         let version = version_id.to_owned();
         let session = session_id.to_owned();
-        Ok(self
-            .metadata
-            .execute(move |db| {
+        Ok(crate::upload_stage!(
+            "metadata.publish",
+            self.metadata.execute(move |db| {
                 Namespace::new(db).publish(fragment, &version, &session, &finalized, &stat)
             })
-            .await?)
+        )
+        .await?)
     }
 
     pub async fn download<W: AsyncWrite + Unpin>(
