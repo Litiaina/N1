@@ -39,8 +39,8 @@ explicit repair; `upload/stream.rs` is unchanged from `f08d55d`.
 ## Executables and checks
 
 Both production N1 builds use Rust/Cargo 1.99.0, the same lockfile and release
-profile on the main PC. Retained symbols do not change optimization settings.
-The benchmark client is identical for both servers.
+profile on the SSD test system. Retained symbols do not change optimization
+settings. The benchmark client is identical for both servers.
 
 | Executable | SHA-256 |
 | --- | --- |
@@ -136,9 +136,9 @@ release tail-latency/saturation acceptance remains open.
 
 ## Evidence
 
-The run root is `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`; copied main-PC
-logs are under `remote-negotiate01/`. Original main-PC evidence remains under
-`/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
+The run root is `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`; copied SSD test
+system logs are under `remote-negotiate01/`. Original SSD test system evidence
+remains under `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
 
 `reports/staged02-hdd/` preserves the identical baseline/candidate failure
 witness. `staged-recovery-candidate02.log`, `staged02-direct-*.log` and

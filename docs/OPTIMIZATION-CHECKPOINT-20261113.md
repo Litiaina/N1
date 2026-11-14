@@ -4,10 +4,10 @@ Work is paused at the operator's request. The optimization is experimental:
 correctness checks pass, but no throughput or CPU improvement has been measured
 for the new binary. Do not promote it as a performance-qualified replacement.
 
-**Continuation:** the operator authorized resuming on MCH on November 13.
-See [MCH optimization and RC.2 continuation](MCH-OPTIMIZATION-20261113.md) for
-the active run. The paused state and home results below remain the historical
-checkpoint; they are not MCH benchmark results.
+**Continuation:** the operator authorized resuming on the four-HDD reference system on November 13.
+See [Four-HDD reference system optimization and RC.2 continuation](FOUR-HDD-OPTIMIZATION-20261113.md) for
+the active run. The paused state and SSD/HDD results below remain the historical
+checkpoint; they are not the four-HDD reference system benchmark results.
 
 ## Preserved change
 
@@ -35,8 +35,9 @@ durability and purge behavior are unchanged. M1 and Console are unchanged.
 
 ## Completed validation
 
-The main PC compiled the candidate using the existing locked, offline release
-toolchain and dependency cache, with its build target and data on DATA_SSD.
+The SSD test system compiled the candidate using the existing locked, offline
+release toolchain and dependency cache, with its build target and data on
+DATA_SSD.
 
 | Check | Result |
 | --- | --- |
@@ -73,9 +74,9 @@ compared to unprofiled benchmarks. The trace contains zero lost samples.
 
 The original reports' increased CPU and variable 15 GiB SSD readback remain
 unresolved. The sparse-read inefficiency is established by the writer's code;
-its share of those regressions has not been established. The main PC has
-different CPU core types, and the diagnostic used CPUs 0–11. Affinity control
-is a diagnostic condition, not an engine performance improvement.
+its share of those regressions has not been established. The SSD test system has
+different CPU core types, and the diagnostic used CPUs 0–11. Affinity control is
+a diagnostic condition, not an engine performance improvement.
 
 An initial diagnostic driver omitted its empty output directory and failed
 before uploading. That was corrected in `profile-baseline02.sh`. The first
@@ -93,33 +94,33 @@ No Python was used.
 Primary local evidence:
 `/mnt/HDD1TB001/n1-large-optimization-20261113-01`.
 
-Main-PC evidence:
-`/mnt/DATA_SSD/n1-large-optimization-20261113-01`.
+SSD test system evidence: `/mnt/DATA_SSD/n1-large-optimization-20261113-01`.
 
-`remote-reports/` on the local HDD contains the main PC's logs and raw perf
-trace. `artifacts/` contains the candidate, exact pre-change current binary,
-tested Rust executable and unchanged Rust benchmark client. `checkpoint/`
-contains the base commit, source patch and SHA-256 manifests. The portable
-checkpoint under `/home/altear/DEV_TEST/n1-optimization-20261113-01` carries the
-complete source snapshot, locked vendored dependencies (including ECS), resume
-notes, patch, logs, raw profiling trace, previous benchmark evidence, profiler
-packages and compressed binaries. It contains no build cache or object dataset.
-The entire continuation can proceed without accessing the main PC or DATA_SSD.
-No test, build, benchmark or profiler remains running.
+`remote-reports/` on the local HDD contains the SSD test system's logs and raw
+perf trace. `artifacts/` contains the candidate, exact pre-change current
+binary, tested Rust executable and unchanged Rust benchmark client.
+`checkpoint/` contains the base commit, source patch and SHA-256 manifests. The
+portable checkpoint under
+`/srv/test-evidence/portable/n1-optimization-20261113-01` carries the complete
+source snapshot, locked vendored dependencies (including ECS), resume notes,
+patch, logs, raw profiling trace, previous benchmark evidence, profiler packages
+and compressed binaries. It contains no build cache or object dataset. The
+entire continuation can proceed without accessing the SSD test system or
+DATA_SSD. No test, build, benchmark or profiler remains running.
 
-### Continuing without the main PC
+### Continuing without the SSD test system
 
 The portable folder is on this laptop and is the continuation source at work.
 DATA_SSD is an additional preserved copy, not a required dependency. The folder
 is approximately 104 MiB before small manifest/note updates. Full task evidence
 also remains on the two local HDDs.
 
-Verify and unpack onto a new MCH HDD directory, keeping compilation and test
-data off the laptop NVMe:
+Verify and unpack onto a new the four-HDD reference system HDD directory,
+keeping compilation and test data off the two-HDD test system’s source NVMe:
 
 ```sh
-CAPSULE=/home/altear/DEV_TEST/n1-optimization-20261113-01
-# Copy this folder to MCH first, then set CAPSULE to its location on that host.
+CAPSULE=/srv/test-evidence/portable/n1-optimization-20261113-01
+# Copy this folder to the four-HDD reference system first, then set CAPSULE to its location on that host.
 bash "$CAPSULE/unpack.sh" /mnt/DISK0/n1-optimization-20261113-01
 cd /mnt/DISK0/n1-optimization-20261113-01/source
 export CARGO_TARGET_DIR=/mnt/DISK0/n1-optimization-20261113-01/target
@@ -130,11 +131,12 @@ cargo build --release -p n1 --bin litiaina-n1 --locked --offline
 
 `unpack.sh` verifies relative checksums, refuses an existing destination and
 generates a Cargo configuration pointing to the restored vendor directory.
-Offline dependency resolution is verified with an empty temporary Cargo home;
-no dependency on DATA_SSD's Cargo cache is required. On MCH, rebuild each
-comparison variant from its preserved source using the same native toolchain.
-The tested home-PC binaries may require a newer glibc than MCH. The copied
-profiler packages are also host-specific; do not assume they match MCH.
+Offline dependency resolution is verified with an empty temporary Cargo home; no
+dependency on DATA_SSD's Cargo cache is required. On the four-HDD reference
+system, rebuild each comparison variant from its preserved source using the same
+native toolchain. The tested SSD test system binaries may require a newer glibc
+than the four-HDD reference system. The copied profiler packages are also
+host-specific; do not assume they match the four-HDD reference system.
 
 The source snapshot contains the experimental candidate. To obtain its exact
 pre-change comparison source, make a separate copy and reverse the preserved
@@ -142,9 +144,10 @@ pre-change comparison source, make a separate copy and reverse the preserved
 intact. Do not substitute binaries built for different hosts into a matched
 performance comparison.
 
-The main PC's configuration names and absolute service paths in the old logs
-are historical evidence. Provision fresh isolated configuration and certificates
-on MCH; do not reuse DATA_SSD paths or change an existing interactive deployment.
+The SSD test system's configuration names and absolute service paths in the old
+logs are historical evidence. Provision fresh isolated configuration and
+certificates on the four-HDD reference system; do not reuse DATA_SSD paths or
+change an existing interactive deployment.
 
 Resume in this order:
 
@@ -160,11 +163,11 @@ Resume in this order:
    diagnostics separately from the ordinary deployment configuration. If the
    candidate regresses, continue diagnosis rather than accepting the regression.
 5. After the optimization is demonstrated, continue the remaining RC.2
-   qualification on MCH's four physical disks. Do not restart completed unrelated
+   qualification on the four-HDD reference system's four physical disks. Do not restart completed unrelated
    populations or claim host power-loss proof from process-restart tests.
 
 `source/compare.sh` is prepared but has **not** been launched. It expects RAM
 copies named `litiaina-n1-current`, `litiaina-n1-optimized` and
-`throughput_bench`, plus the existing isolated test configuration. Recheck paths,
-free space and drive health on the next host before starting it. Do not carry
-the old test root paths blindly to MCH.
+`throughput_bench`, plus the existing isolated test configuration. Recheck
+paths, free space and drive health on the next host before starting it. Do not
+carry the old test root paths blindly to the four-HDD reference system.

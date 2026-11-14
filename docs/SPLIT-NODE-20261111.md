@@ -1,33 +1,33 @@
-# Home split-node qualification — November 11, 2026
+# SSD metadata / two-HDD object qualification — November 11, 2026
 
 **Reliability preflight and original million-object campaign passed;
 RC.2 remains unreleased.** Population, full post-restart readback
 and both full member-loss readbacks are complete. The continued member-1 phase
 passed all 1,000,000 original objects with zero payload/version mismatches;
 normal expiry cleanup and final censuses subsequently passed on November 12.
-See the [final closure](HOME-QUALIFICATION-20261113.md) and
-[continuation report](MCH-CONTINUATION-20261112.md) for the current placement,
+See the [final closure](TWO-HDD-QUALIFICATION-20261113.md) and
+[continuation report](FOUR-HDD-CONTINUATION-20261112.md) for the current placement,
 preserved identities and scope correction. No replacement population is running.
 
 ## Placement
 
 | Component | Host | Private fixture storage |
 | --- | --- | --- |
-| N1 object engine | Workstation `192.168.254.12` | Pool A, 1+1, `/mnt/HDD1TB001/n1-split-node-20261111-01/smoke4096/member-0` and the corresponding `member-1` under `/mnt/HDD1TB002` |
-| M1 metadata engine | Main PC `192.168.254.107` | Database, staging, snapshots, build output, executables and client oracles on `/mnt/DATA_SSD` |
-| Native storage hop | M1 → N1 | Verified `n1s://192.168.254.12:50002`, private CA and separate server certificate with the N1 IP SAN |
-| Public workload hop | Rust client on main PC → M1 | Loopback HTTP; M1 also listens on `0.0.0.0` for this private test |
+| N1 object engine | Workstation `object-test.example.invalid` | Pool A, 1+1, `/mnt/HDD1TB001/n1-split-node-20261111-01/smoke4096/member-0` and the corresponding `member-1` under `/mnt/HDD1TB002` |
+| M1 metadata engine | SSD test system `ssd-test.example.invalid` | Database, staging, snapshots, build output, executables and client oracles on `/mnt/DATA_SSD` |
+| Native storage hop | M1 → N1 | Verified `n1s://object-test.example.invalid:50002`, private CA and separate server certificate with the N1 IP SAN |
+| Public workload hop | Rust client on SSD test system → M1 | Loopback HTTP; M1 also listens on `0.0.0.0` for this private test |
 
 Both N1 members are independent XFS filesystems. The workstation uses Wi-Fi;
-this is a separate performance profile from MCH's four SATA HDDs. No cold-cache
-or hardware power-loss claim follows. No filesystem was formatted and no
-pre-existing dataset was removed. Credentials and key files remain owner-only.
-N1 selects `io_uring`; the existing aligned direct-I/O implementation and
-SHA-256/CRC32C integrity policy remain unchanged.
+this is a separate performance profile from the four-HDD reference system's four
+SATA HDDs. No cold-cache or hardware power-loss claim follows. No filesystem was
+formatted and no pre-existing dataset was removed. Credentials and key files
+remain owner-only. N1 selects `io_uring`; the existing aligned direct-I/O
+implementation and SHA-256/CRC32C integrity policy remain unchanged.
 
-Local evidence root: `/mnt/HDD1TB001/n1-split-node-20261111-01`.
-Main-PC evidence root: `/mnt/DATA_SSD/n1-split-node-20261111-01`.
-Builds use the existing DATA_SSD target directory
+Local evidence root: `/mnt/HDD1TB001/n1-split-node-20261111-01`. SSD test system
+evidence root: `/mnt/DATA_SSD/n1-split-node-20261111-01`. Builds use the
+existing DATA_SSD target directory
 `/mnt/DATA_SSD/m1-owned-storage-20261110-01/target`, Rust 1.99.0 and locked,
 offline dependencies. The resulting N1 executable runs on the workstation's
 compatible glibc. No build or population dataset uses the source NVMe.
@@ -112,14 +112,14 @@ database; it did not replace measurements.
 
 ## Headless million-object campaign
 
-The large campaign is **continuing its unfinished checks**, not yet passed as
-a whole. It originally populated private `million/` directories on both nodes,
-separate from the preflights. The frozen Rust
-population/readback client runs four writers in 256-object batches and eight
-verification readers. Its client journals stay on DATA_SSD. The controller is
-detached on the N1 workstation, and the M1/client processes have independent
-sessions on the main PC. Closing the IDE or SSH client does not terminate them.
-Both hosts and the home network must remain available.
+The large campaign is **continuing its unfinished checks**, not yet passed as a
+whole. It originally populated private `million/` directories on both nodes,
+separate from the preflights. The frozen Rust population/readback client runs
+four writers in 256-object batches and eight verification readers. Its client
+journals stay on DATA_SSD. The controller is detached on the N1 workstation, and
+the M1/client processes have independent sessions on the SSD test system.
+Closing the IDE or SSH client does not terminate them. Both hosts and the test
+network must remain available.
 
 At the November 12 stop, population had acknowledged all **1,000,000 objects**:
 500,224 before the midpoint crash and 499,776 in the resumed invocation. The
@@ -135,16 +135,16 @@ The partial counter was not used to skip objects. Its verifier exited 0 and
 checked unchanged ACK hashes before and after the pass. Final natural-expiry GC
 and censuses subsequently passed with all original identities unchanged.
 
-The home processes were stopped for travel. Results, source, executables, original
-ACKs and a compressed M1 database checkpoint are preserved at
-`/home/altear/DEV_TEST/n1-m1-rc2-preserved-20261112.PLPlQD`.
-The database archive's individual file hashes match the stopped main-PC
-database. Original N1 shard files remain on their HDDs. Both drives are now
-mounted with their original UUIDs. The continuation serves those same shards
-from the workstation, with the verified M1 checkpoint on MCH. Member 1 was
-detached only for its unfinished readback and is now restored. Both task-owned
-services are stopped after final cleanup. No reformat,
-new enrollment or replacement population is performed.
+The SSD/HDD processes were stopped for travel. Results, source, executables,
+original ACKs and a compressed M1 database checkpoint are preserved at
+`/srv/test-evidence/portable/n1-m1-rc2-preserved-20261112.PLPlQD`. The database
+archive's individual file hashes match the stopped SSD test system database.
+Original N1 shard files remain on their HDDs. Both drives are now mounted with
+their original UUIDs. The continuation serves those same shards from the
+workstation, with the verified M1 checkpoint on the four-HDD reference system.
+Member 1 was detached only for its unfinished readback and is now restored. Both
+task-owned services are stopped after final cleanup. No reformat, new enrollment
+or replacement population is performed.
 
 The original campaign's sequence and current disposition are:
 
@@ -196,11 +196,11 @@ release gates remain tracked separately in the RC.2 implementation list.
 tree; `source/network-operations-final.tar.gz` contains the subsequent operator
 client. These qualification additions do not change N1/M1 runtime source.
 `network-inventory.tar.gz` preserves the census source. The final working tree
-is additionally frozen as `source/home-source-checkpoint.tar.gz` on both nodes.
-`source/committed-baseline.tar.gz` is committed `29bca4b` for the matched screen.
-Binary/source manifests, logs and controller scripts are retained on the
-selected drives. The original MCH executables have different hashes/toolchains
-and are not substituted for these artifacts.
+is additionally frozen as `source/ssd-hdd-source-checkpoint.tar.gz` on both
+nodes. `source/committed-baseline.tar.gz` is committed `29bca4b` for the matched
+screen. Binary/source manifests, logs and controller scripts are retained on the
+selected drives. The original the four-HDD reference system executables have
+different hashes/toolchains and are not substituted for these artifacts.
 
 The first certificate fixture used a CA certificate as the server leaf: M1
 refused its native connection. A separate leaf signed by the test CA resolves

@@ -10,6 +10,11 @@ RC.2, with a November 25 go/no-go review (Asia/Manila). The
 [release plan](RC2-RELEASE-PLAN.md) orders the remaining work and evidence.
 Required gates still control release; a target date does not waive failures.
 
+**Next hardware window:** Monday, November 16, 2026 (Asia/Manila), on the four-HDD reference system.
+[The preparation checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md) covers hardware,
+independent ACK recording, four-drive recovery, controlled power loss and
+acceptance evidence. This is scheduled work, not a completed qualification.
+
 The [first preparation batch](M1-ACCEPTANCE-20261113.md) holds N1 fixed, reduces
 M1's observed bridged-upload CPU cost and passes 418 workspace checks, the same
 seven selected service cases on SSD and two HDDs, and separate object-full/
@@ -43,13 +48,13 @@ The matched small multipart run improves latency and CPU; adverse large-file
 controls remain explicit performance acceptance work.
 
 The [concurrent-status/resource qualification](M1-RESOURCE-RECOVERY-20261114.md)
-then closes an indexed M1 status request waiting behind active part writers.
-The corrected M1 passes an actual private kernel write-delay/restart witness,
-15 selected SSD cases, four physical-HDD cases, four original Console workflows
-and a short real cgroup pressure profile. All 425 default workspace tests pass.
-This covers the recorded local resource profiles; broader sustained saturation,
-physical power loss, final MCH hardware and complete contract/performance
-acceptance remain required.
+then closes an indexed M1 status request waiting behind active part writers. The
+corrected M1 passes an actual private kernel write-delay/restart witness, 15
+selected SSD cases, four physical-HDD cases, four original Console workflows and
+a short real cgroup pressure profile. All 425 default workspace tests pass. This
+covers the recorded local resource profiles; broader sustained saturation,
+physical power loss, final the four-HDD reference system hardware and complete
+contract/performance acceptance remain required.
 
 The [bridge-status follow-up](M1-BRIDGE-STATUS-20261114.md) then passes the
 equivalent active-body query for staged receipts, retaining file-size checks
@@ -65,7 +70,8 @@ checks, 18 selected SSD cases, four two-HDD cases and four original Console
 upload workflows with N1 unchanged. Confirmed loss of an unused allocation is
 recovered with a fresh private LINK identity, preserving the named session and
 ACKs. The measured large-file gains and adverse controls remain scoped; final
-power-loss, MCH, saturation and complete operator/contract acceptance stay open.
+power-loss, the four-HDD reference system, saturation and complete
+operator/contract acceptance stay open.
 
 The [latency follow-up](M1-LATENCY-20261114.md) reproduces small one-shot tails
 under retained desktop load and correlates M1/N1 persistence waits with XFS
@@ -75,9 +81,10 @@ does not qualify a durable deployment or close tail acceptance. N1 remains
 unchanged; 426 default workspace tests and strict normal/diagnostic lint pass.
 
 The [M1 commit I/O follow-up](M1-COMMIT-IO-20261114.md) reduces database append
-calls while retaining the existing synchronization policy and frozen N1.
-It preserves the small-object tails and mixed large-file observations;
-fewer syscalls do not close persistent tail-latency, MCH or power-loss acceptance.
+calls while retaining the existing synchronization policy and frozen N1. It
+preserves the small-object tails and mixed large-file observations; fewer
+syscalls do not close persistent tail-latency, the four-HDD reference system or
+power-loss acceptance.
 
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
@@ -86,10 +93,10 @@ Promoting development to `main` does not release RC.2
 or close any acceptance gate.
 
 **Release hold:** the [November 8 full-stack million-object campaign](MILLION-OBJECTS-20261108.md)
-passed on the main PC, with M1 on DATA_SSD and N1 on two XFS HDDs. Its complete
+passed on the SSD test system, with M1 on DATA_SSD and N1 on two XFS HDDs. Its complete
 original-version/payload readback after killing and reopening both engines
 closes the requested API population count for that checkpoint/profile.
-Standalone-only and original Console population, MCH minimum-hardware and
+Standalone-only and original Console population, the four-HDD reference system minimum-hardware and
 remaining fault/power-loss qualification retain their separate gates. A
 process-kill/recovery pass does not establish hardware power-loss resilience.
 Full-stack performance and the completion gates below remain required before
@@ -131,12 +138,12 @@ the guard stops the campaign. Fresh filesystems do not close the transport
 or end-to-end performance gate. Completed integrity passes are retained
 separately from the aborted comparison.
 
-## Planned MCH hardening — November 11, 2026
+## Planned the four-HDD reference system hardening — November 11, 2026
 
-The operator has designated MCH's four-physical-HDD machine as the minimum
-supported hardware reference for RC.2 qualification. November 11, 2026
-(Asia/Manila) is the planned hardening campaign; it is not a completed test or
-a release deadline.
+The operator has designated the four-HDD reference system's four-physical-HDD
+machine as the minimum supported hardware reference for RC.2 qualification.
+November 11, 2026 (Asia/Manila) is the planned hardening campaign; it is not a
+completed test or a release deadline.
 
 Close the implementation gaps below and qualify the final candidate through
 all three paths: standalone N1, M1 → N1, and Console → M1 → N1. Cover the required
@@ -159,7 +166,7 @@ The final campaign must retain these separate acceptance results:
 | --- | --- |
 | Candidate identity | Clean source checkpoint, compiler/build flags, executable hashes, independent N1/M1 configuration, exact physical member/control/database placement |
 | Contract and operations | Named HTTP/native and direct LINK operations; original Console workflows; permissions, refresh/revocation, IP/ports/TLS and effective concurrency/rate/GC/healing controls |
-| Current-lifecycle scale | Owned-M1 split-node population, full post-restart readback, both complete member-loss readbacks, natural-expiry GC and final metadata/physical censuses pass at one million. Original ACK hashes are unchanged; exactly two million shards, zero pending/staged/unreferenced/misplaced shards. This closes the original campaign at its frozen binaries, not a million qualification of subsequent runtime changes. Extra populations and queued successors remain stopped. Console's 128-object preflight is separate; no standalone or Console million is running or queued. See [final closure](HOME-QUALIFICATION-20261113.md). |
+| Current-lifecycle scale | Owned-M1 split-node population, full post-restart readback, both complete member-loss readbacks, natural-expiry GC and final metadata/physical censuses pass at one million. Original ACK hashes are unchanged; exactly two million shards, zero pending/staged/unreferenced/misplaced shards. This closes the original campaign at its frozen binaries, not a million qualification of subsequent runtime changes. Extra populations and queued successors remain stopped. Console's 128-object preflight is separate; no standalone or Console million is running or queued. See [final closure](TWO-HDD-QUALIFICATION-20261113.md). |
 | Storage faults | Four-drive physical 3+1 and 2+2 layouts, failures within/beyond parity, corruption detection, unavailable members, replacement and verified operator-driven repair; geometry remains immutable |
 | Metadata and transactions | Lost metadata/staging, snapshot restore, pinned history/permissions, concurrent publication/GC/migration, interrupted purge and process crashes at named/object boundaries |
 | Recovery and maintenance | Same/different-node object recovery, metadata backups, coordinated whole-product recovery, cross-EC migration and retry/stop; degraded or deferred diagnostics remain distinct from verified corruption |
@@ -210,74 +217,77 @@ passes fresh M1 → N1 population, two-million-shard census and complete origina
 payload/version readback after SIGKILL/reopen of both engines. It records the
 SSD database/two-HDD pool profile, exact source/binaries, batch latency and
 sampled per-process CPU/RSS. It is separate from the standalone-only, Console,
-MCH topology and physical power-loss gates.
+the four-HDD reference system topology and physical power-loss gates.
 
 ## Work required before completion
 
 | Area | Remaining work / acceptance condition |
 | --- | --- |
-| Full NOA v1 surface | Direct archive/manifest routes are implemented. Native ZIP64/TAR/manifest responses now stream with a length calculated during immutable metadata capture; the >8 MiB failure reproduces on the old binary and passes on the corrected M1, including cleanup and existing archive faults. See [MCH continuation](MCH-OPTIMIZATION-20261113.md). Complete field-level responses, permissions, errors and retry qualification against the original standard remain required. Scoped GC/healing/migration have explicit physical and browser coverage. Registered route names alone are insufficient. |
-| Export lifecycle | Indexed TTL cleanup, transactional retained-byte reservations and bounded restart admission are implemented. Four new real-process lifecycle/error-isolation cases and the existing service checks pass on MCH (21 total). The home's eight-phase same-database screen records nearly equal M1 CPU but a 13.6% higher candidate upload mean with substantial phase variation; performance acceptance remains open. See the November 11 handover and split-node report. |
-| Named-service recovery | Full metadata/staging loss, verified snapshot restore, named history/permissions/resume and metadata/object/both process crashes pass on two local HDDs. The current-finalization integration exposed lost volatile completion after a partial-upload restart; M1 now performs narrowly triggered, byte/part-bounded public status reconciliation and one retry. Four real resume cases and the ten current two-HDD reliability cases pass; see [home qualification](HOME-QUALIFICATION-20261113.md). Preserve the documented operator pause; independent live captures are not an atomic cross-service snapshot. Qualify host power loss and additional crash points separately. |
-| Metadata request quotas | Shared HTTP/native mixed overload passes on MCH with 16 workers, exact budget checks and every ACK verified after both processes restart; the real 60-second idle-bucket cleanup also passes. Matched on/off performance samples are retained. Final deployment defaults, proxy policy and broader saturation/maintenance impact remain separate. Do not infer coverage from object-engine middleware. |
-| Optional Accel | Real integration and fault-response checks are implemented. The November 13 MCH witness additionally passes real private-CA HTTPS, untrusted-CA/wrong-host rejection, 64 concurrent pinned reads and Accel restart using process-local CA trust. Broader sustained load and the complete conditional/range/header matrix remain separate; preserve authoritative M1 resolution and fallback rules. |
-| Console and administration | The November 13 home qualification passes operator master-key authorization, metadata backup/list/download/restore, original upload workflows and four live browser cases, plus 45 tests of the unchanged Console. Full contract/administration coverage and deployment/load acceptance remain separate; these scoped passes are not complete feature parity. |
+| Full NOA v1 surface | Direct archive/manifest routes are implemented. Native ZIP64/TAR/manifest responses now stream with a length calculated during immutable metadata capture; the >8 MiB failure reproduces on the old binary and passes on the corrected M1, including cleanup and existing archive faults. See [Four-HDD reference system continuation](FOUR-HDD-OPTIMIZATION-20261113.md). Complete field-level responses, permissions, errors and retry qualification against the original standard remain required. Scoped GC/healing/migration have explicit physical and browser coverage. Registered route names alone are insufficient. |
+| Export lifecycle | Indexed TTL cleanup, transactional retained-byte reservations and bounded restart admission are implemented. Four new real-process lifecycle/error-isolation cases and the existing service checks pass on the four-HDD reference system (21 total). The SSD/two-HDD profile’s eight-phase same-database screen records nearly equal M1 CPU but a 13.6% higher candidate upload mean with substantial phase variation; performance acceptance remains open. See the November 11 handover and split-node report. |
+| Named-service recovery | Full metadata/staging loss, verified snapshot restore, named history/permissions/resume and metadata/object/both process crashes pass on two local HDDs. The current-finalization integration exposed lost volatile completion after a partial-upload restart; M1 now performs narrowly triggered, byte/part-bounded public status reconciliation and one retry. Four real resume cases and the ten current two-HDD reliability cases pass; see [SSD/HDD qualification](TWO-HDD-QUALIFICATION-20261113.md). Preserve the documented operator pause; independent live captures are not an atomic cross-service snapshot. Qualify host power loss and additional crash points separately. |
+| Metadata request quotas | Shared HTTP/native mixed overload passes on the four-HDD reference system with 16 workers, exact budget checks and every ACK verified after both processes restart; the real 60-second idle-bucket cleanup also passes. Matched on/off performance samples are retained. Final deployment defaults, proxy policy and broader saturation/maintenance impact remain separate. Do not infer coverage from object-engine middleware. |
+| Optional Accel | Real integration and fault-response checks are implemented. The November 13 the four-HDD reference system witness additionally passes real private-CA HTTPS, untrusted-CA/wrong-host rejection, 64 concurrent pinned reads and Accel restart using process-local CA trust. Broader sustained load and the complete conditional/range/header matrix remain separate; preserve authoritative M1 resolution and fallback rules. |
+| Console and administration | The November 13 SSD/HDD qualification passes operator master-key authorization, metadata backup/list/download/restore, original upload workflows and four live browser cases, plus 45 tests of the unchanged Console. Full contract/administration coverage and deployment/load acceptance remain separate; these scoped passes are not complete feature parity. |
 | End-to-end population | Historical Procyon-backed API M1 → N1 passed one million objects at `8dbba32`. The original owned-M1 split-node million campaign now also passes every required phase, including final automatic GC and exact censuses. Later runtime changes, original Console and standalone-only scale qualification retain separate gates; no replacement campaigns are running or queued. |
-| Broader storage qualification | Four distinct MCH HDDs pass 3+1 and 2+2: all 24 loss combinations through the first count beyond parity, corruption/exact repair, beyond-parity refusal and sequential replacement after one/two simultaneous losses. The final connected-blank-target rerun and encrypted backup/service-identity witness both pass. A separate home profile places N1 on two HDDs and M1 on another host's DATA_SSD; see `SPLIT-NODE-20261111.md`. Hardware power loss remains separate. |
-| Matched performance | The current key lifecycle record links original-NCX, previous-LINK and pre-optimization key-only ABBA benchmarks, plus standalone batch/multipart/concurrent upload. Record CPU/RSS, latency, throughput, allocation and every individual large-object sample. Begin now persists with the first durable payload by operator choice; a Rust reopen/readback probe verifies speculative XFS EOF allocation is gone. Earlier regressions remain in their original reports. Mixed and focused large-object results must both be reported; no universal performance claim follows. November 8 records sustained named-pipeline population metrics, not a matched old/new comparison. Matched named-pipeline, saturation and MCH tail-latency acceptance remain open. |
+| Broader storage qualification | Four distinct HDDs on the reference system pass 3+1 and 2+2: all 24 loss combinations through the first count beyond parity, corruption/exact repair, beyond-parity refusal and sequential replacement after one/two simultaneous losses. The final connected-blank-target rerun and encrypted backup/service-identity witness both pass. A separate SSD/HDD profile places N1 on two HDDs and M1 on another host's DATA_SSD; see `SPLIT-NODE-20261111.md`. Hardware power loss remains separate. |
+| Matched performance | The current key lifecycle record links original-NCX, previous-LINK and pre-optimization key-only ABBA benchmarks, plus standalone batch/multipart/concurrent upload. Record CPU/RSS, latency, throughput, allocation and every individual large-object sample. Begin now persists with the first durable payload by operator choice; a Rust reopen/readback probe verifies speculative XFS EOF allocation is gone. Earlier regressions remain in their original reports. Mixed and focused large-object results must both be reported; no universal performance claim follows. November 8 records sustained named-pipeline population metrics, not a matched old/new comparison. Matched named-pipeline, saturation and the four-HDD reference system tail-latency acceptance remain open. |
 
-The [November 13 home standalone continuation](HOME-OPTIMIZATION-20261113.md)
-records the subsequent N1 copy-removal candidate, compiler-matched 15 GiB
-comparisons on SSD 1+0 and physical HDD 1+1, expanded small-object/read controls
-and an attached 100 GiB pass with full SHA-256 readback and zero-residue purge.
-Observed large-upload CPU cost falls; HDD throughput stays near its LINK
-reference. Adverse small tails remain recorded. Its exact N1 checkpoint is held
-fixed for M1 profiling; it does not close the final MCH, saturation or hardware
-power-loss gates.
+The [November 13 SSD/HDD standalone
+continuation](SSD-HDD-OPTIMIZATION-20261113.md) records the subsequent N1
+copy-removal candidate, compiler-matched 15 GiB comparisons on SSD 1+0 and
+physical HDD 1+1, expanded small-object/read controls and an attached 100 GiB
+pass with full SHA-256 readback and zero-residue purge. Observed large-upload
+CPU cost falls; HDD throughput stays near its LINK reference. Adverse small
+tails remain recorded. Its exact N1 checkpoint is held fixed for M1 profiling;
+it does not close the final the four-HDD reference system, saturation or
+hardware power-loss gates.
 
-The November 7 preparation screen and controlled local follow-up are recorded
-in [TESTING.md](../TESTING.md). The initial ABBA screen measured 14.1% more small
+The November 7 preparation screen and controlled local follow-up are recorded in
+[TESTING.md](../TESTING.md). The initial ABBA screen measured 14.1% more small
 upload time. The follow-up holds the running N1, metadata database and pool
 constant, alternates binaries and quotas, retains each request latency, audits
 placement and profiles durable calls. Upload averages reverse across campaigns;
 M1 listener buffering and request-path limiter maintenance were corrected, but
-neither an upload speedup nor tail-latency parity is claimed.
-Both the original and follow-up measurements remain available. The subsequent
-November 8 full-stack population pass is recorded separately. Remaining
-standalone/Console population, saturation, MCH hardware and power-loss gates
-are not closed by an average improvement or by this population pass.
+neither an upload speedup nor tail-latency parity is claimed. Both the original
+and follow-up measurements remain available. The subsequent November 8
+full-stack population pass is recorded separately. Remaining standalone/Console
+population, saturation, the four-HDD reference system hardware and power-loss
+gates are not closed by an average improvement or by this population pass.
 
-The [November 13 home qualification](HOME-QUALIFICATION-20261113.md) completes
-the original owned-M1 million campaign and tests newer binaries separately:
-401 default workspace checks, 29 real-service cases, Console workflows and
-matched performance. A lost-completion resume regression is fixed solely in
-M1's native adapter. Monitoring submits zero payload I/O in quiet-node checks;
-same-object warm and file-cache-advised read replays do not reproduce an earlier
-mixed-workload throughput loss, but retain M1 CPU overhead and every adverse
-sample. These results do not close the deferred current-candidate MCH,
-saturation, physical power-loss or remaining contract/scale gates.
+The [November 13 SSD/HDD qualification](TWO-HDD-QUALIFICATION-20261113.md)
+completes the original owned-M1 million campaign and tests newer binaries
+separately: 401 default workspace checks, 29 real-service cases, Console
+workflows and matched performance. A lost-completion resume regression is fixed
+solely in M1's native adapter. Monitoring submits zero payload I/O in quiet-node
+checks; same-object warm and file-cache-advised read replays do not reproduce an
+earlier mixed-workload throughput loss, but retain M1 CPU overhead and every
+adverse sample. These results do not close the deferred current-candidate the
+four-HDD reference system, saturation, physical power-loss or remaining
+contract/scale gates.
 
-The [November 13 MCH optimization continuation](MCH-OPTIMIZATION-20261113.md)
-qualifies the sparse-write shortcut separately: 218 N1 library cases, physical
-direct-I/O proof, renewed four-HDD 3+1/2+2 faults, 32 matched large uploads,
-1,536 small lifecycle samples and 32 fixed-object verified GETs. The corrected
-M1 native archive case, 34 selected real-service/Console cases, 407 default
-workspace tests, mixed HTTP/native overload with post-crash ACK readback,
-idle-quota cleanup and private-CA Accel HTTPS also pass. Matched M1 and named
-pipeline measurements are complete, with adverse samples retained. A balanced
-HDD 1+1 confirmation reproduces an 8.21% sparse-only upload regression. Subsequent
-allocation-window and larger-buffer experiments are rejected and removed.
-The current sparse/receive candidate passes 222 N1 library tests, five physical
-direct-I/O cases and renewed four-HDD faults. Its separate 32-large/1,536-small
-matched matrix improves aggregate upload throughput in all five groups, but
-retains higher four-HDD CPU time and some adverse small-object tails. Scoped
-counters show fewer cycles/instructions at lower CPU frequency; strict
-CPU-time/tail acceptance remains open. The exact current candidate subsequently
-passes 36 selected public-service/Console cases, 411 default workspace tests and
-strict workspace/all-target Clippy, with all 349 Rust source files matching the
+The [November 13 the four-HDD reference system optimization
+continuation](FOUR-HDD-OPTIMIZATION-20261113.md) qualifies the sparse-write
+shortcut separately: 218 N1 library cases, physical direct-I/O proof, renewed
+four-HDD 3+1/2+2 faults, 32 matched large uploads, 1,536 small lifecycle samples
+and 32 fixed-object verified GETs. The corrected M1 native archive case, 34
+selected real-service/Console cases, 407 default workspace tests, mixed
+HTTP/native overload with post-crash ACK readback, idle-quota cleanup and
+private-CA Accel HTTPS also pass. Matched M1 and named pipeline measurements are
+complete, with adverse samples retained. A balanced HDD 1+1 confirmation
+reproduces an 8.21% sparse-only upload regression. Subsequent allocation-window
+and larger-buffer experiments are rejected and removed. The current
+sparse/receive candidate passes 222 N1 library tests, five physical direct-I/O
+cases and renewed four-HDD faults. Its separate 32-large/1,536-small matched
+matrix improves aggregate upload throughput in all five groups, but retains
+higher four-HDD CPU time and some adverse small-object tails. Scoped counters
+show fewer cycles/instructions at lower CPU frequency; strict CPU-time/tail
+acceptance remains open. The exact current candidate subsequently passes 36
+selected public-service/Console cases, 411 default workspace tests and strict
+workspace/all-target Clippy, with all 349 Rust source files matching the
 workstation manifest. Incompatible M1 multipart geometry retains its measured
-staging-copy cost. These results do not qualify the rejected experiments,
-repeat the prior million population or establish physical power-loss resilience.
+staging-copy cost. These results do not qualify the rejected experiments, repeat
+the prior million population or establish physical power-loss resilience.
 
 ## Fixed boundaries
 

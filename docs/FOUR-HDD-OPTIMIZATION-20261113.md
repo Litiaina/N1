@@ -1,4 +1,4 @@
-# MCH optimization and RC.2 continuation — November 13, 2026
+# Four-HDD optimization and RC.2 continuation — November 13, 2026
 
 **This continuation's regression and measurement runs are complete. RC.2 is
 unreleased; performance acceptance remains open.** The standalone comparisons,
@@ -10,10 +10,10 @@ and some small-object tails remain explicit concerns. This run resumes the
 then continues the remaining qualification gates. Completed earlier million
 populations, readbacks and censuses remain their original evidence.
 
-The subsequent [home standalone continuation](HOME-OPTIMIZATION-20261113.md)
-removes further upload copies and records a new compiler-matched comparison.
-Its source/executable identity and hardware profiles are separate from this
-completed MCH run; its results do not replace the measurements below.
+The subsequent [SSD/HDD standalone
+continuation](SSD-HDD-OPTIMIZATION-20261113.md) removes further upload copies
+and records a new compiler-matched comparison. Its source/executable identity
+and hardware profiles are separate from this completed four-HDD reference run; its results do not replace the measurements below.
 
 The baseline throughout this report is commit `3d6e1a3`. The **initial
 sparse-only candidate** and the later **receive02 candidate** have separate
@@ -23,25 +23,26 @@ the current working implementation.
 
 ## Isolation and provenance
 
-The host is `itserver`, `administrator@192.168.0.12`, with an Intel i5-11400,
-six cores/twelve threads and approximately 11 GiB RAM. The four independent
-HDDs are mounted as XFS at `/mnt/DISK0` through `/mnt/DISK3`. The system NVMe is
-a Kingston SNV2S500G with an ext4 filesystem. Existing deployed services and
-their data are not test targets. No global toolchain, CPU policy, kernel setting
-or installed package is changed.
+The four-HDD reference system has an Intel i5-11400, six cores/twelve threads
+and approximately 11 GiB RAM. The four independent HDDs are mounted as XFS at
+`/mnt/DISK0` through `/mnt/DISK3`. The system NVMe is a Kingston SNV2S500G with
+an ext4 filesystem. Existing deployed services and their data are not test
+targets. No global toolchain, CPU policy, kernel setting or installed package is
+changed.
 
 Task source, dependencies, reports and binaries live under
 `/mnt/DISK0/n1-optimization-20261113-01`. Its verified input capsule is the
 sibling `n1-optimization-20261113-01-capsule` directory. Builds reuse the prior
 task's HDD target directory, but use this run's isolated Cargo home and vendored
-dependencies. There is no dependency on the main PC or DATA_SSD.
+dependencies. There is no dependency on the SSD test system or DATA_SSD.
 
 The source checkpoint is committed `3d6e1a3` plus the three-file sparse-upload
 optimization and its interrupted-part regression test. Both N1 variants are
-built natively with **Rust/Cargo 1.92.0**, the same lockfile and ordinary release
-profile. The baseline is reconstructed by reversing the preserved patch in a
-separate source copy. The candidate's three source hashes match the capsule.
-The home-PC executables are retained as evidence, not used as MCH measurements.
+built natively with **Rust/Cargo 1.92.0**, the same lockfile and ordinary
+release profile. The baseline is reconstructed by reversing the preserved patch
+in a separate source copy. The candidate's three source hashes match the
+capsule. The SSD test system executables are retained as evidence, not used as
+measurements of the four-HDD reference system.
 
 An artifact audit caught Cargo reusing the baseline for the first candidate
 because the preserved candidate source had older modification times in the
@@ -61,7 +62,7 @@ other task workloads outside the timing windows.
 
 | Profile | Placement | Workload |
 | --- | --- | --- |
-| NVMe 1+0 | New private member under `/home/administrator/n1-optimization-20261113-01` | 1 GiB and 15 GiB durable multipart; small-object standard/durable latency |
+| NVMe 1+0 | New private member under `/srv/test-evidence/n1-optimization-20261113-01` | 1 GiB and 15 GiB durable multipart; small-object standard/durable latency |
 | HDD 1+1 | New private members on DISK1 and DISK2 | 1 GiB durable multipart; small-object standard/durable latency |
 | HDD 3+1 | New private member on each of DISK0–3 | 1 GiB and 15 GiB durable multipart; small-object standard/durable latency |
 
@@ -302,9 +303,9 @@ the unadvised NVMe condition is not labeled wholly cached.
 The 17.84% immediate-read difference is **not reproduced by the fixed-object
 comparison**: advised HDD throughput differs by −0.92%; the other three groups
 are 1.23–2.98% faster. The earlier comparison did not control placement/cache;
-host and disk scheduling may also contribute. These results do not establish
-one definitive cause, prove every deployment's reads equivalent, or close the
-earlier home SATA readback concern on different hardware.
+host and disk scheduling may also contribute. These results do not establish one
+definitive cause, prove every deployment's reads equivalent, or close the
+earlier SSD/HDD SATA readback concern on different hardware.
 
 Four additional 1 GiB diagnostic transfers query the existing I/O backend
 counters before/after transfer, outside its timing window. NVMe submissions
@@ -352,28 +353,31 @@ intent and fail the response.
 Ten local archive/budget/lifecycle unit cases and strict all-target M1 Clippy
 pass. New cases compare predicted lengths with the actual pinned archive writers
 for empty, boundary-length, long and Unicode names; test large-size arithmetic,
-overflow, streaming before completion and late failures. The MCH candidate passes
-the new native archive case and existing archive disconnect/crash, source-loss,
-permissions/history and graceful shutdown cases. Complete service results follow.
+overflow, streaming before completion and late failures. The four-HDD reference
+system candidate passes the new native archive case and existing archive
+disconnect/crash, source-loss, permissions/history and graceful shutdown cases.
+Complete service results follow.
 
 ## Service, Console and admission qualification
 
 The corrected archive M1 and optimized N1 pass **34 selected real-service
 cases**, zero failed, in **437.66 s**. M1 control/database/staging fixtures use
-the MCH NVMe; N1's two independent object members use DISK1 and DISK2. This is
-an actual service/native hop, not an in-process store replacement. The suite
-includes original Console master authorization and backup/download/restore,
-four original live browser cases, Console migration/GC, metadata loss/restore,
-member loss/corruption, portable backup/recovery, interrupted publication,
-cross-EC migration, retained-export lifecycle, large indexed resume, token/peer
-quota rules and TLS listener behavior. The original Console is the already
-frozen November 12 build; no Console code changes are made.
+the four-HDD reference system NVMe; N1's two independent object members use
+DISK1 and DISK2. This is an actual service/native hop, not an in-process store
+replacement. The suite includes original Console master authorization and
+backup/download/restore, four original live browser cases, Console migration/GC,
+metadata loss/restore, member loss/corruption, portable backup/recovery,
+interrupted publication, cross-EC migration, retained-export lifecycle, large
+indexed resume, token/peer quota rules and TLS listener behavior. The original
+Console is the already frozen November 12 build; no Console code changes are
+made.
 
 The nine service exclusions are the shared-filesystem OS-unmount fixture,
 separate explicit-binary performance/audit drivers and existing interactive
-deployment probes. Shared MCH mounts and production data are not detached.
-Performance drivers are measured separately rather than allowed to compete
-with the functional suite. New ignored load/TLS cases are qualified separately.
+deployment probes. Shared the four-HDD reference system mounts and production
+data are not detached. Performance drivers are measured separately rather than
+allowed to compete with the functional suite. New ignored load/TLS cases are
+qualified separately.
 
 The complete native release workspace passes **407 default tests, zero failed**,
 with **58 explicit opt-in/helper exclusions**. This count precedes the two new
@@ -631,17 +635,17 @@ empty-fragment database are preserved separately from the successful run.
 
 ## Evidence
 
-Remote root: `/mnt/DISK0/n1-optimization-20261113-01`.
-Local retrieved evidence: `/mnt/HDD1TB001/n1-mch-optimization-20261113-01`.
-Portable source/dependencies remain under `/home/altear/DEV_TEST`; DATA_SSD is
-not required. `reports/SUMMARY-FINAL.json` and `READ-SUMMARY.json` preserve
-the initial candidate's samples. `RECEIVE-SUMMARY01.json` records the current
+Remote root: `/mnt/DISK0/n1-optimization-20261113-01`. Local retrieved evidence:
+`/mnt/HDD1TB001/n1-four-hdd-optimization-20261113-01`. Portable
+source/dependencies remain under `/srv/test-evidence/portable`; DATA_SSD is not
+required. `reports/SUMMARY-FINAL.json` and `READ-SUMMARY.json` preserve the
+initial candidate's samples. `RECEIVE-SUMMARY01.json` records the current
 candidate's complete matrix; `CYCLES-SUMMARY01.json` records the separate
 hardware counter diagnostic. All preserve raw source paths. Bash orchestration
 and Perl arithmetic are under `evidence/`. All workload and fault logic is Rust.
 No Python is used.
 
-| Native MCH artifact | SHA-256 |
+| Native the four-HDD reference system artifact | SHA-256 |
 | --- | --- |
 | Current N1, base `3d6e1a3` | `2809bc8063b364928e3cfb247b9df794798d2dfb233c149b811100948c75cb9b` |
 | Initial sparse-only N1 | `756d64365790986787a63720f2b2007d28e00fd667b82a2c8e9f0c6ca9a97391` |
@@ -668,11 +672,12 @@ population remains. Existing deployed services were not stopped.
 
 The exact baseline/candidate N1, corrected M1, Rust client and tested harnesses
 are preserved in `evidence/receive02-tested-artifacts.tar.gz`, with relative
-SHA-256 manifests. The 26 MiB archive, current source checkpoint and reports
-are also copied to `/home/altear/DEV_TEST/n1-mch-continuation-20261113-01`.
-The dependency capsule remains in its sibling portable directory; neither
-DATA_SSD nor a build cache is needed to recover this work. No commit, push,
-tag or release has been performed.
+SHA-256 manifests. The 26 MiB archive, current source checkpoint and reports are
+also copied to
+`/srv/test-evidence/portable/n1-four-hdd-continuation-20261113-01`. The
+dependency capsule remains in its sibling portable directory; neither DATA_SSD
+nor a build cache is needed to recover this work. No commit, push, tag or
+release has been performed.
 
 After optimizing and validating the affected paths, resume the
 [RC.2 checklist](RC2-IMPLEMENTATION.md): final-candidate service/Console and

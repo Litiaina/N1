@@ -556,7 +556,7 @@ NOA v1 conformance pass**. Specific remaining differences include:
   frame. Their payload is not subject to the 8 MiB control-frame bound. Final
   bytes follow source verification and pin/manifest cleanup; a partial exchange
   requires reconnecting. Other unknown-length control responses remain bounded.
-  See the [MCH qualification](docs/MCH-OPTIMIZATION-20261113.md) for the >9 MiB
+  See the [Four-HDD reference system qualification](docs/FOUR-HDD-OPTIMIZATION-20261113.md) for the >9 MiB
   regression, old-binary reproduction and candidate coverage.
 - Request/response fields, permissions, errors and retry semantics require the
   complete contract campaign. Named request quotas and configured optional Accel

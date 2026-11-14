@@ -1,10 +1,10 @@
-# Home RC.2 qualification — November 12–13, 2026
+# Two-HDD and SSD RC.2 qualification — November 12–13, 2026
 
 **The original owned-M1 million-object campaign is complete. RC.2 remains
 unreleased.** The final natural-expiry GC and metadata/physical censuses passed
 on November 12, using its frozen executables and original dataset. Qualification
-of the newer finalization runtime is recorded separately below. MCH was not
-contacted for these home checks; its next hardware campaign remains deferred.
+of the newer finalization runtime is recorded separately below. the four-HDD reference system was not
+contacted for these SSD/HDD checks; its next hardware campaign remains deferred.
 
 ## Original campaign closure
 
@@ -17,8 +17,8 @@ mismatch. Those completed populations/readbacks were not repeated for closure.
 The remaining 192 unacknowledged crash-era upload attempts expired naturally on
 November 12 at 21:49:23–21:49:32 Asia/Manila. The final controller waited until
 21:52:32, without changing the clock, expiries or cleanup policy. It verified
-the original main-PC database's four stopped files against the preserved
-checkpoint before reopening them. The exact original home N1/M1 executables
+the original SSD test system database's four stopped files against the preserved
+checkpoint before reopening them. The exact original SSD/HDD N1/M1 executables
 then performed normal automatic GC with both original members present.
 
 | Final witness | Result |
@@ -40,15 +40,16 @@ The final database reports 4,755,931,220 disk bytes. Counts differ from the
 earlier 7,001,423-record integrity check because GC removed expired lifecycle
 state; the original acknowledged names, versions and payloads remain unchanged.
 
-The evidence root is
-`/mnt/HDD1TB001/n1-rc2-home-qualification-20261112-02`. Its `reports/` contains
-`original-gc-completed.json`, `original-final-metadata.json`,
-`original-final-physical.json`, `original-final-integrity.json`, timing, original
-binary hashes and `ORIGINAL-FINAL02-EXIT=0`. `ORIGINAL-CAMPAIGN-COMPLETED` also
-exists in the original continuation root. Corresponding main-PC evidence is
-under `/mnt/DATA_SSD/n1-rc2-home-qualification-20261112-02`; frozen final-stage
-scripts are under `source/`. The portable checkpoint in `/home/altear/DEV_TEST`
-remains unchanged. Earlier stopped/failed launch reports are retained.
+The evidence root is `/mnt/HDD1TB001/n1-rc2-ssd-hdd-qualification-20261112-02`.
+Its `reports/` contains `original-gc-completed.json`,
+`original-final-metadata.json`, `original-final-physical.json`,
+`original-final-integrity.json`, timing, original binary hashes and
+`ORIGINAL-FINAL02-EXIT=0`. `ORIGINAL-CAMPAIGN-COMPLETED` also exists in the
+original continuation root. Corresponding SSD test system evidence is under
+`/mnt/DATA_SSD/n1-rc2-ssd-hdd-qualification-20261112-02`; frozen final-stage
+scripts are under `source/`. The portable checkpoint in
+`/srv/test-evidence/portable` remains unchanged. Earlier stopped/failed launch
+reports are retained.
 
 This closes the original frozen-checkpoint campaign. It does not transfer a
 million-object qualification to subsequently changed N1/M1 executables or
@@ -100,11 +101,11 @@ tests. The original service harness contains 41 opt-in cases; the new isolated
 read-replay benchmark adds one. This table does not claim all cases, full NOA
 conformance or physical power-loss coverage.
 
-DATA_SSD tests use main-PC M1/database/control and N1 1+0 fixtures on the same
-SATA SSD, with native loopback. The two-HDD checks run on the laptop with N1
-1+1 and M1/control on HDD1TB001; each N1 member occupies a distinct XFS
-filesystem. This latter profile tests functional co-location, not a measured
-split-node SSD deployment. Original split-node/million evidence remains
+DATA_SSD tests use SSD test system M1/database/control and N1 1+0 fixtures on
+the same SATA SSD, with native loopback. The two-HDD checks run on the two-HDD
+test system with N1 1+1 and M1/control on HDD1TB001; each N1 member occupies a
+distinct XFS filesystem. This latter profile tests functional co-location, not a
+measured split-node SSD deployment. Original split-node/million evidence remains
 separate. No drive was reformatted or physically disconnected in these checks.
 
 Current binaries, compiled on DATA_SSD with Rust 1.99.0 and the unchanged
@@ -162,7 +163,8 @@ in baseline phases instead, with both candidates' medians close to baseline.
 This does not establish a reproducible adapter-induced rename slowdown, nor a
 universal rename speedup. The root cause of those phase stalls is unproven.
 Final-candidate healthy upload mean is **7.92% lower** in run 03; this small
-sequential SSD screen does not settle saturation or MCH tail latency.
+sequential SSD screen does not settle saturation or the four-HDD reference
+system tail latency.
 
 | Measured process resource | Run 02 baseline / candidate | Run 03 baseline / candidate |
 | --- | ---: | ---: |
@@ -240,20 +242,21 @@ the final cache-advice-capable harness is
 `5af6c07ea54f455be499d285e041e2dfc4580c5c390d6cdd6d70d85af83df599`.
 
 Neither controlled profile reproduces the initial throughput loss. The initial
-mixed upload/read observation remains retained, without attributing its cause
-to a verified implementation defect. Monitoring has measurable M1 CPU cost;
-these small balanced screens establish neither zero overhead nor sustained
-tail-latency acceptance on MCH's minimum hardware.
+mixed upload/read observation remains retained, without attributing its cause to
+a verified implementation defect. Monitoring has measurable M1 CPU cost; these
+small balanced screens establish neither zero overhead nor sustained
+tail-latency acceptance on the four-HDD reference system's minimum hardware.
 
 ## Remaining release scope
 
-The home checks above are complete, with task-owned services stopped and
-evidence retained. MCH's current-candidate four-HDD/minimum-hardware and sustained
-performance qualification remain deferred by the operator. Physical power-loss
-qualification remains separate from the completed SIGKILL and member-directory
-faults. Complete contract/Console acceptance and current-runtime scale gates
-remain tracked in [RC2-IMPLEMENTATION.md](RC2-IMPLEMENTATION.md); no redundant
-million-object population is running or queued.
+The SSD/HDD checks above are complete, with task-owned services stopped and
+evidence retained. the four-HDD reference system's current-candidate
+four-HDD/minimum-hardware and sustained performance qualification remain
+deferred by the operator. Physical power-loss qualification remains separate
+from the completed SIGKILL and member-directory faults. Complete
+contract/Console acceptance and current-runtime scale gates remain tracked in
+[RC2-IMPLEMENTATION.md](RC2-IMPLEMENTATION.md); no redundant million-object
+population is running or queued.
 
 Final provenance checks match **353 Rust/manifests/lock files** between this
 worktree and the compiled DATA_SSD source. N1/LINK/native-client source is
@@ -264,7 +267,8 @@ remain in the task evidence root. The final workspace marker is
 `WORKSPACE10-EXIT=0`; the later fixture-only cache-advice addition passes strict
 service-test lint, optimized compilation and its complete physical replay.
 
-All builds, fixtures and reports use the selected HDDs or main-PC DATA_SSD.
-Workloads and faults are Rust; the original Console uses Node/Playwright and
-Chromium. No Python, new million-object population, MCH access, commit, push,
-tag or release is performed by this qualification.
+All builds, fixtures and reports use the selected HDDs or SSD test system
+DATA_SSD. Workloads and faults are Rust; the original Console uses
+Node/Playwright and Chromium. No Python, new million-object population, the
+four-HDD reference system access, commit, push, tag or release is performed by
+this qualification.

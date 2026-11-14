@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only consistency gate for the staged MCH EC 3+1 million-object result.
+"""Read-only consistency gate for the staged four-drive EC 3+1 million-object result.
 
 This validates recorded evidence, not hardware identity or a new engine run.
 It never connects to servers, launches processes, or modifies an input file.

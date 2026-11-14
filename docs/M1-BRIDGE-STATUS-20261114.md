@@ -68,12 +68,12 @@ report retains the failed controller/setup pilots separately.
 
 ## Matched bridge-status measurements
 
-The main PC runs M1 and N1 1+0 on DATA_SSD. Four alternating previous/candidate/
-candidate/previous phases pin the harness and both child engines to
-performance-core logical CPUs 0–11. Each side contributes 200 idle samples;
-the corrected candidate also completes 200 active-body samples. The previous
-binary's first active query exceeds two seconds in both baseline phases.
-These are local plaintext HTTP control queries with warm status state,
+The SSD test system runs M1 and N1 1+0 on DATA_SSD. Four alternating
+previous/candidate/ candidate/previous phases pin the harness and both child
+engines to performance-core logical CPUs 0–11. Each side contributes 200 idle
+samples; the corrected candidate also completes 200 active-body samples. The
+previous binary's first active query exceeds two seconds in both baseline
+phases. These are local plaintext HTTP control queries with warm status state,
 not a TLS, cold-cache, upload-throughput or maximum request-rate benchmark.
 
 | Instrumented observation | Previous M1 | Corrected M1 |
@@ -103,17 +103,19 @@ in [the single-part report](M1-SINGLE-PART-20261114.md).
 
 ## Evidence and release boundary
 
-Main-PC root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
+SSD test system root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
 `reports/bridge16-*` holds functional/build and initial timing evidence;
 `reports/bridge19-*` holds the instrumented screen and final source audit.
 `reports/stalled17` and `memory18` hold the repeated physical-kernel fault and
-pressure evidence. Exact overlays, drivers and manifests are in `source/`.
-The workstation copy is under
+pressure evidence. Exact overlays, drivers and manifests are in `source/`. The
+workstation copy is under
 `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01/remote-bridge19`, with HDD/browser
 logs in `reports/bridge16-hdd` and `reports/console-bridge16-live`. The portable
-checkpoint under `/home/altear/DEV_TEST` retains source, binaries and evidence
-without credentials, private TLS keys, datasets, loop images or build caches.
+checkpoint under `/srv/test-evidence/portable` retains source, binaries and
+evidence without credentials, private TLS keys, datasets, loop images or build
+caches.
 
-RC.2 is unreleased. Final MCH topology/power-loss, broader sustained
-maintenance/load, final contract/operator and accepted performance gates
-remain required. No million-object campaign was restarted. No Python was used.
+RC.2 is unreleased. Final the four-HDD reference system topology/power-loss,
+broader sustained maintenance/load, final contract/operator and accepted
+performance gates remain required. No million-object campaign was restarted. No
+Python was used.

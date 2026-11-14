@@ -25,6 +25,12 @@ or a commitment to implement them.
 
 ## Internal maintenance
 
+Use hardware specifications and deployment roles in public reports and commit
+messages. Omit private host/site names, LAN addresses, login names, personal
+paths, device serials and filesystem/boot identifiers. Keep exact inventory and
+raw evidence privately; retain benchmark results, adverse observations and
+artifact checksums in sanitized reports. Follow [the reporting profiles](docs/TEST-PROFILES.md).
+
 Use **N1** for the object store, **M1** for the metadata store, **LINK** for
 N1's key algorithm and storage architecture, and **M1 storage** for M1's own
 transactional database. Source directories describe responsibilities: `object_engine/`,

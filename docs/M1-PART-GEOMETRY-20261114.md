@@ -29,12 +29,13 @@ sessions still reject a size/count change. No UI redesign is included.
 
 ## Matched measurement
 
-Main PC `192.168.254.107`, DATA_SSD XFS, N1 1+0 and M1 on the same SSD. Compiler
-and release profile are matched. Baseline is buffer01 (`f1c74d6` runtime),
-candidate is negotiate01. Both use the **same new Rust benchmark executable**
-and request negotiation. Baseline ignores the new field and keeps the hint;
-candidate chooses aligned parts. The deliberately different resulting geometry
-is the feature being measured, not a claim of identical native request counts.
+SSD test system `ssd-test.example.invalid`, DATA_SSD XFS, N1 1+0 and M1 on the
+same SSD. Compiler and release profile are matched. Baseline is buffer01
+(`f1c74d6` runtime), candidate is negotiate01. Both use the **same new Rust
+benchmark executable** and request negotiation. Baseline ignores the new field
+and keeps the hint; candidate chooses aligned parts. The deliberately different
+resulting geometry is the feature being measured, not a claim of identical
+native request counts.
 
 ABBA: baseline forward order, candidate reverse, candidate forward, baseline
 reverse. Each phase uploads two separate 1 GiB deterministic sources with four
@@ -167,7 +168,7 @@ specific gap without changing upload retry immutability.
 
 Private run roots:
 
-- Main PC: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
+- SSD test system: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
 - Workstation: `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`, with the second
   member under the corresponding HDD1TB002 directory.
 

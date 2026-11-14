@@ -324,7 +324,7 @@ version labels are historical, not additional stable releases.
   rather than treating a replacement marker as proof of health.
 
 The October 6 copy/delete candidate passed testing and was subsequently deployed
-to the main server with its matching backup helper. Objects and configuration
+to the primary instance with its matching backup helper. Objects and configuration
 were preserved; Console and Accel were unchanged. Performance results include
 both regressions and improvements; deployment does not declare LTS readiness.
 The subsequent upload/deletion hardening above passed isolated validation and

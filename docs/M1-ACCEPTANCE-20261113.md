@@ -7,14 +7,14 @@ profiles; the remaining release conditions still apply.
 
 ## Isolation and identities
 
-The main PC is `altear@192.168.254.107`, Intel i5-12600K, 16 logical CPUs.
-M1's database, control, staging, binaries and build output use DATA_SSD, an XFS
-filesystem on `/dev/sda1`. N1 uses a private **1+0** pool on the same SSD. This
-is a co-located SSD measurement, not the split-node HDD or MCH 3+1 profile.
-Listeners are private loopback HTTPS/native TLS, with certificate verification.
-The existing interactive Console/database and original million-object corpus
-are untouched. No drive is reformatted; the ENOSPC fixtures below format only
-new, bounded loopback images on DATA_SSD.
+The SSD test system has an Intel i5-12600K, 16 logical CPUs. M1's database,
+control, staging, binaries and build output use DATA_SSD, an XFS filesystem on
+`/dev/sda1`. N1 uses a private **1+0** pool on the same SSD. This is a
+co-located SSD measurement, not the split-node HDD or the four-HDD reference
+system 3+1 profile. Listeners are private loopback HTTPS/native TLS, with
+certificate verification. The existing interactive Console/database and original
+million-object corpus are untouched. No drive is reformatted; the ENOSPC
+fixtures below format only new, bounded loopback images on DATA_SSD.
 
 | Executable | SHA-256 |
 | --- | --- |
@@ -179,7 +179,7 @@ These are ENOSPC-plus-process-crash checks, not physical power-loss tests.
   63 explicit opt-in/helper exclusions across 50 target summaries. This includes
   the library and benchmark counts below; they are not additional default tests.
 - Strict workspace/all-target Clippy and workspace formatting pass. All **355
-  Rust source files** match the tested main-PC worktree manifest.
+  Rust source files** match the tested SSD test system worktree manifest.
 - M1 release library suite: **49 passed, zero failed**, two explicit opt-in exclusions.
 - Rust benchmark source/shape checks: **2 passed**; strict benchmark Clippy passed.
 - Candidate service checks: **7 passed** — the existing public HTTP/native scenario,
@@ -192,7 +192,7 @@ These are ENOSPC-plus-process-crash checks, not physical power-loss tests.
   Replacing the staged bytes correctly then permits exact readback and repeated finalize.
 - Both final-candidate ENOSPC cases pass, in addition to their baseline witnesses.
 
-The same seven cases also pass on the laptop with **two independent physical
+The same seven cases also pass on the two-HDD test system with **two independent physical
 XFS HDDs in 1+1**, using the exact frozen N1, buffer01 M1 and service executable
 listed above. M1/database/control share HDD1 in this functional profile. It is
 not an SSD-metadata performance measurement. The serial indexed-resume case
@@ -213,16 +213,17 @@ large/small provenance, and its earlier output is retained separately.
 
 ## Evidence and remaining work
 
-Main-PC root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
-Local evidence mirror: `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`.
-`reports/SUMMARY.json` aggregates raw phases; the Bash drivers and Perl arithmetic
-are under `source/`. Workload and fault logic are Rust. `resource02` and
-`resource03` identify baseline/candidate ENOSPC runs; external ACK/PASSED journals
-are under their corresponding `resources02/03/evidence` directories.
+SSD test system root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`. Local
+evidence mirror: `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`.
+`reports/SUMMARY.json` aggregates raw phases; the Bash drivers and Perl
+arithmetic are under `source/`. Workload and fault logic are Rust. `resource02`
+and `resource03` identify baseline/candidate ENOSPC runs; external ACK/PASSED
+journals are under their corresponding `resources02/03/evidence` directories.
 The local mirror additionally retains the independent two-HDD service logs.
 
 The remaining work includes moving compatible work earlier in M1's bridged
-upload lifecycle, final-candidate HDD/MCH coverage, sustained mixed-load and
-stalled-I/O/host-memory-pressure tests, complete contract/Console acceptance and
-controlled physical power interruption. The existing million-object results
-retain their original scope. No new population, release or power cut occurs here.
+upload lifecycle, final-candidate HDD/the four-HDD reference system coverage,
+sustained mixed-load and stalled-I/O/host-memory-pressure tests, complete
+contract/Console acceptance and controlled physical power interruption. The
+existing million-object results retain their original scope. No new population,
+release or power cut occurs here.

@@ -1,4 +1,4 @@
-# MCH throughput and multipart timing — November 12, 2026
+# Four-HDD throughput and multipart timing — November 12, 2026
 
 **Passed.** The release-profile Rust client completed three repetitions of
 each workload through **HTTPS → M1 on NVMe → native TLS → N1 on four HDDs,
@@ -11,29 +11,30 @@ The interactive Console and its M1 database remained available at the end of
 this measurement. RC.2 remains
 unreleased.
 
-These tables retain the original MCH snapshot. The later
-[finalization and media qualification](FINALIZATION-20261112.md) measures the
-optimized runtime against its preceding LINK baseline on DATA_SSD 1+0 and
+These tables retain the original the four-HDD reference system snapshot. The
+later [finalization and media qualification](FINALIZATION-20261112.md) measures
+the optimized runtime against its preceding LINK baseline on DATA_SSD 1+0 and
 HDD 1+0/1+1, including p50/p95/p99, CPU/RSS and recovery checks. Its different
-hosts and topology do not replace the MCH 3+1 measurements here.
-The [subsequent home qualification](HOME-QUALIFICATION-20261113.md) records
-M1 restart recovery, current-candidate service/Console checks, matched adapter
-performance and monitoring overhead. No additional MCH run is included there.
+hosts and topology do not replace the four-HDD reference system 3+1 measurements
+here. The [subsequent SSD/HDD qualification](TWO-HDD-QUALIFICATION-20261113.md)
+records M1 restart recovery, current-candidate service/Console checks, matched
+adapter performance and monitoring overhead. No additional the four-HDD
+reference system run is included there.
 
 ## Placement and method
 
-Host `itserver`, `192.168.0.12`: Intel Core i5-11400, six cores / twelve threads,
+Four-HDD reference system: Intel Core i5-11400, six cores / twelve threads,
 approximately 11 GiB RAM. M1 uses its independent `m1_storage` database.
 
 | Component | Location / policy |
 | --- | --- |
-| M1 database and multipart staging | Ext4 on `/dev/nvme0n1p2`, KINGSTON SNV2S500G; isolated directory under `/home/administrator/DEV_TEST/n1-m1-rc2-20261112-01/throughput-20261112-01` |
+| M1 database and multipart staging | Ext4 on `/dev/nvme0n1p2`, KINGSTON SNV2S500G; isolated directory under `/srv/test-evidence/portable/n1-m1-rc2-20261112-01/throughput-20261112-01` |
 | N1 pool A | The existing interactive pool's fresh member directories under `/mnt/DISK0` through `/mnt/DISK3`, each a distinct XFS HDD filesystem |
 | HDD models | ST1000DM010-2EP1; two WDC WD10EZEX-21W drives; WDC WD10JPVX-00J |
 | EC / block | Immutable 3 data + 1 parity, 256 KiB block; one logical stripe is 768 KiB |
 | Object runtime | Existing release N1 process, io_uring, aligned direct I/O for large writes, adaptive concurrency enabled |
 | Integrity / durability | Existing CRC32C + SHA-256 policy; strict upload acknowledgements |
-| Request path | Rust client on MCH → private loopback HTTPS M1 → the same N1 process and pool used by Console |
+| Request path | Rust client on the four-HDD reference system → private loopback HTTPS M1 → the same N1 process and pool used by Console |
 | Isolation | A separate M1 database and benchmark-only fragment; no benchmark fragment or object is created in the interactive Console's metadata database |
 
 The interactive M1/Console continue running; existing deployed services remain
@@ -221,13 +222,14 @@ peak RSS was **359.63 MiB** in the main run. No swaps were reported by GNU time.
 
 ## Evidence, cleanup and reproduction
 
-MCH evidence root: **`/mnt/DISK0/n1-throughput-20261112-01`**.
-The main run exits 0 after **3 min 57.52 s**, including verification and untimed
-cleanup. `results/PASSED.json` records **609 reclaimed objects**; the separate
-`batch-results/PASSED.json` records another **300**. Both scoped GC jobs complete
-with **zero failures and zero deferred objects**. Only the private benchmark
-database uses zero trash retention for cleanup; the interactive policy is
-unchanged. The private benchmark M1 processes are stopped afterward.
+the four-HDD reference system evidence root:
+**`/mnt/DISK0/n1-throughput-20261112-01`**. The main run exits 0 after **3 min
+57.52 s**, including verification and untimed cleanup. `results/PASSED.json`
+records **609 reclaimed objects**; the separate `batch-results/PASSED.json`
+records another **300**. Both scoped GC jobs complete with **zero failures and
+zero deferred objects**. Only the private benchmark database uses zero trash
+retention for cleanup; the interactive policy is unchanged. The private
+benchmark M1 processes are stopped afterward.
 
 `results/` and `batch-results/` retain each trial, methodology, all latency
 samples, per-process before/after counters and completion reports. `reports/`
@@ -245,11 +247,11 @@ and diff checks pass. All workload and verification code is Rust.
 | Batch-only Rust client | `16a674c57e22e5a71549fb8edbdc64794a3993ff8dd9eaf918102e170e7da921` |
 | Standalone N1 Rust client | `d6aed438e54503d83374be750a390b6f8ef35cecd1c453292f5ddf381e29b8e5` |
 
-The server runtime matches committed `2d1ed2b`; release builds use MCH's Rust
-1.92 toolchain. Benchmark source is
+The server runtime matches committed `2d1ed2b`; release builds use the four-HDD
+reference system's Rust 1.92 toolchain. Benchmark source is
 [`throughput_bench.rs`](../metadata_engine/examples/throughput_bench.rs) with
-separate measurement and request modules. Original source archives remain at
-the continuation root under `imported/throughput-bench-20261112.tar.gz` and
+separate measurement and request modules. Original source archives remain at the
+continuation root under `imported/throughput-bench-20261112.tar.gz` and
 `throughput-bench-batch-20261112.tar.gz`; their SHA-256 values are
 `19afb2c2e3b6e8a80386dd0e05005b720aec94bc91f9aa9d0a09b06acb336693` and
 `cccc2a061ebe43c705421c37d84258e22bf3a000c557c31a4fa22b31abc2db64`.
@@ -270,13 +272,13 @@ path, N1/M1/Console PIDs and repeat count. The isolated M1 must have zero trash
 retention for the client's scoped cleanup. Never point this client at the
 interactive metadata database. Choose new private result directories; existing
 results are never overwritten. A local copy of all reports is on HDD1TB001 at
-`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01/reports/mch-throughput-20261112-01`.
+`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01/reports/four-hdd-throughput-20261112-01`.
 
 Standalone mode uses its separate config: native loopback TLS URL, CA, N1
 secret-env path, the three interactive service PIDs and repeat count. It does
 not start or configure M1. The frozen standalone source archive is
-`imported/standalone-throughput-bench-final-20261112.tar.gz` under the MCH
-continuation root, SHA-256
+`imported/standalone-throughput-bench-final-20261112.tar.gz` under the four-HDD
+reference system continuation root, SHA-256
 `30745769b5954923309ad1d943a70a03740bd30f30e613eec5227e984e2000ac`.
 
 This workload does not repeat or replace the preserved million-object campaign.

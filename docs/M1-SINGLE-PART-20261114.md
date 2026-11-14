@@ -77,13 +77,14 @@ workflow or a Console million-object population.
 
 ## Small multipart comparison
 
-The main PC runs both engines and the Rust client over loopback TLS, with M1's
-database and N1's 1+0 member on DATA_SSD. Four alternating baseline/candidate/
-candidate/baseline phases each upload 100 strict durable 4096-byte single-part
-objects with explicit geometry and no negotiation. Each upload is finalized,
-read back with complete SHA-256 verification and reclaimed. Every phase passes
-the offline metadata check and a physical member census containing only the
-pool marker. Both variants use the identical Rust client `gc-ack06`, SHA-256
+The SSD test system runs both engines and the Rust client over loopback TLS,
+with M1's database and N1's 1+0 member on DATA_SSD. Four alternating
+baseline/candidate/ candidate/baseline phases each upload 100 strict durable
+4096-byte single-part objects with explicit geometry and no negotiation. Each
+upload is finalized, read back with complete SHA-256 verification and reclaimed.
+Every phase passes the offline metadata check and a physical member census
+containing only the pool marker. Both variants use the identical Rust client
+`gc-ack06`, SHA-256
 `aaf3725d6b9bd6597dfd114dc1073ad9c9a12616241ac763b7c71d11ce68cdd8`.
 
 These are sequential single-object multipart requests, not batch throughput.
@@ -153,17 +154,18 @@ for clients which can choose compatible multi-part boundaries; explicit
 incompatible sessions retain their existing contract.
 
 Object-level p99 is not inferred from two large uploads per shape. Physical
-power loss, final-candidate MCH topology and broader saturation/maintenance
-remain separate release gates. No new million-object campaign was started.
+power loss, final-candidate the four-HDD reference system topology and broader
+saturation/maintenance remain separate release gates. No new million-object
+campaign was started.
 
 ## Evidence
 
-The main-PC run root is
-`/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`. Its `source/` holds the exact
-overlays, build/service drivers, manifests and alternating benchmark drivers;
-`reports/singlepart09-*` holds raw checks and measurements. The workstation
-copy is under `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01/remote-singlepart09`.
-Physical witnesses are under `reports/singlepart09-hdd`, and original browser
-evidence is under `reports/console-singlepart09-live` on the workstation run.
-Earlier failed candidates, including the empty-object failure, remain in the
-same private evidence roots. No Python was used.
+The SSD test system run root is `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
+Its `source/` holds the exact overlays, build/service drivers, manifests and
+alternating benchmark drivers; `reports/singlepart09-*` holds raw checks and
+measurements. The workstation copy is under
+`/mnt/HDD1TB001/n1-m1-acceptance-20261113-01/remote-singlepart09`. Physical
+witnesses are under `reports/singlepart09-hdd`, and original browser evidence is
+under `reports/console-singlepart09-live` on the workstation run. Earlier failed
+candidates, including the empty-object failure, remain in the same private
+evidence roots. No Python was used.

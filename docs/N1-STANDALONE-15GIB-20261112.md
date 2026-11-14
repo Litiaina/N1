@@ -1,16 +1,17 @@
 # Standalone N1: 15 GiB upload — November 12, 2026
 
 **Passed.** A release-profile Rust client uploaded exactly **16,106,127,360
-bytes (15 GiB)** directly to N1 on MCH, downloaded and SHA-256-verified every
+bytes (15 GiB)** directly to N1 on the four-HDD reference system, downloaded and SHA-256-verified every
 byte, checked repeated finalize, then purged the four test shards. Subsequent
 stat returned 404. The driver exits 0. N1 runtime code and configuration remain
 unchanged; M1 is absent from this request path.
 
 ## Method
 
-The host is `itserver`, `192.168.0.12`, Intel Core i5-11400, six cores / twelve
+The four-HDD reference system has an Intel Core i5-11400, six cores / twelve
 threads, approximately 11 GiB RAM. This uses the same N1 release binary and
-long-lived process as the [preceding 1 GiB measurements](MCH-THROUGHPUT-20261112.md#standalone-n1-finalization).
+long-lived process as the [preceding 1 GiB
+measurements](FOUR-HDD-THROUGHPUT-20261112.md#standalone-n1-finalization).
 
 - Native **verified TLS over loopback → N1 → Pool A**, four SATA XFS HDDs at
   `/mnt/DISK0` through `/mnt/DISK3`.
@@ -84,9 +85,10 @@ finalize time.
 
 ## Evidence and reproduction
 
-MCH evidence root: **`/mnt/DISK0/n1-standalone-15gib-20261112-01`**. The measured
-client job ran **15:06:41–15:10:26 Asia/Manila**. `results/` preserves methodology,
-the client-held LINK identity, all phase/process counters and `PASSED.json`;
+the four-HDD reference system evidence root:
+**`/mnt/DISK0/n1-standalone-15gib-20261112-01`**. The measured client job ran
+**15:06:41–15:10:26 Asia/Manila**. `results/` preserves methodology, the
+client-held LINK identity, all phase/process counters and `PASSED.json`;
 `reports/` contains live progress, GNU time, summary, strict release Clippy and
 build logs, status/exit and server/client hashes. `source/` and `artifacts/`
 preserve the tested client. These are client evidence records, not N1 metadata.
@@ -117,7 +119,7 @@ the diagnostic client's supported sizes; they do not introduce an N1 file-size
 limit. The client never provisions a metadata fragment or calls M1.
 
 The local evidence copy is on HDD1TB001 at
-`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01/reports/mch-n1-15gib-20261112-01`.
+`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01/reports/four-hdd-n1-15gib-20261112-01`.
 Its completion record matches the remote SHA-256. All original deployed
 services and the interactive stack remain running. No commit, push, tag or
 release was performed.

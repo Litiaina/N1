@@ -61,9 +61,9 @@ then finishes the original request, finalizes twice and verifies the complete
 original payload and version after killing/restarting both engines.
 
 Four alternating previous/candidate/candidate/previous phases pin the test
-process and its engine children to main-PC performance-core logical CPUs 0–11.
-M1 and the N1 1+0 member use DATA_SSD. These are local plaintext HTTP status
-measurements through the real M1 service, not remote TLS latency, upload
+process and its engine children to SSD test system performance-core logical CPUs
+0–11. M1 and the N1 1+0 member use DATA_SSD. These are local plaintext HTTP
+status measurements through the real M1 service, not remote TLS latency, upload
 throughput or a maximum request-rate test. Each aggregate contains 200
 individual successful queries per available state.
 
@@ -146,8 +146,8 @@ The accepted 192 MiB envelope is a separately identified run.
 
 ## Evidence and remaining gates
 
-Main-PC root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
-The exact controllers, source overlays and manifests are in `source/`.
+SSD test system root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`. The exact
+controllers, source overlays and manifests are in `source/`.
 `reports/status12-*` contains build, regression and latency evidence;
 `reports/stalled10` through `stalled13` retain all block-delay attempts;
 `reports/memory14` and `memory15` retain both memory profiles. Rust owns the
@@ -159,12 +159,13 @@ The workstation copy is under
 `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01/remote-status12`, with physical
 service and browser evidence in `reports/status12-hdd` and
 `reports/console-status12-live`. Portable preservation under
-`/home/altear/DEV_TEST` excludes service credentials, private TLS keys, test
-databases, object payloads, loop images and build caches.
+`/srv/test-evidence/portable` excludes service credentials, private TLS keys,
+test databases, object payloads, loop images and build caches.
 
 These checks close the reproduced indexed-status blockage and qualify the
 specified delayed-I/O and short memory-pressure profiles. They do not replace
-physical power-loss testing, final-candidate four-HDD MCH qualification,
-sustained saturation with concurrent maintenance, complete contract/operator
-acceptance or remaining large-file performance acceptance. Existing million
-campaigns remain preserved; none was restarted for this stage. RC.2 is unreleased.
+physical power-loss testing, final-candidate four-HDD the four-HDD reference
+system qualification, sustained saturation with concurrent maintenance, complete
+contract/operator acceptance or remaining large-file performance acceptance.
+Existing million campaigns remain preserved; none was restarted for this stage.
+RC.2 is unreleased.

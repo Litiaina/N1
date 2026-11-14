@@ -6,6 +6,10 @@ It records evidence, not the architecture or
 operator procedure. Product behavior is defined by [NOA.md](NOA.md); remaining
 completion gates are in [docs/RC2-IMPLEMENTATION.md](docs/RC2-IMPLEMENTATION.md).
 
+Hardware roles and public/private evidence conventions are defined in
+[the qualification profiles](docs/TEST-PROFILES.md). Machine identities and
+private path mappings belong to operator evidence, not repository reports.
+
 Current Cargo packages are `n1` (object store) and `m1` (metadata store); their
 server binaries are `litiaina-n1` and `litiaina-m1`. Historical evidence retains
 the names and executable hashes used when each campaign ran. Renaming does not
@@ -107,28 +111,28 @@ recovery checks pass. The original million corpus and N1 runtime remain unchange
 [release plan](docs/RC2-RELEASE-PLAN.md) recommends November 27 with a November 25
 go/no-go review; required acceptance conditions still control release.
 
-## Home standalone optimization — November 13, 2026
+## SSD/HDD standalone optimization — November 13, 2026
 
-The [standalone optimization report](docs/HOME-OPTIMIZATION-20261113.md) records
-compiler-matched 15 GiB reference/candidate comparisons on DATA_SSD 1+0 and two
-physical XFS HDDs in 1+1, small-object latency distributions, same-identity read
-controls and hardware-counter diagnostics. The candidate passes 269 N1/LINK
-release tests, zero failures, plus the separately enabled physical direct-I/O
-reopen witness and strict Clippy. All 116 runtime source files match its build
-snapshot. The attached 100 GiB run passes full SHA-256/length readback, repeated
-finalize, purge/404 and the physical marker-only census on both HDDs. It records
-73.81 MiB/s upload, 44.28 MiB/s GET, 26.97 ms finalize and 118.69 MiB whole-run
-peak N1 RSS. Earlier completed million and MCH campaigns
-are preserved rather than restarted. The report retains adverse tails and
-separates observed efficiency from unmeasured hardware saturation.
-An additional two-HDD ABBA passes 2,048 complete small-object lifecycles. Its
-512 samples per implementation/mode do not reproduce the earlier p99 regression;
-both distributions, remaining median/p95 costs and the renewed marker-only
-physical census are retained separately.
+The [standalone optimization report](docs/SSD-HDD-OPTIMIZATION-20261113.md)
+records compiler-matched 15 GiB reference/candidate comparisons on DATA_SSD 1+0
+and two physical XFS HDDs in 1+1, small-object latency distributions,
+same-identity read controls and hardware-counter diagnostics. The candidate
+passes 269 N1/LINK release tests, zero failures, plus the separately enabled
+physical direct-I/O reopen witness and strict Clippy. All 116 runtime source
+files match its build snapshot. The attached 100 GiB run passes full
+SHA-256/length readback, repeated finalize, purge/404 and the physical
+marker-only census on both HDDs. It records 73.81 MiB/s upload, 44.28 MiB/s GET,
+26.97 ms finalize and 118.69 MiB whole-run peak N1 RSS. Earlier completed
+million and the four-HDD reference system campaigns are preserved rather than
+restarted. The report retains adverse tails and separates observed efficiency
+from unmeasured hardware saturation. An additional two-HDD ABBA passes 2,048
+complete small-object lifecycles. Its 512 samples per implementation/mode do not
+reproduce the earlier p99 regression; both distributions, remaining median/p95
+costs and the renewed marker-only physical census are retained separately.
 
-## MCH RC.2 qualification — November 11, 2026
+## Four-HDD reference system RC.2 qualification — November 11, 2026
 
-The [November 13 continuation](docs/MCH-OPTIMIZATION-20261113.md) records the
+The [November 13 continuation](docs/FOUR-HDD-OPTIMIZATION-20261113.md) records the
 subsequent sparse-upload optimization: 32 matched large transfers, 1,536 small
 multipart lifecycle samples, 32 identical-object GET replays and renewed
 four-HDD 3+1/2+2 faults. Native N1 passes 218 default library tests and all four
@@ -164,38 +168,40 @@ two simultaneously connected blank replacements. The corrected encrypted
 backup/service-identity witness also passes. These faults use private member
 directories; they do not simulate host power loss.
 
-The current local workspace passes **378 default tests, zero failed**, with
-56 explicit opt-in/helper exclusions. Workspace strict Clippy and formatting
-pass. MCH's final export candidate passes **21 real-service cases**, including
-per-artifact cleanup error isolation. Retrieved on November 12, the controlled
-same-database screen, 4,096-object named crash/recovery/census and 19 native
-storage regressions also completed successfully. One parent-invoked storage
-helper is explicitly excluded. See the [MCH continuation](docs/MCH-CONTINUATION-20261112.md).
-Keep these results separate from the
-[home split-node qualification](docs/SPLIT-NODE-20261111.md): N1 on two local
-HDDs, M1 and its database on the main PC's DATA_SSD, with a real native TLS hop.
-That profile now passes its fresh 378-test workspace regression, actual
-both-process kills and complete 4,096-object readback, each member's loss,
+The current local workspace passes **378 default tests, zero failed**, with 56
+explicit opt-in/helper exclusions. Workspace strict Clippy and formatting pass.
+the four-HDD reference system's final export candidate passes **21 real-service
+cases**, including per-artifact cleanup error isolation. Retrieved on November
+12, the controlled same-database screen, 4,096-object named
+crash/recovery/census and 19 native storage regressions also completed
+successfully. One parent-invoked storage helper is explicitly excluded. See the
+[Four-HDD reference system
+continuation](docs/FOUR-HDD-CONTINUATION-20261112.md). Keep these results
+separate from the [SSD/HDD split-node
+qualification](docs/SPLIT-NODE-20261111.md): N1 on two local HDDs, M1 and its
+database on the SSD test system's DATA_SSD, with a real native TLS hop. That
+profile now passes its fresh 378-test workspace regression, actual both-process
+kills and complete 4,096-object readback, each member's loss,
 snapshot/database-loss recovery and a fresh 256-object physical-census
-preflight. Its owned-M1 million campaign was stopped by the operator on
-November 12: population, full post-restart readback and full member-0-loss
-readback passed; member-1-loss readback reached 720,000 reported checks before
+preflight. Its owned-M1 million campaign was stopped by the operator on November
+12: population, full post-restart readback and full member-0-loss readback
+passed; member-1-loss readback reached 720,000 reported checks before
 interruption. The November 12 continuation then **passed the complete original
-million-object member-1-loss readback**, 13,968,125,000 bytes, zero payload/version
-mismatches in 11,757.437 seconds, with unchanged original ACK hashes. Member 1
-is restored. Final natural-expiry cleanup and censuses subsequently passed:
-192 expired attempts reclaimed without errors, one million names/versions/LINK
-references, exactly two million shards and no pending, staged, misplaced or
-unreferenced objects. The final database integrity check verified 7,000,272
-records. See the [home closure report](docs/HOME-QUALIFICATION-20261113.md).
-A portable
-source/evidence/database checkpoint is under `/home/altear/DEV_TEST`; see the
-handover for its exact path and restart constraints. The
-eight-phase export-feature screen records nearly equal M1 CPU but a 13.6%
-higher candidate upload mean with large per-phase variation; acceptance remains
-open. See that report for raw evidence and scope.
+million-object member-1-loss readback**, 13,968,125,000 bytes, zero
+payload/version mismatches in 11,757.437 seconds, with unchanged original ACK
+hashes. Member 1 is restored. Final natural-expiry cleanup and censuses
+subsequently passed: 192 expired attempts reclaimed without errors, one million
+names/versions/LINK references, exactly two million shards and no pending,
+staged, misplaced or unreferenced objects. The final database integrity check
+verified 7,000,272 records. See the [SSD/HDD closure
+report](docs/TWO-HDD-QUALIFICATION-20261113.md). A portable
+source/evidence/database checkpoint is under `/srv/test-evidence/portable`; see
+the handover for its exact path and restart constraints. The eight-phase
+export-feature screen records nearly equal M1 CPU but a 13.6% higher candidate
+upload mean with large per-phase variation; acceptance remains open. See that
+report for raw evidence and scope.
 
-The [November 12 continuation](docs/MCH-CONTINUATION-20261112.md) records the
+The [November 12 continuation](docs/FOUR-HDD-CONTINUATION-20261112.md) records the
 preserved million-object database's complete 7,001,423-record integrity pass,
 the native 4,099-object recovery and interruption/corruption resume witnesses,
 and an actual original-Console 128-object crash/recovery/census pass. Extra
@@ -205,45 +211,46 @@ completed at its frozen binaries, without another population or payload pass.
 The read-only helper has its own regression and
 strict Clippy checks. The 378-test workspace count above predates that helper.
 
-The [MCH throughput measurement](docs/MCH-THROUGHPUT-20261112.md) uses NVMe M1
-and the interactive four-HDD 3+1 N1 pool, with an isolated benchmark database.
-Three repetitions verify 900 small objects and nine 1 GiB objects, then reclaim
-all 909 through scoped GC with zero failures/deferred work. Individual and batch
+The [Four-HDD reference system throughput
+measurement](docs/FOUR-HDD-THROUGHPUT-20261112.md) uses NVMe M1 and the
+interactive four-HDD 3+1 N1 pool, with an isolated benchmark database. Three
+repetitions verify 900 small objects and nine 1 GiB objects, then reclaim all
+909 through scoped GC with zero failures/deferred work. Individual and batch
 small uploads, large one-shot and durable multipart, init/status/finalize/retry,
 per-process CPU/RSS and every original payload/version are recorded. This is
 server-local current-build performance, with warm immediate reads; it does not
-close matched-baseline, browser/LAN, saturation or million-object gates.
-The follow-up standalone native N1 measurement verifies and purges three
-additional 1 GiB multipart objects without M1 requests. Finalize averages
-59.73 ms, versus 70.43 ms for aligned M1 and 9,317.64 ms for M1's incompatible
-part-geometry bridge. The same report preserves every trial and the timing
-differences; no runtime code changed for these measurements.
-The [15 GiB native N1 follow-up](docs/N1-STANDALONE-15GIB-20261112.md) also
-passes: 320 durable 48 MiB parts, four writers, complete SHA-256 readback,
-repeated finalize and four-shard purge. Whole upload is 95.45 s / 160.92 MiB/s;
-finalize is 100.67 ms. This is one large-object trial, not a fault or tail-latency
-qualification.
+close matched-baseline, browser/LAN, saturation or million-object gates. The
+follow-up standalone native N1 measurement verifies and purges three additional
+1 GiB multipart objects without M1 requests. Finalize averages 59.73 ms, versus
+70.43 ms for aligned M1 and 9,317.64 ms for M1's incompatible part-geometry
+bridge. The same report preserves every trial and the timing differences; no
+runtime code changed for these measurements. The [15 GiB native N1
+follow-up](docs/N1-STANDALONE-15GIB-20261112.md) also passes: 320 durable 48 MiB
+parts, four writers, complete SHA-256 readback, repeated finalize and four-shard
+purge. Whole upload is 95.45 s / 160.92 MiB/s; finalize is 100.67 ms. This is
+one large-object trial, not a fault or tail-latency qualification.
 
-The subsequent [finalization and media qualification](docs/FINALIZATION-20261112.md)
-compares the preceding LINK binary with the bounded finalization change using
-the same Rust client/compiler. It measures native N1 without M1 on DATA_SSD
-1+0, HDD 1+0 and HDD 1+1, including per-stage p50/p95/p99, complete 1 GiB and
-15 GiB uploads, CPU/RSS and adverse observations. The final workspace passes
-396 tests with zero failures; a dedicated actual SIGKILL witness on DATA_SSD
-passes cold completion recovery, exact readback and purge. These are separate
-results from the original MCH measurements above. They do not extend the
+The subsequent [finalization and media
+qualification](docs/FINALIZATION-20261112.md) compares the preceding LINK binary
+with the bounded finalization change using the same Rust client/compiler. It
+measures native N1 without M1 on DATA_SSD 1+0, HDD 1+0 and HDD 1+1, including
+per-stage p50/p95/p99, complete 1 GiB and 15 GiB uploads, CPU/RSS and adverse
+observations. The final workspace passes 396 tests with zero failures; a
+dedicated actual SIGKILL witness on DATA_SSD passes cold completion recovery,
+exact readback and purge. These are separate results from the original the
+four-HDD reference system measurements above. They do not extend the
 million-object result to this changed runtime or prove physical power loss.
 
-The [November 13 home qualification](docs/HOME-QUALIFICATION-20261113.md)
+The [November 13 SSD/HDD qualification](docs/TWO-HDD-QUALIFICATION-20261113.md)
 then closes the original campaign's final GC/censuses and tests the newer
 runtime separately. A real both-process-resume test exposed an M1 completion
-recovery gap, now fixed through bounded public N1 status reconciliation.
-The final checkpoint passes **401 default workspace tests**, 29 distinct
+recovery gap, now fixed through bounded public N1 status reconciliation. The
+final checkpoint passes **401 default workspace tests**, 29 distinct
 real-service cases across SSD and two HDDs, original Console browser workflows
 and the frozen Console's 45 Node tests. Matched M1-adapter screens retain both
 the adverse first rename tail and the reversed follow-up, per-request samples
 and CPU/RSS. These checks do not qualify physical power loss or substitute for
-the deferred current-candidate four-HDD MCH run.
+the deferred current-candidate four-HDD the four-HDD reference system run.
 
 Performance acceptance remains open. Native M1 has lower mutation latency than
 Procyon on the completed HDD matrix but costs 50.7% more M1 CPU at 1,000 objects.
@@ -334,13 +341,13 @@ actual SIGKILL of both engines, offline census, restart and full readback of
 every original acknowledged version and payload. This closes the requested
 API population count of at least 500,000 objects for this checkpoint/profile.
 
-The main PC at `192.168.254.107` used an i5-12600K and approximately 31 GiB RAM.
-M1's database, binaries, control and journals were on `/mnt/DATA_SSD`; the 1+1
-pool used the independent XFS HDDs at `/media/altear/HDD1TB001` and
-`/media/altear/HDD1TB002`. Eight writers submitted strict durable batches of up
-to 256 objects; M1 admission was four and N1 admission sixteen. Required
-io_uring initialized without fallback. Request quotas and scheduled scrubs
-were disabled for this functional scale profile.
+The SSD test system at `ssd-test.example.invalid` used an i5-12600K and
+approximately 31 GiB RAM. M1's database, binaries, control and journals were on
+`/mnt/DATA_SSD`; the 1+1 pool used the independent XFS HDDs at
+`/mnt/test-media/HDD1TB001` and `/mnt/test-media/HDD1TB002`. Eight writers
+submitted strict durable batches of up to 256 objects; M1 admission was four and
+N1 admission sixteen. Required io_uring initialized without fallback. Request
+quotas and scheduled scrubs were disabled for this functional scale profile.
 
 | Check | Result |
 | --- | ---: |
@@ -373,8 +380,9 @@ that host under `/mnt/DATA_SSD/n1-rc2-million-20261108.ZsO460`; the campaign
 completed successfully and its task processes ended.
 
 This is a full-stack API and process-crash/reopen pass. Console population,
-standalone-only million-object qualification, MCH four-HDD minimum-hardware and
-physical power-loss gates remain separate. **RC.2 remains unreleased.**
+standalone-only million-object qualification, the four-HDD reference system
+four-HDD minimum-hardware and physical power-loss gates remain separate. **RC.2
+remains unreleased.**
 
 ## Performance acceptance for feature changes
 
@@ -437,14 +445,14 @@ follow-up below investigates it. No all-operation parity or old-NCX comparison
 is inferred from this screen.
 
 Evidence, raw results, failed attempts, exact binaries, reproduction scripts and
-source preservation are under
-`/mnt/HDD1TB001/n1-rc2-preparation-20261107-01`; see its
-[preparation report](/mnt/HDD1TB001/n1-rc2-preparation-20261107-01/reports/PREPARATION-RESULTS.md)
-and [benchmark report](/mnt/HDD1TB001/n1-rc2-preparation-20261107-01/reports/BENCHMARK-RESULTS.md).
-Historical absolute `/mnt/PROJECT-DISK-1TB` links below identify their original
-report locations; five are unavailable on this machine and were not reverified.
-Retained artifact TTL/disk-limit implementation, complete contract/Console
-coverage and the scheduled MCH scale/physical-fault/power-loss gates remain open.
+source preservation are under `/mnt/HDD1TB001/n1-rc2-preparation-20261107-01`;
+see its preparation report (private evidence: `PREPARATION-RESULTS.md`) and
+benchmark report (private evidence: `BENCHMARK-RESULTS.md`). Historical absolute
+`/mnt/PROJECT-DISK-1TB` links below identify their original report locations;
+five are unavailable on this machine and were not reverified. Retained artifact
+TTL/disk-limit implementation, complete contract/Console coverage and the
+scheduled the four-HDD reference system scale/physical-fault/power-loss gates
+remain open.
 
 ### Controlled performance follow-up
 
@@ -481,9 +489,9 @@ serve as a throughput benchmark. A same-object 256 MiB read replay averages
 
 The complete methods, individual samples, slower tails, exact binaries and
 failed attempts are in the
-[performance investigation](/mnt/HDD1TB001/n1-upload-regression-20261107-01/reports/PERFORMANCE-RESULTS.md).
+performance investigation (private evidence: `PERFORMANCE-RESULTS.md`).
 The original mixed workload is repeated with the final binary; see its
-[per-operation results](/mnt/HDD1TB001/n1-upload-regression-20261107-01/reports/FULL-WORKLOAD.md).
+per-operation results (private evidence: `FULL-WORKLOAD.md`).
 Its mean small-upload time is 12.51% lower, mean multipart-upload time 1.85%
 lower, and mean small GET 44.997 to 1.658 ms. Rename averages 13.83% more time
 and some other percentiles/RSS increase; they are not hidden by a faster total.
@@ -506,10 +514,10 @@ backup/restore, and finite/unlimited size policy with isolated secrets.
 
 The service checks assert both signature banners, M1's HTTP/native identity,
 `m1_config.ini` / `m1.env` defaults and independent N1/M1 monitoring labels.
-Evidence is under `/mnt/HDD1TB001/n1-m1-naming-20261106-01/reports`.
-These are functional checks of the naming/readability checkpoint, not new
-throughput, million-object or hardware power-loss results. The MCH qualification
-and RC.2 release hold remain in the completion checklist.
+Evidence is under `/mnt/HDD1TB001/n1-m1-naming-20261106-01/reports`. These are
+functional checks of the naming/readability checkpoint, not new throughput,
+million-object or hardware power-loss results. The four-HDD reference system
+qualification and RC.2 release hold remain in the completion checklist.
 
 ## Key-only lifecycle qualification — November 5, 2026
 
@@ -726,12 +734,13 @@ production Console runtime is unchanged by this regression test.
 
 ## Earlier monitoring and recovery checkpoint — November 4, 2026
 
-At this monitoring checkpoint, work was on `link` and `main` was held. Authoritative
-evidence is on `altear@192.168.254.107` under
+At this monitoring checkpoint, work was on `link` and `main` was held.
+Authoritative evidence is on the SSD test system under
 `/mnt/DATA_SSD/n1-local-test-20261103-01/health-monitoring-01`. Task-owned HDD
-roots are under `/media/altear/PROJECT-1TB/n1-monitoring-20261104` and
-`/media/altear/TEST-1TB/mx-tests/n1-monitoring-20261104`; whole drives were not
-reformatted. Workstation browser output uses RAM; builds/reports use DATA_SSD.
+roots are under `/mnt/test-media/PROJECT-1TB/n1-monitoring-20261104` and
+`/mnt/test-media/TEST-1TB/mx-tests/n1-monitoring-20261104`; whole drives were
+not reformatted. Workstation browser output uses RAM; builds/reports use
+DATA_SSD.
 
 The complete workspace passed **440 cases** (`workspace-final13.log`), and
 scoped strict Clippy passed. The ordinary run leaves opt-in physical/helper
@@ -803,7 +812,7 @@ exact environments in each report identify the tested snapshot. Counts from
 different runs are not added together as new distinct tests.
 
 The later local size-policy and credential-provisioning checks on
-`192.168.254.107` passed: 421 workspace cases, 81 storage documentation cases,
+`ssd-test.example.invalid` passed: 421 workspace cases, 81 storage documentation cases,
 both explicit metadata-to-object HDD witnesses, and all three original Console
 live cases. A separate real **15 GiB** strict durable upload used 480 parts and
 passed repeated finalize and complete byte-for-byte download verification.
@@ -816,19 +825,20 @@ population campaigns.
 
 | Campaign | Recorded result | Scope and evidence |
 | --- | --- | --- |
-| Complete local workspace | 414 passed, zero failed; nine explicit helper/physical exclusions | [Full-stack report](/mnt/PROJECT-DISK-1TB/n1-ini-restoration-20261103-01/reports/FULL-STACK-QUALIFICATION-20261103.md) |
+| Complete local workspace | 414 passed, zero failed; nine explicit helper/physical exclusions | Full-stack report (private evidence: `FULL-STACK-QUALIFICATION-20261103.md`) |
 | Post-fix metadata/native checks | 14 metadata library and three native-client cases passed; strict metadata/shared-config Clippy passed | Same report; `checkpoint-metadata104.log`, `checkpoint-object-client105.log`, `checkpoint-clippy103.log` |
 | Original Console regression | Three live cases and 38 Node cases passed; static validation had zero errors/warnings | Same full-stack report; existing production Console/runtime/proxy preserved |
 | Corrected local two-HDD smoke | API 1,024 objects and original Console 1,000 objects passed census and every post-SIGKILL payload/version read | Same report, separate fresh datasets |
-| MCH component regression and physical API | 246 passed, zero failed; eight explicit helper/physical exclusions; physical API witness and 1,024-object API smoke passed | [MCH full-stack report](/mnt/PROJECT-DISK-1TB/n1-mch-full-stack-20261103-01/reports/MCH-FULL-STACK-QUALIFICATION-20261103.md) |
-| Direct LINK 500,000-object campaign | Passed 500,000 durable ACKs, all exact full GETs after restart and a 1,000,000-shard census | [Object-only 500K report](/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/HEADLESS-500K-20261102-20261103.md); a separate earlier object-only snapshot |
-| Procyon metadata foundation on MCH HDDs | One million KV entries, 100K mutations, concurrent snapshots and two SIGKILL/resume cycles passed; other drives passed independent smaller campaigns | [Metadata KV report](/mnt/PROJECT-DISK-1TB/n1-mch-metadata-20261103-01/reports/MCH-METADATA-QUALIFICATION-20261103.md); not object uploads |
-| API and Console 500,000-object campaigns at that checkpoint | In progress at the source checkpoint; no full-stack 500K pass recorded in that snapshot | [Headless handover](/mnt/PROJECT-DISK-1TB/n1-mch-full-stack-20261103-01/reports/HEADLESS-HANDOVER-20261103.md) and the terminal files it identifies |
+| Four-HDD reference system component regression and physical API | 246 passed, zero failed; eight explicit helper/physical exclusions; physical API witness and 1,024-object API smoke passed | Four-HDD reference system full-stack report (private evidence: `four-hdd-FULL-STACK-QUALIFICATION-20261103.md`) |
+| Direct LINK 500,000-object campaign | Passed 500,000 durable ACKs, all exact full GETs after restart and a 1,000,000-shard census | Object-only 500K report (private evidence: `HEADLESS-500K-20261102-20261103.md`); a separate earlier object-only snapshot |
+| Procyon metadata foundation on the four-HDD reference system HDDs | One million KV entries, 100K mutations, concurrent snapshots and two SIGKILL/resume cycles passed; other drives passed independent smaller campaigns | Metadata KV report (private evidence: `four-hdd-METADATA-QUALIFICATION-20261103.md`); not object uploads |
+| API and Console 500,000-object campaigns at that checkpoint | In progress at the source checkpoint; no full-stack 500K pass recorded in that snapshot | Headless handover (private evidence: `HEADLESS-HANDOVER-20261103.md`) and the terminal files it identifies |
 
 Headless terminal JSON files and raw logs are authoritative for completion after
 this status snapshot. A populated dataset or upload progress line is not a
 terminal pass. The Console population follows only after its API campaign passes
-census and complete post-restart reads. Local and MCH campaigns are independent.
+census and complete post-restart reads. Local and the four-HDD reference system
+campaigns are independent.
 
 ## Failure retained and corrected
 
@@ -851,9 +861,9 @@ current large-upload writer, physical page-cache proof, repeated fault/recovery
 checks and matched buffered-LINK/NCX comparisons. It includes per-phase CPU/RSS,
 latency, allocation and adverse measurements. That November 5 campaign used
 `/mnt/HDD1TB001` and `/mnt/HDD1TB002`, with source/build/data evidence on HDDs.
-The November 8 main-PC campaign uses DATA_SSD for M1/control/builds and the HDDs
-at `/media/altear/HDD1TB001` and `/media/altear/HDD1TB002`, as recorded in its
-[report](docs/MILLION-OBJECTS-20261108.md).
+The November 8 SSD test system campaign uses DATA_SSD for M1/control/builds and
+the HDDs at `/mnt/test-media/HDD1TB001` and `/mnt/test-media/HDD1TB002`, as
+recorded in its [report](docs/MILLION-OBJECTS-20261108.md).
 
 Compare the same workload, integrity/durability policy, hardware, concurrency,
 cache state and completed operation semantics. Report upload/download latency,
@@ -863,7 +873,7 @@ is not a physical power cut. Physical LINK purge is not the same operation
 as moving a named object to trash.
 
 The direct old/new comparison is retained in
-[NCX-VS-CRC32C-LINK-20261103.md](/mnt/HDD1TB001/n1-xfs-rebenchmark-20261105-01/evidence-before-format/mnt/PROJECT-DISK-1TB/n1-link-rc2-20261101-01/reports/NCX-VS-CRC32C-LINK-20261103.md).
+NCX-VS-CRC32C-LINK-20261103.md (private evidence: `NCX-VS-CRC32C-LINK-20261103.md`).
 It does not prove a win in every metric or the performance of the later metadata
 stack. Full product NOA conformance and the remaining fault/topology/recovery
 gates must pass before RC.2 is released.

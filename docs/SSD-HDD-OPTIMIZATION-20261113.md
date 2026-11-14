@@ -8,8 +8,9 @@ checkpoint is held fixed for subsequent M1 profiling; this is not a declaration
 that every operation improved or that RC.2 is release-qualified.
 
 N1 remains the standalone LINK object engine. No M1 service, database or Console
-is in the timed upload path. Existing MCH and million-object results are
-preserved; the completed million campaign is not restarted.
+is in the timed upload path. Existing the four-HDD reference system and
+million-object results are preserved; the completed million campaign is not
+restarted.
 
 ## Implementation
 
@@ -42,17 +43,17 @@ no useful improvement from substituting ring; no hash dependency is changed.
 
 ## Method and evidence
 
-Local run root: `/mnt/HDD1TB001/n1-home-optimization-20261113-01`.
-Main-PC run root: `/mnt/DATA_SSD/n1-home-optimization-20261113-01` on
-`altear@192.168.254.107`. Binaries, source snapshots, drivers, manifests, raw
-JSON, per-part samples and logs are retained under those roots.
+Local run root: `/mnt/HDD1TB001/n1-ssd-hdd-optimization-20261113-01`. SSD test
+system run root: `/mnt/DATA_SSD/n1-ssd-hdd-optimization-20261113-01` on `SSD
+test system`. Binaries, source snapshots, drivers, manifests, raw JSON, per-part
+samples and logs are retained under those roots.
 
-The laptop uses two ST1000LM049 HDDs, distinct XFS filesystems at
-`/mnt/HDD1TB001` and `/mnt/HDD1TB002`, in a private 1+1 pool. The main PC uses
-the Intel DATA_SSD XFS filesystem in a private 1+0 pool. Both use 256 KiB blocks,
-48 MiB parts, four writers, native loopback TLS and strict durable upload.
-No user fragment is created. No existing user data, service, global governor,
-kernel perf policy or disk scheduler is changed.
+the two-HDD test system uses two ST1000LM049 HDDs, distinct XFS filesystems at
+`/mnt/HDD1TB001` and `/mnt/HDD1TB002`, in a private 1+1 pool. The SSD test
+system uses the Intel DATA_SSD XFS filesystem in a private 1+0 pool. Both use
+256 KiB blocks, 48 MiB parts, four writers, native loopback TLS and strict
+durable upload. No user fragment is created. No existing user data, service,
+global governor, kernel perf policy or disk scheduler is changed.
 
 15 GiB runs include init, the client's identity-journal flush, payload and
 finalize. Full streamed SHA-256/length readback, repeated finalize and purge/404
@@ -65,13 +66,13 @@ reference `before-a3`. The unchanged `before-a2` sample also appears in the
 earlier intermediate screen; it is one physical run, not two distinct tests.
 The complete earlier samples remain available rather than being discarded.
 
-Main-PC hardware counters attach only to the private N1 PID. These profiled
-windows are diagnostics, distinct from unprofiled HDD acceptance observations.
-Effective frequency is retained because CPU seconds can rise when a process
-executes fewer cycles at a lower clock. This does not excuse an observed
-regression or establish that every metric improves. Laptop hardware counters
-require unavailable local sudo authentication; its process CPU/RSS/I/O are
-retained without weakening the kernel's profiling policy.
+SSD test system hardware counters attach only to the private N1 PID. These
+profiled windows are diagnostics, distinct from unprofiled HDD acceptance
+observations. Effective frequency is retained because CPU seconds can rise when
+a process executes fewer cycles at a lower clock. This does not excuse an
+observed regression or establish that every metric improves. Two-HDD-system
+hardware counters require unavailable local sudo authentication; its process
+CPU/RSS/I/O are retained without weakening the kernel's profiling policy.
 
 During the HDD sequence, throughput changes substantially between consecutive
 passes, including the unchanged reference. The results must retain that storage
@@ -176,8 +177,9 @@ part + first finalize; the other operations remain separately recorded.
 These tails are adverse and must not be described as improved. To examine the
 SSD tail with more samples, a separate ABBA control uses 1,024 objects per mode
 per phase: **8,192 additional verified/purged lifecycles**, 2,048 upload samples
-per implementation/mode. It runs on the separate main PC while the laptop's
-100 GiB readback runs, without sharing a physical disk or service.
+per implementation/mode. It runs on the separate SSD test system while the
+two-HDD test system's 100 GiB readback runs, without sharing a physical disk or
+service.
 
 | SSD expanded control | Reference p50 / p95 / p99 ms | native04 p50 / p95 / p99 ms |
 | --- | --- | --- |
@@ -315,18 +317,20 @@ but adverse tails remain visible and cannot be dismissed as noise by assertion.
 
 These are configured four-writer workloads, not a saturation sweep proving the
 maximum throughput of either device or a high-end server. Native loopback TLS
-does not measure the Console, M1, a physical network or every protocol path.
-No maximum-object-count, billion-object, all-topology or hardware power-loss
-claim follows. The MCH four-HDD candidate and M1's named multipart geometry
-bridge retain separate acceptance work. N1 must remain fixed during subsequent
-M1 profiling so improvements and costs can be attributed to the correct engine.
+does not measure the Console, M1, a physical network or every protocol path. No
+maximum-object-count, billion-object, all-topology or hardware power-loss claim
+follows. The four-HDD reference system four-HDD candidate and M1's named
+multipart geometry bridge retain separate acceptance work. N1 must remain fixed
+during subsequent M1 profiling so improvements and costs can be attributed to
+the correct engine.
 
-The large-upload objective is supported on these home profiles: lower observed
-CPU cost with essentially unchanged HDD upload throughput, plus successful
-bounded-memory 100 GiB verification. Small-object tail concerns and final MCH
-hardware acceptance remain explicit; freezing a reference for M1 measurements
-does not mark those gates closed. No N1 runtime changes are made while M1's
-own transport, geometry bridge and database costs are isolated.
+The large-upload objective is supported on these SSD/HDD profiles: lower
+observed CPU cost with essentially unchanged HDD upload throughput, plus
+successful bounded-memory 100 GiB verification. Small-object tail concerns and
+final the four-HDD reference system hardware acceptance remain explicit;
+freezing a reference for M1 measurements does not mark those gates closed. No N1
+runtime changes are made while M1's own transport, geometry bridge and database
+costs are isolated.
 
 The exact reference executable SHA-256 is
 `fa785ff25299ff445e47d5da84a5fd37b42e19a6f9c381e99926d383c78b3915`;
@@ -348,13 +352,14 @@ comparison rows and their raw-file paths. `CONTROLS.json`,
 separate controls. Every successful/failed attempt remains in its original
 directory, including rejected intermediate candidates.
 
-`reports/hdd11-100g-native04/results/PASSED.json` is the terminal 100 GiB result;
-`upload-r1.json` is its earlier upload-only checkpoint, explicitly marked
-readback-unverified. It is not rewritten into a later verification claim.
+`reports/hdd11-100g-native04/results/PASSED.json` is the terminal 100 GiB
+result; `upload-r1.json` is its earlier upload-only checkpoint, explicitly
+marked readback-unverified. It is not rewritten into a later verification claim.
 `progress.csv`, `window-summary.json`, the raw client/vmstat logs and process/
 disk counters retain timing and resource evidence. `reports/final-census/`
 records physical cleanup and the runtime source check. `checkpoint/` contains
-the N1 source/build manifests; `artifacts/` retains the exact executables.
-A verified 29 MiB portable source/binary/evidence bundle is preserved at
-`/home/altear/DEV_TEST/n1-home-optimization-20261113-01`, without datasets,
-build caches or service secrets, so continuation does not require DATA_SSD access.
+the N1 source/build manifests; `artifacts/` retains the exact executables. A
+verified 29 MiB portable source/binary/evidence bundle is preserved at
+`/srv/test-evidence/portable/n1-ssd-hdd-optimization-20261113-01`, without
+datasets, build caches or service secrets, so continuation does not require
+DATA_SSD access.

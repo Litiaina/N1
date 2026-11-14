@@ -57,14 +57,14 @@ it is not a new N1 Lite/NCX comparison.
 
 | Placement | Host / filesystem / connection | Topology |
 | --- | --- | --- |
-| DATA_SSD | Main PC, i5-12600K, Intel SSDSC2KW240H6 SATA SSD, XFS | 1+0 |
-| One HDD | Laptop, Ryzen 5 PRO 4650U, ST1000LM049-2GH172, XFS, USB UAS | 1+0 |
-| Two HDDs | Same laptop, two independent XFS HDD filesystems over USB UAS | 1+1 |
+| DATA_SSD | SSD test system, i5-12600K, Intel SSDSC2KW240H6 SATA SSD, XFS | 1+0 |
+| One HDD | Two-HDD test system, Ryzen 5 PRO 4650U, ST1000LM049-2GH172, XFS, USB UAS | 1+0 |
+| Two HDDs | Same two-HDD test system, two independent XFS HDD filesystems over USB UAS | 1+1 |
 
 The SSD/HDD comparison has equal 1+0 topology but different host CPUs and
 SATA/USB paths. It describes these deployments rather than an isolated
 media-only comparison. Clients and N1 use native TLS loopback on their
-respective hosts, excluding LAN and browser overhead. Canonical main-PC
+respective hosts, excluding LAN and browser overhead. Canonical SSD test system
 artifacts/builds use DATA_SSD; local artifacts and datasets use the HDDs.
 Runtime binaries are copied into RAM. No filesystem was reformatted.
 
@@ -79,10 +79,10 @@ Small-object runs use 256 sequential, verified/purged **4 KiB** objects per
 durability mode and binary. Percentiles use nearest rank over individual
 samples. Upload latency is init + part + finalize for the same object; stage
 percentiles must not be added together. Separate balanced HDD confirmation
-blocks alternate baseline/candidate order. The raw blockwise observations
-remain retained rather than being replaced by the confirmation.
-These small-object numbers measure the multipart lifecycle, not one-shot or
-batch upload. The earlier MCH report measures those separate methods.
+blocks alternate baseline/candidate order. The raw blockwise observations remain
+retained rather than being replaced by the confirmation. These small-object
+numbers measure the multipart lifecycle, not one-shot or batch upload. The
+earlier the four-HDD reference system report measures those separate methods.
 
 CPU is N1 process CPU time over upload, not whole-host usage. RSS is sampled
 every 50 ms and excludes filesystem page cache. No global cache drop is used;
@@ -249,18 +249,18 @@ or physical power-cut qualification was run for this change.
 
 All task-owned benchmark services are stopped. The private SSD/HDD benchmark
 members contain no remaining shard payloads or incomplete-upload identities;
-their pool identity files and shared fanout directories remain. Earlier
-campaign datasets and services are preserved.
+their pool identity files and shared fanout directories remain. Earlier campaign
+datasets and services are preserved.
 
 ## Evidence and retained failures
 
-Local evidence: `/mnt/HDD1TB001/n1-finalize-home-20261112-01`.
-Canonical main-PC copies: `/mnt/DATA_SSD/n1-finalize-home-20261112-01`.
-The other HDD contains only the task's private second member in addition to
-previous preserved datasets. `reports/` holds unedited phase results,
-resource/disk counters and test logs. `source/` holds frozen Bash drivers,
-Rust source snapshots and Perl aggregation; all workload/fault logic is Rust.
-No Python is used.
+Local evidence: `/mnt/HDD1TB001/n1-finalize-ssd-hdd-20261112-01`. Canonical SSD
+test system copies: `/mnt/DATA_SSD/n1-finalize-ssd-hdd-20261112-01`. The other
+HDD contains only the task's private second member in addition to previous
+preserved datasets. `reports/` holds unedited phase results, resource/disk
+counters and test logs. `source/` holds frozen Bash drivers, Rust source
+snapshots and Perl aggregation; all workload/fault logic is Rust. No Python is
+used.
 
 Final runtime SHA-256:
 `e69ecd5e97030f3cc67960d7a69781d3bd68c3bf65c94012bc35db07b3f8b4b7`.
@@ -289,6 +289,7 @@ were corrected without weakening the existing assertions. An additional
 fixture was corrected to drop member descriptors before testing reopen;
 retained descriptors had correctly triggered the exclusive member lease.
 
-This qualification does not release RC.2, replace the pending MCH campaign,
-prove physical power-loss survival or requalify million-object behavior of the
-changed runtime. No commit, push or release is performed by this task.
+This qualification does not release RC.2, replace the pending the four-HDD
+reference system campaign, prove physical power-loss survival or requalify
+million-object behavior of the changed runtime. No commit, push or release is
+performed by this task.

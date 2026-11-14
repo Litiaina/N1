@@ -6,31 +6,31 @@ processes, completed an offline metadata/shard census, reopened both services
 and verified every acknowledged original version and every payload byte.
 
 This qualifies the full-stack API population and process-crash/reopen path for
-source `8dbba3201414a7b986c0cacb41c3c525b021c274` and the profile below.
-It satisfies the requested API population count of at least 500,000 objects.
-The original Console population, separate standalone-only million-object run,
-MCH minimum-hardware qualification and hardware power-loss tests retain their
-own acceptance gates. **RC.2 remains unreleased.**
+source `8dbba3201414a7b986c0cacb41c3c525b021c274` and the profile below. It
+satisfies the requested API population count of at least 500,000 objects. The
+original Console population, separate standalone-only million-object run, the
+four-HDD reference system minimum-hardware qualification and hardware power-loss
+tests retain their own acceptance gates. **RC.2 remains unreleased.**
 
 ## Machine and storage
 
-Host `litiaina`, `192.168.254.107`: Intel Core i5-12600K, 10 cores / 16 threads,
-approximately 31 GiB RAM; Debian 13, kernel `6.12.115+deb13.1-amd64`, glibc 2.41.
-The tested binaries were built on this host with Rust/Cargo **1.99.0**, using
-the repository release profile: optimization level 3, LTO, one codegen unit,
-abort on panic and stripped binaries. Build jobs were bounded to six;
-incremental compilation was disabled. No target-native flags were added.
+SSD test system: Intel Core i5-12600K, 10 cores / 16 threads, approximately 31
+GiB RAM; Debian 13, kernel `6.12.115+deb13.1-amd64`, glibc 2.41. The tested
+binaries were built on this host with Rust/Cargo **1.99.0**, using the
+repository release profile: optimization level 3, LTO, one codegen unit, abort
+on panic and stripped binaries. Build jobs were bounded to six; incremental
+compilation was disabled. No target-native flags were added.
 
 | Role | Physical partition | Mount | Filesystem |
 | --- | --- | --- | --- |
 | Source, build, binaries, temporary files, M1 database, control, ACK journals and reports | `/dev/sdb1` | `/mnt/DATA_SSD` | XFS, SSD |
-| N1 pool member 0 | `/dev/sdd1` | `/media/altear/HDD1TB001` | XFS, rotational HDD |
-| N1 pool member 1 | `/dev/sdc1` | `/media/altear/HDD1TB002` | XFS, rotational HDD |
+| N1 pool member 0 | `/dev/sdd1` | `/mnt/test-media/HDD1TB001` | XFS, rotational HDD |
+| N1 pool member 1 | `/dev/sdc1` | `/mnt/test-media/HDD1TB002` | XFS, rotational HDD |
 
 The driver checked all three filesystem types and UUIDs before each campaign.
-Their recorded UUIDs are respectively `2ce37ab6-8384-49e3-9e13-f978d8757d96`,
-`90efc5fc-d2c4-4ae2-a5b9-321c4efb2420` and
-`3d098292-42e9-42e1-a57e-bd447a52581b`. These identify the test devices;
+Their recorded UUIDs are respectively `ssd-filesystem-id`,
+`hdd-0-filesystem-id` and
+`hdd-1-filesystem-id`. These identify the test devices;
 they do not change LINK's logical member identities.
 
 The retained run root on that host is:
@@ -42,8 +42,8 @@ The retained run root on that host is:
 The million-object member roots are:
 
 ```text
-/media/altear/HDD1TB001/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member0
-/media/altear/HDD1TB002/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member1
+/mnt/test-media/HDD1TB001/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member0
+/mnt/test-media/HDD1TB002/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member1
 ```
 
 M1's database is under `datasets/million-api/metadata/control/metadata` in the
@@ -164,7 +164,7 @@ result.
 ## Evidence and reproduction
 
 All paths in this section are relative to the retained SSD run root on
-`192.168.254.107`:
+`ssd-test.example.invalid`:
 
 | Evidence | Location |
 | --- | --- |

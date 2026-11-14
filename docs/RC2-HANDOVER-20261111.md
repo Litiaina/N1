@@ -1,11 +1,11 @@
 # RC.2 qualification — November 11, 2026
 
 **RC.2 remains unreleased. Performance gate 1 is still open.** Qualification
-resumed on MCH on November 12. See the [continuation report](MCH-CONTINUATION-20261112.md)
-and [home split-node report](SPLIT-NODE-20261111.md).
+resumed on the four-HDD reference system on November 12. See the [continuation report](FOUR-HDD-CONTINUATION-20261112.md)
+and [SSD/HDD split-node report](SPLIT-NODE-20261111.md).
 No commit, push, tag or release is authorized by this qualification.
 
-The home profile has since passed 378 fresh workspace checks, both-process
+The SSD/two-HDD profile has since passed 378 fresh workspace checks, both-process
 SIGKILL/reopen/readback, each of the two members' loss, metadata snapshot/loss/
 restore and an exact fresh census preflight. Its eight-phase screen leaves
 performance acceptance open. The owned-M1 million campaign was **stopped by the
@@ -13,44 +13,48 @@ operator on November 12 for travel**. Population, full post-restart readback and
 the complete member-0-loss readback passed. Member-1-loss readback reached
 720,000 reported checks before interruption. On November 12, that unfinished
 phase resumed against the original N1 shards and byte-verified M1 checkpoint/
-ACKs on MCH, then **passed all 1,000,000 original objects / 13,968,125,000 bytes**
-with zero payload/version mismatches in **11,757.437 seconds**. Natural-expiry
-cleanup and final censuses subsequently passed at home: 192 expired attempts
-reclaimed, one million named/version/LINK references, exactly two million
-shards and no pending, staged, misplaced or unreferenced objects. The original
-ACK hashes are unchanged. The [final closure report](HOME-QUALIFICATION-20261113.md)
-separates this frozen-checkpoint result from newer-runtime qualification.
-No completed phase was repeated; no fresh population is authorized.
+ACKs on the four-HDD reference system, then **passed all 1,000,000 original
+objects / 13,968,125,000 bytes** with zero payload/version mismatches in
+**11,757.437 seconds**. Natural-expiry cleanup and final censuses subsequently
+passed on the SSD/two-HDD test systems: 192 expired attempts reclaimed, one
+million named/version/LINK references, exactly two million shards and no
+pending, staged, misplaced or unreferenced objects. The original ACK hashes are
+unchanged. The [final closure report](TWO-HDD-QUALIFICATION-20261113.md)
+separates this frozen-checkpoint result from newer-runtime qualification. No
+completed phase was repeated; no fresh population is authorized.
 
 The portable checkpoint is
-`/home/altear/DEV_TEST/n1-m1-rc2-preserved-20261112.PLPlQD`.
-Its `README.md` explains completed results, source/binary provenance, the
-verified compressed M1 database, original ACKs and how to continue on MCH.
-Original N1 shards remain on the HDDs; they are not duplicated onto the NVMe.
-HDD1TB002 was unmounted at stop; both original HDDs are now mounted. Member 1
-has been restored after its successful loss readback. No dataset was
-wiped. Extra campaigns mistakenly started on November 12 are stopped; their
-partial evidence is preserved separately from this original continuation.
+`/srv/test-evidence/portable/n1-m1-rc2-preserved-20261112.PLPlQD`. Its
+`README.md` explains completed results, source/binary provenance, the verified
+compressed M1 database, original ACKs and how to continue on the four-HDD
+reference system. Original N1 shards remain on the HDDs; they are not duplicated
+onto the NVMe. HDD1TB002 was unmounted at stop; both original HDDs are now
+mounted. Member 1 has been restored after its successful loss readback. No
+dataset was wiped. Extra campaigns mistakenly started on November 12 are
+stopped; their partial evidence is preserved separately from this original
+continuation.
 
-## Resumed on MCH
+## Resumed on the four-HDD reference system
 
-Testing resumed on November 11 on `administrator@192.168.0.12`. The private run
-root is `/mnt/DISK0/n1-rc2-mch-20261111-01`; the corresponding private directories
-on DISK1–3 hold test members. Existing deployed N1 services are not test targets.
-Builds and datasets remain on these HDDs, outside the system NVMe.
+Testing resumed on November 11 on the four-HDD reference system. The private run
+root is `/mnt/DISK0/n1-rc2-four-hdd-20261111-01`; the corresponding private
+directories on DISK1–3 hold test members. Existing deployed N1 services are not
+test targets. Builds and datasets remain on these HDDs, outside the system NVMe.
 
 The rejected cache prototype is now **archived, not in the runtime working
 tree**. The storage implementation and its architecture descriptions were
 restored to committed `29bca4b`; its complete experimental patch/source remain
-in the portable files below. The shared-key candidate is isolated on MCH.
+in the portable files below. The shared-key candidate is isolated on the
+four-HDD reference system.
 
 All three M1 binaries, the fixed N1 binary and common release-profile Rust
-client were built on MCH using Rust 1.92. The shared-key candidate passes 19
-storage tests with zero failures and one parent-invoked child-fixture exclusion.
-All 24 comparison phases completed: four repetitions of three variants at 100
-and 1,000 small objects, with a verified 256 MiB multipart object in every run.
-This compares M1 implementations over the same N1 LINK binary, not NCX versus
-LINK. Mean sums of individual request latencies and whole-workload M1 CPU are:
+client were built on the four-HDD reference system using Rust 1.92. The
+shared-key candidate passes 19 storage tests with zero failures and one
+parent-invoked child-fixture exclusion. All 24 comparison phases completed: four
+repetitions of three variants at 100 and 1,000 small objects, with a verified
+256 MiB multipart object in every run. This compares M1 implementations over the
+same N1 LINK binary, not NCX versus LINK. Mean sums of individual request
+latencies and whole-workload M1 CPU are:
 
 | Objects/run | M1 | Small PUT sum | Rename sum | Trash sum | M1 CPU | Peak M1 RSS |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -118,7 +122,7 @@ a held download, complete cleanup and capacity refusal preserving the source.
 All **378 default workspace tests pass**, zero failed, with 56 explicit opt-in
 or helper cases excluded. Strict workspace-wide all-target Clippy now passes:
 the three inherited proof-tool findings were corrected without changing wire
-behavior. Its nine argument/configuration tests pass separately. MCH has also
+behavior. Its nine argument/configuration tests pass separately. the four-HDD reference system has also
 passed the 12 maintenance and five export unit cases from overlay 04 and all
 **20 service checks**, including the three new lifecycle cases. Matched
 candidate-versus-native measurements are running. Overlay 05 adds the
@@ -128,12 +132,12 @@ sharing the source filesystem; corrected DISK1/DISK3 placement then passed in
 11.01 s (`physical-backup-recovery08.log`). This was a fixture placement error.
 
 The new per-artifact failure regression reproduces cleanup starvation against
-the prior candidate and passes with error isolation. Failed artifacts keep
-their reservation and expiry index while later jobs are reclaimed; retry after
-restart releases the remaining charge once filesystem access is restored.
-The latest candidate completed **21 service cases, zero failed**, before the
-operator left the MCH network. `BLOCKERS08-SERVICE-COMPLETED` was recorded at
-`2026-11-11T07:58:33Z`.
+the prior candidate and passes with error isolation. Failed artifacts keep their
+reservation and expiry index while later jobs are reclaimed; retry after restart
+releases the remaining charge once filesystem access is restored. The latest
+candidate completed **21 service cases, zero failed**, before the operator left
+the four-HDD reference system network. `BLOCKERS08-SERVICE-COMPLETED` was
+recorded at `2026-11-11T07:58:33Z`.
 
 The completed fresh-fixture follow-up of candidate 04 fails latency acceptance: at 1,000
 objects, the candidate averages **128.736 s** for uploads versus **112.810 s**
@@ -162,10 +166,10 @@ zero staging, unreferenced shards or pending publications. Following it, native
 storage regression passed **19 tests, zero failed**, with one explicitly
 parent-invoked child helper excluded; documentation tests had no runnable cases.
 `BLOCKERS08-COMPLETED` and `STORAGE09-COMPLETED` record actual completion at
-`2026-11-11T08:01:31Z` and `2026-11-11T08:06:23Z`. The home profile has separate
-datasets, binary hashes and results.
+`2026-11-11T08:01:31Z` and `2026-11-11T08:06:23Z`. The SSD/two-HDD profile has
+separate datasets, binary hashes and results.
 
-The current headless controller is `evidence/n1-mch-blockers08.sh` (PID 3393645
+The current headless controller is `evidence/n1-four-hdd-blockers08.sh` (PID 3393645
 at launch). Read `reports/BLOCKERS08-STATUS`, `BLOCKERS08-FAILED`,
 `BLOCKERS08-SERVICE-COMPLETED` and `BLOCKERS08-COMPLETED`. It runs service checks,
 controlled performance and a 4,096-object named preflight. The following
@@ -201,17 +205,17 @@ Committed baseline: `29bca4b8e120bded2223c1ed911b97a9e451fe23`. Native database
 source remains unchanged; the accepted/rejected distinction above concerns
 M1's export service and isolated performance experiments, not LINK placement.
 
-The rejected record-cache and shared-tree-key source, original handover,
-compact raw reports and reproduction scripts remain in
-`.git/rc2-work-20261111/`, with `SHA256SUMS`. The portable evidence archive's
-SHA-256 is `4bee72752f2dcf6c43820b963aaac04b9e36e3a9523d6bd764a75a62d5e64976`.
-Original main-PC data remain at
+The rejected record-cache and shared-tree-key source, original handover, compact
+raw reports and reproduction scripts remain in `.git/rc2-work-20261111/`, with
+`SHA256SUMS`. The portable evidence archive's SHA-256 is
+`4bee72752f2dcf6c43820b963aaac04b9e36e3a9523d6bd764a75a62d5e64976`. Original SSD
+test system data remain at
 `/mnt/DATA_SSD/m1-owned-storage-20261110-01/optimization12`; their earlier SSD
-regressions are not replaced by the MCH results. See
+regressions are not replaced by the four-HDD reference system results. See
 [M1-STORAGE-20261110.md](M1-STORAGE-20261110.md) for that historical campaign.
 
-New MCH source overlays, exact frozen executables, orchestration and raw logs
-remain under `evidence/`, `artifacts/` and `reports/` in the run root. Local
-workspace/lint results and positive/negative regressions are preserved in
-`evidence/local-checks08.tar.gz`. Workload and fault logic is Rust. No Python,
-commit, push, tag or release is performed.
+New the four-HDD reference system source overlays, exact frozen executables,
+orchestration and raw logs remain under `evidence/`, `artifacts/` and `reports/`
+in the run root. Local workspace/lint results and positive/negative regressions
+are preserved in `evidence/local-checks08.tar.gz`. Workload and fault logic is
+Rust. No Python, commit, push, tag or release is performed.

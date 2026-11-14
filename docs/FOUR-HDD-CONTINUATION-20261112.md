@@ -1,26 +1,27 @@
-# MCH qualification continuation — November 12, 2026
+# Four-HDD qualification continuation — November 12, 2026
 
 **Original campaign continuation only; RC.2 remains unreleased.** Completed
 population, post-restart readback and both full member-loss readbacks now pass
 within their recorded scope. The remaining natural-expiry cleanup and final
-censuses **completed on November 12 at home**, using the original binaries and
-byte-matched database. See [final closure and current-candidate checks](HOME-QUALIFICATION-20261113.md).
+censuses **completed on November 12 on the SSD/two-HDD test systems**, using the original binaries and
+byte-matched database. See [final closure and current-candidate checks](TWO-HDD-QUALIFICATION-20261113.md).
 No fresh population, commit, push, tag or
 release is authorized by this continuation.
 
 ## Placement and preservation
 
-The new private MCH root is `/mnt/DISK0/n1-rc2-continuation-20261112-01`.
+The new private four-HDD test root is `/mnt/DISK0/n1-rc2-continuation-20261112-01`.
 Source, compiled helpers, imported evidence and a recovered copy of the stopped
 M1 database are on its SATA XFS HDD. Rust 1.92 builds use the previous campaign's
 task-local Cargo cache, target and vendored dependencies. Installed services,
 global toolchains and existing campaigns are untouched.
 
 The portable checkpoint remains unchanged at
-`/home/altear/DEV_TEST/n1-m1-rc2-preserved-20261112.PLPlQD`. MCH received its frozen
-source, original ACK journals, endpoint identity, reports and compressed M1
-database. All four database files match the original stopped-file SHA-256
-manifest before opening. The original compressed import remains intact.
+`/srv/test-evidence/portable/n1-m1-rc2-preserved-20261112.PLPlQD`. the four-HDD
+reference system received its frozen source, original ACK journals, endpoint
+identity, reports and compressed M1 database. All four database files match the
+original stopped-file SHA-256 manifest before opening. The original compressed
+import remains intact.
 
 Both original USB XFS HDDs were mounted by the operator on the workstation.
 Their UUIDs were verified against the preserved checkpoint. N1 served the
@@ -29,9 +30,9 @@ the original directory is now restored. No data, marker or
 LINK identity was regenerated. New local evidence lives at
 `/mnt/HDD1TB001/n1-rc2-continuation-20261112-01`.
 
-## Retrieved completed MCH results
+## Retrieved completed the four-HDD reference system results
 
-The previous run, `/mnt/DISK0/n1-rc2-mch-20261111-01`, completed before the
+The previous run, `/mnt/DISK0/n1-rc2-four-hdd-20261111-01`, completed before the
 operator left its network. Its final markers and raw reports now confirm:
 
 - 21 selected real-service checks passed, including four export lifecycle and
@@ -56,7 +57,7 @@ Detailed measurements and frozen executable hashes remain in the
 The recovered M1 copy passes the explicit full database integrity check:
 **7,001,423 records**, with 4,673,335,380 reported disk bytes. This checks the
 native database structure and records; it is separate from object readback.
-Evidence is `reports/home-million-integrity.json` and its GNU-time report.
+Evidence is `reports/ssd-hdd-million-integrity.json` and its GNU-time report.
 
 The first strict metadata census rejected unfinished publication intents after
 finding the original million acknowledged versions. The original failure log
@@ -79,7 +80,7 @@ stopped before the final-stage controller waited for actual TTL expiry.
 
 `original-member-1-only/PASSED.json` has SHA-256
 `aef7111641de2e1527bbb994e2e93e3d11a8b66e4a78c67d86aeca4a3f3661c5`;
-the preserved local copy matches MCH. This is completion of the interrupted
+the preserved local copy matches the four-HDD reference system. This is completion of the interrupted
 phase against original data, not a new population or a matched performance
 comparison. Final cleanup began after **21:52:32 Asia/Manila**
 (three minutes after the latest recorded intent expiry), without changing TTLs
@@ -91,45 +92,48 @@ and zero pending publications**; the offline integrity check verified
 zero staging, zero unreferenced shards and zero wrong placements. Original ACK
 hashes remained unchanged. All final controllers exited 0.
 
-The interrupted second member-loss readback ran again from zero against
-all original ACKs. A read-only Rust helper reuses the existing payload/version
+The interrupted second member-loss readback ran again from zero against all
+original ACKs. A read-only Rust helper reuses the existing payload/version
 oracle while allowing a recorded API-address change. It checks the original
 endpoint digest against the frozen campaign, refuses changes to identity or
 credentials, hashes ACK journals before/after, never provisions a fragment and
 never uploads an object. It records the rebuilt verifier separately instead of
 editing the frozen campaign's executable binding. Its provenance regression
-passes on MCH, as does strict release-profile Clippy. This verifies the same
-original million identities. The earlier 720,000 counter has no per-index
-checkpoint, so the interrupted phase started its readback at zero. No completed
-readback phase is repeated.
+passes on the four-HDD reference system, as does strict release-profile Clippy.
+This verifies the same original million identities. The earlier 720,000 counter
+has no per-index checkpoint, so the interrupted phase started its readback at
+zero. No completed readback phase is repeated.
 
 N1 uses its exact original executable and the original two HDDs on the
-workstation. M1 uses the byte-verified preserved database on MCH with the
-same-source MCH executable: the original home executable requires newer glibc.
-The changed host, compiler, binary hash and API address are recorded separately.
-N1 listens at `192.168.0.40`; M1 verifies its leaf against the original CA.
-Original credentials, ACKs, versions and LINK identity remain unchanged.
+workstation. M1 uses the byte-verified preserved database on the four-HDD
+reference system with the same-source reference executable: the original SSD/HDD
+executable requires newer glibc. The changed host, compiler, binary hash and API
+address are recorded separately. N1 listens at `object-test.example.invalid`; M1
+verifies its leaf against the original CA. Original credentials, ACKs, versions
+and LINK identity remain unchanged.
 
 Current evidence is `reports/ORIGINAL-ONLY-STATUS`,
 `original-member-1-only.log`, `original-member-1-only.time` and
-`original-member-1-only/{prepared,PASSED,FAILED}.json` on MCH. A pass requires the
-full count, bytes and version checks, plus unchanged ACK hashes. The first
-local launcher requested a descriptor limit above the host's hard limit; no
-verifier ran in that attempt. Its log and the remote startup timeout are
-preserved. The corrected launcher respects the existing hard limit.
+`original-member-1-only/{prepared,PASSED,FAILED}.json` on the four-HDD reference
+system. A pass requires the full count, bytes and version checks, plus unchanged
+ACK hashes. The first local launcher requested a descriptor limit above the
+host's hard limit; no verifier ran in that attempt. Its log and the remote
+startup timeout are preserved. The corrected launcher respects the existing hard
+limit.
 
 The detached local `evidence/finish-original-only.sh` preserved the verifier's
-reports and returned the original member directory. The final home controllers
-were frozen as `source/finish-original-home02.sh` and
-`source/finish-original-metadata-home02.sh` under
-`/mnt/HDD1TB001/n1-rc2-home-qualification-20261112-02`. They reused the original
-stopped main-PC database after verifying all four files against the portable
-checkpoint, and the exact original N1/M1 executables. MCH was not contacted for
-these final stages. Their reports retain the previous stopped launchers too;
-`ORIGINAL-FINAL02-EXIT=0` and `ORIGINAL-CAMPAIGN-COMPLETED` identify terminal
-success. No payload readback or population was repeated for census closure.
-This completes the original campaign at its frozen checkpoint, not a million
-qualification of the subsequently changed finalization runtime or an RC.2 release.
+reports and returned the original member directory. The final SSD/HDD
+controllers were frozen as `source/finish-original-ssd-hdd02.sh` and
+`source/finish-original-metadata-ssd-hdd02.sh` under
+`/mnt/HDD1TB001/n1-rc2-ssd-hdd-qualification-20261112-02`. They reused the
+original stopped SSD test system database after verifying all four files against
+the portable checkpoint, and the exact original N1/M1 executables. the four-HDD
+reference system was not contacted for these final stages. Their reports retain
+the previous stopped launchers too; `ORIGINAL-FINAL02-EXIT=0` and
+`ORIGINAL-CAMPAIGN-COMPLETED` identify terminal success. No payload readback or
+population was repeated for census closure. This completes the original campaign
+at its frozen checkpoint, not a million qualification of the subsequently
+changed finalization runtime or an RC.2 release.
 
 ## Extra campaigns stopped after scope correction
 
@@ -155,22 +159,23 @@ including refusal to overwrite damaged acknowledged data and byte-exact journal
 preservation. No engine code changed to obtain these results.
 
 The current Console source and dependencies were frozen from commit
-`89fd5b9e7f41cab7df418e39048ee6b43506835c`, including its existing working changes,
-and freshly built on MCH. No Console implementation was edited. Node 22.23.3
-and the already available Chromium 149.0.7827.55 runtime are task-scoped;
-no system package or deployed service changed. The real production Console
-preflight passed **128 ACKs**, both-service SIGKILL/reopen, all original payloads
-and versions, and exact census: **256 shards**, zero staging, unreferenced
-shards or pending publication. It used 1,787,920 logical bytes and one real
-batch request; its browser report has zero failed/unknown/scanner results and
-zero retained upload items on completion. This is a preflight, not a million
-pass or a physical million-entry directory traversal.
+`89fd5b9e7f41cab7df418e39048ee6b43506835c`, including its existing working
+changes, and freshly built on the four-HDD reference system. No Console
+implementation was edited. Node 22.23.3 and the already available Chromium
+149.0.7827.55 runtime are task-scoped; no system package or deployed service
+changed. The real production Console preflight passed **128 ACKs**, both-service
+SIGKILL/reopen, all original payloads and versions, and exact census: **256
+shards**, zero staging, unreferenced shards or pending publication. It used
+1,787,920 logical bytes and one real batch request; its browser report has zero
+failed/unknown/scanner results and zero retained upload items on completion.
+This is a preflight, not a million pass or a physical million-entry directory
+traversal.
 
 | Extra stage | Preserved state after operator correction |
 | --- | --- |
 | Standalone N1 | Stopped around 120,320 ACKs. Partial population and journals retained; not a million pass. |
 | Bulk original-shard copy | Stopped with partial archives. No complete-transfer claim. Original local HDDs remain the continuation target. |
-| Fresh MCH M1 → N1 | Queued controller stopped; do not start a replacement population. |
+| Fresh the four-HDD reference system M1 → N1 | Queued controller stopped; do not start a replacement population. |
 | Original Console → M1 → N1 | 128-object preflight passed. Queued million campaign stopped. |
 | Additional post-GC million readback | Queued controller stopped. Do not repeat completed readbacks. |
 

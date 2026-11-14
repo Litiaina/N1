@@ -1,4 +1,4 @@
-# Historical NCX/NDX MCH scale qualification
+# Historical NCX/NDX the four-HDD reference system scale qualification
 
 This record predates the N1 LINK object store and M1 metadata store separation.
 Its frozen binaries, Python harness results and namespace workloads belong to
@@ -13,21 +13,23 @@ complete historical-version hash checkpoint covered 500,000 objects. Preserve
 the original members, ledger and failed reports; do not start a new engine on
 those original roots. See [TESTING.md](../TESTING.md) for timings and limitations.
 
-Frozen candidate `6ec60476` retains the format, durability barriers and admission
-deadline. It shares pending flush rounds, corrects CPU/I/O-wait pressure
-accounting and bounds GC work between foreground service windows. Both full
-444-test MCH library runs and required-native checks passed; 150 Python harness
-regressions passed. A first supervisor stopped at its shared 512-task ceiling
-when the 512-client stress test tried to create threads. Preserve that failure.
-The fresh supervisor uses 2,048 tasks, retaining 4 GiB/no swap and unchanged
-engine concurrency/deadlines. Its full fault/correctness gates passed. The
-matched fresh ABBA comparison measured **317.77 → 372.94 objects/s (17.36%)**,
-with all acknowledged hashes checked before/after SIGKILL in all four trials.
+Frozen candidate `6ec60476` retains the format, durability barriers and
+admission deadline. It shares pending flush rounds, corrects CPU/I/O-wait
+pressure accounting and bounds GC work between foreground service windows. Both
+full 444-test the four-HDD reference system library runs and required-native
+checks passed; 150 Python harness regressions passed. A first supervisor stopped
+at its shared 512-task ceiling when the 512-client stress test tried to create
+threads. Preserve that failure. The fresh supervisor uses 2,048 tasks, retaining
+4 GiB/no swap and unchanged engine concurrency/deadlines. Its full
+fault/correctness gates passed. The matched fresh ABBA comparison measured
+**317.77 → 372.94 objects/s (17.36%)**, with all acknowledged hashes checked
+before/after SIGKILL in all four trials.
 
 The optional aged-population comparison was operator-stopped during its first
 member copy, before reconciliation or comparison completed. Preserve that
-partial fixture and the original failed population. Do not resume copying as
-a prerequisite to scale. Existing results are read directly on MCH.
+partial fixture and the original failed population. Do not resume copying as a
+prerequisite to scale. Existing results are read directly on the four-HDD
+reference system.
 
 A fresh million-object supervisor uses the same frozen candidate and validates
 the existing twelve PASS phases and ABBA evidence by pinned hashes. It starts
@@ -57,19 +59,19 @@ million-object stages never started.
 
 The assertion now checks its own canonical keys while an unrelated key remains
 held. This test-only correction leaves the engine binary unchanged. The fresh
-frozen test executable started headlessly on MCH at **17:47 Manila**; all 426
-library tests passed together in 257.603 seconds. Backend selection passed
-four cases with two opt-in cases ignored, and the separately required native
-io_uring integration passed. The full-64-object strict-batch gate passed all six
-error/kill rounds across four filesystems, with 106 successful ACKs and 960
-historical hash checks; no injected-fault operation falsely succeeded.
-Scheduled GC, RC concurrency stress, native-protocol and read-repair gates
-passed. The matched comparison passed, but the later scale stage stopped at
-the 713,184-object admission failure described above. No scale pass is claimed.
-Production service PIDs were unchanged at launch.
-The final warning-denied build, focused executor/backup tests, explicit native
-integration and 109 harness/shim regressions passed locally. Production N1,
-Accel and Console remain running unchanged.
+frozen test executable started headlessly on the four-HDD reference system at
+**17:47 Manila**; all 426 library tests passed together in 257.603 seconds.
+Backend selection passed four cases with two opt-in cases ignored, and the
+separately required native io_uring integration passed. The full-64-object
+strict-batch gate passed all six error/kill rounds across four filesystems, with
+106 successful ACKs and 960 historical hash checks; no injected-fault operation
+falsely succeeded. Scheduled GC, RC concurrency stress, native-protocol and
+read-repair gates passed. The matched comparison passed, but the later scale
+stage stopped at the 713,184-object admission failure described above. No scale
+pass is claimed. Production service PIDs were unchanged at launch. The final
+warning-denied build, focused executor/backup tests, explicit native integration
+and 109 harness/shim regressions passed locally. Production N1, Accel and
+Console remain running unchanged.
 
 The sequence requires, in order: final candidate tests, actual
 strict-group execution, full 64-object synchronization-error/kill gates on all
@@ -86,14 +88,14 @@ incomplete qualifications. Production services must not be restarted or replaced
 
 ## Preserved native-I/O baseline
 
-Launched October 24, 2026 on MCH after physical-device and capacity preflight.
-Four independent SATA HDDs, XFS, EC 3+1; fresh test directories only. Scheduled
-GC, concurrency stress, native protocol and read-repair gates passed. The
-sequence was then operator-stopped and preserved at **10,000 acknowledged
-objects** to isolate a requested 5 GB throughput benchmark. The million-object
-qualification is **incomplete**, not passed or still running. Existing
-production service PIDs were unchanged. No formatting, reboot or production
-deployment was performed. Do not use the older two-member
+Launched October 24, 2026 on the four-HDD reference system after physical-device
+and capacity preflight. Four independent SATA HDDs, XFS, EC 3+1; fresh test
+directories only. Scheduled GC, concurrency stress, native protocol and
+read-repair gates passed. The sequence was then operator-stopped and preserved
+at **10,000 acknowledged objects** to isolate a requested 5 GB throughput
+benchmark. The million-object qualification is **incomplete**, not passed or
+still running. Existing production service PIDs were unchanged. No formatting,
+reboot or production deployment was performed. Do not use the older two-member
 `n1-hdd-qualify.py` wrapper.
 
 A **fresh headless relaunch** subsequently started on October 24, using new
@@ -125,7 +127,7 @@ When the operator is at work:
 1. Require the complete local candidate validation to pass. Freeze the engine,
    proof tool, Python helpers, default configuration and their SHA-256 hashes.
    A changed or server-rebuilt binary requires its own correctness gates.
-2. Inventory MCH's kernel, CPU/RAM, filesystem versions and mounts. Record
+2. Inventory the four-HDD reference system's kernel, CPU/RAM, filesystem versions and mounts. Record
    UUID, serial, capacity and transport for **four independent physical
    devices**. Four partitions or logical volumes on one drive do not qualify.
    Confirm kernel/process permissions allow required io_uring.
@@ -146,7 +148,7 @@ When the operator is at work:
 5. Confirm unused test ports, descriptor limits and a headless supervisor with
    a fixed time/resource budget and no automatic restarts. Only test-owned
    processes and fixture files may be interrupted or damaged. Do not unplug
-   devices, unmount shared filesystems or power-cycle MCH.
+   devices, unmount shared filesystems or power-cycle the four-HDD reference system.
 
 Read-only inventory commands, after selecting the four actual mount paths:
 
@@ -157,9 +159,9 @@ df -hT -- "$M0" "$M1" "$M2" "$M3"
 df -i -- "$M0" "$M1" "$M2" "$M3"
 ```
 
-Mount/UUID/physical-device mapping must be checked on MCH, not inferred from
-the laptop. Recheck it during the run. Stop rather than fall back to the OS
-filesystem if a member disappears.
+Mount/UUID/physical-device mapping must be checked on the four-HDD reference
+system, not inferred from the two-HDD test system. Recheck it during the run.
+Stop rather than fall back to the OS filesystem if a member disappears.
 
 ## Sequence
 

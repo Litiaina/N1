@@ -397,9 +397,10 @@ SSL_CERT_FILE=/etc/litiaina/accel-ca.pem ./litiaina-m1 serve --config /etc/litia
 
 This setting belongs in the service environment; putting `SSL_CERT_FILE` only
 inside `m1.env` does not export it to the TLS library. Keep certificate and
-hostname verification enabled. The [MCH TLS witness](docs/MCH-OPTIMIZATION-20261113.md)
-checks trusted/untrusted CAs, wrong hostnames, concurrent pinned reads and actual
-Accel restart without changing the global trust store.
+hostname verification enabled. The [Four-HDD reference system TLS
+witness](docs/FOUR-HDD-OPTIMIZATION-20261113.md) checks trusted/untrusted CAs,
+wrong hostnames, concurrent pinned reads and actual Accel restart without
+changing the global trust store.
 
 Direct `/noa/v1/objects/archive` accepts selected keys/entries in JSON. Prefixes,
 `export_all` or more than 1,000 explicit entries choose TAR. JSON selection bodies

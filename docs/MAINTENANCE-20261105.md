@@ -63,7 +63,7 @@ cases. Browser viewport repetitions are not new distinct test functions.
 ## Physical and browser fault coverage
 
 Both actual HDDs hold private new test roots. PROJECT uses XFS on rotational
-ST1000LM049, serial `ZGS2GMQM`; TEST uses ext4 on ST1000LM049, serial `ZGS2GHFF`.
+ST1000LM049, serial `hdd-0-device-id`; TEST uses ext4 on ST1000LM049, serial `hdd-1-device-id`.
 Control/database and one member share PROJECT; the other member uses TEST.
 Device letters may change across reboot. The source NVMe holds no campaign
 population, reports or build target. Workloads and payload oracles are Rust;
