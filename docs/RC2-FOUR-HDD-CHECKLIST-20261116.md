@@ -41,6 +41,11 @@ are in [the completion checklist](RC2-IMPLEMENTATION.md).
 
 ## 2. Freeze the candidate and validate the recorder
 
+Complete system `1.0.0-RC.2` selects N1 `1.0.0-RC.2` and M1 `1.0.0-RC.1`;
+verify their independent versions against [the system manifest](../deploy/system-release.json)
+and [release policy](VERSIONING.md). Historical binary hashes are not relabelled
+when package versions change.
+
 The starting runtime source is `f114c30`. The latest selected artifacts are
 documented in [the M1 commit I/O report](M1-COMMIT-IO-20261114.md).
 Documentation edits do not change their identities. Verify the binaries actually

@@ -16,7 +16,7 @@
 </div>
 
 <p align="center">
-  <strong>Development target: N1 + M1 1.0.0-RC.2 — unreleased</strong>
+  <strong>System 1.0.0-RC.2 — N1 1.0.0-RC.2 + M1 1.0.0-RC.1 — unreleased</strong>
 </p>
 
 ## Overview
@@ -77,6 +77,11 @@ supplied through a selected secrets file or its service environment.
 Follow the operator guide to enroll empty member roots, configure the two
 services and connect Console to metadata.
 
+N1 and M1 have independent package versions. The complete system release
+records their selected combination in [the system manifest](deploy/system-release.json).
+See [versioning and release policy](docs/VERSIONING.md) for component tags,
+artifact identities and compatibility rules.
+
 ## Documentation
 
 | Read | Purpose |
@@ -88,6 +93,7 @@ services and connect Console to metadata.
 | [N1 API reference](docs/api/N1.md) | Native LINK requests, responses, executable Rust walkthrough and secondary HTTP examples |
 | [Testing](TESTING.md) | Reproduce tests and distinguish qualified results from running campaigns |
 | [Changelog](CHANGELOG.md) | Product changes; older engine history is explicitly separated |
+| [Versioning](docs/VERSIONING.md) | Independent N1/M1 versions and the qualified system release |
 
 Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
 [metadata internals](docs/M1.md) and

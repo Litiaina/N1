@@ -5,6 +5,12 @@ qualification gaps. It does not redefine the API, prescribe deployment or serve
 as a chronological work log. This repository contains the N1 LINK object store and the
 M1 metadata store with its own specialized database; see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
+System RC.2 targets N1 `1.0.0-RC.2` and M1 `1.0.0-RC.1`. The independent
+component versions and selected pairing are defined by
+[the release policy](VERSIONING.md) and
+[system manifest](../deploy/system-release.json). A version declaration does
+not close a qualification gate or create a release.
+
 **Recommended qualification schedule — November 13:** target November 27 for
 RC.2, with a November 25 go/no-go review (Asia/Manila). The
 [release plan](RC2-RELEASE-PLAN.md) orders the remaining work and evidence.

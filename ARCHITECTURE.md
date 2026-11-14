@@ -47,6 +47,12 @@ object Cargo package is still `n1`; existing executable names and the original
 startup banner are preserved. Versions come from Cargo, not release labels in
 keys or upload directories.
 
+N1 and M1 declare independent package versions. The current targets are
+N1 `1.0.0-RC.2` and M1 `1.0.0-RC.1`; complete system `1.0.0-RC.2` selects that
+pair through [the system manifest](deploy/system-release.json). These release
+versions are separate from NOA, LINK and database-format versions. See
+[the versioning policy](docs/VERSIONING.md).
+
 ## Repository structure and naming
 
 Directory names describe responsibilities; Cargo packages and binaries identify

@@ -1,6 +1,6 @@
 [package]
 name = "cli_core"
-version.workspace = true
+version = "1.0.0-RC.2"
 edition = "2024"
 description = "Shared operator configuration, monitoring and CLI utilities for N1 and M1"
 

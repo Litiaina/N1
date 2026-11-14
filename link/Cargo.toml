@@ -1,6 +1,6 @@
 [package]
 name = "n1_link"
-version.workspace = true
+version = "1.0.0-RC.2"
 edition = "2024"
 description = "LINK (Litiaina Immutable Native Key): N1 identity, placement and immutable shard format"
 

@@ -10,6 +10,11 @@ RC.2 is in development. Server settings use INI; secrets come from a private
 file or the service environment. No migration from earlier development configurations
 or storage formats is required or promised.
 
+The complete system target is `1.0.0-RC.2`, comprising N1 `1.0.0-RC.2` and
+M1 `1.0.0-RC.1`. Each server's `--version`, banner and API version fields report
+its own package version. Check [the system manifest](deploy/system-release.json)
+and [versioning policy](docs/VERSIONING.md) when selecting a supported pair.
+
 For a named N1 deployment, the connection path is:
 
 `Console / named client → M1 → native N1 (LINK) → shards`

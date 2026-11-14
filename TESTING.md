@@ -21,6 +21,39 @@ change earlier test outcomes or close the
 RC.2 release gates. Historical mentions of a held `main` describe the policy at
 the time of those campaigns.
 
+## Component and system version checks
+
+The current targets are complete system `1.0.0-RC.2`, N1 `1.0.0-RC.2` and
+M1 `1.0.0-RC.1`. [The versioning policy](docs/VERSIONING.md) distinguishes their
+release histories from protocol and disk-format identifiers.
+
+The release-manifest regression resolves Cargo metadata and verifies the
+selected component versions, tag names and executable targets. The N1 CLI
+checks verify its server/backup versions and storage/protocol output without
+creating storage. M1's CLI checks verify its own version without initialization
+and exercise explicit database init/check behavior. Run them with test/build
+output on the selected test media:
+
+```sh
+cargo test --release --offline --locked -p cli_core --test release_manifest
+cargo test --release --offline --locked -p n1 --test release_version
+cargo test --release --offline --locked -p m1 --test cli
+```
+
+The November 15 formalization passes all five version/CLI checks and the
+existing two-HDD `public_noa_metadata_object_restart_and_native_contract`
+case. That case verifies M1's API version while running M1 RC.1 against the
+frozen N1 RC.2 binary, including its existing upload/read/restart coverage.
+Strict Clippy for the affected test targets and formatting pass. This is scoped
+version/interoperability coverage, not a rerun of every qualification campaign.
+
+These checks validate version/release metadata and CLI behavior; they do not
+substitute for the system's data-integrity, power-loss or performance gates.
+Historical reports retain the version strings and hashes their binaries
+actually used. Version formalization does not relabel those artifacts.
+
+## Recent qualification reports
+
 The [November 14 multipart geometry report](docs/M1-PART-GEOMETRY-20261114.md)
 records optional M1 negotiation, cross-client pending-session reuse, matched
 measurements with N1 frozen, Console checks and a separately reproduced native

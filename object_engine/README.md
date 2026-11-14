@@ -4,6 +4,10 @@ N1 is the standalone object store built on **LINK — Litiaina Immutable Native
 Key**, the key algorithm and storage architecture. Cargo package/crate `n1`
 builds `litiaina-n1` and `litiaina-n1-backup`.
 
+N1's package version is `1.0.0-RC.2`, independent of M1 `1.0.0-RC.1`.
+Complete system `1.0.0-RC.2` selects that pair; see
+[the versioning policy](../docs/VERSIONING.md). These targets remain unreleased.
+
 N1 owns immutable pools, shard I/O, upload/finalize, reads, integrity, repair,
 physical purge and object recovery. **M1**, in [`metadata_engine/`](../metadata_engine),
 owns names, logical versions, permissions and named-object lifecycle, using

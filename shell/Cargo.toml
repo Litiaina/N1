@@ -1,6 +1,6 @@
 [package]
 name = "n1_shell"
-version.workspace = true
+version = "1.0.0-RC.2"
 edition = "2024"
 description = "Litiaina N1 native CLI and object-backup operator host"
 

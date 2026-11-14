@@ -393,6 +393,7 @@ async fn public_noa_metadata_object_restart_and_native_contract() {
     )
     .await;
     assert_eq!(ping["engine"], "m1");
+    assert_eq!(ping["version"], env!("CARGO_PKG_VERSION"));
     let created=json_response(client.post(format!("{base}/fragments")).json(&json!({"name":"NOA witness","secret":"test-only-master","key":"test-only-fragment"})).send().await.unwrap(),201).await;
     let fragment = created["fragment_hash"].as_str().unwrap();
     let logged = json_response(

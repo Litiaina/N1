@@ -5,6 +5,11 @@ review**, in Asia/Manila time. These are planning targets, not authorization to
 release or permission to waive a failed acceptance condition. Move the release
 date if a required gate remains open.
 
+The intended combination is **N1 `1.0.0-RC.2` + M1 `1.0.0-RC.1`**, recorded in
+[`deploy/system-release.json`](../deploy/system-release.json), for complete
+system **`1.0.0-RC.2`**. Each component has its own release history and tags;
+follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
+
 **Operator schedule — November 15:** four-HDD recovery qualification and
 controlled physical power-loss testing are scheduled for **Monday, November 16, 2026**, Asia/Manila.
 The start time and power-cut window will be established on site. Prepare with

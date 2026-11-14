@@ -41,3 +41,8 @@ and asynchronous control-flow macros on readable lines; `rustfmt` does not
 expand every macro body. Preserve operator controls and established module
 responsibilities. A naming change must update Cargo targets, imports, tools,
 tests and operator documentation together.
+
+Follow [the versioning policy](docs/VERSIONING.md): packages own their versions;
+the system release records its selected component combination. Update
+`deploy/system-release.json` when changing that intended combination. Keep
+binary versions separate from API, key and database-format identifiers.

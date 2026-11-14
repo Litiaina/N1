@@ -1,6 +1,6 @@
 [package]
 name = "n1-release-proof"
-version.workspace = true
+version = "1.0.0-RC.2"
 edition = "2024"
 
 [[bin]]

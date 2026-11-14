@@ -1,6 +1,6 @@
 [package]
 name = "n1"
-version.workspace = true
+version = "1.0.0-RC.2"
 edition = "2024"
 description = "Litiaina N1 standalone object store built on the LINK architecture"
 

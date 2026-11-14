@@ -1,6 +1,6 @@
 [package]
 name = "m1_storage"
-version.workspace = true
+version = "1.0.0-RC.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "M1's specialized transactional metadata storage engine"

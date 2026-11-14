@@ -4,11 +4,16 @@ This file records product changes. Architecture is defined in
 [ARCHITECTURE.md](ARCHITECTURE.md); commands are in
 [DOCUMENTATION.md](DOCUMENTATION.md); test results are in [TESTING.md](TESTING.md).
 
-## Unreleased — 1.0.0-RC.2
+## Unreleased — system 1.0.0-RC.2
 
 RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It has not
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
+
+- Give N1 and M1 independent package and release identities: N1 targets
+  `1.0.0-RC.2`, M1 targets its first candidate `1.0.0-RC.1`, and the complete
+  system remains `1.0.0-RC.2`. Record the intended pairing in the system release
+  manifest. Keep protocol/storage formats independent; no release is created.
 
 - Reduce bridged multipart conversion I/O by verifying and forwarding each
   external file together. Retain M1's durable source until N1's final durable
