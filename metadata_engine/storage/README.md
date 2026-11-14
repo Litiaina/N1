@@ -34,6 +34,11 @@ fragment/table keys; it does not implement the storage algorithms.
   oversized on-disk record. An individual transaction retains its own limit.
   Values, changed tree paths and an ordered commit record are appended. A
   successful `sync_all` precedes publishing the new root and replying success.
+  Consecutive small records share a buffer of at most 64 KiB per appender;
+  the buffer is drained before returning a completed commit for synchronization
+  or checkpoint replay. Larger records retain the exact positioned-write path.
+  This combines writes within a commit, without delaying admission, combining
+  acknowledged groups or changing their durability boundary.
 - Tables share one root and one durability boundary. A committed change cannot
   expose a name without its related version, index or reclamation mutation.
 - A failed append or synchronization prevents publication and poisons further

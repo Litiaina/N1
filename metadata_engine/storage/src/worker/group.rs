@@ -37,14 +37,14 @@ pub(super) fn commit(core: &Core, requests: Vec<Request>) {
     }
     let result = (|| {
         core.healthy()?;
-        let mut writer = Appender {
-            generation: current.generation.clone(),
-            end: current.end,
+        let mut writer = Appender::new(
+            current.generation.clone(),
+            current.end,
             // Retain older pages when concurrent snapshots or a batch may
             // reuse them; single-writer mutations otherwise accumulate cold
             // COW versions. This changes cache admission, never file lifetime.
-            evict_replaced: accepted.len() == 1 && Arc::strong_count(&current) == 2,
-        };
+            accepted.len() == 1 && Arc::strong_count(&current) == 2,
+        );
         let mut changes = Vec::with_capacity(pending.len());
         for (key, write) in pending {
             let entry = write

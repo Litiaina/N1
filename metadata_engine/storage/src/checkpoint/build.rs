@@ -25,12 +25,12 @@ pub(crate) fn build(core: &Core, source: Arc<State>) -> Result<Prepared> {
         core.poisoned.clone(),
         true,
     ));
-    let mut writer = Appender {
+    let mut writer = Appender::new(
         generation,
-        end: format::DATA_START,
+        format::DATA_START,
         // The target has no external readers before checkpoint publication.
-        evict_replaced: true,
-    };
+        true,
+    );
     let mut cursor = tree::Cursor::new(
         source.generation.clone(),
         source.root,

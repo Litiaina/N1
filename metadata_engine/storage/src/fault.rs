@@ -46,6 +46,17 @@ mod tests {
             tx.put(b"\0name", b"after").unwrap();
             tx.put(b"\x01version", b"after").unwrap();
             tx.put(b"\x02new", b"new").unwrap();
+            if std::env::var("M1_STORAGE_FAULT_BUFFERED").as_deref() == Ok("1") {
+                // Cross several append-buffer boundaries before the existing
+                // values-written barrier, leaving a physical uncommitted tail.
+                for index in 0..8 {
+                    tx.put(
+                        format!("\x02buffer/{index:02}").as_bytes(),
+                        &[0xa5; 32 * 1024],
+                    )
+                    .unwrap();
+                }
+            }
             tx.commit().unwrap();
         }
         panic!("fault barrier did not trigger");
@@ -61,7 +72,7 @@ mod tests {
 
     #[test]
     fn process_barriers_preserve_atomic_state() {
-        for point in [
+        for (point, buffered) in [
             "values-written",
             "tree-written",
             "commit-written",
@@ -70,7 +81,11 @@ mod tests {
             "checkpoint-synced",
             "manifest-renamed",
             "checkpoint-installed",
-        ] {
+        ]
+        .into_iter()
+        .map(|point| (point, false))
+        .chain([("values-written", true)])
+        {
             let root = tempfile::Builder::new()
                 .permissions(fs::Permissions::from_mode(0o700))
                 .tempdir()
@@ -82,6 +97,8 @@ mod tests {
             tx.put(b"\x03ack", b"must survive").unwrap();
             tx.commit().unwrap();
             drop(db);
+            let generation = root.path().join("store-00000000000000000001.m1");
+            let committed_end = fs::metadata(&generation).unwrap().len();
             let mut child = Child(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -92,6 +109,10 @@ mod tests {
                     ])
                     .env("M1_STORAGE_FAULT_ROOT", root.path())
                     .env("M1_STORAGE_FAULT", point)
+                    .env(
+                        "M1_STORAGE_FAULT_BUFFERED",
+                        if buffered { "1" } else { "0" },
+                    )
                     .stdout(Stdio::piped())
                     .stderr(Stdio::inherit())
                     .spawn()
@@ -111,6 +132,9 @@ mod tests {
             waiting
                 .recv_timeout(Duration::from_secs(30))
                 .unwrap_or_else(|error| panic!("barrier={point}: {error}"));
+            if buffered {
+                assert!(fs::metadata(&generation).unwrap().len() > committed_end + 64 * 1024);
+            }
             child.0.kill().unwrap();
             assert!(!child.0.wait().unwrap().success());
             reader.join().unwrap();
@@ -134,6 +158,9 @@ mod tests {
             }
             if matches!(point, "values-written" | "tree-written") {
                 assert!(!changed);
+            }
+            if buffered {
+                assert_eq!(db.verify().unwrap().records, 3);
             }
         }
     }

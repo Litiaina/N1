@@ -70,6 +70,13 @@ filesystem-wide `syncfs` dependency; RAM results are diagnostic, not production
 durability or performance acceptance. Default builds exclude the new opt-in
 request profiler. All 426 default workspace checks and strict lint checks pass.
 
+The [M1 commit I/O follow-up](docs/M1-COMMIT-IO-20261114.md) coalesces bounded
+database append writes with N1 still frozen. It records 92.4% fewer M1 positioned
+write calls, separate traced controls, the loaded-host small-object comparison
+and all four 15 GiB A–B–B–A samples. Long tails and adverse throughput/readback
+observations remain explicit. Storage crash/recovery, real XFS ENOSPC, two-HDD
+service cases and original Console workflows retain their separate evidence.
+
 ## What each test proves
 
 | Layer | Required checks | Does not prove |

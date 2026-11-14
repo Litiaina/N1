@@ -74,6 +74,11 @@ N1's filesystem-wide publication barrier as concrete costs. The RAM control
 does not qualify a durable deployment or close tail acceptance. N1 remains
 unchanged; 426 default workspace tests and strict normal/diagnostic lint pass.
 
+The [M1 commit I/O follow-up](M1-COMMIT-IO-20261114.md) reduces database append
+calls while retaining the existing synchronization policy and frozen N1.
+It preserves the small-object tails and mixed large-file observations;
+fewer syscalls do not close persistent tail-latency, MCH or power-loss acceptance.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

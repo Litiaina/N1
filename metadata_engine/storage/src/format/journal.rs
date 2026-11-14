@@ -56,9 +56,29 @@ pub(crate) struct Appender {
     pub generation: Arc<Generation>,
     pub end: u64,
     pub evict_replaced: bool,
+    buffer: Vec<u8>,
 }
 
 impl Appender {
+    pub fn new(generation: Arc<Generation>, end: u64, evict_replaced: bool) -> Self {
+        Self {
+            generation,
+            end,
+            evict_replaced,
+            buffer: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.buffer.is_empty() {
+            self.generation
+                .file
+                .write_all_at(&self.buffer, self.end - self.buffer.len() as u64)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
     pub fn append(&mut self, kind: u8, bytes: &[u8]) -> Result<u64> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(Error::Invalid("M1 record exceeds format bound".into()));
@@ -74,17 +94,28 @@ impl Appender {
         header[12..16].copy_from_slice(&crc.to_be_bytes());
         let header_crc = checksum(&header[..24]);
         header[24..28].copy_from_slice(&header_crc.to_be_bytes());
-        // One exact positioned write per record. Metadata records are small;
-        // coalescing their header/payload avoids a second filesystem syscall.
-        // write_all_at retains partial-write/interruption handling, and every
-        // record remains bounded by MAX_RECORD_BYTES.
-        let mut record = Vec::with_capacity(RECORD_HEADER + bytes.len());
-        record.extend_from_slice(&header);
-        record.extend_from_slice(bytes);
-        self.generation.file.write_all_at(&record, offset)?;
-        self.end = offset
+        let length = RECORD_HEADER + bytes.len();
+        let end = offset
             .checked_add(RECORD_HEADER as u64 + bytes.len() as u64)
             .ok_or_else(|| Error::Invalid("M1 file offset overflow".into()))?;
+        // Coalesce consecutive records within one commit, not across durable
+        // groups. Tree edits only read the preceding committed root; commit()
+        // drains this bounded buffer before any new root can be used or synced.
+        // Oversized values retain the existing exact positioned-write path.
+        if length > 64 * 1024 {
+            self.flush()?;
+            let mut record = Vec::with_capacity(length);
+            record.extend_from_slice(&header);
+            record.extend_from_slice(bytes);
+            self.generation.file.write_all_at(&record, offset)?;
+        } else {
+            if self.buffer.len() + length > 64 * 1024 {
+                self.flush()?;
+            }
+            self.buffer.extend_from_slice(&header);
+            self.buffer.extend_from_slice(bytes);
+        }
+        self.end = end;
         Ok(offset)
     }
 
@@ -135,6 +166,7 @@ impl Appender {
         bytes.resize(bytes.len() + (end - unpadded) as usize, 0);
         bytes[24..32].copy_from_slice(&end.to_be_bytes());
         let commit = self.append(COMMIT, &bytes)?;
+        self.flush()?;
         Ok(State {
             generation: self.generation.clone(),
             sequence,
