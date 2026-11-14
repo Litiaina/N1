@@ -52,6 +52,25 @@ Documentation edits do not change their identities. Verify the binaries actually
 installed on the reference system; a rebuild needs its own hash, toolchain and
 regression evidence.
 
+### Preparation checkpoint — November 15
+
+Source checkpoint `efdd40c` declares the independent component versions above.
+Its five manifest/CLI checks and one real-service M1 → N1 interoperability
+case pass, together with the targeted strict lint and formatting checks. These
+six checks qualify the versioning change; they do not replace performance,
+four-HDD, power-loss or complete operator acceptance.
+
+- Keep N1's selected runtime and ECS Core revision
+  `c77c638bfb709368f49517f2828fa977738e8467` fixed. No dependency upgrade or
+  engine redesign is part of this preparation.
+- Preserve a portable copy of the source, selected executables, checksums and
+  version/interoperability logs. Keep existing population journals and earlier
+  evidence with their original identities; verify the copied checksums before
+  starting on the reference system.
+- The separately powered recorder dry run, hardware inventory, actual power
+  window and acceptance limits below still require completion. The available
+  process-fault harnesses do not establish that hardware recording is ready.
+
 - [ ] Record source commit, compiler, build flags, executable hashes, effective
   INI settings, durability modes and pool geometry. Hold the selected N1 runtime
   fixed during M1 comparisons. Preserve the baseline binaries separately.
