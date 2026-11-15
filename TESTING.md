@@ -61,9 +61,20 @@ two physical XFS HDDs. All 2,541 measured operations complete without errors;
 all 513 identities pass complete live-data/deleted-state checks before and after
 a clean restart, followed by zero-residue cleanup. It exposes multi-second
 mutation/resume tails and slower busy uploads without M1. Functional concurrency
-passes; mixed-latency acceptance remains open. The new Rust harness passes its
+passes; the measured latency limits belong to that hardware/workload profile,
+without an established software regression. The new Rust harness passes its
 two verification/quantile checks and strict lint. This is separate from a new
 million-object, four-HDD or physical power-loss campaign.
+
+The same report's [two-SATA-SSD control](docs/N1-MIXED-WORKLOAD-20261116.md#two-sata-ssd-control)
+then runs the exact N1/client binaries and workload settings on separate SATA
+data/OS SSDs, with no NVMe test placement. All 4,291 measured operations and 872
+identities pass, including full readback before/after restart and marker-only
+cleanup. Busy acknowledged multipart throughput is 49.333 versus 14.200 MiB/s
+on HDD, with substantially shorter busy mutation/read tails. Adverse light-after
+controls remain recorded. Host/CPU/filesystem differences prevent attributing
+the change solely to USB enclosures; this is a hardware-profile comparison,
+not a software-regression result or runtime optimization.
 
 The [November 14 multipart geometry report](docs/M1-PART-GEOMETRY-20261114.md)
 records optional M1 negotiation, cross-client pending-session reuse, matched

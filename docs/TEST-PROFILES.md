@@ -6,7 +6,7 @@ not identify privately operated machines, their owners or their networks.
 | Profile | CPU and memory recorded in the reports | Storage and deployment |
 | --- | --- | --- |
 | Four-HDD reference system | Intel Core i5-11400, 6 cores / 12 threads, approximately 11 GiB RAM | Four independent HDD filesystems; immutable 3+1 or 2+2 fixtures; separate Kingston SNV2S500G NVMe for M1 in the named-service profile |
-| SSD test system | Intel Core i5-12600K, 10 cores / 16 threads, approximately 31–32 GiB RAM | Intel SSDSC2KW240H6 SATA SSD; co-located N1 1+0/M1 measurements and M1's side of split-node tests, as specified by each report |
+| SSD test system | Intel Core i5-12600K, 10 cores / 16 threads, approximately 31–32 GiB RAM | Intel SSDSC2KW240H6 SATA data SSD; co-located N1 1+0/M1 measurements and M1's side of split-node tests. The standalone 1+1 mixed control also uses the Kingston SA400S37480G SATA OS SSD, as specified by its report |
 | Two-HDD test system | AMD Ryzen 5 PRO 4650U; memory and kernel details belong to each run's private manifest | Two ST1000LM049 HDDs over USB UAS; independent filesystems and 1+1 fixtures, with 1+0 controls where recorded |
 
 These describe equipment and roles, not interchangeable benchmarks. A run's

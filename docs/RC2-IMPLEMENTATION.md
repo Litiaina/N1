@@ -101,6 +101,15 @@ tails, while large uploads slow under the busy mix. These costs occur without
 M1. This closes the recorded local functional-mix exercise, not standalone
 tail-performance, four-HDD or hardware power-loss acceptance.
 
+Its subsequent [two-SATA-SSD control](N1-MIXED-WORKLOAD-20261116.md#two-sata-ssd-control)
+holds both executables and workload settings fixed: 4,291 operations and 872
+identities pass on SATA data/OS SSDs, without NVMe test files. Busy multipart
+byte rate rises from 14.200 to 49.333 MiB/s and busy mutation/read tails shorten;
+some light-after observations worsen. This demonstrates platform-dependent
+performance, not a new N1 version regression or proof of enclosure failure.
+N1 remains frozen; the comparison does not reopen its architecture or close
+the separate hardware/fault/system release gates.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.
