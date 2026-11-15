@@ -54,6 +54,17 @@ actually used. Version formalization does not relabel those artifacts.
 
 ## Recent qualification reports
 
+The [November 16 standalone mixed workload](docs/N1-MIXED-WORKLOAD-20261116.md)
+holds N1 fixed and runs large/small uploads, video ranges, full downloads and
+deletes together, with five, fourteen and five paced application sessions on
+two physical XFS HDDs. All 2,541 measured operations complete without errors;
+all 513 identities pass complete live-data/deleted-state checks before and after
+a clean restart, followed by zero-residue cleanup. It exposes multi-second
+mutation/resume tails and slower busy uploads without M1. Functional concurrency
+passes; mixed-latency acceptance remains open. The new Rust harness passes its
+two verification/quantile checks and strict lint. This is separate from a new
+million-object, four-HDD or physical power-loss campaign.
+
 The [November 14 multipart geometry report](docs/M1-PART-GEOMETRY-20261114.md)
 records optional M1 negotiation, cross-client pending-session reuse, matched
 measurements with N1 frozen, Console checks and a separately reproduced native

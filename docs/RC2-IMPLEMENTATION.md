@@ -92,6 +92,15 @@ preserves the small-object tails and mixed large-file observations; fewer
 syscalls do not close persistent tail-latency, the four-HDD reference system or
 power-loss acceptance.
 
+The [November 16 standalone mixed workload](N1-MIXED-WORKLOAD-20261116.md)
+then holds the same N1 binary fixed on two XFS HDDs. Five/fourteen/five concurrent
+application sessions complete 2,541 measured operations without request errors,
+with all 513 identities verified before and after clean restart and subsequently
+purged. Small uploads/deletes and some GET/resume requests retain multi-second
+tails, while large uploads slow under the busy mix. These costs occur without
+M1. This closes the recorded local functional-mix exercise, not standalone
+tail-performance, four-HDD or hardware power-loss acceptance.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.
