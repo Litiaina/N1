@@ -1,13 +1,16 @@
 # Standalone N1 mixed file-service workload — November 16, 2026
 
-**Integrity and functional concurrency passed.** Standalone N1
+**Original frozen-binary campaigns: integrity and functional concurrency passed.**
+Standalone N1
 completed uploads, downloads, video-style ranges, reconnect/resume and deletes
 together without M1. All 513 created identities were accounted for. The busy
 profile exposes substantial write/delete tails and slower large uploads; it
 does not justify a general claim of excellent mixed-workload performance.
 
-No N1, M1, LINK, ECS Core or database runtime code changed. This stage adds a
-Rust workload client and records the existing N1 binary's behavior.
+No N1, M1, LINK, ECS Core or database runtime code changes in the original
+campaigns below. They add a Rust workload client and record the existing N1
+binary's behavior. The [publication follow-up](#publication-follow-up-on-both-minimum-storage-profiles)
+separately records a rejected performance experiment and retained hardening.
 
 The subsequent [two-SATA-SSD control](#two-sata-ssd-control) uses the exact same
 N1 and workload executables. It substantially improves busy-phase latency and
@@ -382,3 +385,176 @@ cleanup and validated cross-platform reduction. The evidence archive SHA-256 is
 Raw credential and private-key files are excluded from that archive. The
 unprivileged kernel journal is inaccessible; its empty output does not prove
 absence of kernel storage errors. No Python is used.
+
+## Publication follow-up on both minimum storage profiles
+
+This follow-up tests one immutable 1+1 pool on the two HDDs and on the two
+SATA SSDs described above, without M1 or Console. LINK, pool geometry,
+checksums, ECS Core, direct I/O, io_uring, scheduling and durability policies
+are preserved. The one-shot publication experiment below is **rejected**;
+its measured disadvantages are not shipped as an optimization.
+
+### Measured waits and physical storage controls
+
+A separate diagnostic window on the unchanged frozen N1 correlates syscall
+and engine timing. An OS-SSD `syncfs` takes 983.341 ms; the captured foreground
+queue reaches about 898 ms. The HDD diagnostic records filesystem-barrier waits
+up to 1,395.902 ms and write-admission waits up to 1,534.437 ms. These are separate
+maxima, not additive latency components or traces of every original outlier.
+The adaptive target stays at 32; the existing per-principal foreground cap is
+six on this two-member configuration. Neither limit changes in this stage.
+
+The SSD syscall diagnostic also samples Health through authenticated shell
+sessions. That introduces control-state I/O and is excluded from performance
+acceptance. The harness now supports `--diagnostics` snapshots outside timed
+windows, without repeated authentication refresh writes.
+
+A private Rust control writes 4 GiB to each member concurrently through aligned
+O_DIRECT files, verifies every byte by direct readback, removes its own files and
+persists the removals. Buffers are bounded. One control synchronizes at completion;
+the other also synchronizes each 8 MiB. Rates are 4 GiB divided by the time until
+both members finish writing, rather than the sum of mirrored physical bytes.
+
+| Paired-file write reference | Two USB HDDs | Two SATA SSDs |
+| --- | ---: | ---: |
+| Sync at completion | 114.523 MiB/s | 70.479 MiB/s |
+| Also sync each 8 MiB | 35.921 MiB/s | 40.391 MiB/s |
+
+The SATA members differ substantially: the data SSD writes at 128.095 MiB/s
+versus 70.480 MiB/s for the OS SSD in the completion-sync control, and at
+104.860 versus 40.392 MiB/s with intermediate syncs. These observations explain
+why an SSD label cannot supply a throughput expectation. The control is a
+sequential paired-file reference, not N1's format, mixed workload, theoretical
+hardware ceiling or a power-loss test. Its rates must not become a claimed N1
+device-utilization percentage.
+
+### Rejected single-object directory-sync experiment
+
+The experiment retains sealed-file persistence but replaces single PUT's grouped
+filesystem-wide publication barrier with multipart's affected-directory fsyncs.
+It reduces some SSD mutation latency, but does not improve both minimum profiles.
+Single PUT is therefore restored to its existing grouped barrier. Batch and
+purge never change during the experiment. No journal, queue, receipt or storage
+format is added.
+
+Both baseline and candidates are built with Rust 1.98.0 and the same repository
+release/LTO settings, retaining symbols. The baseline runtime is the committed
+source preceding this follow-up, SHA-256
+`53a6412f1358cadd97db0474f20be3e8d5547376f996b594e8920e3d57229a63`.
+It is a rebuild, not the historical frozen artifact relabeled with a different
+compiler. The rejected final experiment is
+`bd08305246a991638f607f53bb1bcadfb454fa3d4732b22f9ede82a224b07f9d`.
+
+All new comparisons use the same extended Rust workload executable,
+`05f9bd9a5383075b28f5aef8dbafc5ffb25759a6e0ee83481576ffb8bd27cdb1`.
+They use **20/40/20-second offered windows**, unchanged full-size bulk files,
+and the same 5/14/5 sessions. They are separate from the preceding 60/120/60
+campaigns. Builds and correctness tests finish before each same-host timed run.
+CPU policies, applications and caches remain unchanged. Every run verifies all
+live bytes and deleted absences before and after clean restart, then purges its
+identities and requires exactly two pool-marker files.
+
+The HDD pair runs baseline then candidate. The SSD numbers below use the
+reverse-order candidate/baseline pair; the earlier forward-order observations
+remain in the evidence. Cells are milliseconds except the multipart-byte row.
+Percentiles include all completions, including drain.
+
+| Busy observation | HDD baseline | HDD experiment | SSD baseline | SSD experiment |
+| --- | ---: | ---: | ---: | ---: |
+| Acknowledged multipart MiB/s inside offered window | 16.2 | 11.6 | 54.2 | 42.8 |
+| Normal small-upload p50 | 1,075.762 | 1,167.154 | 483.197 | 339.017 |
+| Strict-plan small-upload p50 | 1,255.134 | 1,548.181 | 457.777 | 305.463 |
+| Video-range p99 | 1,678.660 | 801.315 | 904.949 | 858.892 |
+| Full-download p99 | 1,975.459 | 1,214.768 | 1,046.238 | 800.877 |
+
+The HDD experiment also raises normal small-upload p95 from 1,856.333 to
+2,655.748 ms, strict-plan p99 from 2,539.850 to 2,800.550 ms, and sampled busy
+RSS from 119.750 to 145.086 MiB. SSD normal small-upload p99 rises from
+1,139.166 to 1,183.992 ms in the reverse-order pair despite the lower median.
+The earlier SSD baseline records 37.6 MiB/s, compared with 42.6 MiB/s for the
+first candidate variant and 42.8 for the final experiment; baseline variation
+alone prevents claiming a reproducible bulk-throughput improvement.
+
+Upload-only controls retain the same bulk sessions and geometry while removing
+the other roles. Their busy normal rates are 96.6/92.6 MiB/s on HDD and
+33.4/38.0 on SSD, baseline/experiment. Strict rates are 16.6/17.0 on HDD and
+34.2/37.0 on SSD. SSD strict-part p99 nevertheless worsens from 1,077.050 to
+1,349.250 ms. These controls and every original outlier are preserved, not pooled
+with mixed samples or used to declare every operation faster.
+
+### Retained correction and evidence
+
+The retained runtime correction opens multipart publication directories before
+renames/removals, including an independent root open description per publication.
+Previously the directory-persistence helper opened them after mutation and reused
+the shared root description. The existing sealed-data and directory barriers
+remain; the change preserves error observation across namespace mutations and
+concurrent publications. File fsync alone does not persist directory entries,
+and writeback errors must be checked by the affected owners. See
+[Linux fsync semantics](https://man7.org/linux/man-pages/man2/fsync.2.html) and
+[Linux error-sequence accounting](https://docs.kernel.org/core-api/errseq.html).
+This correction is not advertised as a throughput optimization.
+
+The selected N1 executable is SHA-256
+`f1a54f1653c1c90ae51416fa1f53474855cc20e1ea7ef52e0561af2c8c166aab`.
+Its source passes **252 default N1 all-target checks, zero failed**, retaining
+eight explicit helper/opt-in exclusions. Three applicable opt-in cases also
+pass explicitly: real-process restart/clone/replacement recovery on the two
+physical HDDs, io_uring positioned-I/O/publication, and direct-I/O page-cache
+bypass/reopen. A new subprocess check kills the writer after acknowledged
+single PUT in both part modes, then verifies the bytes and idempotent retry.
+Another check verifies independent publication-root open descriptions. The two
+existing workload verification/quantile checks, strict release N1/client lint
+and formatting pass. These are N1-scoped checks, not a rerun of M1's suite.
+
+The selected binary completes 1,089 measured operations on HDD and 1,379 on
+SSD, with zero request/worker errors and all five operation classes overlapping.
+HDD verification accounts for **210 live + 48 deleted = 258 identities** and
+4,530,913,280 live bytes; SSD accounts for **314 live + 62 deleted = 376 identities**
+and 4,559,220,736 bytes. Every live byte and deleted absence passes before and
+after clean restart. All 634 identities are subsequently purged; both private
+pools contain only their two member markers. No qualification service remains.
+
+Final same-build baseline/selected comparisons use the same 20/40/20-second
+windows. The table includes adverse observations. Latencies are milliseconds;
+CPU/RSS cover the busy phase including drain, and throughput counts only
+acknowledged multipart bytes inside the offered busy window.
+
+| Busy observation | HDD baseline | HDD selected | SSD baseline | SSD selected |
+| --- | ---: | ---: | ---: | ---: |
+| Acknowledged multipart MiB/s | 10.0 | 14.6 | 49.2 | 41.8 |
+| Normal small-upload p50 / p99 | 1,422.525 / 3,725.201 | 1,431.020 / 2,658.376 | 414.004 / 1,176.485 | 533.299 / 1,076.113 |
+| Strict-plan small-upload p50 / p99 | 1,456.267 / 3,097.040 | 1,516.882 / 2,201.459 | 423.374 / 1,126.335 | 491.604 / 1,192.085 |
+| Video-range p50 / p99 | 86.383 / 1,308.827 | 115.370 / 883.991 | 7.463 / 633.765 | 6.928 / 167.341 |
+| Full-download p99 | 1,795.944 | 1,320.405 | 551.141 | 214.376 |
+| DELETE + absence p99 | 2,359.530 | 1,897.294 | 1,023.081 | 665.644 |
+| Normal part p99 | 2,724.230 | 2,337.936 | 968.227 | 778.503 |
+| Strict part p99 | 3,244.139 | 2,746.022 | 1,182.830 | 914.738 |
+| Finalize maximum; sample count | 279.219; 2 | 360.613; 2 | 151.557; 3 | 151.702; 2 |
+| N1 CPU seconds | 16.40 | 16.22 | 19.93 | 17.19 |
+| N1 sampled peak RSS MiB | 135.102 | 117.641 | 176.008 | 155.848 |
+
+The unchanged baseline itself spans 10.0–16.2 MiB/s on HDD and 37.6–54.2 MiB/s
+on SSD across these short mixed controls. Selected rates lie within those
+observed ranges. That is context for storage-state variation, not a statistical
+parity test or proof that the directory-handle correction causes either gain or
+loss. The lower selected SSD throughput, higher mutation medians, higher HDD
+video median and larger finalize maxima remain explicit. Two or three finalize
+samples cannot establish object-level p99. No universal speedup is claimed.
+
+An evidence audit checks all 18 baseline/experimental/selected campaigns: exact
+pre/post-restart live hashes, catalog counts, expected deleted counts, marker-only
+cleanup and zero recorded workload errors. Raw request quantiles are independently
+recomputed. Only the two selected campaigns above run the retained final binary;
+the audit does not relabel the rejected campaigns as selected-source results.
+
+Evidence is mapped under `/srv/test-evidence/n1-busy-stability-20261116`:
+source patches, immutable baseline/rejected/selected executables, Rust control
+source, syscall observations, per-operation samples, resource series, test logs,
+complete readbacks and marker-only censuses. The complete ten-case SSD evidence
+archive has SHA-256
+`40ad8c8c3edb4a1de09751f37ff5d91971c3f79f5de5006d54d67adb1ffd00cb`.
+Raw credentials and private keys are excluded. No historical million-object
+campaign is restarted or relabeled as qualification of these changes.
+Physical host power loss, wider physical EC and system/Console qualification
+retain their existing release scope. No tag or release is created.

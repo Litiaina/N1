@@ -7,6 +7,7 @@ use std::time::Duration;
 
 const CHILD: &str = "N1_FINALIZE_CRASH_CASE";
 const READY: &str = "N1_DURABLE_COMPLETION_ACKNOWLEDGED";
+const PUT_CHILD: &str = "N1_PUT_CRASH_CASE";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Case {
@@ -22,6 +23,104 @@ impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn acknowledged_single_put_survives_process_kill_in_both_part_modes() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    if let Some(path) = std::env::var_os(PUT_CHILD) {
+        let case: Case = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        runtime.block_on(async {
+            let pool = storage_pool::Pool::reopen_fixture(case.layout, &case.paths).unwrap();
+            let store = Store::new(vec![pool], [17; 32], 16).unwrap();
+            store
+                .put(SCOPE, case.key, std::io::Cursor::new(source(case.length)))
+                .await
+                .unwrap();
+            println!("{READY}");
+            std::io::stdout().flush().unwrap();
+            std::future::pending::<()>().await;
+        });
+        unreachable!();
+    }
+
+    for mode in [Durability::Standard, Durability::Durable] {
+        let fixture = Fixture::new();
+        let store = fixture.enroll();
+        let data = source(40001);
+        let init = runtime
+            .block_on(store.init(SCOPE, 0, data.len() as u64, 49152, mode, 3600))
+            .unwrap();
+        drop(store);
+        let path = fixture.base.join("put-crash-case.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&Case {
+                layout: fixture.layout.clone(),
+                paths: fixture.paths.clone(),
+                key: init.object_key.clone(),
+                length: data.len(),
+                part_bytes: 49152,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "core::tests::finalize_crash::acknowledged_single_put_survives_process_kill_in_both_part_modes",
+                    "--nocapture",
+                ])
+                .env(PUT_CHILD, path)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let output = child.0.stdout.take().unwrap();
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(output).lines() {
+                if line.unwrap().contains(READY) {
+                    let _ = ready.send(());
+                    break;
+                }
+            }
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(30))
+            .expect("child did not acknowledge complete PUT");
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        observer.join().unwrap();
+        runtime.block_on(async {
+            let store = fixture.reopen();
+            assert_eq!(
+                store
+                    .download(SCOPE, init.object_key.clone(), 0, None, Vec::new())
+                    .await
+                    .unwrap()
+                    .0,
+                data
+            );
+            assert!(
+                store
+                    .put(SCOPE, init.object_key.clone(), std::io::Cursor::new(data))
+                    .await
+                    .unwrap()
+                    .already_finalized
+            );
+            store.delete(SCOPE, init.object_key.clone()).await.unwrap();
+            assert!(matches!(
+                store.stat(SCOPE, init.object_key).await,
+                Err(Error::NotFound)
+            ));
+        });
     }
 }
 

@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Serialize)]
@@ -24,6 +24,7 @@ pub struct Sample {
 }
 pub struct Recorder {
     start: Instant,
+    started_unix_micros: u128,
     samples: Mutex<Vec<Sample>>,
     active: AtomicUsize,
     roles: [AtomicUsize; 5],
@@ -34,6 +35,10 @@ impl Recorder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             start: Instant::now(),
+            started_unix_micros: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("workload clock precedes Unix epoch")
+                .as_micros(),
             samples: Mutex::new(Vec::new()),
             active: AtomicUsize::new(0),
             roles: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -139,6 +144,7 @@ impl Recorder {
         let errors = samples.iter().filter(|s| s.error.is_some()).count();
         Ok(
             json!({"operations":operations,"offered_window_operations":offered_window,"request_samples":samples.len(),"errors":errors,
+            "started_unix_micros":self.started_unix_micros,
             "peak_requests_in_flight":self.peak_active.load(Ordering::Relaxed),
             "peak_distinct_roles_in_flight":self.peak_roles.load(Ordering::Relaxed)}),
         )

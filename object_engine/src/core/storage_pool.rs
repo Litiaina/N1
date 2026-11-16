@@ -622,11 +622,23 @@ impl Member {
     /// Exact namespace dependencies of a promoted shard and retired staging
     /// directory. Callers join every fsync; no whole-filesystem flush is needed.
     pub(crate) fn publication_directories(&self, fp: Fingerprint) -> Result<Vec<Arc<File>>> {
+        self.check_binding()?;
         let (a, b) = fp.fanout();
+        // A new open description gives this publication its own error cursor;
+        // cloning the shared root descriptor would let another fsync consume it.
+        // Pin each ancestor before creating its child or changing its entries.
+        let root = Arc::new(File::from(rfs::openat(
+            &*self.root,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?));
+        let ancestor = self.directory(Path::new(&a), true, false)?;
+        let leaf = self.directory(Path::new(&format!("{a}/{b}")), true, false)?;
         Ok(vec![
-            self.directory(Path::new(&format!("{a}/{b}")), false, false)?,
-            self.directory(Path::new(&a), false, false)?,
-            self.root.clone(),
+            leaf,
+            ancestor,
+            root,
             self.directory(Path::new(".uploads"), false, false)?,
         ])
     }
@@ -754,6 +766,25 @@ impl From<rustix::io::Errno> for Error {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    #[test]
+    fn publications_pin_independent_root_descriptions() {
+        use std::io::{Seek, SeekFrom};
+        let (base, paths, layout) = roots(1);
+        let pool = Pool::fixture(layout, &paths).unwrap();
+        let member = pool.members[0].as_ref().unwrap();
+        let fp = Fingerprint([41; 32]);
+        let first = member.publication_directories(fp).unwrap();
+        let second = member.publication_directories(fp).unwrap();
+        // Directory offsets are per open description, just as error cursors
+        // are. This distinguishes a fresh open from dup/Arc clones.
+        (&*first[2]).seek(SeekFrom::Start(1)).unwrap();
+        assert_eq!((&*second[2]).stream_position().unwrap(), 0);
+        assert_eq!((&*member.root).stream_position().unwrap(), 0);
+        drop(first);
+        drop(second);
+        drop(pool);
+        std::fs::remove_dir_all(base).unwrap();
+    }
     fn roots(count: usize) -> (PathBuf, Vec<PathBuf>, PoolLayout) {
         let base = PathBuf::from(
             std::env::var_os("N1_LINK_TEST_ROOT").unwrap_or_else(|| "/tmp/n1-link-tests".into()),

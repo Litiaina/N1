@@ -76,6 +76,19 @@ controls remain recorded. Host/CPU/filesystem differences prevent attributing
 the change solely to USB enclosures; this is a hardware-profile comparison,
 not a software-regression result or runtime optimization.
 
+The [publication follow-up](docs/N1-MIXED-WORKLOAD-20261116.md#publication-follow-up-on-both-minimum-storage-profiles)
+adds paired-file storage references and separate normal/durable upload-only
+controls on both minimum 1+1 profiles. A single-PUT directory-sync experiment
+improves some SSD timings but regresses the HDD mix, so it is rejected. The
+retained change pins multipart directory descriptions before namespace mutation;
+single PUT, batch, purge, LINK and scheduling retain their established behavior.
+The selected source passes **252 default N1 tests, zero failed**, with eight
+explicit helper/opt-in exclusions. Three applicable physical/io_uring/direct-I/O
+cases are then run explicitly and pass, including real-process restart/member
+replacement and aligned payload page-cache checks. The Rust workload's two
+verification/quantile checks, strict N1/client lint and formatting pass. This
+stage does not replace the independent physical power-loss or wider-EC gates.
+
 The [November 14 multipart geometry report](docs/M1-PART-GEOMETRY-20261114.md)
 records optional M1 negotiation, cross-client pending-session reuse, matched
 measurements with N1 frozen, Console checks and a separately reproduced native

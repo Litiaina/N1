@@ -13,12 +13,42 @@ use serde_json::json;
 use std::{path::PathBuf, time::Duration};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Default)]
+struct Options {
+    diagnostics: bool,
+    upload_only: bool,
+    policy: workload::PartPolicy,
+}
+impl Options {
+    fn parse(flags: &[String]) -> Result<Self> {
+        let mut options = Self::default();
+        for flag in flags {
+            match flag.as_str() {
+                "--diagnostics" => options.diagnostics = true,
+                "--upload-only" => options.upload_only = true,
+                "--normal-only" | "--durable-only" => {
+                    if options.policy != workload::PartPolicy::Mixed {
+                        return Err("select exactly one part durability policy".into());
+                    }
+                    options.policy = if flag == "--normal-only" {
+                        workload::PartPolicy::Normal
+                    } else {
+                        workload::PartPolicy::Durable
+                    };
+                }
+                _ => return Err(format!("unknown workload option: {flag}").into()),
+            }
+        }
+        Ok(options)
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 7 {
+    if args.len() < 7 {
         eprintln!(
-            "usage: mixed_workload N1-binary first-private-root second-private-root output-root light-seconds busy-seconds"
+            "usage: mixed_workload N1-binary first-private-root second-private-root output-root light-seconds busy-seconds [--diagnostics] [--upload-only] [--normal-only|--durable-only]"
         );
         std::process::exit(2);
     }
@@ -37,6 +67,7 @@ async fn run(args: &[String], output: &std::path::Path) -> Result<()> {
     if cfg!(debug_assertions) {
         return Err("use a release-profile workload client".into());
     }
+    let options = Options::parse(&args[7..])?;
     let light: u64 = args[5].parse()?;
     let busy: u64 = args[6].parse()?;
     if !(2..=300).contains(&light) || !(2..=600).contains(&busy) {
@@ -55,12 +86,21 @@ async fn run(args: &[String], output: &std::path::Path) -> Result<()> {
             label: label.into(),
             seconds,
             bulk,
-            video,
-            downloads,
-            interactive,
-            deletes,
+            video: if options.upload_only { 0 } else { video },
+            downloads: if options.upload_only { 0 } else { downloads },
+            interactive: if options.upload_only { 0 } else { interactive },
+            deletes: if options.upload_only { 0 } else { deletes },
+            policy: options.policy,
         };
-        let row = workload::phase(&api, catalog.clone(), profile, stack.pid(), output).await?;
+        let row = workload::phase(
+            &api,
+            catalog.clone(),
+            profile,
+            stack.pid(),
+            output,
+            options.diagnostics,
+        )
+        .await?;
         results.push(row);
         // Allow a short natural quiet period, without dropping caches or changing governors.
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -74,7 +114,10 @@ async fn run(args: &[String], output: &std::path::Path) -> Result<()> {
     api::save(
         &output.join("PASSED.json"),
         &json!({
-            "passed":true,"scope":"standalone N1 native TLS, private two-HDD 1+1 pool",
+            "passed":true,"scope":"standalone N1 native TLS, private 1+1 pool on two independent filesystems",
+            "scenario":if options.upload_only { "upload-only" } else { "mixed" },
+            "part_policy":options.policy,
+            "diagnostics":options.diagnostics,
             "no_m1_process_or_requests":true,"phases":results,"cleanup":cleanup,"census":census,
             "restart":"clean process restart; not power loss or SIGKILL",
             "acceptance":"functional integrity and completed workload; latency is reported without an invented production SLA"

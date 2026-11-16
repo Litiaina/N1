@@ -10,6 +10,11 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Pin multipart publication directory descriptions before namespace changes,
+  with independent root error accounting. Retain N1's existing single-object,
+  batch and purge barriers; reject the measured single-object directory-sync
+  experiment after adverse results on the two-drive HDD profile.
+
 - Give N1 and M1 independent package and release identities: N1 targets
   `1.0.0-RC.2`, M1 targets its first candidate `1.0.0-RC.1`, and the complete
   system remains `1.0.0-RC.2`. Record the intended pairing in the system release

@@ -14,6 +14,13 @@ actual filesystem, EC geometry, durability, cache conditions, software identity
 and placement still govern what its result proves. Preserve the different
 filesystems and transport failures recorded by earlier campaigns.
 
+Standalone N1's minimum redundant qualification profile is one immutable 1+1
+pool across two physical drives and independent filesystems. Both the two-HDD
+and two-SATA-SSD profiles must be exercised, including normal and durable part
+ACKs and simultaneous reads, uploads and deletes. Their actual storage capacity
+and competing load are recorded separately. A 1+0 control measures a different
+configuration; the four-drive profile covers wider EC and failure combinations.
+
 ## Public and private evidence
 
 Publish CPU/RAM, drive models and capacities, filesystem/kernel versions,

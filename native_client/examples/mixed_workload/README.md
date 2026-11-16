@@ -58,6 +58,22 @@ Native connections are capped at 64, admitted operations at 32, and request
 quotas are explicitly disabled to measure storage contention. Effective memory,
 adaptive concurrency, pool and runtime settings are captured in provenance.
 
+Append `--diagnostics` to collect N1 Health snapshots immediately before and
+after each phase, outside its measured window. These snapshots expose cumulative
+I/O queue, operation and filesystem-barrier timings. Their retained percentiles
+are not phase-local distributions. Request reports include a Unix-microsecond
+anchor for correlation with a separate syscall trace; wall-clock adjustments
+can affect that alignment. Diagnostic runs remain separate from baseline
+performance samples. No engine code or durability policy changes for this mode.
+
+Append `--upload-only` for a control with only the one/two/one bulk-upload
+sessions. `--normal-only` or `--durable-only` fixes the measured part-ACK policy;
+omitting both preserves the alternating policy above. These flags can be combined
+to measure normal and strict uploads separately before comparing them with mixed
+traffic. They do not change completed-object durability, the seed library, full
+verification, restart or cleanup. Controls are separate scenarios, not extra
+samples to pool into the mixed workload's latency distributions.
+
 No host CPU policy or global cache setting is changed. Requests already started
 when a window ends are allowed to finish. Reports separate completed operations
 inside the offered window from totals including that drain. Resource samples are

@@ -423,6 +423,8 @@ holes remain missing frames, even though the logical length is already complete.
 
 Finalization consumes completion state, moves staged files to calculated final
 paths with no replacement, and persists the affected directories concurrently.
+Directory descriptors are pinned before namespace changes; each publication
+opens its own root description to retain independent writeback-error accounting.
 It performs O(pool width) operations: no part traversal, payload reread, or
 whole-filesystem flush. Normal mode folds completed roots in memory and persists
 the sealed payload at finalize. Durable mode persists each part before recording

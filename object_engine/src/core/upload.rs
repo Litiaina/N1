@@ -6,7 +6,7 @@ mod small_batch;
 mod stream;
 use completion::{PreparedPart, refresh_completion_seals, write_completion_seals, write_seals};
 use once_cell::sync::OnceCell;
-use publication::{persist_publication, publish_files};
+use publication::{persist_publication, prepare_publication, publish_files};
 use std::sync::atomic::AtomicUsize;
 pub(crate) use stream::{WriteOptions, write_frames};
 pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
@@ -445,10 +445,11 @@ impl Store {
                     persist_files(&files).await?;
                 }
                 let _snapshot = store.snapshot_gate.clone().read_owned().await;
+                let directories = prepare_publication(&files, fp).await?;
                 let publication = publish_files(&files, fp).await;
                 // Every started rename/removal drains and reaches its barrier,
                 // including when a peer failed. Success requires both results.
-                let persisted = persist_publication(&files, fp).await;
+                let persisted = persist_publication(directories).await;
                 let bindings = blocking(move || group.check().map_err(Error::from)).await;
                 publication?;
                 persisted?;

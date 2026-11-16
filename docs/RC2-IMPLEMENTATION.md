@@ -110,6 +110,15 @@ performance, not a new N1 version regression or proof of enclosure failure.
 N1 remains frozen; the comparison does not reopen its architecture or close
 the separate hardware/fault/system release gates.
 
+The subsequent [publication follow-up](N1-MIXED-WORKLOAD-20261116.md#publication-follow-up-on-both-minimum-storage-profiles)
+tests normal, durable and mixed traffic on both minimum 1+1 storage profiles.
+It rejects a single-PUT directory-sync experiment after adverse HDD results,
+retaining the established single-PUT, batch, purge and scheduler behavior.
+The retained correction pins multipart publication directory descriptions before
+namespace mutation. No M1, LINK, codec or storage-format change is involved.
+This is scoped N1 qualification, not a universal performance or RC.2 release
+claim. N1 stabilization takes priority over further M1 optimization.
+
 **Branch policy — November 7, 2026:** `main` is the mainstream N1 LINK + M1
 development branch. The former NCX/NDX engine is the independent **N1 Lite**
 product in `Litiaina/N1-Lite`, with its own engine and operational identities.

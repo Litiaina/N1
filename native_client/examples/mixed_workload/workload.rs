@@ -20,6 +20,24 @@ const LIVE: u8 = 1;
 const DELETING: u8 = 2;
 const DELETED: u8 = 3;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartPolicy {
+    #[default]
+    Mixed,
+    Normal,
+    Durable,
+}
+impl PartPolicy {
+    fn durable(self, sequence: u64, worker: usize) -> bool {
+        match self {
+            Self::Mixed => (sequence + worker as u64) % 2 == 1,
+            Self::Normal => false,
+            Self::Durable => true,
+        }
+    }
+}
+
 pub struct Object {
     key: String,
     seed: u64,
@@ -65,6 +83,7 @@ pub struct Profile {
     pub downloads: usize,
     pub interactive: usize,
     pub deletes: usize,
+    pub policy: PartPolicy,
 }
 pub async fn seed(api: &Api, output: &Path) -> Result<Arc<Catalog>> {
     let mut catalog = Catalog {
@@ -130,16 +149,35 @@ pub async fn phase(
     profile: Profile,
     pid: u32,
     output: &Path,
+    diagnostics: bool,
 ) -> Result<Value> {
+    let health = if diagnostics {
+        let mut client = api.connect().await?;
+        let before = api::value(client.control(Command::Health).await?)?;
+        Some((client, before))
+    } else {
+        None
+    };
     let monitor = Monitor::start(pid)?;
     let recorder = Recorder::new();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(profile.seconds);
     let clients =
         profile.bulk + profile.video + profile.downloads + profile.interactive + profile.deletes;
+    let expected_roles = [
+        profile.bulk,
+        profile.video,
+        profile.downloads,
+        profile.interactive,
+        profile.deletes,
+    ]
+    .into_iter()
+    .filter(|count| *count > 0)
+    .count();
     let start = Arc::new(tokio::sync::Barrier::new(clients + 1));
     let stop = Arc::new(AtomicBool::new(false));
     let diagnostic = profile.seconds < 10;
+    let policy = profile.policy;
     let mut jobs = tokio::task::JoinSet::new();
     for (role, count) in [
         ("bulk", profile.bulk),
@@ -167,6 +205,7 @@ pub async fn phase(
                     deadline,
                     &stop,
                     diagnostic,
+                    policy,
                 )
                 .await;
                 if result.is_err() {
@@ -205,6 +244,15 @@ pub async fn phase(
     let seconds = started.elapsed().as_secs_f64();
     let resources = monitor.finish(output, &profile.label).await?;
     let measurements = recorder.summary(output, &profile.label, seconds, profile.seconds as f64)?;
+    if let Some((mut client, before)) = health {
+        let after = api::value(client.control(Command::Health).await?)?;
+        api::save(
+            &output.join(format!("{}-health.json", profile.label)),
+            &json!({"before":before,"after":after,
+                "scope":"cumulative engine counters; percentiles are not phase-local",
+                "timing":"two control calls outside the measured phase"}),
+        )?;
+    }
     let row = json!({"phase":profile.label,"offered_seconds":profile.seconds,"wall_seconds":seconds,
         "sessions":clients,"measurements":measurements,"resources":resources,"worker_errors":errors,
         "drain_note":"new user operations stop at the window; already-started objects finish and may extend wall time"});
@@ -222,7 +270,7 @@ pub async fn phase(
     if measurements["peak_distinct_roles_in_flight"]
         .as_u64()
         .unwrap_or(0)
-        < 4
+        < expected_roles as u64
     {
         return Err("workload did not demonstrate overlapping operation classes".into());
     }
@@ -245,17 +293,27 @@ async fn session(
     deadline: Instant,
     stop: &AtomicBool,
     diagnostic: bool,
+    policy: PartPolicy,
 ) -> Result<()> {
     let mut sequence = 0u64;
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         match role {
-            "bulk" => bulk(api, client, catalog, recorder, sequence, diagnostic, worker).await?,
+            "bulk" => {
+                bulk(
+                    api, client, catalog, recorder, sequence, diagnostic, worker, policy,
+                )
+                .await?
+            }
             "interactive" => {
                 let size =
                     [4096, 4096, 64 * 1024, 64 * 1024, 256 * 1024, MIB][sequence as usize % 6];
                 let seed = catalog.next_seed.fetch_add(1, Ordering::Relaxed);
                 let payload = Payload::new(seed, size);
-                let durable = sequence.is_multiple_of(3);
+                let durable = if policy == PartPolicy::Mixed {
+                    sequence.is_multiple_of(3)
+                } else {
+                    policy.durable(sequence, worker)
+                };
                 let object = recorder
                     .call(
                         role,
@@ -352,6 +410,7 @@ async fn think(millis: u64) {
     tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn bulk(
     api: &Api,
     client: &mut N1NativeClient,
@@ -360,6 +419,7 @@ async fn bulk(
     sequence: u64,
     smoke: bool,
     worker: usize,
+    policy: PartPolicy,
 ) -> Result<()> {
     let size = if smoke {
         32 * MIB
@@ -370,7 +430,7 @@ async fn bulk(
     };
     let seed = catalog.next_seed.fetch_add(1, Ordering::Relaxed);
     let payload = Payload::new(seed, size);
-    let durable = (sequence + worker as u64) % 2 == 1;
+    let durable = policy.durable(sequence, worker);
     let key = recorder
         .call(
             "bulk",
