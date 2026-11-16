@@ -1,0 +1,226 @@
+# M1 mixed traffic with concurrent maintenance — November 16, 2026
+
+**Passed on both minimum 1+1 profiles.** The same M1 and N1 executables complete
+mixed named-object traffic with GC, monitoring and live metadata backups.
+All recorded completed objects retain their bytes and versions after both
+processes are killed and reopened. All recorded trashed names remain absent.
+Both snapshots from each profile restore successfully. Final reclamation leaves
+one pool marker per member and no shard or staged-identity files.
+
+No N1, M1, LINK, ECS Core, database implementation, format or dependency changes
+are made in this stage. The addition is an opt-in Rust integration workload,
+split into orchestration, application traffic and observations under
+[`metadata_engine/tests/noa_service/maintenance_load.rs`](../metadata_engine/tests/noa_service/maintenance_load.rs).
+The established N1 checkpoint stays fixed.
+
+## Hardware and artifacts
+
+The [qualification profiles](TEST-PROFILES.md) identify the two systems:
+
+| Profile | Host and memory | Independent members | M1 placement |
+| --- | --- | --- | --- |
+| Two HDDs | Ryzen 5 PRO 4650U, 6 cores / 12 threads, approximately 15 GiB usable RAM | Two ST1000LM049 1 TB HDDs; separate XFS filesystems, USB UAS | Database, staging, backups and evidence on the first HDD |
+| Two SATA SSDs | Core i5-12600K, 10 cores / 16 threads, approximately 31 GiB usable RAM | Intel SSDSC2KW240H6 on XFS and Kingston SA400S37480G on ext4 | Database, staging, backups and evidence on the data SSD; the second SSD retains normal OS use |
+
+Each N1 pool uses immutable 1+1 geometry and 256 KiB blocks. Sources remain in
+the normal checkout; builds, fixtures and output use the designated test media,
+with no NVMe build target or workload dataset. CPU policy, caches and ordinary
+desktop activity are left unchanged. The different processors, filesystems and
+competing activity make this a platform comparison, not an isolated media test.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Fixed N1, `1.0.0-RC.2`, selected publication checkpoint | `f1a54f1653c1c90ae51416fa1f53474855cc20e1ea7ef52e0561af2c8c166aab` |
+| Fixed M1, `1.0.0-RC.1` | `07cd00e0599f052feaf559e88f1d6f6481674e4ac371d16b66938f526a8077e7` |
+| Selected Rust service workload | `633af951b985d3b4ea474759c002ec7e0f39d7af666d91e698dfff74f620e728` |
+
+The source base is `0985721`. M1 runtime changes since its append-I/O report
+are component version formalization; this stage adds no runtime change. Builds
+use Rust 1.98.0, locked/offline dependencies and the repository release profile
+with symbols retained. The copied executables have identical hashes on both
+systems. Service logs confirm io_uring initialization with no fallback; the
+previously qualified aligned direct-I/O implementation is unchanged.
+
+## Workload and limits
+
+One Rust scenario runs four **60-second offered windows**, in the order
+**maintenance off, on, on, off**. All windows use the same foreground roles:
+
+- Two small-file sessions cycle through 4 KiB, 64 KiB and 256 KiB strict
+  completed uploads, verify each readback and rename every fourth object.
+- One session uploads 128 MiB objects in 8 MiB parts, alternating standard
+  `durability=batched` and durable `durability=strict`. It measures init, each
+  part, finalize and repeated finalize separately.
+- Two readers perform complete 8 MiB downloads and unaligned 1 MiB video-style
+  ranges against the never-trashed seed library. Every byte is compared;
+  complete reads also verify SHA-256 and the published version.
+- A bounded deletion queue trashes half the new small objects after their
+  initial readback. It does not directly delete LINK shards.
+
+Small-file sessions pause 100 ms and the library readers pause 200 ms. The bulk
+session continues while its window is open. These are paced closed-loop clients;
+they establish neither maximum user count nor open-loop saturation capacity.
+Traffic is loopback public NOA v1 HTTP into M1 and native NOA into N1. This is
+not a browser, WAN or TLS-throughput benchmark.
+
+During each maintenance-on phase, a separate client polls ordinary health,
+pool capacity and fragment capacity every 250 ms; another runs scoped GC with
+two seconds between completed jobs. One live MVCC backup is requested after
+the first second. Client operation intervals confirm foreground/maintenance
+overlap. Monitoring requests do not request a content/deep scan.
+GC and backup samples include their start/status exchanges; operation counts
+and overlap peaks are not exact HTTP/native request-frame counts.
+
+The fixture uses 32 M1 upload slots, a 64 MiB upload-memory budget and 16 native
+connections. N1 retains its fixture defaults, including 16 admitted operations,
+a 256 MiB operation-memory budget and adaptive concurrency. Request quotas are
+disabled in both fixtures to measure storage/maintenance contention. GC has
+32-record batches, one object worker, 25 ms pacing and zero trash TTL. Automatic
+GC is disabled to preserve the off/on controls. These are isolated test settings;
+production defaults are unchanged. Existing automatic-TTL checks remain separate.
+
+The client has bounded samples, a 16-item deletion queue, a 20,000-object limit
+and a 20 GiB cumulative payload limit. It never buffers a complete large object.
+CPU/RSS observations sample the two services separately every 250 ms. Client
+hashing and byte comparisons are not charged to either server's CPU.
+
+Started operations finish after the offered window. All completions and their
+tails are retained. Multipart rates below count only acknowledged part bytes
+completed within the original 60 seconds; they exclude later drain, small
+uploads and read traffic. Latencies include the drain. Quantiles use nearest
+rank; small cohorts do not establish a stable production p99.
+
+## Integrity and recovery
+
+| Result | Two HDDs | Two SATA SSDs |
+| --- | ---: | ---: |
+| Measured logical operations | 3,708 | 7,551 |
+| Recorded request/worker errors | 0 | 0 |
+| Created identities, including two seeds | 416 | 1,423 |
+| Live / trashed before final cleanup | 216 / 200 | 739 / 684 |
+| Completed 128 MiB objects | 19 | 57 |
+| Live bytes verified after both-process SIGKILL/reopen | 2,587,373,568 | 7,742,042,112 |
+| Concurrent snapshots restored and verified | 2 | 2 |
+| Final physical files | Two member markers | Two member markers |
+| Complete scenario wall time, including verification and cleanup | 475.90 s | 357.77 s |
+
+The independent path/version/length/hash oracle is synchronized before the
+process kills. Readback does not re-upload missing objects. The original database
+passes offline verification before restarting. After recovery, every recorded
+live object passes complete bytes/SHA-256/version checks, and every trashed name
+returns 404.
+
+Each live backup is restored into a different fresh directory and its database
+tree is verified. M1 then serves that restored database and reads both unchanged
+library versions through NOA. These are concurrent **metadata** snapshots, not
+atomic whole-product snapshots: the test does not require a later-GC-purged
+payload to reappear when old metadata is restored. Coordinated disaster recovery
+retains its documented operator pause and separate qualification.
+
+Finally, all remaining live names are trashed and scoped GC completes with zero
+failures or deferred work. The final original database verifies and retains no
+upload-to-LINK controls. A separate offline member walk requires exactly one
+pool marker per member, no symlinks and no identity-specific files. These
+qualification walks occur outside the traffic measurements.
+
+The two hardware executions are repetitions of one new scenario, not two new
+distinct test cases. The short smoke fixture is not pooled into these results.
+
+## Observed performance
+
+Small uploads below include their complete named upload, with readback measured
+separately. Video requests include response consumption and byte verification.
+The off/on labels describe maintenance; foreground session counts stay fixed.
+
+| Profile / phase | Logical operations | Multipart MiB/s in offered window | Small upload p50 / p99 ms | Video range p99 ms |
+| --- | ---: | ---: | ---: | ---: |
+| HDD off 1 | 896 | 9.867 | 690.549 / 3,307.177 | 524.908 |
+| HDD on 1 | 1,023 | 8.933 | 951.612 / 3,257.888 | 588.541 |
+| HDD on 2 | 926 | 7.067 | 1,313.506 / 3,546.765 | 1,017.762 |
+| HDD off 2 | 863 | 9.200 | 775.502 / 2,630.733 | 554.539 |
+| SSD off 1 | 1,901 | 34.667 | 196.498 / 1,006.630 | 29.804 |
+| SSD on 1 | 1,911 | 24.800 | 235.509 / 995.726 | 31.417 |
+| SSD on 2 | 1,924 | 25.600 | 231.190 / 938.986 | 58.466 |
+| SSD off 2 | 1,815 | 33.867 | 187.037 / 1,099.363 | 47.641 |
+
+Maintenance consumes real service/storage capacity: bulk rates decrease in the
+on windows, and some foreground latencies worsen. It does not stop foreground
+progress or produce a request error in these runs. There is no binary change
+between off and on, so these differences are not a new software regression.
+The live database and trash backlog evolve across phases; this is an operational
+off/on observation, not a statistically isolated overhead percentage.
+
+| Service observation over traffic phases and drain | Two HDDs | Two SATA SSDs |
+| --- | ---: | ---: |
+| Total phase wall time | 283.204 s | 256.214 s |
+| M1 CPU seconds | 23.331 | 32.978 |
+| N1 CPU seconds | 44.339 | 75.493 |
+| Highest recorded M1 process RSS high-water mark | 95.50 MiB | 117.36 MiB |
+| Highest recorded N1 process RSS high-water mark | 134.48 MiB | 152.68 MiB |
+| Peak simultaneous measured operation intervals | 8 | 7 |
+| Backup completion observations | 715.680 / 662.864 ms | 105.718 / 131.462 ms |
+
+CPU seconds come from each process's CPU clock. These are short workload
+footprint observations, not a long-duration leak test. The 16 MiB seed library
+fits in memory; no cache drop is performed and read rates are not cold-storage
+measurements. GC timing includes all work selected by that job, including trash
+from preceding off phases; it is not a per-object delete latency.
+
+## Monitoring observations and checks
+
+The initial smoke fixture incorrectly required every cached health component to
+remain `healthy` throughout load. It failed when observations became stale,
+with no recorded data-request failure or reported database/disk error. Its log
+and fixture are retained. The corrected test preserves all health responses,
+checks reported storage/database errors separately and requires fresh healthy
+observations after the workload settles. No engine health policy is changed.
+
+Each full profile retains two top-level `degraded` observations: stale telemetry
+followed by a pending object sample. The retained metadata/object sample ages
+reach 19/18 seconds on HDD and 10/10 seconds on SSD, with a configured one-second
+observation interval. Both services return to fresh `healthy` observations after
+the workload. This is delayed/pending telemetry, not evidence of corrupted
+payloads. The report does not claim continuous health freshness or complete
+Console interpretation/alert acceptance.
+
+The M1 and database library regression passes **58 tests, zero failed**, with
+three explicit helper/opt-in exclusions; the storage child fixture is exercised
+by its parent crash test. This is targeted library coverage, not a new full
+workspace or all-target storage result.
+The selected workload passes strict release Clippy and formatting. The existing
+public HTTP/named-native/restart contract also passes against this exact pair
+on the two-SSD fixture. Database/service regression logs and source/runtime
+preservation checks are retained with the evidence.
+
+## Evidence and release scope
+
+Private evidence is mapped under
+`/srv/test-evidence/m1-maintenance-20261116`: executable/source hashes, original
+failed smoke, corrected smoke, all eight phase request/resource/health files,
+independent ACK oracles, snapshot/restart checks, exact cleanup results and raw
+logs. The two-SSD evidence archive is copied onto the local evidence HDD;
+credentials, private configuration and workload datasets are excluded from it.
+All workload and fault logic is Rust. No Python is used.
+
+Core invocation, with fresh private parents on the selected media:
+
+```sh
+CARGO_TARGET_DIR=/path/on/test-media/target \
+  cargo test --release -p m1 --test noa_service --no-run --offline --locked
+
+N1_IO_BACKEND=uring \
+M1_TEST_BINARY=/path/to/fixed/litiaina-m1 \
+N1_OBJECT_TEST_BINARY=/path/to/fixed/litiaina-n1 \
+N1_OBJECT_TEST_ROOT=/path/on/test-media/new-controls \
+N1_OBJECT_TEST_FIRST_ROOT=/path/on/first-member/new-parent \
+N1_OBJECT_TEST_SECOND_ROOT=/path/on/second-member/new-parent \
+M1_MAINTENANCE_SECONDS=60 \
+  /path/to/release/noa_service --ignored --exact \
+  maintenance_load::mixed_traffic_with_gc_monitoring_and_backups_preserves_every_ack \
+  --nocapture
+```
+
+This completes the recorded two-profile concurrent-maintenance/restart case.
+Existing million-object results remain preserved. Physical power loss, final
+four-drive qualification, broader saturation and full contract/Console/operator
+acceptance retain their separate release gates. No release or tag is created.

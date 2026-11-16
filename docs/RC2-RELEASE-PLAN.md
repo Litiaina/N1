@@ -1,39 +1,39 @@
 # RC.2 qualification plan
 
-Recommended release target: **November 27, 2026**, with a **November 25 go/no-go
-review**, in Asia/Manila time. These are planning targets, not authorization to
-release or permission to waive a failed acceptance condition. Move the release
-date if a required gate remains open.
+Full N1 and M1 qualification is planned to begin **around November 20, 2026**,
+in Asia/Manila time. Preparation and scoped checks continue beforehand. Release
+RC.2 when the required gates pass; no calendar date waives a failed condition.
+
+The stable **1.0.0** target is **February 14, 2027**, conditional on successful
+qualification and reliability/performance evidence from real deployments during
+the intervening release-candidate period. Neither target authorizes publication.
 
 The intended combination is **N1 `1.0.0-RC.2` + M1 `1.0.0-RC.1`**, recorded in
 [`deploy/system-release.json`](../deploy/system-release.json), for complete
 system **`1.0.0-RC.2`**. Each component has its own release history and tags;
 follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
 
-**Operator schedule — November 15:** four-HDD recovery qualification and
-controlled physical power-loss testing are scheduled for **Monday, November 16, 2026**, Asia/Manila.
-The start time and power-cut window will be established on site. Prepare with
-[the Monday checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power cut or
-completed result is implied. This advances that hardware window from the
-original November 21–23 plan. Final-candidate reconciliation remains necessary
-if runtime changes follow the Monday campaign.
+The four-HDD recovery and controlled physical power-loss window still needs its
+actual operator start time. Prepare with
+[the four-drive checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power
+cut or completed result is implied. Final-candidate reconciliation remains
+necessary if runtime changes follow a campaign.
 
-The starting source checkpoint is `9f0b922`. N1's measured native04 executable
-and its runtime/build manifests are retained in [the SSD/HDD optimization
-report](SSD-HDD-OPTIMIZATION-20261113.md). Hold that N1 runtime fixed while
-measuring M1. Attribute costs to the client, M1 and N1 separately. Preserve all
-completed populations, ACK journals, fault checks and adverse measurements; do
-not restart the million-object campaign routinely.
+Use the selected artifact identities in the
+[N1 publication qualification](N1-MIXED-WORKLOAD-20261116.md#publication-follow-up-on-both-minimum-storage-profiles)
+and [M1 concurrent-maintenance report](M1-MAINTENANCE-20261116.md). Hold N1 fixed
+while measuring M1. Attribute costs to the client, M1 and N1 separately.
+Preserve completed populations, ACK journals, fault checks and adverse
+measurements; do not restart the million-object campaign routinely.
 
 | Target window | Work | Evidence needed to close the stage |
 | --- | --- | --- |
-| November 13–17 | M1 baseline, profiling and necessary optimization | Matched standalone and named paths on the same N1/pool; small and large objects; normal/durable, multipart geometry, init/status/finalize; per-process CPU/RSS/I/O and individual latency samples; complete payload/version verification and affected regressions |
-| Monday, November 16 | Four-HDD recovery and power-loss window | Complete the hardware/independent-ACK-recorder preflight, record actual four-HDD and power-cut outcomes using the Monday checklist, and retain unfinished gates explicitly |
-| November 18–20 | Full-stack resource and maintenance qualification | Bounded saturation with monitoring, GC, backup and migration; isolated disk-full, memory-pressure, stalled-I/O and connection failures; all acknowledged data retained and incomplete publications refused |
-| November 21–23 | Remaining hardware gates and final-candidate reconciliation | Preserve November 16 evidence; close unfinished four-HDD/power-loss cases and qualify affected runtime changes against the externally retained ACK journal |
-| November 24 | Candidate freeze and contract/Console closure | Exact source/build/binary identities; complete required NOA v1/v2 and operator workflow matrix; affected scale coverage reconciled with existing evidence; final regression |
-| November 25 | Go/no-go review | Every required row in the completion checklist has a result, evidence and an explicit disposition; unresolved data-integrity, durability or accepted-performance failures mean no-go |
-| November 26–27 | Packaging and release preparation | Clean installation/startup/configuration, binary versions and checksums, documentation and release notes checked against the frozen candidate; publish only on operator instruction |
+| Before November 20 | Preserve the selected N1 checkpoint and prepare M1/system checks | Keep established N1 paths fixed; retain existing populations and matched performance results; add only missing qualification coverage and correct demonstrated failures |
+| From around November 20 | Full-stack resource, maintenance and operator qualification | Mixed traffic with monitoring, GC, backup and migration; isolated disk-full, memory-pressure, stalled-I/O and connection failures; all acknowledged data retained and incomplete publications refused |
+| Operator hardware window | Four-HDD recovery and physical power loss | Complete hardware/independent-ACK-recorder preflight; record actual four-HDD and power-cut outcomes; qualify affected changes against retained ACKs |
+| After required checks pass | Candidate freeze, contract closure and go/no-go review | Exact source/build/binary identities; required NOA v1/v2 and Console matrix; affected scale evidence reconciled; final regression; unresolved required failures mean no-go |
+| After go decision | Packaging and RC.2 preparation | Clean installation/startup/configuration, binary versions, checksums, documentation and release notes match the frozen candidate; publish only on operator instruction |
+| RC period through February 14, 2027 target | Real-deployment validation before stable 1.0.0 | Retain deployment failures, recovery and performance evidence; resolve release-blocking defects and qualify the final stable candidate before publication |
 
 Use the available SSD and two-HDD test systems for preparation. Four-HDD
 qualification and physical power interruption require the corresponding

@@ -1,7 +1,8 @@
 # N1 and M1 four-HDD qualification checklist — November 16, 2026
 
-**Scheduled: Monday, November 16, 2026, Asia/Manila.** The start time and operator
-window will be established on site. This is a preparation checklist, not a test
+**Preparation checklist.** Full qualification is planned to begin around
+November 20, 2026, Asia/Manila; the hardware start time and operator window still
+need confirmation. This checklist records preparation, not a test
 result or an automated power-cut job. No tests or power cuts have been performed
 under this checklist. Use the [hardware reporting profiles](TEST-PROFILES.md).
 

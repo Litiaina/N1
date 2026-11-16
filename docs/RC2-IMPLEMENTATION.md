@@ -11,12 +11,13 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
-**Recommended qualification schedule — November 13:** target November 27 for
-RC.2, with a November 25 go/no-go review (Asia/Manila). The
-[release plan](RC2-RELEASE-PLAN.md) orders the remaining work and evidence.
-Required gates still control release; a target date does not waive failures.
+**Operator schedule:** begin full N1 and M1 qualification around **November 20,
+2026** (Asia/Manila). Release RC.2 after its required gates pass. Target stable
+**1.0.0 on February 14, 2027**, conditional on qualification and the intervening
+real-deployment evidence. The [release plan](RC2-RELEASE-PLAN.md) orders the work;
+target dates do not waive failures.
 
-**Next hardware window:** Monday, November 16, 2026 (Asia/Manila), on the four-HDD reference system.
+**Hardware preparation:** use the four-HDD reference system in the operator's confirmed window.
 [The preparation checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md) covers hardware,
 independent ACK recording, four-drive recovery, controlled power loss and
 acceptance evidence. This is scheduled work, not a completed qualification.
@@ -256,6 +257,7 @@ the four-HDD reference system topology and physical power-loss gates.
 
 | Area | Remaining work / acceptance condition |
 | --- | --- |
+| Concurrent maintenance | The [November 16 two-profile scenario](M1-MAINTENANCE-20261116.md) passes mixed M1 → N1 traffic with concurrent GC, monitoring and live metadata backups: 11,259 measured operations, full post-SIGKILL verification, four snapshot restores and marker-only cleanup. Both runtimes stay fixed; maintenance costs and stale telemetry remain recorded. Broader saturation, coordinated recovery and complete operator/alert acceptance remain separate. |
 | Full NOA v1 surface | Direct archive/manifest routes are implemented. Native ZIP64/TAR/manifest responses now stream with a length calculated during immutable metadata capture; the >8 MiB failure reproduces on the old binary and passes on the corrected M1, including cleanup and existing archive faults. See [Four-HDD reference system continuation](FOUR-HDD-OPTIMIZATION-20261113.md). Complete field-level responses, permissions, errors and retry qualification against the original standard remain required. Scoped GC/healing/migration have explicit physical and browser coverage. Registered route names alone are insufficient. |
 | Export lifecycle | Indexed TTL cleanup, transactional retained-byte reservations and bounded restart admission are implemented. Four new real-process lifecycle/error-isolation cases and the existing service checks pass on the four-HDD reference system (21 total). The SSD/two-HDD profile’s eight-phase same-database screen records nearly equal M1 CPU but a 13.6% higher candidate upload mean with substantial phase variation; performance acceptance remains open. See the November 11 handover and split-node report. |
 | Named-service recovery | Full metadata/staging loss, verified snapshot restore, named history/permissions/resume and metadata/object/both process crashes pass on two local HDDs. The current-finalization integration exposed lost volatile completion after a partial-upload restart; M1 now performs narrowly triggered, byte/part-bounded public status reconciliation and one retry. Four real resume cases and the ten current two-HDD reliability cases pass; see [SSD/HDD qualification](TWO-HDD-QUALIFICATION-20261113.md). Preserve the documented operator pause; independent live captures are not an atomic cross-service snapshot. Qualify host power loss and additional crash points separately. |

@@ -36,6 +36,8 @@ mod gc_concurrent;
 mod lost_allocation;
 #[path = "noa_service/maintenance.rs"]
 mod maintenance;
+#[path = "noa_service/maintenance_load.rs"]
+mod maintenance_load;
 #[path = "noa_service/monitoring.rs"]
 mod monitoring;
 #[path = "noa_service/monitoring_performance.rs"]

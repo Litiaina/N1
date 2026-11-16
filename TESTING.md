@@ -54,6 +54,16 @@ actually used. Version formalization does not relabel those artifacts.
 
 ## Recent qualification reports
 
+The [November 16 M1 concurrent-maintenance scenario](docs/M1-MAINTENANCE-20261116.md)
+holds both engines fixed across two-HDD and two-SATA-SSD 1+1 profiles. Mixed
+uploads, reads/ranges, rename and trash run with and without GC, monitoring and
+live metadata backups. All **11,259 measured operations / 1,839 identities**
+pass, including complete post-SIGKILL payload/version/absence verification,
+four restored snapshots and marker-only final member cleanup. Off/on resource
+and latency results, stale monitoring samples and the corrected smoke assumption
+are preserved. This is one new scenario exercised on two profiles; no runtime
+change or replacement million-object campaign follows.
+
 The [November 16 standalone mixed workload](docs/N1-MIXED-WORKLOAD-20261116.md)
 holds N1 fixed and runs large/small uploads, video ranges, full downloads and
 deletes together, with five, fourteen and five paced application sessions on
