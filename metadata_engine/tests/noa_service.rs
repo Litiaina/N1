@@ -48,6 +48,8 @@ mod multipart_bridge;
 mod multipart_geometry;
 #[path = "noa_service/object_recovery.rs"]
 mod object_recovery;
+#[path = "noa_service/object_status.rs"]
+mod object_status;
 #[path = "noa_service/preparation_bench.rs"]
 mod preparation_bench;
 #[path = "noa_service/reliability.rs"]
