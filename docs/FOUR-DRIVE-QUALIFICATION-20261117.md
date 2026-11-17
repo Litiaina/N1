@@ -1,6 +1,6 @@
 # N1 RC.2 and M1 RC.1 four-drive qualification — November 17, 2026
 
-**Four-drive recovery/operator checks and two coordinated physical
+**Four-drive recovery/operator checks and three coordinated physical
 power-loss windows passed. No release or tag.** This continues the current N1 checkpoint
 and qualifies M1 against four physical SATA HDDs. Earlier million
 populations and four-drive campaigns remain preserved with their original
@@ -397,9 +397,62 @@ match their complete source length/SHA-256 and M1 version where applicable,
 and all **seven required absences** hold. No recovery upload or repair is sent.
 An isolated copy of the cold M1 database passes the offline check with **250
 records / 4,902,996 disk bytes**. The cold member census matches the preceding
-148-file census exactly after normalizing the two report formats. The first
-direct comparison rejects their different path/header formats; the original
+148-file census exactly after normalizing the two report formats. Both original
 inventories are retained alongside the normalized comparison.
+
+## Third physical power removal — strict multipart reception
+
+After the retained corpus verifies, two new external writers each start a
+378 MiB + 17-byte normal-mode control and a strict multipart upload of the same
+size. The controls finalize and pass complete readback. Both strict uploads then
+have durable part ACKs saved on the independently powered client before the
+fresh cut cue. The operator removes the power plug and confirms the server and
+all four HDDs are off while both uploads are incomplete.
+
+The native journal retains **48 strict part ACKs** and the M1 journal **46**.
+Their outstanding requests are parts 48 and 46 respectively; both ultimately
+fail without a successful reply. The recorders drain normally and retain **233
+and 229 complete records**, including the uncertain outcomes. No client is killed
+to manufacture the disconnect. The operator reconnects power only after both
+journals are saved. This is a physical cut during strict payload reception,
+without claiming an exact fsync/commit instruction as the cut point.
+
+The next boot retains the same four filesystems, pool identities and selected
+binary hashes. All four XFS filesystems complete log recovery, each HDD's power
+counter advances once again, and the monitored sector/interface-error counts
+are unchanged. Cold M1/control files are copied outside the server before the
+private services start. The isolated cold database check passes with **276
+records / 5,419,092 disk bytes**.
+
+Read-only verification of all ten retained journals succeeds before any
+recovery writes:
+
+| Required state | Result |
+| --- | --- |
+| Previously completed objects, including both new controls | **34**, exact length/SHA-256 and M1 version where applicable |
+| Acknowledged native purges / metadata trash absences | **7**, all still absent |
+| Strict native / M1 part ACKs | **48 / 46**, all **94** retained |
+| Unfinished objects with no finalize attempt | Both remain unreadable |
+| Missing native / M1 parts | **16 / 18**, including each 17-byte tail |
+
+Explicit recovery sends only those 34 missing parts, preserving both original
+LINK identities, the M1 session/version and every earlier ACK. Both uploads
+finalize and pass full source readback. The complete retained corpus is now
+**43 identities: 36 live and seven purged/trashed**. The earlier populations
+are not recreated or counted as new uploads.
+
+The final read-only deep audit passes for **17 live native objects** and all
+**23 M1-referenced versions**, including four trash references: **40 backing
+objects / 160 shards**, with no missing, corrupt or unavailable shards. M1's
+diagnostic verifies **4,208,984,455 logical bytes**, with zero failed or deferred
+versions. No repair is requested.
+
+After cleanly stopping only the private services, M1's offline check passes
+with **282 records / 5,664,852 disk bytes**. The member census contains exactly
+**160 shard files plus four pool markers**, no symlinks and no `.uploads/`
+files. Both server binaries stay unchanged. The fault recorders serialize
+requests and synchronize their external journals; their run times are not
+ordinary upload-throughput measurements.
 
 ## Evidence and remaining work
 
@@ -409,7 +462,9 @@ attempts, fault oracles, service logs, browser results and raw measurements.
 All engine workloads and fault logic are Rust; browser coverage uses the existing
 Node/Playwright workflows. No Python is used.
 
-The first operator-confirmed power cut now has independent ACK/recovery evidence.
-Process/member-fault checks and this physical window retain their actual fault
-classifications; broader power/transition acceptance is not inferred. Full release acceptance remains in
+All three operator-confirmed cuts have independent evidence: readback after
+publication, an idle extended corpus and strict multipart reception. These
+recorded physical windows pass; exact publication/checkpoint/repair/GC power
+cut points and other unexecuted cases retain their separate scope. No further
+cut is scheduled by this checkpoint. Full release acceptance remains in
 [the completion checklist](RC2-IMPLEMENTATION.md).

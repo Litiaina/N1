@@ -3,10 +3,11 @@
 **Active checklist, updated November 17, 2026.** The operator opened the
 four-drive window early, ahead of the planned November 20 start. See the
 [recorded results](FOUR-DRIVE-QUALIFICATION-20261117.md) for completed checks,
-remaining performance observations and original failures. The first physical
-power-cut window now passes independent ACK/recovery verification. It lands
-during readback after publication; active-write and other transition windows
-keep their separate scope. This file
+remaining performance observations and original failures. Three physical
+power-cut windows now pass independent verification: readback after publication,
+idle services and strict multipart reception. The last preserves all 94 strict
+part ACKs before recovery. Other exact transition windows keep their separate
+scope. This file
 is not an automated power-cut job. Use the [hardware reporting profiles](TEST-PROFILES.md).
 
 Use the four-HDD reference system to qualify N1 and M1 recovery and begin
@@ -29,7 +30,7 @@ are in [the completion checklist](RC2-IMPLEMENTATION.md).
 - [x] Place M1's database and staging on the designated SSD/NVMe, and N1's
   private pool members on the four HDDs. Record control/build/log paths too.
   Capacity must cover the selected payloads, staging, backups and retained logs.
-- [ ] Use fresh task-private directories without formatting or erasing existing
+- [x] Use fresh task-private directories without formatting or erasing existing
   datasets. List all services affected by loss of power to this host and arrange
   their operator-controlled maintenance window before the first cut.
 - [x] Keep the client, acknowledgement journal and control connection on a
@@ -80,6 +81,13 @@ journals verify before explicit missing-part-only recovery. The offline database
 check and exact shard census also pass. This is one recorded physical window,
 not every transition in the matrix below.
 
+Two later physical cuts retain the extended corpus, including an interruption
+during strict uploads on both paths. All ten journals verify before recovery:
+34 complete objects, seven absences and 94 strict part ACKs. Missing-part-only
+resume, a read-only 160-shard audit, the final offline database and exact member
+census pass. These three recorded cuts do not certify the unexecuted exact
+instruction windows in the matrix below. No further cut is scheduled here.
+
 - Keep N1's selected runtime and ECS Core revision
   `c77c638bfb709368f49517f2828fa977738e8467` fixed. No dependency upgrade or
   engine redesign is part of this preparation.
@@ -88,7 +96,7 @@ not every transition in the matrix below.
   evidence with their original identities; verify the copied checksums before
   starting on the reference system.
 - The November 17 checkpoint completes the hardware inventory, separately
-  powered recorder dry run and first operator-confirmed physical cut. Process
+  powered recorder dry run and three operator-confirmed physical cuts. Process
   interruption and the remaining physical transition windows retain their
   separate classifications.
 

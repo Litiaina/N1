@@ -36,6 +36,14 @@ strict parts verify. Missing-part-only recovery and the offline metadata/physica
 census pass. This closes that recorded prior-ACK window, not the remaining
 active-write/transition or final release acceptance conditions.
 
+Two subsequent physical cuts retain the expanded corpus: an idle-service cut
+and a cut during strict multipart reception on both N1 and M1 paths. All 94
+strict part ACKs verify before missing-part-only recovery. The final 43-identity
+corpus, all 160 retained shards, the 282-record offline database and exact
+member census pass with both server binaries unchanged. This closes the
+recorded strict-upload power-loss window; unexecuted exact transition windows
+and final system acceptance remain separately tracked below.
+
 The [first preparation batch](M1-ACCEPTANCE-20261113.md) holds N1 fixed, reduces
 M1's observed bridged-upload CPU cost and passes 418 workspace checks, the same
 seven selected service cases on SSD and two HDDs, and separate object-full/

@@ -59,6 +59,14 @@ An additional operator-confirmed physical cut of the idle services retains that
 any recovery writes. The cold database's 250 records and exact member census
 also pass. This second interruption is recorded separately from active uploads.
 
+The third physical cut occurs during strict multipart reception on both paths.
+All **94 strict part ACKs**, 34 completed objects and seven required absences
+verify before recovery writes. Missing-part-only resume completes under the
+original identities. All **40 backing objects / 160 shards** pass the final deep
+audit; the 282-record offline database and exact 164-file census also pass.
+The retained corpus is **43 identities: 36 live and seven purged/trashed**.
+Both server executable hashes remain unchanged throughout the three cuts.
+
 ## Component and system version checks
 
 The current targets are complete system `1.0.0-RC.2`, N1 `1.0.0-RC.2` and
