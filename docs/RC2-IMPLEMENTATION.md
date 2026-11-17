@@ -29,6 +29,13 @@ M1 stale-connection read-control failure. Matched timing retains adverse tails
 and an independently measured slow HDD; it does not establish universal
 performance parity or complete hardware power-loss acceptance.
 
+The same report now records the first operator-confirmed physical power cut:
+all four HDDs lose power while independent clients retain ACKs. Before explicit
+resume, 20 complete objects, four required absences and both pending uploads'
+strict parts verify. Missing-part-only recovery and the offline metadata/physical
+census pass. This closes that recorded prior-ACK window, not the remaining
+active-write/transition or final release acceptance conditions.
+
 The [first preparation batch](M1-ACCEPTANCE-20261113.md) holds N1 fixed, reduces
 M1's observed bridged-upload CPU cost and passes 418 workspace checks, the same
 seven selected service cases on SSD and two HDDs, and separate object-full/

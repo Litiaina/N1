@@ -3,8 +3,10 @@
 **Active checklist, updated November 17, 2026.** The operator opened the
 four-drive window early, ahead of the planned November 20 start. See the
 [recorded results](FOUR-DRIVE-QUALIFICATION-20261117.md) for completed checks,
-remaining performance observations and original failures. Physical power loss
-will be coordinated last; none has been performed in this window. This file
+remaining performance observations and original failures. The first physical
+power-cut window now passes independent ACK/recovery verification. It lands
+during readback after publication; active-write and other transition windows
+keep their separate scope. This file
 is not an automated power-cut job. Use the [hardware reporting profiles](TEST-PROFILES.md).
 
 Use the four-HDD reference system to qualify N1 and M1 recovery and begin
@@ -30,10 +32,10 @@ are in [the completion checklist](RC2-IMPLEMENTATION.md).
 - [ ] Use fresh task-private directories without formatting or erasing existing
   datasets. List all services affected by loss of power to this host and arrange
   their operator-controlled maintenance window before the first cut.
-- [ ] Keep the client, acknowledgement journal and control connection on a
+- [x] Keep the client, acknowledgement journal and control connection on a
   separate powered computer. A battery-powered laptop is suitable if its journal
   is synchronized to persistent storage. Keep the network equipment powered.
-- [ ] Identify the exact switched power feed and confirm that it removes power
+- [x] Identify the exact switched power feed and confirm that it removes power
   from the test server and every tested drive, including separately powered enclosures.
   Record manual switching or the actual PDU mechanism. A reboot, reset, process
   kill or USB disconnect is a different fault and must be labelled accordingly.
@@ -72,8 +74,11 @@ The [external Rust recorder](../metadata_engine/examples/power_loss_witness/READ
 passes clean N1/M1 checks and two process-interruption/reopen/recovery dry runs.
 All prior successful replies remain on the independently powered client's HDD;
 verification precedes recovery and retained strict parts are not resent.
-These results prepare the physical-cut window; the operator power-feed and
-shared-service outage confirmation are still pending. No hardware cut is claimed.
+The operator subsequently confirms the power feed and shared-service outage,
+removes the plug and restores power after both clients drain. All six retained
+journals verify before explicit missing-part-only recovery. The offline database
+check and exact shard census also pass. This is one recorded physical window,
+not every transition in the matrix below.
 
 - Keep N1's selected runtime and ECS Core revision
   `c77c638bfb709368f49517f2828fa977738e8467` fixed. No dependency upgrade or
@@ -82,9 +87,10 @@ shared-service outage confirmation are still pending. No hardware cut is claimed
   version/interoperability logs. Keep existing population journals and earlier
   evidence with their original identities; verify the copied checksums before
   starting on the reference system.
-- The November 17 checkpoint completes the hardware inventory and separately
-  powered recorder dry run. The actual power window remains pending; process
-  interruption does not establish hardware power-loss durability.
+- The November 17 checkpoint completes the hardware inventory, separately
+  powered recorder dry run and first operator-confirmed physical cut. Process
+  interruption and the remaining physical transition windows retain their
+  separate classifications.
 
 - [x] Record source commit, compiler, build flags, executable hashes, effective
   INI settings, durability modes and pool geometry. Hold the selected N1 runtime
@@ -103,7 +109,7 @@ shared-service outage confirmation are still pending. No hardware cut is claimed
 - [x] Dry-run the recorder against an isolated fixture: interrupt the connection,
   reopen its journal, and confirm complete records, exact expected ACKs and
   recovery without replacing them with a new population.
-- [ ] Distinguish failed/unknown requests from successful replies. After a cut,
+- [x] Distinguish failed/unknown requests from successful replies. After a cut,
   drain any complete replies already in flight and synchronize the final ACK
   set before verification. A successful durable reply must not be excluded just
   because it arrived near the cut.

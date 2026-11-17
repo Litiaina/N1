@@ -1,7 +1,7 @@
 # N1 RC.2 and M1 RC.1 four-drive qualification — November 17, 2026
 
-**Four-drive recovery and operator checks passed; hardware power loss is not
-yet performed. No release or tag.** This continues the current N1 checkpoint
+**Four-drive recovery/operator checks and the first coordinated physical
+power-loss window passed. No release or tag.** This continues the current N1 checkpoint
 and qualifies M1 against four physical SATA HDDs. Earlier million
 populations and four-drive campaigns remain preserved with their original
 artifact identities; none is restarted by this stage.
@@ -18,8 +18,10 @@ copied to a separate computer's evidence HDD.
 
 No filesystem is reformatted or unmounted. Member loss detaches newly created
 private directories; corruption targets only the corresponding private shards.
-Existing services and datasets are outside the fault targets. CPU policy and
-ordinary competing activity remain unchanged. Host power is not interrupted.
+Directory/member faults target only the private datasets. CPU policy and
+ordinary competing activity remain unchanged. The later physical-cut window
+explicitly includes the whole host and all four drives, with the operator's
+authorization for existing services to go offline.
 
 N1 stays at SHA-256
 `f1a54f1653c1c90ae51416fa1f53474855cc20e1ea7ef52e0561af2c8c166aab`,
@@ -255,11 +257,71 @@ clean M1 case and interrupted M1 recovery above.
 
 This closes recorder preparation for its initial upload/finalize/absence window.
 It does not simulate or certify physical power loss, nor establish exact hardware
-cut timing during checkpoint, repair or GC. The operator still needs to confirm
-the actual server/drive power feed and existing-service outage window, keeping
+cut timing during checkpoint, repair or GC. At this preparation checkpoint, the
+operator still needs to confirm the actual server/drive power feed and existing-service outage window, keeping
 the recorder and network powered. The existing private 3+1 fixture, original
 ACK journals and all earlier populations remain available; physical interruption
 is deliberately the last coordinated stage.
+
+## Physical power removal — first window
+
+After the other checks, the operator physically removes the server's power plug
+and confirms that the server and all four SATA HDDs are off. The client laptop,
+its journal HDD and the network remain powered. Both external recorders are
+already running, and keep recording complete successful replies independently
+of the server. This is a physical power interruption, not a reboot or process
+kill. The operator reconnects power only after both recorders have drained and
+their journals are retained.
+
+Each recorder creates six identities and saves 69 complete journal records.
+Its last mutation is a successful finalize for object 5; the cut interrupts the
+subsequent readback. N1 eventually reports a stalled source and M1 reports an
+interrupted response body. No later mutation intent or complete reply is omitted.
+This window therefore tests prior durable publication, retained strict staging
+and deletion across power loss. It is **not** labelled a cut during an in-flight
+payload write or at an exact publication instruction.
+
+The host returns with a different boot ID and the same four XFS mounts, pool
+markers and executable hashes. Kernel logs show starting/ending XFS log recovery
+on all four filesystems. Cold M1/control files are copied outside the server
+before opening either test service. The original INI files are then used for
+ordinary startup; the pool and database are never reinitialized.
+
+Read-only verification of all six retained journals succeeds before explicit
+resume, including the four earlier dry-run journals:
+
+| Still-required state after physical power loss | N1 client | M1 client | Combined |
+| --- | ---: | ---: | ---: |
+| New completed objects, full length/SHA-256 (M1 also version) | 4 | 4 | 8 |
+| New acknowledged deletion/absence | 1 physical purge | 1 metadata trash | 2 |
+| New pending upload / retained strict part ACKs | 1 / 2 | 1 / 2 | 2 / 4 |
+| Earlier completed objects, full readback | 6 | 6 | 12 |
+| Earlier acknowledged deletion/absence | 1 | 1 | 2 |
+
+Thus **20 completed objects, four required absences and both incomplete uploads'
+four strict part ACKs survive**. The 26 identities are the retained corpus, not
+a replacement population. Explicit recovery then sends only missing parts 1
+and 3 for each new incomplete upload, preserving acknowledged parts 0 and 2.
+Both finalize and pass complete SHA-256/version readback. The final logical
+census is **22 complete objects plus four deleted/trashed identities**.
+
+After stopping only the private test services cleanly, M1's offline check passes
+with **154 verified records / 712,788 engine-reported disk bytes**. The four
+members contain exactly **96 shard files plus four pool markers**, and no files
+under `.uploads/`. Two native purges remove their backing identities; the two
+M1 trash entries intentionally retain backing blobs until their configured TTL
+and GC. No permanent per-deletion object record is added.
+
+The boot journal also retains an unrelated preinstalled service's address-in-use
+restart loop. The preceding boot's logs show the same failure before this test;
+it is not a failure of either selected private executable. The unit is not
+modified. Raw boot/kernel, pre/post-service, cold-control, operator-coordination,
+ACK and recovery evidence remains outside the server.
+
+This closes the recorded physical-cut window and its prior-ACK guarantees on
+the selected 3+1 installation. Active-write, exact transition, larger-EC physical
+power cuts and broader repetitions retain their own scope; no universal
+power-loss or RC.2-ready claim follows from this one cut.
 
 ## Evidence and remaining work
 
@@ -269,7 +331,7 @@ attempts, fault oracles, service logs, browser results and raw measurements.
 All engine workloads and fault logic are Rust; browser coverage uses the existing
 Node/Playwright workflows. No Python is used.
 
-Actual hardware power-loss qualification requires the separate operator window
-and independently powered durable ACK recorder. Process kills and detached
-member directories do not close that gate. Full release acceptance remains in
+The first operator-confirmed power cut now has independent ACK/recovery evidence.
+Process/member-fault checks and this physical window retain their actual fault
+classifications; broader power/transition acceptance is not inferred. Full release acceptance remains in
 [the completion checklist](RC2-IMPLEMENTATION.md).

@@ -39,8 +39,12 @@ layouts; mutation commands keep their existing replay rules. Matched small and
 1 GiB measurements retain adverse tails and low transfer rates. An independent
 Rust storage control also finds a slow member outside both engines. See the
 report for exact counts, original failed attempts, the monitoring-test deadline
-correction and artifact identities. Hardware power loss remains a separate,
-operator-coordinated final stage; none is claimed from process faults.
+correction and artifact identities. The subsequent operator-confirmed physical
+power cut passes: all six retained ACK journals verify before recovery, including
+20 complete objects, four required absences and both incomplete uploads' strict
+parts. Missing-part-only resume, the offline database check and exact shard census
+also pass. This first cut lands during readback after publication; it does not
+stand in for the separate active-write/transition windows.
 
 ## Component and system version checks
 
