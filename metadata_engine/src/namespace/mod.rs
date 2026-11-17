@@ -10,3 +10,4 @@ pub(crate) mod store;
 
 pub(crate) use store::PendingUpload;
 pub use store::{Namespace, NamespaceFile, NamespaceFilePage, PublishedVersion, UploadHandle};
+pub use store::{SearchField, SearchMatch, SearchPage, SearchSpec};

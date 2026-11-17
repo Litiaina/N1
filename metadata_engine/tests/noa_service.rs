@@ -64,6 +64,8 @@ mod resume_listing;
 mod resume_progress;
 #[path = "noa_service/resume_scale.rs"]
 mod resume_scale;
+#[path = "noa_service/search.rs"]
+mod search;
 #[path = "noa_service/single_part.rs"]
 mod single_part;
 #[path = "noa_service/staged_recovery.rs"]

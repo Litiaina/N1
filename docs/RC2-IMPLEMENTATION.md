@@ -19,6 +19,11 @@ pass. Console identifies M1 and N1 separately and retains its desktop interface.
 This closes the recorded UI/launcher regressions; final release acceptance and
 the exact scope of the earlier hardware campaigns remain separate.
 
+The same report's [native search qualification](M1-CONSOLE-20261117.md#native-m1-search--november-18-2026)
+adds bounded M1 search without Accel: 113 default M1 checks and ten explicit
+service cases pass. N1 and the database format remain unchanged. Console
+handles unknown totals and sparse continuation pages; no release is implied.
+
 **Operator schedule:** the four-drive window opened early on **November 17,
 2026**, ahead of the planned November 20 start (Asia/Manila). Continue full N1
 and M1 qualification; perform coordinated physical power loss last. Release
@@ -249,7 +254,7 @@ fixture/setup errors out of pass counts while retaining their logs.
 | N1 runtime infrastructure | Retained module structure, adaptive concurrency, I/O scheduler, io_uring, aligned O_DIRECT large uploads, middleware, server, streaming reads, banner and backup automation |
 | Operator controls | INI/environment startup; IP/ports/TLS; immutable pool enrollment/append; concurrency, memory, I/O, rate, GC and healing controls |
 | M1 database (`m1_storage`) | Independently implemented ordered copy-on-write tree, optimistic transactions, synchronized group commits, cross-table snapshots, bounded cache/scans and online checkpoints; replacement qualification tracked separately |
-| M1 named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
+| M1 named metadata service | Logical fragments and permissions; pending upload identity; atomic named publication; max-ULID version selection; namespace/listings; bounded native name/path/extension search; rename/trash/recovery; native byte forwarding and original multipart geometry bridge |
 | Public adapters | Main named NOA v1 HTTP/WebSocket and native operations; independent direct LINK NOA v2; original Console runtime/proxy retained |
 | Exports and direct archives | Retained version-pinned ZIP64/TAR writer; direct selected/manifest archives with bounded workers, cancellable capture and M1-owned crash cleanup; export job state, range and signed downloads |
 | M1 request quotas | Shared physical-peer auth/global limits and canonical-fragment read/upload limits across HTTP/native; disabled policy skips admission work; forwarding headers cannot choose the peer |

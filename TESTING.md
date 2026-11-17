@@ -541,6 +541,25 @@ rename/trash on fixed names, with byte verification after each phase. Its
 RAM-only mode separates software cost from HDD waits; it is not durability
 qualification.
 
+## Native M1 namespace search — November 18, 2026
+
+Native search's six unit cases exercise matching, namespace visibility,
+fragment isolation, cursor pagination and the 4,096-entry work cap.
+The opt-in Rust service case
+`search::native_search_permissions_pagination_restart_and_console_without_accel`
+uses real M1/N1 binaries and Console, including concurrent reads/writes and
+signed-cursor query binding and continuation across an M1 process crash.
+Pure search must submit no N1 payload
+I/O. The existing Accel and private-CA cases also verify native fallback while
+retaining upstream TLS rejection and provider-specific cursors.
+
+The [qualification report](docs/M1-CONSOLE-20261117.md#native-m1-search--november-18-2026)
+records the selected binary, 113 default checks, ten explicit service checks,
+browser regressions and the measured small-catalogue latency distribution.
+Use the existing explicit private-root/binary/browser settings for service
+tests. Search changes neither N1 nor M1's storage format; previous populations
+are preserved rather than rerun as new evidence.
+
 ## RC.2 preparation — November 7, 2026
 
 The initial preparation checkpoint passes **479 default tests**, with **44 explicit

@@ -111,6 +111,20 @@ async fn configured_accel_uses_authorized_pinned_reads_and_namespace_search_with
     assert!(search.headers().contains_key("x-accel-search"));
     let search: Value = search.json().await.unwrap();
     assert!(search.to_string().contains("media/video.bin"), "{search}");
+    maintenance::put(&client, &base, &token, "UPPER/Case.bin", b"case").await;
+    for (scope, count) in [("UPPER", 1), ("upper", 0)] {
+        let scoped = client
+            .get(format!("{base}/namespace/search"))
+            .bearer_auth(&token)
+            .query(&[("q", "case"), ("scope", scope)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), 200);
+        assert_eq!(scoped.headers()["x-m1-search"], "native");
+        let scoped: Value = scoped.json().await.unwrap();
+        assert_eq!(scoped["results"].as_array().unwrap().len(), count);
+    }
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", stack.native))
         .await
         .unwrap();
@@ -157,6 +171,7 @@ async fn configured_accel_uses_authorized_pinned_reads_and_namespace_search_with
     let new_token = json_response(client.post(format!("{base}/auth/fragment"))
         .json(&json!({"fragment":alias,"secret":"replacement-fragment-key","read":true,"write":true,"modify":true,"delete":true})).send().await.unwrap(), 200).await;
     let token = new_token["access_token"].as_str().unwrap();
+    maintenance::put(&client, &base, token, "media/video-copy.bin", b"second").await;
     let read = client.get(&url).bearer_auth(token).send().await.unwrap();
     assert!(read.headers().contains_key("x-accel-cache"));
     assert_eq!(read.bytes().await.unwrap().as_ref(), payload);
@@ -165,16 +180,63 @@ async fn configured_accel_uses_authorized_pinned_reads_and_namespace_search_with
     assert_eq!(read.status(), 200);
     assert!(!read.headers().contains_key("x-accel-cache"));
     assert_eq!(read.bytes().await.unwrap().as_ref(), payload);
-    assert_eq!(
-        client
-            .get(format!("{base}/namespace/search?q=video.bin"))
+    let search = client
+        .get(format!("{base}/namespace/search?q=video.bin"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(search.status(), 200);
+    assert_eq!(search.headers()["x-m1-search"], "native");
+    let search: Value = search.json().await.unwrap();
+    assert!(search.to_string().contains("media/video.bin"), "{search}");
+    let first: Value = client
+        .get(format!("{base}/namespace/search?q=video&limit=1"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let continuation = first["continuation_token"].as_str().unwrap();
+    accel = Some(spawn(&binary, &[], &accel_root, "accel-restarted.log"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let available = client
+            .get(format!("{base}/namespace/search?q=video"))
             .bearer_auth(token)
             .send()
             .await
-            .unwrap()
-            .status(),
-        503
+            .unwrap();
+        if available.headers().contains_key("x-accel-search") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Accel did not resume"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let resumed = client
+        .get(format!("{base}/namespace/search"))
+        .bearer_auth(token)
+        .query(&[
+            ("q", "video"),
+            ("limit", "1"),
+            ("continuation_token", continuation),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), 200);
+    assert_eq!(resumed.headers()["x-m1-search"], "native");
+    let resumed: Value = resumed.json().await.unwrap();
+    assert_ne!(
+        resumed["results"][0]["object_key"],
+        first["results"][0]["object_key"]
     );
+    drop(accel.take());
 
     // A faulty accelerator may only cause a pre-header fallback. Once its
     // bytes are published, a truncated body must fail instead of being spliced

@@ -392,7 +392,11 @@ query or fragment; backend IDs accept letters, digits, `_` and `-`. Omit either
 URL to disable that integration; backend IDs default to `n1-primary`. M1 verifies
 permissions and resolves the version before using Accel. Failed read headers or
 invalid response geometry fall back to N1; a failed body ends the download.
-Search requires the optional accelerator and returns 503 when unavailable.
+Search works without the accelerator through bounded M1 metadata pages.
+Fresh unavailable acceleration falls back to M1; an existing Accel cursor
+retains its provider, so start a fresh search if that provider is unavailable.
+Scoped searches use M1's exact namespace path case. See the
+[search API](docs/api/M1.md#search-named-objects) for fields, limits and cursors.
 HTTPS uses the host trust store. The qualified Linux M1 build also accepts a
 private CA bundle through its **process/service environment**:
 

@@ -2,7 +2,7 @@ use super::*;
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
 
-const FRAGMENT: PoolId = PoolId([23; 16]);
+pub(super) const FRAGMENT: PoolId = PoolId([23; 16]);
 fn version(n: u128) -> String {
     Ulid::from(n).to_string()
 }
@@ -30,7 +30,7 @@ fn upload(n: u128) -> ObjectUpload {
         durable: true,
     }
 }
-fn reserve(namespace: &Namespace, path: &str, n: u128) -> UploadHandle {
+pub(super) fn reserve(namespace: &Namespace, path: &str, n: u128) -> UploadHandle {
     namespace
         .reserve_upload(
             FRAGMENT,
@@ -43,7 +43,7 @@ fn reserve(namespace: &Namespace, path: &str, n: u128) -> UploadHandle {
         )
         .unwrap()
 }
-fn publish(namespace: &Namespace, handle: &UploadHandle, n: u128) -> PublishedVersion {
+pub(super) fn publish(namespace: &Namespace, handle: &UploadHandle, n: u128) -> PublishedVersion {
     let upload = upload(n);
     namespace
         .publish(
@@ -69,7 +69,7 @@ fn stat() -> ObjectStat {
         integrity_root: "12".repeat(32),
     }
 }
-fn fixture() -> (tempfile::TempDir, Namespace) {
+pub(super) fn fixture() -> (tempfile::TempDir, Namespace) {
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     {

@@ -73,6 +73,10 @@ impl Accel {
         self.config.read.is_some()
     }
 
+    pub(crate) fn searches_enabled(&self) -> bool {
+        self.config.search.is_some()
+    }
+
     pub(crate) fn new(config: &Config) -> ApiResult<Self> {
         let client = if config.read.is_some() || config.search.is_some() {
             Some(

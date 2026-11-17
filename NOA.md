@@ -180,7 +180,11 @@ Deletion remains soft-only. TTL lifecycle owns final reclamation; NOA v1 does
 not add empty-trash, hard-delete, or per-version-delete semantics.
 
 Snapshot is a read-authorized NDJSON projection feed with a completion marker.
-Search proxies to optional Accel. Optional `N1_ACCEL_READ_URL` also accelerates
+Search works directly in M1 through bounded live-metadata pages, with optional
+Accel for indexed fragment-wide queries. Native pages can have unknown totals
+and empty results with a continuation; see the
+[search contract and examples](docs/api/M1.md#search-named-objects).
+Optional `N1_ACCEL_READ_URL` also accelerates
 version-pinned object bytes after M1 authorization/resolution, including existing
 Console media URLs. Pre-header failure falls back to N1; mid-stream failure
 terminates the response. Accel never becomes namespace or durability authority.
@@ -561,8 +565,10 @@ NOA v1 conformance pass**. Specific remaining differences include:
 - Request/response fields, permissions, errors and retry semantics require the
   complete contract campaign. Named request quotas and configured optional Accel
   search/read now have scoped HTTP/native integration tests, not a blanket
-  conformance result. Search returns 503 when Accel is absent or unavailable;
-  object reads preserve their pre-header origin fallback.
+  conformance result. Fresh search works without Accel and falls back to M1
+  when acceleration is unavailable; an existing Accel cursor retains its
+  provider and error semantics. Object reads preserve their pre-header origin
+  fallback.
 - Indexed metadata TTL reclamation, scoped integrity/healing and verified pool
   migration are implemented. Their remaining physical topology, scale and fault
   gates remain in the completion checklist. Metadata snapshots and object

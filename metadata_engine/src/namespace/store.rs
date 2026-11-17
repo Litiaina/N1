@@ -8,6 +8,8 @@ use ulid::Ulid;
 
 const ATTEMPTS: usize = 64;
 pub(crate) mod lifecycle;
+mod search;
+pub use search::{SearchField, SearchMatch, SearchPage, SearchSpec};
 type SnapshotFiles = (Vec<(RecordKey, PublishedVersion)>, Option<RecordKey>);
 pub(crate) struct ShallowEntry {
     pub path: String,

@@ -172,6 +172,17 @@ A rename racing the callback can miss, in which case M1 uses its already-resolve
 LINK reference. Cache response identity/geometry is checked before publishing
 headers. Mid-stream failure ends the response without a second origin stream.
 
+Namespace search also works without Accel. M1 searches live metadata heads
+through a request-scoped snapshot, with bounded batches, result limits and a
+signed query/fragment-bound keyset cursor. It examines at most 4,096 metadata
+entries plus one lookahead per page and performs no N1 payload I/O. Unknown
+match totals remain unknown; an empty bounded page may carry a continuation.
+Pages opened during concurrent mutations are live views, not a retained global
+snapshot. Configured Accel can still serve indexed fragment-wide searches;
+scoped searches retain M1's case-sensitive path boundary. Fresh unavailable
+acceleration falls back to M1, while existing cursors stay with their provider.
+No secondary records, database-format change or upload-path writes are added.
+
 M1's request quotas share actual-peer authentication/global budgets and canonical
 fragment view/upload budgets across HTTP and native clients. Native admission
 precedes raw-body transfer. Fragment limiter keys use the stable 16-byte identity;

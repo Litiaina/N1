@@ -74,7 +74,11 @@ async fn read(client: &Client, base: &str, token: &str, bytes: &[u8], cached: bo
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), if cached { 200 } else { 503 });
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().contains_key("x-accel-search"), cached);
+    assert_eq!(response.headers().contains_key("x-m1-search"), !cached);
+    let result: Value = response.json().await.unwrap();
+    assert_eq!(result["results"][0]["object_key"], "tls.bin");
 }
 
 async fn start(binary: &Path, root: &Path, port: u16) -> Process {

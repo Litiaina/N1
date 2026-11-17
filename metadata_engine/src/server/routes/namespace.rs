@@ -647,14 +647,6 @@ async fn bulk(
     }
     Ok(Json(json!({"affected":affected,"failed":failed})))
 }
-pub(super) async fn search(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    axum::extract::RawQuery(query): axum::extract::RawQuery,
-) -> ApiResult<Response> {
-    auth::authorize(&app, &headers, "read").await?;
-    app.accel.search(&headers, query.as_deref()).await
-}
 pub(super) async fn snapshot(
     State(app): State<Arc<App>>,
     headers: HeaderMap,

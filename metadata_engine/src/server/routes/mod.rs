@@ -2,6 +2,7 @@ mod auth;
 pub(crate) mod cursor;
 mod maintenance;
 mod namespace;
+mod namespace_search;
 pub(crate) mod read;
 mod upload;
 use super::App;
@@ -70,7 +71,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/noa/v1/trash", get(namespace::trash_list))
         .route("/noa/v1/trash/recover-all", post(namespace::recover_all))
         .route("/noa/v1/namespace/snapshot", get(namespace::snapshot))
-        .route("/noa/v1/namespace/search", get(namespace::search))
+        .route("/noa/v1/namespace/search", get(namespace_search::search))
         .route("/noa/v1/objects/meta/{*key}", get(read::metadata))
         .route("/noa/v1/objects/versions/{*key}", get(read::versions))
         .route("/noa/v1/objects/get/{*key}", get(read::get))
