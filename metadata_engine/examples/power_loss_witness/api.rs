@@ -66,7 +66,17 @@ impl Api {
                 }
                 let mut client =
                     N1NativeClient::connect_with_tls(&config.url, Some(tls(&config.ca)?)).await?;
-                client.auth_fragment(&config.fragment, &secret).await?;
+                // A bounded manual fault window can outlast the default
+                // fifteen-minute session. Request an existing allowed lifetime;
+                // keep the server's configured maximum and expiry enforcement.
+                client
+                    .control(Command::Login {
+                        fragment: config.fragment.clone(),
+                        secret,
+                        permissions: None,
+                        ttl_seconds: Some(3600),
+                    })
+                    .await?;
                 Ok(Self::N1(client))
             }
             Backend::M1 => {
@@ -341,6 +351,116 @@ impl Api {
                     Err(format!("unexpected absence status {}", response.status()).into())
                 }
             }
+        }
+    }
+
+    pub async fn assert_unpublished(&mut self, spec: &workload::Spec, plan: &Value) -> Result<()> {
+        match self {
+            Self::N1(client) => {
+                let mut sink = HashSink {
+                    hash: Sha256::new(),
+                    bytes: 0,
+                    limit: 1,
+                };
+                match client
+                    .download(text(plan, "object_key")?, 0, Some(1), &mut sink)
+                    .await
+                {
+                    Err(NativeClientError::Native { code, .. }) if code == "404" => Ok(()),
+                    Ok(_) => Err("an unfinalized native object is readable".into()),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Self::M1 { .. } => {
+                if self.absent(spec, plan).await? {
+                    Ok(())
+                } else {
+                    Err("an unpublished named object is readable".into())
+                }
+            }
+        }
+    }
+
+    pub async fn native_health(&mut self, plan: &Value) -> Result<Value> {
+        let Self::N1(client) = self else {
+            return Err("native audit requires N1".into());
+        };
+        Ok(client
+            .control(Command::ObjectHealth {
+                object_key: text(plan, "object_key")?,
+                deep: true,
+            })
+            .await?
+            .result
+            .ok_or("missing deep-health reply")?)
+    }
+
+    pub async fn fragment_health(&mut self) -> Result<Value> {
+        let Self::M1 {
+            client,
+            base,
+            token,
+        } = self
+        else {
+            return Err("fragment audit requires M1".into());
+        };
+        response(
+            client
+                .get(format!("{base}/maintenance/health?deep_scan=true"))
+                .bearer_auth(token.as_str())
+                .send()
+                .await?,
+        )
+        .await?;
+        let started = std::time::Instant::now();
+        loop {
+            let state = response(
+                client
+                    .get(format!("{base}/maintenance/pools/health"))
+                    .bearer_auth(token.as_str())
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let pools = state["pools"]
+                .as_array()
+                .ok_or("missing deep-audit pools")?;
+            if pools.iter().any(|pool| {
+                matches!(
+                    pool["integrity"]["status"].as_str(),
+                    Some("failed" | "incomplete")
+                )
+            }) {
+                return Err("M1 fragment deep audit failed or was incomplete".into());
+            }
+            if !pools.is_empty()
+                && pools
+                    .iter()
+                    .all(|pool| pool["integrity"]["status"] == "passed")
+            {
+                let mut checked = 0;
+                for pool in pools {
+                    let scan = &pool["integrity"];
+                    let count = scan["versions_checked"]
+                        .as_u64()
+                        .ok_or("missing deep-audit count")?;
+                    if scan["verified_versions"] != count
+                        || scan["failed_versions"] != 0
+                        || scan["deferred_versions"] != 0
+                    {
+                        return Err("deep audit did not verify every referenced version".into());
+                    }
+                    checked += count;
+                }
+                if checked == 0 {
+                    return Err("empty fragment audit is not a passing witness".into());
+                }
+                return Ok(state);
+            }
+            if started.elapsed() > Duration::from_secs(600) {
+                return Err("fragment audit deadline exceeded".into());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 

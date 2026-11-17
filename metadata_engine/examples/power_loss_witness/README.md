@@ -7,10 +7,18 @@ client and the network powered throughout a server interruption.
 
 Use only the task's private pool/database and credentials. Choose a native-aligned
 part size for the actual immutable pool. The example caps parts at 8 MiB and
-objects at three parts plus a 17-byte tail; these are witness bounds, not server
+uses three full parts plus a 17-byte tail by default; these are witness bounds, not server
 limits. One object is processed at a time, so every complete successful reply
 can be synchronized immediately before any next request. This is a recovery
 witness, not a throughput benchmark.
+
+An optional `payload_parts` configuration field selects 3–127 full parts plus
+the same 17-byte tail. For example, 63 with 6 MiB parts creates a 378 MiB object
+with 64 transfer parts, providing a longer active-write window for a manual
+power cut. Memory remains bounded by one part. The original default configuration
+encoding and retained journal bindings stay identical; existing ACKs can still
+be verified without replacing their population. Total journal operations are
+bounded independently of the server's object-size limits.
 
 ```sh
 cargo build --release --locked --offline -p m1 --example power_loss_witness
@@ -33,6 +41,8 @@ N1 uses `AUTH_KEY` from the private environment file. For M1, set `backend` to
 `m1`, use its HTTPS URL and existing private fragment hash, and supply a private
 file containing `MASTER_KEY`. Authentication tokens and credentials are never
 written to the ACK journal. TLS verification remains enabled.
+The native witness explicitly requests a one-hour access token for its bounded
+manual window; the server's configured access-token maximum is still enforced.
 
 ```sh
 # New journal only. Save stdout/stderr separately; do not interrupt the client
@@ -52,6 +62,11 @@ power_loss_witness verify --config /test/recorder/n1.json \
 power_loss_witness recover --config /test/recorder/n1.json \
   --journal /test/recorder/new-acks.jsonl \
   --report /test/recorder/recover-01.json
+
+# Separate read-only redundancy audit after recovery, outside throughput timing.
+power_loss_witness audit --config /test/recorder/n1.json \
+  --journal /test/recorder/new-acks.jsonl \
+  --report /test/recorder/deep-audit-01.json
 ```
 
 The first object is a fully published normal-mode control. Following objects
@@ -65,12 +80,21 @@ recorders from using the same journal. Reopening validates its sequence,
 configuration and complete lines without discarding a partial record.
 
 Verification checks every retained published object's length/SHA-256, M1 version,
-strict part progress and acknowledged absence. Normal intermediate ACKs and an
-unused Begin carry no power-loss persistence promise. An unacknowledged deletion
+strict part progress and acknowledged absence. An upload with no finalize attempt
+must still be unreadable. A finalize without a successful reply remains uncertain
+and may already have completed. Normal intermediate ACKs and an unused Begin
+carry no power-loss persistence promise. An unacknowledged deletion
 is recorded as uncertain and can be retried explicitly. Recovery refuses to
 resend an acknowledged strict part or recreate a wholly absent identity.
 M1 deletion means trash; N1 deletion means physical purge. This witness does not
 equate the two or silently run M1 GC.
+
+The separate audit requires every live native object's deep checksum result to
+have all configured shards present, no corruption/unavailable members, and the
+full expected verified length. For M1 it starts the existing fragment diagnostic
+and requires every referenced version to verify, including retained trash/history
+references. That M1 audit covers the fragment rather than only the journal's
+paths. Both audits are read-only; neither requests repair.
 
 Process interruption is the recorder's dry run. A hardware result additionally
 needs an operator record of the actual power feed, cut/recovery times, affected

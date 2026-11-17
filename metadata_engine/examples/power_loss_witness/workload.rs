@@ -18,11 +18,11 @@ pub struct Spec {
 }
 
 impl Spec {
-    fn new(index: u64, part_bytes: u64, run: &str) -> Self {
+    fn new(index: u64, part_bytes: u64, run: &str, payload_parts: u64) -> Self {
         let mut spec = Self {
             index,
             path: format!("power-witness/{run}/object-{index:06}"),
-            total: 3 * part_bytes + 17,
+            total: payload_parts * part_bytes + 17,
             part_bytes,
             // Publish one normal-mode control before the strict fault window.
             strict: index != 0,
@@ -65,6 +65,7 @@ struct Item {
     plan: Option<Value>,
     parts: BTreeSet<u64>,
     finalized: Option<Value>,
+    finalizing: bool,
     deleting: bool,
     deleted: bool,
 }
@@ -84,7 +85,9 @@ fn inventory(journal: &Journal) -> Result<BTreeMap<u64, Item>> {
                 if spec.index != record.object
                     || spec.part_bytes == 0
                     || spec.part_bytes > 8 << 20
-                    || spec.total != 3 * spec.part_bytes + 17
+                    || spec.total < 17
+                    || !(spec.total - 17).is_multiple_of(spec.part_bytes)
+                    || !(3..=127).contains(&((spec.total - 17) / spec.part_bytes))
                     || items.contains_key(&spec.index)
                 {
                     return Err("invalid or duplicate source identity in journal".into());
@@ -96,6 +99,7 @@ fn inventory(journal: &Journal) -> Result<BTreeMap<u64, Item>> {
                         plan: None,
                         parts: BTreeSet::new(),
                         finalized: None,
+                        finalizing: false,
                         deleting: false,
                         deleted: false,
                     },
@@ -117,6 +121,9 @@ fn inventory(journal: &Journal) -> Result<BTreeMap<u64, Item>> {
             }
             if action == "delete" {
                 item.deleting = true;
+            }
+            if action == "finalize" {
+                item.finalizing = true;
             }
             pending = Some((record.object, action.into(), record.details.clone()));
         } else if let Some(action) = record.kind.strip_suffix("_ack") {
@@ -179,6 +186,7 @@ pub async fn write(
     api: &mut api::Api,
     journal: &mut Journal,
     part_bytes: u64,
+    payload_parts: u64,
     count: u64,
 ) -> Result<()> {
     if journal.records.len() != 1 {
@@ -186,7 +194,7 @@ pub async fn write(
     }
     let run = ulid::Ulid::new().to_string();
     for index in 0..count {
-        let spec = Spec::new(index, part_bytes, &run);
+        let spec = Spec::new(index, part_bytes, &run, payload_parts);
         let plan = request(
             journal,
             index,
@@ -269,6 +277,9 @@ pub async fn verify(api: &mut api::Api, journal: &Journal) -> Result<Value> {
             complete += 1;
             rows.push(json!({"object":index,"published_sha256_verified":true}));
         } else if !item.parts.is_empty() {
+            if !item.finalizing {
+                api.assert_unpublished(&item.spec, &plan).await?;
+            }
             let Some(missing) = api.missing(&item.spec, &plan).await? else {
                 if item.spec.strict {
                     return Err(format!("strict acknowledged upload {index} disappeared").into());
@@ -291,6 +302,52 @@ pub async fn verify(api: &mut api::Api, journal: &Journal) -> Result<Value> {
     Ok(
         json!({"read_only":true,"complete_objects_verified":complete,
         "deletions_verified":deleted,"pending_strict_parts_verified":strict_parts,"objects":rows}),
+    )
+}
+
+pub async fn audit(api: &mut api::Api, journal: &Journal) -> Result<Value> {
+    if matches!(api, api::Api::M1 { .. }) {
+        return api.fragment_health().await;
+    }
+    let mut rows = Vec::new();
+    for (index, item) in inventory(journal)? {
+        if item.deleted || item.deleting || item.finalized.is_none() {
+            continue;
+        }
+        let plan = item
+            .plan
+            .as_ref()
+            .ok_or("published audit identity lacks a plan")?;
+        let health = api.native_health(plan).await?;
+        let info = &health["info"];
+        let width = info["data_shards"]
+            .as_u64()
+            .ok_or("missing audit data width")?
+            + info["parity_shards"]
+                .as_u64()
+                .ok_or("missing audit parity width")?;
+        if health["status"] != "healthy"
+            || health["deep"] != true
+            || health["verified_bytes"] != item.spec.total
+            || info["total_bytes"] != item.spec.total
+            || info["finalized_shards"] != width
+            || ["missing_shards", "corrupt_shards", "unavailable_shards"]
+                .iter()
+                .any(|field| {
+                    health[field]
+                        .as_array()
+                        .is_none_or(|values| !values.is_empty())
+                })
+        {
+            return Err(format!("deep shard audit failed for native object {index}").into());
+        }
+        rows.push(json!({"object":index,"health":health}));
+    }
+    if rows.is_empty() {
+        return Err("empty native audit is not a passing witness".into());
+    }
+    Ok(
+        json!({"scope":"retained published native identities","objects_checked":rows.len(),"objects":rows}),
     )
 }
 
@@ -362,7 +419,7 @@ mod tests {
     use super::*;
     #[test]
     fn source_is_stable_across_arbitrary_part_boundaries_and_has_a_short_tail() {
-        let first = Spec::new(7, 4096, "test");
+        let first = Spec::new(7, 4096, "test", 3);
         let second = Spec {
             part_bytes: 6144,
             ..first.clone()
@@ -385,7 +442,7 @@ mod tests {
         journal.record("part_ack", 0, json!({})).unwrap();
         assert!(inventory(&journal).is_err());
         let mut journal = Journal::create(&root.path().join("duplicate.jsonl"), "test").unwrap();
-        let spec = Spec::new(0, 4096, "test");
+        let spec = Spec::new(0, 4096, "test", 3);
         journal
             .record("begin_intent", 0, serde_json::to_value(spec).unwrap())
             .unwrap();

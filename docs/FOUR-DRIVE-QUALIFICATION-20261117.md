@@ -1,7 +1,7 @@
 # N1 RC.2 and M1 RC.1 four-drive qualification — November 17, 2026
 
-**Four-drive recovery/operator checks and the first coordinated physical
-power-loss window passed. No release or tag.** This continues the current N1 checkpoint
+**Four-drive recovery/operator checks and two coordinated physical
+power-loss windows passed. No release or tag.** This continues the current N1 checkpoint
 and qualifies M1 against four physical SATA HDDs. Earlier million
 populations and four-drive campaigns remain preserved with their original
 artifact identities; none is restarted by this stage.
@@ -42,6 +42,7 @@ The ordinary M1 build contains no request profiler. M1 remains version
 | Fixed throughput client | `800d8463962423af4dbb589341c0b5a7986717746f3cf45ebc1d77e1ed55dfc3` |
 | Final four-drive service harness | `a8c14b33a33bd60559f23acf085a7505e14e48937a0e67e1d80dfe254ad79d98` |
 | Independent Rust ACK recorder, Rust 1.98.0 | `385c9e3a15900945c7ef8a6da1f2c64a9528698dc876a5afa37f308022fe9f34` |
+| Extended recorder and deep auditor, Rust 1.98.0 | `1ac650af50cc8e809d5e09900aa409a4ccf89b331f8efa5fd750e095b6e305d1` |
 
 ## Reproduced M1 connection failure and correction
 
@@ -283,7 +284,9 @@ payload write or at an exact publication instruction.
 
 The host returns with a different boot ID and the same four XFS mounts, pool
 markers and executable hashes. Kernel logs show starting/ending XFS log recovery
-on all four filesystems. Cold M1/control files are copied outside the server
+on all four filesystems. Each HDD's hardware power-cycle counter increases by
+exactly one; reallocated/pending/offline-uncorrectable sector and interface-CRC
+counts are unchanged. Cold M1/control files are copied outside the server
 before opening either test service. The original INI files are then used for
 ordinary startup; the pool and database are never reinitialized.
 
@@ -322,6 +325,81 @@ This closes the recorded physical-cut window and its prior-ACK guarantees on
 the selected 3+1 installation. Active-write, exact transition, larger-EC physical
 power cuts and broader repetitions retain their own scope; no universal
 power-loss or RC.2-ready claim follows from this one cut.
+
+## Extended controls and deep redundancy audit
+
+The recorder gains an optional longer reception window: 63 × 6 MiB full parts
+plus a 17-byte tail, 378 MiB per object and 64 transfer parts. It still holds
+only one part in memory. The default configuration encoding remains identical,
+with a targeted regression check and actual re-verification of retained ACK
+journals. A second physical-cut cue is withdrawn when its timing becomes stale.
+The extended writers finish before the operator subsequently removes power;
+that actual interruption is recorded separately below as an idle-service cut.
+
+The extended M1 control completes eight identities. The bare native recorder
+stops during its fifth identity at 900.685 seconds after creation, consistent
+with the unchanged 900-second default access-token lifetime. It had requested
+the SDK's default lifetime without renewal. N1's authorization path rejects an
+expired upload before accepting its body; the SDK reports broken pipe while
+sending. M1's existing pooled-session handling continues through the same
+window. The original failure is retained as a client-lifetime issue, not an
+object-integrity failure or an N1 I/O regression.
+
+The recorder now requests an existing allowed one-hour native session; no
+server token policy changes. Before recovery, it verifies all **43** saved
+native strict part ACKs and all **four** saved M1 pending-part ACKs. Every
+completed object and required absence also verifies. A separate read-only check
+requires unfinished objects with no finalize attempt to remain unreadable.
+Real native and M1 positive controls pass; deliberately stale copies presenting
+already finalized objects as unfinished are correctly rejected. Original
+journals are never truncated or overwritten.
+
+Missing-part-only recovery completes both native pending objects and both M1
+pending objects, without resending their strict ACKs. All 13 extended identities
+are accounted for: four live native objects plus one native purge, and six live
+M1 objects plus two metadata trash entries. Combined with the retained corpus,
+this yields **39 identities: 32 live and seven purged/trashed**. These extra
+objects were created after the first physical cut; that earlier cut's scope is
+not retroactively enlarged.
+
+The final explicit checksum/parity audit uses the existing APIs, without repair:
+all **15 live native objects** pass complete configured-shard checks, and M1's
+fragment diagnostic verifies **21 referenced versions**, including four retained
+trash references, with zero failed or deferred checks. Thus all **36 retained
+backing objects / 144 shards** pass; the other three native identities are
+physically purged. M1 verifies 3,416,260,965 logical bytes in its diagnostic.
+The audit is separate from throughput timing and is not presented as a cold-read
+benchmark.
+
+The extended offline database check passes with **250 verified records /
+4,902,996 engine-reported disk bytes**. Member census finds exactly **144 shard
+files and four pool markers**, with no `.uploads/` files. Five recorder unit
+checks, strict example lint and formatting pass. Only the external test client
+changes in this follow-up; both selected server executable hashes remain fixed.
+
+## Second physical power removal — retained extended corpus
+
+The operator subsequently confirms removing the server's power plug with all
+four HDDs off. Both upload writers have already stopped; the private services
+are idle. This is an additional physical interruption of the retained extended
+corpus, not an active-upload cut. The operator reconnects power after the client
+confirms that no recorder remains in flight.
+
+The host returns with a new boot ID, the same four XFS filesystem and pool
+identities, and unchanged server executable hashes. All four XFS filesystems
+complete log recovery. Each HDD's power-cycle counter increases by one again;
+reallocated, pending, offline-uncorrectable and interface-CRC counts are unchanged.
+The unopened M1/control files are copied to the independently powered client
+before the private services start with their original configuration.
+
+All eight retained journals pass read-only verification: **32 live objects**
+match their complete source length/SHA-256 and M1 version where applicable,
+and all **seven required absences** hold. No recovery upload or repair is sent.
+An isolated copy of the cold M1 database passes the offline check with **250
+records / 4,902,996 disk bytes**. The cold member census matches the preceding
+148-file census exactly after normalizing the two report formats. The first
+direct comparison rejects their different path/header formats; the original
+inventories are retained alongside the normalized comparison.
 
 ## Evidence and remaining work
 

@@ -46,6 +46,19 @@ parts. Missing-part-only resume, the offline database check and exact shard cens
 also pass. This first cut lands during readback after publication; it does not
 stand in for the separate active-write/transition windows.
 
+The same report retains a later, non-power-cut 378 MiB control. It corrects the
+external native recorder's default-session expiry, verifies all prior ACKs and
+completes missing-part-only recovery. The resulting 39-identity corpus passes
+32 live-object checks and seven required absences. Explicit read-only audits
+verify all 36 retained backing objects/144 shards, including M1 trash references;
+the offline database and exact 148-file census pass. These controls do not
+enlarge the first physical cut's original 26-identity scope.
+
+An additional operator-confirmed physical cut of the idle services retains that
+39-identity corpus. All 32 live objects and seven required absences verify before
+any recovery writes. The cold database's 250 records and exact member census
+also pass. This second interruption is recorded separately from active uploads.
+
 ## Component and system version checks
 
 The current targets are complete system `1.0.0-RC.2`, N1 `1.0.0-RC.2` and
