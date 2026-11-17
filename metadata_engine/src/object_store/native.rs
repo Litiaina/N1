@@ -325,7 +325,32 @@ impl NativeObjectStore {
 
     async fn command<T: DeserializeOwned>(&self, command: Command) -> ObjectStoreResult<T> {
         let mut connection = self.connection().await?;
-        match crate::upload_stage!("native.control", connection.client.control(command)).await {
+        // A pooled socket can outlive an N1 process restart. Only read-only
+        // controls may reconnect and replay once; allocation, repair, purge
+        // and every payload mutation retain their original no-replay rule.
+        let retry = matches!(
+            &command,
+            Command::UploadStatus { .. }
+                | Command::ObjectStat { .. }
+                | Command::ObjectHealth { .. }
+                | Command::Health
+        )
+        .then(|| command.clone());
+        let first =
+            crate::upload_stage!("native.control", connection.client.control(command)).await;
+        let result = match (first, retry) {
+            (Err(error), Some(command)) if disconnected(&error) => {
+                // Preserve admission and shutdown ownership and bypass other
+                // idle sockets from the same stopped process. Healthy calls
+                // send exactly their existing single control exchange.
+                let (client, expires_at) = self.transport(false).await?;
+                connection.client = client;
+                connection.expires_at = expires_at;
+                connection.client.control(command).await
+            }
+            (result, _) => result,
+        };
+        match result {
             Ok(response) => {
                 let value = decode(response)?;
                 connection.release();
@@ -603,6 +628,7 @@ fn check_finalization(upload: &ObjectUpload, result: &ObjectFinalization) -> Obj
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod control_recovery;
     use n1_link::noa::Request;
     use serde_json::json;
     use tokio::{

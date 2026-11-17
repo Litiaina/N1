@@ -1,10 +1,11 @@
 # N1 and M1 four-HDD qualification checklist — November 16, 2026
 
-**Preparation checklist.** Full qualification is planned to begin around
-November 20, 2026, Asia/Manila; the hardware start time and operator window still
-need confirmation. This checklist records preparation, not a test
-result or an automated power-cut job. No tests or power cuts have been performed
-under this checklist. Use the [hardware reporting profiles](TEST-PROFILES.md).
+**Active checklist, updated November 17, 2026.** The operator opened the
+four-drive window early, ahead of the planned November 20 start. See the
+[recorded results](FOUR-DRIVE-QUALIFICATION-20261117.md) for completed checks,
+remaining performance observations and original failures. Physical power loss
+will be coordinated last; none has been performed in this window. This file
+is not an automated power-cut job. Use the [hardware reporting profiles](TEST-PROFILES.md).
 
 Use the four-HDD reference system to qualify N1 and M1 recovery and begin
 controlled hardware power-loss testing. Preserve the completed million-object
@@ -14,16 +15,16 @@ are in [the completion checklist](RC2-IMPLEMENTATION.md).
 
 ## 1. Hardware and test scope
 
-- [ ] Confirm the hardware profile: Intel Core i5-11400, 6 cores / 12 threads,
+- [x] Confirm the hardware profile: Intel Core i5-11400, 6 cores / 12 threads,
   approximately 11 GiB RAM, four HDDs and a separate SSD/NVMe. Record actual
   specifications, Linux version and access to kernel logs.
-- [ ] Identify all four HDDs by device, serial, filesystem UUID and mount path
+- [x] Identify all four HDDs by device, serial, filesystem UUID and mount path
   in the private inventory. Confirm four distinct devices/filesystems and record
   their transport in the public summary.
   Existing reference roots are `/mnt/DISK0` through `/mnt/DISK3`.
-- [ ] Check current drive/filesystem health, free space and kernel I/O errors
+- [x] Check current drive/filesystem health, free space and kernel I/O errors
   before writing. Preserve any existing faults as evidence.
-- [ ] Place M1's database and staging on the designated SSD/NVMe, and N1's
+- [x] Place M1's database and staging on the designated SSD/NVMe, and N1's
   private pool members on the four HDDs. Record control/build/log paths too.
   Capacity must cover the selected payloads, staging, backups and retained logs.
 - [ ] Use fresh task-private directories without formatting or erasing existing
@@ -47,8 +48,9 @@ verify their independent versions against [the system manifest](../deploy/system
 and [release policy](VERSIONING.md). Historical binary hashes are not relabelled
 when package versions change.
 
-The starting runtime source is `f114c30`. The latest selected artifacts are
-documented in [the M1 commit I/O report](M1-COMMIT-IO-20261114.md).
+The November 15 starting runtime source was `f114c30`, documented in
+[the M1 commit I/O report](M1-COMMIT-IO-20261114.md). The November 17 selected
+artifacts are recorded in [the current qualification](FOUR-DRIVE-QUALIFICATION-20261117.md).
 Documentation edits do not change their identities. Verify the binaries actually
 installed on the reference system; a rebuild needs its own hash, toolchain and
 regression evidence.
@@ -61,6 +63,18 @@ case pass, together with the targeted strict lint and formatting checks. These
 six checks qualify the versioning change; they do not replace performance,
 four-HDD, power-loss or complete operator acceptance.
 
+### Four-drive checkpoint — November 17
+
+The [current report](FOUR-DRIVE-QUALIFICATION-20261117.md) records the selected
+frozen N1 and corrected M1 hashes, 3+1/2+2 recovery/operator/mixed checks,
+compiler-matched controls, adverse timing and independent storage measurements.
+The [external Rust recorder](../metadata_engine/examples/power_loss_witness/README.md)
+passes clean N1/M1 checks and two process-interruption/reopen/recovery dry runs.
+All prior successful replies remain on the independently powered client's HDD;
+verification precedes recovery and retained strict parts are not resent.
+These results prepare the physical-cut window; the operator power-feed and
+shared-service outage confirmation are still pending. No hardware cut is claimed.
+
 - Keep N1's selected runtime and ECS Core revision
   `c77c638bfb709368f49517f2828fa977738e8467` fixed. No dependency upgrade or
   engine redesign is part of this preparation.
@@ -68,32 +82,32 @@ four-HDD, power-loss or complete operator acceptance.
   version/interoperability logs. Keep existing population journals and earlier
   evidence with their original identities; verify the copied checksums before
   starting on the reference system.
-- The separately powered recorder dry run, hardware inventory, actual power
-  window and acceptance limits below still require completion. The available
-  process-fault harnesses do not establish that hardware recording is ready.
+- The November 17 checkpoint completes the hardware inventory and separately
+  powered recorder dry run. The actual power window remains pending; process
+  interruption does not establish hardware power-loss durability.
 
-- [ ] Record source commit, compiler, build flags, executable hashes, effective
+- [x] Record source commit, compiler, build flags, executable hashes, effective
   INI settings, durability modes and pool geometry. Hold the selected N1 runtime
   fixed during M1 comparisons. Preserve the baseline binaries separately.
 - [ ] Verify io_uring initialization and the intended direct-I/O path rather than
   assuming an environment variable proves which backend is active.
-- [ ] Prepare a Rust client/recorder on an independently powered system that
+- [x] Prepare a Rust client/recorder on an independently powered system that
   survives losing its connection. Existing process-fault tests do not provide a
   hardware power-loss controller or independently powered ACK journal.
-- [ ] Record operation IDs, LINK keys, named paths/versions, lengths, expected
+- [x] Record operation IDs, LINK keys, named paths/versions, lengths, expected
   checksums, durability mode, acknowledged parts and final/delete outcomes.
   Store credentials separately from the evidence.
-- [ ] Synchronize the journal file and its directory when created. Synchronize
+- [x] Synchronize the journal file and its directory when created. Synchronize
   new ACK records before using them as a power-cut trigger. Keep deterministic
   source data or enough information to reproduce and check every payload.
-- [ ] Dry-run the recorder against an isolated fixture: interrupt the connection,
+- [x] Dry-run the recorder against an isolated fixture: interrupt the connection,
   reopen its journal, and confirm complete records, exact expected ACKs and
   recovery without replacing them with a new population.
 - [ ] Distinguish failed/unknown requests from successful replies. After a cut,
   drain any complete replies already in flight and synchronize the final ACK
   set before verification. A successful durable reply must not be excluded just
   because it arrived near the cut.
-- [ ] Prove that the selected read-only verification can target the retained
+- [x] Prove that the selected read-only verification can target the retained
   objects and sessions without first re-uploading or repairing their contents.
 
 ## 3. Test order and fault coverage

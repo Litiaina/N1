@@ -216,6 +216,9 @@ async fn init(client: &mut N1NativeClient, total: u64) -> Value {
 #[tokio::test]
 async fn allocation_and_object_io_do_not_wait_for_a_stalled_monitoring_probe() {
     use std::time::Duration;
+    // The collector remains blocked until explicitly released below. This
+    // checks independence, not a one-second durable-I/O SLA on a busy HDD.
+    let deadline = Duration::from_secs(30);
     let server = Server::new(false).await;
     let mut client = server.client().await;
     let started = Arc::new(tokio::sync::Notify::new());
@@ -234,7 +237,7 @@ async fn allocation_and_object_io_do_not_wait_for_a_stalled_monitoring_probe() {
             .await
     });
     ready.await;
-    let response = tokio::time::timeout(Duration::from_secs(1), client.control(Command::Pools))
+    let response = tokio::time::timeout(deadline, client.control(Command::Pools))
         .await
         .expect("placement discovery waited for monitoring")
         .unwrap();
@@ -242,7 +245,7 @@ async fn allocation_and_object_io_do_not_wait_for_a_stalled_monitoring_probe() {
     assert_eq!(pools["pools"][0]["id"], json!(server.fixture.layout.id));
     assert_eq!(pools["pools"][0]["available_members"], 4);
     let payload = vec![37u8; 12288];
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(deadline, async {
         let plan = init(&mut client, payload.len() as u64).await;
         client
             .put(
@@ -266,6 +269,10 @@ async fn allocation_and_object_io_do_not_wait_for_a_stalled_monitoring_probe() {
     })
     .await
     .expect("object I/O waited for monitoring");
+    assert!(
+        !collector.is_finished(),
+        "monitoring collector was released early"
+    );
     release.add_permits(1);
     assert_eq!(collector.await.unwrap().sequence, 1);
 }

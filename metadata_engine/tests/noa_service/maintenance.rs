@@ -409,10 +409,20 @@ async fn add_destination(stack: &mut Stack) -> (String, String) {
         .as_str()
         .unwrap()
         .to_owned();
-    let first = PathBuf::from(std::env::var_os("N1_OBJECT_TEST_FIRST_ROOT").unwrap())
-        .join(format!("migration-{}", ulid::Ulid::new()));
-    let second = PathBuf::from(std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT").unwrap())
-        .join(format!("migration-{}", ulid::Ulid::new()));
+    let parents = if let Some(paths) = std::env::var_os("N1_OBJECT_TEST_FOUR_ROOTS") {
+        std::env::split_paths(&paths).take(2).collect::<Vec<_>>()
+    } else {
+        ["N1_OBJECT_TEST_FIRST_ROOT", "N1_OBJECT_TEST_SECOND_ROOT"]
+            .map(|name| {
+                PathBuf::from(
+                    std::env::var_os(name).expect("explicit migration member parent required"),
+                )
+            })
+            .to_vec()
+    };
+    assert_eq!(parents.len(), 2);
+    let first = parents[0].join(format!("migration-{}", ulid::Ulid::new()));
+    let second = parents[1].join(format!("migration-{}", ulid::Ulid::new()));
     std::fs::create_dir(&first).unwrap();
     std::fs::create_dir(&second).unwrap();
     let config = stack.root.join("destination.json");
@@ -927,14 +937,20 @@ async fn expired_partial_upload_cleanup_survives_backend_outage_and_metadata_res
     })
     .unwrap();
     let service = m1::service::MetadataService::new(executor, objects);
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    let part_bytes = settings["pools"][0]["layout"]["data_shards"]
+        .as_u64()
+        .unwrap()
+        * 4096;
     let upload = service
         .begin_upload(m1::service::UploadRequest {
             fragment,
             path: "abandoned.bin".into(),
             content_type: "application/octet-stream".into(),
             pool: None,
-            total_bytes: 8192,
-            part_bytes: 4096,
+            total_bytes: part_bytes * 2,
+            part_bytes,
             durable: true,
             ttl_seconds: 3,
         })
@@ -945,8 +961,8 @@ async fn expired_partial_upload_cleanup_survives_backend_outage_and_metadata_res
             fragment,
             &upload.version_id,
             0,
-            4096,
-            &mut std::io::Cursor::new(vec![17; 4096]),
+            part_bytes,
+            &mut std::io::Cursor::new(vec![17; part_bytes as usize]),
         )
         .await
         .unwrap();

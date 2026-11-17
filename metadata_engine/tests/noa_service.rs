@@ -144,13 +144,54 @@ impl Stack {
             .create(&root)
             .unwrap();
         eprintln!("public NOA evidence: {}", root.display());
-        let first = std::env::var_os("N1_OBJECT_TEST_FIRST_ROOT")
-            .map(|parent| PathBuf::from(parent).join(root.file_name().unwrap()))
-            .unwrap_or_else(|| root.join("member0"));
-        std::fs::create_dir(&first).unwrap();
-        let second = std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT")
-            .map(|p| PathBuf::from(p).join(root.file_name().unwrap()));
-        if let Some(path) = &second {
+        let (members, data, parity) =
+            if let Some(paths) = std::env::var_os("N1_OBJECT_TEST_FOUR_ROOTS") {
+                use std::{collections::HashSet, os::unix::fs::MetadataExt};
+                assert!(std::env::var_os("N1_OBJECT_TEST_FIRST_ROOT").is_none());
+                assert!(std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT").is_none());
+                let parents = std::env::split_paths(&paths)
+                    .map(|path| std::fs::canonicalize(path).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(parents.len(), 4, "four explicit member parents required");
+                let devices = parents
+                    .iter()
+                    .map(|p| p.metadata().unwrap().dev())
+                    .collect::<HashSet<_>>();
+                assert_eq!(devices.len(), 4, "four independent filesystems required");
+                let data = std::env::var("N1_OBJECT_TEST_DATA_SHARDS")
+                    .expect("explicit four-member data shard count required")
+                    .parse::<u16>()
+                    .unwrap();
+                assert!(
+                    [2, 3].contains(&data),
+                    "only 3+1 and 2+2 fixtures supported"
+                );
+                (
+                    parents
+                        .iter()
+                        .map(|p| p.join(root.file_name().unwrap()))
+                        .collect(),
+                    data,
+                    4 - data,
+                )
+            } else {
+                assert!(
+                    std::env::var_os("N1_OBJECT_TEST_DATA_SHARDS").is_none(),
+                    "four-member geometry requires four explicit member parents"
+                );
+                let first = std::env::var_os("N1_OBJECT_TEST_FIRST_ROOT")
+                    .map(|parent| PathBuf::from(parent).join(root.file_name().unwrap()))
+                    .unwrap_or_else(|| root.join("member0"));
+                let second = std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT")
+                    .map(|p| PathBuf::from(p).join(root.file_name().unwrap()));
+                let parity = u16::from(second.is_some());
+                (
+                    std::iter::once(first).chain(second).collect::<Vec<_>>(),
+                    1,
+                    parity,
+                )
+            };
+        for path in &members {
             std::fs::create_dir(path).unwrap();
         }
         let object_binary = PathBuf::from(
@@ -159,19 +200,16 @@ impl Stack {
         let object_config = root.join("object.json");
         let object_port = port();
         let mut init = Command::new(&object_binary);
-        init.args(["init", "--config"])
-            .arg(&object_config)
-            .arg("--member")
-            .arg(&first);
-        if let Some(second) = &second {
-            init.arg("--member").arg(second);
+        init.args(["init", "--config"]).arg(&object_config);
+        for member in &members {
+            init.arg("--member").arg(member);
         }
         let output = init
             .args([
                 "--data-shards",
-                "1",
+                &data.to_string(),
                 "--parity-shards",
-                if second.is_some() { "1" } else { "0" },
+                &parity.to_string(),
                 "--block-bytes",
                 &block_bytes.to_string(),
                 "--native-address",
@@ -217,9 +255,16 @@ impl Stack {
         );
         ini.with_section(Some("storage_pool.A"))
             .set("generation", "1")
-            .set("roots", first.display().to_string())
-            .set("data_shards", "1")
-            .set("parity_shards", "0")
+            .set(
+                "roots",
+                members
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .set("data_shards", data.to_string())
+            .set("parity_shards", parity.to_string())
             .set("sealed", "false");
         ini.with_section(Some("upload_config"))
             .set("max_concurrent_io", "32")
@@ -338,8 +383,14 @@ impl Stack {
 }
 async fn json_response(response: reqwest::Response, status: u16) -> Value {
     let actual = response.status().as_u16();
+    let route = response.url().path().to_owned();
     let bytes = response.bytes().await.unwrap();
-    assert_eq!(actual, status, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        actual,
+        status,
+        "{route}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     serde_json::from_slice(&bytes).unwrap()
 }
 async fn native(

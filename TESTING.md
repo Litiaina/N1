@@ -21,6 +21,27 @@ change earlier test outcomes or close the
 RC.2 release gates. Historical mentions of a held `main` describe the policy at
 the time of those campaigns.
 
+## Four-drive qualification — November 17
+
+The [current four-drive report](docs/FOUR-DRIVE-QUALIFICATION-20261117.md) retains
+the frozen N1 executable and qualifies M1 on separate NVMe metadata/staging with
+3+1 and 2+2 physical SATA HDD pools. It passes the 24-combination standalone
+member-loss matrix, corruption/repair/blank replacement, both twelve-case public
+service runs, five additional recovery/migration cases, the real Console operator
+backup/upload workflows and 46 Console Node checks. Both mixed maintenance runs
+pass 7,898 operations / 680 identities, full post-SIGKILL verification, four
+snapshot restores and marker-only cleanup. Earlier million populations are
+retained with their original identities.
+
+The wider pool reproduces an M1 stale-socket 502 after an N1 restart. One fresh
+connection retry for disconnected read-only controls closes that case on both
+layouts; mutation commands keep their existing replay rules. Matched small and
+1 GiB measurements retain adverse tails and low transfer rates. An independent
+Rust storage control also finds a slow member outside both engines. See the
+report for exact counts, original failed attempts, the monitoring-test deadline
+correction and artifact identities. Hardware power loss remains a separate,
+operator-coordinated final stage; none is claimed from process faults.
+
 ## Component and system version checks
 
 The current targets are complete system `1.0.0-RC.2`, N1 `1.0.0-RC.2` and

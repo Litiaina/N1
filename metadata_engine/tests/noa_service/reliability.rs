@@ -121,6 +121,14 @@ struct Acknowledged {
 #[ignore = "destructive private two-HDD fixture: full metadata/staging loss, exact snapshot and native independence"]
 async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_durable_resume() {
     let mut stack = Stack::new().await;
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    // This witness removes all M1 staging. Its unfinished parts must therefore
+    // be native-aligned and backed by N1, as in the original 1+1 fixture.
+    let part_bytes = settings["pools"][0]["layout"]["data_shards"]
+        .as_u64()
+        .unwrap() as usize
+        * 8192;
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -183,7 +191,7 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
             200,
         )
         .await;
-        let shape = json!({"total_size_bytes":24593,"part_size_bytes":8192,"expected_parts":4});
+        let shape = json!({"total_size_bytes":part_bytes*3+17,"part_size_bytes":part_bytes,"expected_parts":4});
         let route = format!("{base}/upload/multipart/durable");
         let upload = json_response(
             client
@@ -203,7 +211,7 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
                 &token,
                 upload["version_id"].as_str().unwrap(),
                 part,
-                vec![41 + part as u8; 8192],
+                vec![41 + part as u8; part_bytes],
             )
             .await;
         }
@@ -399,7 +407,7 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
                 token,
                 version,
                 part,
-                vec![41 + part as u8; if part == 3 { 17 } else { 8192 }],
+                vec![41 + part as u8; if part == 3 { 17 } else { part_bytes }],
             )
             .await;
         }
@@ -428,7 +436,13 @@ async fn full_metadata_loss_restores_fragments_versions_trash_permissions_and_du
         assert_eq!(response.status(), 200);
         assert_eq!(
             response.bytes().await.unwrap().as_ref(),
-            [vec![41; 8192], vec![42; 8192], vec![43; 8192], vec![44; 17]].concat()
+            [
+                vec![41; part_bytes],
+                vec![42; part_bytes],
+                vec![43; part_bytes],
+                vec![44; 17]
+            ]
+            .concat()
         );
     }
     record(

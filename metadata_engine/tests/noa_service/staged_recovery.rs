@@ -24,7 +24,10 @@ async fn object_client(stack: &Stack) -> n1_native_client::N1NativeClient {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires real isolated N1/M1 processes and two physical member roots"]
 async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publication_boundary() {
-    assert!(std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT").is_some());
+    assert!(
+        std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT").is_some()
+            || std::env::var_os("N1_OBJECT_TEST_FOUR_ROOTS").is_some()
+    );
     let mut stack = Stack::new().await;
     let client = Client::builder()
         .timeout(Duration::from_secs(60))

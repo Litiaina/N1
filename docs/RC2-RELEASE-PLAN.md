@@ -1,7 +1,9 @@
 # RC.2 qualification plan
 
-Full N1 and M1 qualification is planned to begin **around November 20, 2026**,
-in Asia/Manila time. Preparation and scoped checks continue beforehand. Release
+The planned full qualification start was around November 20, 2026. The operator
+opened the four-HDD window early on **November 17, 2026**, in Asia/Manila time;
+the [recorded qualification](FOUR-DRIVE-QUALIFICATION-20261117.md) continues the
+selected checkpoint and retains earlier populations. Release
 RC.2 when the required gates pass; no calendar date waives a failed condition.
 
 The stable **1.0.0** target is **February 14, 2027**, conditional on successful
@@ -13,8 +15,8 @@ The intended combination is **N1 `1.0.0-RC.2` + M1 `1.0.0-RC.1`**, recorded in
 system **`1.0.0-RC.2`**. Each component has its own release history and tags;
 follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
 
-The four-HDD recovery and controlled physical power-loss window still needs its
-actual operator start time. Prepare with
+The four-HDD recovery window is active. Coordinate physical power loss **after**
+the other qualification checks, as the final operator-controlled stage. Prepare with
 [the four-drive checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power
 cut or completed result is implied. Final-candidate reconciliation remains
 necessary if runtime changes follow a campaign.

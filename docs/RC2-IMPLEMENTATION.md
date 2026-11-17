@@ -11,8 +11,10 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
-**Operator schedule:** begin full N1 and M1 qualification around **November 20,
-2026** (Asia/Manila). Release RC.2 after its required gates pass. Target stable
+**Operator schedule:** the four-drive window opened early on **November 17,
+2026**, ahead of the planned November 20 start (Asia/Manila). Continue full N1
+and M1 qualification; perform coordinated physical power loss last. Release
+RC.2 after its required gates pass. Target stable
 **1.0.0 on February 14, 2027**, conditional on qualification and the intervening
 real-deployment evidence. The [release plan](RC2-RELEASE-PLAN.md) orders the work;
 target dates do not waive failures.
@@ -20,7 +22,12 @@ target dates do not waive failures.
 **Hardware preparation:** use the four-HDD reference system in the operator's confirmed window.
 [The preparation checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md) covers hardware,
 independent ACK recording, four-drive recovery, controlled power loss and
-acceptance evidence. This is scheduled work, not a completed qualification.
+acceptance evidence. The [November 17 qualification](FOUR-DRIVE-QUALIFICATION-20261117.md)
+passes the selected 3+1/2+2 member/process-fault, public API, Console backup,
+migration and mixed-maintenance checks with N1 fixed. It corrects a reproduced
+M1 stale-connection read-control failure. Matched timing retains adverse tails
+and an independently measured slow HDD; it does not establish universal
+performance parity or complete hardware power-loss acceptance.
 
 The [first preparation batch](M1-ACCEPTANCE-20261113.md) holds N1 fixed, reduces
 M1's observed bridged-upload CPU cost and passes 418 workspace checks, the same

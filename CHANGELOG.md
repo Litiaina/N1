@@ -10,6 +10,12 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Recover a disconnected pooled M1 native socket once for read-only upload
+  status, object stat and health controls. Preserve the healthy single-RPC
+  path, admission ownership and existing no-replay rules for mutations.
+  Qualify the reproduced restart case on both four-drive EC layouts, with
+  retained original failures and adverse performance measurements.
+
 - Pin multipart publication directory descriptions before namespace changes,
   with independent root error accounting. Retain N1's existing single-object,
   batch and purge barriers; reject the measured single-object directory-sync

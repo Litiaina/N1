@@ -10,11 +10,16 @@ fn pattern(seed: u64) -> Vec<u8> {
 }
 
 fn payload(seed: u64, length: usize) -> bytes::Bytes {
+    payload_at(seed, 0, length)
+}
+
+fn payload_at(seed: u64, offset: u64, length: usize) -> bytes::Bytes {
     let block = pattern(seed);
     let mut bytes = Vec::with_capacity(length);
     while bytes.len() < length {
-        let take = (length - bytes.len()).min(block.len());
-        bytes.extend_from_slice(&block[..take]);
+        let index = (offset + bytes.len() as u64) as usize % BLOCK;
+        let take = (length - bytes.len()).min(BLOCK - index);
+        bytes.extend_from_slice(&block[index..index + take]);
     }
     bytes.into()
 }
@@ -213,15 +218,21 @@ pub(super) async fn foreground(
         });
     }
     tasks.spawn(async move {
+        let negotiate = match std::env::var("M1_MAINTENANCE_NEGOTIATE_PART_SIZE") {
+            Ok(value) if value=="true" => true,
+            Ok(value) if value=="false" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => panic!("M1_MAINTENANCE_NEGOTIATE_PART_SIZE must be true or false"),
+        };
         let mut index = 0;
         while Instant::now() < stop {
-            let length = 128 << 20;
-            let part_bytes = 8 << 20;
+            let length = 128u64 << 20;
+            let preferred = 8u64 << 20;
             let seed = (phase * 100_000 + 90_000 + index) as u64;
-            let bytes = payload(seed, part_bytes);
+            let source = payload(seed, BLOCK);
             let mut digest = Sha256::new();
-            for _ in 0..16 {
-                digest.update(&bytes);
+            for _ in 0..128 {
+                digest.update(&source);
             }
             let path = format!("load/large-p{phase}-{index}.bin");
             let route = format!(
@@ -234,19 +245,25 @@ pub(super) async fn foreground(
                 .call(0, "multipart_init", 0, async {
                     json_response(context.client.post(format!("{route}/init/{path}?durability={policy}"))
                     .bearer_auth(&context.token).json(&json!({
-                        "total_size_bytes":length,"part_size_bytes":part_bytes,"expected_parts":16
+                        "total_size_bytes":length,"part_size_bytes":preferred,"expected_parts":16,
+                        "negotiate_part_size":negotiate
                     })).send().await.unwrap(),200).await
                 })
                 .await;
             let version = plan["version_id"].as_str().unwrap();
+            let part_bytes = plan["part_size_bytes"].as_u64().unwrap();
+            let count = plan["expected_parts"].as_u64().unwrap();
+            assert_eq!(count,length.div_ceil(part_bytes));
             let mode = if index % 2 == 0 {
                 "normal_part"
             } else {
                 "durable_part"
             };
-            for part in 0..16 {
+            for part in 0..count {
+                let bytes = payload_at(seed, part*part_bytes,
+                    (length-part*part_bytes).min(part_bytes) as usize);
                 meter
-                    .call(0, mode, part_bytes as u64, async {
+                    .call(0, mode, bytes.len() as u64, async {
                         json_response(
                             context
                                 .client
@@ -271,7 +288,7 @@ pub(super) async fn foreground(
                             plan["session_id"].as_str().unwrap()
                         ))
                         .bearer_auth(&context.token)
-                        .json(&json!({"total_size_bytes":length,"expected_parts":16}))
+                        .json(&json!({"total_size_bytes":length,"expected_parts":count}))
                         .send()
                         .await
                         .unwrap(),
@@ -292,4 +309,24 @@ pub(super) async fn foreground(
             index += 1;
         }
     });
+}
+
+#[test]
+fn negotiated_boundaries_preserve_the_logical_source_offset() {
+    let total = 3 * BLOCK + 123;
+    let seed = 197;
+    for part_bytes in [BLOCK / 2 + 17, 3 * BLOCK / 2, 2 * BLOCK] {
+        let mut actual = Vec::new();
+        for offset in (0..total).step_by(part_bytes) {
+            actual.extend_from_slice(&payload_at(
+                seed,
+                offset as u64,
+                (total - offset).min(part_bytes),
+            ));
+        }
+        assert_eq!(actual.len(), total);
+        for (offset, byte) in actual.into_iter().enumerate() {
+            assert_eq!(byte, (((offset % BLOCK) as u64 * 31 + seed) % 251) as u8);
+        }
+    }
 }
