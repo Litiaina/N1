@@ -24,8 +24,8 @@ try {
   await page.waitForFunction(()=>Boolean(window.WindowManager)&&!document.querySelector('#boot-screen'));
   await page.evaluate(()=>{window.WindowManager.open('dashboard');(0,eval)('ResMonitor.showTab("health")');});
   await expect(page.locator('#health-metadata-backups')).toBeVisible();
-  await page.getByRole('button',{name:'List metadata snapshots',exact:true}).click();
-  await expect(page.locator('#metadata-backup-status')).toContainText('Enter the metadata master key');
+  await page.getByRole('button',{name:'List M1 snapshots',exact:true}).click();
+  await expect(page.locator('#metadata-backup-status')).toContainText('Enter the M1 master key');
   await page.locator('#metadata-operator-key').fill('incorrect-test-master');
   await page.locator('#metadata-operator-authorize').click();
   await expect(page.locator('#metadata-operator-status')).toContainText('Master key was not accepted');

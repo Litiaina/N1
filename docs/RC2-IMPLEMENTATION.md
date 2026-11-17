@@ -11,6 +11,14 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
+The [November 17 M1/Console qualification](M1-CONSOLE-20261117.md) holds both
+selected engines fixed: 134 default M1/storage/native-client checks, 31 explicit
+SSD service cases, real two-HDD Console backup/upload/migration/GC workflows,
+400 enabled browser executions and both independent-engine launcher profiles
+pass. Console identifies M1 and N1 separately and retains its desktop interface.
+This closes the recorded UI/launcher regressions; final release acceptance and
+the exact scope of the earlier hardware campaigns remain separate.
+
 **Operator schedule:** the four-drive window opened early on **November 17,
 2026**, ahead of the planned November 20 start (Asia/Manila). Continue full N1
 and M1 qualification; perform coordinated physical power loss last. Release
