@@ -24,6 +24,7 @@ pub(super) async fn health(
         app.diagnostics.start(app.clone(), claims.id(), None)?;
     }
     let mut value = super::super::monitoring::health(&app).await;
+    value["integrity_scan"] = app.diagnostics.summary(claims.id());
     // Explicit diagnostics may request live in-memory counters. Routine Console
     // polling never takes this path or bypasses filesystem observation caching.
     if q.get("live_counters").is_some_and(|s| s == "true") {
@@ -57,7 +58,32 @@ pub(super) async fn fragment_health(
     }
     let mut health = super::super::monitoring::health(&app).await;
     health["fragment"] = json!(ulid::Ulid::from_bytes(target.id.0).to_string());
+    health["integrity_scan"] = app.diagnostics.summary(target.id);
     Ok(Json(health))
+}
+
+pub(super) async fn integrity_stop(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let claims = auth::authorize(&app, &headers, "read").await?;
+    Ok(Json(app.diagnostics.cancel(claims.id())?))
+}
+
+pub(super) async fn fragment_integrity_stop(
+    State(app): State<Arc<App>>,
+    Path(fragment): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let claims = auth::authorize(&app, &headers, "read").await?;
+    let target = app
+        .db
+        .execute(move |db| crate::fragments::resolve(&db, &fragment))
+        .await?;
+    if target.id != claims.id() && !claims.operator {
+        return Err(ApiError::forbidden());
+    }
+    Ok(Json(app.diagnostics.cancel(target.id)?))
 }
 pub(super) async fn pools(
     State(app): State<Arc<App>>,
@@ -92,6 +118,7 @@ pub(super) async fn pools(
         "pools": pools,
         "observation": observed,
         "object_status": object["status"],
+        "integrity_scan": app.diagnostics.summary(claims.id()),
         "error": object["error"],
         "allocation_policy": "newest complete unsealed pool",
         "metadata_store": "m1_storage"

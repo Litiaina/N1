@@ -129,6 +129,14 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/noa/v1/maintenance/health", get(maintenance::health))
         .route(
+            "/noa/v1/maintenance/integrity/stop",
+            post(maintenance::integrity_stop),
+        )
+        .route(
+            "/noa/v1/maintenance/fragments/{fragment}/integrity/stop",
+            post(maintenance::fragment_integrity_stop),
+        )
+        .route(
             "/noa/v1/maintenance/metadata/backups",
             get(super::backups::list).post(super::backups::create),
         )

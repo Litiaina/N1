@@ -59,24 +59,39 @@ pub(super) async fn metadata(app: &Arc<App>) -> Observation {
         .await
 }
 pub(super) async fn object(app: &Arc<App>) -> Observation {
+    let observed = object_sample(app, app.config.monitor_interval_seconds).await;
+    // A nested N1 cold sample is not a completed health verdict. Retry only
+    // that warm-up state, under the same cache admission and a five-second
+    // minimum interval. Healthy and unavailable samples retain operator policy.
+    if !observed.refreshing
+        && observed
+            .value
+            .as_ref()
+            .is_some_and(|v| v["status"] == "pending")
+    {
+        return object_sample(app, app.config.monitor_interval_seconds.min(5)).await;
+    }
+    observed
+}
+
+async fn object_sample(app: &Arc<App>, interval_seconds: u64) -> Observation {
     let client = app.monitor_objects.clone();
     app.object_observations
         .clone()
-        .observe(
-            Duration::from_secs(app.config.monitor_interval_seconds),
-            move || async move {
-                match tokio::time::timeout(Duration::from_secs(2), client.control(Command::Health))
-                    .await
-                {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(error)) => json!({"status": "unavailable", "error": error.to_string()}),
-                    Err(_) => json!({
-                        "status": "unavailable",
-                        "error": "N1 monitoring request timed out"
-                    }),
-                }
-            },
-        )
+        .observe(Duration::from_secs(interval_seconds), move || async move {
+            // N1's own cold observation can wait two seconds. Give that
+            // response time to arrive instead of racing an equal timeout.
+            match tokio::time::timeout(Duration::from_secs(5), client.control(Command::Health))
+                .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => json!({"status": "unavailable", "error": error.to_string()}),
+                Err(_) => json!({
+                    "status": "unavailable",
+                    "error": "N1 monitoring request timed out"
+                }),
+            }
+        })
         .await
 }
 fn component(observed: &Observation, role: &str, endpoint: String) -> Value {
@@ -138,8 +153,11 @@ pub(super) async fn health(app: &Arc<App>) -> Value {
                 && d["available_bytes"].as_u64().is_some_and(|n| n > 0)
                 && d["available_inodes"] != 0
         });
+    let metadata_observation_state = meta["status"].as_str().unwrap_or("unknown").to_owned();
     meta["status"] = json!(if metadata_ready {
         "healthy"
+    } else if matches!(metadata_observation_state.as_str(), "pending" | "stale") {
+        metadata_observation_state.as_str()
     } else {
         "degraded"
     });
@@ -161,11 +179,10 @@ pub(super) async fn health(app: &Arc<App>) -> Value {
             disks.push(member.clone());
         }
     }
-    let status = if metadata_ready && object["status"] == "healthy" {
-        "healthy"
-    } else {
-        "degraded"
-    };
+    let status = overall_status(
+        meta["status"].as_str().unwrap_or("unknown"),
+        object["status"].as_str().unwrap_or("unknown"),
+    );
     let capacity = &object["capacity"];
     let mut maintenance = object["maintenance"].clone();
     if !maintenance.is_object() {
@@ -259,4 +276,46 @@ pub(super) async fn health(app: &Arc<App>) -> Value {
             "interval_seconds": app.config.monitor_interval_seconds
         }
     })
+}
+
+fn overall_status(metadata: &str, object: &str) -> &'static str {
+    let states = [metadata, object];
+    if states
+        .iter()
+        .any(|state| matches!(*state, "critical" | "failed" | "lost"))
+    {
+        "critical"
+    } else if states
+        .iter()
+        .any(|state| matches!(*state, "degraded" | "warning"))
+    {
+        "degraded"
+    } else if states.contains(&"pending") {
+        "pending"
+    } else if states.iter().all(|state| *state == "healthy") {
+        "healthy"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overall_status;
+
+    #[test]
+    fn cold_and_unavailable_samples_are_not_storage_damage_verdicts() {
+        for (metadata, object, expected) in [
+            ("healthy", "healthy", "healthy"),
+            ("pending", "healthy", "pending"),
+            ("healthy", "pending", "pending"),
+            ("healthy", "stale", "unknown"),
+            ("stale", "healthy", "unknown"),
+            ("healthy", "unavailable", "unknown"),
+            ("pending", "degraded", "degraded"),
+            ("healthy", "critical", "critical"),
+        ] {
+            assert_eq!(overall_status(metadata, object), expected);
+        }
+    }
 }

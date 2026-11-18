@@ -43,6 +43,7 @@ fn classify(health: ObjectStoreResult<Value>) -> Check {
 struct Scan {
     fragment: PoolId,
     pool: Option<String>,
+    started_at: u64,
     state: BTreeMap<String, Value>,
 }
 pub(super) struct Diagnostics {
@@ -53,6 +54,7 @@ pub(super) struct Diagnostics {
 #[derive(Default)]
 struct Lifecycle {
     stopping: bool,
+    cancel_requested: bool,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl Default for Diagnostics {
@@ -65,6 +67,76 @@ impl Default for Diagnostics {
     }
 }
 impl Diagnostics {
+    pub(super) fn summary(&self, fragment: PoolId) -> Value {
+        let cancelled = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel_requested;
+        let scan = self.scan.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(scan) = scan.as_ref().filter(|scan| scan.fragment == fragment) else {
+            return json!({"status": "not_scanned"});
+        };
+        let mut summary = json!({
+            "status": "passed", "pool": scan.pool,
+            "started_at": scan.started_at, "elapsed_ms": 0,
+            "versions_checked": 0, "verified_versions": 0,
+            "failed_versions": 0, "deferred_versions": 0, "verified_bytes": 0
+        });
+        for state in scan.state.values() {
+            for key in [
+                "versions_checked",
+                "verified_versions",
+                "failed_versions",
+                "deferred_versions",
+                "verified_bytes",
+            ] {
+                summary[key] = json!(
+                    summary[key]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(state[key].as_u64().unwrap_or(0))
+                );
+            }
+            summary["elapsed_ms"] = json!(
+                summary["elapsed_ms"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .max(state["elapsed_ms"].as_u64().unwrap_or(0))
+            );
+            if state["status"] == "running" {
+                summary["status"] = json!("running");
+            } else if summary["status"] != "running" {
+                if state["status"] == "failed" {
+                    summary["status"] = json!("failed");
+                } else if summary["status"] != "failed" && state["status"] != "passed" {
+                    summary["status"] = state["status"].clone();
+                }
+            }
+        }
+        summary["stop_requested"] = json!(cancelled && summary["status"] == "running");
+        if summary["status"] == "running" {
+            summary["elapsed_ms"] = json!(
+                cli_core::monitoring::now()
+                    .saturating_sub(scan.started_at)
+                    .saturating_mul(1000)
+            );
+        }
+        summary
+    }
+
+    /// A stop drains the currently admitted check; it never aborts owned N1 I/O.
+    pub(super) fn cancel(&self, fragment: PoolId) -> ApiResult<Value> {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let scan = self.scan.lock().unwrap_or_else(|e| e.into_inner());
+        if scan.as_ref().is_some_and(|scan| scan.fragment == fragment) {
+            lifecycle.cancel_requested = true;
+        }
+        drop(scan);
+        drop(lifecycle);
+        Ok(self.summary(fragment))
+    }
+
     pub(super) fn status(&self, fragment: PoolId, pool: &str) -> Option<Value> {
         let scan = self.scan.lock().unwrap_or_else(|e| e.into_inner());
         scan.as_ref()
@@ -82,12 +154,26 @@ impl Diagnostics {
         if lifecycle.stopping {
             return Err(ApiError::invalid("integrity monitoring is shutting down"));
         }
-        let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
-            ApiError(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "an integrity scan is already running".into(),
-            )
-        })?;
+        let permit = match self.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let scan = self.scan.lock().unwrap_or_else(|e| e.into_inner());
+                if scan.as_ref().is_some_and(|scan| {
+                    scan.fragment == fragment
+                        && scan
+                            .pool
+                            .as_deref()
+                            .is_none_or(|active| pool.as_deref() == Some(active))
+                }) {
+                    return Ok(());
+                }
+                return Err(ApiError(
+                    axum::http::StatusCode::CONFLICT,
+                    "An integrity check is already running in another scope. Wait for it to finish before starting this scope.".into(),
+                ));
+            }
+        };
+        lifecycle.cancel_requested = false;
         let state = app
             .pools
             .iter()
@@ -111,6 +197,7 @@ impl Diagnostics {
         *self.scan.lock().unwrap_or_else(|e| e.into_inner()) = Some(Scan {
             fragment,
             pool,
+            started_at: cli_core::monitoring::now(),
             state,
         });
         let this = self.clone();
@@ -118,6 +205,11 @@ impl Diagnostics {
             let _permit = permit;
             let started = Instant::now();
             let result = this.run(&app, fragment, started).await;
+            let cancelled = this
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel_requested;
             let mut scan = this.scan.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(scan) = scan.as_mut() {
                 for state in scan.state.values_mut() {
@@ -125,6 +217,8 @@ impl Diagnostics {
                     state["status"] =
                         json!(if state["failed_versions"].as_u64().unwrap_or(0) > 0 {
                             "failed"
+                        } else if cancelled {
+                            "cancelled"
                         } else if result.is_err()
                             || state["deferred_versions"].as_u64().unwrap_or(0) > 0
                         {
@@ -154,14 +248,10 @@ impl Diagnostics {
         }
     }
     fn ensure_running(&self) -> ApiResult<()> {
-        if self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stopping
-        {
+        let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if lifecycle.stopping || lifecycle.cancel_requested {
             return Err(ApiError::invalid(
-                "integrity scan stopped during shutdown; unchecked objects are not declared healthy",
+                "integrity check stopped; unchecked objects are not declared healthy",
             ));
         }
         Ok(())
@@ -257,6 +347,46 @@ mod tests {
     use super::*;
     use crate::object_store::ObjectStoreError;
     use n1_native_client::NativeClientError;
+    #[test]
+    fn progress_is_scoped_and_cancellation_never_hides_confirmed_damage() {
+        let diagnostics = Diagnostics::default();
+        let fragment = PoolId([9; 16]);
+        assert_eq!(diagnostics.summary(fragment)["status"], "not_scanned");
+        *diagnostics.scan.lock().unwrap() = Some(Scan {
+            fragment,
+            pool: None,
+            started_at: 123,
+            state: BTreeMap::from([
+                (
+                    "A".into(),
+                    json!({"status":"running","versions_checked":3,"verified_versions":2,"failed_versions":0,"deferred_versions":1,"verified_bytes":100,"elapsed_ms":50}),
+                ),
+                (
+                    "B".into(),
+                    json!({"status":"running","versions_checked":2,"verified_versions":1,"failed_versions":1,"deferred_versions":0,"verified_bytes":20,"elapsed_ms":60}),
+                ),
+            ]),
+        });
+        let progress = diagnostics.summary(fragment);
+        assert_eq!(progress["versions_checked"], 5);
+        assert_eq!(progress["failed_versions"], 1);
+        assert_eq!(progress["verified_bytes"], 120);
+        assert!(progress["elapsed_ms"].as_u64().unwrap() >= 60);
+        assert_eq!(
+            diagnostics.cancel(PoolId([8; 16])).unwrap()["status"],
+            "not_scanned"
+        );
+        assert!(!diagnostics.lifecycle.lock().unwrap().cancel_requested);
+        assert_eq!(
+            diagnostics.cancel(fragment).unwrap()["stop_requested"],
+            true
+        );
+        let mut scan = diagnostics.scan.lock().unwrap();
+        scan.as_mut().unwrap().state.get_mut("A").unwrap()["status"] = json!("cancelled");
+        scan.as_mut().unwrap().state.get_mut("B").unwrap()["status"] = json!("failed");
+        drop(scan);
+        assert_eq!(diagnostics.summary(fragment)["status"], "failed");
+    }
     #[test]
     fn only_confirmed_integrity_failures_count_as_damage() {
         for status in [400, 401, 403, 404, 409, 410, 429, 500, 502, 503, 504] {

@@ -11,6 +11,21 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
+## Current release decision — November 18, 2026
+
+| Gate | Current state |
+| --- | --- |
+| N1 runtime | Frozen at the selected `f1a54f…` executable. The recorded minimum-profile performance, 3+1/2+2 recovery and three physical cuts retain their passes. |
+| M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The latest read-only monitoring change passes 115 default tests, eight local service cases and twelve four-drive executions. |
+| Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
+| Complete contract/operator matrix | Open: reconcile required fields, permissions, errors and retries with their actual cases, including the exact final Console/M1 pairing. Registered routes are not complete conformance. |
+| Sustained resource/performance acceptance | Open: select quantitative limits and close the recorded saturation/tail acceptance for the supported deployment profile. Preserve adverse samples and distinguish hardware effects from code changes. |
+| Remaining physical transitions | The three completed cuts remain passed. Unexecuted transition-specific and partial-drive-power cases retain their scope and require a fresh operator window. No automatic power cut is authorized by this checklist. |
+| Packaging and publication | Open: qualify clean deployment, preserve the exact component/Console manifest and checksums, then make the release decision. Tags and release publication require operator instruction. |
+
+The sections below retain earlier evidence and its limits. A historical open
+item is not automatically a new instruction to restart a completed population.
+
 The [November 17 M1/Console qualification](M1-CONSOLE-20261117.md) holds both
 selected engines fixed: 134 default M1/storage/native-client checks, 31 explicit
 SSD service cases, real two-HDD Console backup/upload/migration/GC workflows,

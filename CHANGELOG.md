@@ -10,6 +10,11 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Join repeated M1 integrity-scan requests, expose scoped progress and support
+  an explicit draining stop. Keep pending/stale telemetry distinct from storage
+  damage. Console separates cached health from content checks and stops hidden
+  scan polling, with N1's qualified runtime unchanged.
+
 - Recover a disconnected pooled M1 native socket once for read-only upload
   status, object stat and health controls. Preserve the healthy single-RPC
   path, admission ownership and existing no-replay rules for mutations.

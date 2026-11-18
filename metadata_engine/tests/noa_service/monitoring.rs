@@ -265,7 +265,9 @@ async fn monitoring_is_scoped_cached_independent_and_metadata_backup_restores_na
         .await;
         if health["components"]["object"]["status"] == "unavailable" {
             assert_eq!(health["components"]["metadata"]["status"], "healthy");
-            assert_eq!(health["status"], "degraded");
+            // Loss of telemetry is explicit at the component; it does not
+            // prove damaged object storage or a corrupt metadata database.
+            assert_eq!(health["status"], "unknown");
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "{health}");

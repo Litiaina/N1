@@ -115,6 +115,13 @@ one asynchronous integrity check; subsequent `deep_scan=false` requests read
 its progress. `refresh=true` cannot bypass sampling admission. The explicit
 `live_counters=true` global health query reads current in-memory object I/O
 counters for diagnostics, retaining cached filesystem observations.
+Health/pool responses expose the current fragment's `integrity_scan` progress.
+Repeated starts join an equivalent running scan with 200; an incompatible scope
+returns 409. Explicit `POST /noa/v1/maintenance/integrity/stop` or
+`POST /noa/v1/maintenance/fragments/{fragment}/integrity/stop` requests a stop
+after the current object check drains. Read permission applies; another
+fragment requires an operator. Stopped/incomplete checks are not integrity
+passes. Cached `pending` service telemetry is not a corruption verdict.
 
 Metadata snapshots require master-key operator authorization:
 
@@ -127,6 +134,7 @@ GET  /noa/v1/maintenance/metadata/signed-backup?token=SCOPED_GRANT
 ```
 
 Named native operations are `maintenance.health`, `maintenance.pools.health`,
+`maintenance.integrity.stop` (the authenticated fragment),
 `metadata.backups.list`, `metadata.backups.create` and
 `metadata.backups.download` (`snapshot` supplies the ID). Creation returns an
 accepted job, listing exposes its state, and download streams a completed
