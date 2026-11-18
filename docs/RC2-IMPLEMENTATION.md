@@ -15,12 +15,12 @@ not close a qualification gate or create a release.
 
 | Gate | Current state |
 | --- | --- |
-| N1 runtime | Frozen at the selected `f1a54f…` executable. The recorded minimum-profile performance, 3+1/2+2 recovery and three physical cuts retain their passes. |
+| N1 runtime | Frozen at the selected `f1a54f…` executable. Minimum-profile performance, 3+1/2+2 recovery, three whole-host cuts and standalone 2+2 physical member loss and return have passed their recorded checks. |
 | M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The latest read-only monitoring change passes 115 default tests, eight local service cases and twelve four-drive executions. |
 | Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
 | Complete contract/operator matrix | Open: reconcile required fields, permissions, errors and retries with their actual cases, including the exact final Console/M1 pairing. Registered routes are not complete conformance. |
 | Sustained resource/performance acceptance | Open: select quantitative limits and close the recorded saturation/tail acceptance for the supported deployment profile. Preserve adverse samples and distinguish hardware effects from code changes. |
-| Remaining physical transitions | The three completed cuts remain passed. Unexecuted transition-specific and partial-drive-power cases retain their scope and require a fresh operator window. No automatic power cut is authorized by this checklist. |
+| Remaining physical transitions | Three whole-host cuts passed. Standalone 2+2 also served four checksum-verified objects with two HDDs physically off. See the [two-drive power test](FOUR-DRIVE-QUALIFICATION-20261117.md#standalone-22-with-two-hdds-physically-powered-off--november-18) for recovery status. Exact publication, checkpoint, repair and GC cut points remain open. |
 | Packaging and publication | Both systemd units passed rendering and verification. The selected N1, M1 and Console artifacts passed clean launcher startup, upload, readback and restart together, with and without optional Accel. The final distribution, artifact manifest and release decision remain open. |
 
 The sections below retain earlier evidence and its limits. A historical open

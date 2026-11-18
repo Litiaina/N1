@@ -96,6 +96,17 @@ and requires every referenced version to verify, including retained trash/histor
 references. That M1 audit covers the fragment rather than only the journal's
 paths. Both audits are read-only; neither requests repair.
 
+For a direct N1 member-power test, `audit --unavailable-members 2` instead
+requires exactly two unavailable shards per published object, sufficient
+remaining data shards, the API's `unknown` redundancy status and complete
+verified bytes. This distinguishes inaccessible shards from verified damage. Missing
+or corrupt shards still fail. Without that explicit option, all configured
+shards must be healthy. The option does not select which members fail, change
+server behavior or apply to M1. Each degraded audit also downloads every published
+object and checks its length and SHA-256 against the original journal. Clear only clean test-shard page-cache entries before a physical
+member cut so cached copies from unavailable disks cannot substitute for the
+remaining disks.
+
 Process interruption is the recorder's dry run. A hardware result additionally
 needs an operator record of the actual power feed, cut/recovery times, affected
 services and drives, boot/filesystem evidence and the retained ACK set. This

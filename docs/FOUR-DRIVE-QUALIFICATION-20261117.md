@@ -468,3 +468,52 @@ recorded physical windows pass; exact publication/checkpoint/repair/GC power
 cut points and other unexecuted cases retain their separate scope. No further
 cut is scheduled by this checkpoint. Full release acceptance remains in
 [the completion checklist](RC2-IMPLEMENTATION.md).
+
+## Standalone 2+2 with two HDDs physically powered off — November 18
+
+The frozen N1 executable served four published objects after an operator cut
+power to two SATA members. The other two HDDs, system NVMe, server and external
+recorder stayed on. The operator selected the pair without disclosing it.
+Direct reads identified the two failed members, and the server boot ID stayed
+the same. Linux recorded two SATA detachments and shut down the affected XFS
+mounts. N1 continued serving reads in the original process.
+
+| Published data | Objects | Verified bytes while two members were off |
+| --- | ---: | ---: |
+| Retained baseline, normal and strict | 2 | 50,331,682 |
+| New controls, normal and strict | 2 | 2,130,706,466 |
+| Total | 4 | 2,181,038,148 |
+
+Before the cut, the recorder verified the original baseline journal and the
+test evicted only its eight clean shard files. Linux reported zero resident
+pages in all eight. During the outage, deep inspection found exactly two valid
+finalized shards and two unavailable shards per object. Each inspection checked
+the full reconstructed length and integrity root. A separate native download
+of each object matched its original length and SHA-256.
+
+The external journal shows both new uploads received all 128 part ACKs and a
+finalize ACK before the first observed SATA error. The kernel recorded a failed
+read during the outage. The next Begin returned native status 500 with an I/O
+error and issued no key. This cut exercises published readback and admission
+with two missing members. The earlier whole-host campaign covers interrupted
+strict multipart reception.
+
+**Four-member recovery passed.** The server stayed on when the operator
+restored drive power. Linux assigned new device names to both disks. Their
+filesystem UUIDs matched the pre-cut inventory. After stopping the private N1
+process to release its directory handles, we unmounted the two shut-down XFS
+mounts and mounted the original filesystems using their existing mount
+configuration. Both completed XFS log recovery.
+
+Before restarting the private N1 service, all four pool marker hashes matched.
+The census contained the original 16 finalized shards and four markers.
+The failed Begin left zero staged files. Before any new upload, independent
+readback verified all 2,181,038,148 bytes against the source hashes again.
+The deep audit reported four healthy shards per object with zero missing,
+corrupt or unavailable shards. Recovery required no application repair.
+
+One fresh normal upload and one fresh strict upload then finalized and passed
+readback and full shard verification. After clean shutdown, each member held
+six finalized shards and its pool marker, with zero staging files. This
+qualifies reads through a physical two-drive outage and service recovery after
+remount on this 2+2 profile.

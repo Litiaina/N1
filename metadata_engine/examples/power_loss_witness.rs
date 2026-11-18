@@ -66,6 +66,9 @@ struct Args {
     report: Option<PathBuf>,
     #[arg(long, default_value_t = 32)]
     objects: u64,
+    /// Native deep audit: require this many unavailable shards per object.
+    #[arg(long, default_value_t = 0)]
+    unavailable_members: u16,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -84,6 +87,7 @@ async fn run(args: Args) -> Result<()> {
         || !(3..=127).contains(&config.payload_parts)
         || args.objects.saturating_mul(config.payload_parts + 8) > 32768
         || config.fragment.is_empty()
+        || (args.unavailable_members != 0 && !matches!(args.mode, Mode::Audit))
         || !args.journal.is_absolute()
         || (!matches!(args.mode, Mode::Write) && args.report.is_none())
         || args
@@ -129,12 +133,13 @@ async fn run(args: Args) -> Result<()> {
             )?;
         }
         Mode::Audit => {
-            let audited = workload::audit(&mut api, &journal).await?;
+            let audited = workload::audit(&mut api, &journal, args.unavailable_members).await?;
             journal::save_new(
                 args.report.as_ref().unwrap(),
                 &json!({
                     "passed":true,"deep_audit":audited,"config_sha256":binding,
-                    "journal_records":journal.records.len()
+                    "journal_records":journal.records.len(),
+                    "expected_unavailable_members":args.unavailable_members
                 }),
             )?;
         }

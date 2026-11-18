@@ -305,8 +305,15 @@ pub async fn verify(api: &mut api::Api, journal: &Journal) -> Result<Value> {
     )
 }
 
-pub async fn audit(api: &mut api::Api, journal: &Journal) -> Result<Value> {
+pub async fn audit(
+    api: &mut api::Api,
+    journal: &Journal,
+    unavailable_members: u16,
+) -> Result<Value> {
     if matches!(api, api::Api::M1 { .. }) {
+        if unavailable_members != 0 {
+            return Err("an unavailable-member audit requires direct N1".into());
+        }
         return api.fragment_health().await;
     }
     let mut rows = Vec::new();
@@ -320,28 +327,42 @@ pub async fn audit(api: &mut api::Api, journal: &Journal) -> Result<Value> {
             .ok_or("published audit identity lacks a plan")?;
         let health = api.native_health(plan).await?;
         let info = &health["info"];
-        let width = info["data_shards"]
+        let data = info["data_shards"]
             .as_u64()
-            .ok_or("missing audit data width")?
-            + info["parity_shards"]
-                .as_u64()
-                .ok_or("missing audit parity width")?;
-        if health["status"] != "healthy"
+            .ok_or("missing audit data width")?;
+        let parity = info["parity_shards"]
+            .as_u64()
+            .ok_or("missing audit parity width")?;
+        let width = data + parity;
+        let unavailable = u64::from(unavailable_members);
+        if unavailable > parity
+            || health["status"]
+                != if unavailable == 0 {
+                    "healthy"
+                } else {
+                    "unknown"
+                }
             || health["deep"] != true
             || health["verified_bytes"] != item.spec.total
             || info["total_bytes"] != item.spec.total
-            || info["finalized_shards"] != width
-            || ["missing_shards", "corrupt_shards", "unavailable_shards"]
-                .iter()
-                .any(|field| {
-                    health[field]
-                        .as_array()
-                        .is_none_or(|values| !values.is_empty())
-                })
+            || info["finalized_shards"] != width - unavailable
+            || health["unavailable_shards"]
+                .as_array()
+                .is_none_or(|shards| shards.len() as u64 != unavailable)
+            || ["missing_shards", "corrupt_shards"].iter().any(|field| {
+                health[field]
+                    .as_array()
+                    .is_none_or(|values| !values.is_empty())
+            })
         {
-            return Err(format!("deep shard audit failed for native object {index}").into());
+            return Err(
+                format!("deep shard audit failed for native object {index}: {health}").into(),
+            );
         }
-        rows.push(json!({"object":index,"health":health}));
+        if unavailable != 0 {
+            api.verify_bytes(&item.spec, plan).await?;
+        }
+        rows.push(json!({"object":index,"health":health,"source_sha256_checked":unavailable != 0}));
     }
     if rows.is_empty() {
         return Err("empty native audit is not a passing witness".into());
