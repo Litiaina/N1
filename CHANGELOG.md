@@ -10,6 +10,9 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store. It
 been released. This section describes implemented changes, not a declaration of
 complete API conformance or qualification.
 
+- Add an independent M1 systemd installer with mount dependencies derived from
+  the metadata configuration and the same deployment controls as N1.
+
 - Join repeated M1 integrity-scan requests, expose scoped progress and support
   an explicit draining stop. Keep pending/stale telemetry distinct from storage
   damage. Console separates cached health from content checks and stops hidden

@@ -461,9 +461,20 @@ service's absolute credential path (normally `/run/credentials/<unit>/<id>`);
 N1 reads it directly without exporting the secrets to child processes. Keep
 object and metadata credentials separate. Raw `Environment=` entries are not
 a secret store; see [systemd's credential guidance](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
-The object systemd installer accepts an arbitrary `--config-file`. Use
-`--no-env-file` when N1 reads `[server] env_file` directly or the service obtains
-credentials another way; the installer then omits its `EnvironmentFile=` line.
+Preview each systemd unit on the machine that will run it.
+
+```sh
+scripts/install-n1-systemd.sh --install-dir /opt/litiaina/n1 --dry-run
+scripts/install-m1-systemd.sh --install-dir /opt/litiaina/m1 --dry-run
+```
+
+N1 requires the configured control and pool mounts. M1 requires its local
+control, database, staging and backup mounts and connects to N1 at the address
+in its INI. The two units can run on different hosts. Both installers accept
+`--config-file`, `--user` and `--group`. Use `--no-env-file` when the engine
+reads its INI-selected secrets file or receives credentials from the service.
+To install and start a unit, run the corresponding command with sudo and
+replace `--dry-run` with `--enable --start`.
 
 Staging GC runs at the configured cleanup interval; the generated INI uses
 3,600 seconds. It conservatively reclaims expired unpublished uploads, never

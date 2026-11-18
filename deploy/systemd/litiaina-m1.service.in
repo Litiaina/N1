@@ -1,0 +1,25 @@
+[Unit]
+Description=Litiaina M1 Metadata Store
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=__REQUIRES_MOUNTS_FOR__
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__WORKING_DIRECTORY__
+EnvironmentFile=__ENV_FILE__
+Environment=RUST_LOG=__RUST_LOG__
+NoNewPrivileges=true
+ExecStartPre=/usr/bin/test -x __BINARY__
+ExecStartPre=/usr/bin/test -f __CONFIG_FILE__
+ExecStart=__BINARY__ serve --config __CONFIG_FILE__
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=300
+LimitNOFILE=1048576
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

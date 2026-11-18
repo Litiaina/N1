@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEMPLATE_FILE="${ROOT_DIR}/deploy/systemd/litiaina-n1.service.in"
+TEMPLATE_FILE=""
 
-SERVICE_NAME="litiaina-n1"
+COMPONENT="n1"
+SERVICE_NAME=""
 INSTALL_DIR=""
 BINARY_PATH=""
 ENV_FILE=""
@@ -19,21 +20,22 @@ FORCE=0
 DRY_RUN=0
 
 usage() {
-  cat <<'USAGE'
-Install the production systemd unit for Litiaina N1.
+  cat <<USAGE
+Install the production systemd unit for Litiaina ${COMPONENT^^}.
 
 Usage:
-  sudo scripts/install-n1-systemd.sh --install-dir /path/to/n1-server [options]
+  sudo scripts/install-${COMPONENT}-systemd.sh --install-dir /opt/litiaina/${COMPONENT} [options]
 
 Required:
-  --install-dir PATH        Working directory for the N1 service.
+  --install-dir PATH        Working directory for this service.
 
 Common options:
-  --binary PATH             N1 binary path. Default: <install-dir>/litiaina-n1
-  --env-file PATH           Environment file. Default: <install-dir>/n1.env
-  --no-env-file             Do not export a file; use N1's selected secrets file or service credentials.
-  --config-file PATH        Config file. Default: <install-dir>/n1_config.ini
-  --service-name NAME       systemd unit name without .service. Default: litiaina-n1
+  --binary PATH             Binary path. Default: <install-dir>/litiaina-${COMPONENT}
+  --env-file PATH           Environment file. Default: <install-dir>/${COMPONENT}.env
+  --no-env-file             Do not export a file; use the selected secrets file or service credentials.
+  --config-file PATH        Config file. Default: <install-dir>/${COMPONENT}_config.ini
+  --service-name NAME       systemd unit name without .service. Default: litiaina-${COMPONENT}
+  --component n1|m1         Shared installer backend selection. Default: ${COMPONENT}
   --rust-log VALUE          RUST_LOG value. Default: info
   --enable                  Run systemctl enable after installing.
   --start                   Run systemctl restart after installing.
@@ -43,14 +45,8 @@ Common options:
   --group GROUP             Service group. Default: primary group of --user.
 
 Examples:
-  sudo scripts/install-n1-systemd.sh \
-    --install-dir /home/administrator/SERVERS/N1-SERVER \
-    --enable --start
-
-  sudo scripts/install-n1-systemd.sh \
-    --install-dir /home/administrator/SERVERS/N1-SERVER \
-    --user administrator --group administrator \
-    --enable --start
+  sudo scripts/install-${COMPONENT}-systemd.sh --install-dir /opt/litiaina/${COMPONENT} --enable --start
+  scripts/install-${COMPONENT}-systemd.sh --install-dir /opt/litiaina/${COMPONENT} --no-env-file --dry-run
 USAGE
 }
 
@@ -81,6 +77,11 @@ require_cmd() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --component)
+        COMPONENT="${2:-}"
+        [[ "$COMPONENT" == n1 || "$COMPONENT" == m1 ]] || die "--component must be n1 or m1"
+        shift 2
+        ;;
       --install-dir)
         INSTALL_DIR="${2:-}"
         shift 2
@@ -104,6 +105,7 @@ parse_args() {
         ;;
       --service-name)
         SERVICE_NAME="${2:-}"
+        [[ -n "$SERVICE_NAME" ]] || die "--service-name cannot be empty"
         shift 2
         ;;
       --rust-log)
@@ -152,9 +154,11 @@ validate_paths() {
   [[ -d "$INSTALL_DIR" ]] || die "install dir does not exist: $INSTALL_DIR"
   INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
 
-  BINARY_PATH="${BINARY_PATH:-${INSTALL_DIR}/litiaina-n1}"
-  ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/n1.env}"
-  CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/n1_config.ini}"
+  TEMPLATE_FILE="${ROOT_DIR}/deploy/systemd/litiaina-${COMPONENT}.service.in"
+  SERVICE_NAME="${SERVICE_NAME:-litiaina-${COMPONENT}}"
+  BINARY_PATH="${BINARY_PATH:-${INSTALL_DIR}/litiaina-${COMPONENT}}"
+  ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/${COMPONENT}.env}"
+  CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/${COMPONENT}_config.ini}"
   if [[ -z "$RUN_USER" ]]; then
     RUN_USER="${SUDO_USER:-$(id -un)}"
   fi
@@ -196,11 +200,19 @@ render_unit() {
   config_file="$(systemd_escape_path "$CONFIG_FILE")"
   config_directory="$(dirname "$CONFIG_FILE")"
   requires_mounts="$({
-    awk '
-      /^\[/ { in_disk = ($0 ~ /^\[disk_config\]/); in_pool = ($0 ~ /^\[storage_pool\./); next }
-      (in_disk && /^fs_storage_path[[:space:]]*=/) || (in_pool && /^roots[[:space:]]*=/) {
+    awk -v component="$COMPONENT" '
+      { sub(/^[[:space:]]+/, "") }
+      /^\[/ {
+        in_disk = ($0 ~ /^\[disk_config\]/)
+        in_pool = ($0 ~ /^\[storage_pool\./)
+        in_metadata = ($0 ~ /^\[metadata_engine\]/)
+        next
+      }
+      (in_disk && /^fs_storage_path[[:space:]]*=/) ||
+      (component == "n1" && in_pool && /^roots[[:space:]]*=/) ||
+      (component == "m1" && in_metadata && /^(data_dir|staging_dir|backup_dir)[[:space:]]*=/) {
         sub(/^[^=]*=/, "")
-        gsub(/,/, "\n")
+        if (in_pool) gsub(/,/, "\n")
         print
       }
     ' "$CONFIG_FILE"
@@ -215,7 +227,7 @@ render_unit() {
       printf '\n'
     fi
   done | sort -u | paste -sd' ' -)"
-  [[ -n "$requires_mounts" ]] || die "no N1 storage mounts found in $CONFIG_FILE"
+  [[ -n "$requires_mounts" ]] || die "no ${COMPONENT^^} storage mounts found in $CONFIG_FILE"
 
   while IFS= read -r line; do
     if [[ "$USE_ENV_FILE" -eq 0 && "$line" == EnvironmentFile=* ]]; then
