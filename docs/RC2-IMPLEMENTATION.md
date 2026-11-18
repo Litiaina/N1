@@ -21,7 +21,7 @@ not close a qualification gate or create a release.
 | Complete contract/operator matrix | Open: reconcile required fields, permissions, errors and retries with their actual cases, including the exact final Console/M1 pairing. Registered routes are not complete conformance. |
 | Sustained resource/performance acceptance | Open: select quantitative limits and close the recorded saturation/tail acceptance for the supported deployment profile. Preserve adverse samples and distinguish hardware effects from code changes. |
 | Remaining physical transitions | The three completed cuts remain passed. Unexecuted transition-specific and partial-drive-power cases retain their scope and require a fresh operator window. No automatic power cut is authorized by this checklist. |
-| Packaging and publication | Open: qualify clean deployment, preserve the exact component/Console manifest and checksums, then make the release decision. Tags and release publication require operator instruction. |
+| Packaging and publication | Both systemd units passed rendering and verification. The selected N1, M1 and Console artifacts passed clean launcher startup, upload, readback and restart together, with and without optional Accel. The final distribution, artifact manifest and release decision remain open. |
 
 The sections below retain earlier evidence and its limits. A historical open
 item is not automatically a new instruction to restart a completed population.
