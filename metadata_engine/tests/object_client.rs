@@ -396,6 +396,48 @@ async fn independent_native_calls_run_concurrently_within_the_limit() {
 }
 
 #[tokio::test]
+async fn explicit_purge_retry_discards_idle_sockets_from_the_stopped_peer() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = client(&listener, 2);
+    let server = tokio::spawn(async move {
+        // Hold the first stat until both connections are in use, then close
+        // both at the peer. The client has two apparently reusable sockets.
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            login(&mut peer).await;
+            let request = read(&mut peer).await;
+            assert!(matches!(request.command, Command::ObjectStat { .. }));
+            peers.push((peer, request.id));
+        }
+        for (mut peer, id) in peers {
+            write(&mut peer, stat(id)).await;
+        }
+        let (mut fresh, _) = listener.accept().await.unwrap();
+        assert!(!login(&mut fresh).await);
+        let request = read(&mut fresh).await;
+        assert!(
+            matches!(request.command, Command::ObjectDelete { object_key } if object_key == "explicit-retry")
+        );
+        write(&mut fresh, Response::ok(request.id, json!({}))).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (first, second) = tokio::join!(store.stat("a"), store.stat("b"));
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            store.purge("initial-attempt").await.unwrap_err().status(),
+            502
+        );
+        store.purge("explicit-retry").await.unwrap();
+        server.await.unwrap();
+    })
+    .await
+    .expect("explicit purge retry stalled");
+    store.shutdown().await;
+}
+
+#[tokio::test]
 async fn cancelled_exchange_is_not_returned_to_the_connection_pool() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = client(&listener, 1);

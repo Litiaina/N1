@@ -290,11 +290,7 @@ impl NativeObjectStore {
     /// permits until done or cancelled; shutdown waits for those owners.
     pub async fn shutdown(&self) {
         self.0.permits.close();
-        self.0
-            .idle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.discard_idle_connections();
         let _drained = self.0.lifecycle.write().await;
         self.0
             .session
@@ -309,6 +305,10 @@ impl NativeObjectStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        self.discard_idle_connections();
+    }
+
+    fn discard_idle_connections(&self) {
         self.0
             .idle
             .lock()
@@ -338,6 +338,11 @@ impl NativeObjectStore {
         .then(|| command.clone());
         let first =
             crate::upload_stage!("native.control", connection.client.control(command)).await;
+        if first.as_ref().is_err_and(disconnected) {
+            // After a peer restart, other idle sockets can still belong to
+            // that process. Leave in-flight calls and the service token alone.
+            self.discard_idle_connections();
+        }
         let result = match (first, retry) {
             (Err(error), Some(command)) if disconnected(&error) => {
                 // Preserve admission and shutdown ownership and bypass other

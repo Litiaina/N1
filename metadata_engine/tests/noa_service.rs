@@ -134,6 +134,11 @@ fn spawn_with_env(
             .unwrap(),
     )
 }
+fn native_part_bytes(config: &Value) -> usize {
+    let layout = &config["pools"][0]["layout"];
+    (layout["data_shards"].as_u64().unwrap() * layout["block_bytes"].as_u64().unwrap()) as usize
+}
+
 impl Stack {
     async fn new() -> Self {
         Self::with_block_bytes(4096).await

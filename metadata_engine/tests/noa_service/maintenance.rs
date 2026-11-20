@@ -833,8 +833,8 @@ async fn real_console_runs_pool_migration_and_metadata_trash_gc() {
     });
     std::fs::write(&access, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
     std::fs::set_permissions(&access, std::fs::Permissions::from_mode(0o600)).unwrap();
-    for phase in ["migration", "gc"] {
-        if phase == "gc" {
+    for phase in ["migration", "gc-outage", "gc"] {
+        if phase == "gc-outage" {
             json_response(
                 client
                     .delete(format!("{base}/objects/console.bin"))
@@ -846,6 +846,9 @@ async fn real_console_runs_pool_migration_and_metadata_trash_gc() {
             )
             .await;
             tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(stack.object.take());
+        } else if phase == "gc" {
+            stack.start_object().await;
         }
         let executable =
             std::env::var_os("N1_BROWSER_NODE").expect("explicit browser Node required");
@@ -900,6 +903,7 @@ async fn real_console_runs_pool_migration_and_metadata_trash_gc() {
             "real_console": true,
             "real_services": true,
             "metadata_gc": true,
+            "gc_outage_and_retry": true,
             "cross_ec_migration": true
         }))
         .unwrap(),

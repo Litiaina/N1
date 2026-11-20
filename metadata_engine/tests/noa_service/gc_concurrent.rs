@@ -23,9 +23,11 @@ async fn trash_gc_defers_active_parts_and_fences_acknowledgements_before_cleanup
     let (_, token, _) = maintenance::auth(&client, &base, "Active upload GC").await;
     let survivor = vec![41; 65537];
     maintenance::put(&client, &base, &token, "survivor.bin", &survivor).await;
+    let config = serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    let stripe_bytes = native_part_bytes(&config);
     let mut results = Vec::new();
     for (path, part_bytes, bridge) in [
-        ("native.bin", 262144usize, false),
+        ("native.bin", stripe_bytes, false),
         ("bridge.bin", 300001usize, true),
     ] {
         maintenance::put(&client, &base, &token, path, &[17; 31]).await;

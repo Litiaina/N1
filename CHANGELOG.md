@@ -13,6 +13,10 @@ complete API conformance or qualification.
 - Add an independent M1 systemd installer with mount dependencies derived from
   the metadata configuration and the same deployment controls as N1.
 
+- Discard M1's idle native connections when a control request detects that N1
+  has disconnected. A subsequent GC run can reconnect and reclaim the retained
+  work after N1 returns. The failed mutation is reported to the operator.
+
 - Join repeated M1 integrity-scan requests, expose scoped progress and support
   an explicit draining stop. Keep pending/stale telemetry distinct from storage
   damage. Console separates cached health from content checks and stops hidden

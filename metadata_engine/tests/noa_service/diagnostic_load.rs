@@ -2,11 +2,6 @@
 use super::*;
 use m1::object_store::{NativeObjectStore, ObjectStoreConfig};
 
-fn native_part_bytes(config: &Value) -> usize {
-    let layout = &config["pools"][0]["layout"];
-    (layout["data_shards"].as_u64().unwrap() * layout["block_bytes"].as_u64().unwrap()) as usize
-}
-
 async fn scan(client: &Client, base: &str, token: &str) -> Value {
     let start = client
         .get(format!("{base}/maintenance/pools/health?deep_scan=true"))
