@@ -68,7 +68,12 @@ pub(super) async fn verify(context: &Context, expected: &Expected, range: bool) 
         assert_eq!(response.status(), 404);
         return;
     }
-    assert_eq!(response.status(), if range { 206 } else { 200 });
+    assert_eq!(
+        response.status(),
+        if range { 206 } else { 200 },
+        "read rejected for {} at offset {offset}, requested {length} bytes",
+        expected.path
+    );
     assert_eq!(
         response.headers()["etag"]
             .to_str()
@@ -89,7 +94,12 @@ pub(super) async fn verify(context: &Context, expected: &Expected, range: bool) 
     let block = pattern(expected.seed);
     let mut position = 0u64;
     let mut hash = Sha256::new();
-    while let Some(chunk) = response.chunk().await.unwrap() {
+    while let Some(chunk) = response.chunk().await.unwrap_or_else(|error| {
+        panic!(
+            "read failed for {} at offset {offset}, received {position} of {length} bytes: {error:#?}",
+            expected.path
+        )
+    }) {
         let mut checked = 0;
         while checked < chunk.len() {
             let index = (offset as u64 + position + checked as u64) as usize % BLOCK;

@@ -11,14 +11,14 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
-## Current release decision — November 18, 2026
+## Current release decision — November 22, 2026
 
 | Gate | Current state |
 | --- | --- |
 | N1 runtime | Frozen at the selected `f1a54f…` executable. Minimum-profile performance, 3+1/2+2 recovery, three whole-host cuts and standalone 2+2 physical member loss and return have passed their recorded checks. |
-| M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The latest read-only monitoring change passes 115 default tests, eight local service cases and twelve four-drive executions. |
+| M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The November 18 monitoring change passed 115 default tests, eight local service cases and twelve four-drive executions. |
 | Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
-| M1 maintenance recovery and mixed reads | The real Console verified GC retry after N1 restart and snapshot recovery. Two interrupted HTTP reads on the four-drive mixed workload keep that gate open. [Maintenance results](M1-CONSOLE-20261117.md#maintenance-under-load-and-after-an-n1-outage) |
+| M1 maintenance recovery and mixed reads | The two-HDD read fix passed 3,629 mixed operations, GC retry and snapshot recovery. The earlier four-drive run had two interrupted reads. Repeat that workload on the selected M1 before closing this gate. [Local read qualification](M1-CONSOLE-20261117.md#local-m1-read-and-maintenance-qualification) |
 | Complete contract/operator matrix | Open: reconcile required fields, permissions, errors and retries with their actual cases, including the exact final Console/M1 pairing. Registered routes are not complete conformance. |
 | Sustained resource/performance acceptance | Open: select quantitative limits and close the recorded saturation/tail acceptance for the supported deployment profile. Preserve adverse samples and distinguish hardware effects from code changes. |
 | Remaining physical transitions | Three whole-host cuts passed. Standalone 2+2 also served four checksum-verified objects with two HDDs physically off. See the [two-drive power test](FOUR-DRIVE-QUALIFICATION-20261117.md#standalone-22-with-two-hdds-physically-powered-off--november-18) for recovery status. Exact publication, checkpoint, repair and GC cut points remain open. |

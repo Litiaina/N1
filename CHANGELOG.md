@@ -17,6 +17,10 @@ complete API conformance or qualification.
   has disconnected. A subsequent GC run can reconnect and reclaim the retained
   work after N1 returns. The failed mutation is reported to the operator.
 
+- Return the backend error on named downloads when N1 rejects a read before
+  sending payload bytes. Full and ranged downloads retain streaming and expose
+  interruptions that occur after delivery begins.
+
 - Join repeated M1 integrity-scan requests, expose scoped progress and support
   an explicit draining stop. Keep pending/stale telemetry distinct from storage
   damage. Console separates cached health from content checks and stops hidden

@@ -213,31 +213,39 @@ pub(crate) async fn stream(
             .await?;
         Body::empty()
     } else {
+        use futures_util::{FutureExt, StreamExt, TryStreamExt, stream};
+
         let (mut writer, reader) = tokio::io::duplex(256 * 1024);
-        let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
-        tokio::spawn(async move {
-            if service
+        let download = tokio::spawn(async move {
+            service
                 .download_resolved(fragment, stored, offset, Some(length), &mut writer)
                 .await
-                .is_err()
-            {
-                let _ = error_tx
-                    .send(std::io::Error::other(
-                        "object download failed integrity or availability checks",
-                    ))
-                    .await;
-            }
         });
-        // Surface a truncated/corrupt backend stream as a body error. A successful
-        // HTTP header alone is never used as evidence of a complete download.
-        use futures_util::{StreamExt, stream};
-        let source = tokio_util::io::ReaderStream::new(reader).chain(stream::once(async move {
-            match error_rx.recv().await {
-                Some(error) => Err(error),
-                None => Ok(bytes::Bytes::new()),
-            }
-        }));
-        Body::from_stream(source)
+        let completion = download.map(|result| -> ApiResult<bytes::Bytes> {
+            result.map_err(|_| {
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "Object download worker stopped".into(),
+                )
+            })??;
+            Ok(bytes::Bytes::new())
+        });
+        let mut chunks = tokio_util::io::ReaderStream::new(reader)
+            .map_err(ApiError::from)
+            .chain(stream::once(completion));
+        // Commit 200/206 only after the first payload bytes. A rejection before
+        // then keeps its real status. Later failures terminate the same body.
+        let first = chunks
+            .try_next()
+            .await?
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "Empty response to a nonempty object read".into(),
+                )
+            })?;
+        Body::from_stream(stream::iter([Ok(first)]).chain(chunks))
     };
     let mut response = body.into_response();
     *response.status_mut() = if partial {

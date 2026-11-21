@@ -320,6 +320,24 @@ async fn deep_scan_distinguishes_saturated_upload_admission_from_confirmed_corru
     assert_eq!(busy["status"], "incomplete", "{busy}");
     assert_eq!(busy["failed_versions"], 0, "{busy}");
     assert_eq!(busy["deferred_versions"], 1, "{busy}");
+    // The namespace lookup still succeeds while the only N1 operation slot
+    // is held. A failure before payload delivery must reach the HTTP caller.
+    for range in [None, Some("bytes=1-8")] {
+        let mut request = client
+            .get(format!("{base}/objects/get/verified.bin"))
+            .bearer_auth(&token);
+        if let Some(range) = range {
+            request = request.header("range", range);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "success headers sent before admission"
+        );
+        let error = json_response(response, 503).await;
+        assert!(error["error"].is_string());
+    }
     producer.write_all(&vec![7; part_bytes - 1]).await.unwrap();
     producer.shutdown().await.unwrap();
     writer.await.unwrap().unwrap();
@@ -366,4 +384,75 @@ async fn deep_scan_distinguishes_saturated_upload_admission_from_confirmed_corru
         &stack.root.join("DIAGNOSTIC-ADMISSION-PASSED.json"),
         &json!({"passed":true,"busy":busy,"idle":idle,"damaged":damaged,"source_verified_before_corruption":true}),
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real M1/N1 streams with deliberate damage to the last stripe on private members"]
+async fn named_reads_fail_on_late_damage_without_publishing_corrupt_bytes() {
+    use n1_link::shard::{FRAME_HEADER_BYTES, HEADER_BYTES, ShardHeader};
+    use std::os::unix::fs::FileExt;
+
+    let mut stack = Stack::with_block_bytes(262144).await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let base = format!("{}/noa/v1", stack.url);
+    let (_, token, _) = maintenance::auth(&client, &base, "Interrupted read").await;
+    let bytes = vec![43; (12 << 20) + 113];
+    maintenance::put(&client, &base, &token, "late.bin", &bytes).await;
+    drop(stack.metadata.take());
+    drop(stack.object.take());
+    let keys = maintenance::links(&maintenance::db(&stack));
+    assert_eq!(keys.len(), 1);
+    let fingerprint = n1_link::ObjectKey::inspect(&keys[0]).unwrap().fingerprint();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    let pool = &config["pools"][0];
+    let layout: n1_link::PoolLayout = serde_json::from_value(pool["layout"].clone()).unwrap();
+    let roots: Vec<PathBuf> = serde_json::from_value(pool["roots"].clone()).unwrap();
+    for (slot, root) in roots.iter().enumerate() {
+        let shard = layout.shard_at_slot(fingerprint, slot).unwrap();
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(root.join(fingerprint.shard_path(shard)))
+            .unwrap();
+        let mut raw = [0; HEADER_BYTES];
+        file.read_exact_at(&mut raw, 0).unwrap();
+        let header = ShardHeader::decode(&raw, &layout, fingerprint, shard).unwrap();
+        let offset = header.frame_offset(header.stripes() - 1).unwrap() + FRAME_HEADER_BYTES as u64;
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, offset).unwrap();
+        byte[0] ^= 1;
+        file.write_all_at(&byte, offset).unwrap();
+        file.sync_data().unwrap();
+    }
+    stack.start_object().await;
+    stack.start_metadata().await;
+    let url = format!("{base}/objects/get/late.bin");
+    for start in [0, 1] {
+        let mut request = client.get(&url).bearer_auth(&token);
+        if start > 0 {
+            request = request.header("range", format!("bytes={start}-"));
+        }
+        let mut response = request.send().await.unwrap();
+        assert_eq!(response.status(), if start == 0 { 200 } else { 206 });
+        assert_eq!(
+            response.content_length().unwrap(),
+            (bytes.len() - start) as u64
+        );
+        let mut end = start;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    assert_eq!(chunk.as_ref(), &bytes[end..end + chunk.len()]);
+                    end += chunk.len();
+                }
+                Ok(None) => panic!("late corruption reported as a successful download"),
+                Err(_) => break,
+            }
+        }
+        assert!(end > start && end < bytes.len());
+    }
 }

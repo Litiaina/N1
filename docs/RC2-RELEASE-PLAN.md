@@ -4,7 +4,9 @@ The planned full qualification start was around November 20, 2026. The operator
 opened the four-HDD window early on **November 17, 2026**, in Asia/Manila time;
 the [recorded qualification](FOUR-DRIVE-QUALIFICATION-20261117.md) continues the
 selected checkpoint and retains earlier populations. Release
-RC.2 when the required gates pass; no calendar date waives a failed condition.
+RC.2 when the required gates pass. The target is a go/no-go review on
+**November 25, 2026** and publication on **November 27, 2026**, subject to
+qualification and operator approval.
 
 The stable **1.0.0** target is **February 14, 2027**, conditional on successful
 qualification and reliability/performance evidence from real deployments during
@@ -15,8 +17,11 @@ The intended combination is **N1 `1.0.0-RC.2` + M1 `1.0.0-RC.1`**, recorded in
 system **`1.0.0-RC.2`**. Each component has its own release history and tags;
 follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
 
-The four-HDD recovery window is active. Coordinate physical power loss **after**
-the other qualification checks, as the final operator-controlled stage. Prepare with
+While the four-HDD system is unavailable, continue local M1, Console and
+packaging checks with N1 frozen. On its return, first rerun the four-drive
+mixed workload that recorded two interrupted reads on the GC recovery build.
+Coordinate the remaining physical power-loss checks **after** the other
+qualification checks, as the final operator-controlled stage. Prepare with
 [the four-drive checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power
 cut or completed result is implied. Final-candidate reconciliation remains
 necessary if runtime changes follow a campaign.
