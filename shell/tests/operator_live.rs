@@ -116,7 +116,7 @@ fn configured(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires explicit RAM root, real object binary, Console/Node/Chromium"]
+#[ignore = "requires private fixture root, real object binary, Console/Node/Chromium"]
 async fn console_operator_captures_replicates_restores_and_preserves_retirement() {
     let parent = PathBuf::from(
         std::env::var_os("N1_OPERATOR_TEST_ROOT").expect("explicit proof parent required"),
@@ -133,7 +133,9 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
     let binary = PathBuf::from(
         std::env::var_os("N1_OBJECT_TEST_BINARY").expect("frozen object binary required"),
     );
-    let shell = PathBuf::from(env!("CARGO_BIN_EXE_litiaina-n1-shell"));
+    let shell = std::env::var_os("N1_OPERATOR_TEST_SHELL_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_litiaina-n1-shell")));
     let key = root.join("backup.key");
     command(
         &binary,
@@ -430,13 +432,13 @@ async fn console_operator_captures_replicates_restores_and_preserves_retirement(
             )
             .await
             .is_err(),
-        "deleted ticket must stay retired after recovery"
+        "a purged LINK identity must stay absent after recovery"
     );
     private(
         &root.join("PASSED.json"),
         &json!({
             "passed": true,
-            "scope": "real Console, HTTP operator, native replication and 1+0 RAM restore",
+            "scope": "real Console, HTTPS operator, native replication and 1+0 restore",
             "snapshot": snapshot,
             "payload_bytes_verified": bytes.len(),
             "permanent_retirement_verified": true,

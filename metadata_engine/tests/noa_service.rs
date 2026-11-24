@@ -20,6 +20,8 @@ mod archives;
 mod bridge_status;
 #[path = "noa_service/console_workflows.rs"]
 mod console_workflows;
+#[path = "noa_service/contract.rs"]
+mod contract;
 #[path = "noa_service/crash_matrix.rs"]
 mod crash_matrix;
 #[path = "noa_service/device_cycle.rs"]

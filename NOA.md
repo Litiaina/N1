@@ -553,14 +553,13 @@ See [the completion checklist](docs/RC2-IMPLEMENTATION.md) for outstanding work.
 
 ## Current compliance boundary
 
-The contract above describes required behavior. The current metadata service
-implements the main fragment, namespace, upload, versioned-read and export
-paths, with integration and original-console tests. It is **not yet a full
-NOA v1 conformance pass**. Specific remaining differences include:
+The [RC.2 API and operator qualification](docs/RC2-API-QUALIFICATION-20261124.md)
+maps the selected N1, M1 and Console builds to passing public interface and
+operator checks. The following boundaries describe the supported behavior:
 
 - Retained export artifact expiry/cleanup, transactional disk accounting and
-  restart admission are implemented with service coverage. Final-candidate
-  performance/contract acceptance remains tracked in the completion checklist.
+  restart admission are implemented with service coverage. The completion
+  checklist tracks final-candidate performance acceptance.
   Direct ZIP64/TAR and streamed TAR-manifest bounded-worker, disconnect,
   process-crash cleanup and source-failure tests are separate from that lifecycle.
 - Direct named-native ZIP64/TAR and TAR-manifest archives compute their exact
@@ -570,10 +569,8 @@ NOA v1 conformance pass**. Specific remaining differences include:
   requires reconnecting. Other unknown-length control responses remain bounded.
   See the [Four-HDD reference system qualification](docs/FOUR-HDD-OPTIMIZATION-20261113.md) for the >9 MiB
   regression, old-binary reproduction and candidate coverage.
-- Request/response fields, permissions, errors and retry semantics require the
-  complete contract campaign. Named request quotas and configured optional Accel
-  search/read now have scoped HTTP/native integration tests, not a blanket
-  conformance result. Fresh search works without Accel and falls back to M1
+- Named request quotas and optional Accel search/read have scoped HTTP/native
+  integration tests. Fresh search works without Accel and falls back to M1
   when acceleration is unavailable; an existing Accel cursor retains its
   provider and error semantics. Object reads preserve their pre-header origin
   fallback.
@@ -584,6 +581,5 @@ NOA v1 conformance pass**. Specific remaining differences include:
   documented operator pause. Independent live snapshots do not provide an atomic
   cross-service point.
 
-A v2 storage pass, a metadata KV test or a successful Console upload does not
-close these gaps. [The completion checklist](docs/RC2-IMPLEMENTATION.md) owns the
-remaining work; [TESTING.md](TESTING.md) owns qualification evidence.
+[The completion checklist](docs/RC2-IMPLEMENTATION.md) tracks the remaining
+system release gates. [TESTING.md](TESTING.md) indexes qualification evidence.

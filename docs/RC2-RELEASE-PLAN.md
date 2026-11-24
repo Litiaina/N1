@@ -19,8 +19,10 @@ follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
 
 The November 24 four-drive rerun and
 [physical publication recovery](FOUR-DRIVE-QUALIFICATION-20261117.md#physical-publication-recovery-on-31)
-passed on the selected pair. Continue the remaining contract, resource and
-operator checks on that pairing.
+passed on the selected pair. The
+[API and operator qualification](RC2-API-QUALIFICATION-20261124.md) records
+the contract and Console checks on the same build. The
+[completion checklist](RC2-IMPLEMENTATION.md) tracks the remaining gates.
 Coordinate the remaining physical power-loss checks **after** the other
 qualification checks, as the final operator-controlled stage. Prepare with
 [the four-drive checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power

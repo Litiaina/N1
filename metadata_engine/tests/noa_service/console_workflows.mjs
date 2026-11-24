@@ -11,7 +11,84 @@ const {serveConsole}=await import(pathToFileURL(path.join(repo,'scripts/serve-co
 const host=await serveConsole({root:dist,n1:access.metadata,bind:'127.0.0.1',httpPort:access.console_port});
 const origin=`http://127.0.0.1:${access.console_port}`;
 const browser=await chromium.launch({headless:true});
+
+async function checkNamespaceEvents(page, request, fragment, token) {
+  const endpoint = new URL('/noa/v1/ws', access.metadata);
+  endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+  endpoint.searchParams.set('token', token);
+  await page.evaluate(url => new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    window.qualificationEvents = [];
+    socket.onmessage = event => window.qualificationEvents.push(JSON.parse(event.data));
+    socket.onopen = resolve;
+    socket.onerror = () => reject(new Error('M1 event subscription failed'));
+  }), endpoint.href);
+  for (const [path, credential] of [['other', access.token], ['own', token]]) {
+    const response = await request.post(origin + `/noa/v1/upload/one-shot/console-event-${path}.bin`, {
+      headers: { authorization: `Bearer ${credential}`, 'content-type': 'application/octet-stream' },
+      data: Buffer.from(path)
+    });
+    expect(response.status()).toBe(201);
+  }
+  await expect.poll(() => page.evaluate(() => window.qualificationEvents)).toEqual([{
+    type: 'EVENT', payload: { event: 'NAMESPACE_CHANGED', fragment }
+  }]);
+}
+
+async function checkFragmentCreation() {
+  const context = await browser.newContext({ viewport: { width: 1366, height: 900 } });
+  try {
+    const page = await context.newPage();
+    await page.goto(origin + '/?engine=n1');
+    await page.waitForFunction(() => Boolean(window.loadFragments) && !document.querySelector('#boot-screen'));
+    expect(await page.evaluate(() => localStorage.getItem('current-fragment'))).toBeNull();
+    await page.evaluate(() => (0, eval)('openFragmentManager("create")'));
+    const form = page.locator('#frag-tab-create');
+    await form.locator('#mountFragmentNameInput').fill('Console-created fragment');
+    await expect(form.locator('#createFragmentHashPreview')).toHaveText(/^[0-9a-f]{64}$/);
+    await form.locator('#mountFragmentKeyInput').fill('test-only-created-fragment');
+    const master = form.locator('#mountMasterSecretInput');
+    const submit = form.locator('#mountFragmentActionBtn');
+    const created = response =>
+      new URL(response.url()).pathname === '/noa/v1/fragments' && response.request().method() === 'POST';
+    await master.fill('incorrect-test-master');
+    const denied = page.waitForResponse(created);
+    await submit.click();
+    const rejected = await denied;
+    expect(rejected.status()).toBe(401);
+    expect(await rejected.json()).toMatchObject({ error: 'Authentication required' });
+    const createError = page.getByRole('alert').filter({
+      hasText: /Failed to create disk \(401[^)]*\): Authentication required/
+    });
+    await expect(createError).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem('current-fragment'))).toBeNull();
+    await master.fill('test-only-master');
+    const accepted = page.waitForResponse(created);
+    await submit.click();
+    const response = await accepted;
+    expect(response.status()).toBe(201);
+    const identity = await response.json();
+    expect(identity.fragment_hash).toMatch(/^[0-9a-f]{64}$/);
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('current-fragment'))).toBe(identity.fragment_hash);
+    await expect(page.locator('#win-fragment-manager')).toBeHidden();
+    const mount = await page.evaluate(() => ({
+      token: localStorage.getItem('current-token'),
+      state: JSON.stringify({ ...localStorage })
+    }));
+    expect(mount.token).toBeTruthy();
+    expect(mount.state).not.toContain('test-only-master');
+    const listing = await context.request.get(origin + '/noa/v1/fragments', {
+      headers: { authorization: `Bearer ${mount.token}` }
+    });
+    expect(await listing.json()).toEqual([identity.fragment_hash]);
+    await checkNamespaceEvents(page, context.request, identity.fragment_id, mount.token);
+  } finally {
+    await context.close();
+  }
+}
+
 try {
+  await checkFragmentCreation();
   const context=await browser.newContext({viewport:{width:1366,height:900},acceptDownloads:true});
   const page=await context.newPage(),errors=[];
   page.on('pageerror',error=>errors.push(error.message));
@@ -61,5 +138,5 @@ try {
       child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error('Original Console live checks failed: '+fs.readFileSync(path.join(access.output,'console-original-live.log'),'utf8'))));
     });
   }finally{fs.closeSync(log);}
-  fs.writeFileSync(path.join(access.output,'console-workflows-PASSED.json'),JSON.stringify({passed:true,real_master_authorization:true,mounted_session_preserved:true,snapshot_created_listed_downloaded:true,original_browser_live_cases:4},null,2));
+  fs.writeFileSync(path.join(access.output,'console-workflows-PASSED.json'),JSON.stringify({passed:true,fresh_fragment_created_and_mounted:true,fragment_scoped_websocket:true,real_master_authorization:true,mounted_session_preserved:true,snapshot_created_listed_downloaded:true,original_browser_live_cases:4},null,2));
 }finally{await browser.close();await host.close();}
