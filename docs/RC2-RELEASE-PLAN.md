@@ -17,9 +17,10 @@ The intended combination is **N1 `1.0.0-RC.2` + M1 `1.0.0-RC.1`**, recorded in
 system **`1.0.0-RC.2`**. Each component has its own release history and tags;
 follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
 
-The [November 24 four-drive rerun](FOUR-DRIVE-QUALIFICATION-20261117.md#system-candidate-verification--november-24)
-passed on the selected M1 with N1 frozen. Continue the remaining contract,
-resource and operator checks on that pairing.
+The November 24 four-drive rerun and
+[physical publication recovery](FOUR-DRIVE-QUALIFICATION-20261117.md#physical-publication-recovery-on-31)
+passed on the selected pair. Continue the remaining contract, resource and
+operator checks on that pairing.
 Coordinate the remaining physical power-loss checks **after** the other
 qualification checks, as the final operator-controlled stage. Prepare with
 [the four-drive checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power

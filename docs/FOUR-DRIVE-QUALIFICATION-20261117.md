@@ -602,8 +602,7 @@ one using standalone N1 and one using M1. Before the private 3+1 fixture was
 shut down cleanly, each client verified two published payloads, one required
 absence, and two acknowledged parts in an incomplete strict upload. The
 independently stored journals and the server data are available for the next
-physical test. That window requires a fresh operator cue at the selected
-transition. No power was interrupted during this qualification.
+physical test.
 
 ### Publication recovery rehearsal
 
@@ -633,3 +632,27 @@ its aligned part size from the configured pool. It passes on 3+1, 2+2 and
 1+1 using the same server binaries. Separate unit-test process barriers for
 M1 journal/checkpoint recovery, N1 durable publication and interrupted purge
 also passed. These are process interruptions.
+
+### Physical publication recovery on 3+1
+
+The operator removed power from the host and all four HDDs twice. The selected
+N1 and M1 hashes remained identical to the package rehearsal. Both boots
+returned the four original XFS filesystems, which completed journal recovery.
+The external recorder and its ACK journals stayed powered throughout.
+
+| Power cut | Recorded point | Readback and recovery |
+| --- | --- | --- |
+| First | The pause expired and both finalized objects were acknowledged before power went off. | Ten published objects, two required absences and four pending strict parts verified after restart. The offline M1 check verified 96 records. |
+| Second | The tracer held eight shard rename threads before the directory sync. The host became unreachable about 22 seconds after the first observed rename. The external journals retained four strict part ACKs per upload and zero finalize ACKs. | All ten previously published objects, both absences and all twelve pending strict part ACKs verified before client recovery, including the eight ACKs from this cut. Both interrupted uploads were unreadable at that point. |
+
+Each interrupted finalization completed on explicit retry using the original
+identity without resending any acknowledged part. Both newly published objects
+passed full SHA-256 readback and deep integrity checks. The prior published
+objects also passed their audits. The final offline M1 check verified 122
+records. Each member retained 13 finalized shards, two incomplete staging
+shards and its pool marker. The extra finalized identity is retained M1 trash.
+No extra files or symlinks appeared.
+
+This test covers acknowledged publication and interruption at N1's shard
+publication barrier, through both the standalone and named paths. M1 database
+commit/checkpoint, shard repair and GC power-interruption windows remain open.
