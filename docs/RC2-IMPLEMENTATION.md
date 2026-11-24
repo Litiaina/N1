@@ -11,18 +11,18 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
-## Current release decision — November 22, 2026
+## Current release decision — November 24, 2026
 
 | Gate | Current state |
 | --- | --- |
 | N1 runtime | Frozen at the selected `f1a54f…` executable. Minimum-profile performance, 3+1/2+2 recovery, three whole-host cuts and standalone 2+2 physical member loss and return have passed their recorded checks. |
 | M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The November 18 monitoring change passed 115 default tests, eight local service cases and twelve four-drive executions. |
 | Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
-| M1 maintenance recovery and mixed reads | The two-HDD read fix passed 3,629 mixed operations, GC retry and snapshot recovery. The earlier four-drive run had two interrupted reads. Repeat that workload on the selected M1 before closing this gate. [Local read qualification](M1-CONSOLE-20261117.md#local-m1-read-and-maintenance-qualification) |
-| Complete contract/operator matrix | Open: reconcile required fields, permissions, errors and retries with their actual cases, including the exact final Console/M1 pairing. Registered routes are not complete conformance. |
-| Sustained resource/performance acceptance | Open: select quantitative limits and close the recorded saturation/tail acceptance for the supported deployment profile. Preserve adverse samples and distinguish hardware effects from code changes. |
-| Remaining physical transitions | Three whole-host cuts passed. Standalone 2+2 also served four checksum-verified objects with two HDDs physically off. See the [two-drive power test](FOUR-DRIVE-QUALIFICATION-20261117.md#standalone-22-with-two-hdds-physically-powered-off--november-18) for recovery status. Exact publication, checkpoint, repair and GC cut points remain open. |
-| Packaging and publication | Both systemd units passed rendering and verification. The selected N1, M1 and Console artifacts passed clean launcher startup, upload, readback and restart together, with and without optional Accel. The final distribution, artifact manifest and release decision remain open. |
+| M1 maintenance recovery and mixed reads | Passed on the selected M1. The 3+1 and 2+2 runs completed 11,912 operations without errors, verified 1,748 identities after restart and restored four snapshots. Full and ranged reads also passed the targeted early-rejection and late-damage checks on both layouts. [Four-drive results](FOUR-DRIVE-QUALIFICATION-20261117.md#system-candidate-verification--november-24) |
+| Complete contract/operator matrix | The selected M1/Console pairing passed search, migration/GC, recovery and upload/resume on the four-drive host. Archive, Accel and replication checks also passed. The field, permission, error and retry matrix still requires final reconciliation. |
+| Sustained resource/performance acceptance | A five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. Small named uploads measured 1.09–1.47 s p99 across the separate mixed-workload windows. Operator latency sign-off remains open. [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
+| Remaining physical transitions | Three whole-host cuts passed. Standalone 2+2 also served four checksum-verified objects with two HDDs physically off. Normal and strict process-kill publication rehearsals passed on the selected release pair. The next physical window targets the shard publication barrier. Exact checkpoint, repair and GC cut points remain open. [Publication rehearsal](FOUR-DRIVE-QUALIFICATION-20261117.md#publication-recovery-rehearsal) |
+| Packaging and publication | The private Linux x86-64 bundle passed extraction and executable/Console checksum verification. Both units rendered and verified. Both launcher profiles passed upload and restart. Final distribution sign-off and publication remain open. |
 
 The sections below retain earlier evidence and its limits. A historical open
 item is not automatically a new instruction to restart a completed population.

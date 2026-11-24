@@ -465,6 +465,24 @@ impl Api {
     }
 
     pub async fn verify_bytes(&mut self, spec: &workload::Spec, plan: &Value) -> Result<()> {
+        self.verify_read(spec, plan, false).await?;
+        Ok(())
+    }
+
+    pub async fn verify_uncertain_publication(
+        &mut self,
+        spec: &workload::Spec,
+        plan: &Value,
+    ) -> Result<bool> {
+        self.verify_read(spec, plan, true).await
+    }
+
+    async fn verify_read(
+        &mut self,
+        spec: &workload::Spec,
+        plan: &Value,
+        allow_unavailable: bool,
+    ) -> Result<bool> {
         let mut sink = HashSink {
             hash: Sha256::new(),
             bytes: 0,
@@ -472,9 +490,16 @@ impl Api {
         };
         match self {
             Self::N1(client) => {
-                client
+                let result = client
                     .download(text(plan, "object_key")?, 0, None, &mut sink)
-                    .await?;
+                    .await;
+                if allow_unavailable
+                    && matches!(&result, Err(NativeClientError::Native { code, .. })
+                        if code == "404" || code == "503")
+                {
+                    return Ok(false);
+                }
+                result?;
             }
             Self::M1 {
                 client,
@@ -486,6 +511,9 @@ impl Api {
                     .bearer_auth(token.as_str())
                     .send()
                     .await?;
+                if allow_unavailable && matches!(response.status().as_u16(), 404 | 503) {
+                    return Ok(false);
+                }
                 if response.status() != 200
                     || response
                         .headers()
@@ -508,7 +536,7 @@ impl Api {
             )
             .into());
         }
-        Ok(())
+        Ok(true)
     }
 }
 

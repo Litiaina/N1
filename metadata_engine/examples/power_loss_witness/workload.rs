@@ -188,13 +188,15 @@ pub async fn write(
     part_bytes: u64,
     payload_parts: u64,
     count: u64,
+    strict_only: bool,
 ) -> Result<()> {
     if journal.records.len() != 1 {
         return Err("write requires a new journal".into());
     }
     let run = ulid::Ulid::new().to_string();
     for index in 0..count {
-        let spec = Spec::new(index, part_bytes, &run, payload_parts);
+        let mut spec = Spec::new(index, part_bytes, &run, payload_parts);
+        spec.strict |= strict_only;
         let plan = request(
             journal,
             index,
@@ -277,9 +279,12 @@ pub async fn verify(api: &mut api::Api, journal: &Journal) -> Result<Value> {
             complete += 1;
             rows.push(json!({"object":index,"published_sha256_verified":true}));
         } else if !item.parts.is_empty() {
-            if !item.finalizing {
+            let published = if item.finalizing {
+                Some(api.verify_uncertain_publication(&item.spec, &plan).await?)
+            } else {
                 api.assert_unpublished(&item.spec, &plan).await?;
-            }
+                None
+            };
             let Some(missing) = api.missing(&item.spec, &plan).await? else {
                 if item.spec.strict {
                     return Err(format!("strict acknowledged upload {index} disappeared").into());
@@ -293,7 +298,9 @@ pub async fn verify(api: &mut api::Api, journal: &Journal) -> Result<Value> {
             if item.spec.strict {
                 strict_parts += item.parts.len();
             }
-            rows.push(json!({"object":index,"strict":item.spec.strict,"acknowledged_parts":item.parts,"missing_parts":missing}));
+            rows.push(json!({"object":index,"strict":item.spec.strict,
+                "acknowledged_parts":item.parts,"missing_parts":missing,
+                "readable_after_unacknowledged_finalize":published}));
         } else {
             // An unused Begin is not a power-loss durability promise.
             rows.push(json!({"object":index,"no_payload_ack":true}));

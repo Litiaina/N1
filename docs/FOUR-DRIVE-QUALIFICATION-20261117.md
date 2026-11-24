@@ -517,3 +517,119 @@ readback and full shard verification. After clean shutdown, each member held
 six finalized shards and its pool marker, with zero staging files. This
 qualifies reads through a physical two-drive outage and service recovery after
 remount on this 2+2 profile.
+
+## System candidate verification — November 24
+
+The November 18 mixed workload had stopped after two interrupted HTTP reads.
+The November 24 rerun passed on the same four-HDD reference profile, with M1
+on NVMe and four independent XFS filesystems in N1 3+1. The frozen N1
+executable was `f1a54f1653c1c90ae51416fa1f53474855cc20e1ea7ef52e0561af2c8c166aab`.
+M1 was `f32dd61d283b549b52587c9905ad5c793de70e772a8d5067b1128b0de157b039`,
+the build that passed the [two-HDD read qualification](M1-CONSOLE-20261117.md#local-m1-read-and-maintenance-qualification).
+
+| Sixty-second offered window | Maintenance | Completed operations including drain | Errors | Full download p95, ms | Small upload p99, ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | Off | 1,356 | 0 | 28.0 | 1,200 |
+| 2 | Monitoring, GC and live backup | 1,652 | 0 | 27.5 | 1,442 |
+| 3 | Monitoring, GC and live backup | 1,734 | 0 | 28.0 | 1,088 |
+| 4 | Off | 1,448 | 0 | 28.2 | 1,471 |
+
+All 6,190 operations completed. After killing and restarting both services,
+the verifier checked the expected bytes, versions and absences for all 891
+identities. Both live snapshots restored and passed verification. Final GC
+processed 587 entries with zero failures or deferrals. Each HDD retained only
+its pool marker. The earlier recording lacks the original upstream error, so
+its cause remains unknown.
+
+The same four-window workload also passed on 2+2 with the selected binaries.
+All 5,722 operations completed without errors. After the process restart, all
+857 identities verified. Both backups restored, and GC reclaimed 551 entries
+with zero failures or deferrals and left one marker per member. Full-download
+p95 was 27.9–28.3 ms and small-upload p99 was 1.11–1.67 seconds across the four
+windows. Neither layout recorded a degraded health sample during the workload.
+
+Nineteen additional real-service executions passed. Both 3+1 and 2+2 exercised
+the public HTTP/native contract, TLS downloads, admission rejection before
+the first byte and damage after a full or ranged transfer started. On 3+1 the
+selected Console (`d3d98e5`) exercised search, backup and version restore,
+upload/resume, pool migration and retrying GC after an outage. The remaining
+checks covered scan cancellation, fragment quotas, archives, migration failure,
+complete metadata loss and recovery, monitoring, and scheduled trash collection.
+
+Eleven further service cases passed with a private 1+1 pool on the first two
+drives of the same server. They covered optional Accel TLS, pinned reads and
+fallback, archive delivery and interrupted exports, retention and quota errors,
+upload size policies, multipart resume and recovery, and N1 backup, replication
+and restore. An attempted fixture setup on a separate two-HDD machine returned
+an I/O error before any of these cases started there.
+
+### Sustained HTTP and native admission
+
+Sixteen clients overloaded a single fragment on 3+1 for a five-minute request
+window. The fragment allowed 40 reads/s and 8 uploads/s, with bursts of 16 and
+4. The test used both transports and rotated tokens. It required each worker to
+observe rate limiting, at least 20 successful reads/s and 4 successful writes/s
+in aggregate, and no admissions beyond the configured budgets plus bursts.
+The recorder counted 11,600 successful reads, 2,267 successful writes and
+170,743 quota rejections. After killing both services it checked the exact
+version and completed-upload counts, restarted both, and read back every
+acknowledged write with its original version.
+
+The largest individual worker p99 was 657 ms, including admitted and rejected
+requests. One-second samples recorded peak RSS of 101,136 KiB for M1 and
+93,712 KiB for N1, with zero sampled process swap. Package staging also used
+the metadata NVMe near the end of the window. These measurements characterize
+the configured quota workload. The operator left mixed-workload tail-latency
+sign-off open on November 24.
+
+To repeat the five-minute run, set `M1_OVERLOAD_SECONDS=300` for
+`admission::overload::sustained_http_native_overload_preserves_acks_and_shared_quotas`.
+The default remains ten seconds. The test pages through a single recovered
+database snapshot to check every version and completed handle.
+
+### Package and physical-test preparation
+
+The private Linux x86-64 package rehearsal used the two selected server
+binaries and the matching-version N1 backup helper. After extraction, all
+three executable hashes and all 5,741 Console file hashes matched. Both
+installer units rendered and passed systemd verification. The Console launcher
+also passed upload, restart and readback with and without optional Accel on the
+reference server. The package SHA-256 was
+`8683dab5365fd88f400d53cee66a0d5d547b5571453466a175f0835919bedfc1`.
+
+The external recorder synchronized 45 journal records for each of two clients,
+one using standalone N1 and one using M1. Before the private 3+1 fixture was
+shut down cleanly, each client verified two published payloads, one required
+absence, and two acknowledged parts in an incomplete strict upload. The
+independently stored journals and the server data are available for the next
+physical test. That window requires a fresh operator cue at the selected
+transition. No power was interrupted during this qualification.
+
+### Publication recovery rehearsal
+
+Two independent clients finalized on the private 3+1 pool, one through
+standalone N1 and one through M1. In separate normal and strict rehearsals,
+the recorder confirmed that all four parts per client had received an ACK.
+A syscall tracer held the actual N1 executable after each of eight shard renames
+and before its publication workers could return and join the directory syncs.
+Both clients still had outstanding finalize requests when the private
+processes were killed. Neither finalize had returned success.
+
+After each restart the recorder verified the original four published payloads,
+two deletions and four pending strict parts before sending a recovery request.
+In the strict rehearsal it also verified the eight new strict ACKs and the
+complete bytes of the two interrupted finalizations, which were readable
+after service startup. M1's startup reconciliation processes pending
+publication intents. The subsequent explicit finalize retries preserved both
+identities and completed without resending parts. A deep integrity audit and
+the offline M1 database check passed.
+
+The selected binaries also passed the six in-flight process-crash cases on
+each layout, including loss of M1, N1 and both with an incomplete request.
+Bridged finalize recovery, GC with an active writer and GC after an outage
+passed on 3+1 and 2+2. The sealed-staging repair test initially submitted an
+8 KiB native part to a 3+1 fixture whose stripe was 12 KiB. The test now takes
+its aligned part size from the configured pool. It passes on 3+1, 2+2 and
+1+1 using the same server binaries. Separate unit-test process barriers for
+M1 journal/checkpoint recovery, N1 durable publication and interrupted purge
+also passed. These are process interruptions.

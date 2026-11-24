@@ -69,8 +69,9 @@ power_loss_witness audit --config /test/recorder/n1.json \
   --report /test/recorder/deep-audit-01.json
 ```
 
-The first object is a fully published normal-mode control. Following objects
-use strict part acknowledgements. Every fourth cycle retains a sparse strict
+By default, the first object is a fully published normal-mode control.
+Use `write --strict-only` to use strict part acknowledgements from the first
+object. Every fourth cycle retains a sparse strict
 upload with parts 0 and 2 acknowledged; another completes then deletes an object.
 All source bytes derive from the recorded object index and offset. The journal
 retains source hashes, original plans, intended requests, complete successful

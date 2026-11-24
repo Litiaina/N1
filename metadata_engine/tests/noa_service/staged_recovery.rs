@@ -22,7 +22,7 @@ async fn object_client(stack: &Stack) -> n1_native_client::N1NativeClient {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires real isolated N1/M1 processes and two physical member roots"]
+#[ignore = "requires real isolated N1/M1 processes and redundant physical member roots"]
 async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publication_boundary() {
     assert!(
         std::env::var_os("N1_OBJECT_TEST_SECOND_ROOT").is_some()
@@ -37,8 +37,12 @@ async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publicati
     let (alias, token) = reliability::fragment(&client, &base, "sealed staging repair").await;
     // Exercise durable native parts directly. Incompatible external geometry
     // has its own durable M1 staging and can replay normal native conversion.
-    let bytes: Vec<_> = (0..40959).map(|i| (i * 31 % 251) as u8).collect();
-    let part_bytes = 8192;
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
+    let part_bytes = 2 * native_part_bytes(&settings);
+    let bytes: Vec<_> = (0..(5 * part_bytes - 1))
+        .map(|i| (i * 31 % 251) as u8)
+        .collect();
     let route = format!("{base}/upload/multipart/durable");
     let upload = json_response(
         client
@@ -95,8 +99,6 @@ async fn explicit_native_staging_repair_preserves_m1_acks_identity_and_publicati
     }
     drop(native);
     drop(stack.object.take());
-    let settings: Value =
-        serde_json::from_slice(&std::fs::read(&stack.object_config).unwrap()).unwrap();
     let layout: PoolLayout =
         serde_json::from_value(settings["pools"][0]["layout"].clone()).unwrap();
     let roots: Vec<PathBuf> =

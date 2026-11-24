@@ -11,6 +11,27 @@ struct Counts {
     milliseconds: Vec<f64>,
 }
 
+fn count_records(
+    view: &m1::MetadataSnapshot,
+    fragment: n1_link::PoolId,
+    table: m1::Table,
+    include: impl Fn(&Value) -> bool,
+) -> usize {
+    let mut after = None;
+    let mut count = 0;
+    loop {
+        let page = view.scan(table, fragment, "", after.as_ref(), 128).unwrap();
+        for (_, bytes) in &page {
+            let record = serde_json::from_slice(bytes).unwrap();
+            count += usize::from(include(&record));
+        }
+        if page.len() < 128 {
+            return count;
+        }
+        after = page.into_iter().last().map(|(key, _)| key);
+    }
+}
+
 async fn connection(port: u16, token: &str) -> tokio::net::TcpStream {
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
@@ -25,8 +46,12 @@ async fn connection(port: u16, token: &str) -> tokio::net::TcpStream {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ten-second mixed HTTP/native overload against private physical N1/M1 fixtures"]
+#[ignore = "mixed HTTP/native overload against private physical N1/M1 fixtures"]
 async fn sustained_http_native_overload_preserves_acks_and_shared_quotas() {
+    let seconds = std::env::var("M1_OVERLOAD_SECONDS")
+        .map(|value| value.parse::<u64>().expect("integer overload duration"))
+        .unwrap_or(10);
+    assert!((10..=600).contains(&seconds));
     let mut stack = Stack::with_block_bytes(262144).await;
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
@@ -74,7 +99,7 @@ async fn sustained_http_native_overload_preserves_acks_and_shared_quotas() {
                 None
             };
             barrier.wait().await;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
             let mut counts = Counts::default();
             let mut index = 0;
             while tokio::time::Instant::now() < deadline {
@@ -171,7 +196,7 @@ async fn sustained_http_native_overload_preserves_acks_and_shared_quotas() {
         );
     }
     let elapsed = started.elapsed().as_secs_f64();
-    assert!(reads >= 200 && writes >= 40);
+    assert!(reads >= 20 * seconds && writes >= 4 * seconds);
     assert!(reads <= 16 + (40.0 * elapsed).ceil() as u64);
     assert!(writes <= 4 + (8.0 * elapsed).ceil() as u64);
     drop(stack.metadata.take());
@@ -192,19 +217,9 @@ async fn sustained_http_native_overload_preserves_acks_and_shared_quotas() {
         assert_eq!(fragments.len(), 1);
         let catalog: Value = serde_json::from_slice(&fragments[0].1).unwrap();
         let id = serde_json::from_value(catalog["id"].clone()).unwrap();
-        assert!(uploads.len() < 200);
-        let rows = view.scan(m1::Table::Versions, id, "", None, 1000).unwrap();
-        assert!(
-            rows.len() < 1000,
-            "fixture census must fit one bounded page"
-        );
-        let stored_versions = rows
-            .iter()
-            .filter(|(_, bytes)| {
-                let row: Value = serde_json::from_slice(bytes).unwrap();
-                row["object_key"].is_string()
-            })
-            .count();
+        let stored_versions = count_records(&view, id, m1::Table::Versions, |row| {
+            row["object_key"].is_string()
+        });
         assert_eq!(
             stored_versions,
             uploads.len() + 1,
@@ -212,12 +227,11 @@ async fn sustained_http_native_overload_preserves_acks_and_shared_quotas() {
         );
         // M1 retains completed handles for idempotent finalize. They are not
         // pending uploads; require exactly the ACKed identities and no others.
-        let handles = view.scan(m1::Table::Uploads, id, "", None, 1000).unwrap();
-        assert_eq!(handles.len(), uploads.len() + 1);
-        for (_, bytes) in handles {
-            let handle: Value = serde_json::from_slice(&bytes).unwrap();
+        let handles = count_records(&view, id, m1::Table::Uploads, |handle| {
             assert_eq!(handle["completed"], true, "unacknowledged staging remained");
-        }
+            true
+        });
+        assert_eq!(handles, uploads.len() + 1);
         assert!(
             view.scan(m1::Table::Reclamation, id, "pending/", None, 1000)
                 .unwrap()
@@ -239,7 +253,7 @@ async fn sustained_http_native_overload_preserves_acks_and_shared_quotas() {
     }
     reliability::record(
         &stack.root.join("SUSTAINED-QUOTAS-PASSED.json"),
-        &json!({"passed":true,"seconds":elapsed,"read_acks":reads,"write_acks":writes,
+        &json!({"passed":true,"offered_seconds":seconds,"seconds":elapsed,"read_acks":reads,"write_acks":writes,
             "workers":rows,"post_both_process_kill_all_write_acks_verified":true,
             "namespace_count_exact":true,"shared_view_rate":40,"shared_upload_rate":8}),
     );

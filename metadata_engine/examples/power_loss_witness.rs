@@ -66,6 +66,9 @@ struct Args {
     report: Option<PathBuf>,
     #[arg(long, default_value_t = 32)]
     objects: u64,
+    /// Write strict parts even for the first object, the normal-mode control by default.
+    #[arg(long)]
+    strict_only: bool,
     /// Native deep audit: require this many unavailable shards per object.
     #[arg(long, default_value_t = 0)]
     unavailable_members: u16,
@@ -87,6 +90,7 @@ async fn run(args: Args) -> Result<()> {
         || !(3..=127).contains(&config.payload_parts)
         || args.objects.saturating_mul(config.payload_parts + 8) > 32768
         || config.fragment.is_empty()
+        || (args.strict_only && !matches!(args.mode, Mode::Write))
         || (args.unavailable_members != 0 && !matches!(args.mode, Mode::Audit))
         || !args.journal.is_absolute()
         || (!matches!(args.mode, Mode::Write) && args.report.is_none())
@@ -113,6 +117,7 @@ async fn run(args: Args) -> Result<()> {
                 config.part_bytes,
                 config.payload_parts,
                 args.objects,
+                args.strict_only,
             )
             .await?;
         }
