@@ -17,6 +17,11 @@ system retain their RC.2 numbering. Historical reports keep the versions
 and hashes of the exact binaries they tested. The system download and
 artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
+The system tag has one downloadable system prerelease. The N1 and M1 tags
+mark the source revisions for their independently versioned binaries. GitHub's
+automatic source archives contain the entire repository at the selected tag,
+including both engine directories.
+
 ## Component releases
 
 Each Cargo package declares its own version. There is no shared workspace

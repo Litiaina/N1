@@ -509,6 +509,28 @@ Runtime environment overrides are `N1_RUNTIME_WORKER_THREADS`,
 `N1_IO_BACKEND=auto` selects the backend with reported fallback;
 `uring` requires io_uring, and `blocking` explicitly selects blocking I/O.
 
+### Rate limits for Console folder uploads
+
+M1's batch uploads issue N1 allocation and verification requests for each
+file. A saturated N1 quota can appear as per-file 429s inside M1's HTTP 207
+batch response. For concurrent folder uploads, this tested profile gives
+those bursts more headroom. Set it in N1's INI and restart N1.
+
+```ini
+[rate_limiter_config]
+enable_rate_limiting=true
+view_limit_per_second=300
+view_limit_burst_size=1024
+upload_limit_per_second=600
+upload_limit_burst_size=3000
+global_limit_per_second=1200
+global_limit_burst_size=4096
+```
+
+The profile keeps authentication and I/O admission active. To retry a partial
+folder upload in Console, select **Skip existing** to keep files already
+committed and submit the missing ones.
+
 ## Metadata lifecycle and maintenance
 
 Metadata owns named trash and expiration policy. A named delete changes metadata
