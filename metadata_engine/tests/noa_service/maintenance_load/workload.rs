@@ -24,13 +24,19 @@ fn payload_at(seed: u64, offset: u64, length: usize) -> bytes::Bytes {
     bytes.into()
 }
 
-pub(super) async fn upload(context: &Context, path: String, length: usize, seed: u64) -> Expected {
+pub(super) async fn upload(
+    context: &Context,
+    path: String,
+    length: usize,
+    seed: u64,
+    durability: &str,
+) -> Expected {
     let bytes = payload(seed, length);
     let ack = json_response(
         context
             .client
             .post(format!(
-                "{}/upload/one-shot/{path}?durability=strict",
+                "{}/upload/one-shot/{path}?durability={durability}",
                 context.base
             ))
             .bearer_auth(&context.token)
@@ -124,6 +130,11 @@ pub(super) async fn foreground(
     library: Vec<Expected>,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
+    let small_durability = match std::env::var("M1_MAINTENANCE_SMALL_DURABILITY").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("strict") => "strict",
+        Ok("batched") => "batched",
+        _ => panic!("M1_MAINTENANCE_SMALL_DURABILITY must be strict or batched"),
+    };
     let (trash, mut receiver) = tokio::sync::mpsc::channel::<usize>(16);
     for worker in 0..2 {
         let (context, meter, trash) = (context.clone(), meter.clone(), trash.clone());
@@ -138,7 +149,7 @@ pub(super) async fn foreground(
                         1,
                         "small_upload",
                         length as u64,
-                        upload(&context, path, length, seed),
+                        upload(&context, path, length, seed, small_durability),
                     )
                     .await;
                 if index % 4 == 0 {

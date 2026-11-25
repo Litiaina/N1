@@ -242,6 +242,7 @@ async fn mixed_traffic_with_gc_monitoring_and_backups_preserves_every_ack() {
             format!("library/{index}.bin"),
             8 << 20,
             index as u64,
+            "strict",
         )
         .await;
         context.save(expected.clone());

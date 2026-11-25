@@ -260,6 +260,26 @@ The candidate lowers the measured median on both profiles. Its SATA worst
 window has higher p99, and both profiles miss the latency targets. The
 candidate remains an experiment.
 
+### Normal one-shot staging experiment
+
+For nonempty Normal uploads of at most one stripe, an M1 candidate stages
+the payload while committing its reservation. It uses N1's existing
+directory-scoped finalize after both succeed. M1 publishes the named
+version after N1's durable completion. The candidate and baseline use the
+same packaged N1 and the same client with
+`M1_MAINTENANCE_SMALL_DURABILITY=batched`.
+
+| Profile | Baseline p50 / p99 ms | Candidate p50 / p99 ms | Small uploads baseline / candidate |
+| --- | ---: | ---: | ---: |
+| SATA, four 15-second windows | 50.197 / 436.957 | 74.164 / 310.707 | 531 / 531 |
+| HDD, four 10-second windows | 1,416.248 / 4,565.071 | 1,411.429 / 3,133.474 | 53 / 49 |
+
+The SATA median regresses even though its p99 improves. The HDD cohorts
+are small enough that their p99 values equal their maxima. The candidate
+misses the latency target on both media and stays outside the release path.
+All four runs verify 1,208 identities after SIGKILL and restart, restore two
+snapshots each and finish with only pool markers on the member disks.
+
 ## Monitoring observations and checks
 
 The initial smoke fixture incorrectly required every cached health component to
