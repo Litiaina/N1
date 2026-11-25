@@ -239,11 +239,18 @@ pub(super) async fn foreground(
             let length = 128u64 << 20;
             let preferred = 8u64 << 20;
             let seed = (phase * 100_000 + 90_000 + index) as u64;
-            let source = payload(seed, BLOCK);
-            let mut digest = Sha256::new();
-            for _ in 0..128 {
-                digest.update(&source);
-            }
+            // Hashing the next bulk object must not delay unrelated client
+            // requests or inflate their measured latency on a Tokio worker.
+            let digest = tokio::task::spawn_blocking(move || {
+                let source = payload(seed, BLOCK);
+                let mut digest = Sha256::new();
+                for _ in 0..128 {
+                    digest.update(&source);
+                }
+                digest.finalize()
+            })
+            .await
+            .expect("bulk source preparation failed");
             let path = format!("load/large-p{phase}-{index}.bin");
             let route = format!(
                 "{}/upload/multipart{}",
@@ -313,7 +320,7 @@ pub(super) async fn foreground(
                 version: version.into(),
                 bytes: length,
                 seed,
-                sha256: hex::encode(digest.finalize()),
+                sha256: hex::encode(digest),
                 trashed: false,
             });
             index += 1;

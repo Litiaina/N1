@@ -166,6 +166,46 @@ fits in memory; no cache drop is performed and read rates are not cold-storage
 measurements. GC timing includes all work selected by that job, including trash
 from preceding off phases; it is not a per-object delete latency.
 
+## Small-upload latency follow-up
+
+The November 26 target is **50 ms p50 and 500 ms p99** for durable named
+uploads of 4, 64 and 256 KiB through M1 to N1. The workload mixes these
+uploads with multipart traffic, downloads, ranges, rename and trash. The
+client now hashes the next 128 MiB multipart source on a blocking worker.
+Previously, this preparation ran on an async worker and could delay the
+client's observation of unrelated responses.
+
+The packaged N1 1.0.0-RC.2 and M1 1.0.0-RC.1 executables ran four 20-second
+offered windows, with maintenance enabled for the middle two. Each run uses
+a 1+1 pool and keeps M1's database on one of its two drives. The SATA profile
+pairs a 240 GB Intel XFS SSD with a 480 GB Kingston ext4 SSD. The HDD profile
+uses two 1 TB USB UAS XFS HDDs. Shards and databases are off NVMe in both.
+Percentiles use nearest rank across all small-upload completions, including
+requests that finish during the drain.
+
+| Profile | Small uploads | p50 ms | p95 ms | p99 ms | Exact restart checks |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Two SATA SSDs | 676 | 54.472 | 344.344 | 548.407 | 695 identities, 2 restored snapshots |
+| Two HDDs | 115 | 891.791 | 3,207.709 | 3,600.323 | 124 identities, 2 restored snapshots |
+
+Both runs pass payload, version and absence verification after terminating
+and restarting both engines, followed by a marker-only member census. The
+SATA 4 KiB cohort meets both latency targets at 46.836 ms p50 and 457.554 ms
+p99 across 228 samples. The 64 KiB cohort records 51.866 / 358.418 ms and the
+256 KiB cohort records 66.642 / 673.357 ms. Neither pooled run meets both
+targets. Four-drive acceptance remains open for this target.
+
+Read-only telemetry records individual N1 filesystem flushes up to 222.999 ms
+on SATA and 1,207.262 ms on HDD. The sampled foreground write-admission queue
+stays below 0.1 ms in both runs. A shorter, instrumented SATA run with
+15-second windows reaches 49.961 ms p50 and 408.724 ms p99 across 523
+uploads. In that run, N1 PUT reaches 342.497 ms p99 and M1 reserve and
+publish reach 63.637 and 76.354 ms p99, respectively. In the instrumented
+HDD run, median N1 PUT is 504.947 ms and median M1 reserve and publish are
+110.518 and 119.867 ms on shared storage. These measurements point to
+durable storage waits without attributing each outlier to one syscall.
+The benchmark correction changes neither packaged engine's runtime.
+
 ## Monitoring observations and checks
 
 The initial smoke fixture incorrectly required every cached health component to
