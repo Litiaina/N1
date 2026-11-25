@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "prerelease",
+  "status": "draft",
   "system": {
     "version": "1.0.0-RC.2",
     "tag": "v1.0.0-RC.2"

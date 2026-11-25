@@ -15,7 +15,9 @@ not close a qualification gate or create a release.
 The [API and operator qualification](RC2-API-QUALIFICATION-20261124.md#candidate-and-fixtures)
 records the baseline identities. The release keeps the qualified N1 executable
 and includes targeted M1 and Console fixes for maintenance status. The artifact
-manifest shipped with the release identifies the final binaries and Console build.
+manifest identifies the binaries and Console build in the original bundle.
+The GitHub release returned to draft after the SSD and NVMe benchmarks. The
+Trash pagination fixes are in source and the original bundle awaits review.
 
 | Gate | Current state |
 | --- | --- |
@@ -27,7 +29,7 @@ manifest shipped with the release identifies the final binaries and Console buil
 | Contract and operator qualification | Passed for the selected N1, M1 and Console builds. The public NOA checks, fresh browser walkthrough, named snapshot restore and optional N1 Shell recovery workflows have recorded evidence. [API and operator matrix](RC2-API-QUALIFICATION-20261124.md) |
 | Sustained resource/performance acceptance | Accepted for the tested four-HDD profile on November 25. All 1,641 durable small uploads finished under 2 seconds. The worst window measured 1.67 s p99. The five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. [Latency sign-off](FOUR-DRIVE-QUALIFICATION-20261117.md#mixed-load-latency-sign-off--november-25) · [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
 | Physical recovery | Passed. Earlier cuts covered strict reception, publication and standalone 2+2 reads during physical two-member loss. Four additional whole-host cuts passed at M1 journal commit, M1 checkpoint publication, N1 shard repair and M1 GC during N1 purge. [Targeted physical results](FOUR-DRIVE-QUALIFICATION-20261117.md#targeted-physical-interruptions--november-25) |
-| Packaging and publication | Linux x86-64 bundle with executable and Console checksums. Both units rendered and verified. Both launcher profiles passed upload and restart. The operator authorized distribution as a prerelease on November 25, 2026. [Release downloads](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2) |
+| Packaging and publication | Linux x86-64 bundle with executable and Console checksums. Both units rendered and verified. Both launcher profiles passed upload and restart. The November 25 prerelease returned to draft with its original tag and assets retained. |
 
 The sections below retain earlier evidence and its limits. A historical open
 item is not automatically a new instruction to restart a completed population.

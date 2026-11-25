@@ -99,8 +99,9 @@ Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
 [metadata internals](docs/M1.md) and
 [RC.2 qualification](docs/RC2-IMPLEMENTATION.md).
 
-The Linux x86-64 prerelease includes N1, M1, the N1 backup helper, and Console.
-[Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2).
+System RC.2 is back in draft pending review of the Trash pagination fixes and
+the local SSD and NVMe benchmark results. The Linux x86-64 bundle includes
+N1, M1, the N1 backup helper, and Console.
 
 ## License and reports
 
