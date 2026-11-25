@@ -13,6 +13,10 @@ not close a qualification gate or create a release.
 
 ## Current release decision — November 25, 2026
 
+The selected N1, M1 and Console artifacts are frozen for the remaining release
+checks. Their identities are recorded in the
+[API and operator qualification](RC2-API-QUALIFICATION-20261124.md#candidate-and-fixtures).
+
 | Gate | Current state |
 | --- | --- |
 | N1 runtime | Frozen at the selected `f1a54f…` executable. Minimum-profile performance, 3+1/2+2 recovery, three whole-host cuts and standalone 2+2 physical member loss and return have passed their recorded checks. |
@@ -20,7 +24,7 @@ not close a qualification gate or create a release.
 | Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
 | M1 maintenance recovery and mixed reads | Passed on the selected M1. The 3+1 and 2+2 runs completed 11,912 operations without errors, verified 1,748 identities after restart and restored four snapshots. Full and ranged reads also passed the targeted early-rejection and late-damage checks on both layouts. [Four-drive results](FOUR-DRIVE-QUALIFICATION-20261117.md#system-candidate-verification--november-24) |
 | Contract and operator qualification | Passed for the selected N1, M1 and Console builds. The public NOA checks, fresh browser walkthrough, named snapshot restore and optional N1 Shell recovery workflows have recorded evidence. [API and operator matrix](RC2-API-QUALIFICATION-20261124.md) |
-| Sustained resource/performance acceptance | A five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. Small named uploads measured 1.09–1.47 s p99 on 3+1 and 1.11–1.67 s on 2+2 across the separate mixed-workload windows. Operator latency sign-off remains open. [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
+| Sustained resource/performance acceptance | Accepted for the tested four-HDD profile on November 25. All 1,641 durable small uploads finished under 2 seconds. The worst window measured 1.67 s p99. The five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. [Latency sign-off](FOUR-DRIVE-QUALIFICATION-20261117.md#mixed-load-latency-sign-off--november-25) · [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
 | Remaining physical transitions | Five whole-host cuts passed, including the selected pair's pre-directory-sync publication cut on 3+1. Both finalize retries preserved the original identities and required zero part resends. Standalone 2+2 also served four checksum-verified objects with two HDDs physically off. Exact M1 commit/checkpoint, repair and GC cut points remain open. [Physical publication recovery](FOUR-DRIVE-QUALIFICATION-20261117.md#physical-publication-recovery-on-31) |
 | Packaging and publication | The private Linux x86-64 bundle passed extraction and executable/Console checksum verification. Both units rendered and verified. Both launcher profiles passed upload and restart. Final distribution sign-off and publication remain open. |
 

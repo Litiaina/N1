@@ -563,6 +563,29 @@ upload size policies, multipart resume and recovery, and N1 backup, replication
 and restore. An attempted fixture setup on a separate two-HDD machine returned
 an I/O error before any of these cases started there.
 
+### Mixed-load latency sign-off — November 25
+
+The operator accepted the selected candidate's durable small-upload latency on
+the four-HDD reference system and froze the N1, M1 and Console artifacts. Two
+paced clients sent 4–256 KiB one-shot uploads while bulk uploads, reads, renames
+and trash operations ran concurrently. Monitoring, GC and live backups ran in
+two of the four windows per layout.
+
+| N1 pool | Small uploads | Median ms | p95 ms | Pooled p99 ms | Worst window p99 ms | Maximum ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3+1 | 826 | 446 | 924 | 1,390 | 1,471 | 1,819 |
+| 2+2 | 815 | 440 | 904 | 1,276 | 1,673 | 1,815 |
+
+All 1,641 uploads finished under 2 seconds, including requests that completed
+during the drain. The 2+2 window with the highest p99 had 191 uploads. The
+sign-off covers the recorded workload and reference hardware.
+
+The same 3+1 run recorded 63 multipart finalizations for 128 MiB objects with
+explicit 8 MiB parts. Finalize took 3.32 s median and 5.38 s maximum because
+M1 forwarded staged data to fit the native stripe geometry. Console requests
+part-size negotiation for fresh uploads. These multipart measurements remain
+part of the qualification record.
+
 ### Sustained HTTP and native admission
 
 Sixteen clients overloaded a single fragment on 3+1 for a five-minute request
@@ -579,8 +602,8 @@ The largest individual worker p99 was 657 ms, including admitted and rejected
 requests. One-second samples recorded peak RSS of 101,136 KiB for M1 and
 93,712 KiB for N1, with zero sampled process swap. Package staging also used
 the metadata NVMe near the end of the window. These measurements characterize
-the configured quota workload. The operator left mixed-workload tail-latency
-sign-off open on November 24.
+the configured quota workload. The separate mixed-workload latency result was
+accepted on November 25.
 
 To repeat the five-minute run, set `M1_OVERLOAD_SECONDS=300` for
 `admission::overload::sustained_http_native_overload_preserves_acks_and_shared_quotas`.
