@@ -1,14 +1,12 @@
 # N1 and M1 four-HDD qualification checklist — November 16, 2026
 
-**Active checklist, updated November 17, 2026.** The operator opened the
-four-drive window early, ahead of the planned November 20 start. See the
-[recorded results](FOUR-DRIVE-QUALIFICATION-20261117.md) for completed checks,
-remaining performance observations and original failures. Three physical
-power-cut windows now pass independent verification: readback after publication,
-idle services and strict multipart reception. The last preserves all 94 strict
-part ACKs before recovery. Other exact transition windows keep their separate
-scope. This file
-is not an automated power-cut job. Use the [hardware reporting profiles](TEST-PROFILES.md).
+**Updated November 25, 2026.** The operator opened the four-drive window early,
+ahead of the planned November 20 start. The
+[qualification record](FOUR-DRIVE-QUALIFICATION-20261117.md) retains the earlier
+physical cuts, including all 94 strict part ACKs from active multipart. The
+[targeted checks](FOUR-DRIVE-QUALIFICATION-20261117.md#targeted-physical-interruptions--november-25)
+passed at M1 journal commit, M1 checkpoint publication, N1 shard repair and
+M1 GC during N1 purge. Use the [hardware reporting profiles](TEST-PROFILES.md).
 
 Use the four-HDD reference system to qualify N1 and M1 recovery and begin
 controlled hardware power-loss testing. Preserve the completed million-object

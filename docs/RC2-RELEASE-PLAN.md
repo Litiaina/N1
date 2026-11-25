@@ -24,12 +24,9 @@ passed on the selected pair. The
 the contract and Console checks on the same build. The operator accepted the
 [mixed-load latency result](FOUR-DRIVE-QUALIFICATION-20261117.md#mixed-load-latency-sign-off--november-25)
 and froze the selected N1, M1 and Console artifacts on November 25. The
-[completion checklist](RC2-IMPLEMENTATION.md) tracks the remaining gates.
-Coordinate the remaining physical power-loss checks **after** the other
-qualification checks, as the final operator-controlled stage. Prepare with
-[the four-drive checklist](RC2-FOUR-HDD-CHECKLIST-20261116.md); no automated power
-cut or completed result is implied. Final-candidate reconciliation remains
-necessary if runtime changes follow a campaign.
+[four targeted power-loss checks](FOUR-DRIVE-QUALIFICATION-20261117.md#targeted-physical-interruptions--november-25)
+passed on that candidate. The [completion checklist](RC2-IMPLEMENTATION.md)
+tracks final distribution sign-off and publication.
 
 Use the selected artifact identities in the
 [N1 publication qualification](N1-MIXED-WORKLOAD-20261116.md#publication-follow-up-on-both-minimum-storage-profiles)

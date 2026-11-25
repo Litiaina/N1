@@ -677,5 +677,41 @@ shards and its pool marker. The extra finalized identity is retained M1 trash.
 No extra files or symlinks appeared.
 
 This test covers acknowledged publication and interruption at N1's shard
-publication barrier, through both the standalone and named paths. M1 database
-commit/checkpoint, shard repair and GC power-interruption windows remain open.
+publication barrier, through both the standalone and named paths. The follow-up
+below records the other interruption windows separately.
+
+### Targeted physical interruptions — November 25
+
+The test used the frozen N1 RC.2 and M1 RC.1 executables on a private 3+1 XFS
+pool with M1 on NVMe. The operator switched power to the host and all four
+HDDs. A separately powered client recorded requests and complete replies and
+synchronized them before each cut. A tracer held the production executables
+at the observed syscall boundaries. After each boot, the fixture checked the original
+filesystem identities and pool markers and ran the offline M1 validator
+before restarting the private services.
+
+| Transition | Held point | Recovery |
+| --- | --- | --- |
+| M1 journal commit | Before the generation file's fsync, with an atomic rename outstanding. A concurrent read still served the old name. | The interrupted rename recovered at the new name with the original version and exact payload. The old name returned 404. Neither the client nor the recorder saw a successful rename reply before the outage. The offline validator checked 61 records. |
+| M1 checkpoint | After renaming the new `CURRENT` descriptor and before its parent directory sync. Both generations remained on disk. Eight writers had recorded 2,205 rename acknowledgements in the live wave. | `CURRENT` reopened generation 6 and the offline validator checked 252 records. All 24 objects from the two preparation waves and the live wave retained the last acknowledged name, exact payload and version after 21,858 total acknowledged renames. |
+| N1 shard repair | After reconstructing and syncing the scratch shard, before renaming it into the final shard path. The independent client had no repair reply. | The final shard path was still absent. Deep health read and verified all 2,359,319 bytes with one shard missing. Explicit retry repaired that shard. Deep health then verified all four shards, the full API download matched the source, and the repair staging directory was gone. |
+| M1 GC and N1 purge | All four target unlinks had executed. N1 was held before its filesystem persistence barrier. The M1 job still showed zero processed items and zero failures. | M1 resumed the same persisted job at startup and reclaimed one item with zero failures or deferrals. The pre-start census found zero surviving target shards. The completed job cleared the trash entry and all target file and staging paths. |
+
+After each cut, the two original baseline journals verified four published
+objects, two required absences and four strict part ACKs in incomplete uploads
+before any client-initiated retry. The 24 checkpoint objects were also verified
+after repair and GC. The repaired object passed a full readback after the final
+restart. Before starting M1 for GC recovery, the private fixture raised trash
+retention from zero to 24 hours. The target was younger than 24 hours. The
+persisted job completed its earlier claim under the new policy. A previously
+acknowledged standalone purge still returned 404 for status, finalize, and
+part write, with no shard or staging residue. The final offline M1 check
+verified 245 records. Both private services then stayed stopped.
+
+The journal-commit process rehearsal also passed. The first checkpoint
+preparation ran through its checkpoint without holding the rename. A second
+attempt reached the still-running first tracer. Both preparations kept their
+ACKs and were verified alongside the confirmed cut using a fresh tracer.
+
+All four targeted physical interruption checks passed. The frozen candidate
+is ready for final distribution approval.
