@@ -206,6 +206,60 @@ HDD run, median N1 PUT is 504.947 ms and median M1 reserve and publish are
 durable storage waits without attributing each outlier to one syscall.
 The benchmark correction changes neither packaged engine's runtime.
 
+### Correlated persistence trace
+
+The same SATA and HDD profiles ran again with M1 request stages and
+selective N1/M1 syscall tracing. Both retained io_uring, the same strict
+upload policy and their existing EC geometry. Traced timings are diagnostic.
+The trace adds overhead and its writes share the test storage.
+
+- On SATA, one N1 PUT took **1,147.814 ms**. After both shard renames, the
+  ext4 member's `syncfs` took **1,059.452 ms** and ended 0.450 ms before N1
+  returned. The XFS member's flush took **5.071 ms**. A second PUT had
+  already renamed its shards while that ext4 flush was running. It waited
+  for a subsequent **63.583 ms** ext4 flush and took **1,192.456 ms** overall.
+- On HDD, one M1 handler took **4,316.382 ms**, with **3,203.263 ms** in N1
+  PUT. After both shard renames, a member's `syncfs` took **907.819 ms** and
+  ended 2.328 ms before PUT returned. M1's subsequent journal `fsync` took
+  **991.110 ms** inside the named publication stage. The syscall trace does
+  not separately time N1's pre-rename io_uring file synchronization.
+
+The two traces identify post-rename filesystem flushes as a source of
+small-upload tail latency. On the shared HDD, M1's separate durable
+publication also contributes. Both traced runs complete post-SIGKILL
+verification, two snapshot restores and the marker-only census across
+639 SATA and 106 HDD identities.
+
+### One-stripe publication experiment
+
+The candidate keeps the sealed-shard data sync and replaces `syncfs` with
+the existing pinned directory syncs for one-shot objects of at most one
+stripe. It checks member bindings before acknowledgement. Larger one-shot
+uploads, multipart and batch use their existing paths.
+
+Both N1 executables are locked Rust 1.99.0 release builds from the same
+source apart from the candidate change. M1 is the same packaged executable
+throughout. Each case uses the corrected client and four 30-second offered
+windows. SATA runs candidate first and HDD runs baseline first. These are
+untraced runs on the same two 1+1 profiles above. Throughput counts multipart
+bytes acknowledged inside the offered windows.
+
+| Profile | Small uploads | p50 ms | p99 ms | Worst window p99 ms | Multipart MiB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SATA baseline | 949 | 65.389 | 512.031 | 656.608 | 24.800 |
+| SATA candidate | 1,026 | 55.542 | 507.343 | 748.919 | 25.000 |
+| HDD baseline | 183 | 1,030.073 | 3,864.991 | 3,988.976 | 6.000 |
+| HDD candidate | 197 | 796.438 | 3,490.224 | 3,975.543 | 6.133 |
+
+The candidate passes 230 N1 library tests, with two opt-in tests excluded.
+All four workload cases verify payloads, versions and absences after SIGKILL
+and restart for **2,432 identities** in total. Each restores two snapshots
+and finishes with only the member markers on disk.
+
+The candidate lowers the measured median on both profiles. Its SATA worst
+window has higher p99, and both profiles miss the latency targets. The
+candidate remains an experiment.
+
 ## Monitoring observations and checks
 
 The initial smoke fixture incorrectly required every cached health component to
