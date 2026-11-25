@@ -24,10 +24,16 @@ fn system_release_selects_the_declared_component_versions_and_binaries() {
     let release: Value =
         serde_json::from_str(include_str!("../../deploy/system-release.json")).unwrap();
     assert_eq!(release["schema_version"], 1);
-    assert_eq!(
-        release["system"]["tag"],
-        format!("v{}", release["system"]["version"].as_str().unwrap())
-    );
+    let system = &release["system"];
+    let mut expected_tag = format!("v{}", system["version"].as_str().unwrap());
+    if let Some(revision) = system.get("package_revision") {
+        let revision = revision
+            .as_u64()
+            .expect("package revision must be a number");
+        assert!(revision > 1);
+        expected_tag.push_str(&format!("+{revision}"));
+    }
+    assert_eq!(system["tag"], expected_tag);
     for name in ["n1", "m1"] {
         let component = &release["components"][name];
         let package = metadata["packages"]

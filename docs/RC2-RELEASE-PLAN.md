@@ -40,7 +40,7 @@ measurements; do not restart the million-object campaign routinely.
 | Before November 20 | Preserve the selected N1 checkpoint and prepare M1/system checks | Keep established N1 paths fixed; retain existing populations and matched performance results; add only missing qualification coverage and correct demonstrated failures |
 | From around November 20 | Full-stack resource, maintenance and operator qualification | Mixed traffic with monitoring, GC, backup and migration; isolated disk-full, memory-pressure, stalled-I/O and connection failures; all acknowledged data retained and incomplete publications refused |
 | Operator hardware window | Four-HDD recovery and physical power loss | Complete hardware/independent-ACK-recorder preflight; record actual four-HDD and power-cut outcomes; qualify affected changes against retained ACKs |
-| After required checks pass | Final go/no-go review | Exact source/build/binary identities; required NOA v1/v2 and Console matrix; affected scale evidence reconciled; final regression; unresolved required failures mean no-go |
+| After required checks pass | Final go/no-go review | Exact source and binary identities, required NOA v1/v2 checks, affected scale evidence and final engine regression. Console qualification follows its own release process. |
 | After go decision | Packaging and RC.2 preparation | Clean installation/startup/configuration, binary versions, checksums, documentation and release notes match the frozen candidate; publish only on operator instruction |
 | RC period through February 14, 2027 target | Real-deployment validation before stable 1.0.0 | Retain deployment failures, recovery and performance evidence; resolve release-blocking defects and qualify the final stable candidate before publication |
 

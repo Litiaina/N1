@@ -99,9 +99,9 @@ Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
 [metadata internals](docs/M1.md) and
 [RC.2 qualification](docs/RC2-IMPLEMENTATION.md).
 
-System RC.2 is back in draft pending review of the Trash pagination fixes and
-the local SSD and NVMe benchmark results. The Linux x86-64 bundle includes
-N1, M1, the N1 backup helper, and Console.
+The Linux x86-64 engine release includes N1, M1, the N1 backup helper, and
+systemd installers. Console is distributed separately.
+[Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2%2B2).
 
 ## License and reports
 

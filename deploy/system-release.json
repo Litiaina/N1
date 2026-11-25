@@ -1,9 +1,10 @@
 {
   "schema_version": 1,
-  "status": "draft",
+  "status": "prerelease",
   "system": {
     "version": "1.0.0-RC.2",
-    "tag": "v1.0.0-RC.2"
+    "package_revision": 2,
+    "tag": "v1.0.0-RC.2+2"
   },
   "components": {
     "n1": {

@@ -13,11 +13,10 @@ not close a qualification gate or create a release.
 ## Current release decision — November 25, 2026
 
 The [API and operator qualification](RC2-API-QUALIFICATION-20261124.md#candidate-and-fixtures)
-records the baseline identities. The release keeps the qualified N1 executable
-and includes targeted M1 and Console fixes for maintenance status. The artifact
-manifest identifies the binaries and Console build in the original bundle.
-The GitHub release returned to draft after the SSD and NVMe benchmarks. The
-Trash pagination fixes are in source and the original bundle awaits review.
+records the baseline identities. Package revision 2 pairs the qualified N1
+executable with M1's maintenance status and Trash pagination fixes. Its
+artifact manifest identifies the exact binaries and their source commits.
+Console has a separate distribution and its own follow-up performance checks.
 
 | Gate | Current state |
 | --- | --- |
@@ -29,7 +28,7 @@ Trash pagination fixes are in source and the original bundle awaits review.
 | Contract and operator qualification | Passed for the selected N1, M1 and Console builds. The public NOA checks, fresh browser walkthrough, named snapshot restore and optional N1 Shell recovery workflows have recorded evidence. [API and operator matrix](RC2-API-QUALIFICATION-20261124.md) |
 | Sustained resource/performance acceptance | Accepted for the tested four-HDD profile on November 25. All 1,641 durable small uploads finished under 2 seconds. The worst window measured 1.67 s p99. The five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. [Latency sign-off](FOUR-DRIVE-QUALIFICATION-20261117.md#mixed-load-latency-sign-off--november-25) · [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
 | Physical recovery | Passed. Earlier cuts covered strict reception, publication and standalone 2+2 reads during physical two-member loss. Four additional whole-host cuts passed at M1 journal commit, M1 checkpoint publication, N1 shard repair and M1 GC during N1 purge. [Targeted physical results](FOUR-DRIVE-QUALIFICATION-20261117.md#targeted-physical-interruptions--november-25) |
-| Packaging and publication | Linux x86-64 bundle with executable and Console checksums. Both units rendered and verified. Both launcher profiles passed upload and restart. The November 25 prerelease returned to draft with its original tag and assets retained. |
+| Engine package revision | Linux x86-64 bundle with N1, M1, the N1 backup helper, and systemd installers. Both units rendered and verified. The revision tag `v1.0.0-RC.2+2` supersedes the withdrawn bundle and identifies the corrected package. |
 
 The sections below retain earlier evidence and its limits. A historical open
 item is not automatically a new instruction to restart a completed population.

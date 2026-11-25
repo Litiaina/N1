@@ -8,6 +8,9 @@ This file records product changes. Architecture is defined in
 
 RC.2 introduces N1's LINK architecture and the independent M1 metadata store.
 
+- End M1 Trash pagination after the final record, including a full final page.
+- Distribute N1 and M1 in the RC.2 engine bundle. Console has its own distribution.
+
 - Show the scheduled M1 garbage collection phase and policy to fragment
   readers. Full server-wide job counts and errors remain available to
   operators. Console shows each maintenance result beside its Status button

@@ -1,8 +1,7 @@
 # System releases and component versions
 
-Litiaina publishes one system release with one Git tag. The release selects
-a tested combination of N1, M1 and Console. N1 and M1 each report their own
-binary version.
+Litiaina publishes N1 and M1 together in one system release with one Git tag.
+Each engine reports its own binary version. Console has its own distribution.
 
 ## RC.2 release versions
 
@@ -17,8 +16,10 @@ system retain their RC.2 numbering. Historical reports keep the versions
 and hashes of the exact binaries they tested. The system download and
 artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
-System RC.2 uses the Git tag `v1.0.0-RC.2`. The artifact manifest records
-the component versions, source commits and binary SHA-256 checksums.
+System RC.2 package revision 2 uses the Git tag `v1.0.0-RC.2+2`. The suffix
+identifies the engine bundle that supersedes the withdrawn `v1.0.0-RC.2`
+package. The artifact manifest records the component versions, source commits
+and binary SHA-256 checksums.
 
 ## Component versions
 
@@ -55,21 +56,19 @@ Before publishing a complete system release:
 
 1. Select and freeze the component versions in the manifest. Record any reused
    qualified binary without rebuilding it merely to match the system number.
-2. Qualify that exact combination through standalone N1, M1 → N1 and the
-   supported Console workflows, closing the required release gates.
+2. Qualify that exact combination through standalone N1 and M1 → N1, closing
+   the required engine release gates.
 3. Preserve a final artifact manifest with the system/component versions,
    component source commits, build/toolchain identity, executable SHA-256 values,
-   supported API/storage contracts and selected Console source/build identity.
-   Keep private infrastructure identifiers out of published metadata.
+   and supported API and storage contracts. Keep private infrastructure
+   identifiers out of published metadata.
 4. Verify each shipped executable's `--version` against its selected package
    version. Publish one system tag for the qualified combination on release
    authorization.
 
 A subsequent system release can select a newer M1 and the same N1, or vice
-versa. Its manifest must identify that tested pairing. Do not move an existing
-system tag to change the component selection. Console belongs to its own
-repository; the final system artifact manifest must identify the tested
-Console build rather than assigning it N1's or M1's version implicitly.
+versa. Its manifest must identify that tested pairing. Use a distinct package
+revision tag to replace a withdrawn release candidate with a corrected bundle.
 
 ## Protocol and disk-format compatibility
 
