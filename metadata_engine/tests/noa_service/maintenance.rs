@@ -146,6 +146,107 @@ async fn start(client: &Client, base: &str, token: &str, kind: &str, query: &str
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_status_reports_scheduled_gc_to_fragment_users_with_scoped_details() {
+    let mut stack = Stack::new().await;
+    drop(stack.metadata.take());
+    policy(&stack, false, 60, 3600, 5);
+    stack.start_metadata().await;
+    let client = Client::new();
+    let base = format!("{}/noa/v1", stack.url);
+    let (alias, token, operator) = auth(&client, &base, "GC status").await;
+    let (_, other_token, _) = auth(&client, &base, "Other GC scope").await;
+    let reader = json_response(
+        client
+            .post(format!("{base}/auth/fragment"))
+            .json(&json!({"fragment":alias,"secret":"test-only-fragment","read":true}))
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
+    let reader = reader["access_token"].as_str().unwrap();
+
+    start(&client, &base, &other_token, "gc", "dry_run=true").await;
+    let other_job = wait(&client, &base, &other_token, "gc").await;
+    drop(stack.metadata.take());
+    policy(&stack, true, 60, 1, 5);
+    stack.start_metadata().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let scheduled = loop {
+        let state = wait(&client, &base, &operator, "gc").await;
+        if state["id"] != other_job["id"] && state["request"]["fragment"].is_null() {
+            break state;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "scheduled GC did not run"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(scheduled["phase"], "completed");
+    assert!(scheduled["scanned"].is_number());
+    for session in [&token, reader] {
+        let state = wait(&client, &base, session, "gc").await;
+        assert_eq!(state["scope"], "server");
+        assert_eq!(state["phase"], "completed");
+        for field in [
+            "id",
+            "request",
+            "scanned",
+            "processed",
+            "last_error",
+            "cursor",
+        ] {
+            assert!(state.get(field).is_none(), "unexpected {field}: {state}");
+        }
+        assert_eq!(state["policy"]["trash_retention_seconds"], 60);
+    }
+    let health = json_response(
+        client
+            .get(format!("{base}/maintenance/health"))
+            .bearer_auth(reader)
+            .send()
+            .await
+            .unwrap(),
+        200,
+    )
+    .await;
+    assert_eq!(health["maintenance"]["gc_job"]["scope"], "server");
+    assert!(health["maintenance"]["gc_job"].get("request").is_none());
+
+    drop(stack.metadata.take());
+    policy(&stack, false, 60, 3600, 5);
+    stack.start_metadata().await;
+    let own = start(&client, &base, &token, "gc", "dry_run=true").await;
+    assert_eq!(wait(&client, &base, reader, "gc").await["id"], own["id"]);
+    let foreign = wait(&client, &base, &other_token, "gc").await;
+    assert_eq!(foreign["phase"], "idle");
+    assert!(foreign.get("request").is_none());
+    for (path, session) in [("start", reader), ("stop", token.as_str())] {
+        assert_eq!(
+            client
+                .post(format!("{base}/maintenance/gc/{path}"))
+                .bearer_auth(session)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/maintenance/gc/status"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "private two-HDD TTL, durable purge intent, partial removal/restart, permissions and scheduling"]
 async fn indexed_trash_gc_enforces_ttl_retries_after_outage_and_automatic_schedule() {
     let mut stack = Stack::new().await;

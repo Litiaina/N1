@@ -23,7 +23,8 @@ pub(super) async fn health(
     if q.get("deep_scan").is_some_and(|s| s == "true") {
         app.diagnostics.start(app.clone(), claims.id(), None)?;
     }
-    let mut value = super::super::monitoring::health(&app).await;
+    let fragment = (!claims.operator).then(|| claims.id());
+    let mut value = super::super::monitoring::health(&app, fragment).await;
     value["integrity_scan"] = app.diagnostics.summary(claims.id());
     // Explicit diagnostics may request live in-memory counters. Routine Console
     // polling never takes this path or bypasses filesystem observation caching.
@@ -56,7 +57,8 @@ pub(super) async fn fragment_health(
     if q.get("deep_scan").is_some_and(|s| s == "true") {
         app.diagnostics.start(app.clone(), target.id, None)?;
     }
-    let mut health = super::super::monitoring::health(&app).await;
+    let fragment_scope = (!claims.operator).then_some(target.id);
+    let mut health = super::super::monitoring::health(&app, fragment_scope).await;
     health["fragment"] = json!(ulid::Ulid::from_bytes(target.id.0).to_string());
     health["integrity_scan"] = app.diagnostics.summary(target.id);
     Ok(Json(health))
@@ -310,11 +312,18 @@ pub(super) async fn status(
     Path(kind): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let claims = auth::authorize(&app, &headers, "maintenance").await?;
-    let value = app
-        .maintenance
-        .status(crate::maintenance::Kind::parse(&kind)?)
-        .await?;
+    use crate::maintenance::Kind;
+    let kind = Kind::parse(&kind)?;
+    let claims = auth::authorize(&app, &headers, "session").await?;
+    if kind == Kind::Gc {
+        if !claims.read {
+            claims.require("maintenance")?;
+        }
+        let fragment = (!claims.operator).then(|| claims.id());
+        return Ok(Json(app.maintenance.status(kind, fragment).await?));
+    }
+    claims.require("maintenance")?;
+    let value = app.maintenance.status(kind, None).await?;
     if !claims.operator
         && value.get("request").is_some()
         && value["request"]["fragment"].as_str() != Some(&claims.id().to_string())
@@ -332,7 +341,7 @@ pub(super) async fn stop(
     claims.require("operator")?;
     let kind = crate::maintenance::Kind::parse(&kind)?;
     app.maintenance.stop_job(kind).await?;
-    Ok(Json(app.maintenance.status(kind).await?))
+    Ok(Json(app.maintenance.status(kind, None).await?))
 }
 pub(super) async fn scoped_start(
     State(app): State<Arc<App>>,

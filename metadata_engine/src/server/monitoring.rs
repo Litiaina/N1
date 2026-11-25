@@ -2,7 +2,7 @@
 //! never opens an object member path, walks the namespace or reads a payload.
 use super::App;
 use cli_core::{monitoring::Observation, system};
-use n1_link::noa::Command;
+use n1_link::{PoolId, noa::Command};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
@@ -113,7 +113,7 @@ fn component(observed: &Observation, role: &str, endpoint: String) -> Value {
     }
     value
 }
-pub(super) async fn health(app: &Arc<App>) -> Value {
+pub(super) async fn health(app: &Arc<App>, fragment: Option<PoolId>) -> Value {
     let (meta, objects) = tokio::join!(metadata(app), object(app));
     let scheme = if app.config.cert_path.is_some() {
         "https"
@@ -231,7 +231,7 @@ pub(super) async fn health(app: &Arc<App>) -> Value {
         crate::maintenance::Kind::Repair,
         crate::maintenance::Kind::Redistribution,
     ] {
-        if let Ok(state) = app.maintenance.status(kind).await {
+        if let Ok(state) = app.maintenance.status(kind, fragment).await {
             maintenance[format!("{}_running", kind.name())] = state["running"].clone();
             maintenance[format!("{}_phase", kind.name())] = state["phase"].clone();
             maintenance[format!("{}_job", kind.name())] = state;

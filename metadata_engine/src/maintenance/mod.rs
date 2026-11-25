@@ -205,7 +205,11 @@ impl Manager {
         }
         Ok(())
     }
-    pub async fn status(&self, kind: Kind) -> ApiResult<serde_json::Value> {
+    pub async fn status(
+        &self,
+        kind: Kind,
+        fragment: Option<PoolId>,
+    ) -> ApiResult<serde_json::Value> {
         let job = self
             .slots
             .lock()
@@ -225,13 +229,27 @@ impl Manager {
                     .await?
             }
         };
-        let mut value = job
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|_| ApiError::invalid("invalid maintenance state"))?
-            .unwrap_or_else(|| serde_json::json!({"kind":kind,"phase":"idle"}));
-        value["running"] = serde_json::json!(job.as_ref().is_some_and(Job::running));
+        let mut value = match job {
+            Some(job) if fragment.is_none() || job.request.fragment == fragment => {
+                let running = job.running();
+                let mut value = serde_json::to_value(job)
+                    .map_err(|_| ApiError::invalid("invalid maintenance state"))?;
+                value["running"] = serde_json::json!(running);
+                value
+            }
+            Some(job) if kind == Kind::Gc && job.request.fragment.is_none() => {
+                serde_json::json!({
+                    "kind": kind, "phase": job.phase, "running": job.running(),
+                    "scope": "server",
+                    "message": "Server-wide garbage collection. To see job counts and errors, authorize with the M1 master key under Health → M1 backups, then check status again."
+                })
+            }
+            _ => serde_json::json!({"kind":kind,"phase":"idle","running":false}),
+        };
+        if kind == Kind::Gc && fragment.is_some() && value["phase"] == "idle" {
+            value["message"] =
+                serde_json::json!("No current garbage collection result for this fragment.");
+        }
         value["policy"] = serde_json::to_value(&self.config).expect("maintenance configuration");
         value["owner"] = serde_json::json!("metadata_engine");
         Ok(value)
