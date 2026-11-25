@@ -37,10 +37,7 @@ fn system_release_selects_the_declared_component_versions_and_binaries() {
             .find(|package| package["name"] == component["package"])
             .unwrap();
         assert_eq!(component["version"], package["version"], "{name}");
-        assert_eq!(
-            component["tag"],
-            format!("{name}/v{}", package["version"].as_str().unwrap())
-        );
+        assert!(component.get("tag").is_none(), "{name} uses the system tag");
         for binary in component["binaries"].as_array().unwrap() {
             assert!(
                 package["targets"].as_array().unwrap().iter().any(|target| {

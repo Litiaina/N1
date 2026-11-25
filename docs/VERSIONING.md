@@ -1,38 +1,35 @@
-# Component and system release versions
+# System releases and component versions
 
-N1 and M1 have independent release histories. The complete system release
-identifies a qualified combination of components, not a version inherited by
-every binary.
+Litiaina publishes one system release with one Git tag. The release selects
+a tested combination of N1, M1 and Console. N1 and M1 each report their own
+binary version.
 
 ## RC.2 release versions
 
-| Release | Version | Tag | Source of truth |
-| --- | --- | --- | --- |
-| Complete system | `1.0.0-RC.2` | `v1.0.0-RC.2` | [`deploy/system-release.json`](../deploy/system-release.json) |
-| N1 object store | `1.0.0-RC.2` | `n1/v1.0.0-RC.2` | [`object_engine/Cargo.toml`](../object_engine/Cargo.toml) |
-| M1 metadata store | `1.0.0-RC.1` | `m1/v1.0.0-RC.1` | [`metadata_engine/Cargo.toml`](../metadata_engine/Cargo.toml) |
+| System or component | Version | Source of truth |
+| --- | --- | --- |
+| Complete system | `1.0.0-RC.2` | [`deploy/system-release.json`](../deploy/system-release.json) |
+| N1 object store | `1.0.0-RC.2` | [`object_engine/Cargo.toml`](../object_engine/Cargo.toml) |
+| M1 metadata store | `1.0.0-RC.1` | [`metadata_engine/Cargo.toml`](../metadata_engine/Cargo.toml) |
 
 M1 starts at RC.1 because it has no previous release. N1 and the complete
 system retain their RC.2 numbering. Historical reports keep the versions
 and hashes of the exact binaries they tested. The system download and
 artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
-The system tag has one downloadable system prerelease. The N1 and M1 tags
-mark the source revisions for their independently versioned binaries. GitHub's
-automatic source archives contain the entire repository at the selected tag,
-including both engine directories.
+System RC.2 uses the Git tag `v1.0.0-RC.2`. The artifact manifest records
+the component versions, source commits and binary SHA-256 checksums.
 
-## Component releases
+## Component versions
 
 Each Cargo package declares its own version. There is no shared workspace
 version. Each binary's `--version`, startup banner and existing API version
 fields report its package version. N1's backup helper belongs to the `n1`
 package and reports N1's version.
 
-A change confined to M1 can advance M1 without changing N1's version or
-rebuilding its qualified binary. The same applies to N1-only releases. Qualify
-affected interactions before claiming a new supported combination; independent
-version numbers do not make every combination compatible.
+A change confined to M1 can advance M1 while the next system release reuses
+the qualified N1 binary. A change confined to N1 can do the same with M1.
+Qualify the affected interactions before publishing the new combination.
 
 Shared libraries and operator tools also have explicit Cargo versions. They
 are not additional storage products or proxies for the system release number.
@@ -50,7 +47,7 @@ build carrying the same release identity.
 ## Complete system release
 
 `deploy/system-release.json` records the intended system version, component
-versions, tag names and packaged server/helper binaries. It is packaging and
+versions, the system tag and packaged server/helper binaries. It is packaging and
 qualification metadata. The manifest regression checks that its component
 versions and executable names match Cargo's actual package metadata.
 
@@ -65,8 +62,8 @@ Before publishing a complete system release:
    supported API/storage contracts and selected Console source/build identity.
    Keep private infrastructure identifiers out of published metadata.
 4. Verify each shipped executable's `--version` against its selected package
-   version. Publish the component tags for new component releases and the
-   system tag for the qualified combination only on release authorization.
+   version. Publish one system tag for the qualified combination on release
+   authorization.
 
 A subsequent system release can select a newer M1 and the same N1, or vice
 versa. Its manifest must identify that tested pairing. Do not move an existing

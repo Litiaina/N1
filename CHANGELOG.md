@@ -40,10 +40,10 @@ RC.2 introduces N1's LINK architecture and the independent M1 metadata store.
   batch and purge barriers; reject the measured single-object directory-sync
   experiment after adverse results on the two-drive HDD profile.
 
-- Give N1 and M1 independent package and release identities: N1 targets
-  `1.0.0-RC.2`, M1 targets its first candidate `1.0.0-RC.1`, and the complete
-  system remains `1.0.0-RC.2`. Record the intended pairing in the system release
-  manifest. Keep protocol and storage formats independently versioned.
+- Give N1 and M1 independent package versions. The system release
+  `1.0.0-RC.2` bundles N1 `1.0.0-RC.2` and M1 `1.0.0-RC.1`. The system
+  manifest records the pairing. Protocol and storage formats have their own
+  versions.
 
 - Reduce bridged multipart conversion I/O by verifying and forwarding each
   external file together. Retain M1's durable source until N1's final durable

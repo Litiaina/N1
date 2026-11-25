@@ -14,8 +14,8 @@ the intervening release-candidate period. Neither target authorizes publication.
 
 The intended combination is **N1 `1.0.0-RC.2` + M1 `1.0.0-RC.1`**, recorded in
 [`deploy/system-release.json`](../deploy/system-release.json), for complete
-system **`1.0.0-RC.2`**. Each component has its own release history and tags;
-follow [the versioning policy](VERSIONING.md) when freezing artifact identities.
+system **`1.0.0-RC.2`**. Publish the combination under one system tag and record
+the individual binary versions and source commits. See [the versioning policy](VERSIONING.md).
 
 The November 24 four-drive rerun and
 [physical publication recovery](FOUR-DRIVE-QUALIFICATION-20261117.md#physical-publication-recovery-on-31)

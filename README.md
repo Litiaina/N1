@@ -79,7 +79,7 @@ services and connect Console to metadata.
 
 N1 and M1 have independent package versions. The complete system release
 records their selected combination in [the system manifest](deploy/system-release.json).
-See [versioning and release policy](docs/VERSIONING.md) for component tags,
+See [versioning and release policy](docs/VERSIONING.md) for the system tag,
 artifact identities and compatibility rules.
 
 ## Documentation
