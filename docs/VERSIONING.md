@@ -4,20 +4,18 @@ N1 and M1 have independent release histories. The complete system release
 identifies a qualified combination of components, not a version inherited by
 every binary.
 
-## Current development targets
+## RC.2 release versions
 
-| Release | Version | Tag when authorized | Source of truth |
+| Release | Version | Tag | Source of truth |
 | --- | --- | --- | --- |
 | Complete system | `1.0.0-RC.2` | `v1.0.0-RC.2` | [`deploy/system-release.json`](../deploy/system-release.json) |
 | N1 object store | `1.0.0-RC.2` | `n1/v1.0.0-RC.2` | [`object_engine/Cargo.toml`](../object_engine/Cargo.toml) |
 | M1 metadata store | `1.0.0-RC.1` | `m1/v1.0.0-RC.1` | [`metadata_engine/Cargo.toml`](../metadata_engine/Cargo.toml) |
 
-All three targets are unreleased. The tag names above are a naming policy,
-not a record of published tags. M1 starts at RC.1 because it has no previous
-release; N1 and the complete system retain their RC.2 numbering. Earlier
-development M1 binaries inherited the workspace's RC.2 string; those reports
-retain their original binary hashes and are not relabelled as new qualification.
-Existing release tags remain unchanged.
+M1 starts at RC.1 because it has no previous release. N1 and the complete
+system retain their RC.2 numbering. Historical reports keep the versions
+and hashes of the exact binaries they tested. The system download and
+artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
 ## Component releases
 
@@ -48,10 +46,8 @@ build carrying the same release identity.
 
 `deploy/system-release.json` records the intended system version, component
 versions, tag names and packaged server/helper binaries. It is packaging and
-qualification metadata; N1 and M1 do not read it during operation. Its current
-`unreleased` status does not assert that the selected combination has passed
-every release gate. The manifest regression checks that its component versions
-and executable names match Cargo's actual package metadata.
+qualification metadata. The manifest regression checks that its component
+versions and executable names match Cargo's actual package metadata.
 
 Before publishing a complete system release:
 

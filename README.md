@@ -16,7 +16,7 @@
 </div>
 
 <p align="center">
-  <strong>System 1.0.0-RC.2 — N1 1.0.0-RC.2 + M1 1.0.0-RC.1 — unreleased</strong>
+  <strong>System 1.0.0-RC.2 — N1 1.0.0-RC.2 + M1 1.0.0-RC.1</strong>
 </p>
 
 ## Overview
@@ -97,12 +97,10 @@ artifact identities and compatibility rules.
 
 Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
 [metadata internals](docs/M1.md) and
-[remaining completion gates](docs/RC2-IMPLEMENTATION.md).
+[RC.2 qualification](docs/RC2-IMPLEMENTATION.md).
 
-**Development status:** RC.2 is unreleased. Implemented features, test evidence
-and remaining API/product work are different things; the completion checklist
-and testing guide identify them explicitly. Earlier development storage formats
-are not a compatibility or migration requirement.
+The Linux x86-64 prerelease includes N1, M1, the N1 backup helper, and Console.
+[Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2).
 
 ## License and reports
 

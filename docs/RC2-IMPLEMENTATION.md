@@ -1,9 +1,8 @@
 # N1 and M1 RC.2 completion checklist
 
-**Status: development, unreleased.** This file tracks current implementation and
-qualification gaps. It does not redefine the API, prescribe deployment or serve
-as a chronological work log. This repository contains the N1 LINK object store and the
-M1 metadata store with its own specialized database; see [ARCHITECTURE.md](../ARCHITECTURE.md).
+This checklist records RC.2 qualification. The repository contains the N1 LINK
+object store and the M1 metadata store with its own specialized database.
+See [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 System RC.2 targets N1 `1.0.0-RC.2` and M1 `1.0.0-RC.1`. The independent
 component versions and selected pairing are defined by
@@ -13,20 +12,22 @@ not close a qualification gate or create a release.
 
 ## Current release decision — November 25, 2026
 
-The selected N1, M1 and Console artifacts are frozen for the remaining release
-checks. Their identities are recorded in the
-[API and operator qualification](RC2-API-QUALIFICATION-20261124.md#candidate-and-fixtures).
+The [API and operator qualification](RC2-API-QUALIFICATION-20261124.md#candidate-and-fixtures)
+records the baseline identities. The release keeps the qualified N1 executable
+and includes targeted M1 and Console fixes for maintenance status. The artifact
+manifest shipped with the release identifies the final binaries and Console build.
 
 | Gate | Current state |
 | --- | --- |
 | N1 runtime | Frozen at the selected `f1a54f…` executable. Minimum-profile performance, 3+1/2+2 recovery, three whole-host cuts and standalone 2+2 physical member loss and return have passed their recorded checks. |
 | M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The November 18 monitoring change passed 115 default tests, eight local service cases and twelve four-drive executions. |
 | Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
+| Maintenance status follow-up | The previous M1 returned 403 after scheduled GC when queried with a regular fragment token. The exact updated M1 release binary passes that regression, including scope isolation and the existing start/stop permissions. Console presents GC, repair and migration results beside their controls and renders the write-pool layout from N1. |
 | M1 maintenance recovery and mixed reads | Passed on the selected M1. The 3+1 and 2+2 runs completed 11,912 operations without errors, verified 1,748 identities after restart and restored four snapshots. Full and ranged reads also passed the targeted early-rejection and late-damage checks on both layouts. [Four-drive results](FOUR-DRIVE-QUALIFICATION-20261117.md#system-candidate-verification--november-24) |
 | Contract and operator qualification | Passed for the selected N1, M1 and Console builds. The public NOA checks, fresh browser walkthrough, named snapshot restore and optional N1 Shell recovery workflows have recorded evidence. [API and operator matrix](RC2-API-QUALIFICATION-20261124.md) |
 | Sustained resource/performance acceptance | Accepted for the tested four-HDD profile on November 25. All 1,641 durable small uploads finished under 2 seconds. The worst window measured 1.67 s p99. The five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. [Latency sign-off](FOUR-DRIVE-QUALIFICATION-20261117.md#mixed-load-latency-sign-off--november-25) · [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
 | Physical recovery | Passed. Earlier cuts covered strict reception, publication and standalone 2+2 reads during physical two-member loss. Four additional whole-host cuts passed at M1 journal commit, M1 checkpoint publication, N1 shard repair and M1 GC during N1 purge. [Targeted physical results](FOUR-DRIVE-QUALIFICATION-20261117.md#targeted-physical-interruptions--november-25) |
-| Packaging and publication | The private Linux x86-64 bundle passed extraction and executable/Console checksum verification. Both units rendered and verified. Both launcher profiles passed upload and restart. Final distribution sign-off and publication remain open. |
+| Packaging and publication | Linux x86-64 bundle with executable and Console checksums. Both units rendered and verified. Both launcher profiles passed upload and restart. The operator authorized distribution as a prerelease on November 25, 2026. [Release downloads](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2) |
 
 The sections below retain earlier evidence and its limits. A historical open
 item is not automatically a new instruction to restart a completed population.
@@ -246,8 +247,7 @@ Verify acknowledged payloads and versions after faults; measure CPU, RSS,
 latency, throughput and monitoring/maintenance overhead on the reference machine.
 Keep process-crash and physical power-loss results separate. Do not omit required
 features, relax integrity/durability, or silently change the deployment profile
-to obtain a pass. RC.2 remains unreleased until the required gaps and release
-gates are closed; a benchmark win or an upload count alone does not close them.
+to obtain a pass. Record the outcomes of the applicable release gates before publication.
 
 The final campaign must retain these separate acceptance results:
 
@@ -286,8 +286,8 @@ fixture/setup errors out of pass counts while retaining their logs.
 
 Implemented is not synonymous with fully qualified. [TESTING.md](../TESTING.md)
 records completed checks and separates object-only, metadata-KV and full-stack
-results. Each report identifies its source checkpoint and executable hashes;
-current development is on `main`, with RC.2 unreleased. The completed local
+results. Each report identifies its source checkpoint and executable hashes.
+The completed local
 [November 4 reliability qualification](RELIABILITY-20261104.md) covers member
 loss/corruption, full metadata loss and restore, crash/resume, encrypted-replica
 recovery and actual OS unmount/remount. It is separate from population and
