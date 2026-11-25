@@ -392,6 +392,32 @@ async fn named_namespace_permissions_and_response_fields_match_noa_v1() {
     assert_eq!(deleted["failed"][0]["status"], 404);
     let trash = checked(client.get(format!("{base}/trash")).bearer_auth(reader), 200).await;
     assert_eq!(trash["entries"][0]["path"], "docs/b.txt");
+    assert!(trash["continuation_token"].is_null());
+    let second_delete = checked(
+        client
+            .delete(format!("{base}/objects/docs/a.txt"))
+            .bearer_auth(&token),
+        200,
+    )
+    .await;
+    assert_eq!(second_delete["affected"], 1);
+    for endpoint in ["trash?limit=1", "posix/list?trash=true&limit=1"] {
+        let url = format!("{base}/{endpoint}");
+        let first = checked(client.get(&url).bearer_auth(reader), 200).await;
+        assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+        let cursor = first["continuation_token"].as_str().unwrap();
+        let last = checked(
+            client
+                .get(&url)
+                .bearer_auth(reader)
+                .query(&[("continuation_token", cursor)]),
+            200,
+        )
+        .await;
+        assert_eq!(last["entries"].as_array().unwrap().len(), 1);
+        assert_ne!(first["entries"][0]["path"], last["entries"][0]["path"]);
+        assert!(last["continuation_token"].is_null());
+    }
     let purge = checked(
         client
             .post(format!("{base}/posix/purge"))
@@ -408,7 +434,7 @@ async fn named_namespace_permissions_and_response_fields_match_noa_v1() {
         200,
     )
     .await;
-    assert_eq!(recovered["affected"], 1);
+    assert_eq!(recovered["affected"], 2);
     for path in ["docs/a.txt", "docs/b.txt", "docs/nested/c.txt"] {
         let read = client
             .get(format!("{base}/objects/get/{path}"))

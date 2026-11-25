@@ -206,7 +206,7 @@ fn claiming_expired_trash_fences_recovery_and_all_versions_until_ack() {
     }
     assert!(!ns.finish_trash(&work, 1).unwrap());
     assert!(ns.finish_trash(&work, 1).unwrap());
-    assert!(ns.trash_page(FRAGMENT, None, 10).unwrap().is_empty());
+    assert!(ns.trash_page(FRAGMENT, None, 10).unwrap().rows.is_empty());
     assert!(ns.claimed_trash(None, None, 10).unwrap().is_empty());
 }
 #[test]

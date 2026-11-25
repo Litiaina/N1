@@ -21,6 +21,11 @@ pub(crate) struct ShallowPage {
     pub after: Option<String>,
 }
 
+pub(crate) struct TrashPage {
+    pub rows: Vec<(String, Trash, PublishedVersion)>,
+    pub after: Option<String>,
+}
+
 pub(crate) struct Reservation {
     pub path: String,
     pub version: String,
@@ -413,28 +418,41 @@ impl Namespace {
         fragment: PoolId,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, Trash, PublishedVersion)>> {
+    ) -> Result<TrashPage> {
         let after = after
             .map(|value| RecordKey::new(fragment, value))
             .transpose()?;
-        let rows = self.engine.snapshot().scan(
+        let view = self.engine.snapshot();
+        let rows = view.scan(
             Table::Reclamation,
             fragment,
             "trash/",
             after.as_ref(),
             limit,
         )?;
-        rows.into_iter()
-            .map(|(key, value)| {
-                let trash: Trash = decode(value)?;
-                let head = trash
-                    .entry
-                    .head
-                    .clone()
-                    .ok_or_else(|| Error::Incompatible("trash record has no head".into()))?;
-                Ok((key.identifier().to_owned(), trash, head))
-            })
-            .collect()
+        // A short result can still have more rows when the scan hits its byte budget.
+        let next = match rows.last() {
+            Some((key, _))
+                if !view
+                    .scan(Table::Reclamation, fragment, "trash/", Some(key), 1)?
+                    .is_empty() =>
+            {
+                Some(key.identifier().to_owned())
+            }
+            _ => None,
+        };
+        let rows =
+            rows.into_iter()
+                .map(|(key, value)| {
+                    let trash: Trash = decode(value)?;
+                    let head =
+                        trash.entry.head.clone().ok_or_else(|| {
+                            Error::Incompatible("trash record has no head".into())
+                        })?;
+                    Ok((key.identifier().to_owned(), trash, head))
+                })
+                .collect::<Result<_>>()?;
+        Ok(TrashPage { rows, after: next })
     }
     pub fn new(engine: MetadataEngine) -> Self {
         Self { engine }

@@ -81,13 +81,12 @@ pub(super) async fn list(
     let scope = format!("posix/{fragment}/{trash}/{path}");
     let after = cursor::decode(&app, &scope, q.continuation_token.as_deref())?;
     let (entries, after) = if trash {
-        let rows = app
+        let page = app
             .db
             .execute(move |db| Namespace::new(db).trash_page(fragment, after.as_deref(), limit))
             .await?;
-        let after = rows.last().map(|r| r.0.clone());
         let mut entries = Vec::new();
-        for (key, t, v) in rows {
+        for (key, t, v) in page.rows {
             if !t.restored && t.path.starts_with(&prefix) {
                 let mut entry = file_entry(t.path, v);
                 entry.trash_entry_id = Some(key.trim_start_matches("trash/").into());
@@ -95,7 +94,7 @@ pub(super) async fn list(
                 entries.push(entry);
             }
         }
-        (entries, after)
+        (entries, page.after)
     } else {
         let scan_prefix = prefix.clone();
         let page = app
@@ -508,7 +507,8 @@ async fn recover_path(
         let rows = app
             .db
             .execute(move |db| Namespace::new(db).trash_page(id, cursor.as_deref(), 1000))
-            .await?;
+            .await?
+            .rows;
         if rows.is_empty() {
             break;
         }
@@ -577,12 +577,13 @@ pub(super) async fn trash_list(
     if !(1..=1000).contains(&limit) {
         return Err(ApiError::invalid("invalid trash page limit"));
     }
-    let rows = app
+    let page = app
         .db
         .execute(move |db| Namespace::new(db).trash_page(id, after.as_deref(), limit))
         .await?;
-    let next = rows.last().map(|r| cursor::encode(&app, &scope, &r.0));
-    let entries: Vec<Value> = rows
+    let next = page.after.map(|key| cursor::encode(&app, &scope, &key));
+    let entries: Vec<Value> = page
+        .rows
         .into_iter()
         .filter(|r| !r.1.restored)
         .map(|(key, t, v)| {

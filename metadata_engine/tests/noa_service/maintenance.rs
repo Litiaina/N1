@@ -146,6 +146,7 @@ async fn start(client: &Client, base: &str, token: &str, kind: &str, query: &str
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires private real N1/M1 binaries and storage roots"]
 async fn gc_status_reports_scheduled_gc_to_fragment_users_with_scoped_details() {
     let mut stack = Stack::new().await;
     drop(stack.metadata.take());
