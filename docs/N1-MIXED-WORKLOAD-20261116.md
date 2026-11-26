@@ -640,3 +640,42 @@ three standalone mixed p99 observations were 510.862, 816.463 and
 912.366 ms. With M1 on SATA it improved named PUT p99 from 697.001 to
 344.462 ms while increasing the median from 70.756 to 128.615 ms. We
 discarded that implementation.
+
+### Where a slow small PUT spends its time
+
+A diagnostic build of `692fd87` timed each stage within the standalone
+server. In the SATA mixed window, 110 small PUT handlers took at least
+500 ms. Their mean was 572.602 ms. These times use the same 110 requests,
+so the stage means add up to the handler mean within rounding.
+
+| Stage | Mean ms |
+| --- | ---: |
+| Admission, plan lookup and member checks | 0.156 |
+| Receive, encode and seal the shard files | 6.892 |
+| Persist the sealed files on both members | 246.340 |
+| Acquire the snapshot read guard | <0.001 |
+| Promote shard files and retire staging directories | 46.005 |
+| Persist publication on both filesystems | 273.206 |
+
+The two storage barriers took **90.7%** of the total time across these
+slow requests. File persistence was the longest stage in 52 requests and
+publication persistence in 58. The slowest handler took 760.166 ms,
+including 467.663 ms for the files and 290.408 ms for publication. The
+client counted 120 mixed small uploads above 500 ms because its timer
+also includes Begin and the protocol exchanges. The diagnostic run
+verified all 1,547 objects after restart. Diagnostic timings cover the
+slow cohort and should be kept separate from the uninstrumented comparisons.
+
+Two follow-up candidates preserved the data-before-publication ordering.
+Each ran twice around a RustFS control on the same SATA members. The entries
+below give mixed small PUT p50 / p99 in milliseconds.
+
+| Change tested on top of the admission fix | N1 first | RustFS control | N1 second |
+| --- | ---: | ---: | ---: |
+| Sync the affected directories after publishing a single-stripe object | 44.996 / 717.002 | 41.951 / 1,018.636 | 153.597 / 651.767 |
+| Share filesystem flushes for both data and publication across small PUTs | 69.227 / 1,094.112 | 31.740 / 572.868 | 84.805 / 1,009.182 |
+
+All six runs passed exact readback after restart. Both alternatives missed
+the 500 ms target in both N1 runs, and sharing both flushes also reduced
+mixed small PUT throughput to 15.567–18.000 operations/s. We retained the
+admission fix and discarded both changes to persistence.
