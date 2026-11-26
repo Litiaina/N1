@@ -592,3 +592,51 @@ byte after process restart. Verification covers **6,604 objects** and
 **4,045,619,200 bytes** across the four independent fixtures. These results
 cover the SATA workload and process restart. The harness and individual
 samples are retained with the private evidence.
+
+### Foreground admission and small PUT latency
+
+On the same SATA pair, a single authorization scope could occupy six of 32
+configured foreground slots. In a repeat using the packaged binary, a 1 MiB
+range took 439.304 ms at p99. N1's read admission queue reached 437.919 ms at
+p99, while the admitted read operation took 7.610 ms at p99. These are
+separate distributions. The revised scheduler uses the greater of the previous
+per-scope limit and half the configured foreground budget rounded down,
+subject to the global adaptive limit.
+The 32-slot fixture consequently admits up to 16 operations for one scope.
+
+The client, TLS, durability and workloads follow the comparison above.
+Each N1 run also captures its existing I/O counters after each timed phase.
+Throughput is measured at the client. RSS is the largest engine process
+sample during the mixed phase and drain, sampled approximately every 200 ms.
+
+| Run order | 4 KiB PUT ops/s | 4 KiB p50 / p99 ms | Mixed small PUT ops/s | Mixed small p50 / p99 ms | Mixed 1 MiB range p99 ms | Mixed multipart MiB/s | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Revised N1 A | 434.089 | 21.221 / 270.496 | 33.467 | 23.850 / 605.002 | 8.293 | 34.133 | 143.465 |
+| RustFS 1.0.6 | 567.513 | 20.760 / 290.338 | 21.067 | 55.767 / 711.509 | 16.859 | 21.333 | 227.785 |
+| Packaged N1 | 177.528 | 86.873 / 232.431 | 19.500 | 49.870 / 731.143 | 439.304 | 25.600 | 124.797 |
+| Revised N1 B | 287.028 | 53.072 / 130.881 | 33.333 | 21.808 / 795.486 | 8.156 | 38.400 | 144.531 |
+
+Read admission p99 fell to 0.010 and 0.015 ms. Revised N1 used 5.43 and
+6.63 CPU seconds in the sampled mixed windows, RustFS used 9.76, and
+packaged N1 used 3.85. Each engine completed a different amount of work.
+All 137 revised N1 small PUTs above 500 ms overlapped a multipart upload.
+The other 1,296 small PUTs outside multipart uploads had p99s of 140.882
+and 155.548 ms. This identifies the workload that triggers the remaining
+tail. RustFS also exceeded 500 ms under mixed load and led on pure PUT rate.
+
+All 4,100 objects written in the two revised standalone runs passed complete
+readback after process restart. With packaged M1 and revised N1, the separate
+named-object workload on two SATA SSDs recorded 64.318 ms p50 and 521.178 ms
+p99 for 981 strict small uploads. Packaged N1 recorded 70.756 / 697.001 ms
+for 943. On two HDDs the corresponding results were 820.538 / 2,663.881 ms
+for 101 uploads and 1,302.004 / 3,469.927 ms for 78. Each variant ran four
+30-second windows on SATA and four 15-second windows on HDD, including GC,
+monitoring and backup traffic. Both revised full-stack fixtures passed exact
+post-SIGKILL payload, version and deletion checks, restored two snapshots
+each, and finished with only the pool member markers.
+
+An earlier experiment grouped directory flushes for one-stripe PUTs. Its
+three standalone mixed p99 observations were 510.862, 816.463 and
+912.366 ms. With M1 on SATA it improved named PUT p99 from 697.001 to
+344.462 ms while increasing the median from 70.756 to 128.615 ms. We
+discarded that implementation.

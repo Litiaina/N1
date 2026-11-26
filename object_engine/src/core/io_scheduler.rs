@@ -747,13 +747,15 @@ fn derive_scheduler_config(max_concurrent_io: usize, blob_roots: usize) -> DiskI
     let disk_floor = blob_roots.max(1);
     let background = (foreground / 4).max(1).min(disk_floor.max(1)).min(8);
     let total = foreground.saturating_add(background).max(1);
-    let foreground_per_fragment = match blob_roots {
+    let topology_share = match blob_roots {
         0 | 1 => foreground.min(4),
         2 => foreground.min(6),
         3 | 4 => foreground.min(blob_roots.saturating_mul(2)),
         _ => foreground.min(blob_roots.saturating_mul(2)).min(16),
-    }
-    .max(1);
+    };
+    // Scale the per-scope ceiling with the operator's foreground I/O budget.
+    // The shared adaptive gate still bounds total foreground work.
+    let foreground_per_fragment = topology_share.max(foreground / 2).max(1);
     let background_per_fragment = (background / 2).max(1);
 
     DiskIoSchedulerConfig {
@@ -876,7 +878,9 @@ mod tests {
     fn scheduler_config_bounds_single_fragment_without_serializing_uploads() {
         let cfg = derive_scheduler_config(16, 1);
         assert_eq!(cfg.foreground_permits, 16);
-        assert_eq!(cfg.foreground_per_fragment_permits, 4);
+        assert_eq!(cfg.foreground_per_fragment_permits, 8);
+        let cfg = derive_scheduler_config(32, 2);
+        assert_eq!(cfg.foreground_per_fragment_permits, 16);
     }
 
     #[test]
