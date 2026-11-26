@@ -8,6 +8,9 @@ This file records product changes. Architecture is defined in
 
 RC.2 introduces N1's LINK architecture and the independent M1 metadata store.
 
+- Package revision 3 lets one authorization scope use more of N1's configured
+  foreground I/O budget. On a two-member pool with 32 slots, its ceiling rises
+  from 6 to 16. The global adaptive limit still applies.
 - End M1 Trash pagination after the final record, including a full final page.
 - Distribute N1 and M1 in the RC.2 engine bundle. Console has its own distribution.
 

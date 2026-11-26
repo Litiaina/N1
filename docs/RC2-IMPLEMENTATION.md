@@ -10,17 +10,18 @@ component versions and selected pairing are defined by
 [system manifest](../deploy/system-release.json). A version declaration does
 not close a qualification gate or create a release.
 
-## Current release decision — November 25, 2026
+## Current release decision — November 26, 2026
 
 The [API and operator qualification](RC2-API-QUALIFICATION-20261124.md#candidate-and-fixtures)
-records the baseline identities. Package revision 2 pairs the qualified N1
-executable with M1's maintenance status and Trash pagination fixes. Its
-artifact manifest identifies the exact binaries and their source commits.
+records the baseline identities. Package revision 3 ships N1's foreground
+I/O scheduling change and retains the M1 and backup helper binaries from
+revision 2. Its artifact manifest identifies the exact binaries and their
+source commits.
 Console has a separate distribution and its own follow-up performance checks.
 
 | Gate | Current state |
 | --- | --- |
-| N1 runtime | Frozen at the selected `f1a54f…` executable. Minimum-profile performance, 3+1/2+2 recovery, three whole-host cuts and standalone 2+2 physical member loss and return have passed their recorded checks. |
+| N1 runtime | The revision 3 scheduler passed standalone restart readback of 4,100 objects and full-stack process recovery on the two-SSD and two-HDD profiles. The 3+1/2+2 and physical power-loss evidence below belongs to the earlier binaries. [Scheduler and durability measurements](N1-MIXED-WORKLOAD-20261116.md#foreground-admission-and-small-put-latency) |
 | M1 storage and named services | Owned-storage, retained million-campaign and service/recovery results remain scoped to their artifacts. The November 18 monitoring change passed 115 default tests, eight local service cases and twelve four-drive executions. |
 | Reported Console monitoring regression | Closed by the [scan-admission/presentation qualification](M1-CONSOLE-20261117.md#monitoring-and-scan-admission--november-18-2026). Repeated starts join; explicit Stop drains; hidden panels stop scan polling. |
 | Maintenance status follow-up | The previous M1 returned 403 after scheduled GC when queried with a regular fragment token. The exact updated M1 release binary passes that regression, including scope isolation and the existing start/stop permissions. Console presents GC, repair and migration results beside their controls and renders the write-pool layout from N1. |
@@ -28,7 +29,7 @@ Console has a separate distribution and its own follow-up performance checks.
 | Contract and operator qualification | Passed for the selected N1, M1 and Console builds. The public NOA checks, fresh browser walkthrough, named snapshot restore and optional N1 Shell recovery workflows have recorded evidence. [API and operator matrix](RC2-API-QUALIFICATION-20261124.md) |
 | Sustained resource/performance acceptance | Accepted for the tested four-HDD profile on November 25. All 1,641 durable small uploads finished under 2 seconds. The worst window measured 1.67 s p99. The five-minute HTTP/native overload passed on 3+1, including readback of all 2,267 acknowledged writes after restart. [Latency sign-off](FOUR-DRIVE-QUALIFICATION-20261117.md#mixed-load-latency-sign-off--november-25) · [Sustained admission results](FOUR-DRIVE-QUALIFICATION-20261117.md#sustained-http-and-native-admission) |
 | Physical recovery | Passed. Earlier cuts covered strict reception, publication and standalone 2+2 reads during physical two-member loss. Four additional whole-host cuts passed at M1 journal commit, M1 checkpoint publication, N1 shard repair and M1 GC during N1 purge. [Targeted physical results](FOUR-DRIVE-QUALIFICATION-20261117.md#targeted-physical-interruptions--november-25) |
-| Engine package revision | Linux x86-64 bundle with N1, M1, the N1 backup helper, and systemd installers. Both units rendered and verified. The revision tag `v1.0.0-RC.2+2` supersedes the withdrawn bundle and identifies the corrected package. |
+| Engine package revision | Linux x86-64 bundle with N1, M1, the N1 backup helper and systemd installers. The revision tag `v1.0.0-RC.2+3` supersedes `v1.0.0-RC.2+2`. |
 
 The sections below retain earlier evidence and its limits. A historical open
 item is not automatically a new instruction to restart a completed population.

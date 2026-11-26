@@ -16,10 +16,10 @@ system retain their RC.2 numbering. Historical reports keep the versions
 and hashes of the exact binaries they tested. The system download and
 artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
-System RC.2 package revision 2 uses the Git tag `v1.0.0-RC.2+2`. The suffix
-identifies the engine bundle that supersedes the withdrawn `v1.0.0-RC.2`
-package. The artifact manifest records the component versions, source commits
-and binary SHA-256 checksums.
+System RC.2 package revision 3 uses the Git tag `v1.0.0-RC.2+3`. It
+supersedes revision 2 (`v1.0.0-RC.2+2`) and ships N1's updated foreground
+I/O scheduler alongside the same M1 and backup helper binaries. The artifact
+manifest records each executable's source commit, toolchain and SHA-256.
 
 ## Component versions
 
