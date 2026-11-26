@@ -16,10 +16,10 @@ system retain their RC.2 numbering. Historical reports keep the versions
 and hashes of the exact binaries they tested. The system download and
 artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
-System RC.2 package revision 3 uses the Git tag `v1.0.0-RC.2+3`. It
-supersedes revision 2 (`v1.0.0-RC.2+2`) and ships N1's updated foreground
-I/O scheduler alongside the same M1 and backup helper binaries. The artifact
-manifest records each executable's source commit, toolchain and SHA-256.
+System RC.2 uses the single tag `v1.0.0-RC.2`. While the repository is
+private, an approved replacement build takes over that tag and its GitHub
+release. The artifact manifest records each executable's source commit,
+toolchain and SHA-256 so operators can identify the installed build.
 
 ## Component versions
 
@@ -41,9 +41,8 @@ changes rather than bumping every crate for an unrelated component release.
 Keep the existing `MAJOR.MINOR.PATCH-RC.N` spelling for current candidates.
 Advance candidate numbers within the affected component's release series.
 After stable releases, use major/minor/patch changes for compatibility breaks,
-compatible features and compatible fixes respectively. Published versions and
-tags identify immutable artifacts; do not replace their contents with a new
-build carrying the same release identity.
+compatible features and compatible fixes respectively. Once a release is
+public, its tag and artifacts are immutable.
 
 ## Complete system release
 
@@ -67,8 +66,7 @@ Before publishing a complete system release:
    authorization.
 
 A subsequent system release can select a newer M1 and the same N1, or vice
-versa. Its manifest must identify that tested pairing. Use a distinct package
-revision tag to replace a withdrawn release candidate with a corrected bundle.
+versa. Its manifest must identify that tested pairing.
 
 ## Protocol and disk-format compatibility
 

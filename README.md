@@ -101,7 +101,7 @@ Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
 
 The Linux x86-64 engine release includes N1, M1, the N1 backup helper, and
 systemd installers. Console is distributed separately.
-[Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2%2B2).
+[Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2).
 
 ## License and reports
 

@@ -3,8 +3,7 @@
   "status": "prerelease",
   "system": {
     "version": "1.0.0-RC.2",
-    "package_revision": 3,
-    "tag": "v1.0.0-RC.2+3"
+    "tag": "v1.0.0-RC.2"
   },
   "components": {
     "n1": {
