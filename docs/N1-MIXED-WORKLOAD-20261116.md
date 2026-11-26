@@ -558,3 +558,37 @@ Raw credentials and private keys are excluded. No historical million-object
 campaign is restarted or relabeled as qualification of these changes.
 Physical host power loss, wider physical EC and system/Console qualification
 retain their existing release scope. No tag or release is created.
+
+## Same-hardware RustFS comparison, November 26
+
+Packaged standalone N1 1.0.0-RC.2 and RustFS 1.0.6 ran sequentially on the
+same Intel Core i5-12600K host with an Intel 240 GB SATA SSD (XFS) and a
+Kingston 480 GB SATA SSD (ext4). Both ran one 1+1 pool on physically separate
+members. The RustFS member format and external shard sizes confirmed the
+layout, and both buckets reported `strict` after restart. N1 used native TLS
+and io_uring. RustFS used S3 over HTTPS. Both clients verified their private
+certificates. Fixtures, builds and reports were on SATA.
+
+One Rust client ran N1, RustFS, RustFS, then N1. Each fresh fixture ran
+1,024 fixed-size 4 KiB PUTs across 16 workers, followed by a 30-second
+mixed window. The mixed window used four paced 4/64/256 KiB uploaders, two
+64 MiB multipart uploaders with 8 MiB strict parts, and two 1 MiB range
+readers. N1 timings include Begin and PUT. RustFS timings include the
+complete S3 PUT. Latency includes requests that drain past the window.
+Throughput counts completions inside the offered window.
+
+| Run order | 4 KiB PUT ops/s | 4 KiB PUT p50 / p99 ms | Mixed small PUT ops/s | Mixed small PUT p50 / p99 ms | Mixed multipart MiB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| N1 A | 190.633 | 50.798 / 541.021 | 14.933 | 91.352 / 1,563.611 | 21.333 |
+| RustFS A | 372.102 | 44.512 / 72.239 | 24.700 | 38.015 / 772.745 | 21.333 |
+| RustFS B | 319.271 | 48.419 / 75.013 | 26.033 | 37.679 / 851.278 | 25.600 |
+| N1 B | 178.032 | 55.193 / 460.835 | 15.533 | 111.829 / 1,059.990 | 25.600 |
+
+RustFS processes more small PUTs and records lower small PUT p50 and p99
+in both comparisons. Its mixed p99 still exceeds 500 ms. Both engines
+complete the same amount of multipart data in each paired mixed window.
+All four runs finish successfully and verify every acknowledged object
+byte after process restart. Verification covers **6,604 objects** and
+**4,045,619,200 bytes** across the four independent fixtures. These results
+cover the SATA workload and process restart. The harness and individual
+samples are retained with the private evidence.
