@@ -41,7 +41,7 @@ fn original_controls_are_loaded_without_renaming_or_json() {
     let (path, _guard) = fixture();
     let mut ini = ini::Ini::load_from_file(&path).unwrap();
     ini.with_section(Some("server"))
-        .set("host", "192.168.0.12")
+        .set("host", "192.0.2.12")
         .set("https_port", "21001")
         .set("native_port", "21002")
         .set("native_max_connections", "81")
@@ -64,7 +64,7 @@ fn original_controls_are_loaded_without_renaming_or_json() {
         .set("latency_samples_per_class", "257");
     ini.write_to_file(&path).unwrap();
     let config = OperatorSettings::load(&path).unwrap();
-    assert_eq!(config.server.host.to_string(), "192.168.0.12");
+    assert_eq!(config.server.host.to_string(), "192.0.2.12");
     assert_eq!(config.server.https_port, 21001);
     assert_eq!(config.server.native_port, 21002);
     assert_eq!(config.server.native_max_connections, 81);

@@ -28,7 +28,7 @@ The portable checkpoint is
 `README.md` explains completed results, source/binary provenance, the verified
 compressed M1 database, original ACKs and how to continue on the four-HDD
 reference system. Original N1 shards remain on the HDDs; they are not duplicated
-onto the NVMe. HDD1TB002 was unmounted at stop; both original HDDs are now
+onto the NVMe. test-hdd-b was unmounted at stop; both original HDDs are now
 mounted. Member 1 has been restored after its successful loss readback. No
 dataset was wiped. Extra campaigns mistakenly started on November 12 are
 stopped; their partial evidence is preserved separately from this original
@@ -37,7 +37,7 @@ continuation.
 ## Resumed on the four-HDD reference system
 
 Testing resumed on November 11 on the four-HDD reference system. The private run
-root is `/mnt/DISK0/n1-rc2-four-hdd-20261111-01`; the corresponding private
+root is `/mnt/test-hdd-0/n1-rc2-four-hdd-20261111-01`; the corresponding private
 directories on DISK1–3 hold test members. Existing deployed N1 services are not
 test targets. Builds and datasets remain on these HDDs, outside the system NVMe.
 
@@ -210,7 +210,7 @@ raw reports and reproduction scripts remain in `.git/rc2-work-20261111/`, with
 `SHA256SUMS`. The portable evidence archive's SHA-256 is
 `4bee72752f2dcf6c43820b963aaac04b9e36e3a9523d6bd764a75a62d5e64976`. Original SSD
 test system data remain at
-`/mnt/DATA_SSD/m1-owned-storage-20261110-01/optimization12`; their earlier SSD
+`/mnt/test-ssd/m1-owned-storage-20261110-01/optimization12`; their earlier SSD
 regressions are not replaced by the four-HDD reference system results. See
 [M1-STORAGE-20261110.md](M1-STORAGE-20261110.md) for that historical campaign.
 

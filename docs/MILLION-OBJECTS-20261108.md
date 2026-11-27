@@ -23,9 +23,9 @@ compilation was disabled. No target-native flags were added.
 
 | Role | Physical partition | Mount | Filesystem |
 | --- | --- | --- | --- |
-| Source, build, binaries, temporary files, M1 database, control, ACK journals and reports | `/dev/sdb1` | `/mnt/DATA_SSD` | XFS, SSD |
-| N1 pool member 0 | `/dev/sdd1` | `/mnt/test-media/HDD1TB001` | XFS, rotational HDD |
-| N1 pool member 1 | `/dev/sdc1` | `/mnt/test-media/HDD1TB002` | XFS, rotational HDD |
+| Source, build, binaries, temporary files, M1 database, control, ACK journals and reports | `/dev/sdb1` | `/mnt/test-ssd` | XFS, SSD |
+| N1 pool member 0 | `/dev/sdd1` | `/mnt/test-hdd-a` | XFS, rotational HDD |
+| N1 pool member 1 | `/dev/sdc1` | `/mnt/test-hdd-b` | XFS, rotational HDD |
 
 The driver checked all three filesystem types and UUIDs before each campaign.
 Their recorded UUIDs are respectively `ssd-filesystem-id`,
@@ -36,14 +36,14 @@ they do not change LINK's logical member identities.
 The retained run root on that host is:
 
 ```text
-/mnt/DATA_SSD/n1-rc2-million-20261108.ZsO460
+/mnt/test-ssd/n1-rc2-million-20261108.ZsO460
 ```
 
 The million-object member roots are:
 
 ```text
-/mnt/test-media/HDD1TB001/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member0
-/mnt/test-media/HDD1TB002/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member1
+/mnt/test-hdd-a/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member0
+/mnt/test-hdd-b/n1-rc2-million-20261108.ZsO460/million-api/n1-noa-01M6VCYPYQZ491ZSB3Q8Y5CD1H/member1
 ```
 
 M1's database is under `datasets/million-api/metadata/control/metadata` in the

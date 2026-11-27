@@ -62,7 +62,7 @@ original payload and version after killing/restarting both engines.
 
 Four alternating previous/candidate/candidate/previous phases pin the test
 process and its engine children to SSD test system performance-core logical CPUs
-0–11. M1 and the N1 1+0 member use DATA_SSD. These are local plaintext HTTP
+0–11. M1 and the N1 1+0 member use test-ssd. These are local plaintext HTTP
 status measurements through the real M1 service, not remote TLS latency, upload
 throughput or a maximum request-rate test. Each aggregate contains 200
 individual successful queries per available state.
@@ -86,11 +86,11 @@ in [the single-part report](M1-SINGLE-PART-20261114.md).
 
 ## Actual kernel I/O delay
 
-The root controller creates an owned 512 MiB loop image on DATA_SSD, verifies
+The root controller creates an owned 512 MiB loop image on test-ssd, verifies
 its backing-file identity, formats that private device as XFS and maps it
 through Linux `dm-delay`. Only the new N1 member uses this mounted filesystem;
 M1's database, the controller and independent ACK evidence remain on healthy
-DATA_SSD paths. Existing physical filesystems and services are not targets.
+test-ssd paths. Existing physical filesystems and services are not targets.
 
 After a seed object and the first durable multipart part are acknowledged,
 the controller adds 5000 ms write delay. The second part stalls in actual
@@ -124,7 +124,7 @@ A separate private Linux cgroup contains the Rust harness, both engine process
 trees and a Rust helper retaining 128 MiB of touched anonymous memory. The
 accepted profile uses `memory.high=192 MiB`, `memory.max=384 MiB`, zero cgroup
 swap and grouped OOM policy. It runs the existing bounded-bridge and complete
-metadata-loss/snapshot-restore cases on fresh private DATA_SSD fixtures.
+metadata-loss/snapshot-restore cases on fresh private test-ssd fixtures.
 
 The bridge case retains its 1 MiB upload-buffer budget, interrupted clients,
 bounded 503 when that budget is occupied, acknowledged-part restart recovery,
@@ -146,7 +146,7 @@ The accepted 192 MiB envelope is a separately identified run.
 
 ## Evidence and remaining gates
 
-SSD test system root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`. The exact
+SSD test system root: `/mnt/test-ssd/n1-m1-acceptance-20261113-01`. The exact
 controllers, source overlays and manifests are in `source/`.
 `reports/status12-*` contains build, regression and latency evidence;
 `reports/stalled10` through `stalled13` retain all block-delay attempts;
@@ -156,7 +156,7 @@ used. Private loop devices, mapper targets, mounts, cgroups and qualification
 processes are removed after the runs. Their small evidence files remain.
 
 The workstation copy is under
-`/mnt/HDD1TB001/n1-m1-acceptance-20261113-01/remote-status12`, with physical
+`/mnt/test-hdd-a/n1-m1-acceptance-20261113-01/remote-status12`, with physical
 service and browser evidence in `reports/status12-hdd` and
 `reports/console-status12-live`. Portable preservation under
 `/srv/test-evidence/portable` excludes service credentials, private TLS keys,

@@ -56,12 +56,12 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     let binary = PathBuf::from(&args[2]).canonicalize()?;
     let project = PathBuf::from(&args[3]).canonicalize()?;
     let test = PathBuf::from(&args[4]).canonicalize()?;
-    if project != Path::new("/mnt/HDD1TB001")
-        || test != Path::new("/mnt/HDD1TB002")
+    if project != Path::new("/mnt/test-hdd-a")
+        || test != Path::new("/mnt/test-hdd-b")
         || project.metadata()?.dev() == test.metadata()?.dev()
     {
         return Err(
-            "benchmark requires the independent /mnt/HDD1TB001 and /mnt/HDD1TB002 mounts".into(),
+            "benchmark requires the independent /mnt/test-hdd-a and /mnt/test-hdd-b mounts".into(),
         );
     }
     let name = format!(

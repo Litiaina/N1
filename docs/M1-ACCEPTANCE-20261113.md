@@ -8,13 +8,13 @@ profiles; the remaining release conditions still apply.
 ## Isolation and identities
 
 The SSD test system has an Intel i5-12600K, 16 logical CPUs. M1's database,
-control, staging, binaries and build output use DATA_SSD, an XFS filesystem on
+control, staging, binaries and build output use test-ssd, an XFS filesystem on
 `/dev/sda1`. N1 uses a private **1+0** pool on the same SSD. This is a
 co-located SSD measurement, not the split-node HDD or the four-HDD reference
 system 3+1 profile. Listeners are private loopback HTTPS/native TLS, with
 certificate verification. The existing interactive Console/database and original
 million-object corpus are untouched. No drive is reformatted; the ENOSPC
-fixtures below format only new, bounded loopback images on DATA_SSD.
+fixtures below format only new, bounded loopback images on test-ssd.
 
 | Executable | SHA-256 |
 | --- | --- |
@@ -148,14 +148,14 @@ Per-process CPU, every read distribution and all samples remain in the summary.
 ## Actual ENOSPC and recovery
 
 Each target has a fresh **512 MiB XFS filesystem in a bounded loopback image
-on DATA_SSD**. The driver checks the loop backing file before formatting it.
+on test-ssd**. The driver checks the loop backing file before formatting it.
 The Rust workload refuses to fill filesystems outside 16 MiB–1 GiB and requires
 its external ACK journal to occupy a different filesystem. It writes until the
 kernel returns ENOSPC; this is not an injected error value or a full host disk.
 
 Object-full puts the N1 member on that filesystem, with M1 and its ACK journal
-on healthy DATA_SSD. Metadata-full puts M1 there, with the object member and
-ACK journal on healthy DATA_SSD. The workload preserves the original seed and
+on healthy test-ssd. Metadata-full puts M1 there, with the object member and
+ACK journal on healthy test-ssd. The workload preserves the original seed and
 every subsequent successful ACK, checks bounded failure responses, kills both
 processes, frees pressure, reopens and verifies every acknowledged version and
 payload. Unacknowledged attempts must recover wholly present or absent. A new
@@ -213,8 +213,8 @@ large/small provenance, and its earlier output is retained separately.
 
 ## Evidence and remaining work
 
-SSD test system root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`. Local
-evidence mirror: `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`.
+SSD test system root: `/mnt/test-ssd/n1-m1-acceptance-20261113-01`. Local
+evidence mirror: `/mnt/test-hdd-a/n1-m1-acceptance-20261113-01`.
 `reports/SUMMARY.json` aggregates raw phases; the Bash drivers and Perl
 arithmetic are under `source/`. Workload and fault logic are Rust. `resource02`
 and `resource03` identify baseline/candidate ENOSPC runs; external ACK/PASSED

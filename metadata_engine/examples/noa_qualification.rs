@@ -21,7 +21,7 @@ struct Args {
     #[arg(long)]
     root: PathBuf,
     /// Optional first-member HDD parent, keeping control/database/journals on
-    /// --root (for example DATA_SSD) independently of both object HDDs.
+    /// --root (for example a separate SSD) independently of both object HDDs.
     #[arg(long)]
     first_root: Option<PathBuf>,
     #[arg(long)]
@@ -46,9 +46,9 @@ struct Args {
     /// operation timeout or a change to acknowledgement durability.
     #[arg(long, default_value_t = 180)]
     startup_timeout_seconds: u64,
-    #[arg(long, default_value = "/home/altear/Development/console")]
+    #[arg(long, default_value = "../console")]
     console_repo: PathBuf,
-    #[arg(long, default_value = "/tmp/n1-console-tools/bin/node")]
+    #[arg(long, default_value = "node")]
     node: PathBuf,
     #[arg(long)]
     console_driver: Option<PathBuf>,

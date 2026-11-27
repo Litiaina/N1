@@ -10,7 +10,7 @@ release is authorized by this continuation.
 
 ## Placement and preservation
 
-The new private four-HDD test root is `/mnt/DISK0/n1-rc2-continuation-20261112-01`.
+The new private four-HDD test root is `/mnt/test-hdd-0/n1-rc2-continuation-20261112-01`.
 Source, compiled helpers, imported evidence and a recovered copy of the stopped
 M1 database are on its SATA XFS HDD. Rust 1.92 builds use the previous campaign's
 task-local Cargo cache, target and vendored dependencies. Installed services,
@@ -28,11 +28,11 @@ Their UUIDs were verified against the preserved checkpoint. N1 served the
 original local shards with member 1 detached for the remaining loss readback;
 the original directory is now restored. No data, marker or
 LINK identity was regenerated. New local evidence lives at
-`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01`.
+`/mnt/test-hdd-a/n1-rc2-continuation-20261112-01`.
 
 ## Retrieved completed the four-HDD reference system results
 
-The previous run, `/mnt/DISK0/n1-rc2-four-hdd-20261111-01`, completed before the
+The previous run, `/mnt/test-hdd-0/n1-rc2-four-hdd-20261111-01`, completed before the
 operator left its network. Its final markers and raw reports now confirm:
 
 - 21 selected real-service checks passed, including four export lifecycle and
@@ -125,7 +125,7 @@ The detached local `evidence/finish-original-only.sh` preserved the verifier's
 reports and returned the original member directory. The final SSD/HDD
 controllers were frozen as `source/finish-original-ssd-hdd02.sh` and
 `source/finish-original-metadata-ssd-hdd02.sh` under
-`/mnt/HDD1TB001/n1-rc2-ssd-hdd-qualification-20261112-02`. They reused the
+`/mnt/test-hdd-a/n1-rc2-ssd-hdd-qualification-20261112-02`. They reused the
 original stopped SSD test system database after verifying all four files against
 the portable checkpoint, and the exact original N1/M1 executables. the four-HDD
 reference system was not contacted for these final stages. Their reports retain

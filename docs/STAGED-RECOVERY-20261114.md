@@ -59,7 +59,7 @@ settings. The benchmark client is identical for both servers.
 
 ## Small-object comparison
 
-DATA_SSD 1+0, loopback native TLS, ABBA, fresh private identities, quotas disabled
+test-ssd 1+0, loopback native TLS, ABBA, fresh private identities, quotas disabled
 in the private performance configuration. Each phase includes 100 normal and
 100 durable 4 KiB uploads. Every object is read back and purged. No M1 process
 is involved. Raw per-operation samples and process counters are retained.
@@ -94,7 +94,7 @@ Pinning alone does not remove the within-binary variation. Neither result is
 discarded or used to claim CPU parity. Longer matched 15 GiB measurements are
 recorded separately; no object-level p99 is inferred from these few objects.
 
-The longer ABBA comparisons complete **eight 15 GiB objects**: four on DATA_SSD
+The longer ABBA comparisons complete **eight 15 GiB objects**: four on test-ssd
 1+0 and four on two physical XFS HDDs in 1+1. Each uses strict durable 48 MiB
 parts, four writers, identical TLS/client/source, full SHA-256 readback,
 repeated finalize and native purge/404. Each filesystem's final private-pool
@@ -136,9 +136,9 @@ release tail-latency/saturation acceptance remains open.
 
 ## Evidence
 
-The run root is `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`; copied SSD test
+The run root is `/mnt/test-hdd-a/n1-m1-acceptance-20261113-01`; copied SSD test
 system logs are under `remote-negotiate01/`. Original SSD test system evidence
-remains under `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
+remains under `/mnt/test-ssd/n1-m1-acceptance-20261113-01`.
 
 `reports/staged02-hdd/` preserves the identical baseline/candidate failure
 witness. `staged-recovery-candidate02.log`, `staged02-direct-*.log` and

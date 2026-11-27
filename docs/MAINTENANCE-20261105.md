@@ -130,7 +130,7 @@ controlled power-loss qualification.
 
 ## Evidence and limits
 
-Campaign root: `/mnt/PROJECT-DISK-1TB/n1-maintenance-20261104-01`.
+Campaign root: `/mnt/test-project/n1-maintenance-20261104-01`.
 The object binary is the unchanged previously qualified executable, SHA-256
 `95c8dac28b4adca91a59eacfb952f292bef37ec0f52f0239a931998941f784c2`.
 Packaged metadata/Shell hashes, source checkpoints, browser assets and terminal

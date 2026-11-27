@@ -16,10 +16,10 @@ system retain their RC.2 numbering. Historical reports keep the versions
 and hashes of the exact binaries they tested. The system download and
 artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
-System RC.2 uses the single tag `v1.0.0-RC.2`. While the repository is
-private, an approved replacement build takes over that tag and its GitHub
-release. The artifact manifest records each executable's source commit,
-toolchain and SHA-256 so operators can identify the installed build.
+System RC.2 uses the single tag `v1.0.0-RC.2`. The artifact manifest records
+each executable's build source, toolchain and SHA-256 so operators can identify
+the installed build. Historical build identifiers may refer to pre-publication
+checkpoints. Public release tags and artifacts are immutable.
 
 ## Component versions
 
@@ -41,8 +41,7 @@ changes rather than bumping every crate for an unrelated component release.
 Keep the existing `MAJOR.MINOR.PATCH-RC.N` spelling for current candidates.
 Advance candidate numbers within the affected component's release series.
 After stable releases, use major/minor/patch changes for compatibility breaks,
-compatible features and compatible fixes respectively. Once a release is
-public, its tag and artifacts are immutable.
+compatible features and compatible fixes respectively.
 
 ## Complete system release
 

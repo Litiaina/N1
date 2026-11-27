@@ -22,7 +22,7 @@ are in [the completion checklist](RC2-IMPLEMENTATION.md).
 - [x] Identify all four HDDs by device, serial, filesystem UUID and mount path
   in the private inventory. Confirm four distinct devices/filesystems and record
   their transport in the public summary.
-  Existing reference roots are `/mnt/DISK0` through `/mnt/DISK3`.
+  Existing reference roots are `/mnt/test-hdd-0` through `/mnt/test-hdd-3`.
 - [x] Check current drive/filesystem health, free space and kernel I/O errors
   before writing. Preserve any existing faults as evidence.
 - [x] Place M1's database and staging on the designated SSD/NVMe, and N1's

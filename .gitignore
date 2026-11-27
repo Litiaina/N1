@@ -51,3 +51,9 @@ Thumbs.db
 *.shard
 *.receipt
 *.ndx
+
+# Locally provisioned TLS material
+*.key
+*.pem
+*.p12
+*.pfx

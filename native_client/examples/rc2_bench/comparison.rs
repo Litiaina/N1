@@ -549,12 +549,12 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         PathBuf::from(&args[4]).canonicalize()?,
         PathBuf::from(&args[5]).canonicalize()?,
     ];
-    if parents[0] != Path::new("/mnt/HDD1TB001")
-        || parents[1] != Path::new("/mnt/HDD1TB002")
+    if parents[0] != Path::new("/mnt/test-hdd-a")
+        || parents[1] != Path::new("/mnt/test-hdd-b")
         || parents[0].metadata()?.dev() == parents[1].metadata()?.dev()
     {
         return Err(
-            "comparison requires the independent /mnt/HDD1TB001 and /mnt/HDD1TB002 mounts".into(),
+            "comparison requires the independent /mnt/test-hdd-a and /mnt/test-hdd-b mounts".into(),
         );
     }
     let smoke = args[1] == "--compare-smoke"
@@ -697,7 +697,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
     if purge_pair {
         provenance["baseline_source_snapshot"] =
-            json!("/mnt/PROJECT-DISK-1TB/n1-key-purge-20261105-01/source/before.tar");
+            json!("/mnt/test-project/n1-key-purge-20261105-01/source/before.tar");
         provenance["geometry_note"] = json!(
             "Identical 256 KiB 1+1 CRC32C/SHA-256 geometry. Frozen LINK uses tickets/terminal records; candidate creates incomplete headers at Begin, uses the same LINK key throughout, and purges to absence."
         );
@@ -710,7 +710,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         );
     } else if key_pair {
         provenance["baseline_source_snapshot"] =
-            json!("/mnt/PROJECT-DISK-1TB/n1-key-purge-20261105-01/source/final-source.tar");
+            json!("/mnt/test-project/n1-key-purge-20261105-01/source/final-source.tar");
         provenance["put_timing"] = json!(
             "end-to-end including Begin for both; baseline persists empty allocation, candidate persists it with the first durable payload or completed publication"
         );
@@ -753,7 +753,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
     if aligned_pair {
         provenance["baseline_source_snapshot"] =
-            json!("/mnt/HDD1TB001/n1-xfs-rebenchmark-20261105-01/bootstrap/current-source.tar");
+            json!("/mnt/test-hdd-a/n1-xfs-rebenchmark-20261105-01/bootstrap/current-source.tar");
         provenance["geometry_note"] = json!(
             "Identical immutable 256 KiB 1+1 CRC32C/SHA-256 shard bytes and LINK identity. Baseline uses buffered payload I/O; candidate streams aligned complete pages through O_DIRECT, buffering only each part's unaligned ends. Small objects remain buffered. No format change."
         );

@@ -75,7 +75,7 @@ async fn run() -> Result<()> {
             .parent()
             .ok_or("missing output parent")?
             .canonicalize()?;
-        if !["/mnt/PROJECT-DISK-1TB", "/media/altear/TEST-1TB", "/tmp"]
+        if !["/mnt/test-project", "/mnt/test-secondary", "/tmp"]
             .iter()
             .any(|root| parent.starts_with(root))
         {

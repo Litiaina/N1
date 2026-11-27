@@ -43,14 +43,14 @@ no useful improvement from substituting ring; no hash dependency is changed.
 
 ## Method and evidence
 
-Local run root: `/mnt/HDD1TB001/n1-ssd-hdd-optimization-20261113-01`. SSD test
-system run root: `/mnt/DATA_SSD/n1-ssd-hdd-optimization-20261113-01` on `SSD
+Local run root: `/mnt/test-hdd-a/n1-ssd-hdd-optimization-20261113-01`. SSD test
+system run root: `/mnt/test-ssd/n1-ssd-hdd-optimization-20261113-01` on `SSD
 test system`. Binaries, source snapshots, drivers, manifests, raw JSON, per-part
 samples and logs are retained under those roots.
 
 the two-HDD test system uses two ST1000LM049 HDDs, distinct XFS filesystems at
-`/mnt/HDD1TB001` and `/mnt/HDD1TB002`, in a private 1+1 pool. The SSD test
-system uses the Intel DATA_SSD XFS filesystem in a private 1+0 pool. Both use
+`/mnt/test-hdd-a` and `/mnt/test-hdd-b`, in a private 1+1 pool. The SSD test
+system uses the Intel test-ssd XFS filesystem in a private 1+0 pool. Both use
 256 KiB blocks, 48 MiB parts, four writers, native loopback TLS and strict
 durable upload. No user fragment is created. No existing user data, service,
 global governor, kernel perf policy or disk scheduler is changed.
@@ -120,8 +120,8 @@ timeline and window throughput.
 
 | Physical profile / implementation | Upload MiB/s | N1 CPU s/GiB | N1 peak RSS MiB | Immediate verified GET MiB/s | Part p50 / p95 / p99 ms | Finalize ms, both objects |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
-| DATA_SSD 1+0 reference, profiled | 105.48 | 2.628 | 80.86 | 364.14 | 1,892 / 1,997 / 2,731 | 22.788 / 23.333 |
-| DATA_SSD 1+0 native04, profiled | 108.92 | 1.911 | 73.07 | 363.47 | 1,894 / 1,984 / 2,039 | 23.207 / 1.032 |
+| test-ssd 1+0 reference, profiled | 105.48 | 2.628 | 80.86 | 364.14 | 1,892 / 1,997 / 2,731 | 22.788 / 23.333 |
+| test-ssd 1+0 native04, profiled | 108.92 | 1.911 | 73.07 | 363.47 | 1,894 / 1,984 / 2,039 | 23.207 / 1.032 |
 | Two HDDs 1+1 reference | 67.66 | 6.623 | 125.13 | 43.91 | 2,523 / 4,695 / 5,510 | 23.865 / 29.669 |
 | Two HDDs 1+1 native04 | 67.33 | 5.542 | 120.12 | 41.91 | 2,559 / 4,752 / 5,344 | 19.359 / 19.295 |
 
@@ -282,7 +282,7 @@ The streamed whole-source hash and exact length match. Repeated finalize keeps
 the identity and returns already finalized. Purge removes both members' files
 and subsequent stat returns 404. After the private server exits cleanly, each
 HDD member root contains exactly its `.n1-arc-pool.json`, with zero shard,
-staging, repair, terminal or symlink files. The separate DATA_SSD member likewise
+staging, repair, terminal or symlink files. The separate test-ssd member likewise
 contains only its pool marker. These censuses cover the private test roots,
 not unrelated user data or legitimate server authentication/control files.
 
@@ -362,4 +362,4 @@ the N1 source/build manifests; `artifacts/` retains the exact executables. A
 verified 29 MiB portable source/binary/evidence bundle is preserved at
 `/srv/test-evidence/portable/n1-ssd-hdd-optimization-20261113-01`, without
 datasets, build caches or service secrets, so continuation does not require
-DATA_SSD access.
+test-ssd access.

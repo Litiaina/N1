@@ -13,8 +13,8 @@ preserved identities and scope correction. No replacement population is running.
 
 | Component | Host | Private fixture storage |
 | --- | --- | --- |
-| N1 object engine | Workstation `object-test.example.invalid` | Pool A, 1+1, `/mnt/HDD1TB001/n1-split-node-20261111-01/smoke4096/member-0` and the corresponding `member-1` under `/mnt/HDD1TB002` |
-| M1 metadata engine | SSD test system `ssd-test.example.invalid` | Database, staging, snapshots, build output, executables and client oracles on `/mnt/DATA_SSD` |
+| N1 object engine | Workstation `object-test.example.invalid` | Pool A, 1+1, `/mnt/test-hdd-a/n1-split-node-20261111-01/smoke4096/member-0` and the corresponding `member-1` under `/mnt/test-hdd-b` |
+| M1 metadata engine | SSD test system `ssd-test.example.invalid` | Database, staging, snapshots, build output, executables and client oracles on `/mnt/test-ssd` |
 | Native storage hop | M1 → N1 | Verified `n1s://object-test.example.invalid:50002`, private CA and separate server certificate with the N1 IP SAN |
 | Public workload hop | Rust client on SSD test system → M1 | Loopback HTTP; M1 also listens on `0.0.0.0` for this private test |
 
@@ -25,10 +25,10 @@ formatted and no pre-existing dataset was removed. Credentials and key files
 remain owner-only. N1 selects `io_uring`; the existing aligned direct-I/O
 implementation and SHA-256/CRC32C integrity policy remain unchanged.
 
-Local evidence root: `/mnt/HDD1TB001/n1-split-node-20261111-01`. SSD test system
-evidence root: `/mnt/DATA_SSD/n1-split-node-20261111-01`. Builds use the
-existing DATA_SSD target directory
-`/mnt/DATA_SSD/m1-owned-storage-20261110-01/target`, Rust 1.99.0 and locked,
+Local evidence root: `/mnt/test-hdd-a/n1-split-node-20261111-01`. SSD test system
+evidence root: `/mnt/test-ssd/n1-split-node-20261111-01`. Builds use the
+existing test-ssd target directory
+`/mnt/test-ssd/m1-owned-storage-20261110-01/target`, Rust 1.99.0 and locked,
 offline dependencies. The resulting N1 executable runs on the workstation's
 compatible glibc. No build or population dataset uses the source NVMe.
 
@@ -65,7 +65,7 @@ compatible glibc. No build or population dataset uses the source NVMe.
   unreferenced shards. An injected unexpected terminal file is rejected by the
   census and removed before the large campaign. LINK signing secrets remain on
   N1; the census transfers only canonical identity bytes, without access tags.
-- **Fresh workspace regression on DATA_SSD:** **378 passed, zero failed**, 56
+- **Fresh workspace regression on test-ssd:** **378 passed, zero failed**, 56
   explicit opt-in/helper exclusions across 48 targets. Strict workspace-wide
   all-target Clippy and formatting pass. M1/storage documentation checks pass
   with zero runnable examples. These are separate from the physical witnesses.
@@ -102,7 +102,7 @@ after admission; it does not prove the export feature caused them or close the
 performance gate. This is a split-node export-feature comparison over fixed
 LINK, not an NCX-versus-LINK or Procyon-versus-owned-M1 comparison.
 
-`reports/performance-[0-7].json` on DATA_SSD holds complete distributions and
+`reports/performance-[0-7].json` on test-ssd holds complete distributions and
 M1 CPU/RSS snapshots. `performance-summary.json` is copied to the local report
 root. Local per-phase files retain N1 process counters. The first performance
 controller stopped after phase 0 because an empty SSH argument was omitted;
@@ -116,7 +116,7 @@ The large campaign is **continuing its unfinished checks**, not yet passed as a
 whole. It originally populated private `million/` directories on both nodes,
 separate from the preflights. The frozen Rust population/readback client runs
 four writers in 256-object batches and eight verification readers. Its client
-journals stay on DATA_SSD. The controller is detached on the N1 workstation, and
+journals stay on test-ssd. The controller is detached on the N1 workstation, and
 the M1/client processes have independent sessions on the SSD test system.
 Closing the IDE or SSH client does not terminate them. Both hosts and the test
 network must remain available.
@@ -172,8 +172,8 @@ The original campaign's sequence and current disposition are:
 `million-events.log` and `million-controller.log` are on the local report root.
 `MILLION-FAILED` or `MILLION-PASSED` is created only when the corresponding
 condition occurs. Raw Rust client logs, journal files and M1 resource samples
-remain on DATA_SSD; N1 resource/disk counters remain on HDD1TB001. The controller
-also checks available DATA_SSD space and stops on failure. It never starts a
+remain on test-ssd; N1 resource/disk counters remain on test-hdd-a. The controller
+also checks available test-ssd space and stops on failure. It never starts a
 replacement workload to overwrite a failed oracle.
 
 This campaign covers **named API → owned M1 → N1**. The completed results remain

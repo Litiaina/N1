@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-SOURCE_FILE="${SOURCE_FILE:-/home/administrator/Downloads/INCDT 122225.mp4}"
+SOURCE_FILE="${SOURCE_FILE:?Set SOURCE_FILE to a local test payload}"
 DISK_ROOTS="${DISK_ROOTS:-/mnt/disk-00,/mnt/disk-01}"
 PORT="${PORT:-50671}"
 PREFIX="${PREFIX:-release-proof/}"

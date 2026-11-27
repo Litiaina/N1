@@ -68,7 +68,7 @@ report retains the failed controller/setup pilots separately.
 
 ## Matched bridge-status measurements
 
-The SSD test system runs M1 and N1 1+0 on DATA_SSD. Four alternating
+The SSD test system runs M1 and N1 1+0 on test-ssd. Four alternating
 previous/candidate/ candidate/previous phases pin the harness and both child
 engines to performance-core logical CPUs 0–11. Each side contributes 200 idle
 samples; the corrected candidate also completes 200 active-body samples. The
@@ -103,13 +103,13 @@ in [the single-part report](M1-SINGLE-PART-20261114.md).
 
 ## Evidence and release boundary
 
-SSD test system root: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
+SSD test system root: `/mnt/test-ssd/n1-m1-acceptance-20261113-01`.
 `reports/bridge16-*` holds functional/build and initial timing evidence;
 `reports/bridge19-*` holds the instrumented screen and final source audit.
 `reports/stalled17` and `memory18` hold the repeated physical-kernel fault and
 pressure evidence. Exact overlays, drivers and manifests are in `source/`. The
 workstation copy is under
-`/mnt/HDD1TB001/n1-m1-acceptance-20261113-01/remote-bridge19`, with HDD/browser
+`/mnt/test-hdd-a/n1-m1-acceptance-20261113-01/remote-bridge19`, with HDD/browser
 logs in `reports/bridge16-hdd` and `reports/console-bridge16-live`. The portable
 checkpoint under `/srv/test-evidence/portable` retains source, binaries and
 evidence without credentials, private TLS keys, datasets, loop images or build

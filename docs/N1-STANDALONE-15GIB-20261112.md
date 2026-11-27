@@ -14,7 +14,7 @@ long-lived process as the [preceding 1 GiB
 measurements](FOUR-HDD-THROUGHPUT-20261112.md#standalone-n1-finalization).
 
 - Native **verified TLS over loopback → N1 → Pool A**, four SATA XFS HDDs at
-  `/mnt/DISK0` through `/mnt/DISK3`.
+  `/mnt/test-hdd-0` through `/mnt/test-hdd-3`.
 - Immutable **3 data + 1 parity**, 256 KiB block, 768 KiB logical stripe.
 - **320 parts of 48 MiB**, four independent writer connections, strict durable
   acknowledgements, existing aligned direct I/O and adaptive concurrency.
@@ -86,7 +86,7 @@ finalize time.
 ## Evidence and reproduction
 
 the four-HDD reference system evidence root:
-**`/mnt/DISK0/n1-standalone-15gib-20261112-01`**. The measured client job ran
+**`/mnt/test-hdd-0/n1-standalone-15gib-20261112-01`**. The measured client job ran
 **15:06:41–15:10:26 Asia/Manila**. `results/` preserves methodology, the
 client-held LINK identity, all phase/process counters and `PASSED.json`;
 `reports/` contains live progress, GNU time, summary, strict release Clippy and
@@ -118,8 +118,8 @@ private secret-env path, the interactive N1/M1/Console PIDs, `repeats: 1` and
 the diagnostic client's supported sizes; they do not introduce an N1 file-size
 limit. The client never provisions a metadata fragment or calls M1.
 
-The local evidence copy is on HDD1TB001 at
-`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01/reports/four-hdd-n1-15gib-20261112-01`.
+The local evidence copy is on test-hdd-a at
+`/mnt/test-hdd-a/n1-rc2-continuation-20261112-01/reports/four-hdd-n1-15gib-20261112-01`.
 Its completion record matches the remote SHA-256. All original deployed
 services and the interactive stack remain running. No commit, push, tag or
 release was performed.

@@ -12,7 +12,7 @@ source was read to examine reliability mechanisms:
   ordered page traversal and explicit integrity checking.
 
 The exact reference copies are retained on the test host under
-`/mnt/DATA_SSD/m1-owned-storage-20261110-01/reference/sqlite`:
+`/mnt/test-ssd/m1-owned-storage-20261110-01/reference/sqlite`:
 
 | File | SHA-256 |
 | --- | --- |

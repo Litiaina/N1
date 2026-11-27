@@ -392,7 +392,7 @@ async fn run_benchmark(args: Vec<String>, include_large: bool) -> Result<()> {
         );
     }
     let report = Path::new(&args[3]).canonicalize()?;
-    if !report.starts_with("/mnt/PROJECT-DISK-1TB") {
+    if !report.starts_with("/mnt/test-project") {
         return Err("benchmark reports must be on PROJECT HDD".into());
     }
     let events = report.join("measurements.jsonl");
@@ -682,8 +682,8 @@ fn isolated_fixture_root(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("n1-benchmark-"))
         && fixture.parent().is_some_and(|parent| {
-            parent == Path::new("/mnt/PROJECT-DISK-1TB")
-                || parent == Path::new("/media/altear/TEST-1TB/mx-tests")
+            parent == Path::new("/mnt/test-project")
+                || parent == Path::new("/mnt/test-secondary/legacy-tests")
         })
 }
 
@@ -694,16 +694,16 @@ mod tests {
     #[test]
     fn fixture_guard_accepts_benchmark_children_and_rejects_unrelated_or_traversed_roots() {
         for path in [
-            "/mnt/PROJECT-DISK-1TB/n1-benchmark-restored-123/member-0",
-            "/media/altear/TEST-1TB/mx-tests/n1-benchmark-20261102-01/member-1",
+            "/mnt/test-project/n1-benchmark-restored-123/member-0",
+            "/mnt/test-secondary/legacy-tests/n1-benchmark-20261102-01/member-1",
         ] {
             assert!(isolated_fixture_root(Path::new(path)), "{path}");
         }
         for path in [
-            "/home/altear/Development/N1/member-0",
-            "/mnt/PROJECT-DISK-1TB/production/member-0",
-            "/mnt/PROJECT-DISK-1TB/n1-benchmark-other/../production/member-0",
-            "/media/altear/TEST-1TB/n1-benchmark-other/member-0",
+            "/workspace/N1/member-0",
+            "/mnt/test-project/production/member-0",
+            "/mnt/test-project/n1-benchmark-other/../production/member-0",
+            "/mnt/test-secondary/n1-benchmark-other/member-0",
         ] {
             assert!(!isolated_fixture_root(Path::new(path)), "{path}");
         }

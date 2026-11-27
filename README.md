@@ -1,109 +1,55 @@
 <div align="center">
-
-  <img
-    src="./assets/litiaina_icon.png"
-    alt="Litiaina"
-    width="150"
-    height="150"
-  />
-
+  <img src="assets/litiaina_icon.png" alt="Litiaina" width="120" height="120" />
   <h1>Litiaina N1</h1>
-
-  <p>
-    <b>N1 is a high-performance single-node object store built on LINK (Litiaina Immutable Native Key). M1 is its independent metadata store with a specialized transactional database for named-object management.</b>
-  </p>
-
 </div>
 
-<p align="center">
-  <strong>System 1.0.0-RC.2 — N1 1.0.0-RC.2 + M1 1.0.0-RC.1</strong>
-</p>
+**N1 is a high-performance single-node object store built on LINK for durable,
+key-addressed storage. M1 adds named objects and versions through a separate
+metadata service.**
 
-## Overview
+LINK (Litiaina Immutable Native Key) lets N1 calculate shard locations from an
+object key and the pool configuration. N1 supports multipart uploads, verified
+range reads, erasure coding and shard repair. Applications that manage their
+own names can store the LINK keys and use N1 directly.
 
-**LINK — Litiaina Immutable Native Key** is N1's native object-addressing and
-shard-placement architecture. The object engine calculates shard locations from
-a client-held key and an immutable storage-pool layout. It does not use NCX/NDX
-or a namespace database to locate object bytes.
+M1 manages names, fragments, listings, versions, permissions and trash in its
+own transactional database. It uses N1's native API for object data. Both
+engines live in this repository and have independent versions. Console is
+distributed separately and connects to M1.
 
-This repository contains two systems:
+## Get started
 
-- **N1 — `object_engine/`** stores and verifies immutable objects. It handles normal,
-  batch and multipart uploads, durable finalization, GET/ranges, object health,
-  repair, zero-residue purge, staging GC and object recovery.
-- **M1 — `metadata_engine/`** provides logical fragments, names, versions, listings,
-  named upload transactions, rename, trash/recovery and exports. Its database
-  engine is independently implemented in `metadata_engine/storage/`. It coordinates
-  storage through the public native LINK interface, without importing
-  object-engine internals.
+- [Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2)
+  for Linux x86-64. This release candidate includes N1 1.0.0-RC.2,
+  M1 1.0.0-RC.1, the N1 backup helper and systemd installers.
+- [Run N1 locally](docs/QUICKSTART.md) with a disposable single-member pool.
+  Use the [operator guide](DOCUMENTATION.md) for redundant pools, TLS and M1 setup.
 
-**LINK** is N1's key algorithm and storage architecture. **M1 storage** is the
-specialized transactional database inside M1; it is not another object store.
-
-`main` contains the mainstream **N1 LINK + M1** system. The former NCX/NDX
-engine is a separate product, **N1 Lite**, in the
-[N1-Lite repository](https://github.com/Litiaina/N1-Lite). It has its own engine,
-builds, binaries, configuration and operator documentation.
-
-The original Console connects to M1's NOA v1 interface. M1 forwards object
-operations to N1 over native NOA v2. Applications that manage their own names
-and LINK keys can use N1 independently, without M1 or its database.
-
-`Console / named client → M1 → N1 (LINK) → shards`
-
-`Client with its own metadata → N1 (LINK) → shards`
-
-N1 retains adaptive concurrency, the disk scheduler, io_uring, streaming,
-middleware, repair and backup infrastructure. Capacity expansion adds a complete
-immutable pool; existing objects keep their original placement. Operators retain
-INI/environment control of addresses, ports, TLS, concurrency and maintenance.
-
-## Build and operate
-
-Build with Rust on Linux. Keep build output and large datasets on storage with
-adequate space, outside the source tree.
+To build from source, install Rust, a C toolchain, Git, `pkg-config` and the
+OpenSSL development headers on Linux. Then run:
 
 ```sh
 cargo build --locked --release -p n1 -p m1 -p n1_shell
-litiaina-n1 --help
-litiaina-m1 --help
-litiaina-n1-shell --help
 ```
 
-Package `n1` builds `litiaina-n1`; package `m1` builds `litiaina-m1`. The source
-directories remain `object_engine/` and `metadata_engine/`. Each server has its
-own INI configuration and private credentials,
-supplied through a selected secrets file or its service environment.
-Follow the operator guide to enroll empty member roots, configure the two
-services and connect Console to metadata.
-
-N1 and M1 have independent package versions. The complete system release
-records their selected combination in [the system manifest](deploy/system-release.json).
-See [versioning and release policy](docs/VERSIONING.md) for the system tag,
-artifact identities and compatibility rules.
+Cargo writes the server binaries, backup helper and optional N1 Shell to
+`target/release/` by default.
 
 ## Documentation
 
-| Read | Purpose |
+| Guide | Covers |
 | --- | --- |
-| [Operator guide](DOCUMENTATION.md) | Configure, start, tune and recover N1 and M1; enroll N1 pools |
-| [Architecture](ARCHITECTURE.md) | System names, repository structure, LINK placement and N1/M1 boundaries |
-| [NOA standard](NOA.md) | Both the named metadata v1 contract and direct LINK v2 contract |
-| [M1 API reference](docs/api/M1.md) | Named requests, responses, curl examples, multipart resume, maintenance and backups |
-| [N1 API reference](docs/api/N1.md) | Native LINK requests, responses, executable Rust walkthrough and secondary HTTP examples |
-| [Testing](TESTING.md) | Reproduce tests and distinguish qualified results from running campaigns |
-| [Changelog](CHANGELOG.md) | Product changes; older engine history is explicitly separated |
-| [Versioning](docs/VERSIONING.md) | Independent N1/M1 versions and the qualified system release |
+| [Operator guide](DOCUMENTATION.md) | Pool enrollment, configuration, maintenance, backup and recovery |
+| [N1 API](docs/api/N1.md) | Direct LINK operations and a runnable Rust example |
+| [M1 API](docs/api/M1.md) | Named uploads, listings, trash and administration with HTTP examples |
+| [NOA](NOA.md) | Shared API specification and protocol versions |
+| [Architecture](ARCHITECTURE.md) | LINK placement, storage layout and engine responsibilities |
+| [Testing](TESTING.md) | How to run tests and read the qualification results |
+| [Changelog](CHANGELOG.md) · [Versioning](docs/VERSIONING.md) | Release changes and component versions |
 
-Detailed references: [LINK byte format](docs/LINK-FORMAT.md),
-[metadata internals](docs/M1.md) and
-[RC.2 qualification](docs/RC2-IMPLEMENTATION.md).
+## License and project policy
 
-The Linux x86-64 engine release includes N1, M1, the N1 backup helper, and
-systemd installers. Console is distributed separately.
-[Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2).
-
-## License and reports
-
-N1 is licensed under [Apache 2.0](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md)
-for the project's contribution and reporting policy.
+N1 and M1 are available under the [Apache License 2.0](LICENSE). The maintainers
+develop the project and publish the source for anyone to use, study, modify and
+redistribute under the license. See the [contribution policy](CONTRIBUTING.md)
+and [security reporting policy](SECURITY.md).

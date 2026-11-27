@@ -129,7 +129,7 @@ fixture inputs; their targets and prerequisites are indexed in
 
 ## Evidence and limits
 
-Local evidence root: `/mnt/PROJECT-DISK-1TB/n1-reliability-20261104-01`.
+Local evidence root: `/mnt/test-project/n1-reliability-20261104-01`.
 `reports/RELIABILITY-20261104.md` contains the full hardware/provenance record;
 `reports/full03/` holds raw logs, terminal JSON, executable hashes and `PASSED`.
 `source/full-test.sh` records the exact commands and environment. The tested

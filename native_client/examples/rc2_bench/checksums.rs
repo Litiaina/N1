@@ -18,7 +18,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         .parent()
         .ok_or("missing report parent")?
         .canonicalize()?
-        .starts_with("/mnt/PROJECT-DISK-1TB")
+        .starts_with("/mnt/test-project")
     {
         return Err("CPU profile report must be on the PROJECT HDD".into());
     }

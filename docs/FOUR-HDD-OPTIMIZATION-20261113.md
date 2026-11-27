@@ -25,16 +25,16 @@ the current working implementation.
 
 The four-HDD reference system has an Intel i5-11400, six cores/twelve threads
 and approximately 11 GiB RAM. The four independent HDDs are mounted as XFS at
-`/mnt/DISK0` through `/mnt/DISK3`. The system NVMe is a Kingston SNV2S500G with
+`/mnt/test-hdd-0` through `/mnt/test-hdd-3`. The system NVMe is a Kingston SNV2S500G with
 an ext4 filesystem. Existing deployed services and their data are not test
 targets. No global toolchain, CPU policy, kernel setting or installed package is
 changed.
 
 Task source, dependencies, reports and binaries live under
-`/mnt/DISK0/n1-optimization-20261113-01`. Its verified input capsule is the
+`/mnt/test-hdd-0/n1-optimization-20261113-01`. Its verified input capsule is the
 sibling `n1-optimization-20261113-01-capsule` directory. Builds reuse the prior
 task's HDD target directory, but use this run's isolated Cargo home and vendored
-dependencies. There is no dependency on the SSD test system or DATA_SSD.
+dependencies. There is no dependency on the SSD test system or test-ssd.
 
 The source checkpoint is committed `3d6e1a3` plus the three-file sparse-upload
 optimization and its interrupted-part regression test. Both N1 variants are
@@ -635,9 +635,9 @@ empty-fragment database are preserved separately from the successful run.
 
 ## Evidence
 
-Remote root: `/mnt/DISK0/n1-optimization-20261113-01`. Local retrieved evidence:
-`/mnt/HDD1TB001/n1-four-hdd-optimization-20261113-01`. Portable
-source/dependencies remain under `/srv/test-evidence/portable`; DATA_SSD is not
+Remote root: `/mnt/test-hdd-0/n1-optimization-20261113-01`. Local retrieved evidence:
+`/mnt/test-hdd-a/n1-four-hdd-optimization-20261113-01`. Portable
+source/dependencies remain under `/srv/test-evidence/portable`; test-ssd is not
 required. `reports/SUMMARY-FINAL.json` and `READ-SUMMARY.json` preserve the
 initial candidate's samples. `RECEIVE-SUMMARY01.json` records the current
 candidate's complete matrix; `CYCLES-SUMMARY01.json` records the separate
@@ -675,7 +675,7 @@ are preserved in `evidence/receive02-tested-artifacts.tar.gz`, with relative
 SHA-256 manifests. The 26 MiB archive, current source checkpoint and reports are
 also copied to
 `/srv/test-evidence/portable/n1-four-hdd-continuation-20261113-01`. The
-dependency capsule remains in its sibling portable directory; neither DATA_SSD
+dependency capsule remains in its sibling portable directory; neither test-ssd
 nor a build cache is needed to recover this work. No commit, push, tag or
 release has been performed.
 

@@ -6,11 +6,8 @@ Key** is N1's key algorithm and storage architecture. M1 owns its specialized
 transactional database in `metadata_engine/storage/`. The public native NOA API
 connects M1 to N1; either service may run on a separate machine.
 
-The `main` branch develops N1 LINK and M1. **N1 Lite** is the former combined
-NCX/NDX engine in the separate
-[N1-Lite repository](https://github.com/Litiaina/N1-Lite). It is an independent
-product with its own engine, binaries, configuration and services. This workspace
-does not build or depend on N1 Lite.
+**N1 Lite**, based on the former combined NCX/NDX engine, is a separate
+product with its own engine, binaries, configuration and services.
 
 `Console / named client → M1 → native N1 (LINK) → shards`
 

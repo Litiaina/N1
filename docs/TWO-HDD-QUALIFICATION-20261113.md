@@ -40,13 +40,13 @@ The final database reports 4,755,931,220 disk bytes. Counts differ from the
 earlier 7,001,423-record integrity check because GC removed expired lifecycle
 state; the original acknowledged names, versions and payloads remain unchanged.
 
-The evidence root is `/mnt/HDD1TB001/n1-rc2-ssd-hdd-qualification-20261112-02`.
+The evidence root is `/mnt/test-hdd-a/n1-rc2-ssd-hdd-qualification-20261112-02`.
 Its `reports/` contains `original-gc-completed.json`,
 `original-final-metadata.json`, `original-final-physical.json`,
 `original-final-integrity.json`, timing, original binary hashes and
 `ORIGINAL-FINAL02-EXIT=0`. `ORIGINAL-CAMPAIGN-COMPLETED` also exists in the
 original continuation root. Corresponding SSD test system evidence is under
-`/mnt/DATA_SSD/n1-rc2-ssd-hdd-qualification-20261112-02`; frozen final-stage
+`/mnt/test-ssd/n1-rc2-ssd-hdd-qualification-20261112-02`; frozen final-stage
 scripts are under `source/`. The portable checkpoint in
 `/srv/test-evidence/portable` remains unchanged. Earlier stopped/failed launch
 reports are retained.
@@ -88,8 +88,8 @@ an O(1) recovery claim. N1's finalization remains O(pool width).
 | Complete workspace, all targets, locked/offline | **401 passed, 0 failed**, 57 explicit opt-in/helper exclusions after adding the read-replay benchmark, 50 target summaries |
 | Native object-adapter transport tests | **16 passed**, including five new completion/recovery cases; included in the 401 above |
 | Strict workspace all-target Clippy, workspace formatting | Passed; new read-replay fixture also passed focused strict Clippy |
-| DATA_SSD real resume | **4 passed**: both-process crash, lost staging, interrupted listing and 1 GiB reconstruction/index recovery |
-| DATA_SSD real API/Console | **15 passed**: permissions/quotas, native/TLS, size policy, Accel, archives, retained-export lifecycle, expired uploads, upload-versus-scrub classification and original Console operator workflows |
+| test-ssd real resume | **4 passed**: both-process crash, lost staging, interrupted listing and 1 GiB reconstruction/index recovery |
+| test-ssd real API/Console | **15 passed**: permissions/quotas, native/TLS, size policy, Accel, archives, retained-export lifecycle, expired uploads, upload-versus-scrub classification and original Console operator workflows |
 | Two independent HDD members, real API | **10 passed**: member loss/corruption, full metadata restore, six in-flight crash cases, indexed GC, scoped healing, cross-EC migration/restart/cancel, monitoring/snapshots, encrypted backup/replication/replacement and total payload-loss refusal |
 | Frozen original Console source/build | Production build and **45 Node tests passed**; current-candidate real browser operator/backup workflow and four original live upload cases passed |
 | Monitoring benchmarks | Quiet-node zero-payload-I/O/CPU/RSS witness, six matched transfers and the same-object warm/file-cache-advised replays passed; measurements and limits below |
@@ -101,14 +101,14 @@ tests. The original service harness contains 41 opt-in cases; the new isolated
 read-replay benchmark adds one. This table does not claim all cases, full NOA
 conformance or physical power-loss coverage.
 
-DATA_SSD tests use SSD test system M1/database/control and N1 1+0 fixtures on
+test-ssd tests use SSD test system M1/database/control and N1 1+0 fixtures on
 the same SATA SSD, with native loopback. The two-HDD checks run on the two-HDD
-test system with N1 1+1 and M1/control on HDD1TB001; each N1 member occupies a
+test system with N1 1+1 and M1/control on test-hdd-a; each N1 member occupies a
 distinct XFS filesystem. This latter profile tests functional co-location, not a
 measured split-node SSD deployment. Original split-node/million evidence remains
 separate. No drive was reformatted or physically disconnected in these checks.
 
-Current binaries, compiled on DATA_SSD with Rust 1.99.0 and the unchanged
+Current binaries, compiled on test-ssd with Rust 1.99.0 and the unchanged
 optimized workspace profile:
 
 | Executable | SHA-256 |
@@ -128,7 +128,7 @@ retained separately in `resume-progress01.log`.
 
 This isolates the M1 adapter change against M1 built from exact committed
 `2fcfeeabc72668d6e0c9dd3d4076323e4f2ec243`, using the same compiler/profile,
-running N1, database, configuration and DATA_SSD 1+0 pool. It is **not** an
+running N1, database, configuration and test-ssd 1+0 pool. It is **not** an
 N1-Lite-versus-LINK or old-Procyon-versus-owned-database comparison. The prior
 [standalone finalization benchmarks](FINALIZATION-20261112.md) remain the N1
 runtime evidence; that N1 executable did not change here.
@@ -205,7 +205,7 @@ phases. The test uses a different newly uploaded object per phase, uncontrolled
 page cache and co-located M1 on HDD1; it does not isolate the cause. This adverse
 observation is retained in `reports/monitoring06-transfers.json` and is not
 described as zero monitoring overhead. `monitoring07-quiet.json` separately
-records the no-payload-I/O and CPU/RSS results on DATA_SSD.
+records the no-payload-I/O and CPU/RSS results on test-ssd.
 
 The follow-up Rust replay holds the same immutable object/version, N1/M1
 processes and placement constant. It performs one complete warmup GET, then
@@ -259,7 +259,7 @@ contract/Console acceptance and current-runtime scale gates remain tracked in
 population is running or queued.
 
 Final provenance checks match **353 Rust/manifests/lock files** between this
-worktree and the compiled DATA_SSD source. N1/LINK/native-client source is
+worktree and the compiled test-ssd source. N1/LINK/native-client source is
 unchanged from committed `2fcfeea`; the N1 artifact hash also matches measured
 candidate13. New runtime work is restricted to M1's native adapter. All frozen
 source overlays, launchers, raw logs, benchmark summaries and executable hashes
@@ -268,7 +268,7 @@ remain in the task evidence root. The final workspace marker is
 service-test lint, optimized compilation and its complete physical replay.
 
 All builds, fixtures and reports use the selected HDDs or SSD test system
-DATA_SSD. Workloads and faults are Rust; the original Console uses
+test-ssd. Workloads and faults are Rust; the original Console uses
 Node/Playwright and Chromium. No Python, new million-object population, the
 four-HDD reference system access, commit, push, tag or release is performed by
 this qualification.

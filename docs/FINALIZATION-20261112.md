@@ -2,7 +2,7 @@
 
 The new finalization path performs **O(pool width)** logical work, independent
 of object bytes and part count. The completed standalone benchmarks improve
-1 GiB upload throughput and mean finalization on DATA_SSD 1+0, HDD 1+0 and
+1 GiB upload throughput and mean finalization on test-ssd 1+0, HDD 1+0 and
 HDD 1+1. A 15 GiB HDD 1+1 upload finalizes in **19.87 ms** after its durable
 parts are acknowledged. This is a standalone N1 qualification; M1 is outside
 the measured request path. RC.2 remains unreleased.
@@ -57,7 +57,7 @@ it is not a new N1 Lite/NCX comparison.
 
 | Placement | Host / filesystem / connection | Topology |
 | --- | --- | --- |
-| DATA_SSD | SSD test system, i5-12600K, Intel SSDSC2KW240H6 SATA SSD, XFS | 1+0 |
+| test-ssd | SSD test system, i5-12600K, Intel SSDSC2KW240H6 SATA SSD, XFS | 1+0 |
 | One HDD | Two-HDD test system, Ryzen 5 PRO 4650U, ST1000LM049-2GH172, XFS, USB UAS | 1+0 |
 | Two HDDs | Same two-HDD test system, two independent XFS HDD filesystems over USB UAS | 1+1 |
 
@@ -65,7 +65,7 @@ The SSD/HDD comparison has equal 1+0 topology but different host CPUs and
 SATA/USB paths. It describes these deployments rather than an isolated
 media-only comparison. Clients and N1 use native TLS loopback on their
 respective hosts, excluding LAN and browser overhead. Canonical SSD test system
-artifacts/builds use DATA_SSD; local artifacts and datasets use the HDDs.
+artifacts/builds use test-ssd; local artifacts and datasets use the HDDs.
 Runtime binaries are copied into RAM. No filesystem was reformatted.
 
 Large objects use 48 MiB parts, four concurrent writers and strict durability.
@@ -97,10 +97,10 @@ Throughput divides total source bytes by total upload wall time. MiB/s uses
 
 | Placement / object size | Baseline upload MiB/s | Candidate upload MiB/s | Baseline mean finalize | Candidate mean finalize |
 | --- | ---: | ---: | ---: | ---: |
-| DATA_SSD 1+0 / 1 GiB, four per binary | 134.99 | **182.35** | 39.15 ms | **6.54 ms** |
+| test-ssd 1+0 / 1 GiB, four per binary | 134.99 | **182.35** | 39.15 ms | **6.54 ms** |
 | HDD 1+0 / 1 GiB, four per binary | 103.82 | **109.25** | 62.41 ms | **22.24 ms** |
 | HDD 1+1 / 1 GiB, four per binary | 64.25 | **76.47** | 65.35 ms | **19.53 ms** |
-| DATA_SSD 1+0 / 15 GiB, two per binary | 100.51 | **101.25** | 121.24 ms | **23.95 ms** |
+| test-ssd 1+0 / 15 GiB, two per binary | 100.51 | **101.25** | 121.24 ms | **23.95 ms** |
 | HDD 1+1 / 15 GiB, one candidate | — | **73.84** | — | **19.87 ms** |
 
 At 1 GiB, the candidate's measured throughput improves **35.08%** on SSD,
@@ -221,11 +221,11 @@ verified/purged lifecycle and are kept separate from upload-only CPU above.
 | Final complete Rust workspace, including added process-crash witness | **396 passed, 0 failed**, 56 explicit ignored/helper/hardware cases across 50 test targets |
 | Release N1 suite before the test-only SIGKILL addition | **216 passed, 0 failed**, two explicit ignored cases |
 | Physical XFS finalization suite for the final runtime | **9 passed, 0 failed** |
-| Actual SIGKILL after durable part ACKs, DATA_SSD | **Passed**: reopen with empty RAM, finalize same key, repeat finalize, exact GET and purge |
+| Actual SIGKILL after durable part ACKs, test-ssd | **Passed**: reopen with empty RAM, finalize same key, repeat finalize, exact GET and purge |
 | Strict N1 and Rust benchmark Clippy; workspace format check | **Passed** |
 | Workspace documentation test compilation | **Passed**; zero runnable examples across six targets |
 
-The dedicated SIGKILL fixture uses logical 3+1 members on DATA_SSD. It proves
+The dedicated SIGKILL fixture uses logical 3+1 members on test-ssd. It proves
 process-crash recovery of that fixture, not four-device independence or host
 power-cut survival. The existing direct-I/O/reopen checks passed independently
 on both HDDs, and the final large-object runs exercise the aligned writer.
@@ -254,8 +254,8 @@ datasets and services are preserved.
 
 ## Evidence and retained failures
 
-Local evidence: `/mnt/HDD1TB001/n1-finalize-ssd-hdd-20261112-01`. Canonical SSD
-test system copies: `/mnt/DATA_SSD/n1-finalize-ssd-hdd-20261112-01`. The other
+Local evidence: `/mnt/test-hdd-a/n1-finalize-ssd-hdd-20261112-01`. Canonical SSD
+test system copies: `/mnt/test-ssd/n1-finalize-ssd-hdd-20261112-01`. The other
 HDD contains only the task's private second member in addition to previous
 preserved datasets. `reports/` holds unedited phase results, resource/disk
 counters and test logs. `source/` holds frozen Bash drivers, Rust source

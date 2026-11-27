@@ -13,7 +13,7 @@ unreleased.
 
 These tables retain the original the four-HDD reference system snapshot. The
 later [finalization and media qualification](FINALIZATION-20261112.md) measures
-the optimized runtime against its preceding LINK baseline on DATA_SSD 1+0 and
+the optimized runtime against its preceding LINK baseline on test-ssd 1+0 and
 HDD 1+0/1+1, including p50/p95/p99, CPU/RSS and recovery checks. Its different
 hosts and topology do not replace the four-HDD reference system 3+1 measurements
 here. The [subsequent SSD/HDD qualification](TWO-HDD-QUALIFICATION-20261113.md)
@@ -29,7 +29,7 @@ approximately 11 GiB RAM. M1 uses its independent `m1_storage` database.
 | Component | Location / policy |
 | --- | --- |
 | M1 database and multipart staging | Ext4 on `/dev/nvme0n1p2`, KINGSTON SNV2S500G; isolated directory under `/srv/test-evidence/portable/n1-m1-rc2-20261112-01/throughput-20261112-01` |
-| N1 pool A | The existing interactive pool's fresh member directories under `/mnt/DISK0` through `/mnt/DISK3`, each a distinct XFS HDD filesystem |
+| N1 pool A | The existing interactive pool's fresh member directories under `/mnt/test-hdd-0` through `/mnt/test-hdd-3`, each a distinct XFS HDD filesystem |
 | HDD models | ST1000DM010-2EP1; two WDC WD10EZEX-21W drives; WDC WD10JPVX-00J |
 | EC / block | Immutable 3 data + 1 parity, 256 KiB block; one logical stripe is 768 KiB |
 | Object runtime | Existing release N1 process, io_uring, aligned direct I/O for large writes, adaptive concurrency enabled |
@@ -223,7 +223,7 @@ peak RSS was **359.63 MiB** in the main run. No swaps were reported by GNU time.
 ## Evidence, cleanup and reproduction
 
 the four-HDD reference system evidence root:
-**`/mnt/DISK0/n1-throughput-20261112-01`**. The main run exits 0 after **3 min
+**`/mnt/test-hdd-0/n1-throughput-20261112-01`**. The main run exits 0 after **3 min
 57.52 s**, including verification and untimed cleanup. `results/PASSED.json`
 records **609 reclaimed objects**; the separate `batch-results/PASSED.json`
 records another **300**. Both scoped GC jobs complete with **zero failures and
@@ -271,8 +271,8 @@ The config supplies the private loopback HTTPS URL, CA, isolated master-env
 path, N1/M1/Console PIDs and repeat count. The isolated M1 must have zero trash
 retention for the client's scoped cleanup. Never point this client at the
 interactive metadata database. Choose new private result directories; existing
-results are never overwritten. A local copy of all reports is on HDD1TB001 at
-`/mnt/HDD1TB001/n1-rc2-continuation-20261112-01/reports/four-hdd-throughput-20261112-01`.
+results are never overwritten. A local copy of all reports is on test-hdd-a at
+`/mnt/test-hdd-a/n1-rc2-continuation-20261112-01/reports/four-hdd-throughput-20261112-01`.
 
 Standalone mode uses its separate config: native loopback TLS URL, CA, N1
 secret-env path, the three interactive service PIDs and repeat count. It does

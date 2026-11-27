@@ -29,7 +29,7 @@ sessions still reject a size/count change. No UI redesign is included.
 
 ## Matched measurement
 
-SSD test system `ssd-test.example.invalid`, DATA_SSD XFS, N1 1+0 and M1 on the
+SSD test system `ssd-test.example.invalid`, test-ssd XFS, N1 1+0 and M1 on the
 same SSD. Compiler and release profile are matched. Baseline is buffer01
 (`f1c74d6` runtime), candidate is negotiate01. Both use the **same new Rust
 benchmark executable** and request negotiation. Baseline ignores the new field
@@ -168,9 +168,9 @@ specific gap without changing upload retry immutability.
 
 Private run roots:
 
-- SSD test system: `/mnt/DATA_SSD/n1-m1-acceptance-20261113-01`.
-- Workstation: `/mnt/HDD1TB001/n1-m1-acceptance-20261113-01`, with the second
-  member under the corresponding HDD1TB002 directory.
+- SSD test system: `/mnt/test-ssd/n1-m1-acceptance-20261113-01`.
+- Workstation: `/mnt/test-hdd-a/n1-m1-acceptance-20261113-01`, with the second
+  member under the corresponding test-hdd-b directory.
 
 The `negotiate01-before-a1`, `after-b1`, `after-b2`, `before-a2` report directories
 hold raw per-request timing, process CPU/RSS/I/O, host samples, exact executable

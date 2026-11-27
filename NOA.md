@@ -2,10 +2,10 @@
 
 NOA defines the public operation contracts of the two systems in this repository.
 **M1**, the metadata store with its own transactional database, serves **NOA v1** for named objects.
-**N1**, the LINK object store, serves **NOA v2** for direct object keys. Neither
-replaces the other. API and wire versions are independent of the binary version
-in Cargo metadata. N1 RC.2 is still in development; full product conformance has
-not yet been established.
+**N1**, the LINK object store, serves **NOA v2** for direct object keys.
+API and wire versions are independent of binary versions. See the
+[RC.2 API qualification](docs/RC2-API-QUALIFICATION-20261124.md) for tested
+contracts and their limits.
 
 For request/response fields, executable examples and complete client workflows:
 

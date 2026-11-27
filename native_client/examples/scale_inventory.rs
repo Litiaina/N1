@@ -148,7 +148,7 @@ fn run() -> Result<()> {
     let start = Instant::now();
     let root = PathBuf::from(&args[1]).canonicalize()?;
     let completed = PathBuf::from(&args[2]).canonicalize()?;
-    if root.parent() != Some(Path::new("/mnt/PROJECT-DISK-1TB"))
+    if root.parent() != Some(Path::new("/mnt/test-project"))
         || completed.parent() != Some(root.as_path())
     {
         return Err("inventory paths are outside the isolated PROJECT HDD fixture".into());
@@ -172,7 +172,7 @@ fn run() -> Result<()> {
         || roots
             != [
                 root.join("member-0"),
-                Path::new("/media/altear/TEST-1TB/mx-tests")
+                Path::new("/mnt/test-secondary/legacy-tests")
                     .join(root.file_name().ok_or("invalid fixture name")?)
                     .join("member-1"),
             ]
@@ -244,7 +244,7 @@ fn run() -> Result<()> {
         .parent()
         .ok_or("missing report parent")?
         .canonicalize()?
-        .starts_with("/mnt/PROJECT-DISK-1TB")
+        .starts_with("/mnt/test-project")
     {
         return Err("report must be on PROJECT HDD".into());
     }

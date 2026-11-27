@@ -5,12 +5,11 @@ and [N1 API guide](docs/api/N1.md). The shared contract is [NOA.md](NOA.md).
 
 This is the operator guide for **N1**, the LINK object store, and **M1**, the
 independent metadata store with its own specialized transactional database. Both systems live in this
-repository. N1 operates without M1; Console's named-object workflows use both.
-RC.2 is in development. Server settings use INI; secrets come from a private
-file or the service environment. No migration from earlier development configurations
-or storage formats is required or promised.
+repository. N1 operates on its own, and Console's named-object workflows use
+both engines. Server settings use INI. Supply secrets in a private file or the
+service environment. For a first run, see the [local quickstart](docs/QUICKSTART.md).
 
-The complete system target is `1.0.0-RC.2`, comprising N1 `1.0.0-RC.2` and
+System `1.0.0-RC.2` includes N1 `1.0.0-RC.2` and
 M1 `1.0.0-RC.1`. Each server's `--version`, banner and API version fields report
 its own package version. Check [the system manifest](deploy/system-release.json)
 and [versioning policy](docs/VERSIONING.md) when selecting a supported pair.
@@ -55,9 +54,9 @@ concurrent batch profile should use that limit too. Where its hard limit allows,
 `ulimit -Sn 1048576` applies it to the current shell and its children without
 changing system-wide settings.
 
-Point the original Console at metadata's HTTPS address, not at LINK's internal
-object listener. Use certificates valid for the actual client/server names.
-`n1s://` verifies TLS for native connections as well.
+Point Console at M1's HTTPS address. Provision certificates valid for the
+client-facing names and keep private keys readable only by their service
+accounts. Use `n1s://` for verified native TLS connections.
 
 ## Object configuration and pool enrollment
 
