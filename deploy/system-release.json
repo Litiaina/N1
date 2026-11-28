@@ -2,8 +2,8 @@
   "schema_version": 1,
   "status": "prerelease",
   "system": {
-    "version": "1.0.0-RC.2",
-    "tag": "v1.0.0-RC.2"
+    "version": "1.0.0-RC.3",
+    "tag": "v1.0.0-RC.3"
   },
   "components": {
     "n1": {
@@ -13,7 +13,7 @@
     },
     "m1": {
       "package": "m1",
-      "version": "1.0.0-RC.1",
+      "version": "1.0.0-RC.2",
       "binaries": ["litiaina-m1"]
     }
   }

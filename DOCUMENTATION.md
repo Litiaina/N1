@@ -9,8 +9,8 @@ repository. N1 operates on its own, and Console's named-object workflows use
 both engines. Server settings use INI. Supply secrets in a private file or the
 service environment. For a first run, see the [local quickstart](docs/QUICKSTART.md).
 
-System `1.0.0-RC.2` includes N1 `1.0.0-RC.2` and
-M1 `1.0.0-RC.1`. Each server's `--version`, banner and API version fields report
+System `1.0.0-RC.3` includes N1 `1.0.0-RC.2` and
+M1 `1.0.0-RC.2`. Each server's `--version`, banner and API version fields report
 its own package version. Check [the system manifest](deploy/system-release.json)
 and [versioning policy](docs/VERSIONING.md) when selecting a supported pair.
 

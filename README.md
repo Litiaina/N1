@@ -19,9 +19,9 @@ distributed separately and connects to M1.
 
 ## Get started
 
-- [Download System 1.0.0-RC.2](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2)
+- [Download System 1.0.0-RC.3](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.3)
   for Linux x86-64. This release candidate includes N1 1.0.0-RC.2,
-  M1 1.0.0-RC.1, the N1 backup helper and systemd installers.
+  M1 1.0.0-RC.2, the N1 backup helper and systemd installers.
 - [Run N1 locally](docs/QUICKSTART.md) with a disposable single-member pool.
   Use the [operator guide](DOCUMENTATION.md) for redundant pools, TLS and M1 setup.
 

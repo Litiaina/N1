@@ -3,20 +3,20 @@
 Litiaina publishes N1 and M1 together in one system release with one Git tag.
 Each engine reports its own binary version. Console has its own distribution.
 
-## RC.2 release versions
+## RC.3 release versions
 
 | System or component | Version | Source of truth |
 | --- | --- | --- |
-| Complete system | `1.0.0-RC.2` | [`deploy/system-release.json`](../deploy/system-release.json) |
+| Complete system | `1.0.0-RC.3` | [`deploy/system-release.json`](../deploy/system-release.json) |
 | N1 object store | `1.0.0-RC.2` | [`object_engine/Cargo.toml`](../object_engine/Cargo.toml) |
-| M1 metadata store | `1.0.0-RC.1` | [`metadata_engine/Cargo.toml`](../metadata_engine/Cargo.toml) |
+| M1 metadata store | `1.0.0-RC.2` | [`metadata_engine/Cargo.toml`](../metadata_engine/Cargo.toml) |
 
-M1 starts at RC.1 because it has no previous release. N1 and the complete
-system retain their RC.2 numbering. Historical reports keep the versions
-and hashes of the exact binaries they tested. The system download and
-artifact manifest are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
+System RC.2 shipped N1 RC.2 and M1 RC.1. System RC.3 reuses those N1 binaries
+and advances M1 to RC.2 for the archive fix. Historical reports retain the
+versions and hashes of the binaries they tested. System downloads and
+artifact manifests are listed in [GitHub Releases](https://github.com/Litiaina/N1/releases).
 
-System RC.2 uses the single tag `v1.0.0-RC.2`. The artifact manifest records
+System RC.3 uses the single tag `v1.0.0-RC.3`. The artifact manifest records
 each executable's build source, toolchain and SHA-256 so operators can identify
 the installed build. Historical build identifiers may refer to pre-publication
 checkpoints. Public release tags and artifacts are immutable.

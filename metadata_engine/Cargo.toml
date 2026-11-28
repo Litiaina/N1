@@ -1,6 +1,6 @@
 [package]
 name = "m1"
-version = "1.0.0-RC.1"
+version = "1.0.0-RC.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Litiaina M1 metadata store with its own transactional database, using N1 through NOA"

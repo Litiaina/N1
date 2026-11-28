@@ -5,7 +5,7 @@ For redundant storage, TLS and optional named objects through M1, use the
 [operator guide](../DOCUMENTATION.md).
 
 Use `litiaina-n1` on your `PATH` from the
-[Linux release](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.2)
+[Linux release](https://github.com/Litiaina/N1/releases/tag/v1.0.0-RC.3)
 or run `cargo build --release --locked -p n1` and add `target/release`
 to your `PATH`.
 

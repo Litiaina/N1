@@ -5,8 +5,8 @@ transactional storage core in [`storage/`](storage). Cargo package/crate `m1`
 builds the `litiaina-m1` binary. N1, the independent **LINK object store**, lives
 in [`object_engine/`](../object_engine) and does not depend on M1 or its database.
 
-M1's first release is `1.0.0-RC.1`. Its package version is independent of
-N1 `1.0.0-RC.2` and complete system `1.0.0-RC.2`; see
+M1's package version is `1.0.0-RC.2`. Complete system `1.0.0-RC.3` bundles
+this M1 release with N1 `1.0.0-RC.2`. See
 [the versioning policy](../docs/VERSIONING.md).
 
 `Console / named client → M1 → N1 (LINK) → shards`
