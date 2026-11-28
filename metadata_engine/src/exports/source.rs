@@ -2,7 +2,12 @@
 //! resolve through metadata; bytes are read from the public native LINK API.
 use super::{BuilderError, store};
 use crate::namespace::Namespace;
+use crate::object_store::ObjectStoreError;
+use n1_native_client::NativeClientError;
 use tokio::io::AsyncWriteExt;
+
+pub(super) const SOURCE_PIPE_BYTES: usize = 256 * 1024;
+
 pub(super) struct Version {
     pub version_id: String,
     pub total_size_bytes: u64,
@@ -37,7 +42,7 @@ pub(super) fn create_multipart_range_reader(
     offset: u64,
     length: u64,
 ) -> impl tokio::io::AsyncRead + Unpin {
-    let (mut output, input) = tokio::io::duplex(256 * 1024);
+    let (mut output, input) = tokio::io::duplex(SOURCE_PIPE_BYTES);
     let objects = store::context().objects.clone();
     let key = version.key.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Error>(1);
@@ -49,7 +54,18 @@ pub(super) fn create_multipart_range_reader(
             // ObjectStoreError's public display excludes LINK access keys.
             // Retain the status so operators can distinguish admission,
             // transport and source-integrity failures without logging secrets.
-            tracing::warn!(status = error.status(), error = %error, "export object read failed");
+            let io_kind = match &error {
+                ObjectStoreError::Native(NativeClientError::Io(error)) => Some(error.kind()),
+                _ => None,
+            };
+            tracing::warn!(
+                status = error.status(),
+                ?io_kind,
+                error = %error,
+                offset,
+                length,
+                "export object read failed"
+            );
             let _ = tx
                 .send(std::io::Error::other(format!(
                     "export object read failed (status {})",

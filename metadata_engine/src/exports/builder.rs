@@ -16,7 +16,7 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::StreamReader;
 
 use super::BuilderError as AppError;
-use super::source::{self as index, create_multipart_range_reader};
+use super::source::{self as index, SOURCE_PIPE_BYTES, create_multipart_range_reader};
 
 use super::models::{ArtifactChunk, ExportConfig, ExportManifestEntry};
 use super::store::{artifact_job_directory, cleanup_artifact_chunks, manifest_path};
@@ -189,9 +189,14 @@ struct PreparedEntry {
     task: JoinHandle<std::io::Result<()>>,
 }
 
+enum QueuedEntry {
+    Prefetched(PreparedEntry),
+    Deferred(ExportManifestEntry),
+}
+
 struct ManifestPrefetcher {
     lines: tokio::io::Lines<BufReader<File>>,
-    queue: VecDeque<PreparedEntry>,
+    queue: VecDeque<QueuedEntry>,
     fragment: String,
     progress: Arc<ActiveProgress>,
     concurrency: usize,
@@ -239,25 +244,38 @@ impl ManifestPrefetcher {
             let manifest: ExportManifestEntry = serde_json::from_str(&line).map_err(|error| {
                 AppError::InternalServerError(format!("decode N1 export manifest entry: {error}"))
             })?;
-            self.queue.push_back(spawn_object_reader(
-                self.fragment.clone(),
-                manifest,
-                Arc::clone(&self.progress),
-            ));
+            // A lookahead read must fit in the source pipe even if the
+            // archive cannot poll its entry yet. Otherwise N1 may close the
+            // stalled native stream before the writer reaches that entry.
+            let entry = if manifest.size_bytes <= SOURCE_PIPE_BYTES as u64 {
+                QueuedEntry::Prefetched(spawn_object_reader(
+                    self.fragment.clone(),
+                    manifest,
+                    Arc::clone(&self.progress),
+                ))
+            } else {
+                QueuedEntry::Deferred(manifest)
+            };
+            self.queue.push_back(entry);
         }
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<PreparedEntry>, AppError> {
         self.fill().await?;
-        let entry = self.queue.pop_front();
-        self.fill().await?;
-        Ok(entry)
+        Ok(self.queue.pop_front().map(|entry| match entry {
+            QueuedEntry::Prefetched(entry) => entry,
+            QueuedEntry::Deferred(manifest) => {
+                spawn_object_reader(self.fragment.clone(), manifest, Arc::clone(&self.progress))
+            }
+        }))
     }
 
     fn abort_remaining(&mut self) {
         for entry in self.queue.drain(..) {
-            entry.task.abort();
+            if let QueuedEntry::Prefetched(entry) = entry {
+                entry.task.abort();
+            }
         }
     }
 }

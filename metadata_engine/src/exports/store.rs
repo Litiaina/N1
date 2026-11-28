@@ -317,6 +317,11 @@ pub(super) fn enqueue_admitted(
             } else {
                 ExportPhase::Failed
             };
+            if record.phase == ExportPhase::Failed {
+                record.objects_completed = progress.objects_completed.load(Ordering::Relaxed);
+                record.source_bytes_completed =
+                    progress.source_bytes_completed.load(Ordering::Relaxed);
+            }
             record.error = Some(error.to_string());
             let _ = save(record.clone()).await;
         }
